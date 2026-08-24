@@ -64,11 +64,10 @@ const LOAD_ONLY_PROBE_ENABLE_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_PROBE";
 const LOAD_ONLY_PROBE_REPORT_PATH_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_REPORT_PATH";
 const HYBRID_RESIDENCY_PROFILE_SELECTOR_ENV: &str = "CAMELID_HYBRID_RESIDENCY_PROFILE";
 const HYBRID_RESIDENCY_PROFILE_V5: &str = "v5-k8-max-960";
-const HYBRID_HOT_PROFILE_ENV: &str =
-    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER";
+const HYBRID_HOT_PROFILE_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER";
 const HYBRID_HOT_PROFILE_V5_SLOTS: [u16; 30] = [
-    39, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30, 31, 32, 31,
-    32, 30, 31, 32, 35, 32, 34, 34, 37,
+    39, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30, 31, 32, 31, 32, 30, 31,
+    32, 35, 32, 34, 34, 37,
 ];
 const HYBRID_HOT_PROFILE_V5_ENCODED: &str =
     "39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37";
@@ -2073,8 +2072,7 @@ impl From<camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger> for LoadOnly
             expert_slot_capacity_bytes: value.expert_slot_capacity_bytes,
             expert_anonymous_slots_per_layer: value.expert_anonymous_slots_per_layer,
             expert_file_mapped_slot_count: value.expert_file_mapped_slot_count,
-            expert_file_mapped_address_span_bytes: value
-                .expert_file_mapped_address_span_bytes,
+            expert_file_mapped_address_span_bytes: value.expert_file_mapped_address_span_bytes,
             expert_table_directory_slot_count: value.expert_table_directory_slot_count,
             expert_table_directory_capacity_bytes: value.expert_table_directory_capacity_bytes,
             expert_table_bound_active_slot_count: value.expert_table_bound_active_slot_count,
@@ -2270,16 +2268,12 @@ fn load_only_hybrid_expert_capacity_ready(
         && profile_total == ledger.expert_slot_count
         && profile_bounded
         && ledger.expert_slot_capacity_bytes == ledger.expert_slot_count.saturating_mul(stride)
-        && ledger.expert_file_mapped_slot_count
-            == ledger.expert_layer_count.saturating_mul(128)
+        && ledger.expert_file_mapped_slot_count == ledger.expert_layer_count.saturating_mul(128)
         && ledger.expert_file_mapped_address_span_bytes
-            == ledger
-                .expert_file_mapped_slot_count
-                .saturating_mul(stride)
+            == ledger.expert_file_mapped_slot_count.saturating_mul(stride)
         && ledger.cghost_logical_bytes >= ledger.expert_file_mapped_address_span_bytes
         && ledger.cghost_mapped_bytes >= ledger.expert_file_mapped_address_span_bytes
-        && ledger.expert_table_directory_slot_count
-            == ledger.expert_layer_count.saturating_mul(32)
+        && ledger.expert_table_directory_slot_count == ledger.expert_layer_count.saturating_mul(32)
         && ledger.expert_table_directory_capacity_bytes
             == ledger
                 .expert_table_directory_slot_count
@@ -2403,8 +2397,7 @@ fn load_only_target_phase_violation(
             && ledger.expert_tables_compute_bound
             && ledger.expert_table_bound_active_slot_count
                 == ledger.expert_layer_count.saturating_mul(8)
-            && ledger.expert_table_bound_active_slot_count
-                <= ledger.expert_file_mapped_slot_count
+            && ledger.expert_table_bound_active_slot_count <= ledger.expert_file_mapped_slot_count
     };
     let required_head_ready = || {
         ledger.tied_head_active
@@ -3608,8 +3601,7 @@ fn validate_routed_expert_snapshot(
             || layer.base_slot_capacity == 0
             || layer.physical_base_slot_budget > layer.base_slot_capacity
             || layer.file_mapped_addressable_slots > layer.base_slot_capacity
-            || (layer.physical_base_slot_budget == 0
-                && layer.file_mapped_addressable_slots == 0)
+            || (layer.physical_base_slot_budget == 0 && layer.file_mapped_addressable_slots == 0)
             || layer.physical_base_slot_budget_bytes
                 != layer
                     .physical_base_slot_budget
@@ -3634,10 +3626,8 @@ fn validate_routed_expert_snapshot(
         }
         capacity = capacity.saturating_add(layer.base_slot_capacity);
         physical_budget = physical_budget.saturating_add(layer.physical_base_slot_budget);
-        file_mapped_slots =
-            file_mapped_slots.saturating_add(layer.file_mapped_addressable_slots);
-        file_mapped_span =
-            file_mapped_span.saturating_add(layer.file_mapped_address_span_bytes);
+        file_mapped_slots = file_mapped_slots.saturating_add(layer.file_mapped_addressable_slots);
+        file_mapped_span = file_mapped_span.saturating_add(layer.file_mapped_address_span_bytes);
         occupied = occupied.saturating_add(layer.occupied_base_slots);
         aggregate.route_lookups = aggregate
             .route_lookups
@@ -3897,12 +3887,9 @@ fn validate_exact_target_hybrid_experts(
     const HOT_SLOT_TOTAL: u64 = LAYERS * 32;
     const RECORD_BYTES: u64 = 3_345_408;
     const STRIDE_BYTES: u64 = 3_358_720;
-    let per_layer_hot_total = snapshot
-        .per_layer
-        .iter()
-        .try_fold(0u64, |sum, layer| {
-            sum.checked_add(layer.anonymous_slot_capacity)
-        });
+    let per_layer_hot_total = snapshot.per_layer.iter().try_fold(0u64, |sum, layer| {
+        sum.checked_add(layer.anonymous_slot_capacity)
+    });
     if snapshot.per_layer.len() != LAYERS as usize
         || per_layer_hot_total != Some(HOT_SLOT_TOTAL)
         || snapshot.last_chained_unique_per_layer.len() != LAYERS as usize
@@ -3913,13 +3900,9 @@ fn validate_exact_target_hybrid_experts(
                 || !(8..=64).contains(&layer.anonymous_slot_capacity)
                 || layer.physical_base_slot_budget != layer.anonymous_slot_capacity
                 || layer.anonymous_slot_capacity_bytes
-                    != layer
-                        .anonymous_slot_capacity
-                        .saturating_mul(STRIDE_BYTES)
+                    != layer.anonymous_slot_capacity.saturating_mul(STRIDE_BYTES)
                 || layer.physical_base_slot_budget_bytes
-                    != layer
-                        .physical_base_slot_budget
-                        .saturating_mul(STRIDE_BYTES)
+                    != layer.physical_base_slot_budget.saturating_mul(STRIDE_BYTES)
                 || layer.file_mapped_addressable_slots != CANONICAL_SLOTS_PER_LAYER
                 || layer.file_mapped_address_span_bytes
                     != CANONICAL_SLOTS_PER_LAYER.saturating_mul(STRIDE_BYTES)
@@ -3943,9 +3926,7 @@ fn validate_exact_target_hybrid_experts(
         || snapshot.file_mapped_addressable_slots
             != LAYERS.saturating_mul(CANONICAL_SLOTS_PER_LAYER)
         || snapshot.base_slot_capacity_bytes
-            != snapshot
-                .base_slot_capacity
-                .saturating_mul(STRIDE_BYTES)
+            != snapshot.base_slot_capacity.saturating_mul(STRIDE_BYTES)
         || snapshot.physical_base_slot_budget_bytes
             != snapshot
                 .physical_base_slot_budget
@@ -4085,10 +4066,8 @@ fn validate_routed_expert_transition(
                     || before.physical_base_slot_budget != after.physical_base_slot_budget
                     || before.physical_base_slot_budget_bytes
                         != after.physical_base_slot_budget_bytes
-                    || before.file_mapped_addressable_slots
-                        != after.file_mapped_addressable_slots
-                    || before.file_mapped_address_span_bytes
-                        != after.file_mapped_address_span_bytes
+                    || before.file_mapped_addressable_slots != after.file_mapped_addressable_slots
+                    || before.file_mapped_address_span_bytes != after.file_mapped_address_span_bytes
                     || after.occupied_base_slots < before.occupied_base_slots
                     || !routed_slot_stats_are_monotonic(&before.slot_stats, &after.slot_stats)
             })
@@ -4585,7 +4564,11 @@ impl ExperimentReport {
         // that loads the assistant had ever completed before 2026-08-21.
         let page_size = {
             let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if raw > 0 { raw as u64 } else { 16_384 }
+            if raw > 0 {
+                raw as u64
+            } else {
+                16_384
+            }
         };
         let mapped_upper_bound = self
             .assistant_memory
@@ -7450,9 +7433,7 @@ mod pure_tests {
             swapped_tier_labels.last_chained_mapped_bound_per_layer[0] += 1;
             swapped_tier_labels.last_chained_hot_bound_records -= 1;
             swapped_tier_labels.last_chained_mapped_bound_records += 1;
-            assert!(
-                validate_routed_expert_snapshot("hybrid spill", &swapped_tier_labels).is_err()
-            );
+            assert!(validate_routed_expert_snapshot("hybrid spill", &swapped_tier_labels).is_err());
 
             let mut false_overflow = receipt;
             false_overflow.last_chained_slot_capacity_overflow = 1;
@@ -7485,9 +7466,7 @@ mod pure_tests {
         let mut tier_without_round = clean.clone();
         tier_without_round.last_chained_hot_bound_per_layer[0] = 1;
         tier_without_round.last_chained_hot_bound_records = 1;
-        assert!(
-            validate_routed_expert_snapshot("hybrid clean", &tier_without_round).is_err()
-        );
+        assert!(validate_routed_expert_snapshot("hybrid clean", &tier_without_round).is_err());
 
         let mut no_round_sequence = clean.clone();
         no_round_sequence.last_chained_round_sequence = 1;
@@ -7806,10 +7785,7 @@ mod pure_tests {
             "1"
         );
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_DRAFT_TOKENS"], "8");
-        assert_eq!(
-            config.environment["CAMELID_GEMMA4_GHOST_READ_THREADS"],
-            "8"
-        );
+        assert_eq!(config.environment["CAMELID_GEMMA4_GHOST_READ_THREADS"], "8");
 
         for invalid in ["032", "48"] {
             let mut drifted = config.clone();

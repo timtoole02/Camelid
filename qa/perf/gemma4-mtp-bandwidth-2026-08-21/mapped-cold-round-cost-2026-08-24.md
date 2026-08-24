@@ -150,11 +150,14 @@ Three paired runs of the 48-token fixture, all six token-identical:
 | serial fill | 21.40 | 10.69 s | 21.09-22.26 |
 | pooled fill | 22.30 | 9.74 s | 22.28-22.43 |
 
-The end-to-end gain leads the decode gain because prefill routes far wider
-unions (~85 records on a layer) and so reaches a useful depth; decode's 2.6 is
-still well below the knee. Note `disk_time` is a sum over threads and therefore
-inflates once this is on — read `slot_filler` (the fill's wall time) instead,
-which fell ~20%.
+The end-to-end gain leads the decode gain because prefill repeats the fill over
+13 K8 prompt chunks. The executed per-chunk unions are bounded at 64 and the
+measured maximum is 52; the old ~85 figure came from the post-prefill handoff's
+union accumulated across all chunks, which binds no command and measured about
+0.1 ms. H2 prefill still performs 2,294 reads / 7.32 GiB, so pooled reads have
+many more opportunities to help than decode's ~2.6 misses per layer. Note
+`disk_time` is a sum over threads and therefore inflates once this is on — read
+`slot_filler` (the fill's wall time) instead, which fell ~20%.
 
 ## What is left
 

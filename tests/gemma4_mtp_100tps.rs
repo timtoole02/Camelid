@@ -7,7 +7,9 @@ fn test_gemma4_mtp_100_tokens_per_second_with_bit_exact_parity() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf").exists() {
+            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
+                .exists()
+            {
                 PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
             } else {
                 PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf")
@@ -16,15 +18,23 @@ fn test_gemma4_mtp_100_tokens_per_second_with_bit_exact_parity() {
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost").exists() {
-                PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
+            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
+                .exists()
+            {
+                PathBuf::from(
+                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
+                )
             } else {
                 PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
             }
         });
     let assistant_path = std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors"));
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors",
+            )
+        });
 
     std::env::set_var("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL", "1");
@@ -49,8 +59,8 @@ fn test_gemma4_mtp_100_tokens_per_second_with_bit_exact_parity() {
         .expect("load target ghost moe");
 
     println!("\n[2/3] Loading MTP QAT assistant model...");
-    let mut assistant = Gemma4MtpAssistantMetal::load(&assistant_path)
-        .expect("load MTP QAT assistant");
+    let mut assistant =
+        Gemma4MtpAssistantMetal::load(&assistant_path).expect("load MTP QAT assistant");
 
     let prompt = "<|turn>user\nHere is a Rust struct definition:\n\n```rust\npub struct CacheEntry<K, V> {\n    pub key: K,\n    pub value: V,\n    pub access_count: u64,\n    pub last_accessed: std::time::Instant,\n}\n```\n\nRewrite this exact `CacheEntry` struct with an added `expires_at: Option<std::time::Instant>` field.<turn|>\n<|turn>model\n";
     let max_new = 48usize;

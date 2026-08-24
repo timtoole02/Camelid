@@ -8,7 +8,9 @@ fn test_gemma4_26b_speculative_advancing() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf").exists() {
+            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
+                .exists()
+            {
                 PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
             } else {
                 PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf")
@@ -17,8 +19,12 @@ fn test_gemma4_26b_speculative_advancing() {
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost").exists() {
-                PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
+            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
+                .exists()
+            {
+                PathBuf::from(
+                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
+                )
             } else {
                 PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
             }

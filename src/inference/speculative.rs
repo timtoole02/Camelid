@@ -287,7 +287,6 @@ impl NGramDrafter {
         }
     }
 
-
     /// Draft plus the length of the n-gram match it came from. The match
     /// length is the only confidence signal a prompt-lookup drafter has: a
     /// 1-token match proposes from a context that recurs constantly and means
@@ -318,13 +317,12 @@ impl NGramDrafter {
         }
         let mut index = self.index.borrow_mut();
         index.sync(history);
-        let (drafts, matched) = if std::env::var("CAMELID_GEMMA4_SPEC_MULTIHOP")
-            .is_ok_and(|v| v == "1")
-        {
-            index.draft_multihop_sized(max_tokens)
-        } else {
-            index.draft_sized(max_tokens)
-        };
+        let (drafts, matched) =
+            if std::env::var("CAMELID_GEMMA4_SPEC_MULTIHOP").is_ok_and(|v| v == "1") {
+                index.draft_multihop_sized(max_tokens)
+            } else {
+                index.draft_sized(max_tokens)
+            };
         let miss = if !drafts.is_empty() {
             None
         } else if index.has_suffix_match() {
@@ -458,7 +456,10 @@ impl BoundedNGramIndex {
         let max_n = self.max_ngram.min(len.saturating_sub(1));
         for n in (self.min_ngram..=max_n).rev() {
             let pattern = &self.history[len - n..];
-            let key = NGramKey { len: n, hash: hash_ngram(pattern) };
+            let key = NGramKey {
+                len: n,
+                hash: hash_ngram(pattern),
+            };
             if let Some(starts) = self.occurrences.get(&key) {
                 for &start in starts.iter().rev() {
                     if start < len - n && &self.history[start..start + n] == pattern {

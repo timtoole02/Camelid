@@ -1,0 +1,18 @@
+<|turn>user
+Add a `pub expires_at: u64,` field at the end of this struct and output the COMPLETE struct definition again, unchanged otherwise, with no explanation:
+
+pub struct CacheEntry<K, V> {
+    pub key: K,
+    pub value: V,
+    pub access_count: u64,
+    pub created_at: u64,
+    pub last_hit: u64,
+}<turn|>
+<|turn>model
+<|channel>thought
+<channel|>```rust
+pub struct CacheEntry<K, V> {
+    pub key: K,
+    pub value: V,
+    pub access_count: u64,
+    pub created_at

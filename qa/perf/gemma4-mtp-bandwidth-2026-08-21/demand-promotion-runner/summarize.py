@@ -1,15 +1,57 @@
 #!/usr/bin/env python3
 """Summarize one bench run dir: tok/s, alpha, round split, correctness vs fixture."""
-import json, re, sys, os
+import base64, binascii, json, re, sys, os
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 EXPECTED = json.load(
     open(os.path.join(_HERE, os.pardir, 'hybrid-hot48-runner', 'expected-48-token-ids.json'))
 )
+ENV_KEY_RE = r'[A-Za-z_][A-Za-z0-9_]*'
+
+
+def read_env_manifest(path):
+    """Read legacy KEY=VALUE receipts and strict base64-v1 manifests."""
+    lines = open(path, errors='strict').read().splitlines()
+    meaningful = [line for line in lines if line]
+    strict = bool(meaningful and meaningful[0] == 'manifest_format=base64-v1')
+    values = {}
+    for line in meaningful:
+        if line == 'manifest_format=base64-v1':
+            key, value = 'manifest_format', 'base64-v1'
+        else:
+            encoded = re.fullmatch(rf'({ENV_KEY_RE})@BASE64=([A-Za-z0-9+/]*={{0,2}})', line)
+            if encoded:
+                key = encoded.group(1)
+                try:
+                    value = base64.b64decode(encoded.group(2), validate=True).decode('utf-8')
+                except (binascii.Error, UnicodeDecodeError) as error:
+                    raise ValueError(f'invalid base64 manifest value for {key}') from error
+            else:
+                plain = re.fullmatch(rf'({ENV_KEY_RE})=(.*)', line)
+                if strict or plain is None:
+                    if strict:
+                        raise ValueError(f'malformed base64-v1 manifest line: {line!r}')
+                    # Historical KEY@FILE receipts expanded multiline values
+                    # directly. Ignore their continuation lines while retaining
+                    # exact-key parsing for the ordinary environment entries.
+                    continue
+                key, value = plain.groups()
+        if key in values:
+            raise ValueError(f'duplicate environment manifest field {key}')
+        values[key] = value
+    return values
 
 def summarize(d):
     log = open(os.path.join(d, 'server.log'), errors='replace').read()
     out = {'run': os.path.basename(d)}
+    try:
+        env = read_env_manifest(os.path.join(d, 'env.txt'))
+        if env.get('CAMELID_BENCH_CEILING_ONLY') == 'oracle-seeded-ngram':
+            out['ceiling_only'] = True
+            out['draft_source'] = 'oracle-seeded-ngram'
+            out['throughput_promotion_allowed'] = False
+    except Exception as error:
+        out['env_manifest_error'] = str(error)[:120]
     try:
         out['load_s'] = round(float(open(os.path.join(d,'timings.txt')).read().split('=')[1]), 2)
     except Exception: pass
@@ -20,11 +62,17 @@ def summarize(d):
     rounds = [(float(a), float(b), float(c), int(e), int(f))
               for a,b,c,e,f in re.findall(
                   r'\[mtp round\] #\d+ wall=([\d.]+)ms \(assistant=([\d.]+)ms, verifier=([\d.]+)ms\) accepted=(\d+)/(\d+)', log)]
+    round_kind = 'mtp'
+    if not rounds:
+        rounds = [(float(a), float(b), float(c), int(e), int(f))
+                  for a,b,c,e,f in re.findall(
+                      r'\[spec round\] #\d+ wall=([\d.]+)ms \(draft=([\d.]+)ms, verifier=([\d.]+)ms\) accepted=(\d+)/(\d+)', log)]
+        round_kind = 'spec'
     if rounds:
         n = len(rounds)
-        out['mtp_rounds'] = n
+        out[f'{round_kind}_rounds'] = n
         out['round_wall_ms_median'] = round(sorted(r[0] for r in rounds)[n//2], 1)
-        out['assistant_ms_median'] = round(sorted(r[1] for r in rounds)[n//2], 1)
+        out[f'{"assistant" if round_kind == "mtp" else "draft"}_ms_median'] = round(sorted(r[1] for r in rounds)[n//2], 1)
         out['verifier_ms_median'] = round(sorted(r[2] for r in rounds)[n//2], 1)
         acc = [r[3] for r in rounds]
         out['accepted_mean'] = round(sum(acc)/n, 2)

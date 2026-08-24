@@ -826,6 +826,247 @@ pub(crate) fn gemma4_hybrid_demand_promotion_enabled() -> bool {
     })
 }
 
+/// `CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP=1`: after exact routing,
+/// execute the already-published hot subset while the host fills the disjoint
+/// cold subset into a compact scratch slab. Default off; the caller must also
+/// provide the bounded scratch and exact start-residency snapshot.
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_hot_cold_overlap_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP").is_ok_and(|value| value == "1")
+    })
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_SINGLE_DOWN=1`: keep the exact
+/// hot/cold overlap schedule, but route the full union once, execute GateUp in
+/// two disjoint ranges, and execute one full-union Down plus layer tail after
+/// the staged-cold bytes are ready. Default off while the exact A/B is being
+/// established on Mini2.
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_hot_cold_single_down_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_SINGLE_DOWN")
+            .is_ok_and(|value| value == "1")
+    })
+}
+
+/// The argument-buffer GateUp and Down kernels carry exact accumulator layouts
+/// through the widened speculative ceiling. Keep this separate from the env
+/// switch so width admission is directly testable and cannot silently drift
+/// back to the original K=8 experiment boundary.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_hybrid_hot_cold_single_down_admits_k(k_tokens: usize) -> bool {
+    (1..=GEMMA4_MAX_WIDENED_SPEC_CHUNK).contains(&k_tokens)
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_PREFILL=1`: extend the parent
+/// hot/cold overlap experiment to exact K=8 prompt chunks. Prefill never
+/// publishes staged records into persistent hot storage; the established
+/// prefill-to-decode handoff remains the only prompt-side publication point.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_hybrid_hot_cold_prefill_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_hybrid_hot_cold_prefill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gemma4_hybrid_hot_cold_prefill_from(
+            std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_PREFILL")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Decode remains admitted by the parent overlap flag. Prompt overlap is a
+/// narrower, separately receipted experiment so K=1 decode and K=16 ceiling
+/// profiles cannot silently inherit a different floating-point association.
+#[cfg(any(target_os = "macos", test))]
+const fn gemma4_hybrid_hot_cold_round_kind_admitted(
+    is_decode_round: bool,
+    k_tokens: usize,
+    prefill_enabled: bool,
+) -> bool {
+    is_decode_round || (prefill_enabled && k_tokens == 8)
+}
+
+/// Prompt overlap consumes staged bytes only. Persistent publication is a
+/// decode policy; prompt residency remains owned by the explicit handoff.
+#[cfg(any(target_os = "macos", test))]
+const fn gemma4_hybrid_hot_cold_publication_allowed(
+    is_decode_round: bool,
+    configured_publish: bool,
+) -> bool {
+    is_decode_round && configured_publish
+}
+
+/// Minimum exact cold subset worth splitting into a second command. Small
+/// subsets can cost more in command setup and accumulation than they hide, so
+/// keep this as an explicit A/B control. Invalid values retain the conservative
+/// default and emit exactly one warning through the process cache.
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_hot_cold_overlap_min_cold() -> usize {
+    static MIN_COLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN_COLD.get_or_init(|| {
+        const ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP_MIN_COLD";
+        match std::env::var(ENV) {
+            Ok(value) => match value.parse::<usize>() {
+                Ok(parsed) if (1..=GEMMA4_OVERFLOW_BANK_SLOTS).contains(&parsed) => parsed,
+                _ => {
+                    eprintln!(
+                        "[metal chained hot-cold] invalid {ENV}={value:?}; expected 1..={GEMMA4_OVERFLOW_BANK_SLOTS}, using 1"
+                    );
+                    1
+                }
+            },
+            Err(std::env::VarError::NotPresent) => 1,
+            Err(error) => {
+                eprintln!(
+                    "[metal chained hot-cold] invalid {ENV}: {error}; expected 1..={GEMMA4_OVERFLOW_BANK_SLOTS}, using 1"
+                );
+                1
+            }
+        }
+    })
+}
+
+/// Default-on publication policy for completed cold stages. The research A/B
+/// uses the one canonical opt-out spelling so an unset or unrelated value
+/// cannot accidentally freeze the persistent hot tier.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_hybrid_hot_cold_overlap_publish_from(value: Option<&str>) -> bool {
+    !matches!(value, Some("0"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_hybrid_hot_cold_overlap_publish_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gemma4_hybrid_hot_cold_overlap_publish_from(
+            std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_MAPPED_WAVE=1`: under the frozen-hot
+/// overlap A/B, bind the exact cold subset directly from the canonical mapped
+/// source instead of copying it through the compact staging slab. This is an
+/// exact-positive opt-in and remains subordinate to overlap plus `PUBLISH=0`.
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_hot_cold_mapped_wave_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_MAPPED_WAVE")
+            .is_ok_and(|value| value == "1")
+    })
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_CPU_COLD_PROBE=1`: calibration-only H11-shaped
+/// observation. After the exact cold records have been staged, run their real
+/// Q4_0 gate/up -> GeGLU -> Q8_0 -> down projections on the CPU while the
+/// already-committed Metal work continues. The CPU result is reduced to a
+/// checksum and discarded; it never participates in the model output or in a
+/// residency decision.
+///
+/// Stage 1 deliberately starts only after the pooled record loader returns.
+/// Its receipt therefore reports `read_overlap=0`; submitting one CPU job as
+/// each positioned read completes remains a separate, more invasive step.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_hybrid_cpu_cold_probe_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_cpu_cold_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gemma4_hybrid_cpu_cold_probe_from(
+            std::env::var("CAMELID_GEMMA4_GHOST_METAL_CPU_COLD_PROBE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Keep the calibration structurally comparable to the measured H11 verifier:
+/// exact K=8 decode, frozen persistent hot policy, staged (not direct-mapped)
+/// cold wave, and the one-cold split threshold. A requested probe outside that
+/// shape does no CPU work and cannot silently turn a prompt, K=1 bootstrap, or
+/// H15 run into a new profile.
+#[cfg(any(target_os = "macos", test))]
+const fn gemma4_hybrid_cpu_cold_probe_round_admitted(
+    requested: bool,
+    hot_cold_overlap_round: bool,
+    is_decode_round: bool,
+    k_tokens: usize,
+    hot_cold_overlap_publish: bool,
+    hot_cold_mapped_wave: bool,
+    min_cold: usize,
+) -> bool {
+    requested
+        && hot_cold_overlap_round
+        && is_decode_round
+        && k_tokens == 8
+        && !hot_cold_overlap_publish
+        && !hot_cold_mapped_wave
+        && min_cold == 1
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_COLD_RECURRENCE_PROBE=1`: observation-only
+/// recurrence probe for the frozen-hot (`PUBLISH=0`) decode experiment. It
+/// compares the previous successful round's exact cold set with the current
+/// exact cold set; it never changes a slot table, binding, fill request, or
+/// publication decision.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_hybrid_cold_recurrence_probe_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+const fn gemma4_hybrid_cold_recurrence_round_admitted(
+    hot_cold_overlap_round: bool,
+    is_decode_round: bool,
+    hot_cold_overlap_publish: bool,
+    min_cold: usize,
+    probe_enabled: bool,
+) -> bool {
+    hot_cold_overlap_round
+        && is_decode_round
+        && !hot_cold_overlap_publish
+        && min_cold == 1
+        && probe_enabled
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_cold_recurrence_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gemma4_hybrid_cold_recurrence_probe_from(
+            std::env::var("CAMELID_GEMMA4_GHOST_METAL_COLD_RECURRENCE_PROBE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_COLD_RECURRENCE_PER_LAYER=1`: append the compact
+/// per-layer receipt. Thirty layer triples are useful for diagnosis but noisy
+/// for normal A/B logs, so this is independent of the parent probe switch.
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_cold_recurrence_per_layer_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_COLD_RECURRENCE_PER_LAYER")
+            .is_ok_and(|value| value == "1")
+    })
+}
+
 /// Pure parse for [`overlap_enabled`]: on unless explicitly "0"/"false".
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn overlap_flag_from(value: Option<&str>) -> bool {
@@ -13505,12 +13746,14 @@ pub(crate) struct Gemma4Q4HybridExpertSource {
     /// a direct physical-prefix request from a canonical mixed-table request
     /// containing the same values, while normalization preserves safe reuse
     /// between equivalent canonical unions.
-    cached_table: std::sync::RwLock<Option<(
-        Vec<Option<usize>>,
-        bool,
-        Vec<usize>,
-        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
-    )>>,
+    cached_table: std::sync::RwLock<
+        Option<(
+            Vec<Option<usize>>,
+            bool,
+            Vec<usize>,
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        )>,
+    >,
     /// Materialized mixed tables increment this count before snapshotting the
     /// directory. The existing pending/command-buffer guards retain their
     /// lease through terminal GPU status, so refill access can fail closed.
@@ -13706,6 +13949,82 @@ impl Gemma4Q4HybridExpertSource {
         }
         Some((table, lease))
     }
+
+    /// Build one compact hot-first table for the staged hot/cold schedule.
+    /// Hot entries point at the currently published anonymous records; cold
+    /// entries point at fixed-stride byte ranges inside the caller-owned stage
+    /// slab. The shared hybrid lease freezes the hot directory until both GPU
+    /// commands retaining the returned binding have reached terminal status.
+    fn materialize_hot_cold_stage_table(
+        self: &std::sync::Arc<Self>,
+        hot_experts: &[usize],
+        cold_experts: &[usize],
+        stage_slab: &Buffer,
+    ) -> Option<(
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        std::sync::Arc<Gemma4Q4HybridBindingLease>,
+    )> {
+        let unique = hot_experts.len().checked_add(cold_experts.len())?;
+        if hot_experts.is_empty() || cold_experts.is_empty() || unique > 128 {
+            return None;
+        }
+        let mut seen = [false; 128];
+        for &expert in hot_experts.iter().chain(cold_experts) {
+            if expert >= 128 || seen[expert] {
+                return None;
+            }
+            seen[expert] = true;
+        }
+
+        loop {
+            let state = self.lease_state.load(std::sync::atomic::Ordering::Acquire);
+            if state < 0 || state == isize::MAX {
+                return None;
+            }
+            if self
+                .lease_state
+                .compare_exchange_weak(
+                    state,
+                    state + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let lease = std::sync::Arc::new(Gemma4Q4HybridBindingLease {
+            source: std::sync::Arc::clone(self),
+        });
+        let published = self.hot_slot_ids.read().ok()?;
+        let mut records = Vec::with_capacity(unique);
+        let mut offsets = Vec::with_capacity(unique);
+        for &expert in hot_experts {
+            let physical_slot = published
+                .iter()
+                .position(|published_expert| *published_expert == Some(expert))?;
+            records.push(self.hot_records.get(physical_slot)?.clone());
+            offsets.push(0usize);
+        }
+        for cold_slot in 0..cold_experts.len() {
+            records.push(stage_slab.clone());
+            offsets.push(cold_slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
+        }
+        drop(published);
+        let record_slots: Vec<usize> = (0..unique).collect();
+        let kernel = metal_linear_kernel()?;
+        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+            &kernel.device,
+            unique,
+            &record_slots,
+            &records,
+            &offsets,
+            0,
+            None,
+        )?;
+        Some((table, lease))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -13885,9 +14204,11 @@ impl Gemma4Q4ExpertSlotBinding {
 
     fn is_hot_ready(&self) -> bool {
         match self {
-            Self::HybridMappedSource(source) => {
-                source.hot_slot_ids.read().ok().is_some_and(|ids| ids.iter().any(|id| id.is_some()))
-            }
+            Self::HybridMappedSource(source) => source
+                .hot_slot_ids
+                .read()
+                .ok()
+                .is_some_and(|ids| ids.iter().any(|id| id.is_some())),
             Self::HybridMappedTable { .. } => true,
             _ => false,
         }
@@ -13938,10 +14259,7 @@ impl Gemma4Q4ExpertSlotBinding {
                 .materialize_for_active_slots(active_slots)
                 .map(|table| Self::RecordGranular(std::sync::Arc::new(table))),
             Self::HybridMappedSource(source) => source
-                .materialize_for_active_slots(
-                    active_slots,
-                    Gemma4Q4HybridBindingMode::Canonical,
-                )
+                .materialize_for_active_slots(active_slots, Gemma4Q4HybridBindingMode::Canonical)
                 .map(|(table, lease)| Self::HybridMappedTable {
                     table: std::sync::Arc::new(table),
                     _lease: lease,
@@ -13959,10 +14277,24 @@ impl Gemma4Q4ExpertSlotBinding {
     fn materialize_for_physical_slots(&self, active_slots: &[usize]) -> Option<Self> {
         match self {
             Self::HybridMappedSource(source) => source
-                .materialize_for_active_slots(
-                    active_slots,
-                    Gemma4Q4HybridBindingMode::Physical,
-                )
+                .materialize_for_active_slots(active_slots, Gemma4Q4HybridBindingMode::Physical)
+                .map(|(table, lease)| Self::HybridMappedTable {
+                    table: std::sync::Arc::new(table),
+                    _lease: lease,
+                }),
+            _ => None,
+        }
+    }
+
+    fn materialize_hot_cold_stage_table(
+        &self,
+        hot_experts: &[usize],
+        cold_experts: &[usize],
+        stage_slab: &Buffer,
+    ) -> Option<Self> {
+        match self {
+            Self::HybridMappedSource(source) => source
+                .materialize_hot_cold_stage_table(hot_experts, cold_experts, stage_slab)
                 .map(|(table, lease)| Self::HybridMappedTable {
                     table: std::sync::Arc::new(table),
                     _lease: lease,
@@ -13976,6 +14308,10 @@ impl Gemma4Q4ExpertSlotBinding {
             self,
             Self::FileMappedSource(_) | Self::HybridMappedSource(_)
         )
+    }
+
+    fn is_hybrid_mapped_source(&self) -> bool {
+        matches!(self, Self::HybridMappedSource(_))
     }
 }
 
@@ -23825,6 +24161,9 @@ pub(crate) struct Gemma4GhostCommonMetal {
     strict_26b: bool,
     q4_simd_fast: bool,
     cached_rope: Option<(usize, usize)>,
+    /// Diagnostic-only previous successful decode cold sets. These masks are
+    /// never consulted by routing, fill, binding, or publication policy.
+    cold_recurrence_previous: Option<Vec<[bool; 128]>>,
     pub(crate) last_chained_ledger: ChainedRoundHostLedger,
 }
 
@@ -23892,6 +24231,40 @@ pub struct ChainedRoundHostLedger {
     pub mapped_bound_records: u32,
     pub hot_bound_per_layer: [u16; 30],
     pub mapped_bound_per_layer: [u16; 30],
+    /// Observation-only previous-cold recurrence receipt. Hits are
+    /// `previous_cold ∩ current_cold`; current is the recall denominator and
+    /// previous is the precision denominator. The arrays preserve the same
+    /// directional counts per layer when the probe is enabled.
+    pub cold_recurrence_previous_ready: bool,
+    pub cold_recurrence_hits: u32,
+    pub cold_recurrence_current: u32,
+    pub cold_recurrence_previous: u32,
+    pub cold_recurrence_hits_per_layer: [u16; 30],
+    pub cold_recurrence_current_per_layer: [u16; 30],
+    pub cold_recurrence_previous_per_layer: [u16; 30],
+    /// Calibration-only duplicate CPU work over exact staged cold records.
+    /// `prepare_ms` snapshots the router-produced Q8 inputs and exact route
+    /// scales; `compute_ms` is the full CPU Q4_0 expert path. Neither duration
+    /// exists unless the default-off H11-shaped/K8 probe is admitted.
+    /// `compute_ms` overlaps the hot window only; the unchanged cold command is
+    /// committed afterward. Its GPU window includes merge+tail, while the CPU
+    /// path includes fresh allocation/scheduling and hot-GPU contention, so q*
+    /// is only a stage-1 estimate with opposing biases.
+    pub cpu_cold_probe_attempted_layers: u32,
+    pub cpu_cold_probe_successful_layers: u32,
+    pub cpu_cold_probe_failures: u32,
+    pub cpu_cold_probe_unique_experts: u32,
+    pub cpu_cold_probe_routes: u32,
+    pub cpu_cold_probe_prepare_ms: f64,
+    pub cpu_cold_probe_compute_ms: f64,
+    pub cpu_cold_probe_hot_gpu_ms: f64,
+    pub cpu_cold_probe_cold_gpu_ms: f64,
+    pub cpu_cold_probe_gpu_samples: u32,
+    pub cpu_cold_probe_hot_inflight_before: u32,
+    pub cpu_cold_probe_cold_inflight_before: u32,
+    pub cpu_cold_probe_hot_completed_after: u32,
+    pub cpu_cold_probe_cold_completed_after: u32,
+    pub cpu_cold_probe_checksum_xor: u32,
     /// Current-routing selected-cold file ranges accepted by the asynchronous
     /// pager-advice queue. Bytes are exact expert payload ranges, never layer
     /// slabs. Enqueue time is nested inside `slot_filler_ms`; advisory
@@ -23960,6 +24333,8 @@ impl ChainedRoundHostLedger {
             + self.setup_ms
             + self.wave_load_ms
             + self.wave_gpu_ms
+            + self.cpu_cold_probe_prepare_ms
+            + self.cpu_cold_probe_compute_ms
     }
 }
 
@@ -23972,6 +24347,1076 @@ fn same_expert_set(a: &[usize], b: &[usize]) -> bool {
     left.sort_unstable();
     right.sort_unstable();
     left == right
+}
+
+/// Host callback phase for exact record publication. `Demand` preserves the
+/// established route/fill behavior. The two cold-stage phases are reachable
+/// only under the explicit hot/cold overlap admission.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gemma4Q4SlotFillPhase {
+    Demand,
+    /// Observe exact route truth and publish the canonical identity table, but
+    /// defer cold bytes to the guarded split-wave schedule.
+    RouteOnly,
+    StageCold,
+    PublishCold,
+}
+
+/// Partition one exact canonical route union without reordering either side.
+/// Invalid IDs or duplicates refuse the experiment so the established exact
+/// path remains the only reachable command schedule.
+#[cfg(any(target_os = "macos", test))]
+fn partition_exact_union_by_hot(
+    union: &[usize],
+    hot: &[bool; 128],
+    cold_capacity: usize,
+    min_cold: usize,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    if union.is_empty() || cold_capacity == 0 || min_cold == 0 || min_cold > cold_capacity {
+        return None;
+    }
+    let mut seen = [false; 128];
+    let mut hot_union = Vec::with_capacity(union.len());
+    let mut cold_union = Vec::with_capacity(union.len());
+    for &expert in union {
+        if expert >= 128 || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        if hot[expert] {
+            hot_union.push(expert);
+        } else {
+            cold_union.push(expert);
+        }
+    }
+    if hot_union.is_empty() || cold_union.len() < min_cold || cold_union.len() > cold_capacity {
+        return None;
+    }
+    Some((hot_union, cold_union))
+}
+
+/// Directional set-overlap receipt. `current` is the denominator for recall;
+/// `previous` is the denominator for precision. Keeping both denominators is
+/// important because cold-set width can change independently of recurrence.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ColdRecurrenceTally {
+    hits: u32,
+    current: u32,
+    previous: u32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ColdRecurrenceTally {
+    fn saturating_add_assign(&mut self, other: Self) {
+        self.hits = self.hits.saturating_add(other.hits);
+        self.current = self.current.saturating_add(other.current);
+        self.previous = self.previous.saturating_add(other.previous);
+    }
+}
+
+/// Classify the exact routed union against the immutable start-of-round hot
+/// snapshot. Invalid or repeated canonical IDs invalidate only the diagnostic
+/// sample; callers must not use this helper as an execution admission gate.
+#[cfg(any(target_os = "macos", test))]
+fn exact_cold_mask_from_union(union: &[usize], hot_at_start: &[bool; 128]) -> Option<[bool; 128]> {
+    let mut seen = [false; 128];
+    let mut cold = [false; 128];
+    for &expert in union {
+        if expert >= seen.len() || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        cold[expert] = !hot_at_start[expert];
+    }
+    Some(cold)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn cold_recurrence_tally(previous: &[bool; 128], current: &[bool; 128]) -> ColdRecurrenceTally {
+    let mut tally = ColdRecurrenceTally::default();
+    for expert in 0..128 {
+        tally.current = tally.current.saturating_add(current[expert] as u32);
+        tally.previous = tally.previous.saturating_add(previous[expert] as u32);
+        tally.hits = tally
+            .hits
+            .saturating_add((previous[expert] && current[expert]) as u32);
+    }
+    tally
+}
+
+/// Produce exact per-layer and round totals. Shape mismatch is a diagnostic
+/// refusal only and cannot influence the model path.
+#[cfg(any(target_os = "macos", test))]
+fn cold_recurrence_tallies(
+    previous: &[[bool; 128]],
+    current: &[[bool; 128]],
+) -> Option<(Vec<ColdRecurrenceTally>, ColdRecurrenceTally)> {
+    if previous.len() != current.len() {
+        return None;
+    }
+    let per_layer: Vec<_> = previous
+        .iter()
+        .zip(current)
+        .map(|(previous, current)| cold_recurrence_tally(previous, current))
+        .collect();
+    let mut round = ColdRecurrenceTally::default();
+    for tally in &per_layer {
+        round.saturating_add_assign(*tally);
+    }
+    Some((per_layer, round))
+}
+
+/// Build disjoint tables for the two in-flight commands. Hot canonical IDs
+/// remain identity-mapped in the mixed argument table; staged cold IDs are
+/// compact indices in a distinct table/buffer.
+#[cfg(any(target_os = "macos", test))]
+fn hot_cold_split_slot_tables(hot: &[usize], cold: &[usize]) -> Option<([u32; 128], [u32; 128])> {
+    if hot.is_empty() || cold.is_empty() || cold.len() > 128 {
+        return None;
+    }
+    let mut seen = [false; 128];
+    let mut hot_table = [u32::MAX; 128];
+    let mut cold_table = [u32::MAX; 128];
+    for &expert in hot {
+        if expert >= 128 || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        hot_table[expert] = expert as u32;
+    }
+    for (slot, &expert) in cold.iter().enumerate() {
+        if expert >= 128 || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        cold_table[expert] = slot as u32;
+    }
+    Some((hot_table, cold_table))
+}
+
+/// Build one compact canonical -> work-slot table for a disjoint hot/cold
+/// partition. Hot slots form `[0, hot.len())` and cold slots immediately
+/// follow them. The GPU router therefore emits one stable work list whose two
+/// ranges can be consumed by separate GateUp command buffers before a single
+/// full-union Down reduction.
+#[cfg(any(target_os = "macos", test))]
+fn hot_cold_compact_slot_table(hot: &[usize], cold: &[usize]) -> Option<[u32; 128]> {
+    let unique = hot.len().checked_add(cold.len())?;
+    if hot.is_empty() || cold.is_empty() || unique > 128 {
+        return None;
+    }
+    let mut seen = [false; 128];
+    let mut table = [u32::MAX; 128];
+    for (slot, expert) in hot.iter().chain(cold).copied().enumerate() {
+        if expert >= 128 || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        table[expert] = slot as u32;
+    }
+    Some(table)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CpuColdProbeRoute {
+    token: usize,
+    scale: f32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq)]
+struct CpuColdProbeExpertPlan {
+    expert: usize,
+    stage_slot: usize,
+    routes: Vec<CpuColdProbeRoute>,
+}
+
+/// Reproduce the router's strict selection-sort tie behavior and selected-mass
+/// normalization, then retain only routes owned by the exact staged-cold set.
+/// Plans stay in stage-slot order, while each expert's routes stay in token
+/// order. This is diagnostic input only; execution still uses the GPU router's
+/// canonical tables and output.
+#[cfg(any(target_os = "macos", test))]
+fn cpu_cold_probe_exact_plan(
+    logits: &[f32],
+    k_tokens: usize,
+    down_exps_scale: &[f32],
+    cold_experts: &[usize],
+) -> Option<Vec<CpuColdProbeExpertPlan>> {
+    if k_tokens == 0
+        || logits.len() != k_tokens.checked_mul(128)?
+        || down_exps_scale.len() < 128
+        || cold_experts.is_empty()
+    {
+        return None;
+    }
+    let mut plan_index = [usize::MAX; 128];
+    let mut plans = Vec::with_capacity(cold_experts.len());
+    for (stage_slot, &expert) in cold_experts.iter().enumerate() {
+        if expert >= 128 || plan_index[expert] != usize::MAX || !down_exps_scale[expert].is_finite()
+        {
+            return None;
+        }
+        plan_index[expert] = plans.len();
+        plans.push(CpuColdProbeExpertPlan {
+            expert,
+            stage_slot,
+            routes: Vec::new(),
+        });
+    }
+
+    for token in 0..k_tokens {
+        let row = &logits[token * 128..(token + 1) * 128];
+        if row.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let mut maxl = -1.0e30f32;
+        for &value in row {
+            if value > maxl {
+                maxl = value;
+            }
+        }
+        let mut probs = [0.0f32; 128];
+        let mut sum = 0.0f32;
+        for expert in 0..128 {
+            probs[expert] = (row[expert] - maxl).exp();
+            sum += probs[expert];
+        }
+        if !sum.is_finite() || sum <= 0.0 {
+            return None;
+        }
+        let inv_sum = 1.0f32 / sum;
+        for probability in &mut probs {
+            *probability *= inv_sum;
+        }
+        let mut ranked: [usize; 128] = std::array::from_fn(|expert| expert);
+        for rank in 0..8 {
+            let mut max_j = rank;
+            let mut max_probability = probs[ranked[rank]];
+            for candidate in (rank + 1)..128 {
+                let probability = probs[ranked[candidate]];
+                if probability > max_probability {
+                    max_probability = probability;
+                    max_j = candidate;
+                }
+            }
+            ranked.swap(rank, max_j);
+        }
+        let mut selected_sum = 0.0f32;
+        for &expert in &ranked[..8] {
+            selected_sum += probs[expert];
+        }
+        selected_sum = selected_sum.max(6.103_515e-5f32);
+        let inv_selected_sum = 1.0f32 / selected_sum;
+        for &expert in &ranked[..8] {
+            let index = plan_index[expert];
+            if index != usize::MAX {
+                plans[index].routes.push(CpuColdProbeRoute {
+                    token,
+                    scale: probs[expert] * inv_selected_sum * down_exps_scale[expert],
+                });
+            }
+        }
+    }
+
+    plans
+        .iter()
+        .all(|plan| !plan.routes.is_empty())
+        .then_some(plans)
+}
+
+/// Snapshot the router command's already-quantized token-major Q8_0 inputs.
+/// Reconstructing blocks from their split scale/quant buffers avoids both a
+/// second quantization and any read race with the next layer overwriting the
+/// reusable Metal scratch.
+#[cfg(any(target_os = "macos", test))]
+fn cpu_cold_probe_q8_snapshot(
+    scales: &[f32],
+    quants: &[i8],
+    k_tokens: usize,
+    hidden: usize,
+) -> Option<Vec<Vec<crate::tensor::Q8_0Block>>> {
+    if k_tokens == 0 || hidden == 0 || !hidden.is_multiple_of(32) {
+        return None;
+    }
+    let blocks = hidden / 32;
+    if scales.len() != k_tokens.checked_mul(blocks)?
+        || quants.len() != k_tokens.checked_mul(hidden)?
+        || scales.iter().any(|scale| !scale.is_finite())
+    {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(k_tokens);
+    for token in 0..k_tokens {
+        let mut row = Vec::with_capacity(blocks);
+        for block in 0..blocks {
+            let mut block_quants = [0i8; 32];
+            let quant_start = token * hidden + block * 32;
+            block_quants.copy_from_slice(&quants[quant_start..quant_start + 32]);
+            row.push(crate::tensor::Q8_0Block {
+                scale: scales[token * blocks + block],
+                quants: block_quants,
+            });
+        }
+        rows.push(row);
+    }
+    Some(rows)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn cpu_cold_probe_record_layout(
+    hidden: usize,
+    expert_ff: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if hidden == 0 || expert_ff == 0 || !hidden.is_multiple_of(32) || !expert_ff.is_multiple_of(32)
+    {
+        return None;
+    }
+    let gate_up_row_bytes =
+        (hidden / 32).checked_mul(crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK)?;
+    let gate_up_bytes = expert_ff.checked_mul(2)?.checked_mul(gate_up_row_bytes)?;
+    let down_row_bytes =
+        (expert_ff / 32).checked_mul(crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK)?;
+    let record_bytes = gate_up_bytes.checked_add(hidden.checked_mul(down_row_bytes)?)?;
+    Some((
+        gate_up_row_bytes,
+        gate_up_bytes,
+        down_row_bytes,
+        record_bytes,
+    ))
+}
+
+/// Full CPU Q4_0 work for one staged expert, grouped across every exact token
+/// route that selected it. Rows are parallelized in the same fixed 64-row
+/// chunks as the established wire runtime. The returned checksum exercises the
+/// exact route scaling but is observation-only and is never merged into model
+/// state.
+#[cfg(any(target_os = "macos", test))]
+fn cpu_cold_probe_expert_checksum(
+    record: &[u8],
+    inputs: &[Vec<crate::tensor::Q8_0Block>],
+    routes: &[CpuColdProbeRoute],
+    hidden: usize,
+    expert_ff: usize,
+) -> Option<f32> {
+    use rayon::prelude::*;
+
+    const ROW_CHUNK: usize = 64;
+    let (gate_up_row_bytes, gate_up_bytes, down_row_bytes, record_bytes) =
+        cpu_cold_probe_record_layout(hidden, expert_ff)?;
+    if record.len() != record_bytes || routes.is_empty() {
+        return None;
+    }
+    let input_blocks = hidden / 32;
+    if inputs.is_empty()
+        || inputs.iter().any(|input| input.len() != input_blocks)
+        || routes
+            .iter()
+            .any(|route| route.token >= inputs.len() || !route.scale.is_finite())
+    {
+        return None;
+    }
+
+    let route_count = routes.len();
+    let gate_up_rows = expert_ff.checked_mul(2)?;
+    let mut gate_up = vec![0.0f32; gate_up_rows.checked_mul(route_count)?];
+    gate_up
+        .par_chunks_mut(ROW_CHUNK * route_count)
+        .enumerate()
+        .for_each(|(chunk_idx, output)| {
+            let first_row = chunk_idx * ROW_CHUNK;
+            let rows = output.len() / route_count;
+            for local_row in 0..rows {
+                let row = first_row + local_row;
+                let weight = &record[row * gate_up_row_bytes..(row + 1) * gate_up_row_bytes];
+                for (route_idx, route) in routes.iter().enumerate() {
+                    output[local_row * route_count + route_idx] =
+                        crate::inference::q4_0_wire_row_dot(weight, &inputs[route.token]);
+                }
+            }
+        });
+
+    let activated_q = (0..route_count)
+        .map(|route_idx| {
+            let activated = (0..expert_ff)
+                .map(|row| {
+                    let gate = gate_up[row * route_count + route_idx];
+                    let up = gate_up[(row + expert_ff) * route_count + route_idx];
+                    crate::inference::gemma4::gelu_tanh(gate) * up
+                })
+                .collect::<Vec<_>>();
+            crate::inference::quantize_q8_0_blocks(&activated)
+        })
+        .collect::<Vec<_>>();
+
+    let mut down = vec![0.0f32; hidden.checked_mul(route_count)?];
+    down.par_chunks_mut(ROW_CHUNK * route_count)
+        .enumerate()
+        .for_each(|(chunk_idx, output)| {
+            let first_row = chunk_idx * ROW_CHUNK;
+            let rows = output.len() / route_count;
+            for local_row in 0..rows {
+                let row = first_row + local_row;
+                let start = gate_up_bytes + row * down_row_bytes;
+                let weight = &record[start..start + down_row_bytes];
+                for route_idx in 0..route_count {
+                    output[local_row * route_count + route_idx] =
+                        crate::inference::q4_0_wire_row_dot(weight, &activated_q[route_idx]);
+                }
+            }
+        });
+
+    let mut checksum = 0.0f32;
+    for (route_idx, route) in routes.iter().enumerate() {
+        for row in 0..hidden {
+            let marker = 1.0f32 + ((row + route_idx * 3) % 17) as f32 * (1.0f32 / 32.0f32);
+            checksum += down[row * route_count + route_idx] * route.scale * marker;
+        }
+    }
+    checksum.is_finite().then_some(checksum)
+}
+
+#[cfg(target_os = "macos")]
+struct CpuColdProbeJob {
+    inputs: Vec<Vec<crate::tensor::Q8_0Block>>,
+    plans: Vec<CpuColdProbeExpertPlan>,
+    prepare_us: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default)]
+struct CpuColdProbeWorkReceipt {
+    valid: bool,
+    unique_experts: u32,
+    routes: u32,
+    prepare_us: u64,
+    compute_us: u64,
+    checksum_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_cpu_cold_probe_job(
+    logits: &[f32],
+    k_tokens: usize,
+    down_exps_scale: &Buffer,
+    cold_experts: &[usize],
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+) -> Option<CpuColdProbeJob> {
+    let started = std::time::Instant::now();
+    let blocks = GEMMA4_Q4_EXPERT_INPUT_BLOCKS;
+    if k_tokens != 8
+        || down_exps_scale.length() < (128 * std::mem::size_of::<f32>()) as u64
+        || input_scales.length() < (k_tokens * blocks * std::mem::size_of::<f32>()) as u64
+        || input_quants.length() < (k_tokens * GEMMA4_Q4_EXPERT_HIDDEN) as u64
+    {
+        return None;
+    }
+    // SAFETY: the completed router command owns these StorageModeShared
+    // buffers and the length checks above cover the exact K=8 snapshots.
+    let scales = unsafe {
+        std::slice::from_raw_parts(input_scales.contents().cast::<f32>(), k_tokens * blocks)
+    };
+    let quants = unsafe {
+        std::slice::from_raw_parts(
+            input_quants.contents().cast::<i8>(),
+            k_tokens * GEMMA4_Q4_EXPERT_HIDDEN,
+        )
+    };
+    let down_scales =
+        unsafe { std::slice::from_raw_parts(down_exps_scale.contents().cast::<f32>(), 128) };
+    let inputs = cpu_cold_probe_q8_snapshot(scales, quants, k_tokens, GEMMA4_Q4_EXPERT_HIDDEN)?;
+    let plans = cpu_cold_probe_exact_plan(logits, k_tokens, down_scales, cold_experts)?;
+    Some(CpuColdProbeJob {
+        inputs,
+        plans,
+        prepare_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn run_cpu_cold_probe_job(job: &CpuColdProbeJob, stage: &Buffer) -> CpuColdProbeWorkReceipt {
+    let unique_experts = job.plans.len().min(u32::MAX as usize) as u32;
+    let routes = job
+        .plans
+        .iter()
+        .map(|plan| plan.routes.len() as u64)
+        .sum::<u64>()
+        .min(u64::from(u32::MAX)) as u32;
+    let needed = job.plans.len().checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE);
+    if needed.is_none_or(|needed| stage.length() < needed as u64) {
+        return CpuColdProbeWorkReceipt {
+            unique_experts,
+            routes,
+            prepare_us: job.prepare_us,
+            ..CpuColdProbeWorkReceipt::default()
+        };
+    }
+
+    let started = std::time::Instant::now();
+    let stage_ptr = stage.contents().cast::<u8>();
+    let mut checksum = 0.0f32;
+    for plan in &job.plans {
+        // SAFETY: stage length above covers every compact slot. StageCold has
+        // returned; until this synchronous observation returns the CPU is the
+        // stage's sole reader, while hot Metal reads disjoint hot records.
+        let record = unsafe {
+            std::slice::from_raw_parts(
+                stage_ptr.add(plan.stage_slot * GEMMA4_Q4_EXPERT_SLOT_STRIDE),
+                GEMMA4_Q4_EXPERT_RECORD_BYTES,
+            )
+        };
+        let Some(expert_checksum) = cpu_cold_probe_expert_checksum(
+            record,
+            &job.inputs,
+            &plan.routes,
+            GEMMA4_Q4_EXPERT_HIDDEN,
+            GEMMA4_Q4_EXPERT_FF,
+        ) else {
+            return CpuColdProbeWorkReceipt {
+                unique_experts,
+                routes,
+                prepare_us: job.prepare_us,
+                compute_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                ..CpuColdProbeWorkReceipt::default()
+            };
+        };
+        checksum += expert_checksum * (1.0f32 + (plan.expert % 13) as f32 * (1.0f32 / 64.0f32));
+    }
+    std::hint::black_box(checksum);
+    CpuColdProbeWorkReceipt {
+        valid: checksum.is_finite(),
+        unique_experts,
+        routes,
+        prepare_us: job.prepare_us,
+        compute_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        checksum_bits: checksum.to_bits(),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CpuColdProbeAccounting {
+    attempted_layers: u32,
+    successful_layers: u32,
+    failures: u32,
+    unique_experts: u32,
+    routes: u32,
+    prepare_us: u64,
+    compute_us: u64,
+    hot_gpu_us: u64,
+    cold_gpu_us: u64,
+    gpu_samples: u32,
+    hot_inflight_before: u32,
+    cold_inflight_before: u32,
+    hot_completed_after: u32,
+    cold_completed_after: u32,
+    checksum_xor: u32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl CpuColdProbeAccounting {
+    fn record_sample(
+        &mut self,
+        valid: bool,
+        unique_experts: u32,
+        routes: u32,
+        prepare_us: u64,
+        compute_us: u64,
+        checksum_bits: u32,
+        hot_inflight_before: bool,
+        cold_inflight_before: bool,
+        hot_completed_after: bool,
+        cold_completed_after: bool,
+    ) {
+        self.attempted_layers = self.attempted_layers.saturating_add(1);
+        self.hot_inflight_before = self
+            .hot_inflight_before
+            .saturating_add(u32::from(hot_inflight_before));
+        self.cold_inflight_before = self
+            .cold_inflight_before
+            .saturating_add(u32::from(cold_inflight_before));
+        self.hot_completed_after = self
+            .hot_completed_after
+            .saturating_add(u32::from(hot_completed_after));
+        self.cold_completed_after = self
+            .cold_completed_after
+            .saturating_add(u32::from(cold_completed_after));
+        self.prepare_us = self.prepare_us.saturating_add(prepare_us);
+        self.compute_us = self.compute_us.saturating_add(compute_us);
+        if valid {
+            self.successful_layers = self.successful_layers.saturating_add(1);
+            self.unique_experts = self.unique_experts.saturating_add(unique_experts);
+            self.routes = self.routes.saturating_add(routes);
+            self.checksum_xor ^= checksum_bits;
+        } else {
+            self.failures = self.failures.saturating_add(1);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_work(
+        &mut self,
+        receipt: CpuColdProbeWorkReceipt,
+        hot_inflight_before: bool,
+        cold_inflight_before: bool,
+        hot_completed_after: bool,
+        cold_completed_after: bool,
+    ) {
+        self.record_sample(
+            receipt.valid,
+            receipt.unique_experts,
+            receipt.routes,
+            receipt.prepare_us,
+            receipt.compute_us,
+            receipt.checksum_bits,
+            hot_inflight_before,
+            cold_inflight_before,
+            hot_completed_after,
+            cold_completed_after,
+        );
+    }
+
+    fn record_refusal(&mut self) {
+        self.attempted_layers = self.attempted_layers.saturating_add(1);
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    fn record_gpu(&mut self, hot_gpu_us: u64, cold_gpu_us: u64) {
+        self.hot_gpu_us = self.hot_gpu_us.saturating_add(hot_gpu_us);
+        self.cold_gpu_us = self.cold_gpu_us.saturating_add(cold_gpu_us);
+        self.gpu_samples = self.gpu_samples.saturating_add(1);
+    }
+
+    /// Equal-time split inferred from two full-workload measurements. The cold
+    /// command includes merge+tail, while CPU timing includes fresh allocation,
+    /// Rayon scheduling, and hot-GPU contention. Those biases oppose each
+    /// other, so this is a stage-1 estimate rather than a bound or a
+    /// production-ready q*.
+    fn stage1_cpu_fraction_estimate(&self) -> Option<f64> {
+        let denominator = self.compute_us.saturating_add(self.cold_gpu_us);
+        (self.successful_layers != 0
+            && self.failures == 0
+            && self.gpu_samples == self.successful_layers
+            && denominator != 0)
+            .then_some(self.cold_gpu_us as f64 / denominator as f64)
+    }
+
+    fn stage1_cpu_fraction_e2e_estimate(&self) -> Option<f64> {
+        let cpu_e2e_us = self.prepare_us.saturating_add(self.compute_us);
+        let denominator = cpu_e2e_us.saturating_add(self.cold_gpu_us);
+        (self.successful_layers != 0
+            && self.failures == 0
+            && self.gpu_samples == self.successful_layers
+            && denominator != 0)
+            .then_some(self.cold_gpu_us as f64 / denominator as f64)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn retire_cpu_cold_probe_gpu_sample(
+    accounting: &mut CpuColdProbeAccounting,
+    sample: (usize, metal::CommandBuffer, metal::CommandBuffer),
+) {
+    let (_layer_idx, hot_cb, cold_cb) = sample;
+    if hot_cb.status() == metal::MTLCommandBufferStatus::Completed
+        && cold_cb.status() == metal::MTLCommandBufferStatus::Completed
+    {
+        let hot_us = command_buffer_gpu_times_us(&hot_cb).0;
+        let cold_us = command_buffer_gpu_times_us(&cold_cb).0;
+        if hot_us != 0 && cold_us != 0 {
+            accounting.record_gpu(
+                hot_us.min(u128::from(u64::MAX)) as u64,
+                cold_us.min(u128::from(u64::MAX)) as u64,
+            );
+        } else {
+            // Unavailable/invalid Metal timestamps collapse to zero in the
+            // shared timestamp helper. Fail the diagnostic closed instead of
+            // reporting a plausible-looking zero-work q* estimate.
+            accounting.failures = accounting.failures.saturating_add(1);
+        }
+    } else {
+        // Timing failure invalidates only this diagnostic sample. Never wait,
+        // fall back, or change a completed model command on the probe's behalf.
+        accounting.failures = accounting.failures.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod hot_cold_overlap_plan_tests {
+    use super::{
+        cold_recurrence_tallies, cpu_cold_probe_exact_plan, cpu_cold_probe_expert_checksum,
+        cpu_cold_probe_q8_snapshot, exact_cold_mask_from_union, f32_to_f16_bits,
+        gemma4_hybrid_cold_recurrence_probe_from, gemma4_hybrid_cold_recurrence_round_admitted,
+        gemma4_hybrid_cpu_cold_probe_from, gemma4_hybrid_cpu_cold_probe_round_admitted,
+        gemma4_hybrid_hot_cold_overlap_publish_from, gemma4_hybrid_hot_cold_prefill_from,
+        gemma4_hybrid_hot_cold_publication_allowed, gemma4_hybrid_hot_cold_round_kind_admitted,
+        hot_cold_compact_slot_table, hot_cold_split_slot_tables, partition_exact_union_by_hot,
+        ColdRecurrenceTally, CpuColdProbeAccounting, CpuColdProbeRoute,
+    };
+
+    fn expert_mask(experts: &[usize]) -> [bool; 128] {
+        let mut mask = [false; 128];
+        for &expert in experts {
+            mask[expert] = true;
+        }
+        mask
+    }
+
+    fn fill_q4_matrix(wire: &mut [u8], rows: usize, blocks: usize, seed: usize) {
+        let row_bytes = blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        assert_eq!(wire.len(), rows * row_bytes);
+        for row in 0..rows {
+            for block in 0..blocks {
+                let base = row * row_bytes + block * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+                let scale = 0.000_5f32 * (1 + (row * 5 + block * 3 + seed) % 13) as f32;
+                wire[base..base + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                for quant in 0..16 {
+                    wire[base + 2 + quant] =
+                        ((row * 41 + block * 17 + quant * 7 + seed) % 256) as u8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_cold_probe_is_exact_positive_and_h11_shaped_k8_only() {
+        assert!(!gemma4_hybrid_cpu_cold_probe_from(None));
+        assert!(gemma4_hybrid_cpu_cold_probe_from(Some("1")));
+        assert!(!gemma4_hybrid_cpu_cold_probe_from(Some("0")));
+        assert!(!gemma4_hybrid_cpu_cold_probe_from(Some("true")));
+
+        assert!(gemma4_hybrid_cpu_cold_probe_round_admitted(
+            true, true, true, 8, false, false, 1,
+        ));
+        for rejected in [
+            (false, true, true, 8, false, false, 1),
+            (true, false, true, 8, false, false, 1),
+            (true, true, false, 8, false, false, 1),
+            (true, true, true, 1, false, false, 1),
+            (true, true, true, 5, false, false, 1),
+            (true, true, true, 8, true, false, 1),
+            (true, true, true, 8, false, true, 1),
+            (true, true, true, 8, false, false, 2),
+        ] {
+            assert!(!gemma4_hybrid_cpu_cold_probe_round_admitted(
+                rejected.0, rejected.1, rejected.2, rejected.3, rejected.4, rejected.5, rejected.6,
+            ));
+        }
+    }
+
+    #[test]
+    fn cpu_cold_probe_plan_preserves_exact_k8_route_pairs_and_scales() {
+        let logits = vec![0.0f32; 8 * 128];
+        let mut down_scales = vec![1.0f32; 128];
+        down_scales[0] = 2.0;
+        down_scales[7] = 4.0;
+        let plans = cpu_cold_probe_exact_plan(&logits, 8, &down_scales, &[7, 0]).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!((plans[0].expert, plans[0].stage_slot), (7, 0));
+        assert_eq!((plans[1].expert, plans[1].stage_slot), (0, 1));
+        assert_eq!(plans[0].routes.len(), 8);
+        assert_eq!(plans[1].routes.len(), 8);
+        for token in 0..8 {
+            assert_eq!(plans[0].routes[token].token, token);
+            assert_eq!(plans[0].routes[token].scale.to_bits(), 0.5f32.to_bits());
+            assert_eq!(plans[1].routes[token].token, token);
+            assert_eq!(plans[1].routes[token].scale.to_bits(), 0.25f32.to_bits());
+        }
+        assert!(cpu_cold_probe_exact_plan(&logits, 8, &down_scales, &[9]).is_none());
+        assert!(cpu_cold_probe_exact_plan(&logits, 8, &down_scales, &[0, 0]).is_none());
+    }
+
+    #[test]
+    fn cpu_cold_probe_q8_snapshot_preserves_split_metal_layout() {
+        let scales = [0.25f32, 0.5, 0.75, 1.0];
+        let quants = (0..128)
+            .map(|value| (value as i16 - 64) as i8)
+            .collect::<Vec<_>>();
+        let rows = cpu_cold_probe_q8_snapshot(&scales, &quants, 2, 64).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].scale.to_bits(), scales[0].to_bits());
+        assert_eq!(rows[0][1].scale.to_bits(), scales[1].to_bits());
+        assert_eq!(rows[1][0].scale.to_bits(), scales[2].to_bits());
+        assert_eq!(rows[1][1].scale.to_bits(), scales[3].to_bits());
+        assert_eq!(&rows[0][0].quants, &quants[..32]);
+        assert_eq!(&rows[1][1].quants, &quants[96..128]);
+        assert!(cpu_cold_probe_q8_snapshot(&scales[..3], &quants, 2, 64).is_none());
+        assert!(cpu_cold_probe_q8_snapshot(&scales, &quants[..127], 2, 64).is_none());
+    }
+
+    #[test]
+    fn cpu_cold_probe_batched_expert_matches_route_by_route_reference() {
+        use crate::inference::{gemma4::gelu_tanh, q4_0_wire_row_dot, quantize_q8_0_blocks};
+
+        const HIDDEN: usize = 64;
+        const EXPERT_FF: usize = 32;
+        let gate_up_row_bytes = (HIDDEN / 32) * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        let gate_up_bytes = 2 * EXPERT_FF * gate_up_row_bytes;
+        let down_row_bytes = (EXPERT_FF / 32) * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        let mut record = vec![0u8; gate_up_bytes + HIDDEN * down_row_bytes];
+        fill_q4_matrix(&mut record[..gate_up_bytes], 2 * EXPERT_FF, HIDDEN / 32, 3);
+        fill_q4_matrix(&mut record[gate_up_bytes..], HIDDEN, EXPERT_FF / 32, 19);
+        let input_rows = [
+            (0..HIDDEN)
+                .map(|i| ((i as f32) - 31.5) * 0.007)
+                .collect::<Vec<_>>(),
+            (0..HIDDEN)
+                .map(|i| (((i * 11 + 5) % 67) as f32 - 33.0) * 0.009)
+                .collect::<Vec<_>>(),
+        ];
+        let inputs = input_rows
+            .iter()
+            .map(|row| quantize_q8_0_blocks(row))
+            .collect::<Vec<_>>();
+        let routes = [
+            CpuColdProbeRoute {
+                token: 1,
+                scale: 0.375,
+            },
+            CpuColdProbeRoute {
+                token: 0,
+                scale: -0.125,
+            },
+        ];
+        let got =
+            cpu_cold_probe_expert_checksum(&record, &inputs, &routes, HIDDEN, EXPERT_FF).unwrap();
+
+        let mut expected = 0.0f32;
+        for (route_idx, route) in routes.iter().enumerate() {
+            let mut gate_up = Vec::with_capacity(2 * EXPERT_FF);
+            for row in 0..2 * EXPERT_FF {
+                let start = row * gate_up_row_bytes;
+                gate_up.push(q4_0_wire_row_dot(
+                    &record[start..start + gate_up_row_bytes],
+                    &inputs[route.token],
+                ));
+            }
+            let activated = (0..EXPERT_FF)
+                .map(|row| gelu_tanh(gate_up[row]) * gate_up[row + EXPERT_FF])
+                .collect::<Vec<_>>();
+            let activated_q = quantize_q8_0_blocks(&activated);
+            for row in 0..HIDDEN {
+                let start = gate_up_bytes + row * down_row_bytes;
+                let down = q4_0_wire_row_dot(&record[start..start + down_row_bytes], &activated_q);
+                let marker = 1.0f32 + ((row + route_idx * 3) % 17) as f32 * (1.0f32 / 32.0f32);
+                expected += down * route.scale * marker;
+            }
+        }
+        assert_eq!(got.to_bits(), expected.to_bits());
+        assert!(cpu_cold_probe_expert_checksum(
+            &record[..record.len() - 1],
+            &inputs,
+            &routes,
+            HIDDEN,
+            EXPERT_FF,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cpu_cold_probe_accounting_suppresses_invalid_q_star_estimates() {
+        let mut accounting = CpuColdProbeAccounting::default();
+        accounting.record_sample(true, 4, 11, 25, 100, 0x1234, true, false, true, false);
+        accounting.record_gpu(40, 300);
+        assert_eq!(accounting.stage1_cpu_fraction_estimate(), Some(0.75));
+        assert_eq!(
+            accounting.stage1_cpu_fraction_e2e_estimate(),
+            Some(300.0 / 425.0)
+        );
+        accounting.record_refusal();
+        assert_eq!(accounting.attempted_layers, 2);
+        assert_eq!(accounting.successful_layers, 1);
+        assert_eq!(accounting.failures, 1);
+        assert_eq!(accounting.unique_experts, 4);
+        assert_eq!(accounting.routes, 11);
+        assert_eq!(accounting.prepare_us, 25);
+        assert_eq!(accounting.compute_us, 100);
+        assert_eq!(accounting.hot_gpu_us, 40);
+        assert_eq!(accounting.cold_gpu_us, 300);
+        assert_eq!(accounting.gpu_samples, 1);
+        assert_eq!(accounting.hot_inflight_before, 1);
+        assert_eq!(accounting.cold_inflight_before, 0);
+        assert_eq!(accounting.checksum_xor, 0x1234);
+        assert_eq!(accounting.stage1_cpu_fraction_estimate(), None);
+        assert_eq!(accounting.stage1_cpu_fraction_e2e_estimate(), None);
+    }
+
+    #[test]
+    fn cold_recurrence_probe_is_default_off_and_exact_positive_only() {
+        assert!(!gemma4_hybrid_cold_recurrence_probe_from(None));
+        assert!(gemma4_hybrid_cold_recurrence_probe_from(Some("1")));
+        assert!(!gemma4_hybrid_cold_recurrence_probe_from(Some("0")));
+        assert!(!gemma4_hybrid_cold_recurrence_probe_from(Some("true")));
+
+        assert!(gemma4_hybrid_cold_recurrence_round_admitted(
+            true, true, false, 1, true,
+        ));
+        assert!(!gemma4_hybrid_cold_recurrence_round_admitted(
+            false, true, false, 1, true,
+        ));
+        assert!(!gemma4_hybrid_cold_recurrence_round_admitted(
+            true, false, false, 1, true,
+        ));
+        assert!(!gemma4_hybrid_cold_recurrence_round_admitted(
+            true, true, true, 1, true,
+        ));
+        assert!(!gemma4_hybrid_cold_recurrence_round_admitted(
+            true, true, false, 2, true,
+        ));
+        assert!(!gemma4_hybrid_cold_recurrence_round_admitted(
+            true, true, false, 1, false,
+        ));
+    }
+
+    #[test]
+    fn exact_cold_mask_uses_only_union_minus_start_hot() {
+        let hot = expert_mask(&[2, 9, 127]);
+        let cold = exact_cold_mask_from_union(&[9, 4, 2, 8, 11], &hot).unwrap();
+        assert_eq!(cold, expert_mask(&[4, 8, 11]));
+        assert!(exact_cold_mask_from_union(&[1, 1], &hot).is_none());
+        assert!(exact_cold_mask_from_union(&[128], &hot).is_none());
+    }
+
+    #[test]
+    fn cold_recurrence_preserves_recall_and_precision_denominators() {
+        let previous = [expert_mask(&[1, 2, 5]), expert_mask(&[8])];
+        let current = [expert_mask(&[2, 3]), expert_mask(&[8, 9, 10])];
+        let (layers, round) = cold_recurrence_tallies(&previous, &current).unwrap();
+        assert_eq!(
+            layers,
+            vec![
+                ColdRecurrenceTally {
+                    hits: 1,
+                    current: 2,
+                    previous: 3,
+                },
+                ColdRecurrenceTally {
+                    hits: 1,
+                    current: 3,
+                    previous: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            round,
+            ColdRecurrenceTally {
+                hits: 2,
+                current: 5,
+                previous: 4,
+            }
+        );
+        assert!(cold_recurrence_tallies(&previous[..1], &current).is_none());
+    }
+
+    #[test]
+    fn prefill_overlap_requires_one_exact_opt_in() {
+        assert!(!gemma4_hybrid_hot_cold_prefill_from(None));
+        assert!(gemma4_hybrid_hot_cold_prefill_from(Some("1")));
+        assert!(!gemma4_hybrid_hot_cold_prefill_from(Some("0")));
+        assert!(!gemma4_hybrid_hot_cold_prefill_from(Some("true")));
+    }
+
+    #[test]
+    fn prefill_overlap_admits_only_k8_while_decode_stays_admitted() {
+        assert!(gemma4_hybrid_hot_cold_round_kind_admitted(true, 1, false));
+        assert!(gemma4_hybrid_hot_cold_round_kind_admitted(true, 16, false));
+        assert!(!gemma4_hybrid_hot_cold_round_kind_admitted(false, 8, false));
+        assert!(gemma4_hybrid_hot_cold_round_kind_admitted(false, 8, true));
+        assert!(!gemma4_hybrid_hot_cold_round_kind_admitted(false, 1, true));
+        assert!(!gemma4_hybrid_hot_cold_round_kind_admitted(false, 16, true));
+    }
+
+    #[test]
+    fn prefill_overlap_never_publishes_persistent_hot_records() {
+        assert!(!gemma4_hybrid_hot_cold_publication_allowed(false, true));
+        assert!(!gemma4_hybrid_hot_cold_publication_allowed(false, false));
+        assert!(gemma4_hybrid_hot_cold_publication_allowed(true, true));
+        assert!(!gemma4_hybrid_hot_cold_publication_allowed(true, false));
+    }
+
+    #[test]
+    fn staged_publication_is_default_on_with_one_exact_opt_out() {
+        assert!(gemma4_hybrid_hot_cold_overlap_publish_from(None));
+        assert!(gemma4_hybrid_hot_cold_overlap_publish_from(Some("1")));
+        assert!(gemma4_hybrid_hot_cold_overlap_publish_from(Some("false")));
+        assert!(!gemma4_hybrid_hot_cold_overlap_publish_from(Some("0")));
+    }
+
+    #[test]
+    fn exact_partition_is_disjoint_complete_and_stable() {
+        let union = [9, 4, 2, 8, 11, 5];
+        let mut resident = [false; 128];
+        for expert in [2, 9, 11] {
+            resident[expert] = true;
+        }
+        let (hot, cold) = partition_exact_union_by_hot(&union, &resident, 3, 1).unwrap();
+        assert_eq!(hot, vec![9, 2, 11]);
+        assert_eq!(cold, vec![4, 8, 5]);
+        for &expert in &union {
+            assert_eq!(hot.contains(&expert) ^ cold.contains(&expert), true);
+        }
+
+        let (hot_table, cold_table) = hot_cold_split_slot_tables(&hot, &cold).unwrap();
+        for &expert in &hot {
+            assert_eq!(hot_table[expert], expert as u32);
+            assert_eq!(cold_table[expert], u32::MAX);
+        }
+        for (slot, &expert) in cold.iter().enumerate() {
+            assert_eq!(hot_table[expert], u32::MAX);
+            assert_eq!(cold_table[expert], slot as u32);
+        }
+    }
+
+    #[test]
+    fn split_refuses_cap_overflow_duplicates_and_degenerate_waves() {
+        let mut resident = [false; 128];
+        resident[1] = true;
+        assert!(partition_exact_union_by_hot(&[1, 2, 3], &resident, 1, 1).is_none());
+        assert!(partition_exact_union_by_hot(&[1, 2, 2], &resident, 3, 1).is_none());
+        assert!(partition_exact_union_by_hot(&[1], &resident, 3, 1).is_none());
+        resident[1] = false;
+        assert!(partition_exact_union_by_hot(&[1, 2], &resident, 3, 1).is_none());
+        resident[1] = true;
+        assert!(partition_exact_union_by_hot(&[1, 2], &resident, 3, 0).is_none());
+        assert!(partition_exact_union_by_hot(&[1, 2], &resident, 3, 4).is_none());
+        assert!(hot_cold_split_slot_tables(&[1, 2], &[2, 3]).is_none());
+        assert!(hot_cold_compact_slot_table(&[1, 2], &[2, 3]).is_none());
+    }
+
+    #[test]
+    fn compact_table_places_hot_then_cold_in_one_exact_work_range() {
+        let hot = [9, 2, 11];
+        let cold = [4, 8, 5];
+        let table = hot_cold_compact_slot_table(&hot, &cold).unwrap();
+        for (slot, &expert) in hot.iter().chain(&cold).enumerate() {
+            assert_eq!(table[expert], slot as u32);
+        }
+        for expert in 0..128 {
+            if !hot.contains(&expert) && !cold.contains(&expert) {
+                assert_eq!(table[expert], u32::MAX);
+            }
+        }
+        assert!(hot_cold_compact_slot_table(&[], &cold).is_none());
+        assert!(hot_cold_compact_slot_table(&hot, &[]).is_none());
+        assert!(hot_cold_compact_slot_table(&[128], &cold).is_none());
+    }
+
+    #[test]
+    fn split_minimum_cold_thresholds_one_two_and_three_are_exact() {
+        let mut resident = [false; 128];
+        resident[1] = true;
+        let two_cold = [1, 2, 3];
+        assert!(partition_exact_union_by_hot(&two_cold, &resident, 24, 1).is_some());
+        assert!(partition_exact_union_by_hot(&two_cold, &resident, 24, 2).is_some());
+        assert!(partition_exact_union_by_hot(&two_cold, &resident, 24, 3).is_none());
+
+        let three_cold = [1, 2, 3, 4];
+        assert!(partition_exact_union_by_hot(&three_cold, &resident, 24, 3).is_some());
+    }
 }
 
 fn expert_set_is_covered(actual: &[usize], covered: &[usize]) -> bool {
@@ -24335,6 +25780,17 @@ pub static SPEC_EMBED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static SPEC_OVERLAP_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SPEC_OVERLAP_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Process-cumulative observation-only cold recurrence totals. Baseline rounds
+/// without a previous successful cold snapshot are deliberately excluded, so
+/// both directional denominators describe the same comparable-round set.
+pub static SPEC_COLD_RECURRENCE_COMPARABLE_ROUNDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_COLD_RECURRENCE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_COLD_RECURRENCE_CURRENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_COLD_RECURRENCE_PREVIOUS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 #[allow(dead_code)] // Phase 1 API; gemma4_runtime integration lands separately.
@@ -24685,6 +26141,7 @@ impl Gemma4GhostCommonMetal {
             strict_26b,
             q4_simd_fast: false,
             cached_rope: None,
+            cold_recurrence_previous: None,
             last_chained_ledger: ChainedRoundHostLedger::default(),
         })
     }
@@ -25013,6 +26470,7 @@ impl Gemma4GhostCommonMetal {
     pub(crate) fn reset_sequence(&mut self) {
         self.next_position.fill(0);
         self.latest_attention_layer = None;
+        self.cold_recurrence_previous = None;
     }
 
     /// Seed a CPU-prefilled sequence into the persistent f32 KV buffers without
@@ -25109,6 +26567,7 @@ impl Gemma4GhostCommonMetal {
         }
         self.next_position.fill(positions);
         self.latest_attention_layer = None;
+        self.cold_recurrence_previous = None;
         Ok(())
     }
 
@@ -25986,6 +27445,134 @@ impl Gemma4GhostCommonMetal {
         }
     }
 
+    fn encode_moe_topk_only(
+        &self,
+        kernel: &MetalLinearKernel,
+        encoder: &metal::ComputeCommandEncoderRef,
+        down_exps_scale: &Buffer,
+        expert_to_slot_table: &Buffer,
+        layer_idx: usize,
+        num_slots: usize,
+        num_resident_slots: usize,
+        k_tokens: usize,
+        logits_byte_offset: u64,
+    ) -> bool {
+        let Some(topk_pipeline) = kernel.gemma4_gpu_topk_routing_pipeline.as_ref() else {
+            eprintln!("[metal chained round] GPU top-k pipeline missing at layer {layer_idx}");
+            return false;
+        };
+        if num_slots == 0 || num_slots > 128 || num_resident_slots > num_slots || k_tokens == 0 {
+            eprintln!(
+                "[metal chained round] GPU top-k refuses layer {layer_idx} slots={num_slots} resident={num_resident_slots} K={k_tokens}"
+            );
+            return false;
+        }
+        encoder.set_compute_pipeline_state(topk_pipeline);
+        encoder.set_buffer(
+            0,
+            Some(&self.resident_scratch.router_logits_batch),
+            logits_byte_offset,
+        );
+        encoder.set_buffer(1, Some(down_exps_scale), 0);
+        encoder.set_buffer(2, Some(expert_to_slot_table), 0);
+        encoder.set_buffer(
+            3,
+            Some(&self.resident_scratch.gpu_candidate_routes[layer_idx]),
+            0,
+        );
+        encoder.set_buffer(4, Some(&self.resident_scratch.gpu_work_list), 0);
+        let k_u32 = k_tokens as u32;
+        let topk_slots_u32 = num_slots as u32;
+        let num_resident_slots_u32 = num_resident_slots as u32;
+        encoder.set_bytes(5, 4, &k_u32 as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &topk_slots_u32 as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &num_resident_slots_u32 as *const u32 as *const _);
+        encoder.set_buffer(8, Some(&self.resident_scratch.gpu_gateup_dispatch_args), 0);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.memory_barrier_with_resources(&[
+            &self.resident_scratch.gpu_work_list,
+            &self.resident_scratch.gpu_candidate_routes[layer_idx],
+            &self.resident_scratch.gpu_gateup_dispatch_args,
+        ]);
+        true
+    }
+
+    fn encode_moe_record_gateup_range(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        slot_binding: &Gemma4Q4ExpertSlotBinding,
+        active_slots: &[usize],
+        layer_idx: usize,
+        k_tokens: usize,
+        work_base: usize,
+        work_count: usize,
+    ) -> bool {
+        let Some(table) = slot_binding.record_table() else {
+            eprintln!(
+                "[metal chained single-down] layer {layer_idx} compact record table unavailable"
+            );
+            return false;
+        };
+        if !gemma4_hybrid_hot_cold_single_down_admits_k(k_tokens)
+            || work_count == 0
+            || active_slots.len() != work_count
+            || work_base
+                .checked_add(work_count)
+                .is_none_or(|end| end > table.slot_count())
+            || active_slots
+                .iter()
+                .copied()
+                .enumerate()
+                .any(|(index, slot)| slot != work_base + index)
+        {
+            eprintln!(
+                "[metal chained single-down] layer {layer_idx} invalid GateUp range base={work_base} count={work_count} slots={} K={k_tokens}",
+                table.slot_count(),
+            );
+            return false;
+        }
+        if table.declare_active_slots(encoder, active_slots) != Some(active_slots.len()) {
+            eprintln!(
+                "[metal chained single-down] layer {layer_idx} GateUp range resource declaration failed"
+            );
+            return false;
+        }
+        if !table.encode_chained_gateup_k8_range(
+            encoder,
+            &self.resident_scratch.expert_input_scales_batch,
+            &self.resident_scratch.expert_input_quants_batch,
+            &self.resident_scratch.gpu_work_list,
+            &self.resident_scratch.gpu_moe_scales,
+            &self.resident_scratch.gpu_moe_quants,
+            work_base,
+            work_count,
+            k_tokens,
+        ) {
+            eprintln!(
+                "[metal chained single-down] layer {layer_idx} ranged GateUp pipeline unavailable"
+            );
+            return false;
+        }
+        encoder.memory_barrier_with_resources(&[
+            &self.resident_scratch.gpu_moe_scales,
+            &self.resident_scratch.gpu_moe_quants,
+            &self.resident_scratch.gpu_work_list,
+            &self.resident_scratch.gpu_candidate_routes[layer_idx],
+        ]);
+        true
+    }
+
     fn encode_moe_topk_gateup_down(
         &self,
         kernel: &MetalLinearKernel,
@@ -26060,7 +27647,9 @@ impl Gemma4GhostCommonMetal {
                 );
                 return false;
             }
-            let num_unique_slots = if let Some(active_slots) = active_slots.filter(|slots| !slots.is_empty()) {
+            let num_unique_slots = if let Some(active_slots) =
+                active_slots.filter(|slots| !slots.is_empty())
+            {
                 if table.declare_active_slots(encoder, active_slots) != Some(active_slots.len()) {
                     eprintln!(
                         "[metal chained round] layer {layer_idx} record-granular GateUp active slot declaration failed"
@@ -26529,8 +28118,18 @@ impl Gemma4GhostCommonMetal {
         num_slots_per_layer: &[usize],
         out_rows: &mut [Vec<f32>],
         mut slot_filler: Option<
-            &mut dyn FnMut(usize, &[f32], Option<&[usize]>, &mut [u32; 128], &mut Vec<usize>),
+            &mut dyn FnMut(
+                usize,
+                &[f32],
+                Option<&[usize]>,
+                Gemma4Q4SlotFillPhase,
+                &mut [u32; 128],
+                &mut Vec<usize>,
+            ) -> bool,
         >,
+        cold_stage_slab: Option<&Buffer>,
+        cold_stage_slot_count: usize,
+        hot_residency_at_start: Option<&[[bool; 128]]>,
         pong_slab: Option<&Buffer>,
         predicted_unions: &[Vec<usize>],
         mut fill_pong_wave: Option<&mut dyn FnMut(usize, &[usize], &mut [u32; 128])>,
@@ -26805,6 +28404,7 @@ impl Gemma4GhostCommonMetal {
                     layer_idx,
                     &[],
                     Some(w0.as_slice()),
+                    Gemma4Q4SlotFillPhase::Demand,
                     &mut ping_table,
                     &mut discard,
                 );
@@ -26871,6 +28471,98 @@ impl Gemma4GhostCommonMetal {
         let stage_profile = chained_stage_profile_enabled();
         let dump_layers =
             std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|value| value == "1");
+        let hot_cold_overlap_round = gemma4_hybrid_hot_cold_overlap_enabled()
+            && gemma4_hybrid_demand_promotion_enabled()
+            && record_demand
+            && file_mapped_demand
+            && gemma4_hybrid_hot_cold_round_kind_admitted(
+                is_decode_round,
+                k_tokens,
+                gemma4_hybrid_hot_cold_prefill_enabled(),
+            )
+            && !stage_profile
+            && !dump_layers
+            && slot_filler.is_some()
+            && cold_stage_slab.is_some()
+            && cold_stage_slot_count > 0
+            && cold_stage_slab.is_some_and(|slab| {
+                slab.length() as usize
+                    >= cold_stage_slot_count.saturating_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+            })
+            && hot_residency_at_start.is_some_and(|hot| hot.len() >= n_layers)
+            && expert_bindings
+                .iter()
+                .take(n_layers)
+                .all(Gemma4Q4ExpertSlotBinding::is_hybrid_mapped_source);
+        let hot_cold_overlap_min_cold = if hot_cold_overlap_round {
+            gemma4_hybrid_hot_cold_overlap_min_cold()
+        } else {
+            1
+        };
+        // Prompt chunks may consume their compact cold stage but must not
+        // mutate persistent residency. The explicit prefill-to-decode handoff
+        // remains the sole prompt publication and sees the final exact union.
+        let hot_cold_overlap_publish = if hot_cold_overlap_round {
+            gemma4_hybrid_hot_cold_publication_allowed(
+                is_decode_round,
+                gemma4_hybrid_hot_cold_overlap_publish_enabled(),
+            )
+        } else {
+            false
+        };
+        let hot_cold_mapped_wave = hot_cold_overlap_round
+            && is_decode_round
+            && !hot_cold_overlap_publish
+            && gemma4_hybrid_hot_cold_mapped_wave_enabled();
+        let hot_cold_single_down = hot_cold_overlap_round
+            && !hot_cold_mapped_wave
+            && gemma4_hybrid_hot_cold_single_down_admits_k(k_tokens)
+            && gemma4_hybrid_hot_cold_single_down_enabled();
+        let cpu_cold_probe_requested = gemma4_hybrid_cpu_cold_probe_enabled();
+        let cpu_cold_probe_round = !hot_cold_single_down
+            && gemma4_hybrid_cpu_cold_probe_round_admitted(
+                cpu_cold_probe_requested,
+                hot_cold_overlap_round,
+                is_decode_round,
+                k_tokens,
+                hot_cold_overlap_publish,
+                hot_cold_mapped_wave,
+                hot_cold_overlap_min_cold,
+            );
+        let mut cpu_cold_probe = cpu_cold_probe_round.then(CpuColdProbeAccounting::default);
+        // At most one pair is retained. The next layer's completed router is
+        // the queue-order barrier that makes its GPU timestamps readable and
+        // releases the sparse resources before the compact stage is reused.
+        let mut pending_cpu_cold_probe_gpu_sample: Option<(
+            usize,
+            metal::CommandBuffer,
+            metal::CommandBuffer,
+        )> = None;
+        if cpu_cold_probe_requested && !cpu_cold_probe_round {
+            eprintln!(
+                "[metal chained cpu-cold-probe] admitted=0 requires=H11-shaped-K8-decode,publish0,mapped_wave0,min_cold1 observed_k={k_tokens} decode={} overlap={} publish={} mapped_wave={} min_cold={} output_mutation=0 slot_policy_mutation=0",
+                u8::from(is_decode_round),
+                u8::from(hot_cold_overlap_round),
+                u8::from(hot_cold_overlap_publish),
+                u8::from(hot_cold_mapped_wave),
+                hot_cold_overlap_min_cold,
+            );
+        }
+        // H11 recurrence observation is narrower than overlap admission:
+        // decode only, frozen hot tier, and the exact one-cold split policy.
+        // The masks below are diagnostic state only and are committed only at
+        // the successful return boundary.
+        let cold_recurrence_probe_round = gemma4_hybrid_cold_recurrence_round_admitted(
+            hot_cold_overlap_round,
+            is_decode_round,
+            hot_cold_overlap_publish,
+            hot_cold_overlap_min_cold,
+            gemma4_hybrid_cold_recurrence_probe_enabled(),
+        );
+        let mut cold_recurrence_current =
+            cold_recurrence_probe_round.then(|| vec![[false; 128]; n_layers]);
+        let mut cold_recurrence_observed_layers = 0usize;
+        let mut cold_recurrence_sample_valid = cold_recurrence_probe_round;
         if file_mapped_demand && (stage_profile || dump_layers) {
             eprintln!(
                 "[metal chained round] rejected: transient mapped expert bindings do not support stage-split or layer-dump command buffers"
@@ -26927,7 +28619,11 @@ impl Gemma4GhostCommonMetal {
         // Sparse no-copy tables are created only after each layer's exact
         // routed union is known and retained through a queue-order barrier.
         let mut live_mapped_bindings: Vec<Gemma4Q4ExpertSlotBinding> = Vec::with_capacity(1);
-        let mut mapped_binding_guards: Vec<Gemma4Q4MappedBindingGuard> = Vec::with_capacity(1);
+        let mut mapped_binding_guards: Vec<Gemma4Q4MappedBindingGuard> = Vec::with_capacity(2);
+        // The compact slab belongs to at most one layer. Its cold command and
+        // the hot command preceding it are both retired by the next layer's
+        // completed router barrier before this promotion runs or reuse begins.
+        let mut pending_staged_promotion: Option<(usize, Vec<usize>, Vec<usize>)> = None;
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let norms = &self.norms[layer_idx];
@@ -27582,7 +29278,11 @@ impl Gemma4GhostCommonMetal {
                         }
                     }
                 }
-                let w1: &[usize] = if predicted_ready { &predicted_w1[layer_idx] } else { &[] };
+                let w1: &[usize] = if predicted_ready {
+                    &predicted_w1[layer_idx]
+                } else {
+                    &[]
+                };
                 let overflow_buf = if !w1.is_empty() && layer_idx < wave1_slabs.len() {
                     Some(wave1_slabs[layer_idx])
                 } else {
@@ -27686,7 +29386,9 @@ impl Gemma4GhostCommonMetal {
                 // closed).
                 let mut pre_encoded_moe: Option<metal::CommandBuffer> = None;
                 let pre_materialized = if file_mapped_demand && overlap_round && num_slots >= 1 {
-                    let active: Vec<usize> = if let Some(pred) = predicted_unions.get(layer_idx).filter(|u| !u.is_empty()) {
+                    let active: Vec<usize> = if let Some(pred) =
+                        predicted_unions.get(layer_idx).filter(|u| !u.is_empty())
+                    {
                         pred.iter().copied().take(num_slots).collect()
                     } else {
                         (0..num_slots).collect()
@@ -27745,7 +29447,8 @@ impl Gemma4GhostCommonMetal {
                             live_mapped_bindings.push(mat);
                         }
                         for binding in live_mapped_bindings.drain(..) {
-                            mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(&cb3, binding));
+                            mapped_binding_guards
+                                .push(Gemma4Q4MappedBindingGuard::new(&cb3, binding));
                         }
                         last_committed_cb = Some(cb3);
                         self.next_position[layer_idx] = start_pos + k_tokens;
@@ -27777,6 +29480,7 @@ impl Gemma4GhostCommonMetal {
                             layer_idx,
                             &[],
                             Some(spec_w0.as_slice()),
+                            Gemma4Q4SlotFillPhase::Demand,
                             &mut spec_ping,
                             &mut spec_discard,
                         );
@@ -27815,6 +29519,11 @@ impl Gemma4GhostCommonMetal {
                     }
                     drop(previous);
                 }
+                if let Some(sample) = pending_cpu_cold_probe_gpu_sample.take() {
+                    if let Some(accounting) = cpu_cold_probe.as_mut() {
+                        retire_cpu_cold_probe_gpu_sample(accounting, sample);
+                    }
+                }
                 // This router wait is also a queue-order retirement barrier for
                 // every earlier layer. Preserve their GPU timestamps, then
                 // release the completed CB references that otherwise keep each
@@ -27835,6 +29544,28 @@ impl Gemma4GhostCommonMetal {
                     );
                     self.last_chained_ledger = ledger;
                     return false;
+                }
+                if let Some((staged_layer, staged_cold, mut staged_union)) =
+                    pending_staged_promotion.take()
+                {
+                    let mut staged_table = [0xFFFFFFFFu32; 128];
+                    if !filler(
+                        staged_layer,
+                        &[],
+                        Some(staged_cold.as_slice()),
+                        Gemma4Q4SlotFillPhase::PublishCold,
+                        &mut staged_table,
+                        &mut staged_union,
+                    ) {
+                        // The completed command already consumed exact staged
+                        // bytes. Publication affects only future residency;
+                        // the immutable canonical mapped record remains the
+                        // exact fallback for this layer.
+                        ledger.overlap_fallbacks = ledger.overlap_fallbacks.saturating_add(1);
+                        eprintln!(
+                            "[metal chained round] layer {staged_layer} retired cold stage could not publish hot residency; canonical mapped fallback retained"
+                        );
+                    }
                 }
                 if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -27995,14 +29726,26 @@ impl Gemma4GhostCommonMetal {
                 let mut updated_slots = [0xFFFFFFFFu32; 128];
                 let mut union = Vec::new();
                 let t_fill = std::time::Instant::now();
-                filler(
+                let route_published = filler(
                     layer_idx,
                     router_slice,
                     None,
+                    if hot_cold_overlap_round {
+                        Gemma4Q4SlotFillPhase::RouteOnly
+                    } else {
+                        Gemma4Q4SlotFillPhase::Demand
+                    },
                     &mut updated_slots,
                     &mut union,
                 );
                 ledger.slot_filler_ms += t_fill.elapsed().as_secs_f64() * 1000.0;
+                if !route_published {
+                    eprintln!(
+                        "[metal chained round] layer {layer_idx} exact route/fill publication failed"
+                    );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
 
                 let unique = union.len();
                 ledger.unique_experts_sum += unique as u32;
@@ -28028,6 +29771,26 @@ impl Gemma4GhostCommonMetal {
                     ledger.missing_expert_failclose += 1;
                     self.last_chained_ledger = ledger;
                     return false;
+                }
+                if cold_recurrence_sample_valid {
+                    let cold_mask = hot_residency_at_start
+                        .and_then(|hot| hot.get(layer_idx))
+                        .and_then(|hot| exact_cold_mask_from_union(&union, hot));
+                    if let (Some(current), Some(cold_mask)) =
+                        (cold_recurrence_current.as_mut(), cold_mask)
+                    {
+                        if let Some(layer) = current.get_mut(layer_idx) {
+                            *layer = cold_mask;
+                            cold_recurrence_observed_layers =
+                                cold_recurrence_observed_layers.saturating_add(1);
+                        } else {
+                            cold_recurrence_sample_valid = false;
+                        }
+                    } else {
+                        // Refuse only this observation. Execution continues on
+                        // the established exact route/fill path unchanged.
+                        cold_recurrence_sample_valid = false;
+                    }
                 }
                 let cap0 = num_slots.max(1);
                 if record_demand && unique > cap0 {
@@ -28063,6 +29826,563 @@ impl Gemma4GhostCommonMetal {
                 } else {
                     vec![wave0, wave1]
                 };
+
+                let hot_cold_partition = if hot_cold_overlap_round {
+                    hot_residency_at_start
+                        .and_then(|hot| hot.get(layer_idx))
+                        .and_then(|hot| {
+                            partition_exact_union_by_hot(
+                                &union,
+                                hot,
+                                cold_stage_slot_count,
+                                hot_cold_overlap_min_cold,
+                            )
+                        })
+                } else {
+                    None
+                };
+                // `RouteOnly` deliberately did not mutate the hot tier. If
+                // this layer cannot prove the bounded two-wave shape or meet
+                // the minimum-cold A/B threshold, perform the established
+                // full-union demand fill before any expert command is committed.
+                if hot_cold_overlap_round && hot_cold_partition.is_none() {
+                    let t_exact = std::time::Instant::now();
+                    if !filler(
+                        layer_idx,
+                        router_slice,
+                        None,
+                        Gemma4Q4SlotFillPhase::Demand,
+                        &mut updated_slots,
+                        &mut union,
+                    ) {
+                        self.last_chained_ledger = ledger;
+                        return false;
+                    }
+                    ledger.slot_filler_ms += t_exact.elapsed().as_secs_f64() * 1000.0;
+                    ledger.overlap_fallbacks = ledger.overlap_fallbacks.saturating_add(1);
+                }
+
+                if let Some((hot_wave, cold_wave)) = hot_cold_partition {
+                    let stage_slab = cold_stage_slab.expect("hot/cold admission checked");
+                    let split_tables = hot_cold_split_slot_tables(&hot_wave, &cold_wave);
+                    let compact_table = hot_cold_single_down
+                        .then(|| hot_cold_compact_slot_table(&hot_wave, &cold_wave))
+                        .flatten();
+                    let hot_ready = if hot_cold_single_down {
+                        compact_table.as_ref().is_some_and(|table| {
+                            wave_slots_ready(table, &union, union.len()).is_none()
+                        })
+                    } else {
+                        split_tables.as_ref().is_some_and(|(hot_table, _)| {
+                            wave_slots_ready(hot_table, &hot_wave, 128).is_none()
+                        })
+                    };
+                    let mut encode_pair = |mapped_wave: bool| {
+                        if !hot_ready {
+                            return None;
+                        }
+                        let (hot_table, expected_cold_table) =
+                            *split_tables.as_ref().expect("checked");
+                        let single_down = hot_cold_single_down && !mapped_wave;
+                        let hot_binding = if single_down {
+                            slot_binding
+                                .materialize_hot_cold_stage_table(&hot_wave, &cold_wave, stage_slab)
+                        } else {
+                            slot_binding.materialize_for_active_slots(&hot_wave)
+                        };
+                        hot_binding.and_then(|hot_binding| {
+                            if single_down {
+                                if hot_binding.record_table().is_none_or(|table| {
+                                    table.slot_count() != unique
+                                        || table.bound_record_count() != unique
+                                }) {
+                                    return None;
+                                }
+                            } else if hot_binding.bound_tier_record_counts()
+                                != Some((hot_wave.len(), 0))
+                            {
+                                return None;
+                            }
+                            let published_table = if single_down {
+                                compact_table.as_ref()?
+                            } else {
+                                &hot_table
+                            };
+                            unsafe {
+                                let dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
+                                std::ptr::copy_nonoverlapping(published_table.as_ptr(), dest, 128);
+                            }
+
+                            let encode_started = std::time::Instant::now();
+                            let hot_cb = kernel.queue.new_command_buffer().to_owned();
+                            let hot_enc = hot_cb.new_compute_command_encoder();
+                            let hot_ok = if single_down {
+                                let hot_slots: Vec<usize> = (0..hot_wave.len()).collect();
+                                self.encode_moe_topk_only(
+                                    kernel,
+                                    hot_enc,
+                                    &down_exps_scale,
+                                    &expert_to_slot_table,
+                                    layer_idx,
+                                    unique,
+                                    unique,
+                                    k_tokens,
+                                    logits_off,
+                                ) && self.encode_moe_record_gateup_range(
+                                    hot_enc,
+                                    &hot_binding,
+                                    &hot_slots,
+                                    layer_idx,
+                                    k_tokens,
+                                    0,
+                                    hot_wave.len(),
+                                )
+                            } else {
+                                self.encode_moe_topk_gateup_down(
+                                    kernel,
+                                    hot_enc,
+                                    &down_exps_scale,
+                                    &expert_to_slot_table,
+                                    &hot_binding,
+                                    Some(&hot_wave),
+                                    layer_idx,
+                                    128,
+                                    128,
+                                    k_tokens,
+                                    &self.resident_scratch.gpu_moe_acc,
+                                    0,
+                                    logits_off,
+                                    None,
+                                ) && self.encode_moe_down(
+                                    kernel,
+                                    hot_enc,
+                                    &hot_binding,
+                                    Some(&hot_wave),
+                                    layer_idx,
+                                    k_tokens,
+                                    &self.resident_scratch.gpu_moe_acc,
+                                    0,
+                                    None,
+                                )
+                            };
+                            hot_enc.end_encoding();
+                            if !hot_ok {
+                                return None;
+                            }
+
+                            let cold_table_buffer = self
+                                .resident_scratch
+                                .wave1_slot_tables
+                                .get(layer_idx)?
+                                .clone();
+                            let cold_binding = if single_down {
+                                hot_binding.clone()
+                            } else if mapped_wave {
+                                if hot_wave.len().checked_add(cold_wave.len()) != Some(unique) {
+                                    return None;
+                                }
+                                let mut identity_table = [u32::MAX; 128];
+                                for &expert in &cold_wave {
+                                    if expert >= identity_table.len()
+                                        || identity_table[expert] != u32::MAX
+                                    {
+                                        return None;
+                                    }
+                                    identity_table[expert] = expert as u32;
+                                }
+                                if wave_slots_ready(&identity_table, &cold_wave, 128).is_some() {
+                                    return None;
+                                }
+                                let binding =
+                                    slot_binding.materialize_for_active_slots(&cold_wave)?;
+                                if binding.bound_tier_record_counts() != Some((0, cold_wave.len()))
+                                {
+                                    return None;
+                                }
+                                unsafe {
+                                    let dest = cold_table_buffer.contents() as *mut u32;
+                                    std::ptr::copy_nonoverlapping(
+                                        identity_table.as_ptr(),
+                                        dest,
+                                        128,
+                                    );
+                                }
+                                binding
+                            } else {
+                                Gemma4Q4ExpertSlotBinding::Monolithic(stage_slab.clone())
+                            };
+                            let cold_active_slots = mapped_wave.then_some(cold_wave.as_slice());
+                            let cold_slot_count = if mapped_wave { 128 } else { cold_wave.len() };
+                            let cold_cb = kernel.queue.new_command_buffer().to_owned();
+                            let cold_enc = cold_cb.new_compute_command_encoder();
+                            let cold_ok = if single_down {
+                                let cold_slots: Vec<usize> = (hot_wave.len()..unique).collect();
+                                let all_slots: Vec<usize> = (0..unique).collect();
+                                self.encode_moe_record_gateup_range(
+                                    cold_enc,
+                                    &cold_binding,
+                                    &cold_slots,
+                                    layer_idx,
+                                    k_tokens,
+                                    hot_wave.len(),
+                                    cold_wave.len(),
+                                ) && self.encode_moe_down(
+                                    kernel,
+                                    cold_enc,
+                                    &cold_binding,
+                                    Some(&all_slots),
+                                    layer_idx,
+                                    k_tokens,
+                                    &self.resident_scratch.gpu_moe_acc,
+                                    0,
+                                    None,
+                                )
+                            } else {
+                                self.encode_moe_topk_gateup_down(
+                                    kernel,
+                                    cold_enc,
+                                    &down_exps_scale,
+                                    &cold_table_buffer,
+                                    &cold_binding,
+                                    cold_active_slots,
+                                    layer_idx,
+                                    cold_slot_count,
+                                    cold_slot_count,
+                                    k_tokens,
+                                    &self.resident_scratch.gpu_moe_acc_wave,
+                                    0,
+                                    logits_off,
+                                    None,
+                                ) && self.encode_moe_down(
+                                    kernel,
+                                    cold_enc,
+                                    &cold_binding,
+                                    cold_active_slots,
+                                    layer_idx,
+                                    k_tokens,
+                                    &self.resident_scratch.gpu_moe_acc_wave,
+                                    0,
+                                    None,
+                                )
+                            };
+                            if cold_ok && !single_down {
+                                let n_el = (k_tokens * GEMMA4_Q4_EXPERT_HIDDEN) as u32;
+                                cold_enc.set_compute_pipeline_state(&kernel.residual_add_pipeline);
+                                cold_enc.set_buffer(0, Some(&self.resident_scratch.gpu_moe_acc), 0);
+                                cold_enc.set_buffer(
+                                    1,
+                                    Some(&self.resident_scratch.gpu_moe_acc_wave),
+                                    0,
+                                );
+                                cold_enc.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
+                                cold_enc.set_bytes(3, 4, &n_el as *const u32 as *const _);
+                                dispatch_1d(
+                                    cold_enc,
+                                    &kernel.residual_add_pipeline,
+                                    k_tokens * GEMMA4_Q4_EXPERT_HIDDEN,
+                                );
+                                cold_enc.memory_barrier_with_resources(&[&self
+                                    .resident_scratch
+                                    .gpu_moe_acc]);
+                            }
+                            let cold_ok = cold_ok
+                                && self.encode_layer_tail(kernel, cold_enc, layer_idx, k_tokens);
+                            cold_enc.end_encoding();
+                            if !cold_ok {
+                                return None;
+                            }
+                            ledger.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+                            Some((
+                                hot_cb,
+                                cold_cb,
+                                hot_binding,
+                                cold_binding,
+                                cold_table_buffer,
+                                expected_cold_table,
+                                mapped_wave,
+                                single_down,
+                            ))
+                        })
+                    };
+                    // The direct mapped experiment must remain a pre-commit
+                    // optimization only. Any resource, receipt, or encode
+                    // refusal drops its uncommitted pair and retries the
+                    // established exact staged schedule unchanged.
+                    let encoded = if hot_cold_mapped_wave {
+                        match encode_pair(true) {
+                            Some(pair) => Some(pair),
+                            None => encode_pair(false),
+                        }
+                    } else {
+                        encode_pair(false)
+                    };
+
+                    if let Some((
+                        hot_cb,
+                        cold_cb,
+                        hot_binding,
+                        cold_binding,
+                        cold_table_buffer,
+                        expected_cold_table,
+                        mapped_wave,
+                        single_down,
+                    )) = encoded
+                    {
+                        if mapped_wave {
+                            debug_assert!(!hot_cold_overlap_publish);
+                            debug_assert_eq!(hot_wave.len() + cold_wave.len(), unique);
+                            // Both sparse tables and both command streams were
+                            // proven before the first commit. Queue order makes
+                            // cold accumulation observe the completed hot
+                            // accumulator, while two independent guards retain
+                            // the anonymous-hot and mapped-cold table leases.
+                            stamp.start(GPU_STAGE_GATEUP);
+                            stamp.push_current(&hot_cb);
+                            hot_cb.commit();
+                            mapped_binding_guards
+                                .push(Gemma4Q4MappedBindingGuard::new(&hot_cb, hot_binding));
+                            stamp.start(GPU_STAGE_GATEUP);
+                            stamp.push_current(&cold_cb);
+                            cold_cb.commit();
+                            mapped_binding_guards
+                                .push(Gemma4Q4MappedBindingGuard::new(&cold_cb, cold_binding));
+                            last_committed_cb = Some(cold_cb);
+                            cb_closed = true;
+                            layer_committed = true;
+                            ledger.overlap_layers = ledger.overlap_layers.saturating_add(1);
+                            ledger.expert_waves_sum = ledger.expert_waves_sum.saturating_add(1);
+                            ledger.expert_waves_max = ledger.expert_waves_max.max(2);
+                            ledger.hot_bound_records = ledger
+                                .hot_bound_records
+                                .saturating_add(hot_wave.len().min(u32::MAX as usize) as u32);
+                            ledger.mapped_bound_records = ledger
+                                .mapped_bound_records
+                                .saturating_add(cold_wave.len().min(u32::MAX as usize) as u32);
+                            if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
+                                *value = value
+                                    .saturating_add(hot_wave.len().min(u16::MAX as usize) as u16);
+                            }
+                            if let Some(value) = ledger.mapped_bound_per_layer.get_mut(layer_idx) {
+                                *value = value
+                                    .saturating_add(cold_wave.len().min(u16::MAX as usize) as u16);
+                            }
+                            if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
+                                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            {
+                                eprintln!(
+                                    "[metal chained hot-cold mapped] layer={layer_idx} hot={} mapped={} active={} min_cold={hot_cold_overlap_min_cold} publish=0 hidden_candidate=1",
+                                    hot_wave.len(),
+                                    cold_wave.len(),
+                                    hot_wave.len() + cold_wave.len(),
+                                );
+                            }
+                            encode_clock = std::time::Instant::now();
+                        } else {
+                            // Both command streams are now fully encoded. Publish
+                            // the hot table, commit only that command, then fill
+                            // the disjoint cold slab while the GPU consumes hot
+                            // records. Cold remains uncommitted until all record
+                            // bytes and its separate table validate.
+                            stamp.start(GPU_STAGE_GATEUP);
+                            stamp.push_current(&hot_cb);
+                            hot_cb.commit();
+                            let stage_started = std::time::Instant::now();
+                            let mut cold_table = [0xFFFFFFFFu32; 128];
+                            let staged = filler(
+                                layer_idx,
+                                &[],
+                                Some(cold_wave.as_slice()),
+                                Gemma4Q4SlotFillPhase::StageCold,
+                                &mut cold_table,
+                                &mut union,
+                            );
+                            let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+                            ledger.wave_load_ms += stage_ms;
+                            let table_exact = staged
+                                && cold_table == expected_cold_table
+                                && wave_slots_ready(&cold_table, &cold_wave, cold_wave.len())
+                                    .is_none();
+                            if table_exact {
+                                unsafe {
+                                    let dest = cold_table_buffer.contents() as *mut u32;
+                                    std::ptr::copy_nonoverlapping(cold_table.as_ptr(), dest, 128);
+                                }
+                                mapped_binding_guards
+                                    .push(Gemma4Q4MappedBindingGuard::new(&hot_cb, hot_binding));
+                                let cpu_probe_job = if cpu_cold_probe_round {
+                                    prepare_cpu_cold_probe_job(
+                                        router_slice,
+                                        k_tokens,
+                                        &down_exps_scale,
+                                        &cold_wave,
+                                        &self.resident_scratch.expert_input_scales_batch,
+                                        &self.resident_scratch.expert_input_quants_batch,
+                                    )
+                                } else {
+                                    None
+                                };
+                                if cpu_cold_probe_round && cpu_probe_job.is_none() {
+                                    if let Some(accounting) = cpu_cold_probe.as_mut() {
+                                        accounting.record_refusal();
+                                    }
+                                }
+                                let mut cpu_probe_valid = false;
+                                if let Some(job) = cpu_probe_job.as_ref() {
+                                    let hot_inflight_before = matches!(
+                                        hot_cb.status(),
+                                        metal::MTLCommandBufferStatus::Enqueued
+                                            | metal::MTLCommandBufferStatus::Committed
+                                            | metal::MTLCommandBufferStatus::Scheduled
+                                    );
+                                    let cold_inflight_before = matches!(
+                                        cold_cb.status(),
+                                        metal::MTLCommandBufferStatus::Enqueued
+                                            | metal::MTLCommandBufferStatus::Committed
+                                            | metal::MTLCommandBufferStatus::Scheduled
+                                    );
+                                    // The CPU exclusively reads the completed
+                                    // cold stage while the already-committed
+                                    // hot command reads disjoint hot records.
+                                    // Cold remains uncommitted until this
+                                    // observation returns, so the probe cannot
+                                    // race a Metal reader of the stage. It
+                                    // deliberately delays cold commit in this
+                                    // calibration profile without changing any
+                                    // bytes consumed by the model command.
+                                    let receipt = run_cpu_cold_probe_job(job, stage_slab);
+                                    cpu_probe_valid = receipt.valid;
+                                    if let Some(accounting) = cpu_cold_probe.as_mut() {
+                                        accounting.record_work(
+                                            receipt,
+                                            hot_inflight_before,
+                                            cold_inflight_before,
+                                            hot_cb.status()
+                                                == metal::MTLCommandBufferStatus::Completed,
+                                            cold_cb.status()
+                                                == metal::MTLCommandBufferStatus::Completed,
+                                        );
+                                    }
+                                }
+                                let cpu_probe_gpu_sample = cpu_probe_valid
+                                    .then(|| (layer_idx, hot_cb.to_owned(), cold_cb.to_owned()));
+                                stamp.start(GPU_STAGE_GATEUP);
+                                stamp.push_current(&cold_cb);
+                                cold_cb.commit();
+                                if single_down {
+                                    // The composite table owns both the hot
+                                    // lease and all cold stage views. Retain a
+                                    // clone specifically through the command
+                                    // that performs the full-union Down.
+                                    mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(
+                                        &cold_cb,
+                                        cold_binding,
+                                    ));
+                                }
+                                if let Some(sample) = cpu_probe_gpu_sample {
+                                    debug_assert!(pending_cpu_cold_probe_gpu_sample.is_none());
+                                    pending_cpu_cold_probe_gpu_sample = Some(sample);
+                                }
+                                last_committed_cb = Some(cold_cb);
+                                cb_closed = true;
+                                layer_committed = true;
+                                ledger.overlap_layers = ledger.overlap_layers.saturating_add(1);
+                                ledger.expert_waves_sum = ledger.expert_waves_sum.saturating_add(1);
+                                ledger.expert_waves_max = ledger.expert_waves_max.max(2);
+                                ledger.hot_bound_records = ledger
+                                    .hot_bound_records
+                                    .saturating_add(unique.min(u32::MAX as usize) as u32);
+                                if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
+                                    *value =
+                                        value.saturating_add(unique.min(u16::MAX as usize) as u16);
+                                }
+                                if hot_cold_overlap_publish {
+                                    pending_staged_promotion =
+                                        Some((layer_idx, cold_wave.clone(), union.clone()));
+                                } else {
+                                    debug_assert!(pending_staged_promotion.is_none());
+                                }
+                                if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
+                                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                {
+                                    if single_down {
+                                        eprintln!(
+                                            "[metal chained hot-cold single-down] layer={layer_idx} hot={} cold={} active={} route_passes=1 down_passes=1 merge_passes=0 publish={} stage={stage_ms:.2}ms",
+                                            hot_wave.len(),
+                                            cold_wave.len(),
+                                            unique,
+                                            u8::from(hot_cold_overlap_publish),
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[metal chained hot-cold] layer={layer_idx} hot={} cold={} min_cold={hot_cold_overlap_min_cold} publish={} stage={stage_ms:.2}ms hidden_candidate=1",
+                                            hot_wave.len(),
+                                            cold_wave.len(),
+                                            u8::from(hot_cold_overlap_publish),
+                                        );
+                                    }
+                                }
+                                encode_clock = std::time::Instant::now();
+                            } else {
+                                // Only hot was committed. Wait for its terminal
+                                // state and release its mixed-table lease before
+                                // restoring the established full-union fill. That
+                                // path overwrites gpu_moe_acc, so the abandoned hot
+                                // result cannot leak into the token.
+                                hot_cb.wait_until_completed();
+                                if hot_cb.status() != metal::MTLCommandBufferStatus::Completed {
+                                    self.last_chained_ledger = ledger;
+                                    return false;
+                                }
+                                // The cold command was never committed. Drop
+                                // its encoded references and composite-table
+                                // lease before the demand fallback mutates any
+                                // hot record or reuses the stage slab.
+                                drop(cold_cb);
+                                drop(cold_binding);
+                                drop(hot_binding);
+                                if let Err(error) = stamp.harvest_completed() {
+                                    eprintln!(
+                                        "[metal chained round] layer {layer_idx} hot/cold fallback retirement failed: {error}"
+                                    );
+                                    self.last_chained_ledger = ledger;
+                                    return false;
+                                }
+                                let t_exact = std::time::Instant::now();
+                                if !filler(
+                                    layer_idx,
+                                    router_slice,
+                                    None,
+                                    Gemma4Q4SlotFillPhase::Demand,
+                                    &mut updated_slots,
+                                    &mut union,
+                                ) {
+                                    self.last_chained_ledger = ledger;
+                                    return false;
+                                }
+                                ledger.slot_filler_ms += t_exact.elapsed().as_secs_f64() * 1000.0;
+                                ledger.overlap_fallbacks =
+                                    ledger.overlap_fallbacks.saturating_add(1);
+                            }
+                        }
+                    } else {
+                        // Encoding/materialization failed before any hot commit.
+                        // The full-union path is still untouched and exact.
+                        let t_exact = std::time::Instant::now();
+                        if !filler(
+                            layer_idx,
+                            router_slice,
+                            None,
+                            Gemma4Q4SlotFillPhase::Demand,
+                            &mut updated_slots,
+                            &mut union,
+                        ) {
+                            self.last_chained_ledger = ledger;
+                            return false;
+                        }
+                        ledger.slot_filler_ms += t_exact.elapsed().as_secs_f64() * 1000.0;
+                        ledger.overlap_fallbacks = ledger.overlap_fallbacks.saturating_add(1);
+                    }
+                }
 
                 if let Some(cb3) = pre_encoded_moe.take() {
                     if waves.len() == 1 {
@@ -28130,6 +30450,7 @@ impl Gemma4GhostCommonMetal {
                             layer_idx,
                             router_slice,
                             Some(wave0.as_slice()),
+                            Gemma4Q4SlotFillPhase::Demand,
                             &mut updated_slots,
                             &mut union,
                         );
@@ -28235,6 +30556,7 @@ impl Gemma4GhostCommonMetal {
                                 layer_idx,
                                 router_slice,
                                 Some(wave.as_slice()),
+                                Gemma4Q4SlotFillPhase::Demand,
                                 &mut updated_slots,
                                 &mut union,
                             );
@@ -28881,6 +31203,79 @@ impl Gemma4GhostCommonMetal {
             self.last_chained_ledger = ledger;
             return false;
         }
+        if let Some(sample) = pending_cpu_cold_probe_gpu_sample.take() {
+            if let Some(accounting) = cpu_cold_probe.as_mut() {
+                retire_cpu_cold_probe_gpu_sample(accounting, sample);
+            }
+        }
+        if let Some(accounting) = cpu_cold_probe.as_ref() {
+            ledger.cpu_cold_probe_attempted_layers = accounting.attempted_layers;
+            ledger.cpu_cold_probe_successful_layers = accounting.successful_layers;
+            ledger.cpu_cold_probe_failures = accounting.failures;
+            ledger.cpu_cold_probe_unique_experts = accounting.unique_experts;
+            ledger.cpu_cold_probe_routes = accounting.routes;
+            ledger.cpu_cold_probe_prepare_ms = accounting.prepare_us as f64 / 1000.0;
+            ledger.cpu_cold_probe_compute_ms = accounting.compute_us as f64 / 1000.0;
+            ledger.cpu_cold_probe_hot_gpu_ms = accounting.hot_gpu_us as f64 / 1000.0;
+            ledger.cpu_cold_probe_cold_gpu_ms = accounting.cold_gpu_us as f64 / 1000.0;
+            ledger.cpu_cold_probe_gpu_samples = accounting.gpu_samples;
+            ledger.cpu_cold_probe_hot_inflight_before = accounting.hot_inflight_before;
+            ledger.cpu_cold_probe_cold_inflight_before = accounting.cold_inflight_before;
+            ledger.cpu_cold_probe_hot_completed_after = accounting.hot_completed_after;
+            ledger.cpu_cold_probe_cold_completed_after = accounting.cold_completed_after;
+            ledger.cpu_cold_probe_checksum_xor = accounting.checksum_xor;
+
+            let cpu_us_per_unique = (accounting.unique_experts != 0)
+                .then_some(accounting.compute_us as f64 / accounting.unique_experts as f64);
+            let cpu_us_per_route = (accounting.routes != 0)
+                .then_some(accounting.compute_us as f64 / accounting.routes as f64);
+            let cold_gpu_us_per_unique = (accounting.unique_experts != 0)
+                .then_some(accounting.cold_gpu_us as f64 / accounting.unique_experts as f64);
+            let cold_gpu_us_per_route = (accounting.routes != 0)
+                .then_some(accounting.cold_gpu_us as f64 / accounting.routes as f64);
+            let cpu_fraction = accounting.stage1_cpu_fraction_estimate();
+            let cpu_fraction_e2e = accounting.stage1_cpu_fraction_e2e_estimate();
+            let q_cpu_unique =
+                cpu_fraction.map(|fraction| fraction * accounting.unique_experts as f64);
+            let q_cpu_routes = cpu_fraction.map(|fraction| fraction * accounting.routes as f64);
+            let q_cpu_unique_e2e =
+                cpu_fraction_e2e.map(|fraction| fraction * accounting.unique_experts as f64);
+            let q_cpu_routes_e2e =
+                cpu_fraction_e2e.map(|fraction| fraction * accounting.routes as f64);
+            let metric = |value: Option<f64>| {
+                value
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "na".to_string())
+            };
+            eprintln!(
+                "[metal chained cpu-cold-probe] admitted=1 profile=H11-shaped start_pos={start_pos} K={k_tokens} attempted_layers={} successful_layers={} gpu_samples={} failures={} cold_unique={} cold_routes={} cpu_prepare={:.3}ms cpu_compute={:.3}ms cpu_us_per_unique={} cpu_us_per_route={} hot_gpu={:.3}ms cold_gpu={:.3}ms cold_gpu_us_per_unique={} cold_gpu_us_per_route={} q_cpu_fraction_compute_stage1_estimate={} q_cpu_unique_compute_stage1_estimate={} q_cpu_routes_compute_stage1_estimate={} q_cpu_fraction_e2e_stage1_estimate={} q_cpu_unique_e2e_stage1_estimate={} q_cpu_routes_e2e_stage1_estimate={} hot_inflight_before={} cold_inflight_before={} hot_completed_after={} cold_completed_after={} read_overlap=0 cpu_gpu_overlap_candidate=hot-wave-only cold_stage_gpu_concurrent=0 cold_gpu_scope=expert+merge+tail gpu_scope_inflation=1 cpu_reuse_optimized=0 concurrent_cold_measured=0 linear_scaling_assumed=1 q_star_status=stage1-estimate-opposing-biases output_mutation=0 slot_policy_mutation=0 stage_write_race=0 checksum_xor=0x{:08x}",
+                accounting.attempted_layers,
+                accounting.successful_layers,
+                accounting.gpu_samples,
+                accounting.failures,
+                accounting.unique_experts,
+                accounting.routes,
+                ledger.cpu_cold_probe_prepare_ms,
+                ledger.cpu_cold_probe_compute_ms,
+                metric(cpu_us_per_unique),
+                metric(cpu_us_per_route),
+                ledger.cpu_cold_probe_hot_gpu_ms,
+                ledger.cpu_cold_probe_cold_gpu_ms,
+                metric(cold_gpu_us_per_unique),
+                metric(cold_gpu_us_per_route),
+                metric(cpu_fraction),
+                metric(q_cpu_unique),
+                metric(q_cpu_routes),
+                metric(cpu_fraction_e2e),
+                metric(q_cpu_unique_e2e),
+                metric(q_cpu_routes_e2e),
+                accounting.hot_inflight_before,
+                accounting.cold_inflight_before,
+                accounting.hot_completed_after,
+                accounting.cold_completed_after,
+                accounting.checksum_xor,
+            );
+        }
         if !record_demand_round_observed_routes(
             record_demand,
             file_mapped_demand,
@@ -28908,13 +31303,15 @@ impl Gemma4GhostCommonMetal {
                         (self.resident_scratch.router_logits_batch.contents() as *const f32)
                             .add(logits_elem)
                     };
-                    let router_slice = unsafe { std::slice::from_raw_parts(router_ptr, k_tokens * 128) };
+                    let router_slice =
+                        unsafe { std::slice::from_raw_parts(router_ptr, k_tokens * 128) };
                     let mut updated_slots = [0xFFFFFFFFu32; 128];
                     let mut union = Vec::new();
                     filler(
                         layer_idx,
                         router_slice,
                         None,
+                        Gemma4Q4SlotFillPhase::Demand,
                         &mut updated_slots,
                         &mut union,
                     );
@@ -28946,6 +31343,27 @@ impl Gemma4GhostCommonMetal {
             );
             self.last_chained_ledger = ledger;
             return false;
+        }
+        if let Some((staged_layer, staged_cold, mut staged_union)) = pending_staged_promotion.take()
+        {
+            let Some(filler) = slot_filler.as_deref_mut() else {
+                self.last_chained_ledger = ledger;
+                return false;
+            };
+            let mut staged_table = [0xFFFFFFFFu32; 128];
+            if !filler(
+                staged_layer,
+                &[],
+                Some(staged_cold.as_slice()),
+                Gemma4Q4SlotFillPhase::PublishCold,
+                &mut staged_table,
+                &mut staged_union,
+            ) {
+                ledger.overlap_fallbacks = ledger.overlap_fallbacks.saturating_add(1);
+                eprintln!(
+                    "[metal chained round] final layer {staged_layer} cold stage could not publish hot residency; canonical mapped fallback retained"
+                );
+            }
         }
         if stamp.pending_count() != 0 {
             eprintln!(
@@ -29028,6 +31446,117 @@ impl Gemma4GhostCommonMetal {
             }
         }
         ledger.download_ms = t_download.elapsed().as_secs_f64() * 1000.0;
+        if cold_recurrence_probe_round
+            && cold_recurrence_sample_valid
+            && cold_recurrence_observed_layers == n_layers
+        {
+            if let Some(current) = cold_recurrence_current.take() {
+                let previous_ready = self
+                    .cold_recurrence_previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.len() == current.len());
+                let baseline = vec![[false; 128]; current.len()];
+                let previous = self
+                    .cold_recurrence_previous
+                    .as_deref()
+                    .filter(|previous| previous.len() == current.len())
+                    .unwrap_or(&baseline);
+                if let Some((per_layer, round)) = cold_recurrence_tallies(previous, &current) {
+                    ledger.cold_recurrence_previous_ready = previous_ready;
+                    ledger.cold_recurrence_hits = round.hits;
+                    ledger.cold_recurrence_current = round.current;
+                    ledger.cold_recurrence_previous = round.previous;
+                    for (layer_idx, tally) in per_layer.iter().enumerate() {
+                        if let Some(value) =
+                            ledger.cold_recurrence_hits_per_layer.get_mut(layer_idx)
+                        {
+                            *value = tally.hits.min(u16::MAX as u32) as u16;
+                        }
+                        if let Some(value) =
+                            ledger.cold_recurrence_current_per_layer.get_mut(layer_idx)
+                        {
+                            *value = tally.current.min(u16::MAX as u32) as u16;
+                        }
+                        if let Some(value) =
+                            ledger.cold_recurrence_previous_per_layer.get_mut(layer_idx)
+                        {
+                            *value = tally.previous.min(u16::MAX as u32) as u16;
+                        }
+                    }
+
+                    let ordering = std::sync::atomic::Ordering::Relaxed;
+                    let (global_rounds, global_hits, global_current, global_previous) =
+                        if previous_ready {
+                            (
+                                SPEC_COLD_RECURRENCE_COMPARABLE_ROUNDS
+                                    .fetch_add(1, ordering)
+                                    .saturating_add(1),
+                                SPEC_COLD_RECURRENCE_HITS
+                                    .fetch_add(u64::from(round.hits), ordering)
+                                    .saturating_add(u64::from(round.hits)),
+                                SPEC_COLD_RECURRENCE_CURRENT
+                                    .fetch_add(u64::from(round.current), ordering)
+                                    .saturating_add(u64::from(round.current)),
+                                SPEC_COLD_RECURRENCE_PREVIOUS
+                                    .fetch_add(u64::from(round.previous), ordering)
+                                    .saturating_add(u64::from(round.previous)),
+                            )
+                        } else {
+                            (
+                                SPEC_COLD_RECURRENCE_COMPARABLE_ROUNDS.load(ordering),
+                                SPEC_COLD_RECURRENCE_HITS.load(ordering),
+                                SPEC_COLD_RECURRENCE_CURRENT.load(ordering),
+                                SPEC_COLD_RECURRENCE_PREVIOUS.load(ordering),
+                            )
+                        };
+                    let ratio = |hits: u64, total: u64| {
+                        (total != 0).then(|| format!("{:.6}", hits as f64 / total as f64))
+                    };
+                    let round_recall = previous_ready
+                        .then(|| ratio(u64::from(round.hits), u64::from(round.current)))
+                        .flatten()
+                        .unwrap_or_else(|| "na".to_owned());
+                    let round_precision = previous_ready
+                        .then(|| ratio(u64::from(round.hits), u64::from(round.previous)))
+                        .flatten()
+                        .unwrap_or_else(|| "na".to_owned());
+                    let global_recall =
+                        ratio(global_hits, global_current).unwrap_or_else(|| "na".to_owned());
+                    let global_precision =
+                        ratio(global_hits, global_previous).unwrap_or_else(|| "na".to_owned());
+                    eprintln!(
+                        "[metal chained cold-recurrence] source=previous-successful-exact-cold target=current-exact-cold scope=decode-publish0-mincold1 policy_mutation=0 start_pos={start_pos} K={k_tokens} previous_ready={} round_hits={} round_current={} round_previous={} round_recall={round_recall} round_precision={round_precision} global_comparable_rounds={global_rounds} global_hits={global_hits} global_current={global_current} global_previous={global_previous} global_recall={global_recall} global_precision={global_precision}",
+                        u8::from(previous_ready),
+                        round.hits,
+                        round.current,
+                        round.previous,
+                    );
+                    if gemma4_hybrid_cold_recurrence_per_layer_enabled() {
+                        let entries = per_layer
+                            .iter()
+                            .enumerate()
+                            .map(|(layer_idx, tally)| {
+                                format!(
+                                    "L{layer_idx}:{}/{}/{}",
+                                    tally.hits, tally.current, tally.previous
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        eprintln!(
+                            "[metal chained cold-recurrence layers] start_pos={start_pos} fields=hits/current/previous entries={entries}"
+                        );
+                    }
+                    // Commit the diagnostic snapshot only after all model and
+                    // output work above succeeded. No execution path reads it.
+                    self.cold_recurrence_previous = Some(current);
+                }
+            }
+        } else if cold_recurrence_probe_round {
+            eprintln!(
+                "[metal chained cold-recurrence] sample=skipped reason=incomplete-exact-layer-sample observed_layers={cold_recurrence_observed_layers} expected_layers={n_layers} policy_mutation=0 start_pos={start_pos} K={k_tokens}"
+            );
+        }
         self.last_chained_ledger = ledger;
         true
     }
@@ -41891,11 +44420,25 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 mod tests {
     #[test]
     fn anonymous_record_overlap_cannot_bypass_route_fill_publication() {
-        assert!(super::preencoded_record_round_can_commit_before_router(true));
-        assert!(!super::preencoded_record_round_can_commit_before_router(false));
+        assert!(super::preencoded_record_round_can_commit_before_router(
+            true
+        ));
+        assert!(!super::preencoded_record_round_can_commit_before_router(
+            false
+        ));
 
-        assert!(super::record_demand_round_observed_routes(false, false, &[], 2));
-        assert!(super::record_demand_round_observed_routes(true, true, &[], 2));
+        assert!(super::record_demand_round_observed_routes(
+            false,
+            false,
+            &[],
+            2
+        ));
+        assert!(super::record_demand_round_observed_routes(
+            true,
+            true,
+            &[],
+            2
+        ));
         assert!(super::record_demand_round_observed_routes(
             true,
             false,
@@ -41933,6 +44476,20 @@ mod tests {
             super::parse_gemma4_max_spec_chunk(Some("not-a-number")),
             super::GEMMA4_MAX_SPEC_CHUNK
         );
+    }
+
+    #[test]
+    fn hot_cold_single_down_admits_the_widened_kernel_range_only() {
+        assert!(!super::gemma4_hybrid_hot_cold_single_down_admits_k(0));
+        assert!(super::gemma4_hybrid_hot_cold_single_down_admits_k(1));
+        assert!(super::gemma4_hybrid_hot_cold_single_down_admits_k(8));
+        assert!(super::gemma4_hybrid_hot_cold_single_down_admits_k(10));
+        assert!(super::gemma4_hybrid_hot_cold_single_down_admits_k(
+            super::GEMMA4_MAX_WIDENED_SPEC_CHUNK
+        ));
+        assert!(!super::gemma4_hybrid_hot_cold_single_down_admits_k(
+            super::GEMMA4_MAX_WIDENED_SPEC_CHUNK + 1
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -45170,8 +47727,15 @@ kernel void sample_active_expert_records(
             .materialize_for_active_slots(&[7])
             .expect("hot canonical override binding");
         assert_eq!(materialized.bound_tier_record_counts(), Some((1, 0)));
+        let mapped_only = source
+            .materialize_for_active_slots(&[8, 9])
+            .expect("simultaneous mapped-only canonical binding");
+        assert_eq!(mapped_only.bound_tier_record_counts(), Some((0, 2)));
         assert!(slots.begin_hybrid_refill().is_none());
         drop(materialized);
+        // Either in-flight table lease independently excludes refill.
+        assert!(slots.begin_hybrid_refill().is_none());
+        drop(mapped_only);
 
         // The published hot directory is unchanged, but the second active
         // union adds a cold canonical record. A cache keyed only by hot IDs

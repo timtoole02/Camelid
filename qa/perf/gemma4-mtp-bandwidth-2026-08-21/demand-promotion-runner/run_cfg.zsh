@@ -1,12 +1,22 @@
 #!/bin/zsh
 # Parameterized Gemma4 26B MoE serve benchmark.
 #   run_cfg.zsh <label> <envfile>
-# envfile holds one KEY=VALUE per line (no export, no quotes).
+# envfile holds one KEY=VALUE per line (no export, no quotes). A literal
+# multi-line value can be loaded from a file relative to envfile with
+# KEY@FILE=path; this is needed for CAMELID_GEMMA4_SPEC_SEED_TEXT fixtures.
 set -euo pipefail
 zmodload zsh/datetime
 
+(( $# == 2 )) || {
+  print -u2 "usage: ${0:t} <label> <envfile>"
+  exit 64
+}
 readonly label=$1
 readonly envfile=$2
+[[ -n $label && $label == [A-Za-z0-9]* && $label != *[^A-Za-z0-9._-]* ]] || {
+  print -u2 "REFUSED: label must be one filename component beginning with an alphanumeric: $label"
+  exit 75
+}
 readonly PORT=${CAMELID_BENCH_PORT:-8189}
 readonly repo=/Users/timtoole/Documents/Camelid
 readonly runner=$repo/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner
@@ -27,20 +37,82 @@ typeset free_percent
 free_percent=$(/usr/bin/memory_pressure -Q | /usr/bin/awk '/free percentage/ {gsub(/%/,"",$5); print $5}')
 (( free_percent >= 55 )) || { print -u2 "REFUSED: free memory ${free_percent}% < 55%"; exit 75 }
 
-/bin/rm -rf $out; /bin/mkdir -p $out
+/bin/rm -rf -- "$out"
+/bin/mkdir -p -- "$out"
 readonly server_log=$out/server.log
 readonly response=$out/response.json
 
-typeset -a envargs
-envargs=(HOME=/Users/timtoole PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp)
+typeset -a envargs manifest_lines
+typeset -A seen_env_keys
+envargs=()
+manifest_lines=(manifest_format=base64-v1)
+readonly file_value_sentinel='__CAMELID_ENV_FILE_VALUE_EOF_7C89D1A6__'
+
+manifest_encode() {
+  print -rn -- "$1" | /usr/bin/base64 | /usr/bin/tr -d '\n'
+}
+
+record_manifest_value() {
+  typeset key=$1 value=$2 encoded
+  encoded=$(manifest_encode "$value")
+  manifest_lines+=("$key@BASE64=$encoded")
+}
+
+add_env_value() {
+  typeset key=$1 value=$2
+  [[ -n $key && $key == [A-Za-z_]* && $key != *[^A-Za-z0-9_]* ]] || {
+    print -u2 "REFUSED: invalid environment identifier: $key"
+    exit 75
+  }
+  [[ -z ${seen_env_keys[$key]:-} ]] || {
+    print -u2 "REFUSED: duplicate environment identifier: $key"
+    exit 75
+  }
+  seen_env_keys[$key]=1
+  envargs+=("$key=$value")
+  record_manifest_value "$key" "$value"
+}
+
+add_env_value HOME /Users/timtoole
+add_env_value PATH /usr/bin:/bin:/usr/sbin:/sbin
+add_env_value TMPDIR /tmp
 while IFS= read -r line; do
   [[ -z $line || $line == \#* ]] && continue
+  if [[ $line == *'@FILE='* ]]; then
+    typeset key=${line%%@FILE=*}
+    typeset value_path=${line#*@FILE=}
+    [[ -n $key && $key == [A-Za-z_]* && $key != *[^A-Za-z0-9_]* && -n $value_path ]] || {
+      print -u2 "REFUSED: malformed KEY@FILE entry in $envfile: $line"; exit 75
+    }
+    [[ $value_path = /* ]] || value_path="${envfile:A:h}/$value_path"
+    value_path=${value_path:A}
+    [[ -f $value_path ]] || {
+      print -u2 "REFUSED: no value file $value_path for $key"; exit 75
+    }
+    # Command substitution normally strips every trailing newline. Append a
+    # sentinel first, then remove exactly that suffix so the environment value
+    # remains byte-for-byte identical to the text file (NUL is not representable
+    # in a Unix environment value).
+    typeset file_value_with_sentinel file_value
+    file_value_with_sentinel="$(/bin/cat -- "$value_path"; print -rn -- "$file_value_sentinel")"
+    [[ $file_value_with_sentinel == *$file_value_sentinel ]] || {
+      print -u2 "REFUSED: could not preserve value file $value_path for $key"; exit 75
+    }
+    file_value=${file_value_with_sentinel%$file_value_sentinel}
+    add_env_value "$key" "$file_value"
+    continue
+  fi
   line=${line//__ASSISTANT__/$assistant}
-  envargs+=("$line")
-done < $envfile
-print -rl -- "${envargs[@]}" > $out/env.txt
-print -r -- "binary=$binary" >> $out/env.txt
-print -r -- "cache_mib=$cache_mib" >> $out/env.txt
+  [[ $line == *=* ]] || {
+    print -u2 "REFUSED: malformed KEY=VALUE entry in $envfile: $line"; exit 75
+  }
+  typeset key=${line%%=*}
+  typeset value=${line#*=}
+  add_env_value "$key" "$value"
+done < "$envfile"
+record_manifest_value binary "$binary"
+record_manifest_value cache_mib "$cache_mib"
+print -rl -- "${manifest_lines[@]}" > "$out/env.txt"
 /usr/bin/memory_pressure -Q > $out/pre-memory.txt
 /usr/sbin/sysctl vm.swapusage >> $out/pre-memory.txt
 

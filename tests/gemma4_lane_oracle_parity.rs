@@ -140,11 +140,10 @@ fn gemma4_lane_oracle_parity() {
     let mut failures: Vec<String> = Vec::new();
 
     // Committed llama.cpp greedy ids (see the module docs for how to regenerate).
-    let oracle: Option<serde_json::Value> = std::fs::read_to_string(
-        "qa/evidence-bundles/gemma4-26b-oracle/llamacpp_greedy_ids.json",
-    )
-    .ok()
-    .and_then(|t| serde_json::from_str(&t).ok());
+    let oracle: Option<serde_json::Value> =
+        std::fs::read_to_string("qa/evidence-bundles/gemma4-26b-oracle/llamacpp_greedy_ids.json")
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok());
     if oracle.is_none() {
         println!("[warn] llama.cpp fixture missing; lane-vs-lane checks only");
     }
@@ -256,7 +255,10 @@ fn gemma4_lane_oracle_parity() {
         println!("[ids spec   ] {spec_ids:?}");
         println!(
             "[text head  ] {:?}",
-            runtime.tokenizer().decode(&head_ids, true).unwrap_or_default()
+            runtime
+                .tokenizer()
+                .decode(&head_ids, true)
+                .unwrap_or_default()
         );
         println!(
             "[text chained] {:?}",
@@ -267,7 +269,10 @@ fn gemma4_lane_oracle_parity() {
         );
         println!(
             "[text spec  ] {:?}",
-            runtime.tokenizer().decode(&spec_ids, true).unwrap_or_default()
+            runtime
+                .tokenizer()
+                .decode(&spec_ids, true)
+                .unwrap_or_default()
         );
 
         match first_divergence(&head_ids, &chained_ids) {
@@ -287,7 +292,12 @@ fn gemma4_lane_oracle_parity() {
                         "[gap ] head  top1={:?} top2={:?} gap={:.3e}\n\
                          [gap ] chain top1={:?} top2={:?} gap={:.3e}\n\
                          [gap ] -> {}",
-                        h.0, h.1, h.2, c.0, c.1, c.2,
+                        h.0,
+                        h.1,
+                        h.2,
+                        c.0,
+                        c.1,
+                        c.2,
                         if h.2.min(c.2) < 1e-3 {
                             "NEAR-TIE: the two lanes rounded a genuine tie apart"
                         } else {
@@ -306,7 +316,11 @@ fn gemma4_lane_oracle_parity() {
         if let Some(o) = oracle.as_ref().and_then(|o| o.get(name)) {
             let raw: Vec<u32> = o["gen_ids"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64().map(|x| x as u32))
+                        .collect()
+                })
                 .unwrap_or_default();
             let oracle_ids = strip_stops(&raw, &eot);
             println!("[ids oracle ] {oracle_ids:?}");

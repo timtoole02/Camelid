@@ -59,6 +59,8 @@ const LOCAL_ATTENTION_SPAN: usize = LOCAL_WINDOW + 1;
 const FULL_HEAD_DIM: usize = 512;
 const FULL_KV_HEADS: usize = 2;
 const MTP_CHAIN_MAX_DRAFTS: usize = 16;
+const MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX: usize = 3;
+const MTP_STEP3_LOGIT_TRACE_ENV: &str = "CAMELID_GEMMA4_MTP_STEP3_LOGIT_TRACE";
 // Official Gemma 4 proportional RoPE keeps the normal split-half geometry for
 // the entire 512-wide head, but gives only the first quarter of dimensions a
 // non-zero angle: 512 * 0.25 / 2 = 64 active pairs.  In particular, pair d is
@@ -1203,6 +1205,27 @@ fn parse_full_q4_opt_in(value: Option<&str>) -> std::result::Result<bool, &'stat
     parse_device_chain_opt_in(value)
 }
 
+fn mtp_step3_logit_trace_enabled_value(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+fn mtp_step3_logit_capture_enabled_values(
+    trace_value: Option<&str>,
+    explicit_capture: bool,
+) -> bool {
+    mtp_step3_logit_trace_enabled_value(trace_value) || explicit_capture
+}
+
+fn mtp_step3_logit_capture_enabled(explicit_capture: bool) -> bool {
+    let trace_value = std::env::var(MTP_STEP3_LOGIT_TRACE_ENV).ok();
+    mtp_step3_logit_capture_enabled_values(trace_value.as_deref(), explicit_capture)
+}
+
 fn full_q4_requested_from_environment() -> Result<bool> {
     const NAME: &str = "CAMELID_GEMMA4_MTP_FULL_Q4";
     match std::env::var(NAME) {
@@ -1779,6 +1802,8 @@ pub struct Gemma4MtpProposal {
     pub recurrent_hidden: Vec<f32>,
     pub timing: Gemma4MtpProposalTiming,
     pub ledger: Gemma4MtpProposalLedger,
+    /// Default-off diagnostic snapshot attached only to zero-based draft 3.
+    pub(crate) step3_assistant_logits: Option<Vec<f32>>,
     #[cfg(test)]
     stage_snapshots: Vec<MtpStageSnapshot>,
 }
@@ -2348,22 +2373,7 @@ impl Gemma4MtpAssistantMetal {
         // therefore run the assistant query at position == shared-KV length;
         // every autoregressive assistant proposal reuses this same position.
         let proposal_position = logical_len;
-        write_rope_tables(
-            proposal_position,
-            10_000.0,
-            LOCAL_HEAD_DIM,
-            LOCAL_HEAD_DIM / 2,
-            &self.scratch.local_cos,
-            &self.scratch.local_sin,
-        );
-        write_rope_tables(
-            proposal_position,
-            1_000_000.0,
-            FULL_HEAD_DIM,
-            FULL_ROPE_ACTIVE_PAIRS,
-            &self.scratch.full_cos,
-            &self.scratch.full_sin,
-        );
+        write_assistant_rope_tables(proposal_position, &self.scratch);
 
         let (local_start, local_count) = assistant_local_attention_bounds(logical_len);
         write_attention_scalar(
@@ -2600,6 +2610,7 @@ impl Gemma4MtpAssistantMetal {
                 kernel_us,
             },
             ledger,
+            step3_assistant_logits: None,
             #[cfg(test)]
             stage_snapshots,
         })
@@ -2615,6 +2626,33 @@ impl Gemma4MtpAssistantMetal {
         target_kv: Gemma4MtpTargetKvView<'_>,
         draft_limit: usize,
         eot: &[u32],
+        get_token_embedding: F,
+    ) -> Result<Vec<Gemma4MtpProposal>>
+    where
+        F: FnMut(u32, &mut [f32]) -> Result<()>,
+    {
+        self.propose_chain_with_step3_logit_capture(
+            anchor_token,
+            initial_recurrent_hidden,
+            target_kv,
+            draft_limit,
+            eot,
+            false,
+            get_token_embedding,
+        )
+    }
+
+    /// Chained assistant sequence with an optional one-shot step-3 logit
+    /// snapshot. The existing trace environment remains an independent opt-in;
+    /// callers use `capture_step3_logits` to request capture for this call only.
+    pub(crate) fn propose_chain_with_step3_logit_capture<F>(
+        &mut self,
+        anchor_token: u32,
+        initial_recurrent_hidden: &[f32],
+        target_kv: Gemma4MtpTargetKvView<'_>,
+        draft_limit: usize,
+        eot: &[u32],
+        capture_step3_logits: bool,
         mut get_token_embedding: F,
     ) -> Result<Vec<Gemma4MtpProposal>>
     where
@@ -2639,22 +2677,7 @@ impl Gemma4MtpAssistantMetal {
         }
 
         let proposal_position = logical_len;
-        write_rope_tables(
-            proposal_position,
-            10_000.0,
-            LOCAL_HEAD_DIM,
-            LOCAL_HEAD_DIM / 2,
-            &self.scratch.local_cos,
-            &self.scratch.local_sin,
-        );
-        write_rope_tables(
-            proposal_position,
-            1_000_000.0,
-            FULL_HEAD_DIM,
-            FULL_HEAD_DIM / 2,
-            &self.scratch.full_cos,
-            &self.scratch.full_sin,
-        );
+        write_assistant_rope_tables(proposal_position, &self.scratch);
 
         let (local_start, local_count) = assistant_local_attention_bounds(logical_len);
         write_attention_scalar(
@@ -2679,6 +2702,8 @@ impl Gemma4MtpAssistantMetal {
         let kernel =
             metal_linear_kernel().ok_or_else(|| invalid("Metal common core disappeared"))?;
         let attention_scores = shared_buffer(&kernel.device, score_bytes);
+        let capture_step3_logits = draft_limit > MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX
+            && mtp_step3_logit_capture_enabled(capture_step3_logits);
 
         let mut proposals = Vec::with_capacity(draft_limit);
         let mut current_token = anchor_token;
@@ -2870,6 +2895,15 @@ impl Gemma4MtpAssistantMetal {
                 )));
             }
 
+            let step3_assistant_logits =
+                if capture_step3_logits && step == MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX {
+                    let mut logits = vec![0.0f32; VOCAB];
+                    read_buffer_f32(&self.scratch.logits, &mut logits);
+                    Some(logits)
+                } else {
+                    None
+                };
+
             read_buffer_f32(
                 &self.scratch.recurrent_hidden,
                 &mut current_recurrent_hidden,
@@ -2887,6 +2921,7 @@ impl Gemma4MtpAssistantMetal {
                     kernel_us,
                 },
                 ledger: Gemma4MtpProposalLedger::default(),
+                step3_assistant_logits,
                 #[cfg(test)]
                 stage_snapshots: Vec::new(),
             });
@@ -2916,6 +2951,29 @@ impl Gemma4MtpAssistantMetal {
         target_embedding: Gemma4MtpTargetEmbeddingView<'_>,
         draft_limit: usize,
         eot: &[u32],
+    ) -> Result<Vec<Gemma4MtpProposal>> {
+        self.propose_chain_device_resident_with_step3_logit_capture(
+            anchor_token,
+            initial_recurrent_hidden,
+            target_kv,
+            target_embedding,
+            draft_limit,
+            eot,
+            false,
+        )
+    }
+
+    /// Device-fed chain with an optional one-shot step-3 logit snapshot. The
+    /// trace environment is still honored independently of the per-call flag.
+    pub(crate) fn propose_chain_device_resident_with_step3_logit_capture(
+        &mut self,
+        anchor_token: u32,
+        initial_recurrent_hidden: &[f32],
+        target_kv: Gemma4MtpTargetKvView<'_>,
+        target_embedding: Gemma4MtpTargetEmbeddingView<'_>,
+        draft_limit: usize,
+        eot: &[u32],
+        capture_step3_logits: bool,
     ) -> Result<Vec<Gemma4MtpProposal>> {
         if draft_limit == 0 {
             return Ok(Vec::new());
@@ -2952,22 +3010,7 @@ impl Gemma4MtpAssistantMetal {
         validate_target_kv_device(&target_kv, device_registry_id)?;
 
         let wall_started = Instant::now();
-        write_rope_tables(
-            logical_len,
-            10_000.0,
-            LOCAL_HEAD_DIM,
-            LOCAL_HEAD_DIM / 2,
-            &self.scratch.local_cos,
-            &self.scratch.local_sin,
-        );
-        write_rope_tables(
-            logical_len,
-            1_000_000.0,
-            FULL_HEAD_DIM,
-            FULL_HEAD_DIM / 2,
-            &self.scratch.full_cos,
-            &self.scratch.full_sin,
-        );
+        write_assistant_rope_tables(logical_len, &self.scratch);
 
         let (local_start, local_count) = assistant_local_attention_bounds(logical_len);
         write_attention_scalar(
@@ -2997,6 +3040,9 @@ impl Gemma4MtpAssistantMetal {
             ));
         }
         let attention_scores = shared_buffer(&kernel.device, score_bytes);
+        let step3_logits_snapshot = (draft_limit > MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX
+            && mtp_step3_logit_capture_enabled(capture_step3_logits))
+        .then(|| shared_buffer(&kernel.device, VOCAB * std::mem::size_of::<f32>()));
 
         write_buffer_f32(&self.scratch.recurrent_hidden, initial_recurrent_hidden);
         unsafe {
@@ -3160,6 +3206,18 @@ impl Gemma4MtpAssistantMetal {
                 (step * std::mem::size_of::<u32>()) as u64,
                 VOCAB,
             );
+            if step == MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX {
+                if let Some(snapshot) = step3_logits_snapshot.as_ref() {
+                    encode_copy_f32_to_offset(
+                        encoder,
+                        &self.pipelines.copy_f32,
+                        &self.scratch.logits,
+                        snapshot,
+                        0,
+                        VOCAB,
+                    );
+                }
+            }
         }
         encoder.end_encoding();
         let encode_us = encode_started.elapsed().as_micros();
@@ -3180,10 +3238,27 @@ impl Gemma4MtpAssistantMetal {
         read_buffer_f32(&self.scratch.chain_recurrent_hidden, &mut recurrent_rows);
         let token_ptr = self.scratch.output_token.contents().cast::<u32>();
         let tokens = unsafe { std::slice::from_raw_parts(token_ptr, draft_limit) }.to_vec();
+        let mut step3_assistant_logits = step3_logits_snapshot.as_ref().map(|snapshot| {
+            let mut logits = vec![0.0f32; VOCAB];
+            read_buffer_f32(snapshot, &mut logits);
+            logits
+        });
 
         let borrowed_target_kv_capacity_bytes = borrowed_target_kv_capacity_bytes(&target_kv)?;
         let per_step_kv_read_bytes = target_kv_read_bytes(local_count, logical_len)?;
         let draft_count_u64 = draft_limit as u64;
+        let readback_bytes = draft_count_u64
+            .checked_mul(
+                (std::mem::size_of::<u32>() + TARGET_HIDDEN * std::mem::size_of::<f32>()) as u64,
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    step3_logits_snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.length()),
+                )
+            })
+            .ok_or_else(|| invalid("device-chain readback ledger overflow"))?;
         let ledger = Gemma4MtpProposalLedger {
             assistant_matrix_bytes: self
                 .assistant_matrix_bytes_per_proposal()
@@ -3194,12 +3269,7 @@ impl Gemma4MtpAssistantMetal {
                 .checked_mul(draft_count_u64)
                 .ok_or_else(|| invalid("device-chain target-KV ledger overflow"))?,
             dynamic_attention_scratch_bytes: attention_scores.length(),
-            readback_bytes: draft_count_u64
-                .checked_mul(
-                    (std::mem::size_of::<u32>() + TARGET_HIDDEN * std::mem::size_of::<f32>())
-                        as u64,
-                )
-                .ok_or_else(|| invalid("device-chain readback ledger overflow"))?,
+            readback_bytes,
         };
         let total_timing = Gemma4MtpProposalTiming {
             encode_us,
@@ -3237,6 +3307,11 @@ impl Gemma4MtpAssistantMetal {
                     ledger
                 } else {
                     Gemma4MtpProposalLedger::default()
+                },
+                step3_assistant_logits: if step == MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX {
+                    step3_assistant_logits.take()
+                } else {
+                    None
                 },
                 #[cfg(test)]
                 stage_snapshots: Vec::new(),
@@ -4682,6 +4757,36 @@ fn write_rope_tables(
     write_buffer_f32(sin_buffer, &sin);
 }
 
+/// Populate the one-position RoPE tables shared by the reference, CPU-chain,
+/// and device-chain proposal paths. Keeping the proportional full-attention
+/// geometry behind this parameter-free seam prevents a chain from silently
+/// rotating the 192 inactive split-half pairs.
+fn write_assistant_rope_tables(position: usize, scratch: &MtpScratch) {
+    write_rope_tables(
+        position,
+        10_000.0,
+        LOCAL_HEAD_DIM,
+        LOCAL_HEAD_DIM / 2,
+        &scratch.local_cos,
+        &scratch.local_sin,
+    );
+    let (cos, sin) = full_rope_table_values(position);
+    debug_assert_eq!(
+        scratch.full_cos.length() as usize,
+        cos.len() * std::mem::size_of::<f32>()
+    );
+    debug_assert_eq!(
+        scratch.full_sin.length() as usize,
+        sin.len() * std::mem::size_of::<f32>()
+    );
+    write_buffer_f32(&scratch.full_cos, &cos);
+    write_buffer_f32(&scratch.full_sin, &sin);
+}
+
+fn full_rope_table_values(position: usize) -> (Vec<f32>, Vec<f32>) {
+    rope_table_values(position, 1_000_000.0, FULL_HEAD_DIM, FULL_ROPE_ACTIVE_PAIRS)
+}
+
 /// Build a full split-half RoPE table. `active_pairs` controls how many
 /// frequencies rotate; it never changes the split-half partner stride.  This
 /// mirrors Transformers proportional RoPE (real frequencies followed by
@@ -4887,6 +4992,31 @@ mod tests {
         assert_eq!(parse_device_chain_opt_in(Some("TrUe")), Ok(true));
         assert!(parse_device_chain_opt_in(Some("yes")).is_err());
         assert!(parse_device_chain_opt_in(Some("")).is_err());
+    }
+
+    #[test]
+    fn step3_logit_trace_is_default_off_and_accepts_only_explicit_truthy_values() {
+        assert!(!mtp_step3_logit_trace_enabled_value(None));
+        assert!(!mtp_step3_logit_trace_enabled_value(Some("0")));
+        assert!(!mtp_step3_logit_trace_enabled_value(Some("false")));
+        assert!(!mtp_step3_logit_trace_enabled_value(Some("unexpected")));
+        assert!(mtp_step3_logit_trace_enabled_value(Some("1")));
+        assert!(mtp_step3_logit_trace_enabled_value(Some(" TrUe ")));
+        assert!(mtp_step3_logit_trace_enabled_value(Some("ON")));
+        assert!(mtp_step3_logit_trace_enabled_value(Some("yes")));
+    }
+
+    #[test]
+    fn step3_logit_capture_is_enabled_by_trace_or_explicit_per_call_request() {
+        assert!(!mtp_step3_logit_capture_enabled_values(None, false));
+        assert!(!mtp_step3_logit_capture_enabled_values(
+            Some("false"),
+            false
+        ));
+        assert!(mtp_step3_logit_capture_enabled_values(Some("1"), false));
+        assert!(mtp_step3_logit_capture_enabled_values(None, true));
+        assert!(mtp_step3_logit_capture_enabled_values(Some("false"), true));
+        assert!(mtp_step3_logit_capture_enabled_values(Some("true"), true));
     }
 
     #[test]
@@ -5526,10 +5656,11 @@ mod tests {
     fn proportional_rope_preserves_full_head_pair_stride() {
         assert_eq!(FULL_HEAD_DIM / 2, 256);
         assert_eq!(FULL_ROPE_ACTIVE_PAIRS, 64);
-        let (cos, sin) =
-            rope_table_values(1_030, 1_000_000.0, FULL_HEAD_DIM, FULL_ROPE_ACTIVE_PAIRS);
+        let (cos, sin) = full_rope_table_values(1_030);
         assert_eq!(cos.len(), 256);
         assert_eq!(sin.len(), 256);
+        assert_ne!(cos[FULL_ROPE_ACTIVE_PAIRS - 1].to_bits(), 1.0f32.to_bits());
+        assert_ne!(sin[FULL_ROPE_ACTIVE_PAIRS - 1].to_bits(), 0.0f32.to_bits());
         assert!(cos[FULL_ROPE_ACTIVE_PAIRS..]
             .iter()
             .all(|value| value.to_bits() == 1.0f32.to_bits()));
@@ -5555,6 +5686,28 @@ mod tests {
         assert_eq!(head[256], sin[0] + 2.0 * cos[0]);
         assert_eq!(head[64].to_bits(), 3.0f32.to_bits());
         assert_eq!(head[320].to_bits(), 4.0f32.to_bits());
+    }
+
+    #[test]
+    fn cpu_and_device_chains_share_proportional_full_rope_tables() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let scratch = MtpScratch::new(&kernel.device);
+        write_assistant_rope_tables(1_030, &scratch);
+
+        let mut cos = vec![0.0f32; FULL_HEAD_DIM / 2];
+        let mut sin = vec![0.0f32; FULL_HEAD_DIM / 2];
+        read_buffer_f32(&scratch.full_cos, &mut cos);
+        read_buffer_f32(&scratch.full_sin, &mut sin);
+        assert_ne!(cos[FULL_ROPE_ACTIVE_PAIRS - 1].to_bits(), 1.0f32.to_bits());
+        assert_ne!(sin[FULL_ROPE_ACTIVE_PAIRS - 1].to_bits(), 0.0f32.to_bits());
+        assert!(cos[FULL_ROPE_ACTIVE_PAIRS..]
+            .iter()
+            .all(|value| value.to_bits() == 1.0f32.to_bits()));
+        assert!(sin[FULL_ROPE_ACTIVE_PAIRS..]
+            .iter()
+            .all(|value| value.to_bits() == 0.0f32.to_bits()));
     }
 
     #[test]

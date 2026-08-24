@@ -41,7 +41,10 @@ const IDLE_STATS: [(&str, &std::sync::atomic::AtomicU64); 21] = [
     ("slot_evictions", &camelid::metal::SPEC_SLOT_EVICTIONS),
     ("prev_union_hits", &camelid::metal::SPEC_PREV_UNION_HITS),
     ("prev_union_total", &camelid::metal::SPEC_PREV_UNION_TOTAL),
-    ("resident_start_hits", &camelid::metal::SPEC_RESIDENT_START_HITS),
+    (
+        "resident_start_hits",
+        &camelid::metal::SPEC_RESIDENT_START_HITS,
+    ),
     ("overlap_layers", &camelid::metal::SPEC_OVERLAP_LAYERS),
     ("overlap_fallbacks", &camelid::metal::SPEC_OVERLAP_FALLBACKS),
 ];
@@ -243,7 +246,10 @@ fn gemma4_spec50_bench() {
             );
             println!(
                 "[greedy] text: {:?}",
-                runtime.tokenizer().decode(&greedy_tokens, true).unwrap_or_default()
+                runtime
+                    .tokenizer()
+                    .decode(&greedy_tokens, true)
+                    .unwrap_or_default()
             );
         }
 
@@ -268,8 +274,10 @@ fn gemma4_spec50_bench() {
             let hg0 = camelid::metal::HEAD_GPU_US.load(Relaxed);
             let hc0 = camelid::metal::HEAD_CALLS.load(Relaxed);
             let hr0 = camelid::metal::HEAD_ROWS.load(Relaxed);
-            let rounds0 = camelid::metal::SPEC_VERIFY_ROUNDS.load(std::sync::atomic::Ordering::Relaxed);
-            let acc0 = camelid::metal::SPEC_ACCEPTED_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+            let rounds0 =
+                camelid::metal::SPEC_VERIFY_ROUNDS.load(std::sync::atomic::Ordering::Relaxed);
+            let acc0 =
+                camelid::metal::SPEC_ACCEPTED_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
             // Exposed-idle decomposition baselines.
             let idle0: Vec<u64> = IDLE_STATS.iter().map(|(_, a)| a.load(Relaxed)).collect();
             // Eviction-cause baselines: cold misses + re-miss distance histogram.
@@ -291,8 +299,12 @@ fn gemma4_spec50_bench() {
                 .spec_decode_generate(&mut kc, &mut vc, logits, &prompt_tokens, &eot, max_new)
                 .unwrap();
             let decode_s = t1.elapsed().as_secs_f64();
-            let rounds = camelid::metal::SPEC_VERIFY_ROUNDS.load(std::sync::atomic::Ordering::Relaxed) - rounds0;
-            let acc = camelid::metal::SPEC_ACCEPTED_TOKENS.load(std::sync::atomic::Ordering::Relaxed) - acc0;
+            let rounds = camelid::metal::SPEC_VERIFY_ROUNDS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - rounds0;
+            let acc = camelid::metal::SPEC_ACCEPTED_TOKENS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - acc0;
             let head_wall_ms = (camelid::metal::HEAD_WALL_US.load(Relaxed) - hw0) as f64 / 1000.0;
             let head_gpu_ms = (camelid::metal::HEAD_GPU_US.load(Relaxed) - hg0) as f64 / 1000.0;
             let head_calls = camelid::metal::HEAD_CALLS.load(Relaxed) - hc0;
@@ -466,7 +478,10 @@ fn gemma4_spec50_bench() {
                 "{{\"workload\":\"{name}\",\"k\":{k},\"greedy_tok_s\":{greedy_tok_s:.2},\"greedy_p50_ms\":{greedy_med_ms:.1},\"spec_tok_s\":{spec_tok_s:.2},\"rounds\":{rounds},\"alpha\":{alpha:.2},\"tokens\":{},\"exact\":{exact}}}",
                 spec_tokens.len()
             ));
-            assert!(exact, "speculative stream diverged from greedy on {name} K={k}");
+            assert!(
+                exact,
+                "speculative stream diverged from greedy on {name} K={k}"
+            );
         }
     }
     println!("\n[spec50-summary]");

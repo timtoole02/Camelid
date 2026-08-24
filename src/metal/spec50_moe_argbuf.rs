@@ -168,6 +168,116 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k(
     }
 }
 
+// Exact K<=12 register-narrow twin of the general K=16 kernel. This keeps only
+// the 24 floating-point accumulators that K=9..12 can address while preserving
+// every load, integer fold, floating-point expression, and output index above.
+kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k12(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device Gemma4ExpertPointerTable& expert_table [[buffer(2)]],
+    device const Gemma4UniqueExpertWork* work_list [[buffer(3)]],
+    device float* output_scales [[buffer(4)]],
+    device char* output_quants [[buffer(5)]],
+    constant uint& num_unique_experts [[buffer(6)]],
+    constant uint& k_candidates [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint b = group % G4Q4_DOWN_BLOCKS;
+    const uint u = group / G4Q4_DOWN_BLOCKS;
+    if (u >= num_unique_experts) return;
+    if (k_candidates == 0u || k_candidates > 12u) return;
+
+    const Gemma4UniqueExpertWork work = work_list[u];
+    const ulong mask = work.candidate_mask;
+    if (mask == 0ULL) return;
+
+    const uint expert_id = work.expert_weight_offset / G4Q4_SLOT_STRIDE;
+    device const uchar* weights = expert_table.records[expert_id];
+    const uint row = b * 32u + lane;
+    device const uchar* gate_row = weights + ulong(row) * G4Q4_GU_ROW_BYTES;
+    device const uchar* up_row = weights + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
+
+    float gate_acc[12];
+    float up_acc[12];
+    #pragma unroll
+    for (uint t = 0; t < 12; ++t) {
+        gate_acc[t] = 0.0f;
+        up_acc[t] = 0.0f;
+    }
+
+    for (uint gb = 0; gb < G4Q4_GU_BLOCKS; ++gb) {
+        device const uchar* b_gate = gate_row + ulong(gb) * G4Q4_WIRE;
+        device const uchar* b_up = up_row + ulong(gb) * G4Q4_WIRE;
+        const float w_scale_gate = float(*reinterpret_cast<device const half*>(b_gate));
+        const float w_scale_up = float(*reinterpret_cast<device const half*>(b_up));
+
+        device const packed_uchar4* pg4 =
+            reinterpret_cast<device const packed_uchar4*>(b_gate + 2);
+        device const packed_uchar4* pu4 =
+            reinterpret_cast<device const packed_uchar4*>(b_up + 2);
+
+        uchar4 rg[4], ru[4];
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            rg[k] = uchar4(pg4[k]);
+            ru[k] = uchar4(pu4[k]);
+        }
+
+        #pragma unroll
+        for (uint t = 0; t < 12; ++t) {
+            if (t >= k_candidates) continue;
+            if ((mask & (1ULL << t)) == 0ULL) continue;
+            device const char* x = input_quants + ulong(t) * G4Q4_HIDDEN + ulong(gb) * 32ul;
+            device const char4* xlo4 = reinterpret_cast<device const char4*>(x);
+            device const char4* xhi4 = reinterpret_cast<device const char4*>(x + 16);
+            const float in_scale = input_scales[ulong(t) * G4Q4_GU_BLOCKS + gb];
+
+            int4 ag = int4(0);
+            int4 au = int4(0);
+            #pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                const int4 xl = int4(xlo4[k]);
+                const int4 xh = int4(xhi4[k]);
+                ag += (int4(rg[k] & uchar4(0x0f)) - 8) * xl + (int4(rg[k] >> 4) - 8) * xh;
+                au += (int4(ru[k] & uchar4(0x0f)) - 8) * xl + (int4(ru[k] >> 4) - 8) * xh;
+            }
+            const int isum_gate = (ag.x + ag.y) + (ag.z + ag.w);
+            const int isum_up = (au.x + au.y) + (au.z + au.w);
+
+            gate_acc[t] += (float(isum_gate) * w_scale_gate) * in_scale;
+            up_acc[t] += (float(isum_up) * w_scale_up) * in_scale;
+        }
+    }
+
+    #pragma unroll
+    for (uint t = 0; t < 12; ++t) {
+        if (t >= k_candidates) continue;
+        if ((mask & (1ULL << t)) == 0ULL) continue;
+        const float gate = gate_acc[t];
+        const float up = up_acc[t];
+        const float inner = 0.7978845608f * (gate + 0.044715f * gate * gate * gate);
+        const float gelu = 0.5f * gate * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+        const float act_val = gelu * up;
+
+        const float max_abs = simd_max(fabs(act_val));
+        const float unrounded = max_abs / 127.0f;
+        const float stored_scale = float(half(unrounded));
+        const float inverse = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+
+        if (lane == 0) {
+            const ulong scale_idx = ulong(u) * ulong(k_candidates) * G4Q4_DOWN_BLOCKS
+                + ulong(t) * G4Q4_DOWN_BLOCKS + ulong(b);
+            output_scales[scale_idx] = stored_scale;
+        }
+
+        const int q = clamp(int(round(act_val * inverse)), -127, 127);
+        const ulong quant_idx = ulong(u) * ulong(k_candidates) * G4Q4_FF
+            + ulong(t) * G4Q4_FF + ulong(row);
+        output_quants[quant_idx] = char(q);
+    }
+}
+
 // Preserve the original K<=8 register geometry after widening the general
 // argument-buffer kernel to K=16.  The widened kernel keeps 32 floating-point
 // accumulators live per lane (gate + up), even for the shipping K=8 round.
@@ -1125,6 +1235,9 @@ kernel void gemma4_q4_expert_argbuf_down_reduce_turbo(
 
 pub(crate) struct Spec50MoeArgbufKernels {
     pub(crate) gateup: ComputePipelineState,
+    /// Register-narrow K<=12 twin. It is optional and default-off so a Metal
+    /// compiler or GPU that rejects it retains the proven K=16 pipeline.
+    gateup_k12: Option<ComputePipelineState>,
     /// Register-narrow K<=8 twin. Optional so an older Metal compiler can
     /// retain the proven K=16 pipeline instead of failing construction.
     gateup_k8: Option<ComputePipelineState>,
@@ -1149,6 +1262,20 @@ pub(crate) struct Spec50MoeArgbufKernels {
 }
 
 static SPEC50_MOE_ARGBUF_KERNELS: OnceLock<Option<Spec50MoeArgbufKernels>> = OnceLock::new();
+const ARGBUF_GATEUP_K12_ENV: &str = "CAMELID_GEMMA4_ARGBUF_GATEUP_K12";
+
+fn argbuf_gateup_k12_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn argbuf_gateup_k12_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var(ARGBUF_GATEUP_K12_ENV).ok();
+        argbuf_gateup_k12_enabled_from(value.as_deref())
+    })
+}
+
 pub(crate) fn spec50_moe_argbuf_kernels(
     device: &Device,
 ) -> Option<&'static Spec50MoeArgbufKernels> {
@@ -1175,6 +1302,18 @@ pub(crate) fn spec50_moe_argbuf_kernels(
                 .new_compute_pipeline_state_with_function(&gateup_function)
                 .map_err(|err| eprintln!("[metal] argbuf GateUp pipeline failed: {err}"))
                 .ok()?;
+            let gateup_k12 = library
+                .get_function(
+                    "spec50_moe_argbuf_gateup_geglu_quant_batch_k12",
+                    None,
+                )
+                .and_then(|function| device.new_compute_pipeline_state_with_function(&function))
+                .map_err(|err| {
+                    eprintln!(
+                        "[metal] argbuf K12-specialized GateUp unavailable; using K16 pipeline: {err}"
+                    )
+                })
+                .ok();
             let gateup_k8 = library
                 .get_function(
                     "spec50_moe_argbuf_gateup_geglu_quant_batch_k8",
@@ -1236,6 +1375,7 @@ pub(crate) fn spec50_moe_argbuf_kernels(
             let head_down_turbo = make_pipeline("gemma4_q4_expert_argbuf_down_reduce_turbo")?;
             Some(Spec50MoeArgbufKernels {
                 gateup,
+                gateup_k12,
                 gateup_k8,
                 gateup_k8_candidate,
                 gateup_k8_tile4,
@@ -1256,21 +1396,82 @@ pub(crate) fn spec50_moe_argbuf_kernels(
 }
 
 const UNBOUND_RECORD_INDEX: u8 = u8::MAX;
+const EXPERT_RECORD_ALIGNMENT: usize = 16 * 1024;
+
+fn expert_record_binding_is_valid(record: &Buffer, offset: usize) -> bool {
+    let Some(end) = offset.checked_add(S50_SLOT_STRIDE) else {
+        return false;
+    };
+    let Some(address) = (record.contents() as usize).checked_add(offset) else {
+        return false;
+    };
+    !record.contents().is_null()
+        && u64::try_from(end).is_ok_and(|end| end <= record.length())
+        && address.is_multiple_of(EXPERT_RECORD_ALIGNMENT)
+}
+
+fn same_metal_buffer(left: &Buffer, right: &Buffer) -> bool {
+    std::ptr::eq::<metal::BufferRef>(&**left, &**right)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GateupRangeLayout {
+    work_offset: usize,
+    work_end: usize,
+    output_scales_offset: usize,
+    output_scales_end: usize,
+    output_quants_offset: usize,
+    output_quants_end: usize,
+}
+
+fn gateup_range_layout(
+    work_base: usize,
+    work_count: usize,
+    k_candidates: usize,
+) -> Option<GateupRangeLayout> {
+    if work_count == 0 || !(1..=16).contains(&k_candidates) {
+        return None;
+    }
+    let work_end_index = work_base.checked_add(work_count)?;
+    let work_stride = std::mem::size_of::<Gemma4UniqueExpertWork>();
+    let scale_stride = k_candidates
+        .checked_mul(S50_FF / 32)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+    let quant_stride = k_candidates.checked_mul(S50_FF)?;
+    Some(GateupRangeLayout {
+        work_offset: work_base.checked_mul(work_stride)?,
+        work_end: work_end_index.checked_mul(work_stride)?,
+        output_scales_offset: work_base.checked_mul(scale_stride)?,
+        output_scales_end: work_end_index.checked_mul(scale_stride)?,
+        output_quants_offset: work_base.checked_mul(quant_stride)?,
+        output_quants_end: work_end_index.checked_mul(quant_stride)?,
+    })
+}
+
+fn buffer_contains_bytes(buffer: &Buffer, end: usize) -> bool {
+    u64::try_from(end).is_ok_and(|end| end <= buffer.length())
+}
 
 /// Encode selected records at their original slot IDs in the GateUp function's
 /// reflected 128-entry argument-buffer layout. The same struct occupies buffer
 /// 2 in Down. Slots without a corresponding record remain deterministic nulls.
-fn new_indexed_expert_table(
+fn new_indexed_expert_table_with_offsets(
     device: &Device,
     kernels: &Spec50MoeArgbufKernels,
     addressable_slot_count: usize,
     record_slots: &[usize],
     records: &[Buffer],
+    record_offsets: &[usize],
 ) -> Option<(Buffer, [u8; 128])> {
     if !(1..=128).contains(&addressable_slot_count)
         || records.is_empty()
         || records.len() != record_slots.len()
+        || records.len() != record_offsets.len()
         || records.len() > addressable_slot_count
+        || records
+            .iter()
+            .zip(record_offsets)
+            .any(|(record, &offset)| !expert_record_binding_is_valid(record, offset))
     {
         return None;
     }
@@ -1298,10 +1499,29 @@ fn new_indexed_expert_table(
         );
     }
     encoder.set_argument_buffer(&table, 0);
-    for (&slot, record) in record_slots.iter().zip(records) {
-        encoder.set_buffer(slot as u64, record, 0);
+    for ((&slot, record), &offset) in record_slots.iter().zip(records).zip(record_offsets) {
+        encoder.set_buffer(slot as u64, record, offset as u64);
     }
     Some((table, slot_to_record))
+}
+
+/// Zero-offset compatibility wrapper for existing per-record buffers.
+fn new_indexed_expert_table(
+    device: &Device,
+    kernels: &Spec50MoeArgbufKernels,
+    addressable_slot_count: usize,
+    record_slots: &[usize],
+    records: &[Buffer],
+) -> Option<(Buffer, [u8; 128])> {
+    let record_offsets = vec![0; records.len()];
+    new_indexed_expert_table_with_offsets(
+        device,
+        kernels,
+        addressable_slot_count,
+        record_slots,
+        records,
+        &record_offsets,
+    )
 }
 
 /// Dense compatibility wrapper used by the original prototype and its tests.
@@ -1360,36 +1580,51 @@ pub(crate) enum Gemma4HeadArgbufDownMode {
 }
 
 impl Gemma4MoeSlotArgTable {
-    pub(crate) fn from_indexed_slot_buffers(
+    /// Build a canonical-ID pointer table whose entries may be byte ranges of
+    /// larger Metal buffers. Repeating a buffer is intentional: each argument
+    /// entry retains the same resource while `record_offsets` selects a
+    /// distinct fixed-stride expert record within it.
+    ///
+    /// The effective record address must retain the existing 16-KiB alignment
+    /// and the complete fixed stride must fit in its backing buffer. Resource
+    /// declarations are de-duplicated by underlying Metal-buffer identity, not
+    /// by table slot, so a slab referenced by many entries is declared once.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_indexed_slot_buffer_offsets(
         device: &Device,
         addressable_slot_count: usize,
         record_slots: &[usize],
         records: &[Buffer],
+        record_offsets: &[usize],
         mapped_bound_record_count: usize,
         mapped_owner: Option<std::sync::Arc<crate::wire_mmap::GgufWireMmap>>,
     ) -> Option<Self> {
         if records.is_empty()
             || records.len() != record_slots.len()
+            || records.len() != record_offsets.len()
             || mapped_bound_record_count > records.len()
             || (mapped_bound_record_count == 0) != mapped_owner.is_none()
-            || records.iter().any(|record| {
-                record.length() as usize != S50_SLOT_STRIDE
-                    || record.contents().is_null()
-                    || !(record.contents() as usize).is_multiple_of(16 * 1024)
-            })
+            || records
+                .iter()
+                .zip(record_offsets)
+                .any(|(record, &offset)| !expert_record_binding_is_valid(record, offset))
             || device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2
         {
             return None;
         }
         let kernels = spec50_moe_argbuf_kernels(device)?;
-        let (table, slot_to_record) = new_indexed_expert_table(
+        let (table, slot_to_record) = new_indexed_expert_table_with_offsets(
             device,
             kernels,
             addressable_slot_count,
             record_slots,
             records,
+            record_offsets,
         )?;
         Some(Self {
+            // Keep one retained Objective-C reference per table entry. Cloned
+            // references to the same MTLBuffer are cheap and make the pointer
+            // table's complete lifetime independent of the caller.
             records: records.to_vec(),
             hot_bound_record_count: records.len() - mapped_bound_record_count,
             mapped_bound_record_count,
@@ -1398,6 +1633,32 @@ impl Gemma4MoeSlotArgTable {
             table,
             _mapped_owner: mapped_owner,
         })
+    }
+
+    pub(crate) fn from_indexed_slot_buffers(
+        device: &Device,
+        addressable_slot_count: usize,
+        record_slots: &[usize],
+        records: &[Buffer],
+        mapped_bound_record_count: usize,
+        mapped_owner: Option<std::sync::Arc<crate::wire_mmap::GgufWireMmap>>,
+    ) -> Option<Self> {
+        if records
+            .iter()
+            .any(|record| record.length() != S50_SLOT_STRIDE as u64)
+        {
+            return None;
+        }
+        let record_offsets = vec![0; records.len()];
+        Self::from_indexed_slot_buffer_offsets(
+            device,
+            addressable_slot_count,
+            record_slots,
+            records,
+            &record_offsets,
+            mapped_bound_record_count,
+            mapped_owner,
+        )
     }
 
     /// Build a fixed pointer table over already allocated anonymous slot
@@ -1580,7 +1841,9 @@ impl Gemma4MoeSlotArgTable {
         &self.table
     }
 
-    /// Declare exactly the distinct active slot resources for one encoder.
+    /// Declare exactly the distinct active resources for one encoder.
+    /// Multiple table slots backed by byte ranges of the same `MTLBuffer`
+    /// require just one `use_resource` declaration.
     /// Validation is completed before the first declaration, so an invalid
     /// union cannot partially mutate the command encoder's residency set.
     pub(crate) fn declare_active_slots(
@@ -1600,26 +1863,40 @@ impl Gemma4MoeSlotArgTable {
         {
             return None;
         }
-        let mut seen = [false; 128];
-        let mut declared = 0usize;
+        let mut seen_slots = [false; 128];
+        let mut distinct_slots = 0usize;
+        let mut record_indices = Vec::with_capacity(active_slots.len());
         for &slot in active_slots {
-            if !seen[slot] {
-                let record_index = usize::from(self.slot_to_record[slot]);
-                encoder.use_resource(&self.records[record_index], MTLResourceUsage::Read);
-                seen[slot] = true;
-                declared += 1;
+            if seen_slots[slot] {
+                continue;
+            }
+            seen_slots[slot] = true;
+            distinct_slots += 1;
+            let record_index = usize::from(self.slot_to_record[slot]);
+            if !record_indices.iter().any(|&selected| {
+                same_metal_buffer(&self.records[selected], &self.records[record_index])
+            }) {
+                record_indices.push(record_index);
             }
         }
-        Some(declared)
+        for &record_index in &record_indices {
+            encoder.use_resource(&self.records[record_index], MTLResourceUsage::Read);
+        }
+        Some(distinct_slots)
     }
 
-    /// Declare all bound record resources for one encoder.
-    pub(crate) fn declare_all_records(
-        &self,
-        encoder: &metal::ComputeCommandEncoderRef,
-    ) -> usize {
-        for record in &self.records {
-            encoder.use_resource(record, MTLResourceUsage::Read);
+    /// Declare all distinct backing resources for one encoder.
+    pub(crate) fn declare_all_records(&self, encoder: &metal::ComputeCommandEncoderRef) -> usize {
+        let mut record_indices = Vec::with_capacity(self.records.len());
+        for record_index in 0..self.records.len() {
+            if !record_indices.iter().any(|&selected| {
+                same_metal_buffer(&self.records[selected], &self.records[record_index])
+            }) {
+                record_indices.push(record_index);
+            }
+        }
+        for &record_index in &record_indices {
+            encoder.use_resource(&self.records[record_index], MTLResourceUsage::Read);
         }
         self.records.len()
     }
@@ -1636,9 +1913,55 @@ impl Gemma4MoeSlotArgTable {
         num_unique_experts: usize,
         k_candidates: usize,
     ) -> bool {
-        if num_unique_experts == 0
-            || num_unique_experts > self.bound_record_count()
-            || !(1..=16).contains(&k_candidates)
+        self.encode_chained_gateup_k8_range(
+            encoder,
+            input_scales,
+            input_quants,
+            work_list,
+            output_scales,
+            output_quants,
+            0,
+            num_unique_experts,
+            k_candidates,
+        )
+    }
+
+    /// Encode one contiguous unique-expert range into its normal positions in
+    /// the full-union activation buffers. A later full-union Down dispatch can
+    /// therefore consume several independently encoded GateUp ranges without
+    /// translating `unique_expert_idx` values.
+    ///
+    /// This method only records commands. The caller must order/barrier all
+    /// range encodes before Down reads their shared full-union outputs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_chained_gateup_k8_range(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input_scales: &Buffer,
+        input_quants: &Buffer,
+        work_list: &Buffer,
+        output_scales: &Buffer,
+        output_quants: &Buffer,
+        work_base: usize,
+        work_count: usize,
+        k_candidates: usize,
+    ) -> bool {
+        let Some(work_end) = work_base.checked_add(work_count) else {
+            return false;
+        };
+        let Some(layout) = gateup_range_layout(work_base, work_count, k_candidates) else {
+            return false;
+        };
+        let input_scales_end = k_candidates
+            .checked_mul(S50_GU_BLOCKS)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()));
+        let input_quants_end = k_candidates.checked_mul(S50_HIDDEN);
+        if work_end > self.bound_record_count()
+            || input_scales_end.is_none_or(|end| !buffer_contains_bytes(input_scales, end))
+            || input_quants_end.is_none_or(|end| !buffer_contains_bytes(input_quants, end))
+            || !buffer_contains_bytes(work_list, layout.work_end)
+            || !buffer_contains_bytes(output_scales, layout.output_scales_end)
+            || !buffer_contains_bytes(output_quants, layout.output_quants_end)
         {
             return false;
         }
@@ -1650,10 +1973,12 @@ impl Gemma4MoeSlotArgTable {
         };
         let gateup = if k_candidates <= 8 {
             pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
+        } else if (9..=12).contains(&k_candidates) && argbuf_gateup_k12_enabled() {
+            pipelines.gateup_k12.as_ref().unwrap_or(&pipelines.gateup)
         } else {
             &pipelines.gateup
         };
-        encode_argbuf_gateup(
+        encode_argbuf_gateup_range(
             encoder,
             gateup,
             input_scales,
@@ -1662,7 +1987,8 @@ impl Gemma4MoeSlotArgTable {
             work_list,
             output_scales,
             output_quants,
-            num_unique_experts as u32,
+            work_base,
+            work_count as u32,
             k_candidates as u32,
         );
         true
@@ -1987,7 +2313,8 @@ impl Spec50MoeArgbufLayer {
         num_unique_experts: usize,
         k_candidates: usize,
     ) -> bool {
-        if num_unique_experts == 0 || num_unique_experts > 128 || !(1..=16).contains(&k_candidates) {
+        if num_unique_experts == 0 || num_unique_experts > 128 || !(1..=16).contains(&k_candidates)
+        {
             return false;
         }
         let Some(kernel) = metal_linear_kernel() else {
@@ -2059,19 +2386,50 @@ fn encode_argbuf_gateup(
     num_unique_experts: u32,
     k_candidates: u32,
 ) {
+    encode_argbuf_gateup_range(
+        encoder,
+        pipeline,
+        input_scales,
+        input_quants,
+        expert_table,
+        work_list,
+        output_scales,
+        output_quants,
+        0,
+        num_unique_experts,
+        k_candidates,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_argbuf_gateup_range(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    expert_table: &Buffer,
+    work_list: &Buffer,
+    output_scales: &Buffer,
+    output_quants: &Buffer,
+    work_base: usize,
+    work_count: u32,
+    k_candidates: u32,
+) {
     debug_assert!((1..=16).contains(&k_candidates));
+    let layout = gateup_range_layout(work_base, work_count as usize, k_candidates as usize)
+        .expect("validated GateUp work range");
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(input_scales), 0);
     encoder.set_buffer(1, Some(input_quants), 0);
     encoder.set_buffer(2, Some(expert_table), 0);
-    encoder.set_buffer(3, Some(work_list), 0);
-    encoder.set_buffer(4, Some(output_scales), 0);
-    encoder.set_buffer(5, Some(output_quants), 0);
-    encoder.set_bytes(6, 4, &num_unique_experts as *const u32 as *const _);
+    encoder.set_buffer(3, Some(work_list), layout.work_offset as u64);
+    encoder.set_buffer(4, Some(output_scales), layout.output_scales_offset as u64);
+    encoder.set_buffer(5, Some(output_quants), layout.output_quants_offset as u64);
+    encoder.set_bytes(6, 4, &work_count as *const u32 as *const _);
     encoder.set_bytes(7, 4, &k_candidates as *const u32 as *const _);
     encoder.dispatch_thread_groups(
         metal::MTLSize {
-            width: u64::from(num_unique_experts) * (S50_FF as u64 / 32),
+            width: u64::from(work_count) * (S50_FF as u64 / 32),
             height: 1,
             depth: 1,
         },
@@ -2305,6 +2663,91 @@ mod tests {
 
     fn new_buffer(device: &Device, len: usize) -> Buffer {
         device.new_buffer(len.max(4) as u64, MTLResourceOptions::StorageModeShared)
+    }
+
+    #[test]
+    fn gateup_range_layout_keeps_outputs_in_full_union_coordinates() {
+        let layout = gateup_range_layout(3, 5, 8).unwrap();
+        assert_eq!(
+            layout.work_offset,
+            3 * std::mem::size_of::<Gemma4UniqueExpertWork>()
+        );
+        assert_eq!(
+            layout.work_end,
+            8 * std::mem::size_of::<Gemma4UniqueExpertWork>()
+        );
+        assert_eq!(layout.output_scales_offset, 3 * 8 * (S50_FF / 32) * 4);
+        assert_eq!(layout.output_scales_end, 8 * 8 * (S50_FF / 32) * 4);
+        assert_eq!(layout.output_quants_offset, 3 * 8 * S50_FF);
+        assert_eq!(layout.output_quants_end, 8 * 8 * S50_FF);
+        assert!(gateup_range_layout(0, 0, 8).is_none());
+        assert!(gateup_range_layout(0, 1, 0).is_none());
+        assert!(gateup_range_layout(0, 1, 17).is_none());
+        assert!(gateup_range_layout(usize::MAX, 1, 8).is_none());
+    }
+
+    #[test]
+    fn gateup_k12_experiment_gate_is_strictly_opt_in() {
+        assert!(!argbuf_gateup_k12_enabled_from(None));
+        assert!(!argbuf_gateup_k12_enabled_from(Some("")));
+        assert!(!argbuf_gateup_k12_enabled_from(Some("0")));
+        assert!(!argbuf_gateup_k12_enabled_from(Some("true")));
+        assert!(argbuf_gateup_k12_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn indexed_table_accepts_aligned_views_of_one_stage_slab() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP indexed stage-slab structure gate: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            return;
+        }
+        let stage = new_buffer(device, 3 * S50_SLOT_STRIDE);
+        let records = vec![stage.clone(), stage.clone(), stage.clone()];
+        let offsets = [0, S50_SLOT_STRIDE, 2 * S50_SLOT_STRIDE];
+        let table = Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+            device,
+            3,
+            &[0, 1, 2],
+            &records,
+            &offsets,
+            0,
+            None,
+        )
+        .expect("three aligned record views of one stage slab");
+        assert_eq!(table.slot_count(), 3);
+        assert_eq!(table.bound_record_count(), 3);
+
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        assert_eq!(table.declare_active_slots(encoder, &[0, 1, 2]), Some(3));
+        encoder.end_encoding();
+
+        let mut misaligned = offsets;
+        misaligned[1] += 1;
+        assert!(Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+            device,
+            3,
+            &[0, 1, 2],
+            &records,
+            &misaligned,
+            0,
+            None,
+        )
+        .is_none());
+        assert!(Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+            device,
+            3,
+            &[0, 1, 2],
+            &records,
+            &[0, S50_SLOT_STRIDE, 3 * S50_SLOT_STRIDE],
+            0,
+            None,
+        )
+        .is_none());
     }
 
     fn write_bytes<T>(buffer: &Buffer, values: &[T]) {
@@ -2748,7 +3191,10 @@ mod tests {
         let encoder = cb.new_compute_command_encoder();
         assert_eq!(table.declare_active_slots(encoder, &[3, 4]), None);
         assert_eq!(table.declare_active_slots(encoder, &[127, 128]), None);
-        assert_eq!(table.declare_active_slots(encoder, &[127, 3, 91, 127]), Some(3));
+        assert_eq!(
+            table.declare_active_slots(encoder, &[127, 3, 91, 127]),
+            Some(3)
+        );
         encoder.end_encoding();
     }
 
@@ -2765,8 +3211,8 @@ mod tests {
         file.as_file()
             .set_len(mapped_bytes as u64)
             .expect("size sparse mapped fixture");
-        let mmap = crate::wire_mmap::GgufWireMmap::map(file.path())
-            .expect("map sparse mapped fixture");
+        let mmap =
+            crate::wire_mmap::GgufWireMmap::map(file.path()).expect("map sparse mapped fixture");
         let owner = std::sync::Arc::downgrade(&mmap);
         let table = Gemma4MoeSlotArgTable::from_mapped_active_slots(
             mmap,
@@ -2783,7 +3229,10 @@ mod tests {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         assert_eq!(table.declare_active_slots(encoder, &[3, 42]), None);
-        assert_eq!(table.declare_active_slots(encoder, &[127, 3, 91, 0]), Some(4));
+        assert_eq!(
+            table.declare_active_slots(encoder, &[127, 3, 91, 0]),
+            Some(4)
+        );
         encoder.end_encoding();
         drop(table);
         assert!(owner.upgrade().is_none());
@@ -3052,6 +3501,130 @@ mod tests {
         }
     }
 
+    /// Real-Metal proof that narrowing the live accumulator arrays from 16 to
+    /// 12 does not alter any GateUp scale or quant bit at the four widths that
+    /// can select the experimental pipeline.
+    #[test]
+    fn gemma4_moe_argbuf_gateup_k12_raw_bit_parity() {
+        const WIDE_K: usize = 12;
+
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP K12 GateUp parity: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP K12 GateUp parity: Tier-2 argument buffers unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let narrow = pipelines
+            .gateup_k12
+            .as_ref()
+            .expect("K12-specialized GateUp pipeline");
+        let (records, _) = synthetic_slot_backings(device);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("anonymous per-slot Tier-2 table");
+
+        let mut rng = Rng::new(0x12a2_6b50_01);
+        let input_scales = new_buffer(device, WIDE_K * S50_GU_BLOCKS * 4);
+        let scales: Vec<f32> = (0..WIDE_K * S50_GU_BLOCKS)
+            .map(|_| 0.0005 + rng.next_f32() * 0.01)
+            .collect();
+        write_bytes(&input_scales, &scales);
+        let input_quants = new_buffer(device, WIDE_K * S50_HIDDEN);
+        let quants: Vec<i8> = (0..WIDE_K * S50_HIDDEN)
+            .map(|_| ((rng.next_u32() % 255) as i32 - 127) as i8)
+            .collect();
+        write_bytes(&input_quants, &quants);
+
+        let work_list = new_buffer(
+            device,
+            EXPERTS * std::mem::size_of::<Gemma4UniqueExpertWork>(),
+        );
+        let scale_len = SYNTHETIC_EXPERTS * WIDE_K * S50_DOWN_BLOCKS * 4;
+        let quant_len = SYNTHETIC_EXPERTS * WIDE_K * S50_FF;
+        let reference_scales = new_buffer(device, scale_len);
+        let reference_quants = new_buffer(device, quant_len);
+        let narrow_scales = new_buffer(device, scale_len);
+        let narrow_quants = new_buffer(device, quant_len);
+        let active_experts: Vec<usize> = (0..SYNTHETIC_EXPERTS).collect();
+
+        for k in 9..=WIDE_K {
+            let candidate_mask = (1u64 << k) - 1;
+            let mut work = vec![Gemma4UniqueExpertWork::default(); EXPERTS];
+            for (slot, entry) in work.iter_mut().take(SYNTHETIC_EXPERTS).enumerate() {
+                *entry = Gemma4UniqueExpertWork {
+                    candidate_mask,
+                    expert_weight_offset: (slot * S50_SLOT_STRIDE) as u32,
+                    slab_index: 0,
+                };
+            }
+            write_bytes(&work_list, &work);
+            for output in [
+                &reference_scales,
+                &reference_quants,
+                &narrow_scales,
+                &narrow_quants,
+            ] {
+                fill_zero(output);
+            }
+
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(encoder, &active_experts),
+                Some(SYNTHETIC_EXPERTS)
+            );
+            encode_argbuf_gateup(
+                encoder,
+                &pipelines.gateup,
+                &input_scales,
+                &input_quants,
+                table.argument_buffer(),
+                &work_list,
+                &reference_scales,
+                &reference_quants,
+                SYNTHETIC_EXPERTS as u32,
+                k as u32,
+            );
+            encode_argbuf_gateup(
+                encoder,
+                narrow,
+                &input_scales,
+                &input_quants,
+                table.argument_buffer(),
+                &work_list,
+                &narrow_scales,
+                &narrow_quants,
+                SYNTHETIC_EXPERTS as u32,
+                k as u32,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed,
+                "K12 GateUp parity K={k} command failed: {}",
+                command_buffer_error_details(cb)
+            );
+
+            let scale_bytes = SYNTHETIC_EXPERTS * k * S50_DOWN_BLOCKS * 4;
+            let quant_bytes = SYNTHETIC_EXPERTS * k * S50_FF;
+            assert_raw_eq(
+                &format!("K12 K={k} GateUp scales"),
+                &read_bytes(&reference_scales, scale_bytes),
+                &read_bytes(&narrow_scales, scale_bytes),
+            );
+            assert_raw_eq(
+                &format!("K12 K={k} GateUp quants"),
+                &read_bytes(&reference_quants, quant_bytes),
+                &read_bytes(&narrow_quants, quant_bytes),
+            );
+        }
+    }
+
     /// Real-Metal proof that both Down scheduling probes preserve every
     /// candidate row's lane ownership, term order, and SIMD reduction bits.
     #[test]
@@ -3267,23 +3840,21 @@ mod tests {
             .is_none()
         );
 
-        let split_receipt =
-            Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
-                std::sync::Arc::clone(&mmap),
-                0,
-                mapped_bytes,
-                SYNTHETIC_EXPERTS,
-                &[1, 0, 1],
-                &hot_slot_ids,
-                &hot_records,
-            )
-            .expect("one-hot/one-cold deduplicated receipt");
+        let split_receipt = Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
+            std::sync::Arc::clone(&mmap),
+            0,
+            mapped_bytes,
+            SYNTHETIC_EXPERTS,
+            &[1, 0, 1],
+            &hot_slot_ids,
+            &hot_records,
+        )
+        .expect("one-hot/one-cold deduplicated receipt");
         assert_eq!(split_receipt.bound_record_count(), 2);
         assert_eq!(split_receipt.hot_bound_record_count(), 1);
         assert_eq!(split_receipt.mapped_bound_record_count(), 1);
         assert_eq!(
-            split_receipt.hot_bound_record_count()
-                + split_receipt.mapped_bound_record_count(),
+            split_receipt.hot_bound_record_count() + split_receipt.mapped_bound_record_count(),
             split_receipt.bound_record_count()
         );
         drop(split_receipt);
