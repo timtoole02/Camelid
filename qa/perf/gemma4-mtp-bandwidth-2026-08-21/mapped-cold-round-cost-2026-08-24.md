@@ -15,7 +15,14 @@ full-Q4 MTP assistant. Fixture: the frozen 48-token
 | + 48 hot slots/layer | 451 ms | 14.51 | 12.5 s |
 | + no redundant post-round fill | 354 ms | 19.14 | 11.0 s |
 | + union-proportional hot profile (1786 slots, 5.59 GiB) | 294-306 ms | 22.0 | 10.7 s |
-| + pooled per-layer demand fill | **~300 ms** | **22.3** | **9.7 s** |
+| + pooled per-layer demand fill | **305-330 ms** | **~21.2 (20.7-22.4)** | **9.7-10.7 s** |
+
+**Read the range, not a point.** Eight consecutive runs of the last row after a
+release build: 16.75, 16.57, 20.69, 20.88, 21.17, 22.41, 21.86, 21.27 tok/s. The
+read volume is identical in all eight (251.7 MiB/round), so the two cold runs
+are not an I/O effect: GPU time is 140-146 ms on those against 107-116 ms once
+settled. Discard the first two runs after a heavy build. Every A/B in this
+document interleaved its arms and was taken inside the settled band.
 
 128-token request on the same config: 291.8 ms/round, **23.86 tok/s**, alpha
 6.67, first 48 token IDs identical to the fixture.
