@@ -14,7 +14,8 @@ full-Q4 MTP assistant. Fixture: the frozen 48-token
 | exact-union binding + demand promotion | 609 ms | 10.88 | 15.5 s |
 | + 48 hot slots/layer | 451 ms | 14.51 | 12.5 s |
 | + no redundant post-round fill | 354 ms | 19.14 | 11.0 s |
-| + union-proportional hot profile (1786 slots, 5.59 GiB) | **294-306 ms** | **22.0** | 10.6 s |
+| + union-proportional hot profile (1786 slots, 5.59 GiB) | 294-306 ms | 22.0 | 10.7 s |
+| + pooled per-layer demand fill | **~300 ms** | **22.3** | **9.7 s** |
 
 128-token request on the same config: 291.8 ms/round, **23.86 tok/s**, alpha
 6.67, first 48 token IDs identical to the fixture.
@@ -123,7 +124,44 @@ round 294-306 ms = assistant 34 ms + verifier ~260 ms
 ```
 
 Reads and GPU are still serialized: `slot_wait` tracks `gpu_busy`, then the fill
-runs with the GPU idle. That ~100 ms is the next target. The per-layer loads are
-issued serially inside `fill_hybrid_hot_slots`; `bench-read-batch-depth.py` says
-depth, not thread count, is the limiter (batch 7 = 2.21 GB/s, batch 28 = 4.01),
-so issuing a round's loads at greater depth is worth ~1.7x on that term.
+runs with the GPU idle.
+
+## Pooled demand fill (`..._DEMAND_PROMOTION_PARALLEL_FILL`, default ON)
+
+The loads were issued one at a time inside `fill_hybrid_hot_slots`. The fill is
+discovered per layer, after that layer's router, so a round can never batch
+across layers — ~79 records over 30 layers, about 2.6 per layer, each a ~3.2 MiB
+positioned read at ~1.24 ms. Slots within one plan are pairwise disjoint, so the
+reads go through the Ghost read pool: resolve every destination on this thread
+first (`slot_bytes_mut` performs the one-time identity invalidation), read in
+parallel, then commit the directory in plan order.
+
+Three paired runs of the 48-token fixture, all six token-identical:
+
+| | decode tok/s (median) | e2e wall | spread |
+|---|---:|---:|---|
+| serial fill | 21.40 | 10.69 s | 21.09-22.26 |
+| pooled fill | 22.30 | 9.74 s | 22.28-22.43 |
+
+The end-to-end gain leads the decode gain because prefill routes far wider
+unions (~85 records on a layer) and so reaches a useful depth; decode's 2.6 is
+still well below the knee. Note `disk_time` is a sum over threads and therefore
+inflates once this is on — read `slot_filler` (the fill's wall time) instead,
+which fell ~20%.
+
+## What is left
+
+```
+round ~300 ms = assistant 34 ms + verifier ~265 ms
+  slot_wait ~120 ms   <- this IS gpu_busy; the GPU owns attn+router+shared here
+  slot_filler ~100 ms <- record copies, GPU idle
+  GPU MoE + tail, final_wait 3 ms, encode 1 ms
+```
+
+The fill cannot move earlier: layer N's route needs layer N-1's output, so the
+chain GPU -> route -> fill -> GPU is a true dependency, and the one predictor
+tried (previous round's union) is inert because those records are already
+resident. Remaining terms, in size order: gateup ~62 ms, qkv_o ~37 ms, the
+~100 ms fill, shared ~20 ms, assistant ~33 ms. The GPU terms are kernel work
+with a long history of small returns; the fill needs a predictor that sees the
+future token.

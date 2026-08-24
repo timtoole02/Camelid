@@ -3548,6 +3548,46 @@ fn ghost_metal_hybrid_demand_promotion_prefetch_enabled() -> bool {
     })
 }
 
+/// `CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_PARALLEL_FILL=0` puts a layer's
+/// record loads back on one thread. Default on, under the demand-promotion
+/// opt-in.
+///
+/// The demand fill is discovered per layer, after that layer's router, so the
+/// round can never batch loads across layers: measured 2026-08-24 that is ~79
+/// records over 30 layers, about 2.6 per layer, each a ~3.2 MiB positioned read
+/// taking ~1.24 ms. `bench-read-batch-depth.py` says depth, not thread count,
+/// is the limiter on this NVMe, and a depth of 2.6 is nowhere near the knee.
+/// Slots within one plan are pairwise disjoint, so the reads are independent.
+///
+/// Three paired runs of the 48-token fixture, all token-identical: 21.40 ->
+/// 22.30 tok/s median decode and 10.69 -> 9.74 s end to end, with the spread
+/// tightening from 21.09-22.26 to 22.28-22.43. The end-to-end gain leads the
+/// decode gain because prefill chunks route far wider unions (~85 records on a
+/// layer) and therefore reach a useful depth.
+#[cfg(target_os = "macos")]
+fn ghost_metal_hybrid_demand_promotion_parallel_fill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_PARALLEL_FILL")
+            .is_ok_and(|value| value == "0")
+    })
+}
+
+/// One demand-fill destination. The plan assigns each admitted expert a
+/// distinct physical slot, so the pointers handed to the read pool address
+/// pairwise-disjoint records inside this layer's own anonymous hot buffers, and
+/// the exclusive refill lease is held for the whole phase.
+#[cfg(target_os = "macos")]
+struct Gemma4HybridFillDestination {
+    expert: usize,
+    pointer: *mut u8,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for Gemma4HybridFillDestination {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for Gemma4HybridFillDestination {}
+
 /// `CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_TRACE=1`: one line per demand
 /// fill with the plan shape, so load/eviction churn can be attributed to a
 /// caller instead of inferred from round totals.
@@ -3621,6 +3661,86 @@ fn fill_hybrid_hot_slots(
     let mut read_failures = 0usize;
     let mut disk_read_us = 0u64;
     let mut host_copy_us = 0u64;
+    let parallel_pool = if plan.loads.len() > 1
+        && ghost_metal_hybrid_demand_promotion_parallel_fill_enabled()
+    {
+        cache.read_pool.as_ref()
+    } else {
+        None
+    };
+    if let Some(pool) = parallel_pool {
+        use rayon::prelude::*;
+        // Resolve every destination first. `slot_bytes_mut` performs the
+        // one-time identity invalidation before any byte can change, so it must
+        // stay on this thread and precede the reads.
+        let mut destinations = Vec::with_capacity(plan.loads.len());
+        let mut admitted = Vec::with_capacity(plan.loads.len());
+        for load in plan.loads.iter().copied() {
+            match refill.slot_bytes_mut(load.slot) {
+                Some(destination) => {
+                    destinations.push(Gemma4HybridFillDestination {
+                        expert: load.expert,
+                        pointer: destination.as_mut_ptr(),
+                    });
+                    admitted.push(load);
+                }
+                None => read_failures = read_failures.saturating_add(1),
+            }
+        }
+        let outcomes: Vec<(bool, bool, u64, u64)> = pool.install(|| {
+            destinations
+                .par_iter()
+                .map(|destination| {
+                    // SAFETY: the refill lease is exclusive for this layer, the
+                    // plan's slots are pairwise disjoint, and each pointer came
+                    // from `slot_bytes_mut` for a full record above.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts_mut(destination.pointer, record_bytes)
+                    };
+                    if let Some(record) = cache
+                        .peek_resident(layer_idx, destination.expert)
+                        .filter(|record| record.byte_len() == record_bytes)
+                    {
+                        let copy_started = std::time::Instant::now();
+                        bytes.copy_from_slice(record.record_bytes());
+                        let us = (copy_started.elapsed().as_secs_f64() * 1_000_000.0) as u64;
+                        return (true, true, 0, us);
+                    }
+                    let read_started = std::time::Instant::now();
+                    let result = cache
+                        .file
+                        .read_moe_expert_into(layer_idx, destination.expert, bytes);
+                    let us = (read_started.elapsed().as_secs_f64() * 1_000_000.0) as u64;
+                    match result {
+                        Ok(()) => (true, false, us, 0),
+                        Err(error) => {
+                            eprintln!(
+                                "[gemma4-ghost-metal] hybrid layer {layer_idx} expert {} hot-slot refill failed; mapped fallback retained: {error}",
+                                destination.expert,
+                            );
+                            (false, false, us, 0)
+                        }
+                    }
+                })
+                .collect()
+        });
+        for (load, (ok, from_host, read_us, copy_us)) in
+            admitted.iter().copied().zip(outcomes.iter().copied())
+        {
+            disk_read_us = disk_read_us.saturating_add(read_us);
+            host_copy_us = host_copy_us.saturating_add(copy_us);
+            if !ok {
+                read_failures = read_failures.saturating_add(1);
+                continue;
+            }
+            directory.commit_load(load);
+            if from_host {
+                host_fills = host_fills.saturating_add(1);
+            } else {
+                disk_reads = disk_reads.saturating_add(1);
+            }
+        }
+    } else {
     for load in plan.loads.iter().copied() {
         let Some(destination) = refill.slot_bytes_mut(load.slot) else {
             read_failures = read_failures.saturating_add(1);
@@ -3662,6 +3782,7 @@ fn fill_hybrid_hot_slots(
                 );
             }
         }
+    }
     }
     // Receipt actual mutation and I/O before publication. If directory
     // validation or publication fails, the anonymous bytes remain unreachable
