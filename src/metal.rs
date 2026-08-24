@@ -28662,23 +28662,25 @@ impl Gemma4GhostCommonMetal {
             return false;
         }
         if record_demand {
-            for layer_idx in 0..self.layers.len() {
-                let logits_off = layer_idx * k_tokens * 128 * 4;
-                let logits_elem = logits_off / std::mem::size_of::<f32>();
-                let router_ptr = unsafe {
-                    (self.resident_scratch.router_logits_batch.contents() as *const f32)
-                        .add(logits_elem)
-                };
-                let router_slice = unsafe { std::slice::from_raw_parts(router_ptr, k_tokens * 128) };
-                let mut updated_slots = [0xFFFFFFFFu32; 128];
-                let mut union = Vec::new();
-                filler(
-                    layer_idx,
-                    router_slice,
-                    None,
-                    &mut updated_slots,
-                    &mut union,
-                );
+            if let Some(filler) = slot_filler.as_deref_mut() {
+                for layer_idx in 0..self.layers.len() {
+                    let logits_off = layer_idx * k_tokens * 128 * 4;
+                    let logits_elem = logits_off / std::mem::size_of::<f32>();
+                    let router_ptr = unsafe {
+                        (self.resident_scratch.router_logits_batch.contents() as *const f32)
+                            .add(logits_elem)
+                    };
+                    let router_slice = unsafe { std::slice::from_raw_parts(router_ptr, k_tokens * 128) };
+                    let mut updated_slots = [0xFFFFFFFFu32; 128];
+                    let mut union = Vec::new();
+                    filler(
+                        layer_idx,
+                        router_slice,
+                        None,
+                        &mut updated_slots,
+                        &mut union,
+                    );
+                }
             }
         }
         for prev in &predicted_cbs {
