@@ -25906,18 +25906,18 @@ impl Gemma4GhostCommonMetal {
                 );
                 return false;
             }
-            let Some(active_slots) = active_slots.filter(|slots| !slots.is_empty()) else {
-                eprintln!(
-                    "[metal chained round] layer {layer_idx} record-granular GateUp missing active slot union"
-                );
-                return false;
+            let num_unique_slots = if let Some(active_slots) = active_slots.filter(|slots| !slots.is_empty()) {
+                if table.declare_active_slots(encoder, active_slots) != Some(active_slots.len()) {
+                    eprintln!(
+                        "[metal chained round] layer {layer_idx} record-granular GateUp active slot declaration failed"
+                    );
+                    return false;
+                }
+                active_slots.len()
+            } else {
+                table.declare_all_records(encoder);
+                table.bound_record_count()
             };
-            if table.declare_active_slots(encoder, active_slots) != Some(active_slots.len()) {
-                eprintln!(
-                    "[metal chained round] layer {layer_idx} record-granular GateUp active slot declaration failed"
-                );
-                return false;
-            }
             if !table.encode_chained_gateup_k8(
                 encoder,
                 &self.resident_scratch.expert_input_scales_batch,
@@ -25925,7 +25925,7 @@ impl Gemma4GhostCommonMetal {
                 &self.resident_scratch.gpu_work_list,
                 &self.resident_scratch.gpu_moe_scales,
                 &self.resident_scratch.gpu_moe_quants,
-                active_slots.len(),
+                num_unique_slots,
                 k_tokens,
             ) {
                 eprintln!(
@@ -26135,17 +26135,15 @@ impl Gemma4GhostCommonMetal {
                 );
                 return false;
             }
-            let Some(active_slots) = active_slots.filter(|slots| !slots.is_empty()) else {
-                eprintln!(
-                    "[metal chained round] layer {layer_idx} record-granular Down missing active slot union"
-                );
-                return false;
-            };
-            if table.declare_active_slots(encoder, active_slots) != Some(active_slots.len()) {
-                eprintln!(
-                    "[metal chained round] layer {layer_idx} record-granular Down active slot declaration failed"
-                );
-                return false;
+            if let Some(active_slots) = active_slots.filter(|slots| !slots.is_empty()) {
+                if table.declare_active_slots(encoder, active_slots) != Some(active_slots.len()) {
+                    eprintln!(
+                        "[metal chained round] layer {layer_idx} record-granular Down active slot declaration failed"
+                    );
+                    return false;
+                }
+            } else {
+                table.declare_all_records(encoder);
             }
             if !table.encode_chained_down_k8(
                 encoder,
@@ -27515,6 +27513,20 @@ impl Gemma4GhostCommonMetal {
                         pre_encoded_moe = Some(cb3);
                     }
                     ledger.pre_encode_ms += t_pre.elapsed().as_secs_f64() * 1000.0;
+                }
+
+                if record_demand {
+                    if let Some(cb3) = pre_encoded_moe.take() {
+                        stamp.start(GPU_STAGE_GATEUP);
+                        stamp.push_current(&cb3);
+                        cb3.commit();
+                        for binding in live_mapped_bindings.drain(..) {
+                            mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(&cb3, binding));
+                        }
+                        last_committed_cb = Some(cb3);
+                        layer_committed = true;
+                        continue;
+                    }
                 }
 
                 // Overlap predicted wave-0 copies with this layer's attn+router GPU.

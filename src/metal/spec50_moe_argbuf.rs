@@ -1613,6 +1613,17 @@ impl Gemma4MoeSlotArgTable {
         Some(declared)
     }
 
+    /// Declare all bound record resources for one encoder.
+    pub(crate) fn declare_all_records(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> usize {
+        for record in &self.records {
+            encoder.use_resource(record, MTLResourceUsage::Read);
+        }
+        self.records.len()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_chained_gateup_k8(
         &self,
