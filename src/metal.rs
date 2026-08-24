@@ -28678,7 +28678,13 @@ impl Gemma4GhostCommonMetal {
                 stamp.start(GPU_STAGE_QKV_O);
             }
 
-            if !unified_single_cb && !layer_committed {
+            let commit_this_layer = if unified_single_cb {
+                (layer_idx + 1) % 3 == 0 || (layer_idx + 1) == self.layers.len()
+            } else {
+                !layer_committed
+            };
+
+            if commit_this_layer && !cb_closed {
                 // Commit this layer's expert/tail work now so the GPU starts
                 // on it while the host encodes the next layer's attention;
                 // the next layer opens a fresh command buffer (same queue, so
