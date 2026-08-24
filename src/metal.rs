@@ -13580,21 +13580,10 @@ impl Gemma4Q4HybridExpertSource {
                 }
             }
         }
-        let mut hot_expert_ids = Vec::with_capacity(self.hot_records.len());
-        let mut hot_records = Vec::with_capacity(self.hot_records.len());
-        for (physical_slot, expert_id) in published.iter().copied().enumerate() {
-            if let Some(expert_id) = expert_id {
-                hot_expert_ids.push(expert_id);
-                hot_records.push(self.hot_records[physical_slot].clone());
-            }
-        }
-        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_mixed_active_slots(
-            std::sync::Arc::clone(&self.mapped.mmap),
-            self.mapped.layer_offset,
-            self.mapped.mapped_span_bytes,
-            active_slots,
-            &hot_expert_ids,
-            &hot_records,
+        let kernel = metal_linear_kernel()?;
+        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_slot_buffers(
+            &kernel.device,
+            &self.hot_records,
         )?;
         if let Ok(mut write_guard) = self.cached_table.write() {
             *write_guard = Some((published.clone(), table.clone()));
