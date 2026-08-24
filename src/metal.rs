@@ -13450,6 +13450,7 @@ pub(crate) struct Gemma4Q4HybridExpertSource {
     mapped: Gemma4Q4FileMappedExpertSource,
     hot_records: Vec<Buffer>,
     hot_slot_ids: std::sync::RwLock<Vec<Option<usize>>>,
+    cached_table: std::sync::RwLock<Option<(Vec<Option<usize>>, spec50_moe_argbuf::Gemma4MoeSlotArgTable)>>,
     /// Materialized mixed tables increment this count before snapshotting the
     /// directory. The existing pending/command-buffer guards retain their
     /// lease through terminal GPU status, so refill access can fail closed.
@@ -13493,6 +13494,7 @@ impl Gemma4Q4HybridExpertSource {
             mapped,
             hot_records,
             hot_slot_ids: std::sync::RwLock::new(vec![None; hot_slot_count]),
+            cached_table: std::sync::RwLock::new(None),
             lease_state: std::sync::atomic::AtomicIsize::new(0),
         })
     }
@@ -13571,6 +13573,13 @@ impl Gemma4Q4HybridExpertSource {
             source: std::sync::Arc::clone(self),
         });
         let published = self.hot_slot_ids.read().ok()?;
+        if let Ok(guard) = self.cached_table.read() {
+            if let Some((cached_published, cached_table)) = guard.as_ref() {
+                if cached_published == &*published {
+                    return Some((cached_table.clone(), lease));
+                }
+            }
+        }
         let mut hot_expert_ids = Vec::with_capacity(self.hot_records.len());
         let mut hot_records = Vec::with_capacity(self.hot_records.len());
         for (physical_slot, expert_id) in published.iter().copied().enumerate() {
@@ -13579,14 +13588,18 @@ impl Gemma4Q4HybridExpertSource {
                 hot_records.push(self.hot_records[physical_slot].clone());
             }
         }
+        let all_slots: Vec<usize> = (0..128).collect();
         let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_mixed_active_slots(
             std::sync::Arc::clone(&self.mapped.mmap),
             self.mapped.layer_offset,
             self.mapped.mapped_span_bytes,
-            active_slots,
+            &all_slots,
             &hot_expert_ids,
             &hot_records,
         )?;
+        if let Ok(mut write_guard) = self.cached_table.write() {
+            *write_guard = Some((published.clone(), table.clone()));
+        }
         Some((table, lease))
     }
 }
@@ -13628,6 +13641,9 @@ impl Gemma4Q4HybridRefillGuard<'_> {
             return false;
         };
         published.fill(None);
+        if let Ok(mut cached) = self.source.cached_table.write() {
+            *cached = None;
+        }
         self.identities_invalidated = true;
         true
     }
@@ -13661,6 +13677,9 @@ impl Gemma4Q4HybridRefillGuard<'_> {
             return false;
         };
         published.clone_from_slice(hot_slot_ids);
+        if let Ok(mut cached) = self.source.cached_table.write() {
+            *cached = None;
+        }
         self.committed = true;
         true
     }
