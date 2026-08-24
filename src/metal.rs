@@ -13588,12 +13588,11 @@ impl Gemma4Q4HybridExpertSource {
                 hot_records.push(self.hot_records[physical_slot].clone());
             }
         }
-        let all_slots: Vec<usize> = (0..128).collect();
         let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_mixed_active_slots(
             std::sync::Arc::clone(&self.mapped.mmap),
             self.mapped.layer_offset,
             self.mapped.mapped_span_bytes,
-            &all_slots,
+            active_slots,
             &hot_expert_ids,
             &hot_records,
         )?;
