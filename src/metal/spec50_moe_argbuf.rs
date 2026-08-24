@@ -1637,38 +1637,23 @@ impl Gemma4MoeSlotArgTable {
         let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
             return false;
         };
-        if k_candidates <= 8 && pipelines.gateup_k8_tile4.is_some() {
-            encode_argbuf_gateup_tile4(
-                encoder,
-                pipelines.gateup_k8_tile4.as_ref().unwrap(),
-                input_scales,
-                input_quants,
-                &self.table,
-                work_list,
-                output_scales,
-                output_quants,
-                num_unique_experts as u32,
-                k_candidates as u32,
-            );
+        let gateup = if k_candidates <= 8 {
+            pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
         } else {
-            let gateup = if k_candidates <= 8 {
-                pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
-            } else {
-                &pipelines.gateup
-            };
-            encode_argbuf_gateup(
-                encoder,
-                gateup,
-                input_scales,
-                input_quants,
-                &self.table,
-                work_list,
-                output_scales,
-                output_quants,
-                num_unique_experts as u32,
-                k_candidates as u32,
-            );
-        }
+            &pipelines.gateup
+        };
+        encode_argbuf_gateup(
+            encoder,
+            gateup,
+            input_scales,
+            input_quants,
+            &self.table,
+            work_list,
+            output_scales,
+            output_quants,
+            num_unique_experts as u32,
+            k_candidates as u32,
+        );
         true
     }
 
