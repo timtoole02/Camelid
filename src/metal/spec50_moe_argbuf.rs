@@ -1360,7 +1360,7 @@ pub(crate) enum Gemma4HeadArgbufDownMode {
 }
 
 impl Gemma4MoeSlotArgTable {
-    fn from_indexed_slot_buffers(
+    pub(crate) fn from_indexed_slot_buffers(
         device: &Device,
         addressable_slot_count: usize,
         record_slots: &[usize],
