@@ -53,8 +53,10 @@ construction; check `exact_prefix_len == 48` instead.
 | `H2-proportional` | **the winner.** Union-proportional hot profile, 22.3 tok/s |
 | `H1-uniform64` | uniform 64 slots/layer. 20.5 tok/s on MORE memory than H2 |
 | `G5-lru` | H2 + `SLOT_POLICY=lru`. Slower than the default LFU |
-| `A-explicit56` | anonymous-slot lane, 56 physical. **Emits garbage** |
-| `C-mono88` | anonymous-slot lane, 88 monolithic. **Emits garbage** |
+| `C4-record64-physical-lfu8` | corrected anonymous lane, fixed 64 physical slots/layer. Exact, but slower than H2 |
+| `C5-record-proportional-lfu8` | corrected anonymous lane with H2's proportional capacities. Exact faster-starting research lane |
+| `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
+| `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 
 `request-48-plain.json` is the frozen gate fixture with `camelid_receipt`
 removed — leaving it in makes the server 500 outside the hybrid lane, because
@@ -69,3 +71,39 @@ per layer per fill. Take the median `selected` per layer over the decode rounds
 as `..._HYBRID_HOT_SLOTS_PER_LAYER` with `..._HYBRID_HOT_PROFILE_FREE=1`. Keep
 the total under the 2,400-record cap; 1786 was measured to fit comfortably
 beside dense weights, the assistant and KV on 16 GiB.
+
+## 2026-08-24 corrected anonymous-lane A/B
+
+The anonymous overlap defect is fixed in `src/metal.rs`: record-backed commands
+cannot commit until the router has been observed, required experts loaded, and
+the table published. The directory also pre-pins all resident experts in the
+current union and refreshes LFU/recency on all-hit rounds.
+
+Two interleaved steady pairs on the frozen 48-token request all reported
+`exact_match_expected: true`:
+
+| profile | decode tok/s | model load | HTTP wall | misses/round | read MiB/round |
+|---|---:|---:|---:|---:|---:|
+| H2 pair 1 | 18.72 | 10.43 s | 11.019 s | 78.9 | 251.7 |
+| C5 pair 1 | 18.41 | 7.58 s | 10.345 s | 136.5 | 435.5 |
+| H2 pair 2 | 18.14 | 11.19 s | 11.154 s | 78.9 | 251.7 |
+| C5 pair 2 | 16.46 | 7.73 s | 11.587 s | 136.5 | 435.5 |
+
+H2 averages 18.43 tok/s versus C5's 17.44 (+5.4%) and remains the steady
+decode winner. C5 loads ~3.16 s faster; load + first request is ~15% faster.
+The machine was in a slower GPU state than the settled H2 range documented in
+`../HANDOFF-2026-08-24.md`, so use the interleaved ratio rather than comparing
+these absolute values with older warm runs.
+
+After the source was committed as `3726b3f1`, a fresh release build produced
+`root-final-h2-oracle`: exact 48/48 at 18.64 tok/s, 78.9 misses/round, and
+251.7 MiB/round. This is the receipt for the exact committed binary.
+
+The correctly bounded C4 run was exact at 16.31 tok/s and 138.5 misses/round.
+Sorting pooled reads by file offset (H4) was also a no-go: two paired runs kept
+the same 2,294 prompt reads / 7.32 GiB and changed prefill filler by only +0.4%.
+The H4 source switch was removed.
+
+The curated receipts are under `runs/`: `root-final-h2-oracle`, the four
+`root-refresh-{h2,c5}-pair*` directories, the C4 run, and the two interleaved
+H2/H4 pairs.

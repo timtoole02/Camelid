@@ -1,0 +1,819 @@
+[hw] GPU: Apple M4 | Metal compute | unified-memory yes | GPU-resident inference available
+[hw] CPU: 10 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 10.3 GiB free / 16.0 GiB total
+  Diagnostics log: /Users/timtoole/.local/state/Camelid/logs/camelid.log
+[gemma4-ghost] CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY=1: background target readahead skipped
+[gemma4-ghost-metal] per-layer slot distribution enabled: total 2640 slots (8.26 GiB resident) across 30 layers
+[metal qkv occupancy] orig max_threads/TG=1024 texw=32 tmem=0 | fused_rms max_threads/TG=1024 texw=32 tmem=0 (lower max_threads/TG ⇒ more registers / lower occupancy)
+[gemma4-ghost-metal] HYBRID ACTIVE: CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS=1 CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32 CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER=74,78,57,55,52,53,56,54,60,58,52,53,56,59,54,63,52,51,58,60,53,59,57,55,59,70,73,69,72,64, layers=30 canonical_addressable=128/layer physical_hot=per-layer-profile hot_capacity_slots=1786 hot_capacity_bytes=5998673920 mapped_cold_span_bytes=12897484800 overflow=0 victim=0 slot_pin=off prediction=off
+[gemma4-ghost-metal] hybrid decode promotion policy: CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION effective=0 terminal_decode_promotion=off final_prefill_hot_handoff=on
+[gemma4-ghost-metal] mapped-cold readahead policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool
+[gemma4-ghost-metal] mapped-cold previous-union policy: source=previous-target-exact-routed-union timing=before-assistant scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool correctness_dependency=0
+[gemma4-ghost-metal] mapped-cold readahead admission: max_inflight_records=512 whole_slab_advice=0 anonymous_capacity_bytes=0 rdadvise=0 rdadvise_early_max_records=0 rdadvise_total_max_records=0 current_routing_enqueued_records=0 current_routing_enqueued_bytes=0 current_routing_enqueue_time_us=0 previous_union_enqueued_records=0 previous_union_enqueued_bytes=0 previous_union_enqueue_time_us=0
+[gemma4-ghost-common] ACTIVE: full Metal common core, context cap=1024 positions, allocated KV=512 (0.21GiB of 0.43GiB at cap), router/shared/expert/tail device-chained, mode=fused-fast, q4-row=simdgroup-ordered
+[gemma4-ghost-metal] CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY=1: arbitrary cold-start expert prewarm skipped; persistent slots will populate from routed demand
+[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers=30 logical_addressable_slots/layer=128 anonymous_expert_capacity_bytes=5998673920 mapped_address_span_bytes=12897484800 mapped_address_span=12.01GiB mode=fused-fast
+[gemma4-ghost] Metal Q6_K tied head enabled (no-copy, file-backed)
+[metal] CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT=1 exact RB2/SG4 dispatch active
+[gemma4-mtp full-q4] enabled=true source_sha256=c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801 matrices=23 packed_bytes=236077056 bf16_matrix_bytes=839385088 quantize_us=60641 norms_quantized=false fallback=false
+[gemma4-mtp full-q4 residency] source_retained=false mapped_bytes=0 locked_bytes=0 resident_pages=0 total_pages=0 packed_bytes=236077056
+[gemma4-mtp] MTP QAT assistant loaded from "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors" lm_head=q4_0 matrices=q4_0_all (speculative enabled)
+
+  ðŸª Warming up the GPU (building the resident engine, one-time)â€¦
+[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 static_k8_dense=off runtime_k_dense=on
+[gemma4 exact partition] packed_k8_gateup=row_complete runtime_width_oracle=raw_bit_exact
+[metal chained] layer 0 slot_wait=3.65ms
+[metal chained] layer 1 slot_wait=12.17ms
+[metal chained] layer 2 slot_wait=4.80ms
+[metal chained] layer 3 slot_wait=8.82ms
+[metal chained] layer 4 slot_wait=10.89ms
+[metal chained] layer 5 slot_wait=11.86ms
+[metal chained] layer 6 slot_wait=6.47ms
+[metal chained] layer 7 slot_wait=6.84ms
+[metal chained] layer 8 slot_wait=7.32ms
+[metal chained] layer 9 slot_wait=10.93ms
+[metal chained] layer 10 slot_wait=9.79ms
+[metal chained] layer 11 slot_wait=5.52ms
+[metal chained] layer 12 slot_wait=5.47ms
+[metal chained] layer 13 slot_wait=9.65ms
+[metal chained] layer 14 slot_wait=10.45ms
+[metal chained] layer 15 slot_wait=12.75ms
+[metal chained] layer 16 slot_wait=13.47ms
+[metal chained] layer 17 slot_wait=5.13ms
+[metal chained] layer 18 slot_wait=4.99ms
+[metal chained] layer 19 slot_wait=5.51ms
+[metal chained] layer 20 slot_wait=8.08ms
+[metal chained] layer 21 slot_wait=7.12ms
+[metal chained] layer 22 slot_wait=7.31ms
+[metal chained] layer 23 slot_wait=12.33ms
+[metal chained] layer 24 slot_wait=5.51ms
+[metal chained] layer 25 slot_wait=6.27ms
+[metal chained] layer 26 slot_wait=6.73ms
+[metal chained] layer 27 slot_wait=12.24ms
+[metal chained] layer 28 slot_wait=8.18ms
+[metal chained] layer 29 slot_wait=7.95ms
+[metal chained ledger] start_pos=0 K=8 ok=true predicted=false slot_wait=248.0ms slot_filler=1423.4ms wave_load=0.0ms final_wait=4.4ms encode=7.7ms gpu_busy(last_cb)=236.0ms disk_loads=1030 disk_bytes=3286.1MiB disk_time=10406.1ms unique=1030 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.4ms fill=0.0ms (copy=0.0ms disk=10406.1ms victim=0.0ms) pre_encode=0.0ms slot hits=0 misses=1030 evictions=0 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=0/1030 resident_at_start=0/1030 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=73.7ms attn=0.0ms router=0.0ms shared=29.3ms gateup=132.9ms down=0.0ms resid=0.0ms gpu_total=236.0ms
+[metal chained] layer 0 slot_wait=6.95ms
+[metal chained] layer 1 slot_wait=13.93ms
+[metal chained] layer 2 slot_wait=7.89ms
+[metal chained] layer 3 slot_wait=9.12ms
+[metal chained] layer 4 slot_wait=11.99ms
+[metal chained] layer 5 slot_wait=8.17ms
+[metal chained] layer 6 slot_wait=8.63ms
+[metal chained] layer 7 slot_wait=7.67ms
+[metal chained] layer 8 slot_wait=9.80ms
+[metal chained] layer 9 slot_wait=2.59ms
+[metal chained] layer 10 slot_wait=2.15ms
+[metal chained] layer 11 slot_wait=6.19ms
+[metal chained] layer 12 slot_wait=4.22ms
+[metal chained] layer 13 slot_wait=1.82ms
+[metal chained] layer 14 slot_wait=2.20ms
+[metal chained] layer 15 slot_wait=2.30ms
+[metal chained] layer 16 slot_wait=1.59ms
+[metal chained] layer 17 slot_wait=8.09ms
+[metal chained] layer 18 slot_wait=2.07ms
+[metal chained] layer 19 slot_wait=4.79ms
+[metal chained] layer 20 slot_wait=2.21ms
+[metal chained] layer 21 slot_wait=4.56ms
+[metal chained] layer 22 slot_wait=5.43ms
+[metal chained] layer 23 slot_wait=2.52ms
+[metal chained] layer 24 slot_wait=3.69ms
+[metal chained] layer 25 slot_wait=5.06ms
+[metal chained] layer 26 slot_wait=7.34ms
+[metal chained] layer 27 slot_wait=8.71ms
+[metal chained] layer 28 slot_wait=2.31ms
+[metal chained] layer 29 slot_wait=4.29ms
+[metal chained ledger] start_pos=8 K=2 ok=true predicted=false slot_wait=168.1ms slot_filler=182.2ms wave_load=0.0ms final_wait=1.9ms encode=1.6ms gpu_busy(last_cb)=100.8ms disk_loads=100 disk_bytes=319.0MiB disk_time=781.8ms unique=377 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.1ms fill=0.0ms (copy=0.0ms disk=781.8ms victim=0.0ms) pre_encode=0.0ms slot hits=277 misses=100 evictions=0 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=277/377 resident_at_start=277/377 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=39.9ms attn=0.0ms router=0.0ms shared=12.9ms gateup=48.0ms down=0.0ms resid=0.0ms gpu_total=100.8ms
+[gemma4-ghost-metal] prefill hot32 handoff ok=true candidates=1130 loads=0 bytes=0.0MiB evictions=0 io_sum=0.0ms wall=0.1ms
+[gemma4-ghost-common] imported 10 CPU-prefilled positions into Metal KV in 0.0ms
+[gemma4-ghost-metal-summary] layers=30 slots/layer=128 routed_positions=5 lookups=1407 hits=277 misses=1130 hit_rate=19.7% evictions=0 host_fills=0 prewarm_copies=0 direct_reads=0 direct_read_bytes=0.0MiB direct_read_per_position=0.0MiB read_failures=0 wall=2094.6ms
+
+  ðŸª Camelid is ready
+  Open the chat UI:  http://127.0.0.1:8189
+  OpenAI-style API:  http://127.0.0.1:8189/v1/chat/completions
+
+  Workspace CLI: ready
+[metal chained] layer 0 slot_wait=4.12ms
+[metal chained] layer 1 slot_wait=14.46ms
+[metal chained] layer 2 slot_wait=14.78ms
+[metal chained] layer 3 slot_wait=16.89ms
+[metal chained] layer 4 slot_wait=11.39ms
+[metal chained] layer 5 slot_wait=12.95ms
+[metal chained] layer 6 slot_wait=13.70ms
+[metal chained] layer 7 slot_wait=12.86ms
+[metal chained] layer 8 slot_wait=9.17ms
+[metal chained] layer 9 slot_wait=13.74ms
+[metal chained] layer 10 slot_wait=10.49ms
+[metal chained] layer 11 slot_wait=13.48ms
+[metal chained] layer 12 slot_wait=11.73ms
+[metal chained] layer 13 slot_wait=20.06ms
+[metal chained] layer 14 slot_wait=19.48ms
+[metal chained] layer 15 slot_wait=15.05ms
+[metal chained] layer 16 slot_wait=18.69ms
+[metal chained] layer 17 slot_wait=19.81ms
+[metal chained] layer 18 slot_wait=19.14ms
+[metal chained] layer 19 slot_wait=11.54ms
+[metal chained] layer 20 slot_wait=18.33ms
+[metal chained] layer 21 slot_wait=13.48ms
+[metal chained] layer 22 slot_wait=15.13ms
+[metal chained] layer 23 slot_wait=17.02ms
+[metal chained] layer 24 slot_wait=14.08ms
+[metal chained] layer 25 slot_wait=19.34ms
+[metal chained] layer 26 slot_wait=16.99ms
+[metal chained] layer 27 slot_wait=26.15ms
+[metal chained] layer 28 slot_wait=23.33ms
+[metal chained] layer 29 slot_wait=19.78ms
+[metal chained ledger] start_pos=0 K=8 ok=true predicted=false slot_wait=467.0ms slot_filler=554.9ms wave_load=0.0ms final_wait=18.2ms encode=1.9ms gpu_busy(last_cb)=241.9ms disk_loads=299 disk_bytes=953.9MiB disk_time=3592.9ms unique=1111 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=3592.9ms victim=0.0ms) pre_encode=0.0ms slot hits=812 misses=299 evictions=6 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=257/1111 resident_at_start=812/1111 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=82.2ms attn=0.0ms router=0.0ms shared=33.8ms gateup=125.9ms down=0.0ms resid=0.0ms gpu_total=241.9ms
+[metal chained] layer 0 slot_wait=6.13ms
+[metal chained] layer 1 slot_wait=10.35ms
+[metal chained] layer 2 slot_wait=8.76ms
+[metal chained] layer 3 slot_wait=12.32ms
+[metal chained] layer 4 slot_wait=5.64ms
+[metal chained] layer 5 slot_wait=5.44ms
+[metal chained] layer 6 slot_wait=6.48ms
+[metal chained] layer 7 slot_wait=7.22ms
+[metal chained] layer 8 slot_wait=13.83ms
+[metal chained] layer 9 slot_wait=14.47ms
+[metal chained] layer 10 slot_wait=14.48ms
+[metal chained] layer 11 slot_wait=7.37ms
+[metal chained] layer 12 slot_wait=8.26ms
+[metal chained] layer 13 slot_wait=5.20ms
+[metal chained] layer 14 slot_wait=9.04ms
+[metal chained] layer 15 slot_wait=7.67ms
+[metal chained] layer 16 slot_wait=5.67ms
+[metal chained] layer 17 slot_wait=5.33ms
+[metal chained] layer 18 slot_wait=11.82ms
+[metal chained] layer 19 slot_wait=11.80ms
+[metal chained] layer 20 slot_wait=6.90ms
+[metal chained] layer 21 slot_wait=8.89ms
+[metal chained] layer 22 slot_wait=9.03ms
+[metal chained] layer 23 slot_wait=12.19ms
+[metal chained] layer 24 slot_wait=7.51ms
+[metal chained] layer 25 slot_wait=7.19ms
+[metal chained] layer 26 slot_wait=8.57ms
+[metal chained] layer 27 slot_wait=9.80ms
+[metal chained] layer 28 slot_wait=7.66ms
+[metal chained] layer 29 slot_wait=12.89ms
+[metal chained ledger] start_pos=8 K=8 ok=true predicted=false slot_wait=267.8ms slot_filler=673.4ms wave_load=0.0ms final_wait=8.3ms encode=1.8ms gpu_busy(last_cb)=254.3ms disk_loads=370 disk_bytes=1180.5MiB disk_time=4362.5ms unique=822 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=4362.5ms victim=0.0ms) pre_encode=0.0ms slot hits=452 misses=370 evictions=70 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=401/822 resident_at_start=452/822 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=97.7ms attn=0.0ms router=0.0ms shared=34.7ms gateup=121.8ms down=0.0ms resid=0.0ms gpu_total=254.3ms
+[metal chained] layer 0 slot_wait=5.06ms
+[metal chained] layer 1 slot_wait=5.50ms
+[metal chained] layer 2 slot_wait=13.14ms
+[metal chained] layer 3 slot_wait=7.63ms
+[metal chained] layer 4 slot_wait=8.39ms
+[metal chained] layer 5 slot_wait=6.72ms
+[metal chained] layer 6 slot_wait=6.27ms
+[metal chained] layer 7 slot_wait=12.50ms
+[metal chained] layer 8 slot_wait=6.63ms
+[metal chained] layer 9 slot_wait=11.71ms
+[metal chained] layer 10 slot_wait=7.18ms
+[metal chained] layer 11 slot_wait=8.49ms
+[metal chained] layer 12 slot_wait=11.07ms
+[metal chained] layer 13 slot_wait=8.00ms
+[metal chained] layer 14 slot_wait=14.04ms
+[metal chained] layer 15 slot_wait=11.17ms
+[metal chained] layer 16 slot_wait=15.36ms
+[metal chained] layer 17 slot_wait=14.42ms
+[metal chained] layer 18 slot_wait=6.67ms
+[metal chained] layer 19 slot_wait=6.75ms
+[metal chained] layer 20 slot_wait=5.02ms
+[metal chained] layer 21 slot_wait=9.62ms
+[metal chained] layer 22 slot_wait=6.65ms
+[metal chained] layer 23 slot_wait=6.12ms
+[metal chained] layer 24 slot_wait=10.38ms
+[metal chained] layer 25 slot_wait=6.78ms
+[metal chained] layer 26 slot_wait=9.32ms
+[metal chained] layer 27 slot_wait=6.20ms
+[metal chained] layer 28 slot_wait=5.00ms
+[metal chained] layer 29 slot_wait=6.11ms
+[metal chained ledger] start_pos=16 K=8 ok=true predicted=false slot_wait=257.8ms slot_filler=424.4ms wave_load=0.0ms final_wait=5.7ms encode=1.4ms gpu_busy(last_cb)=224.2ms disk_loads=249 disk_bytes=794.4MiB disk_time=2598.4ms unique=822 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=2598.4ms victim=0.0ms) pre_encode=0.0ms slot hits=573 misses=249 evictions=189 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=442/822 resident_at_start=573/822 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=86.1ms attn=0.0ms router=0.0ms shared=28.8ms gateup=109.3ms down=0.0ms resid=0.0ms gpu_total=224.2ms
+[metal chained] layer 0 slot_wait=2.08ms
+[metal chained] layer 1 slot_wait=6.41ms
+[metal chained] layer 2 slot_wait=12.41ms
+[metal chained] layer 3 slot_wait=6.00ms
+[metal chained] layer 4 slot_wait=5.51ms
+[metal chained] layer 5 slot_wait=6.31ms
+[metal chained] layer 6 slot_wait=5.14ms
+[metal chained] layer 7 slot_wait=7.70ms
+[metal chained] layer 8 slot_wait=6.51ms
+[metal chained] layer 9 slot_wait=5.22ms
+[metal chained] layer 10 slot_wait=8.33ms
+[metal chained] layer 11 slot_wait=10.44ms
+[metal chained] layer 12 slot_wait=8.98ms
+[metal chained] layer 13 slot_wait=11.14ms
+[metal chained] layer 14 slot_wait=8.62ms
+[metal chained] layer 15 slot_wait=8.93ms
+[metal chained] layer 16 slot_wait=6.55ms
+[metal chained] layer 17 slot_wait=7.96ms
+[metal chained] layer 18 slot_wait=9.61ms
+[metal chained] layer 19 slot_wait=9.98ms
+[metal chained] layer 20 slot_wait=7.51ms
+[metal chained] layer 21 slot_wait=10.39ms
+[metal chained] layer 22 slot_wait=7.05ms
+[metal chained] layer 23 slot_wait=7.23ms
+[metal chained] layer 24 slot_wait=9.42ms
+[metal chained] layer 25 slot_wait=6.50ms
+[metal chained] layer 26 slot_wait=8.87ms
+[metal chained] layer 27 slot_wait=7.26ms
+[metal chained] layer 28 slot_wait=5.88ms
+[metal chained] layer 29 slot_wait=8.03ms
+[metal chained ledger] start_pos=24 K=8 ok=true predicted=false slot_wait=231.9ms slot_filler=268.7ms wave_load=0.0ms final_wait=7.1ms encode=1.5ms gpu_busy(last_cb)=219.1ms disk_loads=177 disk_bytes=564.7MiB disk_time=1339.7ms unique=836 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=1339.7ms victim=0.0ms) pre_encode=0.0ms slot hits=659 misses=177 evictions=174 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=545/836 resident_at_start=659/836 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=63.6ms attn=0.0ms router=0.0ms shared=29.0ms gateup=126.5ms down=0.0ms resid=0.0ms gpu_total=219.1ms
+[metal chained] layer 0 slot_wait=4.44ms
+[metal chained] layer 1 slot_wait=7.29ms
+[metal chained] layer 2 slot_wait=8.14ms
+[metal chained] layer 3 slot_wait=6.78ms
+[metal chained] layer 4 slot_wait=10.19ms
+[metal chained] layer 5 slot_wait=10.81ms
+[metal chained] layer 6 slot_wait=10.81ms
+[metal chained] layer 7 slot_wait=6.20ms
+[metal chained] layer 8 slot_wait=10.52ms
+[metal chained] layer 9 slot_wait=6.08ms
+[metal chained] layer 10 slot_wait=5.42ms
+[metal chained] layer 11 slot_wait=7.84ms
+[metal chained] layer 12 slot_wait=5.64ms
+[metal chained] layer 13 slot_wait=10.45ms
+[metal chained] layer 14 slot_wait=10.42ms
+[metal chained] layer 15 slot_wait=8.14ms
+[metal chained] layer 16 slot_wait=7.32ms
+[metal chained] layer 17 slot_wait=6.56ms
+[metal chained] layer 18 slot_wait=6.83ms
+[metal chained] layer 19 slot_wait=7.18ms
+[metal chained] layer 20 slot_wait=7.07ms
+[metal chained] layer 21 slot_wait=7.49ms
+[metal chained] layer 22 slot_wait=6.97ms
+[metal chained] layer 23 slot_wait=7.24ms
+[metal chained] layer 24 slot_wait=6.98ms
+[metal chained] layer 25 slot_wait=7.00ms
+[metal chained] layer 26 slot_wait=7.83ms
+[metal chained] layer 27 slot_wait=11.86ms
+[metal chained] layer 28 slot_wait=8.17ms
+[metal chained] layer 29 slot_wait=8.53ms
+[metal chained ledger] start_pos=32 K=8 ok=true predicted=false slot_wait=236.1ms slot_filler=279.5ms wave_load=0.0ms final_wait=3.9ms encode=1.4ms gpu_busy(last_cb)=202.4ms disk_loads=179 disk_bytes=571.1MiB disk_time=1412.0ms unique=869 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=1412.0ms victim=0.0ms) pre_encode=0.0ms slot hits=690 misses=179 evictions=179 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=499/869 resident_at_start=690/869 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=57.9ms attn=0.0ms router=0.0ms shared=30.9ms gateup=113.6ms down=0.0ms resid=0.0ms gpu_total=202.4ms
+[metal chained] layer 0 slot_wait=4.37ms
+[metal chained] layer 1 slot_wait=7.68ms
+[metal chained] layer 2 slot_wait=7.66ms
+[metal chained] layer 3 slot_wait=12.33ms
+[metal chained] layer 4 slot_wait=7.77ms
+[metal chained] layer 5 slot_wait=7.46ms
+[metal chained] layer 6 slot_wait=7.87ms
+[metal chained] layer 7 slot_wait=7.12ms
+[metal chained] layer 8 slot_wait=12.72ms
+[metal chained] layer 9 slot_wait=9.12ms
+[metal chained] layer 10 slot_wait=6.32ms
+[metal chained] layer 11 slot_wait=10.44ms
+[metal chained] layer 12 slot_wait=7.55ms
+[metal chained] layer 13 slot_wait=13.82ms
+[metal chained] layer 14 slot_wait=6.10ms
+[metal chained] layer 15 slot_wait=11.65ms
+[metal chained] layer 16 slot_wait=6.77ms
+[metal chained] layer 17 slot_wait=7.40ms
+[metal chained] layer 18 slot_wait=5.79ms
+[metal chained] layer 19 slot_wait=9.88ms
+[metal chained] layer 20 slot_wait=12.60ms
+[metal chained] layer 21 slot_wait=7.15ms
+[metal chained] layer 22 slot_wait=6.59ms
+[metal chained] layer 23 slot_wait=12.67ms
+[metal chained] layer 24 slot_wait=6.99ms
+[metal chained] layer 25 slot_wait=10.49ms
+[metal chained] layer 26 slot_wait=8.44ms
+[metal chained] layer 27 slot_wait=8.96ms
+[metal chained] layer 28 slot_wait=9.58ms
+[metal chained] layer 29 slot_wait=10.13ms
+[metal chained ledger] start_pos=40 K=8 ok=true predicted=false slot_wait=263.3ms slot_filler=309.6ms wave_load=0.0ms final_wait=5.9ms encode=1.4ms gpu_busy(last_cb)=245.5ms disk_loads=198 disk_bytes=631.7MiB disk_time=1696.0ms unique=721 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=1696.0ms victim=0.0ms) pre_encode=0.0ms slot hits=523 misses=198 evictions=198 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=258/721 resident_at_start=523/721 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=89.5ms attn=0.0ms router=0.0ms shared=33.9ms gateup=122.2ms down=0.0ms resid=0.0ms gpu_total=245.5ms
+[metal chained] layer 0 slot_wait=2.86ms
+[metal chained] layer 1 slot_wait=13.98ms
+[metal chained] layer 2 slot_wait=10.96ms
+[metal chained] layer 3 slot_wait=6.58ms
+[metal chained] layer 4 slot_wait=7.45ms
+[metal chained] layer 5 slot_wait=9.40ms
+[metal chained] layer 6 slot_wait=6.47ms
+[metal chained] layer 7 slot_wait=10.10ms
+[metal chained] layer 8 slot_wait=11.31ms
+[metal chained] layer 9 slot_wait=10.97ms
+[metal chained] layer 10 slot_wait=5.79ms
+[metal chained] layer 11 slot_wait=10.91ms
+[metal chained] layer 12 slot_wait=11.11ms
+[metal chained] layer 13 slot_wait=8.98ms
+[metal chained] layer 14 slot_wait=10.41ms
+[metal chained] layer 15 slot_wait=14.22ms
+[metal chained] layer 16 slot_wait=12.08ms
+[metal chained] layer 17 slot_wait=9.67ms
+[metal chained] layer 18 slot_wait=5.40ms
+[metal chained] layer 19 slot_wait=5.20ms
+[metal chained] layer 20 slot_wait=7.91ms
+[metal chained] layer 21 slot_wait=10.52ms
+[metal chained] layer 22 slot_wait=9.19ms
+[metal chained] layer 23 slot_wait=10.27ms
+[metal chained] layer 24 slot_wait=8.17ms
+[metal chained] layer 25 slot_wait=7.06ms
+[metal chained] layer 26 slot_wait=9.72ms
+[metal chained] layer 27 slot_wait=9.75ms
+[metal chained] layer 28 slot_wait=7.97ms
+[metal chained] layer 29 slot_wait=12.22ms
+[metal chained ledger] start_pos=48 K=8 ok=true predicted=false slot_wait=276.5ms slot_filler=217.2ms wave_load=0.0ms final_wait=4.6ms encode=1.5ms gpu_busy(last_cb)=254.1ms disk_loads=119 disk_bytes=379.7MiB disk_time=960.0ms unique=778 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=960.0ms victim=0.0ms) pre_encode=0.0ms slot hits=659 misses=119 evictions=119 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=497/778 resident_at_start=659/778 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=80.1ms attn=0.0ms router=0.0ms shared=30.5ms gateup=143.5ms down=0.0ms resid=0.0ms gpu_total=254.1ms
+[metal chained] layer 0 slot_wait=7.57ms
+[metal chained] layer 1 slot_wait=10.39ms
+[metal chained] layer 2 slot_wait=11.11ms
+[metal chained] layer 3 slot_wait=10.83ms
+[metal chained] layer 4 slot_wait=5.28ms
+[metal chained] layer 5 slot_wait=6.53ms
+[metal chained] layer 6 slot_wait=6.40ms
+[metal chained] layer 7 slot_wait=9.83ms
+[metal chained] layer 8 slot_wait=5.48ms
+[metal chained] layer 9 slot_wait=6.82ms
+[metal chained] layer 10 slot_wait=7.29ms
+[metal chained] layer 11 slot_wait=10.03ms
+[metal chained] layer 12 slot_wait=8.19ms
+[metal chained] layer 13 slot_wait=5.67ms
+[metal chained] layer 14 slot_wait=5.80ms
+[metal chained] layer 15 slot_wait=8.22ms
+[metal chained] layer 16 slot_wait=9.78ms
+[metal chained] layer 17 slot_wait=7.06ms
+[metal chained] layer 18 slot_wait=7.61ms
+[metal chained] layer 19 slot_wait=7.31ms
+[metal chained] layer 20 slot_wait=6.20ms
+[metal chained] layer 21 slot_wait=5.38ms
+[metal chained] layer 22 slot_wait=5.99ms
+[metal chained] layer 23 slot_wait=5.67ms
+[metal chained] layer 24 slot_wait=5.78ms
+[metal chained] layer 25 slot_wait=6.65ms
+[metal chained] layer 26 slot_wait=5.09ms
+[metal chained] layer 27 slot_wait=6.75ms
+[metal chained] layer 28 slot_wait=10.13ms
+[metal chained] layer 29 slot_wait=9.23ms
+[metal chained ledger] start_pos=56 K=8 ok=true predicted=false slot_wait=223.9ms slot_filler=237.0ms wave_load=0.0ms final_wait=8.7ms encode=1.4ms gpu_busy(last_cb)=210.3ms disk_loads=151 disk_bytes=481.8MiB disk_time=1046.9ms unique=877 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=1046.9ms victim=0.0ms) pre_encode=0.0ms slot hits=726 misses=151 evictions=151 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=560/877 resident_at_start=726/877 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=65.6ms attn=0.0ms router=0.0ms shared=26.5ms gateup=118.1ms down=0.0ms resid=0.0ms gpu_total=210.3ms
+[metal chained] layer 0 slot_wait=4.32ms
+[metal chained] layer 1 slot_wait=10.27ms
+[metal chained] layer 2 slot_wait=6.52ms
+[metal chained] layer 3 slot_wait=6.27ms
+[metal chained] layer 4 slot_wait=11.70ms
+[metal chained] layer 5 slot_wait=6.27ms
+[metal chained] layer 6 slot_wait=8.75ms
+[metal chained] layer 7 slot_wait=10.55ms
+[metal chained] layer 8 slot_wait=10.62ms
+[metal chained] layer 9 slot_wait=5.38ms
+[metal chained] layer 10 slot_wait=6.89ms
+[metal chained] layer 11 slot_wait=6.73ms
+[metal chained] layer 12 slot_wait=7.33ms
+[metal chained] layer 13 slot_wait=6.09ms
+[metal chained] layer 14 slot_wait=6.29ms
+[metal chained] layer 15 slot_wait=12.69ms
+[metal chained] layer 16 slot_wait=9.46ms
+[metal chained] layer 17 slot_wait=11.53ms
+[metal chained] layer 18 slot_wait=8.09ms
+[metal chained] layer 19 slot_wait=11.13ms
+[metal chained] layer 20 slot_wait=11.23ms
+[metal chained] layer 21 slot_wait=7.08ms
+[metal chained] layer 22 slot_wait=10.30ms
+[metal chained] layer 23 slot_wait=12.60ms
+[metal chained] layer 24 slot_wait=8.16ms
+[metal chained] layer 25 slot_wait=9.74ms
+[metal chained] layer 26 slot_wait=11.95ms
+[metal chained] layer 27 slot_wait=9.14ms
+[metal chained] layer 28 slot_wait=10.94ms
+[metal chained] layer 29 slot_wait=11.22ms
+[metal chained ledger] start_pos=64 K=8 ok=true predicted=false slot_wait=269.1ms slot_filler=244.1ms wave_load=0.0ms final_wait=5.8ms encode=1.4ms gpu_busy(last_cb)=256.0ms disk_loads=138 disk_bytes=440.3MiB disk_time=1071.3ms unique=967 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=1071.3ms victim=0.0ms) pre_encode=0.0ms slot hits=829 misses=138 evictions=138 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=607/967 resident_at_start=829/967 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=84.6ms attn=0.0ms router=0.0ms shared=33.7ms gateup=137.8ms down=0.0ms resid=0.0ms gpu_total=256.0ms
+[metal chained] layer 0 slot_wait=7.70ms
+[metal chained] layer 1 slot_wait=6.73ms
+[metal chained] layer 2 slot_wait=7.17ms
+[metal chained] layer 3 slot_wait=9.70ms
+[metal chained] layer 4 slot_wait=8.92ms
+[metal chained] layer 5 slot_wait=6.18ms
+[metal chained] layer 6 slot_wait=7.40ms
+[metal chained] layer 7 slot_wait=9.95ms
+[metal chained] layer 8 slot_wait=8.24ms
+[metal chained] layer 9 slot_wait=6.81ms
+[metal chained] layer 10 slot_wait=5.48ms
+[metal chained] layer 11 slot_wait=6.13ms
+[metal chained] layer 12 slot_wait=9.21ms
+[metal chained] layer 13 slot_wait=5.70ms
+[metal chained] layer 14 slot_wait=4.83ms
+[metal chained] layer 15 slot_wait=5.56ms
+[metal chained] layer 16 slot_wait=7.91ms
+[metal chained] layer 17 slot_wait=9.00ms
+[metal chained] layer 18 slot_wait=4.79ms
+[metal chained] layer 19 slot_wait=4.87ms
+[metal chained] layer 20 slot_wait=8.62ms
+[metal chained] layer 21 slot_wait=4.83ms
+[metal chained] layer 22 slot_wait=5.35ms
+[metal chained] layer 23 slot_wait=7.35ms
+[metal chained] layer 24 slot_wait=4.53ms
+[metal chained] layer 25 slot_wait=5.14ms
+[metal chained] layer 26 slot_wait=7.32ms
+[metal chained] layer 27 slot_wait=8.80ms
+[metal chained] layer 28 slot_wait=9.91ms
+[metal chained] layer 29 slot_wait=5.28ms
+[metal chained ledger] start_pos=72 K=8 ok=true predicted=false slot_wait=209.3ms slot_filler=206.8ms wave_load=0.0ms final_wait=3.2ms encode=1.5ms gpu_busy(last_cb)=202.5ms disk_loads=123 disk_bytes=392.4MiB disk_time=902.2ms unique=983 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=902.2ms victim=0.0ms) pre_encode=0.0ms slot hits=860 misses=123 evictions=123 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=656/983 resident_at_start=860/983 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=66.7ms attn=0.0ms router=0.0ms shared=29.8ms gateup=106.1ms down=0.0ms resid=0.0ms gpu_total=202.5ms
+[metal chained] layer 0 slot_wait=2.04ms
+[metal chained] layer 1 slot_wait=10.33ms
+[metal chained] layer 2 slot_wait=4.81ms
+[metal chained] layer 3 slot_wait=7.57ms
+[metal chained] layer 4 slot_wait=9.49ms
+[metal chained] layer 5 slot_wait=8.97ms
+[metal chained] layer 6 slot_wait=6.18ms
+[metal chained] layer 7 slot_wait=8.99ms
+[metal chained] layer 8 slot_wait=4.51ms
+[metal chained] layer 9 slot_wait=5.69ms
+[metal chained] layer 10 slot_wait=8.89ms
+[metal chained] layer 11 slot_wait=9.54ms
+[metal chained] layer 12 slot_wait=4.78ms
+[metal chained] layer 13 slot_wait=5.29ms
+[metal chained] layer 14 slot_wait=4.91ms
+[metal chained] layer 15 slot_wait=7.01ms
+[metal chained] layer 16 slot_wait=10.28ms
+[metal chained] layer 17 slot_wait=10.58ms
+[metal chained] layer 18 slot_wait=4.59ms
+[metal chained] layer 19 slot_wait=6.38ms
+[metal chained] layer 20 slot_wait=9.67ms
+[metal chained] layer 21 slot_wait=9.02ms
+[metal chained] layer 22 slot_wait=7.64ms
+[metal chained] layer 23 slot_wait=6.05ms
+[metal chained] layer 24 slot_wait=4.44ms
+[metal chained] layer 25 slot_wait=7.61ms
+[metal chained] layer 26 slot_wait=8.37ms
+[metal chained] layer 27 slot_wait=4.95ms
+[metal chained] layer 28 slot_wait=10.23ms
+[metal chained] layer 29 slot_wait=6.02ms
+[metal chained ledger] start_pos=80 K=8 ok=true predicted=false slot_wait=214.7ms slot_filler=158.2ms wave_load=0.0ms final_wait=4.3ms encode=1.4ms gpu_busy(last_cb)=209.1ms disk_loads=90 disk_bytes=287.1MiB disk_time=585.9ms unique=1015 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=585.9ms victim=0.0ms) pre_encode=0.0ms slot hits=925 misses=90 evictions=90 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=713/1015 resident_at_start=925/1015 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=80.6ms attn=0.0ms router=0.0ms shared=25.4ms gateup=103.1ms down=0.0ms resid=0.0ms gpu_total=209.1ms
+[metal chained] layer 0 slot_wait=3.22ms
+[metal chained] layer 1 slot_wait=5.59ms
+[metal chained] layer 2 slot_wait=5.46ms
+[metal chained] layer 3 slot_wait=8.00ms
+[metal chained] layer 4 slot_wait=9.04ms
+[metal chained] layer 5 slot_wait=10.41ms
+[metal chained] layer 6 slot_wait=9.98ms
+[metal chained] layer 7 slot_wait=5.79ms
+[metal chained] layer 8 slot_wait=9.78ms
+[metal chained] layer 9 slot_wait=9.76ms
+[metal chained] layer 10 slot_wait=10.21ms
+[metal chained] layer 11 slot_wait=10.09ms
+[metal chained] layer 12 slot_wait=5.22ms
+[metal chained] layer 13 slot_wait=8.18ms
+[metal chained] layer 14 slot_wait=9.45ms
+[metal chained] layer 15 slot_wait=11.26ms
+[metal chained] layer 16 slot_wait=5.03ms
+[metal chained] layer 17 slot_wait=7.86ms
+[metal chained] layer 18 slot_wait=5.85ms
+[metal chained] layer 19 slot_wait=7.55ms
+[metal chained] layer 20 slot_wait=5.72ms
+[metal chained] layer 21 slot_wait=10.79ms
+[metal chained] layer 22 slot_wait=4.42ms
+[metal chained] layer 23 slot_wait=9.64ms
+[metal chained] layer 24 slot_wait=9.87ms
+[metal chained] layer 25 slot_wait=11.28ms
+[metal chained] layer 26 slot_wait=10.19ms
+[metal chained] layer 27 slot_wait=11.40ms
+[metal chained] layer 28 slot_wait=12.08ms
+[metal chained] layer 29 slot_wait=6.83ms
+[metal chained ledger] start_pos=88 K=8 ok=true predicted=false slot_wait=249.8ms slot_filler=165.3ms wave_load=0.0ms final_wait=3.9ms encode=1.4ms gpu_busy(last_cb)=242.1ms disk_loads=106 disk_bytes=338.2MiB disk_time=579.1ms unique=1022 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=579.1ms victim=0.0ms) pre_encode=0.0ms slot hits=916 misses=106 evictions=106 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=692/1022 resident_at_start=916/1022 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=101.2ms attn=0.0ms router=0.0ms shared=30.0ms gateup=110.9ms down=0.0ms resid=0.0ms gpu_total=242.1ms
+[metal chained] layer 0 slot_wait=2.51ms
+[metal chained] layer 1 slot_wait=12.04ms
+[metal chained] layer 2 slot_wait=10.31ms
+[metal chained] layer 3 slot_wait=6.77ms
+[metal chained] layer 4 slot_wait=12.99ms
+[metal chained] layer 5 slot_wait=7.12ms
+[metal chained] layer 6 slot_wait=6.45ms
+[metal chained] layer 7 slot_wait=11.09ms
+[metal chained] layer 8 slot_wait=11.59ms
+[metal chained] layer 9 slot_wait=5.25ms
+[metal chained] layer 10 slot_wait=10.07ms
+[metal chained] layer 11 slot_wait=11.17ms
+[metal chained] layer 12 slot_wait=4.48ms
+[metal chained] layer 13 slot_wait=10.27ms
+[metal chained] layer 14 slot_wait=10.32ms
+[metal chained] layer 15 slot_wait=10.66ms
+[metal chained] layer 16 slot_wait=11.07ms
+[metal chained] layer 17 slot_wait=11.10ms
+[metal chained] layer 18 slot_wait=9.14ms
+[metal chained] layer 19 slot_wait=11.60ms
+[metal chained] layer 20 slot_wait=11.03ms
+[metal chained] layer 21 slot_wait=11.75ms
+[metal chained] layer 22 slot_wait=11.82ms
+[metal chained] layer 23 slot_wait=13.27ms
+[metal chained] layer 24 slot_wait=12.40ms
+[metal chained] layer 25 slot_wait=9.81ms
+[metal chained] layer 26 slot_wait=11.91ms
+[metal chained] layer 27 slot_wait=12.91ms
+[metal chained] layer 28 slot_wait=9.22ms
+[metal chained] layer 29 slot_wait=7.95ms
+[metal chained ledger] start_pos=96 K=8 ok=true predicted=false slot_wait=297.9ms slot_filler=151.5ms wave_load=0.0ms final_wait=9.5ms encode=1.9ms gpu_busy(last_cb)=269.5ms disk_loads=95 disk_bytes=303.1MiB disk_time=538.8ms unique=934 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=538.8ms victim=0.0ms) pre_encode=0.0ms slot hits=839 misses=95 evictions=95 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=580/934 resident_at_start=839/934 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=107.3ms attn=0.0ms router=0.0ms shared=30.9ms gateup=131.2ms down=0.0ms resid=0.0ms gpu_total=269.5ms
+[gemma4-ghost-metal] prefill hot32 handoff ok=true candidates=2712 loads=0 bytes=0.0MiB evictions=0 io_sum=0.0ms wall=0.1ms
+[gemma4-ghost-common] imported 104 CPU-prefilled positions into Metal KV in 0.0ms
+[gemma4-mtp bootstrap] prefill_seed_attempted=1 used=1 fallback=none
+[gemma4-ghost-metal] previous-union readahead next_start_pos=104 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=298 wait_us=89820 gpu_us=57662 kernel_us=31939 wall_us=90244
+[metal chained] layer 0 slot_wait=1.99ms
+[metal chained] layer 1 slot_wait=7.61ms
+[metal chained] layer 2 slot_wait=5.34ms
+[metal chained] layer 3 slot_wait=4.77ms
+[metal chained] layer 4 slot_wait=5.64ms
+[metal chained] layer 5 slot_wait=5.03ms
+[metal chained] layer 6 slot_wait=7.86ms
+[metal chained] layer 7 slot_wait=5.00ms
+[metal chained] layer 8 slot_wait=5.21ms
+[metal chained] layer 9 slot_wait=5.42ms
+[metal chained] layer 10 slot_wait=9.17ms
+[metal chained] layer 11 slot_wait=5.22ms
+[metal chained] layer 12 slot_wait=7.21ms
+[metal chained] layer 13 slot_wait=4.64ms
+[metal chained] layer 14 slot_wait=4.27ms
+[metal chained] layer 15 slot_wait=4.43ms
+[metal chained] layer 16 slot_wait=6.58ms
+[metal chained] layer 17 slot_wait=4.94ms
+[metal chained] layer 18 slot_wait=6.67ms
+[metal chained] layer 19 slot_wait=10.21ms
+[metal chained] layer 20 slot_wait=4.40ms
+[metal chained] layer 21 slot_wait=4.30ms
+[metal chained] layer 22 slot_wait=6.86ms
+[metal chained] layer 23 slot_wait=4.59ms
+[metal chained] layer 24 slot_wait=8.69ms
+[metal chained] layer 25 slot_wait=4.07ms
+[metal chained] layer 26 slot_wait=4.93ms
+[metal chained] layer 27 slot_wait=8.72ms
+[metal chained] layer 28 slot_wait=8.89ms
+[metal chained] layer 29 slot_wait=4.87ms
+[metal chained ledger] start_pos=104 K=8 ok=true predicted=false slot_wait=177.4ms slot_filler=133.2ms wave_load=0.0ms final_wait=2.7ms encode=1.5ms gpu_busy(last_cb)=179.9ms disk_loads=94 disk_bytes=299.9MiB disk_time=475.6ms unique=865 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=475.6ms victim=0.0ms) pre_encode=0.0ms slot hits=771 misses=94 evictions=94 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=579/865 resident_at_start=771/865 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=61.1ms attn=0.0ms router=0.0ms shared=26.7ms gateup=92.0ms down=0.0ms resid=0.0ms gpu_total=179.9ms
+[mtp round] #0 wall=437.32ms (assistant=90.35ms, verifier=346.94ms) accepted=3/8
+[gemma4-ghost-metal] previous-union readahead next_start_pos=108 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=144 wait_us=40244 gpu_us=39686 kernel_us=27 wall_us=40445
+[metal chained] layer 0 slot_wait=5.54ms
+[metal chained] layer 1 slot_wait=3.96ms
+[metal chained] layer 2 slot_wait=3.68ms
+[metal chained] layer 3 slot_wait=7.87ms
+[metal chained] layer 4 slot_wait=3.60ms
+[metal chained] layer 5 slot_wait=3.82ms
+[metal chained] layer 6 slot_wait=6.47ms
+[metal chained] layer 7 slot_wait=3.60ms
+[metal chained] layer 8 slot_wait=6.91ms
+[metal chained] layer 9 slot_wait=3.39ms
+[metal chained] layer 10 slot_wait=3.47ms
+[metal chained] layer 11 slot_wait=4.75ms
+[metal chained] layer 12 slot_wait=3.74ms
+[metal chained] layer 13 slot_wait=3.60ms
+[metal chained] layer 14 slot_wait=7.74ms
+[metal chained] layer 15 slot_wait=3.48ms
+[metal chained] layer 16 slot_wait=3.95ms
+[metal chained] layer 17 slot_wait=7.65ms
+[metal chained] layer 18 slot_wait=3.57ms
+[metal chained] layer 19 slot_wait=7.49ms
+[metal chained] layer 20 slot_wait=3.82ms
+[metal chained] layer 21 slot_wait=7.29ms
+[metal chained] layer 22 slot_wait=3.52ms
+[metal chained] layer 23 slot_wait=4.23ms
+[metal chained] layer 24 slot_wait=6.01ms
+[metal chained] layer 25 slot_wait=3.77ms
+[metal chained] layer 26 slot_wait=3.67ms
+[metal chained] layer 27 slot_wait=5.49ms
+[metal chained] layer 28 slot_wait=4.05ms
+[metal chained] layer 29 slot_wait=4.96ms
+[metal chained ledger] start_pos=108 K=8 ok=true predicted=false slot_wait=145.0ms slot_filler=47.1ms wave_load=0.0ms final_wait=2.7ms encode=1.1ms gpu_busy(last_cb)=145.9ms disk_loads=34 disk_bytes=108.5MiB disk_time=76.8ms unique=760 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.4ms fill=0.0ms (copy=0.0ms disk=76.8ms victim=0.0ms) pre_encode=0.0ms slot hits=726 misses=34 evictions=34 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=633/760 resident_at_start=726/760 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=50.6ms attn=0.0ms router=0.0ms shared=21.4ms gateup=73.9ms down=0.0ms resid=0.0ms gpu_total=145.9ms
+[mtp round] #1 wall=259.32ms (assistant=40.52ms, verifier=218.77ms) accepted=6/8
+[gemma4-ghost-metal] previous-union readahead next_start_pos=115 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=136 wait_us=44127 gpu_us=43863 kernel_us=27 wall_us=44309
+[metal chained] layer 0 slot_wait=1.36ms
+[metal chained] layer 1 slot_wait=8.41ms
+[metal chained] layer 2 slot_wait=4.57ms
+[metal chained] layer 3 slot_wait=7.83ms
+[metal chained] layer 4 slot_wait=5.89ms
+[metal chained] layer 5 slot_wait=4.23ms
+[metal chained] layer 6 slot_wait=4.94ms
+[metal chained] layer 7 slot_wait=8.24ms
+[metal chained] layer 8 slot_wait=3.70ms
+[metal chained] layer 9 slot_wait=8.14ms
+[metal chained] layer 10 slot_wait=8.48ms
+[metal chained] layer 11 slot_wait=4.27ms
+[metal chained] layer 12 slot_wait=4.43ms
+[metal chained] layer 13 slot_wait=4.13ms
+[metal chained] layer 14 slot_wait=4.21ms
+[metal chained] layer 15 slot_wait=3.76ms
+[metal chained] layer 16 slot_wait=4.26ms
+[metal chained] layer 17 slot_wait=3.70ms
+[metal chained] layer 18 slot_wait=3.72ms
+[metal chained] layer 19 slot_wait=6.95ms
+[metal chained] layer 20 slot_wait=3.42ms
+[metal chained] layer 21 slot_wait=3.58ms
+[metal chained] layer 22 slot_wait=8.09ms
+[metal chained] layer 23 slot_wait=4.15ms
+[metal chained] layer 24 slot_wait=4.23ms
+[metal chained] layer 25 slot_wait=3.48ms
+[metal chained] layer 26 slot_wait=4.61ms
+[metal chained] layer 27 slot_wait=3.84ms
+[metal chained] layer 28 slot_wait=5.01ms
+[metal chained] layer 29 slot_wait=4.18ms
+[metal chained ledger] start_pos=115 K=8 ok=true predicted=false slot_wait=149.7ms slot_filler=120.7ms wave_load=0.0ms final_wait=3.7ms encode=1.3ms gpu_busy(last_cb)=144.8ms disk_loads=89 disk_bytes=283.9MiB disk_time=398.0ms unique=831 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=398.0ms victim=0.0ms) pre_encode=0.0ms slot hits=742 misses=89 evictions=89 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=511/831 resident_at_start=742/831 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=52.2ms attn=0.0ms router=0.0ms shared=21.1ms gateup=71.5ms down=0.0ms resid=0.0ms gpu_total=144.8ms
+[mtp round] #2 wall=343.68ms (assistant=44.38ms, verifier=299.27ms) accepted=7/8
+[gemma4-ghost-metal] previous-union readahead next_start_pos=123 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=128 wait_us=40521 gpu_us=39825 kernel_us=26 wall_us=40696
+[metal chained] layer 0 slot_wait=4.12ms
+[metal chained] layer 1 slot_wait=3.60ms
+[metal chained] layer 2 slot_wait=7.83ms
+[metal chained] layer 3 slot_wait=4.17ms
+[metal chained] layer 4 slot_wait=3.62ms
+[metal chained] layer 5 slot_wait=4.79ms
+[metal chained] layer 6 slot_wait=4.03ms
+[metal chained] layer 7 slot_wait=5.57ms
+[metal chained] layer 8 slot_wait=4.01ms
+[metal chained] layer 9 slot_wait=4.68ms
+[metal chained] layer 10 slot_wait=3.91ms
+[metal chained] layer 11 slot_wait=4.97ms
+[metal chained] layer 12 slot_wait=3.95ms
+[metal chained] layer 13 slot_wait=7.64ms
+[metal chained] layer 14 slot_wait=7.92ms
+[metal chained] layer 15 slot_wait=4.54ms
+[metal chained] layer 16 slot_wait=4.18ms
+[metal chained] layer 17 slot_wait=4.65ms
+[metal chained] layer 18 slot_wait=3.76ms
+[metal chained] layer 19 slot_wait=4.05ms
+[metal chained] layer 20 slot_wait=7.87ms
+[metal chained] layer 21 slot_wait=3.56ms
+[metal chained] layer 22 slot_wait=6.78ms
+[metal chained] layer 23 slot_wait=6.20ms
+[metal chained] layer 24 slot_wait=4.25ms
+[metal chained] layer 25 slot_wait=4.06ms
+[metal chained] layer 26 slot_wait=5.95ms
+[metal chained] layer 27 slot_wait=3.56ms
+[metal chained] layer 28 slot_wait=5.77ms
+[metal chained] layer 29 slot_wait=4.20ms
+[metal chained ledger] start_pos=123 K=8 ok=true predicted=false slot_wait=148.1ms slot_filler=145.3ms wave_load=0.0ms final_wait=6.4ms encode=1.6ms gpu_busy(last_cb)=149.1ms disk_loads=124 disk_bytes=395.6MiB disk_time=557.2ms unique=946 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=557.2ms victim=0.0ms) pre_encode=0.0ms slot hits=822 misses=124 evictions=124 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=598/946 resident_at_start=822/946 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=49.0ms attn=0.0ms router=0.0ms shared=22.1ms gateup=78.0ms down=0.0ms resid=0.0ms gpu_total=149.1ms
+[mtp round] #3 wall=367.98ms (assistant=40.77ms, verifier=327.18ms) accepted=7/8
+[gemma4-ghost-metal] previous-union readahead next_start_pos=131 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=116 wait_us=46571 gpu_us=46318 kernel_us=19 wall_us=46728
+[metal chained] layer 0 slot_wait=1.39ms
+[metal chained] layer 1 slot_wait=8.04ms
+[metal chained] layer 2 slot_wait=3.91ms
+[metal chained] layer 3 slot_wait=4.72ms
+[metal chained] layer 4 slot_wait=3.66ms
+[metal chained] layer 5 slot_wait=8.03ms
+[metal chained] layer 6 slot_wait=3.80ms
+[metal chained] layer 7 slot_wait=4.31ms
+[metal chained] layer 8 slot_wait=6.47ms
+[metal chained] layer 9 slot_wait=8.63ms
+[metal chained] layer 10 slot_wait=3.74ms
+[metal chained] layer 11 slot_wait=9.03ms
+[metal chained] layer 12 slot_wait=5.88ms
+[metal chained] layer 13 slot_wait=7.61ms
+[metal chained] layer 14 slot_wait=3.97ms
+[metal chained] layer 15 slot_wait=3.93ms
+[metal chained] layer 16 slot_wait=4.17ms
+[metal chained] layer 17 slot_wait=4.22ms
+[metal chained] layer 18 slot_wait=4.64ms
+[metal chained] layer 19 slot_wait=7.69ms
+[metal chained] layer 20 slot_wait=3.85ms
+[metal chained] layer 21 slot_wait=3.53ms
+[metal chained] layer 22 slot_wait=4.90ms
+[metal chained] layer 23 slot_wait=6.14ms
+[metal chained] layer 24 slot_wait=5.63ms
+[metal chained] layer 25 slot_wait=5.09ms
+[metal chained] layer 26 slot_wait=3.76ms
+[metal chained] layer 27 slot_wait=8.61ms
+[metal chained] layer 28 slot_wait=4.04ms
+[metal chained] layer 29 slot_wait=4.12ms
+[metal chained ledger] start_pos=131 K=8 ok=true predicted=false slot_wait=157.4ms slot_filler=127.4ms wave_load=0.0ms final_wait=2.5ms encode=1.2ms gpu_busy(last_cb)=156.4ms disk_loads=99 disk_bytes=315.9MiB disk_time=429.0ms unique=995 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=429.0ms victim=0.0ms) pre_encode=0.0ms slot hits=896 misses=99 evictions=99 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=731/995 resident_at_start=896/995 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=61.4ms attn=0.0ms router=0.0ms shared=22.7ms gateup=72.3ms down=0.0ms resid=0.0ms gpu_total=156.4ms
+[mtp round] #4 wall=364.98ms (assistant=46.79ms, verifier=318.17ms) accepted=7/8
+[gemma4-ghost-metal] previous-union readahead next_start_pos=139 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=155 wait_us=47697 gpu_us=47408 kernel_us=20 wall_us=47899
+[metal chained] layer 0 slot_wait=1.44ms
+[metal chained] layer 1 slot_wait=4.11ms
+[metal chained] layer 2 slot_wait=4.59ms
+[metal chained] layer 3 slot_wait=3.68ms
+[metal chained] layer 4 slot_wait=6.74ms
+[metal chained] layer 5 slot_wait=8.82ms
+[metal chained] layer 6 slot_wait=3.44ms
+[metal chained] layer 7 slot_wait=3.32ms
+[metal chained] layer 8 slot_wait=5.50ms
+[metal chained] layer 9 slot_wait=3.63ms
+[metal chained] layer 10 slot_wait=4.02ms
+[metal chained] layer 11 slot_wait=5.03ms
+[metal chained] layer 12 slot_wait=7.86ms
+[metal chained] layer 13 slot_wait=3.98ms
+[metal chained] layer 14 slot_wait=3.92ms
+[metal chained] layer 15 slot_wait=4.62ms
+[metal chained] layer 16 slot_wait=3.76ms
+[metal chained] layer 17 slot_wait=4.89ms
+[metal chained] layer 18 slot_wait=4.54ms
+[metal chained] layer 19 slot_wait=4.30ms
+[metal chained] layer 20 slot_wait=3.46ms
+[metal chained] layer 21 slot_wait=7.64ms
+[metal chained] layer 22 slot_wait=3.38ms
+[metal chained] layer 23 slot_wait=7.98ms
+[metal chained] layer 24 slot_wait=4.26ms
+[metal chained] layer 25 slot_wait=3.52ms
+[metal chained] layer 26 slot_wait=4.16ms
+[metal chained] layer 27 slot_wait=4.48ms
+[metal chained] layer 28 slot_wait=7.52ms
+[metal chained] layer 29 slot_wait=4.03ms
+[metal chained ledger] start_pos=139 K=8 ok=true predicted=false slot_wait=142.5ms slot_filler=105.3ms wave_load=0.0ms final_wait=3.0ms encode=1.2ms gpu_busy(last_cb)=148.5ms disk_loads=91 disk_bytes=290.3MiB disk_time=312.3ms unique=876 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.3ms fill=0.0ms (copy=0.0ms disk=312.3ms victim=0.0ms) pre_encode=0.0ms slot hits=785 misses=91 evictions=91 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=666/876 resident_at_start=785/876 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=54.5ms attn=0.0ms router=0.0ms shared=22.3ms gateup=71.7ms down=0.0ms resid=0.0ms gpu_total=148.5ms
+[mtp round] #5 wall=319.85ms (assistant=47.98ms, verifier=271.84ms) accepted=7/8
+[gemma4-ghost-metal] previous-union readahead next_start_pos=147 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=4 returned_drafts=4 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=84 wait_us=23725 gpu_us=23477 kernel_us=52 wall_us=23852
+[metal chained] layer 0 slot_wait=1.04ms
+[metal chained] layer 1 slot_wait=2.75ms
+[metal chained] layer 2 slot_wait=5.24ms
+[metal chained] layer 3 slot_wait=2.42ms
+[metal chained] layer 4 slot_wait=2.48ms
+[metal chained] layer 5 slot_wait=2.86ms
+[metal chained] layer 6 slot_wait=2.34ms
+[metal chained] layer 7 slot_wait=2.45ms
+[metal chained] layer 8 slot_wait=2.74ms
+[metal chained] layer 9 slot_wait=2.70ms
+[metal chained] layer 10 slot_wait=2.46ms
+[metal chained] layer 11 slot_wait=2.77ms
+[metal chained] layer 12 slot_wait=3.09ms
+[metal chained] layer 13 slot_wait=2.52ms
+[metal chained] layer 14 slot_wait=2.44ms
+[metal chained] layer 15 slot_wait=2.27ms
+[metal chained] layer 16 slot_wait=6.74ms
+[metal chained] layer 17 slot_wait=2.79ms
+[metal chained] layer 18 slot_wait=2.87ms
+[metal chained] layer 19 slot_wait=3.37ms
+[metal chained] layer 20 slot_wait=2.53ms
+[metal chained] layer 21 slot_wait=5.84ms
+[metal chained] layer 22 slot_wait=2.55ms
+[metal chained] layer 23 slot_wait=2.97ms
+[metal chained] layer 24 slot_wait=7.39ms
+[metal chained] layer 25 slot_wait=2.35ms
+[metal chained] layer 26 slot_wait=2.51ms
+[metal chained] layer 27 slot_wait=6.56ms
+[metal chained] layer 28 slot_wait=2.52ms
+[metal chained] layer 29 slot_wait=2.93ms
+[metal chained ledger] start_pos=147 K=5 ok=true predicted=false slot_wait=96.4ms slot_filler=62.6ms wave_load=0.0ms final_wait=3.1ms encode=1.3ms gpu_busy(last_cb)=96.9ms disk_loads=66 disk_bytes=210.6MiB disk_time=115.4ms unique=769 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.2ms fill=0.0ms (copy=0.0ms disk=115.4ms victim=0.0ms) pre_encode=0.0ms slot hits=703 misses=66 evictions=66 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=476/769 resident_at_start=703/769 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=30.7ms attn=0.0ms router=0.0ms shared=15.8ms gateup=50.4ms down=0.0ms resid=0.0ms gpu_total=96.9ms
+[mtp round] #6 wall=203.18ms (assistant=23.91ms, verifier=179.25ms) accepted=1/8
+[gemma4-ghost-metal] previous-union readahead next_start_pos=149 records=0 bytes=0.0MiB enqueue=0.000ms waited=0 bound_experts=0 copied_bytes=0
+[gemma4-mtp device-chain] requested_drafts=2 returned_drafts=2 command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format=q4_0_all matrix_bytes_per_draft=236077056 encode_us=46 wait_us=13719 gpu_us=12619 kernel_us=20 wall_us=13806
+[metal chained] layer 0 slot_wait=0.81ms
+[metal chained] layer 1 slot_wait=3.84ms
+[metal chained] layer 2 slot_wait=1.88ms
+[metal chained] layer 3 slot_wait=1.73ms
+[metal chained] layer 4 slot_wait=1.66ms
+[metal chained] layer 5 slot_wait=1.88ms
+[metal chained] layer 6 slot_wait=1.64ms
+[metal chained] layer 7 slot_wait=6.35ms
+[metal chained] layer 8 slot_wait=2.22ms
+[metal chained] layer 9 slot_wait=2.31ms
+[metal chained] layer 10 slot_wait=3.87ms
+[metal chained] layer 11 slot_wait=4.02ms
+[metal chained] layer 12 slot_wait=1.72ms
+[metal chained] layer 13 slot_wait=1.69ms
+[metal chained] layer 14 slot_wait=1.61ms
+[metal chained] layer 15 slot_wait=6.29ms
+[metal chained] layer 16 slot_wait=1.64ms
+[metal chained] layer 17 slot_wait=1.87ms
+[metal chained] layer 18 slot_wait=1.70ms
+[metal chained] layer 19 slot_wait=1.70ms
+[metal chained] layer 20 slot_wait=6.57ms
+[metal chained] layer 21 slot_wait=2.22ms
+[metal chained] layer 22 slot_wait=6.64ms
+[metal chained] layer 23 slot_wait=1.99ms
+[metal chained] layer 24 slot_wait=2.20ms
+[metal chained] layer 25 slot_wait=1.69ms
+[metal chained] layer 26 slot_wait=6.88ms
+[metal chained] layer 27 slot_wait=1.75ms
+[metal chained] layer 28 slot_wait=2.17ms
+[metal chained] layer 29 slot_wait=4.41ms
+[metal chained ledger] start_pos=149 K=3 ok=true predicted=false slot_wait=86.9ms slot_filler=31.8ms wave_load=0.0ms final_wait=2.5ms encode=0.8ms gpu_busy(last_cb)=85.3ms disk_loads=34 disk_bytes=108.5MiB disk_time=47.2ms unique=528 mapped_readahead_current_records=0 mapped_readahead_current_bytes=0.0MiB mapped_readahead_current_enqueue=0.000ms mapped_readahead_previous_union_records=0 mapped_readahead_previous_union_bytes=0.0MiB mapped_readahead_previous_union_enqueue=0.000ms
+[metal chained idle] route=0.1ms fill=0.0ms (copy=0.0ms disk=47.2ms victim=0.0ms) pre_encode=0.0ms slot hits=494 misses=34 evictions=34 victim_hits=0 salvage=0 (0.0ms) verify_fails=0 union_vs_prev=401/528 resident_at_start=494/528 overlap_layers=0/0
+[metal chained stages] split=per-cb qkv_o=36.5ms attn=0.0ms router=0.0ms shared=12.8ms gateup=36.0ms down=0.0ms resid=0.0ms gpu_total=85.3ms
+[mtp round] #7 wall=146.80ms (assistant=13.85ms, verifier=132.93ms) accepted=2/8
+[gemma4-ghost-metal-summary] layers=30 slots/layer=128 routed_positions=76 lookups=18327 hits=15402 misses=2925 hit_rate=84.0% evictions=2269 host_fills=0 prewarm_copies=0 direct_reads=0 direct_read_bytes=0.0MiB direct_read_per_position=0.0MiB read_failures=0 wall=10199.9ms
