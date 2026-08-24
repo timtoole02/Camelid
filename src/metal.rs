@@ -13580,25 +13580,34 @@ impl Gemma4Q4HybridExpertSource {
                 }
             }
         }
-        let mut dedup_active = active_slots.to_vec();
-        dedup_active.sort_unstable();
-        dedup_active.dedup();
-        if dedup_active.iter().any(|&s| s >= self.hot_records.len()) {
-            return None;
-        }
-        let active_records = dedup_active
-            .iter()
-            .map(|&s| self.hot_records[s].clone())
-            .collect::<Vec<_>>();
-        let kernel = metal_linear_kernel()?;
-        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffers(
-            &kernel.device,
-            self.hot_records.len(),
-            &dedup_active,
-            &active_records,
-            0,
-            None,
-        )?;
+        let is_decode_physical_active = active_slots.len() == self.hot_records.len()
+            && active_slots.iter().enumerate().all(|(i, &s)| s == i)
+            && published.iter().any(|id| id.is_some());
+
+        let table = if is_decode_physical_active {
+            let kernel = metal_linear_kernel()?;
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_slot_buffers(
+                &kernel.device,
+                &self.hot_records,
+            )?
+        } else {
+            let mut hot_expert_ids = Vec::with_capacity(self.hot_records.len());
+            let mut hot_records = Vec::with_capacity(self.hot_records.len());
+            for (physical_slot, expert_id) in published.iter().copied().enumerate() {
+                if let Some(expert_id) = expert_id {
+                    hot_expert_ids.push(expert_id);
+                    hot_records.push(self.hot_records[physical_slot].clone());
+                }
+            }
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_mixed_active_slots(
+                std::sync::Arc::clone(&self.mapped.mmap),
+                self.mapped.layer_offset,
+                self.mapped.mapped_span_bytes,
+                active_slots,
+                &hot_expert_ids,
+                &hot_records,
+            )?
+        };
         if let Ok(mut write_guard) = self.cached_table.write() {
             *write_guard = Some((published.clone(), table.clone()));
         }
