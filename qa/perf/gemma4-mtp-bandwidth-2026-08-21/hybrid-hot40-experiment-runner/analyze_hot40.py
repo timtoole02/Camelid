@@ -147,7 +147,7 @@ HOT40_STARTUP_PATTERN = re.compile(
     r"HYBRID_HOT_SLOTS=32 .*HYBRID_HOT40_EXPERIMENT=1, "
     r"layers=30 canonical_addressable=128/layer physical_hot=40/layer "
     r"hot_capacity_slots=1200 hot_capacity_bytes=4030464000 "
-    r"mapped_cold_span_bytes=12897484800 verifier_k=1\.\.8 overflow=0 victim=0 "
+    r"mapped_cold_span_bytes=12897484800 verifier_k=1\.\.=?8 overflow=0 victim=0 "
     r"slot_pin=off prediction=off$",
     re.MULTILINE,
 )
