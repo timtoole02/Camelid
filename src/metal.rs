@@ -13778,6 +13778,16 @@ impl Gemma4Q4ExpertSlotBinding {
         )
     }
 
+    fn is_hot_ready(&self) -> bool {
+        match self {
+            Self::HybridMappedSource(source) => {
+                source.hot_slot_ids.read().ok().is_some_and(|ids| ids.iter().any(|id| id.is_some()))
+            }
+            Self::HybridMappedTable { .. } => true,
+            _ => false,
+        }
+    }
+
     fn monolithic_buffer(&self) -> Option<&Buffer> {
         match self {
             Self::Monolithic(buffer) => Some(buffer),
@@ -26608,6 +26618,10 @@ impl Gemma4GhostCommonMetal {
                 .iter()
                 .take(n_layers)
                 .all(|u| !u.is_empty());
+        let is_decode_hot = expert_bindings
+            .first()
+            .is_some_and(Gemma4Q4ExpertSlotBinding::is_hot_ready);
+        let unified_single_cb = predicted_ready || (record_demand && is_decode_hot);
         let mut predicted_w1: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
         let mut predicted_ping_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
         let mut predicted_pong_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
@@ -27400,7 +27414,7 @@ impl Gemma4GhostCommonMetal {
                 layer.eps,
                 k_tokens,
             );
-            if predicted_ready || record_demand {
+            if unified_single_cb {
                 begin_gpu_stage!(GPU_STAGE_SHARED);
                 encode_shared_mlp!(encoder);
                 let active: Vec<usize> = (0..num_slots).collect();
@@ -28651,7 +28665,7 @@ impl Gemma4GhostCommonMetal {
                 stamp.start(GPU_STAGE_QKV_O);
             }
 
-            if !predicted_ready && !record_demand && !layer_committed {
+            if !unified_single_cb && !layer_committed {
                 // Commit this layer's expert/tail work now so the GPU starts
                 // on it while the host encodes the next layer's attention;
                 // the next layer opens a fresh command buffer (same queue, so
