@@ -1,0 +1,27 @@
+{
+  "schema": "pxx.r007-retest.v1",
+  "generated_utc": "2026-08-22T14:17:59Z",
+  "retests": "pxx docs/RECEIPTS.md R-007, findings 1 and 3, originally recorded against Camelid v0.4.4 on Apple Silicon",
+  "camelid_version": "camelid v0.6.1-191-gdb283b69",
+  "camelid_git_head_short": "db283b69",
+  "host": {
+    "os": "Linux 7.0.0-28-generic",
+    "arch": "x86_64",
+    "accelerator": "metal-or-cpu"
+  },
+  "model": {
+    "file": "Qwen3-1.7B-Q8_0.gguf",
+    "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a"
+  },
+  "findings": {
+    "f1_serve_stability": "serve_ready_survived_plain_completion",
+    "f3_openai_tools_surface": "FIXED_tool_calls_populated"
+  },
+  "scope": "One build, one host, one model, one request per finding. Tests the OpenAI-compatible serve surface only. Says nothing about Camelid's own agent lane, which has a separate receipt and passes independently via 'camelid agent-eval'. No parity, quality, or throughput claim.",
+  "verdict_legend": {
+    "FIXED_tool_calls_populated": "serve parsed the tool call into the structured tool_calls field; R-007 finding 3 is resolved on this build",
+    "UNCHANGED_raw_marker_in_content": "raw <tool_call> markers returned as content with tool_calls null; R-007 finding 3 still present",
+    "PARTIAL_tool_named_in_content_no_markers": "tool named in prose but not structured; needs manual reading of raw/f3-response.json",
+    "NO_TOOL_ATTEMPT": "model did not attempt the tool; inconclusive for the serve layer, re-run with a tool-capable row"
+  }
+}

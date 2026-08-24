@@ -1,0 +1,6 @@
+[offload] forced VRAM budget: 4096 MiB
+model: layers=36 hidden=2560 ffn=9728 heads=32 kv_heads=8 head_dim=128 vocab=Some(151936) | KV reserved at context=4096
+[offload] 36 layers: 21 resident in VRAM, 15 offloaded to host
+[offload] budget (MiB): free 4096 = KV 1152 + ends 394 + safety 256 + scratch 102 + resident-layers 2148 (of total-layers 3682)
+[offload] per-layer ~102 MiB | resident-weights budget 2191 MiB | expect REDUCED tok/s: 15 of 36 layers stream from host each forward
+[offload] layer map (V=VRAM, H=host): VVVVVVVVVVVVVVVVVVVVVHHHHHHHHHHHHHHH
