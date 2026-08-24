@@ -27493,6 +27493,25 @@ impl Gemma4GhostCommonMetal {
                     self.last_chained_ledger = ledger;
                     return false;
                 }
+                if let Some((hot_bound, mapped_bound)) = active_binding.bound_tier_record_counts() {
+                    ledger.hot_bound_records = ledger
+                        .hot_bound_records
+                        .saturating_add(hot_bound.min(u32::MAX as usize) as u32);
+                    ledger.mapped_bound_records = ledger
+                        .mapped_bound_records
+                        .saturating_add(mapped_bound.min(u32::MAX as usize) as u32);
+                    if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
+                        *value = value.saturating_add(hot_bound.min(u16::MAX as usize) as u16);
+                    }
+                    if let Some(value) = ledger.mapped_bound_per_layer.get_mut(layer_idx) {
+                        *value = value.saturating_add(mapped_bound.min(u16::MAX as usize) as u16);
+                    }
+                    if let Some(value) = ledger.unique_per_layer.get_mut(layer_idx) {
+                        *value = value.saturating_add(
+                            (hot_bound.saturating_add(mapped_bound)).min(u16::MAX as usize) as u16,
+                        );
+                    }
+                }
                 if let Some(mat) = mat_binding {
                     live_mapped_bindings.push(mat);
                 }
@@ -28696,6 +28715,7 @@ impl Gemma4GhostCommonMetal {
                 for binding in live_mapped_bindings.drain(..) {
                     mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(cmd_buf, binding));
                 }
+                predicted_cbs.push(cmd_buf.to_owned());
                 last_committed_cb = Some(cmd_buf.to_owned());
                 cb_closed = true;
                 encode_clock = std::time::Instant::now();

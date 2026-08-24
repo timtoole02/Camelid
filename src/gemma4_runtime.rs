@@ -4814,7 +4814,22 @@ impl GhostMetalExpertRuntime {
             return true;
         }
 
-        let routes = self.latest_routed_experts.clone();
+        let routes: Vec<Vec<usize>> = self
+            .routed_expert_interval_union
+            .iter()
+            .enumerate()
+            .map(|(layer_idx, union)| {
+                let mut experts: Vec<usize> = (0..128)
+                    .filter(|&expert| (union[expert / 64] & (1u64 << (expert % 64))) != 0)
+                    .collect();
+                if experts.is_empty() {
+                    if let Some(latest) = self.latest_routed_experts.get(layer_idx) {
+                        experts = latest.clone();
+                    }
+                }
+                experts
+            })
+            .collect();
         let counters = WaveFillCounters::default();
         let started = std::time::Instant::now();
         let ok = fill_chained_hybrid_hot_layers(
