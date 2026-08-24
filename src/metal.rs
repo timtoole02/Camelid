@@ -832,6 +832,36 @@ pub(crate) fn overlap_flag_from(value: Option<&str>) -> bool {
     !matches!(value, Some(v) if v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
+/// Only a canonical mapped source can execute a pre-encoded expert command
+/// before the host observes this layer's router output. Its expert namespace
+/// is permanently identity-mapped, so no demand fill or table publication is
+/// owed before commit. Anonymous record tables must wait for route -> fill ->
+/// publish; committing their pre-encoded command early silently drops every
+/// expert absent from the start-of-round directory.
+#[cfg(any(target_os = "macos", test))]
+const fn preencoded_record_round_can_commit_before_router(file_mapped_demand: bool) -> bool {
+    file_mapped_demand
+}
+
+/// Fail closed if an anonymous record-table round ever bypasses its host route
+/// barrier again. Canonical mapped sources are allowed to remain host-route
+/// free because their identity table is complete before the round starts.
+#[cfg(any(target_os = "macos", test))]
+fn record_demand_round_observed_routes(
+    record_demand: bool,
+    file_mapped_demand: bool,
+    unique_per_layer: &[u16],
+    expected_layers: usize,
+) -> bool {
+    !record_demand
+        || file_mapped_demand
+        || (expected_layers > 0
+            && unique_per_layer.len() >= expected_layers
+            && unique_per_layer[..expected_layers]
+                .iter()
+                .all(|&unique| unique > 0))
+}
+
 #[cfg(target_os = "macos")]
 impl GpuStageStamp {
     fn new() -> Self {
@@ -13470,7 +13500,17 @@ pub(crate) struct Gemma4Q4HybridExpertSource {
     mapped: Gemma4Q4FileMappedExpertSource,
     hot_records: Vec<Buffer>,
     hot_slot_ids: std::sync::RwLock<Vec<Option<usize>>>,
-    cached_table: std::sync::RwLock<Option<(Vec<Option<usize>>, spec50_moe_argbuf::Gemma4MoeSlotArgTable)>>,
+    /// Cached mixed table keyed by the published hot directory, binding mode,
+    /// and normalized active canonical union. The explicit mode distinguishes
+    /// a direct physical-prefix request from a canonical mixed-table request
+    /// containing the same values, while normalization preserves safe reuse
+    /// between equivalent canonical unions.
+    cached_table: std::sync::RwLock<Option<(
+        Vec<Option<usize>>,
+        bool,
+        Vec<usize>,
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+    )>>,
     /// Materialized mixed tables increment this count before snapshotting the
     /// directory. The existing pending/command-buffer guards retain their
     /// lease through terminal GPU status, so refill access can fail closed.
@@ -13479,6 +13519,18 @@ pub(crate) struct Gemma4Q4HybridExpertSource {
     /// and GPU binding structurally exclusive rather than relying on the
     /// runtime's outer mutex alone.
     lease_state: std::sync::atomic::AtomicIsize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gemma4Q4HybridBindingMode {
+    /// `active_slots` contains canonical expert IDs. Hot records override the
+    /// corresponding mapped records through the published directory.
+    Canonical,
+    /// `active_slots` is the complete anonymous physical prefix. This mode is
+    /// deliberately explicit: a canonical union can also equal `[0..hot)` and
+    /// must never be reinterpreted from its values alone.
+    Physical,
 }
 
 #[cfg(target_os = "macos")]
@@ -13564,11 +13616,19 @@ impl Gemma4Q4HybridExpertSource {
     fn materialize_for_active_slots(
         self: &std::sync::Arc<Self>,
         active_slots: &[usize],
+        mode: Gemma4Q4HybridBindingMode,
     ) -> Option<(
         spec50_moe_argbuf::Gemma4MoeSlotArgTable,
         std::sync::Arc<Gemma4Q4HybridBindingLease>,
     )> {
         if active_slots.is_empty() || active_slots.iter().any(|&slot| slot >= 128) {
+            return None;
+        }
+        let is_physical_active = mode == Gemma4Q4HybridBindingMode::Physical;
+        if is_physical_active
+            && (active_slots.len() != self.hot_records.len()
+                || active_slots.iter().enumerate().any(|(i, &slot)| slot != i))
+        {
             return None;
         }
         loop {
@@ -13593,18 +13653,26 @@ impl Gemma4Q4HybridExpertSource {
             source: std::sync::Arc::clone(self),
         });
         let published = self.hot_slot_ids.read().ok()?;
+        if is_physical_active && !published.iter().any(|id| id.is_some()) {
+            return None;
+        }
+        let mut normalized_active = active_slots.to_vec();
+        normalized_active.sort_unstable();
+        normalized_active.dedup();
         if let Ok(guard) = self.cached_table.read() {
-            if let Some((cached_published, cached_table)) = guard.as_ref() {
-                if cached_published == &*published {
+            if let Some((cached_published, cached_physical, cached_active, cached_table)) =
+                guard.as_ref()
+            {
+                if cached_published == &*published
+                    && *cached_physical == is_physical_active
+                    && cached_active == &normalized_active
+                {
                     return Some((cached_table.clone(), lease));
                 }
             }
         }
-        let is_decode_physical_active = active_slots.len() == self.hot_records.len()
-            && active_slots.iter().enumerate().all(|(i, &s)| s == i)
-            && published.iter().any(|id| id.is_some());
 
-        let table = if is_decode_physical_active {
+        let table = if is_physical_active {
             let kernel = metal_linear_kernel()?;
             spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_slot_buffers(
                 &kernel.device,
@@ -13629,7 +13697,12 @@ impl Gemma4Q4HybridExpertSource {
             )?
         };
         if let Ok(mut write_guard) = self.cached_table.write() {
-            *write_guard = Some((published.clone(), table.clone()));
+            *write_guard = Some((
+                published.clone(),
+                is_physical_active,
+                normalized_active,
+                table.clone(),
+            ));
         }
         Some((table, lease))
     }
@@ -13865,7 +13938,10 @@ impl Gemma4Q4ExpertSlotBinding {
                 .materialize_for_active_slots(active_slots)
                 .map(|table| Self::RecordGranular(std::sync::Arc::new(table))),
             Self::HybridMappedSource(source) => source
-                .materialize_for_active_slots(active_slots)
+                .materialize_for_active_slots(
+                    active_slots,
+                    Gemma4Q4HybridBindingMode::Canonical,
+                )
                 .map(|(table, lease)| Self::HybridMappedTable {
                     table: std::sync::Arc::new(table),
                     _lease: lease,
@@ -13874,6 +13950,24 @@ impl Gemma4Q4ExpertSlotBinding {
                 table: std::sync::Arc::clone(table),
                 _lease: std::sync::Arc::clone(_lease),
             }),
+        }
+    }
+
+    /// Bind the complete anonymous physical prefix directly. Production mixed
+    /// tables use canonical mode; keeping this operation separate prevents an
+    /// exact canonical prefix from being mistaken for physical slot IDs.
+    fn materialize_for_physical_slots(&self, active_slots: &[usize]) -> Option<Self> {
+        match self {
+            Self::HybridMappedSource(source) => source
+                .materialize_for_active_slots(
+                    active_slots,
+                    Gemma4Q4HybridBindingMode::Physical,
+                )
+                .map(|(table, lease)| Self::HybridMappedTable {
+                    table: std::sync::Arc::new(table),
+                    _lease: lease,
+                }),
+            _ => None,
         }
     }
 
@@ -27642,7 +27736,7 @@ impl Gemma4GhostCommonMetal {
                     ledger.pre_encode_ms += t_pre.elapsed().as_secs_f64() * 1000.0;
                 }
 
-                if record_demand {
+                if preencoded_record_round_can_commit_before_router(file_mapped_demand) {
                     if let Some(cb3) = pre_encoded_moe.take() {
                         stamp.start(GPU_STAGE_GATEUP);
                         stamp.push_current(&cb3);
@@ -28783,6 +28877,18 @@ impl Gemma4GhostCommonMetal {
                 "[metal chained round] command buffer failed with status {:?}: {}",
                 final_cb.status(),
                 command_buffer_error_details(&final_cb)
+            );
+            self.last_chained_ledger = ledger;
+            return false;
+        }
+        if !record_demand_round_observed_routes(
+            record_demand,
+            file_mapped_demand,
+            &ledger.unique_per_layer,
+            self.layers.len(),
+        ) {
+            eprintln!(
+                "[metal chained round] anonymous record-demand round did not observe routed experts for every layer; refusing a stale-table result"
             );
             self.last_chained_ledger = ledger;
             return false;
@@ -41784,6 +41890,33 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn anonymous_record_overlap_cannot_bypass_route_fill_publication() {
+        assert!(super::preencoded_record_round_can_commit_before_router(true));
+        assert!(!super::preencoded_record_round_can_commit_before_router(false));
+
+        assert!(super::record_demand_round_observed_routes(false, false, &[], 2));
+        assert!(super::record_demand_round_observed_routes(true, true, &[], 2));
+        assert!(super::record_demand_round_observed_routes(
+            true,
+            false,
+            &[3, 1],
+            2,
+        ));
+        assert!(!super::record_demand_round_observed_routes(
+            true,
+            false,
+            &[3, 0],
+            2,
+        ));
+        assert!(!super::record_demand_round_observed_routes(
+            true,
+            false,
+            &[3],
+            2,
+        ));
+    }
+
+    #[test]
     fn gemma4_spec_chunk_parser_matches_executable_kernel_width() {
         assert_eq!(
             super::parse_gemma4_max_spec_chunk(None),
@@ -45036,8 +45169,54 @@ kernel void sample_active_expert_records(
         let materialized = source
             .materialize_for_active_slots(&[7])
             .expect("hot canonical override binding");
+        assert_eq!(materialized.bound_tier_record_counts(), Some((1, 0)));
         assert!(slots.begin_hybrid_refill().is_none());
         drop(materialized);
+
+        // The published hot directory is unchanged, but the second active
+        // union adds a cold canonical record. A cache keyed only by hot IDs
+        // would incorrectly return the one-record table above.
+        let widened = source
+            .materialize_for_active_slots(&[7, 8])
+            .expect("active-union-specific mixed binding");
+        assert_eq!(widened.bound_tier_record_counts(), Some((1, 1)));
+        drop(widened);
+
+        // A canonical union can have exactly the same values as the anonymous
+        // physical prefix. It must remain a canonical mixed table unless the
+        // caller explicitly requests the physical namespace.
+        let physical = (0..GEMMA4_Q4_HYBRID_HOT_SLOTS).collect::<Vec<_>>();
+        let canonical_prefix = source
+            .materialize_for_active_slots(&physical)
+            .expect("canonical prefix binding");
+        assert_eq!(
+            canonical_prefix.bound_tier_record_counts(),
+            Some((1, GEMMA4_Q4_HYBRID_HOT_SLOTS - 1))
+        );
+        drop(canonical_prefix);
+
+        let direct = source
+            .materialize_for_physical_slots(&physical)
+            .expect("explicit physical binding");
+        assert_eq!(
+            direct.bound_tier_record_counts(),
+            Some((GEMMA4_Q4_HYBRID_HOT_SLOTS, 0))
+        );
+        drop(direct);
+
+        // Canonical unions are set-valued and safely reuse the normalized
+        // active-set cache entry even when their input order differs.
+        let mut permuted = physical;
+        permuted.swap(0, 1);
+        assert!(source.materialize_for_physical_slots(&permuted).is_none());
+        let canonical = source
+            .materialize_for_active_slots(&permuted)
+            .expect("permuted canonical mixed binding");
+        assert_eq!(
+            canonical.bound_tier_record_counts(),
+            Some((1, GEMMA4_Q4_HYBRID_HOT_SLOTS - 1))
+        );
+        drop(canonical);
 
         // An abandoned transaction must invalidate the old identity before
         // its first mutation, leaving the modified record unreachable.

@@ -2679,7 +2679,18 @@ impl GhostMetalSlotDirectory {
             )));
         }
 
+        // Protect every valid resident needed by this route before admitting
+        // its first miss. Pinning only as experts were encountered let an
+        // early miss evict a resident expert that appeared later in the same
+        // union, forcing an avoidable second read within one plan.
         let mut pinned = vec![false; self.entries.len()];
+        for &expert in experts {
+            if let Some(slot) = self.lookup_resident_slot(expert) {
+                if self.entries[slot].is_some_and(|entry| entry.expert == expert) {
+                    pinned[slot] = true;
+                }
+            }
+        }
         let mut route_slots = Vec::with_capacity(experts.len());
         let mut loads = Vec::<GhostMetalSlotLoad>::new();
         let mut planned = std::collections::HashMap::<usize, usize>::new();
@@ -5692,6 +5703,16 @@ impl GhostMetalExpertRuntime {
                 }
 
                 if layer.slots.is_hybrid_mapped() {
+                    // Snapshot residency before demand fill. Counting after a
+                    // successful fill turns every compulsory load into a hit
+                    // and made first-prompt telemetry report 100% hits beside
+                    // gigabytes of direct reads.
+                    let hot_hits_before_fill = selected_experts
+                        .iter()
+                        .filter(|&&expert| {
+                            layer.directory.lookup_resident_slot(expert).is_some()
+                        })
+                        .count();
                     // Promote this round's exact routed union into the layer's
                     // anonymous hot records BEFORE the mixed table is built, so
                     // the command buffer binds zero file-mapped records. A
@@ -5713,12 +5734,6 @@ impl GhostMetalExpertRuntime {
                         &selected_experts,
                         &layer.directory.resident_slot_table,
                     );
-                    let hot_hits = selected_experts
-                        .iter()
-                        .filter(|&&expert| {
-                            layer.directory.lookup_resident_slot(expert).is_some()
-                        })
-                        .count();
                     if routed
                         && mapped_readahead_enabled
                         && !mapped_rdadvise_enabled
@@ -5775,18 +5790,28 @@ impl GhostMetalExpertRuntime {
                     }
                     fill_counters
                         .plan_hits
-                        .fetch_add(hot_hits as u64, std::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(
+                            hot_hits_before_fill as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     fill_counters.plan_misses.fetch_add(
-                        selected_experts.len().saturating_sub(hot_hits) as u64,
+                        selected_experts
+                            .len()
+                            .saturating_sub(hot_hits_before_fill) as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     layer.stats.route_lookups = layer
                         .stats
                         .route_lookups
                         .saturating_add(selected_experts.len() as u64);
-                    layer.stats.hits = layer.stats.hits.saturating_add(hot_hits as u64);
+                    layer.stats.hits = layer
+                        .stats
+                        .hits
+                        .saturating_add(hot_hits_before_fill as u64);
                     layer.stats.misses = layer.stats.misses.saturating_add(
-                        selected_experts.len().saturating_sub(hot_hits) as u64,
+                        selected_experts
+                            .len()
+                            .saturating_sub(hot_hits_before_fill) as u64,
                     );
                     for (expert, slot) in updated_slots.iter_mut().enumerate() {
                         *slot = expert as u32;
@@ -5796,10 +5821,7 @@ impl GhostMetalExpertRuntime {
 
                 let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                let all_resident = selected_experts.iter().all(|&e| {
-                    e < 128 && layer.directory.resident_slot_table[e] >= 0
-                });
-                if allow_drop || all_resident {
+                if allow_drop {
                     for e in 0..128 {
                         let s = layer.directory.resident_slot_table[e];
                         updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
@@ -5808,6 +5830,11 @@ impl GhostMetalExpertRuntime {
                 }
 
                 let t_fill = std::time::Instant::now();
+                // Run the directory plan even when every selected expert is
+                // already resident. Besides returning zero loads, that path
+                // refreshes LFU/recency for the current union; bypassing it
+                // made hot-only rounds invisible and caused avoidable later
+                // evictions on anonymous record backing.
                 fill_metal_wave_slots_from_host_cache(
                     layer,
                     cache,
@@ -25777,6 +25804,33 @@ mod ghost_moe_wire_tests {
         assert_eq!(hits.hits, 2);
         assert!(hits.evicted.is_empty());
         assert!(hits.loads.is_empty());
+    }
+
+    #[test]
+    fn metal_slot_plan_prepins_residents_routed_after_an_early_miss() {
+        let mut directory = GhostMetalSlotDirectory::new(2);
+        for load in directory.plan(&[1, 2]).unwrap().loads {
+            directory.commit_load(load);
+        }
+
+        // Expert 1 is the older LFU tie-break victim, but it is also needed
+        // later in this same union. The miss for expert 3 must evict expert 2
+        // instead of evicting and then re-reading expert 1.
+        let plan = directory.plan(&[3, 1]).unwrap();
+        assert_eq!(plan.route_slots.len(), 2);
+        assert_eq!(plan.hits, 1);
+        assert_eq!(
+            plan.loads
+                .iter()
+                .map(|load| load.expert)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(
+            plan.evicted,
+            vec![GhostMetalSlotEviction { slot: 1, expert: 2 }]
+        );
+        assert_eq!(directory.lookup_resident_slot(1), Some(0));
     }
 
     /// An eviction's identity must name the displaced expert and the exact
