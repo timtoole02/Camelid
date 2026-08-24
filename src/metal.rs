@@ -27401,19 +27401,30 @@ impl Gemma4GhostCommonMetal {
                 layer.eps,
                 k_tokens,
             );
-            if predicted_ready {
+            if predicted_ready || record_demand {
+                begin_gpu_stage!(GPU_STAGE_SHARED);
+                encode_shared_mlp!(encoder);
+                let mat_binding = if file_mapped_demand {
+                    let active: Vec<usize> = (0..num_slots).collect();
+                    slot_binding.materialize_for_active_slots(&active)
+                } else {
+                    None
+                };
+                let active_binding = mat_binding.as_ref().unwrap_or(slot_binding);
                 begin_gpu_stage!(GPU_STAGE_GATEUP);
-                if let Some(moe) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) {
-                    unsafe {
-                        let dest = moe.expert_to_slot_table.contents() as *mut u32;
-                        std::ptr::copy_nonoverlapping(
-                            predicted_ping_tables[layer_idx].as_ptr(),
-                            dest,
-                            128,
-                        );
+                if predicted_ready {
+                    if let Some(moe) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) {
+                        unsafe {
+                            let dest = moe.expert_to_slot_table.contents() as *mut u32;
+                            std::ptr::copy_nonoverlapping(
+                                predicted_ping_tables[layer_idx].as_ptr(),
+                                dest,
+                                128,
+                            );
+                        }
                     }
                 }
-                let w1 = &predicted_w1[layer_idx];
+                let w1: &[usize] = if predicted_ready { &predicted_w1[layer_idx] } else { &[] };
                 let overflow_buf = if !w1.is_empty() && layer_idx < wave1_slabs.len() {
                     Some(wave1_slabs[layer_idx])
                 } else {
@@ -27425,7 +27436,7 @@ impl Gemma4GhostCommonMetal {
                     encoder,
                     &down_exps_scale,
                     &expert_to_slot_table,
-                    slot_binding,
+                    active_binding,
                     None,
                     layer_idx,
                     total_slots,
@@ -27444,7 +27455,7 @@ impl Gemma4GhostCommonMetal {
                 if !self.encode_moe_down(
                     kernel,
                     encoder,
-                    slot_binding,
+                    active_binding,
                     None,
                     layer_idx,
                     k_tokens,
@@ -27455,6 +27466,9 @@ impl Gemma4GhostCommonMetal {
                     encoder.end_encoding();
                     self.last_chained_ledger = ledger;
                     return false;
+                }
+                if let Some(mat) = mat_binding {
+                    live_mapped_bindings.push(mat);
                 }
             } else if let Some(filler) = slot_filler.as_mut() {
                 ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
@@ -28638,7 +28652,7 @@ impl Gemma4GhostCommonMetal {
                 stamp.start(GPU_STAGE_QKV_O);
             }
 
-            if !predicted_ready && !layer_committed {
+            if !predicted_ready && !record_demand && !layer_committed {
                 // Commit this layer's expert/tail work now so the GPU starts
                 // on it while the host encodes the next layer's attention;
                 // the next layer opens a fresh command buffer (same queue, so
@@ -28665,6 +28679,9 @@ impl Gemma4GhostCommonMetal {
             encoder.end_encoding();
             stamp.push_current(cmd_buf);
             cmd_buf.commit();
+            for binding in live_mapped_bindings.drain(..) {
+                mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(cmd_buf, binding));
+            }
             predicted_cbs.push(cmd_buf.to_owned());
             cmd_buf.to_owned()
         };
