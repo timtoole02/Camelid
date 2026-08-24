@@ -13580,10 +13580,24 @@ impl Gemma4Q4HybridExpertSource {
                 }
             }
         }
+        let mut dedup_active = active_slots.to_vec();
+        dedup_active.sort_unstable();
+        dedup_active.dedup();
+        if dedup_active.iter().any(|&s| s >= self.hot_records.len()) {
+            return None;
+        }
+        let active_records = dedup_active
+            .iter()
+            .map(|&s| self.hot_records[s].clone())
+            .collect::<Vec<_>>();
         let kernel = metal_linear_kernel()?;
-        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_slot_buffers(
+        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffers(
             &kernel.device,
-            &self.hot_records,
+            self.hot_records.len(),
+            &dedup_active,
+            &active_records,
+            0,
+            None,
         )?;
         if let Ok(mut write_guard) = self.cached_table.write() {
             *write_guard = Some((published.clone(), table.clone()));
