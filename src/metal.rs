@@ -26409,6 +26409,7 @@ impl Gemma4GhostCommonMetal {
         predicted_unions: &[Vec<usize>],
         mut fill_pong_wave: Option<&mut dyn FnMut(usize, &[usize], &mut [u32; 128])>,
         wave1_slabs: &[&Buffer],
+        is_decode_round: bool,
     ) -> bool {
         let k_tokens = hidden_rows.len();
         if k_tokens == 0 || k_tokens > GEMMA4_RESIDENT_MAX_BATCH {
@@ -26621,7 +26622,7 @@ impl Gemma4GhostCommonMetal {
         let is_decode_hot = expert_bindings
             .first()
             .is_some_and(Gemma4Q4ExpertSlotBinding::is_hot_ready);
-        let unified_single_cb = predicted_ready || (record_demand && is_decode_hot && start_pos > 0);
+        let unified_single_cb = predicted_ready || (record_demand && is_decode_hot && is_decode_round);
         let mut predicted_w1: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
         let mut predicted_ping_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
         let mut predicted_pong_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];

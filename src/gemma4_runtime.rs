@@ -5566,6 +5566,7 @@ impl GhostMetalExpertRuntime {
                 gpu_unions,
                 fill_pong_fn,
                 &wave1_refs,
+                !self.prefill_round,
             )
         };
         if hybrid_terminal_promotion_allowed(
