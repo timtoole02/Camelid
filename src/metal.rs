@@ -27404,8 +27404,8 @@ impl Gemma4GhostCommonMetal {
             if predicted_ready || record_demand {
                 begin_gpu_stage!(GPU_STAGE_SHARED);
                 encode_shared_mlp!(encoder);
+                let active: Vec<usize> = (0..num_slots).collect();
                 let mat_binding = if file_mapped_demand {
-                    let active: Vec<usize> = (0..num_slots).collect();
                     slot_binding.materialize_for_active_slots(&active)
                 } else {
                     None
@@ -27437,7 +27437,7 @@ impl Gemma4GhostCommonMetal {
                     &down_exps_scale,
                     &expert_to_slot_table,
                     active_binding,
-                    None,
+                    Some(&active),
                     layer_idx,
                     total_slots,
                     num_slots,
@@ -27456,7 +27456,7 @@ impl Gemma4GhostCommonMetal {
                     kernel,
                     encoder,
                     active_binding,
-                    None,
+                    Some(&active),
                     layer_idx,
                     k_tokens,
                     &self.resident_scratch.gpu_moe_acc,
