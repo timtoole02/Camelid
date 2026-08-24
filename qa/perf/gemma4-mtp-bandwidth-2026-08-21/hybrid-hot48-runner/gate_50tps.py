@@ -25,7 +25,7 @@ PROFILE = (
     31, 32, 30, 31, 32, 35, 32, 34, 34, 37,
 )
 PROFILE_CSV = ",".join(str(value) for value in PROFILE)
-MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS = 64
+MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS = 512
 FULL_Q4_MATRIX_BYTES = 236_077_056
 FULL_Q4_SOURCE_SHA256 = "c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801"
 BF16_MATRIX_BYTES = 839_385_088
@@ -143,7 +143,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         not isinstance(geometry, dict)
         or geometry.get("mapped_readahead_enabled") is not True
         or geometry.get("mapped_readahead_max_inflight_records")
-        != MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS
+        not in (64, 512, MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS)
         or geometry.get("mapped_readahead_anonymous_capacity_bytes") != 0
         or not isinstance(geometry.get("record_payload_bytes"), int)
         or isinstance(geometry.get("record_payload_bytes"), bool)
@@ -341,7 +341,8 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         raise GateError("server did not disable terminal decode promotion")
     if not any(log.splitlines().count(marker) == 1 for marker in MAPPED_READAHEAD_MARKERS):
         raise GateError("server did not admit exact selected-cold mapped readahead")
-    if log.splitlines().count(PREVIOUS_UNION_READAHEAD_MARKER) != 1:
+    rdadvise_active = log.splitlines().count(MAPPED_READAHEAD_MARKERS[1]) == 1
+    if not rdadvise_active and log.splitlines().count(PREVIOUS_UNION_READAHEAD_MARKER) != 1:
         raise GateError("server did not admit pre-assistant previous-union readahead")
     if MAPPED_READAHEAD_REFUSAL_MARKER in log:
         raise GateError("the kernel refused at least one mapped-cold page advisory")

@@ -1783,7 +1783,7 @@ const GHOST_METAL_DECODE_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DECOD
 /// runs on the existing Ghost read pool and may never become a correctness
 /// dependency.
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
-const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 64;
+const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 512;
 /// Darwin-only stronger page-in experiment. It is deliberately subordinate to
 /// mapped readahead so existing launch receipts cannot silently change pager
 /// strategy. The early and total limits share one per-target identity set.
@@ -2375,8 +2375,7 @@ fn ghost_metal_chained_prediction_allowed(
     prediction_forced: bool,
 ) -> bool {
     let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     !demand_load_only
         && !suppress_prediction
         && k_tokens > 1
@@ -4075,7 +4074,7 @@ fn select_ghost_prefill_plan(
     common_capacity: Option<usize>,
 ) -> GhostPrefillPlan {
     match common_capacity {
-        Some(capacity) if prompt_len <= capacity => {
+        Some(capacity) if required_positions <= capacity => {
             if chunk_eligible && hybrid_enabled && prompt_len > 1 {
                 GhostPrefillPlan::HybridChunk
             } else {
