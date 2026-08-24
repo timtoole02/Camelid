@@ -29,11 +29,21 @@ MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS = 64
 FULL_Q4_MATRIX_BYTES = 236_077_056
 FULL_Q4_SOURCE_SHA256 = "c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801"
 BF16_MATRIX_BYTES = 839_385_088
-MAPPED_READAHEAD_MARKER = (
-    "[gemma4-ghost-metal] mapped-cold readahead policy: "
-    "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 "
-    "scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool"
+MAPPED_READAHEAD_MARKERS = (
+    (
+        "[gemma4-ghost-metal] mapped-cold readahead policy: "
+        "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 "
+        "scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool"
+    ),
+    (
+        "[gemma4-ghost-metal] mapped-cold rdadvise policy: "
+        "CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE effective=1 "
+        "parent=CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD strategy=F_RDADVISE "
+        "dispatch=direct exact_record_ranges=1 early_max_records=32 "
+        "total_max_records=64 anonymous_capacity_bytes=0 correctness_dependency=0"
+    ),
 )
+MAPPED_READAHEAD_MARKER = MAPPED_READAHEAD_MARKERS[0]
 PREVIOUS_UNION_READAHEAD_MARKER = (
     "[gemma4-ghost-metal] mapped-cold previous-union policy: "
     "source=previous-target-exact-routed-union timing=before-assistant "
@@ -329,7 +339,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     )
     if log.count(promotion_marker) != 1:
         raise GateError("server did not disable terminal decode promotion")
-    if log.splitlines().count(MAPPED_READAHEAD_MARKER) != 1:
+    if not any(log.splitlines().count(marker) == 1 for marker in MAPPED_READAHEAD_MARKERS):
         raise GateError("server did not admit exact selected-cold mapped readahead")
     if log.splitlines().count(PREVIOUS_UNION_READAHEAD_MARKER) != 1:
         raise GateError("server did not admit pre-assistant previous-union readahead")
