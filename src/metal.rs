@@ -27475,6 +27475,17 @@ impl Gemma4GhostCommonMetal {
                 // the serial two-wave path below runs unchanged (fail
                 // closed).
                 let mut pre_encoded_moe: Option<metal::CommandBuffer> = None;
+                let pre_materialized = if file_mapped_demand && overlap_round && num_slots >= 1 {
+                    let active: Vec<usize> = if let Some(pred) = predicted_unions.get(layer_idx).filter(|u| !u.is_empty()) {
+                        pred.iter().copied().take(num_slots).collect()
+                    } else {
+                        (0..num_slots).collect()
+                    };
+                    slot_binding.materialize_for_active_slots(&active)
+                } else {
+                    None
+                };
+                let pre_slot_binding = pre_materialized.as_ref().unwrap_or(slot_binding);
                 if overlap_round && num_slots >= 1 {
                     let t_pre = std::time::Instant::now();
                     let cb3 = kernel.queue.new_command_buffer().to_owned();
@@ -27485,7 +27496,7 @@ impl Gemma4GhostCommonMetal {
                             enc,
                             &down_exps_scale,
                             &expert_to_slot_table,
-                            slot_binding,
+                            pre_slot_binding,
                             None,
                             layer_idx,
                             num_slots,
@@ -27498,7 +27509,7 @@ impl Gemma4GhostCommonMetal {
                         ) && self.encode_moe_down(
                             kernel,
                             enc,
-                            slot_binding,
+                            pre_slot_binding,
                             None,
                             layer_idx,
                             k_tokens,
@@ -27520,6 +27531,9 @@ impl Gemma4GhostCommonMetal {
                         stamp.start(GPU_STAGE_GATEUP);
                         stamp.push_current(&cb3);
                         cb3.commit();
+                        if let Some(mat) = pre_materialized {
+                            live_mapped_bindings.push(mat);
+                        }
                         for binding in live_mapped_bindings.drain(..) {
                             mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(&cb3, binding));
                         }
