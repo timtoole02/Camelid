@@ -1637,23 +1637,38 @@ impl Gemma4MoeSlotArgTable {
         let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
             return false;
         };
-        let gateup = if k_candidates <= 8 {
-            pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
+        if k_candidates <= 8 && pipelines.gateup_k8_tile4.is_some() {
+            encode_argbuf_gateup_tile4(
+                encoder,
+                pipelines.gateup_k8_tile4.as_ref().unwrap(),
+                input_scales,
+                input_quants,
+                &self.table,
+                work_list,
+                output_scales,
+                output_quants,
+                num_unique_experts as u32,
+                k_candidates as u32,
+            );
         } else {
-            &pipelines.gateup
-        };
-        encode_argbuf_gateup(
-            encoder,
-            gateup,
-            input_scales,
-            input_quants,
-            &self.table,
-            work_list,
-            output_scales,
-            output_quants,
-            num_unique_experts as u32,
-            k_candidates as u32,
-        );
+            let gateup = if k_candidates <= 8 {
+                pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
+            } else {
+                &pipelines.gateup
+            };
+            encode_argbuf_gateup(
+                encoder,
+                gateup,
+                input_scales,
+                input_quants,
+                &self.table,
+                work_list,
+                output_scales,
+                output_quants,
+                num_unique_experts as u32,
+                k_candidates as u32,
+            );
+        }
         true
     }
 
@@ -1677,17 +1692,31 @@ impl Gemma4MoeSlotArgTable {
         let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
             return false;
         };
-        encode_argbuf_down(
-            encoder,
-            &pipelines.down,
-            act_scales,
-            act_quants,
-            &self.table,
-            candidate_routes,
-            work_list,
-            output,
-            k_candidates as u32,
-        );
+        if k_candidates <= 8 && pipelines.down_rows8.is_some() {
+            encode_argbuf_down_rows8(
+                encoder,
+                pipelines.down_rows8.as_ref().unwrap(),
+                act_scales,
+                act_quants,
+                &self.table,
+                candidate_routes,
+                work_list,
+                output,
+                k_candidates as u32,
+            );
+        } else {
+            encode_argbuf_down(
+                encoder,
+                &pipelines.down,
+                act_scales,
+                act_quants,
+                &self.table,
+                candidate_routes,
+                work_list,
+                output,
+                k_candidates as u32,
+            );
+        }
         true
     }
 
