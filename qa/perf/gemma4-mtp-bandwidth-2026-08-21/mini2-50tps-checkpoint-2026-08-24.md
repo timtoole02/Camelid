@@ -505,6 +505,38 @@ cost roughly 10x more than the established sparse Down kernel on M4. It was
 stopped before production selector wiring, a full verifier build, or an ABBA
 run. The exact kernel and fail-fast timing gate remain as closure evidence.
 
+## Exact assistant Q4 head row-packing probe (H66)
+
+H66 tests whether one 32-thread SIMDgroup can evaluate two or four adjacent
+rows of the assistant's 262,144 x 1,024 Q4 output head while reusing its input
+loads. Every row keeps the established four Q4 sub-block updates and exact
+`16,8,4,pair01,pair23` reduction tree. The candidate adds no buffers,
+threadgroup memory, barriers, submissions, or argmax changes, and remains
+test-only until the isolated continuation gate passes.
+
+The active Mini2 gate passed twice. Row2 and Row4 were raw-u32 identical to
+the established kernel for ragged rows, nonzero packed offsets, Q4 canaries,
+output guards, production BF16-lattice and adversarial finite inputs, and both
+rounded and unrounded outputs. The guarded full-shape timing gate then compared
+all 262,144 logits for both candidates before measuring the exact 44-head
+request segments `4,9,12,13,6`. It used a directly filled 150,994,944-byte
+synthetic Q4 buffer with official head geometry, two discarded warmups per
+path, and nine balanced three-way samples.
+
+The paired median request delta was -2,131 us for Row2 and -192 us for Row4;
+negative means the candidate was slower. Row4's five segment deltas were
+`-22,-9,-40,-30,-31` us, so it also failed every non-regression gate. Median
+total GPU time was 64,065 us established, 66,211 us Row2, and 64,229 us Row4.
+The watchdog recorded zero current swap and zero swap-in/out growth, a
+211,993,296-byte peak child physical footprint, and 1,666,056,192-byte peak
+host wired memory.
+
+H66 is a **NO-GO**. The established one-row head kernel is already the better
+M4 schedule; reduced threadgroup count and input-load reuse do not offset the
+additional live row state. H66 stopped before production wiring, a profile,
+or full-model ABBA. Its exact kernels and guarded fail-fast timing gate remain
+as closure evidence.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -526,6 +558,7 @@ Profiles and executable for this checkpoint:
 - `H62-mtp-bf16-lattice-loads`
 - `H64-async-two-wave-chunked-read`
 - `H65-wide-down-mma-terms` (source/timing closure only; no profile)
+- `H66-mtp-q4-head-row-pack` (source/timing closure only; no profile)
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -594,6 +627,11 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
   pass; ignored 30-layer K14 production-histogram timing failed round 0 at
   278,369 us versus 28,540 us established, a 249,823 us regression; Mini2
   remained at zero swap and no full verifier run was attempted;
+- H66 ragged/offset/guard/BF16/adversarial raw-u32 gate: pass twice; guarded
+  full 262,144-logit shape parity passed for Row2 and Row4, but paired
+  44-head timing regressed 2,131 us/request and 192 us/request respectively;
+  zero swap, 211,993,296-byte peak child footprint, 1,666,056,192-byte peak
+  wired memory, and no production wiring or ABBA;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

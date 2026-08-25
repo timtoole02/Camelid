@@ -329,6 +329,185 @@ kernel void mtp_q4_0_gemv_f32acc(
         : value;
 }
 
+// H66 exact assistant-head probe. The established kernel launches one
+// SIMDgroup for every vocabulary row even though all rows consume the same
+// 1,024-value input. These variants keep each row's scalar accumulation and
+// reduction tree unchanged while one SIMDgroup evaluates two or four adjacent
+// rows and reuses the input loads. They add no barriers or threadgroup memory.
+inline float mtp_q4_0_nibble_term_f32acc(
+    float d,
+    uchar4 wb,
+    float x0,
+    float x1,
+    float x2,
+    float x3,
+    float x16,
+    float x17,
+    float x18,
+    float x19) {
+    return d * (float(int(wb.x & 0x0f) - 8) * x0 + float(int(wb.x >> 4) - 8) * x16
+              + float(int(wb.y & 0x0f) - 8) * x1 + float(int(wb.y >> 4) - 8) * x17
+              + float(int(wb.z & 0x0f) - 8) * x2 + float(int(wb.z >> 4) - 8) * x18
+              + float(int(wb.w & 0x0f) - 8) * x3 + float(int(wb.w >> 4) - 8) * x19);
+}
+
+inline float mtp_q4_0_reduce_f32acc(float partial) {
+    partial += simd_shuffle_down(partial, ushort(16));
+    partial += simd_shuffle_down(partial, ushort(8));
+    partial += simd_shuffle_down(partial, ushort(4));
+    const float pair01 = simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+    const float pair23 = simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+    return pair01 + pair23;
+}
+
+kernel void mtp_q4_0_gemv_rows2_f32acc(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    uint row_group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint row0 = row_group * 2u;
+    if (row0 >= rows) return;
+    const uint row1 = row0 + 1u;
+    const uint blocks_per_row = cols / 32;
+    const ulong row_bytes = ulong(blocks_per_row) * 18ul;
+    device const uchar* matrix = q4_weights + weight_byte_offset;
+    float partial0 = 0.0f;
+    float partial1 = 0.0f;
+    for (uint b = lane; b < blocks_per_row; b += 32) {
+        const uint in_base = b * 32;
+        const ulong block_offset = ulong(b) * 18ul;
+        device const uchar* block0 = matrix + ulong(row0) * row_bytes + block_offset;
+        device const uchar* block1 = block0;
+        if (row1 < rows) {
+            block1 = matrix + ulong(row1) * row_bytes + block_offset;
+        }
+        const float d0 = float(*reinterpret_cast<device const half*>(block0));
+        const float d1 = float(*reinterpret_cast<device const half*>(block1));
+        device const packed_uchar4* q40 =
+            reinterpret_cast<device const packed_uchar4*>(block0 + 2);
+        device const packed_uchar4* q41 =
+            reinterpret_cast<device const packed_uchar4*>(block1 + 2);
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            const uint k4 = k * 4;
+            const float x0 = input[in_base + k4];
+            const float x1 = input[in_base + k4 + 1];
+            const float x2 = input[in_base + k4 + 2];
+            const float x3 = input[in_base + k4 + 3];
+            const float x16 = input[in_base + 16 + k4];
+            const float x17 = input[in_base + 17 + k4];
+            const float x18 = input[in_base + 18 + k4];
+            const float x19 = input[in_base + 19 + k4];
+            partial0 += mtp_q4_0_nibble_term_f32acc(
+                d0, uchar4(q40[k]), x0, x1, x2, x3, x16, x17, x18, x19);
+            partial1 += mtp_q4_0_nibble_term_f32acc(
+                d1, uchar4(q41[k]), x0, x1, x2, x3, x16, x17, x18, x19);
+        }
+    }
+    const float value0 = mtp_q4_0_reduce_f32acc(partial0);
+    const float value1 = mtp_q4_0_reduce_f32acc(partial1);
+    if (lane == 0) {
+        output[row0] = round_output_bf16 != 0u ? mtp_round_bf16(value0) : value0;
+        if (row1 < rows) {
+            output[row1] = round_output_bf16 != 0u ? mtp_round_bf16(value1) : value1;
+        }
+    }
+}
+
+kernel void mtp_q4_0_gemv_rows4_f32acc(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    uint row_group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint row0 = row_group * 4u;
+    if (row0 >= rows) return;
+    const uint row1 = row0 + 1u;
+    const uint row2 = row0 + 2u;
+    const uint row3 = row0 + 3u;
+    const uint blocks_per_row = cols / 32;
+    const ulong row_bytes = ulong(blocks_per_row) * 18ul;
+    device const uchar* matrix = q4_weights + weight_byte_offset;
+    float partial0 = 0.0f;
+    float partial1 = 0.0f;
+    float partial2 = 0.0f;
+    float partial3 = 0.0f;
+    for (uint b = lane; b < blocks_per_row; b += 32) {
+        const uint in_base = b * 32;
+        const ulong block_offset = ulong(b) * 18ul;
+        device const uchar* block0 = matrix + ulong(row0) * row_bytes + block_offset;
+        device const uchar* block1 = block0;
+        device const uchar* block2 = block0;
+        device const uchar* block3 = block0;
+        if (row1 < rows) {
+            block1 = matrix + ulong(row1) * row_bytes + block_offset;
+        }
+        if (row2 < rows) {
+            block2 = matrix + ulong(row2) * row_bytes + block_offset;
+        }
+        if (row3 < rows) {
+            block3 = matrix + ulong(row3) * row_bytes + block_offset;
+        }
+        const float d0 = float(*reinterpret_cast<device const half*>(block0));
+        const float d1 = float(*reinterpret_cast<device const half*>(block1));
+        const float d2 = float(*reinterpret_cast<device const half*>(block2));
+        const float d3 = float(*reinterpret_cast<device const half*>(block3));
+        device const packed_uchar4* q40 =
+            reinterpret_cast<device const packed_uchar4*>(block0 + 2);
+        device const packed_uchar4* q41 =
+            reinterpret_cast<device const packed_uchar4*>(block1 + 2);
+        device const packed_uchar4* q42 =
+            reinterpret_cast<device const packed_uchar4*>(block2 + 2);
+        device const packed_uchar4* q43 =
+            reinterpret_cast<device const packed_uchar4*>(block3 + 2);
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            const uint k4 = k * 4;
+            const float x0 = input[in_base + k4];
+            const float x1 = input[in_base + k4 + 1];
+            const float x2 = input[in_base + k4 + 2];
+            const float x3 = input[in_base + k4 + 3];
+            const float x16 = input[in_base + 16 + k4];
+            const float x17 = input[in_base + 17 + k4];
+            const float x18 = input[in_base + 18 + k4];
+            const float x19 = input[in_base + 19 + k4];
+            partial0 += mtp_q4_0_nibble_term_f32acc(
+                d0, uchar4(q40[k]), x0, x1, x2, x3, x16, x17, x18, x19);
+            partial1 += mtp_q4_0_nibble_term_f32acc(
+                d1, uchar4(q41[k]), x0, x1, x2, x3, x16, x17, x18, x19);
+            partial2 += mtp_q4_0_nibble_term_f32acc(
+                d2, uchar4(q42[k]), x0, x1, x2, x3, x16, x17, x18, x19);
+            partial3 += mtp_q4_0_nibble_term_f32acc(
+                d3, uchar4(q43[k]), x0, x1, x2, x3, x16, x17, x18, x19);
+        }
+    }
+    const float value0 = mtp_q4_0_reduce_f32acc(partial0);
+    const float value1 = mtp_q4_0_reduce_f32acc(partial1);
+    const float value2 = mtp_q4_0_reduce_f32acc(partial2);
+    const float value3 = mtp_q4_0_reduce_f32acc(partial3);
+    if (lane == 0) {
+        output[row0] = round_output_bf16 != 0u ? mtp_round_bf16(value0) : value0;
+        if (row1 < rows) {
+            output[row1] = round_output_bf16 != 0u ? mtp_round_bf16(value1) : value1;
+        }
+        if (row2 < rows) {
+            output[row2] = round_output_bf16 != 0u ? mtp_round_bf16(value2) : value2;
+        }
+        if (row3 < rows) {
+            output[row3] = round_output_bf16 != 0u ? mtp_round_bf16(value3) : value3;
+        }
+    }
+}
+
 // Gemma 4 uses split-half RoPE. The tables always cover head_dim/2 entries;
 // proportional full attention represents inactive pairs as BF16 (1, 0), so
 // the partner of d remains d + head_dim/2 even when only 64 pairs rotate.
@@ -1856,6 +2035,10 @@ struct MtpPipelines {
     argmax: ComputePipelineState,
     gather_q6k_embed_and_recurrent: ComputePipelineState,
     q4_0_gemv: ComputePipelineState,
+    #[cfg(test)]
+    q4_0_gemv_rows2: ComputePipelineState,
+    #[cfg(test)]
+    q4_0_gemv_rows4: ComputePipelineState,
 }
 
 impl MtpPipelines {
@@ -1939,6 +2122,10 @@ impl MtpPipelines {
             argmax: pipeline("mtp_argmax_f32")?,
             gather_q6k_embed_and_recurrent: pipeline("mtp_gather_q6k_embed_and_recurrent")?,
             q4_0_gemv: pipeline("mtp_q4_0_gemv_f32acc")?,
+            #[cfg(test)]
+            q4_0_gemv_rows2: pipeline("mtp_q4_0_gemv_rows2_f32acc")?,
+            #[cfg(test)]
+            q4_0_gemv_rows4: pipeline("mtp_q4_0_gemv_rows4_f32acc")?,
         })
     }
 
@@ -4960,6 +5147,46 @@ fn encode_q4_0_gemv_packed(
     );
 }
 
+#[cfg(test)]
+fn encode_q4_0_gemv_packed_rows(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    q4_weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    matrix: Q4TensorRef,
+    round_output_bf16: bool,
+    rows_per_group: u32,
+) {
+    assert!(matches!(rows_per_group, 2 | 4));
+    assert!(matrix.byte_offset + matrix.byte_len <= q4_weights.length());
+    let cols = matrix.cols;
+    let rows = matrix.rows;
+    let weight_byte_offset = matrix.byte_offset;
+    let round_output_bf16 = u32::from(round_output_bf16);
+    let groups = rows.div_ceil(rows_per_group);
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(q4_weights), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), 0);
+    encoder.set_bytes(3, 4, &cols as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &rows as *const u32 as *const c_void);
+    encoder.set_bytes(5, 8, &weight_byte_offset as *const u64 as *const c_void);
+    encoder.set_bytes(6, 4, &round_output_bf16 as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: groups as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 fn encode_assistant_matrix(
     encoder: &metal::ComputeCommandEncoderRef,
     pipelines: &MtpPipelines,
@@ -6104,6 +6331,596 @@ mod tests {
                 .iter()
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum H66HeadPath {
+        Established,
+        Rows2,
+        Rows4,
+    }
+
+    impl H66HeadPath {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Established => "established",
+                Self::Rows2 => "rows2",
+                Self::Rows4 => "rows4",
+            }
+        }
+    }
+
+    fn encode_h66_head_path(
+        encoder: &metal::ComputeCommandEncoderRef,
+        pipelines: &MtpPipelines,
+        path: H66HeadPath,
+        weights: &Buffer,
+        input: &Buffer,
+        output: &Buffer,
+        matrix: Q4TensorRef,
+        round_output_bf16: bool,
+    ) {
+        match path {
+            H66HeadPath::Established => encode_q4_0_gemv_packed(
+                encoder,
+                &pipelines.q4_0_gemv,
+                weights,
+                input,
+                output,
+                matrix,
+                round_output_bf16,
+            ),
+            H66HeadPath::Rows2 => encode_q4_0_gemv_packed_rows(
+                encoder,
+                &pipelines.q4_0_gemv_rows2,
+                weights,
+                input,
+                output,
+                matrix,
+                round_output_bf16,
+                2,
+            ),
+            H66HeadPath::Rows4 => encode_q4_0_gemv_packed_rows(
+                encoder,
+                &pipelines.q4_0_gemv_rows4,
+                weights,
+                input,
+                output,
+                matrix,
+                round_output_bf16,
+                4,
+            ),
+        }
+    }
+
+    fn run_h66_head_once_bits(
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        path: H66HeadPath,
+        weights: &Buffer,
+        input: &Buffer,
+        matrix: Q4TensorRef,
+        round_output_bf16: bool,
+        guard_rows: usize,
+    ) -> Vec<u32> {
+        const GUARD_BITS: u32 = 0x4e91_2345;
+        let output_rows = matrix.rows as usize + guard_rows;
+        let initial = vec![f32::from_bits(GUARD_BITS); output_rows];
+        let output = f32_buffer(&kernel.device, &initial);
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_h66_head_path(
+            encoder,
+            pipelines,
+            path,
+            weights,
+            input,
+            &output,
+            matrix,
+            round_output_bf16,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(
+            command_buffer.status(),
+            MTLCommandBufferStatus::Completed,
+            "H66 {:?} command failed",
+            path
+        );
+        let mut values = vec![0.0f32; output_rows];
+        read_buffer_f32(&output, &mut values);
+        let bits: Vec<u32> = values.into_iter().map(f32::to_bits).collect();
+        assert!(
+            bits[matrix.rows as usize..]
+                .iter()
+                .all(|bits| *bits == GUARD_BITS),
+            "H66 {:?} overwrote the output guard",
+            path
+        );
+        bits
+    }
+
+    #[test]
+    fn q4_head_rows2_rows4_are_raw_bit_exact_with_ragged_rows_and_guards() {
+        const ROWS: usize = 7;
+        const COLS: usize = 8_192;
+        const PREFIX: usize = 256;
+        const SUFFIX: usize = 256;
+        const GUARD_ROWS: usize = 5;
+        const WEIGHT_CANARY: u8 = 0xa5;
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP kernels");
+        let row_bytes = COLS / Q4_0_BLOCK_VALUES * Q4_0_BLOCK_BYTES;
+        let packed_bytes = ROWS * row_bytes;
+        let mut packed = vec![0u8; packed_bytes];
+        for row in 0..ROWS {
+            let source: Vec<u16> = (0..COLS)
+                .map(|col| {
+                    let phase = ((row * COLS + col) as f32 * 0.000_976_562_5).sin();
+                    f32_to_bf16_rne_bits(phase * (0.25 + row as f32 * 0.03125))
+                })
+                .collect();
+            quantize_q4_0_row(&source, &mut packed[row * row_bytes..(row + 1) * row_bytes]);
+        }
+        let mut storage = vec![WEIGHT_CANARY; PREFIX + packed_bytes + SUFFIX];
+        storage[PREFIX..PREFIX + packed_bytes].copy_from_slice(&packed);
+        let weights = shared_buffer(&kernel.device, storage.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                storage.as_ptr(),
+                weights.contents().cast::<u8>(),
+                storage.len(),
+            );
+        }
+        let matrix = Q4TensorRef {
+            byte_offset: PREFIX as u64,
+            byte_len: packed_bytes as u64,
+            rows: ROWS as u32,
+            cols: COLS as u32,
+        };
+        let mut production_input: Vec<f32> = (0..COLS)
+            .map(|index| round_to_bf16_f32(((index as f32 * 0.003_906_25).cos() * 0.75) - 0.125))
+            .collect();
+        production_input[..6].copy_from_slice(&[
+            0.0,
+            -0.0,
+            f32::from_bits(0x3f80_0000),
+            f32::from_bits(0xbf80_0000),
+            f32::from_bits(0x0000_0000),
+            f32::from_bits(0x8000_0000),
+        ]);
+        let mut adversarial_input = bf16_fusion_adversarial_finite_values(COLS, 0x66);
+        adversarial_input[..4].copy_from_slice(&[
+            0.0,
+            -0.0,
+            f32::from_bits(0x3f80_8000),
+            f32::from_bits(0xbf80_8000),
+        ]);
+        assert!(production_input.iter().all(|value| value.is_finite()));
+        assert!(adversarial_input.iter().all(|value| value.is_finite()));
+
+        for (input_label, input_values) in [
+            ("production-bf16", production_input),
+            ("adversarial-finite", adversarial_input),
+        ] {
+            let input = f32_buffer(&kernel.device, &input_values);
+            for round_output_bf16 in [false, true] {
+                let established = run_h66_head_once_bits(
+                    kernel,
+                    &pipelines,
+                    H66HeadPath::Established,
+                    &weights,
+                    &input,
+                    matrix,
+                    round_output_bf16,
+                    GUARD_ROWS,
+                );
+                for path in [H66HeadPath::Rows2, H66HeadPath::Rows4] {
+                    let candidate = run_h66_head_once_bits(
+                        kernel,
+                        &pipelines,
+                        path,
+                        &weights,
+                        &input,
+                        matrix,
+                        round_output_bf16,
+                        GUARD_ROWS,
+                    );
+                    assert_eq!(
+                        candidate,
+                        established,
+                        "H66 {} drifted for {input_label}, round_output_bf16={round_output_bf16}",
+                        path.label()
+                    );
+                }
+            }
+        }
+
+        let final_storage =
+            unsafe { std::slice::from_raw_parts(weights.contents().cast::<u8>(), storage.len()) };
+        assert!(final_storage[..PREFIX]
+            .iter()
+            .all(|byte| *byte == WEIGHT_CANARY));
+        assert!(final_storage[PREFIX + packed_bytes..]
+            .iter()
+            .all(|byte| *byte == WEIGHT_CANARY));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct H66HeadRequestTiming {
+        segments_us: [u128; 5],
+        total_us: u128,
+    }
+
+    fn time_h66_head_request(
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        path: H66HeadPath,
+        weights: &Buffer,
+        input: &Buffer,
+        output: &Buffer,
+        matrix: Q4TensorRef,
+    ) -> H66HeadRequestTiming {
+        const SEGMENTS: [usize; 5] = [4, 9, 12, 13, 6];
+        let mut segments_us = [0u128; SEGMENTS.len()];
+        for (segment_index, drafts) in SEGMENTS.into_iter().enumerate() {
+            let command_buffer = kernel.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            for _ in 0..drafts {
+                encode_h66_head_path(
+                    encoder, pipelines, path, weights, input, output, matrix, false,
+                );
+            }
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_eq!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed,
+                "H66 timing {:?} segment {segment_index} failed",
+                path
+            );
+            segments_us[segment_index] = command_buffer_gpu_times_us(command_buffer).0;
+        }
+        H66HeadRequestTiming {
+            total_us: segments_us.iter().sum(),
+            segments_us,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct H66VmCounters {
+        swapins: u64,
+        swapouts: u64,
+    }
+
+    #[allow(deprecated)]
+    fn h66_vm_counters() -> Option<H66VmCounters> {
+        let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        let result = unsafe {
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                stats.as_mut_ptr().cast::<libc::integer_t>(),
+                &mut count,
+            )
+        };
+        if result != libc::KERN_SUCCESS {
+            return None;
+        }
+        let stats = unsafe { stats.assume_init() };
+        Some(H66VmCounters {
+            swapins: stats.swapins,
+            swapouts: stats.swapouts,
+        })
+    }
+
+    fn h66_median_i128(samples: &[i128]) -> i128 {
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        ordered[ordered.len() / 2]
+    }
+
+    fn h66_current_swap_is_zero() -> bool {
+        std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "vm.swapusage"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .is_some_and(|text| text.contains("used = 0.00M"))
+    }
+
+    fn h66_synthetic_official_geometry_head(device: &Device) -> (Buffer, Q4TensorRef) {
+        const PREFIX: usize = 256;
+        const SUFFIX: usize = 256;
+        const HEAD_BYTES: usize = 150_994_944;
+        const CANARY: u8 = 0x5a;
+        const SCALES: [u16; 8] = [
+            0x3000, 0x3400, 0x3800, 0x3c00, 0xb000, 0xb400, 0xb800, 0xbc00,
+        ];
+        let buffer = shared_buffer(device, PREFIX + HEAD_BYTES + SUFFIX);
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                buffer.contents().cast::<u8>(),
+                PREFIX + HEAD_BYTES + SUFFIX,
+            )
+        };
+        bytes.fill(CANARY);
+        let blocks_per_row = ASSISTANT_HIDDEN / Q4_0_BLOCK_VALUES;
+        for row in 0..VOCAB {
+            for block in 0..blocks_per_row {
+                let block_index = row * blocks_per_row + block;
+                let base = PREFIX + block_index * Q4_0_BLOCK_BYTES;
+                let scale = SCALES[(row.wrapping_mul(17) + block.wrapping_mul(5)) % SCALES.len()];
+                bytes[base..base + 2].copy_from_slice(&scale.to_le_bytes());
+                for q in 0..16 {
+                    bytes[base + 2 + q] = (row as u8)
+                        .wrapping_mul(29)
+                        .wrapping_add((block as u8).wrapping_mul(11))
+                        .wrapping_add((q as u8).wrapping_mul(7));
+                }
+            }
+        }
+        assert!(bytes[..PREFIX].iter().all(|byte| *byte == CANARY));
+        assert!(bytes[PREFIX + HEAD_BYTES..]
+            .iter()
+            .all(|byte| *byte == CANARY));
+        (
+            buffer,
+            Q4TensorRef {
+                byte_offset: PREFIX as u64,
+                byte_len: HEAD_BYTES as u64,
+                rows: VOCAB as u32,
+                cols: ASSISTANT_HIDDEN as u32,
+            },
+        )
+    }
+
+    #[test]
+    #[ignore = "real-Metal H66 exact synthetic-official-geometry 44-head timing gate"]
+    fn q4_head_rows2_rows4_synthetic_official_geometry_exact_44_head_timing() {
+        const SEGMENTS: [usize; 5] = [4, 9, 12, 13, 6];
+        const OFFICIAL_HEAD_BYTES: u64 = 150_994_944;
+        const OUTPUT_GUARD_ROWS: usize = 16;
+        const OUTPUT_GUARD_BITS: u32 = 0x4e91_2345;
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP H66 synthetic official-geometry head timing: no Metal device");
+            return;
+        };
+        assert!(h66_current_swap_is_zero(), "H66 requires zero current swap");
+        let before_vm = h66_vm_counters().expect("H66 requires VM swap counters");
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile H66 pipelines");
+        for pipeline in [&pipelines.q4_0_gemv_rows2, &pipelines.q4_0_gemv_rows4] {
+            assert_eq!(pipeline.thread_execution_width(), 32);
+            assert!(pipeline.max_total_threads_per_threadgroup() >= 32);
+            assert_eq!(pipeline.static_threadgroup_memory_length(), 0);
+        }
+        let (head_weights, head) = h66_synthetic_official_geometry_head(&kernel.device);
+        assert_eq!(
+            (head.rows, head.cols),
+            (VOCAB as u32, ASSISTANT_HIDDEN as u32)
+        );
+        assert_eq!(head.byte_len, OFFICIAL_HEAD_BYTES);
+        assert_eq!(SEGMENTS.iter().sum::<usize>(), 44);
+        let mut input_values: Vec<f32> = (0..ASSISTANT_HIDDEN)
+            .map(|index| round_to_bf16_f32(((index as f32 * 0.015_625).sin() * 0.625) + 0.03125))
+            .collect();
+        input_values[..4].copy_from_slice(&[0.0, -0.0, 1.0, -1.0]);
+        let input = f32_buffer(&kernel.device, &input_values);
+        let initial_output = vec![f32::from_bits(OUTPUT_GUARD_BITS); VOCAB + OUTPUT_GUARD_ROWS];
+        let output_established = f32_buffer(&kernel.device, &initial_output);
+        let output_candidate = f32_buffer(&kernel.device, &initial_output);
+
+        let exact_once = |path: H66HeadPath, output: &Buffer| {
+            let command_buffer = kernel.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode_h66_head_path(
+                encoder,
+                &pipelines,
+                path,
+                &head_weights,
+                &input,
+                output,
+                head,
+                false,
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let mut values = vec![0.0f32; VOCAB];
+            read_buffer_f32(output, &mut values);
+            values.into_iter().map(f32::to_bits).collect::<Vec<_>>()
+        };
+        let established_bits = exact_once(H66HeadPath::Established, &output_established);
+        let rows2_bits = exact_once(H66HeadPath::Rows2, &output_candidate);
+        assert_eq!(
+            rows2_bits, established_bits,
+            "H66 full-shape Row2 logits drifted"
+        );
+        let rows4_bits = exact_once(H66HeadPath::Rows4, &output_candidate);
+        assert_eq!(
+            rows4_bits, established_bits,
+            "H66 full-shape Row4 logits drifted"
+        );
+
+        for warmup in 0..2 {
+            let order = if warmup == 0 {
+                [
+                    H66HeadPath::Established,
+                    H66HeadPath::Rows2,
+                    H66HeadPath::Rows4,
+                ]
+            } else {
+                [
+                    H66HeadPath::Rows4,
+                    H66HeadPath::Rows2,
+                    H66HeadPath::Established,
+                ]
+            };
+            for path in order {
+                let output = match path {
+                    H66HeadPath::Established => &output_established,
+                    H66HeadPath::Rows2 | H66HeadPath::Rows4 => &output_candidate,
+                };
+                let _ = time_h66_head_request(
+                    kernel,
+                    &pipelines,
+                    path,
+                    &head_weights,
+                    &input,
+                    output,
+                    head,
+                );
+            }
+        }
+
+        let mut established = Vec::with_capacity(9);
+        let mut rows2 = Vec::with_capacity(9);
+        let mut rows4 = Vec::with_capacity(9);
+        for sample in 0..9 {
+            let order = match sample % 3 {
+                0 => [
+                    H66HeadPath::Established,
+                    H66HeadPath::Rows2,
+                    H66HeadPath::Rows4,
+                ],
+                1 => [
+                    H66HeadPath::Rows2,
+                    H66HeadPath::Rows4,
+                    H66HeadPath::Established,
+                ],
+                _ => [
+                    H66HeadPath::Rows4,
+                    H66HeadPath::Established,
+                    H66HeadPath::Rows2,
+                ],
+            };
+            for path in order {
+                let output = match path {
+                    H66HeadPath::Established => &output_established,
+                    H66HeadPath::Rows2 | H66HeadPath::Rows4 => &output_candidate,
+                };
+                let timing = time_h66_head_request(
+                    kernel,
+                    &pipelines,
+                    path,
+                    &head_weights,
+                    &input,
+                    output,
+                    head,
+                );
+                match path {
+                    H66HeadPath::Established => established.push(timing),
+                    H66HeadPath::Rows2 => rows2.push(timing),
+                    H66HeadPath::Rows4 => rows4.push(timing),
+                }
+            }
+        }
+
+        let paired_savings = |candidate: &[H66HeadRequestTiming]| -> (i128, [i128; 5]) {
+            let request: Vec<i128> = established
+                .iter()
+                .zip(candidate)
+                .map(|(control, candidate)| control.total_us as i128 - candidate.total_us as i128)
+                .collect();
+            let segment_medians = std::array::from_fn(|segment| {
+                let deltas: Vec<i128> = established
+                    .iter()
+                    .zip(candidate)
+                    .map(|(control, candidate)| {
+                        control.segments_us[segment] as i128
+                            - candidate.segments_us[segment] as i128
+                    })
+                    .collect();
+                h66_median_i128(&deltas)
+            });
+            (h66_median_i128(&request), segment_medians)
+        };
+        let (rows2_saving, rows2_segments) = paired_savings(&rows2);
+        let (rows4_saving, rows4_segments) = paired_savings(&rows4);
+        eprintln!(
+            "[gemma4-mtp h66-head] official=0 official_geometry=1 synthetic=1 admission_only=1 head_rows={} head_cols={} head_bytes={} drafts=44 request_segments=4,9,12,13,6 warmups_per_path=2 samples=9 exact_logits={}/{} rows2_paired_saving_us={} rows4_paired_saving_us={} rows2_segment_saving_us={:?} rows4_segment_saving_us={:?}",
+            head.rows,
+            head.cols,
+            head.byte_len,
+            established_bits.len(),
+            VOCAB,
+            rows2_saving,
+            rows4_saving,
+            rows2_segments,
+            rows4_segments,
+        );
+        for sample in 0..9 {
+            eprintln!(
+                "[gemma4-mtp h66-head] sample={} established_total_us={} rows2_total_us={} rows4_total_us={} established_segments_us={:?} rows2_segments_us={:?} rows4_segments_us={:?}",
+                sample,
+                established[sample].total_us,
+                rows2[sample].total_us,
+                rows4[sample].total_us,
+                established[sample].segments_us,
+                rows2[sample].segments_us,
+                rows4[sample].segments_us,
+            );
+        }
+        for (label, output) in [
+            ("established", &output_established),
+            ("candidate", &output_candidate),
+        ] {
+            let values = unsafe {
+                std::slice::from_raw_parts(
+                    output.contents().cast::<f32>(),
+                    VOCAB + OUTPUT_GUARD_ROWS,
+                )
+            };
+            assert!(
+                values[VOCAB..]
+                    .iter()
+                    .all(|value| value.to_bits() == OUTPUT_GUARD_BITS),
+                "H66 {label} overwrote the full-shape output guard"
+            );
+        }
+        let head_storage = unsafe {
+            std::slice::from_raw_parts(
+                head_weights.contents().cast::<u8>(),
+                head_weights.length() as usize,
+            )
+        };
+        let head_start = head.byte_offset as usize;
+        let head_end = head_start + head.byte_len as usize;
+        assert!(head_storage[..head_start].iter().all(|byte| *byte == 0x5a));
+        assert!(head_storage[head_end..].iter().all(|byte| *byte == 0x5a));
+        let after_vm = h66_vm_counters().expect("H66 requires VM swap counters");
+        assert_eq!(after_vm.swapins, before_vm.swapins, "H66 timing swapped in");
+        assert_eq!(
+            after_vm.swapouts, before_vm.swapouts,
+            "H66 timing swapped out"
+        );
+        assert!(
+            h66_current_swap_is_zero(),
+            "H66 ended with nonzero current swap"
+        );
+        let (winner, winner_saving, winner_segments) = if rows4_saving >= rows2_saving {
+            (H66HeadPath::Rows4, rows4_saving, rows4_segments)
+        } else {
+            (H66HeadPath::Rows2, rows2_saving, rows2_segments)
+        };
+        assert!(
+            winner_segments.iter().all(|saving| *saving >= 0),
+            "H66 {} regressed at least one request segment: {:?}",
+            winner.label(),
+            winner_segments
+        );
+        assert!(
+            winner_saving >= 20_000,
+            "H66 best exact path {} saved only {winner_saving}us/request; require at least 20000us",
+            winner.label()
         );
     }
 
