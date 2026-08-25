@@ -42,6 +42,9 @@ const GEMMA4_MTP_FULL_Q4_ENV: &str = "CAMELID_GEMMA4_MTP_FULL_Q4";
 const GEMMA4_MTP_LOAD_WARMUP_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_WARMUP";
 
 #[cfg(target_os = "macos")]
+const GEMMA4_MTP_PRIVATE_QUEUE_WARMUP_ENV: &str = "CAMELID_GEMMA4_MTP_PRIVATE_QUEUE_WARMUP";
+
+#[cfg(target_os = "macos")]
 fn parse_gemma4_mtp_full_q4_required(value: Option<&str>) -> std::result::Result<bool, String> {
     match value {
         None | Some("0") => Ok(false),
@@ -95,9 +98,53 @@ fn gemma4_mtp_load_warmup_from_environment() -> Result<bool> {
     parse_gemma4_mtp_load_warmup(value.as_deref()).map_err(BackendError::InvalidModelMetadata)
 }
 
+#[cfg(target_os = "macos")]
+fn parse_gemma4_mtp_private_queue_warmup(value: Option<&str>) -> std::result::Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) => Err(format!(
+            "{GEMMA4_MTP_PRIVATE_QUEUE_WARMUP_ENV} must be 0, 1, false, or true, got {value:?}"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp_private_queue_warmup_from_environment() -> Result<bool> {
+    let value = match std::env::var(GEMMA4_MTP_PRIVATE_QUEUE_WARMUP_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{GEMMA4_MTP_PRIVATE_QUEUE_WARMUP_ENV} must contain Unicode text"
+            )));
+        }
+    };
+    parse_gemma4_mtp_private_queue_warmup(value.as_deref())
+        .map_err(BackendError::InvalidModelMetadata)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_gemma4_mtp_warmup_configuration(
+    load_warmup: bool,
+    private_queue_warmup: bool,
+) -> std::result::Result<(), String> {
+    if private_queue_warmup && !load_warmup {
+        return Err(format!(
+            "{GEMMA4_MTP_PRIVATE_QUEUE_WARMUP_ENV}=1 requires {GEMMA4_MTP_LOAD_WARMUP_ENV}=1"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod mtp_profile_env_tests {
-    use super::{parse_gemma4_mtp_full_q4_required, parse_gemma4_mtp_load_warmup};
+    use super::{
+        parse_gemma4_mtp_full_q4_required, parse_gemma4_mtp_load_warmup,
+        parse_gemma4_mtp_private_queue_warmup, validate_gemma4_mtp_warmup_configuration,
+    };
 
     #[test]
     fn full_q4_requirement_is_explicit_and_fail_closed() {
@@ -119,6 +166,33 @@ mod mtp_profile_env_tests {
         assert_eq!(parse_gemma4_mtp_load_warmup(Some("TrUe")), Ok(true));
         assert!(parse_gemma4_mtp_load_warmup(Some("yes")).is_err());
         assert!(parse_gemma4_mtp_load_warmup(Some("")).is_err());
+    }
+
+    #[test]
+    fn private_queue_warmup_is_explicit_and_subordinate() {
+        assert_eq!(parse_gemma4_mtp_private_queue_warmup(None), Ok(false));
+        assert_eq!(parse_gemma4_mtp_private_queue_warmup(Some("0")), Ok(false));
+        assert_eq!(
+            parse_gemma4_mtp_private_queue_warmup(Some("FALSE")),
+            Ok(false)
+        );
+        assert_eq!(parse_gemma4_mtp_private_queue_warmup(Some("1")), Ok(true));
+        assert_eq!(
+            parse_gemma4_mtp_private_queue_warmup(Some("TrUe")),
+            Ok(true)
+        );
+        assert!(parse_gemma4_mtp_private_queue_warmup(Some("yes")).is_err());
+        assert!(parse_gemma4_mtp_private_queue_warmup(Some("")).is_err());
+        assert_eq!(
+            validate_gemma4_mtp_warmup_configuration(false, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_gemma4_mtp_warmup_configuration(true, false),
+            Ok(())
+        );
+        assert_eq!(validate_gemma4_mtp_warmup_configuration(true, true), Ok(()));
+        assert!(validate_gemma4_mtp_warmup_configuration(false, true).is_err());
     }
 }
 
@@ -15617,6 +15691,9 @@ impl Gemma4Runtime {
         let mtp_assistant = {
             let full_q4_required = gemma4_mtp_full_q4_required_from_environment()?;
             let load_warmup = gemma4_mtp_load_warmup_from_environment()?;
+            let private_queue_warmup = gemma4_mtp_private_queue_warmup_from_environment()?;
+            validate_gemma4_mtp_warmup_configuration(load_warmup, private_queue_warmup)
+                .map_err(BackendError::InvalidModelMetadata)?;
             let assistant_path =
                 std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH").map(std::path::PathBuf::from);
             match assistant_path {
@@ -15642,16 +15719,23 @@ impl Gemma4Runtime {
                                 );
                             }
                             if load_warmup {
-                                let timing = assistant.warm_target_free().map_err(|error| {
+                                let timing = if private_queue_warmup {
+                                    assistant.warm_target_free_on_private_queue()
+                                } else {
+                                    assistant.warm_target_free()
+                                }
+                                .map_err(|error| {
                                     BackendError::InvalidModelMetadata(format!(
                                         "{GEMMA4_MTP_LOAD_WARMUP_ENV}=1 target-free assistant warmup failed: {error}"
                                     ))
                                 })?;
                                 eprintln!(
-                                    "[gemma4-mtp warmup] assistant=target-free encode_us={} wait_us={} gpu_us={} wall_us={} target_state_mutation=0",
+                                    "[gemma4-mtp warmup] assistant=target-free queue={} encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={} target_state_mutation=0",
+                                    if private_queue_warmup { "private-device-chain" } else { "common" },
                                     timing.encode_us,
                                     timing.wait_us,
                                     timing.gpu_us,
+                                    timing.kernel_us,
                                     timing.wall_us,
                                 );
                             }

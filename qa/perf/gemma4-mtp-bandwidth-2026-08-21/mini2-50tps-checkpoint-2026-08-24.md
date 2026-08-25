@@ -234,6 +234,37 @@ H50 tested the earlier complementary pre-assistant reuse hypothesis described
 at the H49 checkpoint. Its exact regression closes that path at a 96-record
 cap; it is not the next promotion candidate.
 
+## Assistant private-queue warmup closure (H57)
+
+H57 tested whether the assistant's existing target-free load warmup could
+remove the roughly 23 ms first-use setup cost seen on the private Metal queue
+used by the measured device-resident draft chain. The experiment was a strict
+default-off queue-selection seam: public proposals remained on the common
+queue, measured device chains were unchanged, and only the already-enabled
+target-free warmup moved to the private queue when
+`CAMELID_GEMMA4_MTP_PRIVATE_QUEUE_WARMUP=1` was explicitly present.
+
+Two post-build runs were discarded. The H57 warmup receipt proved that it ran
+on `queue=private-device-chain`, but the next measured chain still reported
+23,155 us of first-use kernel setup. A subsequent H49/H57/H57/H49 sequence
+measured:
+
+| run | lane | tok/s | assistant ms | verifier ms | first-chain kernel us |
+|---|---|---:|---:|---:|---:|
+| A1 | H49 control | 31.0252 | 229.46 | 1,317.27 | 23,184 |
+| B1 | H57 | 31.4639 | 225.76 | 1,299.39 | 23,544 |
+| B2 | H57 | 31.2167 | 229.93 | 1,307.33 | 24,012 |
+| A2 | H49 control | 31.7381 | 229.11 | 1,282.86 | 23,224 |
+
+The H49 controls averaged 31.3817 tok/s and H57 averaged 31.3403 tok/s, a
+0.13% regression. H57's first-chain kernel setup averaged 23,778 us versus
+23,204 us for the controls. Every receipt reported 48/48 exact parity, zero
+swap and a clean watchdog exit. The largest measured child footprint was
+7,127,268,304 bytes and the largest host-wired value was 8,326,168,576 bytes,
+both below the hard ceilings. Private-queue target-free warming is therefore
+closed; the cold cost belongs to the chain-specific workload rather than the
+queue object alone.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -248,6 +279,7 @@ Profiles and executable for this checkpoint:
 - `H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control`
 - `H55-async-two-wave-collapse`
 - `H56-mtp-assistant-router-probe`
+- `H57-mtp-private-queue-warmup`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -256,6 +288,9 @@ Profiles and executable for this checkpoint:
   `/Users/timtoole/bin/camelid-h56-0c269ac41c12`
 - H55/H56 SHA-256:
   `0c269ac41c126388581675fef21c1f6e7f9417ae4485608bf5b358fe59e03ba3`
+- H57 Mini2 executable: `/Users/timtoole/bin/camelid-h57-5cfecb36b41f`
+- H57 SHA-256:
+  `5cfecb36b41fd380f8a411a82e92527a00dfca2173376924701d8de844eb7fd7`
 
 ## Validation and provenance
 
@@ -276,6 +311,7 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - exact 1,408-slot profile admission: 1/1;
 - H55 parser/plan/raw-bit terminal parity: 3/3;
 - H56 parser/source/tally/global-budget accounting: 4/4;
+- H57 parser/subordinate-warmup configuration: 3/3;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

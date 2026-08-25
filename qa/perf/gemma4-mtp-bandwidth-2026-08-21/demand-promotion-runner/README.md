@@ -101,6 +101,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control` | Strict-memory H49 control: exact frozen 1,408-slot profile and KV192; ABBA mean 31.74 tok/s, zero swap |
 | `H55-async-two-wave-collapse` | H54 submission recovery: exact two-command hot/terminal path; strict-memory ABBA mean 31.45 tok/s versus H49 31.74, no-go |
 | `H56-mtp-assistant-router-probe` | Read-only assistant-hidden router projection; global-96 residual-cold recall 4.63% and 31.61 ms projected savings, so predictive host staging is closed |
+| `H57-mtp-private-queue-warmup` | Target-free assistant warmup on the measured chain's private queue; exact strict-memory ABBA mean 31.34 tok/s versus H49 31.38, and the ~23 ms first-chain setup remained, no-go |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 

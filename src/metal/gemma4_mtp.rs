@@ -2305,6 +2305,21 @@ impl Gemma4MtpAssistantMetal {
     /// it cannot perturb Ghost expert LFU state or target sequence residency.
     #[doc(hidden)]
     pub fn warm_target_free(&mut self) -> Result<Gemma4MtpProposalTiming> {
+        self.warm_target_free_with_queue(false)
+    }
+
+    /// Warm the same target-free workload on the private queue used by the
+    /// one-command device-resident draft chain. This is a separate opt-in so
+    /// the established common-queue warmup remains the default control.
+    #[doc(hidden)]
+    pub fn warm_target_free_on_private_queue(&mut self) -> Result<Gemma4MtpProposalTiming> {
+        self.warm_target_free_with_queue(true)
+    }
+
+    fn warm_target_free_with_queue(
+        &mut self,
+        private_queue: bool,
+    ) -> Result<Gemma4MtpProposalTiming> {
         let kernel =
             metal_linear_kernel().ok_or_else(|| invalid("Metal common core disappeared"))?;
         let local_elements = LOCAL_KV_HEADS * LOCAL_HEAD_DIM;
@@ -2337,7 +2352,8 @@ impl Gemma4MtpAssistantMetal {
         };
         let zero_target = vec![0.0f32; TARGET_HIDDEN];
         let previous_ledger = self.last_proposal_ledger;
-        let proposal = self.propose(&zero_target, &zero_target, target_kv)?;
+        let proposal =
+            self.propose_with_queue(&zero_target, &zero_target, target_kv, private_queue)?;
         self.last_proposal_ledger = previous_ledger;
         Ok(proposal.timing)
     }
@@ -2351,6 +2367,21 @@ impl Gemma4MtpAssistantMetal {
         target_scaled_embedding: &[f32],
         pending_target_hidden: &[f32],
         target_kv: Gemma4MtpTargetKvView<'_>,
+    ) -> Result<Gemma4MtpProposal> {
+        self.propose_with_queue(
+            target_scaled_embedding,
+            pending_target_hidden,
+            target_kv,
+            false,
+        )
+    }
+
+    fn propose_with_queue(
+        &mut self,
+        target_scaled_embedding: &[f32],
+        pending_target_hidden: &[f32],
+        target_kv: Gemma4MtpTargetKvView<'_>,
+        private_queue: bool,
     ) -> Result<Gemma4MtpProposal> {
         let wall_started = Instant::now();
         if target_scaled_embedding.len() != TARGET_HIDDEN
@@ -2421,7 +2452,11 @@ impl Gemma4MtpAssistantMetal {
             metal_linear_kernel().ok_or_else(|| invalid("Metal common core disappeared"))?;
         let attention_scores = shared_buffer(&kernel.device, score_bytes);
 
-        let command_buffer = kernel.queue.new_command_buffer();
+        let command_buffer = if private_queue {
+            self.queue.new_command_buffer()
+        } else {
+            kernel.queue.new_command_buffer()
+        };
         let encoder = command_buffer.new_compute_command_encoder();
         let encode_started = Instant::now();
         #[cfg(test)]
