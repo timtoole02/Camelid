@@ -54,6 +54,8 @@ def manifest_values(stage_cap: int = 8) -> dict[str, str]:
         {
             "binary": "/Users/timtoole/camelid-h69-bin/camelid",
             "cache_mib": "0",
+            "request": str(ANALYZER.REQUEST_FILE),
+            "request_sha256": hashlib.sha256(ANALYZER.REQUEST_FILE.read_bytes()).hexdigest(),
             "expected_token_ids_sha256": hashlib.sha256(expected_text).hexdigest(),
             "supervision_mode": "manual-no-watchdog",
             "source_commit": SOURCE_COMMIT,
@@ -543,8 +545,8 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
             with self.assertRaisesRegex(ANALYZER.ReceiptError, "frozen"):
                 ANALYZER.analyze(run_dir)
 
-    def test_environment_rejects_profile_drift_and_unknown_fields(self) -> None:
-        for mutation in ("slots", "kv", "extra"):
+    def test_environment_rejects_profile_drift_request_drift_and_unknown_fields(self) -> None:
+        for mutation in ("slots", "kv", "request", "request_sha", "extra"):
             with self.subTest(mutation=mutation), fixture() as run_dir:
                 values = manifest_values()
                 if mutation == "slots":
@@ -553,6 +555,10 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
                     ].replace("60", "61", 1)
                 elif mutation == "kv":
                     values["CAMELID_GEMMA4_KV_INIT"] = "512"
+                elif mutation == "request":
+                    values["request"] = "/tmp/not-the-canonical-request.json"
+                elif mutation == "request_sha":
+                    values["request_sha256"] = "0" * 64
                 else:
                     values["CAMELID_UNDECLARED"] = "1"
                 write_manifest(run_dir / "env.txt", values)

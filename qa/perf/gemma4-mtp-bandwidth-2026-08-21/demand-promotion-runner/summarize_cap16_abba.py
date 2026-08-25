@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fail closed and summarize one cap8/cap16/cap16/cap8 Mini2 campaign."""
 
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,9 @@ MTP_ROUND_RE = re.compile(
     r"\(assistant=[\d.]+ms, verifier=[\d.]+ms\) accepted=(\d+)/(\d+)"
 )
 EXPECTED_MTP_WIDTHS = (14, 13, 14, 7)
+CANONICAL_REQUEST = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "request-48-plain.json"
+)
 
 
 class ReceiptError(ValueError):
@@ -111,6 +115,15 @@ def read_run(run_dir, expect_cap16):
     require(env.get("supervision_mode") == "manual-no-watchdog",
             f"run did not disable watchdog in {env_path}")
     require(env.get("source_tree_clean") == "1", f"source tree was dirty in {env_path}")
+    require(env.get("request") == CANONICAL_REQUEST,
+            f"canonical request path drift in {env_path}")
+    try:
+        with open(CANONICAL_REQUEST, "rb") as handle:
+            request_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    except OSError as error:
+        raise ReceiptError(f"cannot hash canonical request {CANONICAL_REQUEST}: {error}") from error
+    require(env.get("request_sha256") == request_sha256,
+            f"canonical request digest drift in {env_path}")
     require(env.get("CAMELID_GEMMA4_KV_INIT") == "192", f"KV_INIT drift in {env_path}")
     require(env.get("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER") ==
             "60,64,45,43,40,41,44,42,47,46,40,41,44,46,42,50,40,39,46,47,41,46,45,43,46,56,59,56,58,51",

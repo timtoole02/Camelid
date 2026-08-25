@@ -129,6 +129,7 @@ PROFILE_FILE = Path(__file__).resolve().parent / "env" / PROFILE_NAME
 CAP16_PROFILE_NAME = "H69-live-hidden-sequential-fast-predict-dual-reader-kv192-cap16"
 CAP16_PROFILE_FILE = Path(__file__).resolve().parent / "env" / CAP16_PROFILE_NAME
 STAGE_CAP16_SELECTOR = "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16"
+REQUEST_FILE = Path(__file__).resolve().parent / "request-48-plain.json"
 EXPECTED_TOKEN_FILE = (
     Path(__file__).resolve().parent.parent
     / "hybrid-hot48-runner"
@@ -141,6 +142,7 @@ COMMON_ENV_METADATA = {
     "TMPDIR",
     "binary",
     "cache_mib",
+    "request",
     "expected_token_ids_sha256",
 }
 PROVENANCE_ENV_METADATA = {
@@ -151,6 +153,7 @@ PROVENANCE_ENV_METADATA = {
     "binary_size",
     "binary_version",
     "runner_sha256",
+    "request_sha256",
     "manual_safety_sampler_sha256",
 }
 
@@ -670,8 +673,8 @@ def parse_env_manifest(path: Path) -> dict[str, str]:
     return values
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(_read_text(path, "expected token fixture").encode("utf-8")).hexdigest()
+def _sha256(path: Path, label: str) -> str:
+    return hashlib.sha256(_read_text(path, label).encode("utf-8")).hexdigest()
 
 
 def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
@@ -713,7 +716,9 @@ def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "TMPDIR": "/tmp",
         "cache_mib": "0",
-        "expected_token_ids_sha256": _sha256(EXPECTED_TOKEN_FILE),
+        "request": str(REQUEST_FILE),
+        "request_sha256": _sha256(REQUEST_FILE, "canonical request fixture"),
+        "expected_token_ids_sha256": _sha256(EXPECTED_TOKEN_FILE, "expected token fixture"),
     }
     for key, expected_value in exact_metadata.items():
         if observed[key] != expected_value:
@@ -732,6 +737,7 @@ def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
     for key in (
         "binary_sha256",
         "runner_sha256",
+        "request_sha256",
         "manual_safety_sampler_sha256",
     ):
         if SHA256_RE.fullmatch(observed[key]) is None:
