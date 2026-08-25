@@ -221,7 +221,7 @@ def stage_line(round_seq: int, start_pos: int, k_tokens: int, stage_cap: int = 8
 
 
 def prompt_ranked_handoff_line(
-    *, effective: bool = True, schema: str = "1"
+    *, effective: bool = True, schema: str = "1", startup_over_capacity: bool = False
 ) -> str:
     capacities = [
         int(value)
@@ -232,11 +232,23 @@ def prompt_ranked_handoff_line(
     selected_capacities = (
         capacities if effective else [capacity - 1 for capacity in capacities]
     )
-    masks = "/".join(
+    if startup_over_capacity:
+        assert not effective
+        selected_capacities[0] = capacities[0] + 1
+    selected_masks = "/".join(
         f"L{layer}:{((1 << capacity) - 1):032x}"
         for layer, capacity in enumerate(selected_capacities)
     )
+    resident_capacities = [
+        min(selected, capacity)
+        for selected, capacity in zip(selected_capacities, capacities)
+    ]
+    resident_masks = "/".join(
+        f"L{layer}:{((1 << capacity) - 1):032x}"
+        for layer, capacity in enumerate(resident_capacities)
+    )
     selected_records = sum(selected_capacities)
+    occupied_records = sum(resident_capacities)
     corrected_refusal = schema == "2" and not effective
     fields = {
         "schema": schema,
@@ -258,9 +270,9 @@ def prompt_ranked_handoff_line(
         "layers": "30",
         "selected_records": str(selected_records),
         "capacity_total": "1408",
-        "occupied_total": str(selected_records),
-        "selected_masks": masks,
-        "resident_masks": masks,
+        "occupied_total": str(occupied_records),
+        "selected_masks": selected_masks,
+        "resident_masks": resident_masks,
         "output_mutation": "0",
         "io_mutation": "1",
         "slot_policy_mutation": "1",
@@ -522,7 +534,9 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
             write_manifest(run_dir / "env.txt", values)
             original = (run_dir / "server.log").read_text(encoding="utf-8")
             (run_dir / "server.log").write_text(
-                prompt_ranked_handoff_line(effective=False)
+                prompt_ranked_handoff_line(
+                    effective=False, startup_over_capacity=True
+                )
                 + "\nCamelid is ready\n"
                 + prompt_ranked_handoff_line()
                 + "\n"

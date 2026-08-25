@@ -396,7 +396,7 @@ def validate_prompt_ranked_handoff(
         selected_records = _parse_uint(
             startup["selected_records"],
             "prompt-ranked startup selected_records",
-            maximum=1_408,
+            maximum=30 * 128,
         )
         occupied_total = _parse_uint(
             startup["occupied_total"],
@@ -410,16 +410,17 @@ def validate_prompt_ranked_handoff(
         for layer, (selected_mask, resident_mask, capacity) in enumerate(
             zip(startup_selected, startup_resident, capacities)
         ):
-            if popcount(selected_mask) > capacity or popcount(resident_mask) > capacity:
+            if popcount(resident_mask) > capacity:
                 raise ReceiptError(
-                    f"prompt-ranked startup L{layer} exceeds fixed capacity"
+                    f"prompt-ranked startup L{layer} residency exceeds fixed capacity"
                 )
             if resident_mask & ~selected_mask:
                 raise ReceiptError(
                     f"prompt-ranked startup L{layer} installed an unselected identity"
                 )
         if (
-            selected_records == 1_408
+            startup["admitted"] == "1"
+            and selected_records == 1_408
             and occupied_total == 1_408
             and startup_selected == startup_resident
         ):
