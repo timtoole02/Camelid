@@ -2026,6 +2026,10 @@ struct LoadOnlyTargetLedger {
     common_kv_capacity_positions: u64,
     common_kv_bytes: u64,
     common_kv_explicitly_touched_bytes: u64,
+    #[serde(default)]
+    common_q8_kv_mirror_bytes: u64,
+    #[serde(default)]
+    common_q8_kv_mirror_explicitly_touched_bytes: u64,
     verifier_scratch_capacity_bytes: u64,
     verifier_scratch_explicitly_touched_bytes: u64,
     common_non_kv_scratch_capacity_bytes: u64,
@@ -2116,6 +2120,9 @@ impl From<camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger> for LoadOnly
             common_kv_capacity_positions: value.common_kv_capacity_positions,
             common_kv_bytes: value.common_kv_bytes,
             common_kv_explicitly_touched_bytes: value.common_kv_explicitly_touched_bytes,
+            common_q8_kv_mirror_bytes: value.common_q8_kv_mirror_bytes,
+            common_q8_kv_mirror_explicitly_touched_bytes: value
+                .common_q8_kv_mirror_explicitly_touched_bytes,
             verifier_scratch_capacity_bytes: value.verifier_scratch_capacity_bytes,
             verifier_scratch_explicitly_touched_bytes: value
                 .verifier_scratch_explicitly_touched_bytes,
@@ -2345,11 +2352,21 @@ fn load_only_target_phase_violation(
             && !ledger.common_wire_q4_source_uncached_reads
             && !ledger.common_wire_q4_source_readahead_disabled
     };
+    let common_q8_mirror_ready = || {
+        ledger.common_q8_kv_mirror_bytes > 0
+            && ledger.common_q8_kv_mirror_explicitly_touched_bytes
+                <= ledger.common_q8_kv_mirror_bytes
+    };
+    let common_q8_mirror_absent = || {
+        ledger.common_q8_kv_mirror_bytes == 0
+            && ledger.common_q8_kv_mirror_explicitly_touched_bytes == 0
+    };
     let common_scratch_ready = || {
         ledger.common_kv_scratch_active
             && ledger.common_kv_capacity_positions > 0
             && ledger.common_kv_bytes > 0
             && ledger.common_kv_explicitly_touched_bytes <= ledger.common_kv_bytes
+            && (common_q8_mirror_ready() || common_q8_mirror_absent())
             && ledger.verifier_scratch_capacity_bytes > 0
             && ledger.verifier_scratch_explicitly_touched_bytes
                 <= ledger.verifier_scratch_capacity_bytes
@@ -2379,6 +2396,7 @@ fn load_only_target_phase_violation(
             && ledger.common_kv_capacity_positions == 0
             && ledger.common_kv_bytes == 0
             && ledger.common_kv_explicitly_touched_bytes == 0
+            && common_q8_mirror_absent()
             && ledger.verifier_scratch_capacity_bytes == 0
             && ledger.verifier_scratch_explicitly_touched_bytes == 0
             && ledger.common_non_kv_scratch_capacity_bytes == 0

@@ -134,6 +134,15 @@ pub(crate) struct MetalLinearKernel {
     attention_decode_scores_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_softmax_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_context_batch_k_pipeline: Option<ComputePipelineState>,
+    /// Default-off Gemma 4 qualification twins. Unlike the generic Q8 decode
+    /// kernel these preserve the established split-three score/softmax/context
+    /// topology and accept the production 256/512-wide heads and GQA groups
+    /// 2/8. Optional pipelines keep the ordinary f32 engine available if a
+    /// deployment cannot compile the experiment.
+    gemma4_attention_decode_scores_q8_pipeline: Option<ComputePipelineState>,
+    gemma4_attention_decode_context_q8_pipeline: Option<ComputePipelineState>,
+    gemma4_attention_decode_scores_batch_k_q8_pipeline: Option<ComputePipelineState>,
+    gemma4_attention_decode_context_batch_k_q8_pipeline: Option<ComputePipelineState>,
     nvfp4_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
     #[allow(dead_code)] // batched-column verify GEMV; exercised by the C0 unit test,
@@ -7227,6 +7236,196 @@ kernel void attention_decode_context_batch_k_f32(
     }
 }
 
+// Q8_0 mirror twins of the split-three score/context phases above. The cache
+// layout is [kv_head][position][block], with each 32-value block encoded as a
+// little-endian f16 scale followed by 32 signed bytes. All strides and the base
+// offset are therefore BYTES. The softmax phase is deliberately shared with
+// f32: scores, denominator, dispatch geometry, causal/sliding bounds, and the
+// ascending accumulation loops remain unchanged. These kernels intentionally
+// impose no <=128 head-width or <=4 GQA-group restriction; Gemma 4 uses
+// (head_dim, group) = (256, 2) locally and (512, 8) globally.
+kernel void gemma4_attention_decode_scores_q8(
+    device const float* query [[buffer(0)]],
+    device const uchar* keys [[buffer(1)]],
+    device float* scores [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_blocks [[buffer(14)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint head = tg.x;
+    if (head >= n_heads) return;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
+    const uint score_base = head * position_count;
+    const uint stride = 32u * n_blocks;
+
+    for (uint p = lane + tg.y * 32u; p < position_count; p += stride) {
+        device const uchar* row = keys + kv_base + p * position_stride;
+        float s = 0.0f;
+        // Keep the f32 twin's single ascending-d reduction loop. Deriving the
+        // wire block at each d is intentional qualification conservatism: it
+        // prevents a nested-block rewrite from changing compiler reduction
+        // topology while Q8 quality is being attributed.
+        float block_scale = 0.0f;
+        for (uint d_idx = 0; d_idx < head_dim; ++d_idx) {
+            const uint block = d_idx / 32u;
+            const uint in_block = d_idx - block * 32u;
+            device const uchar* wire = row + block * 34u;
+            if (in_block == 0u) {
+                block_scale = float(*reinterpret_cast<device const half*>(wire));
+            }
+            const float kval = block_scale
+                * float(reinterpret_cast<device const char*>(wire + 2u)[in_block]);
+            s += query[q_base + d_idx] * kval;
+        }
+        scores[score_base + p] = s * scale;
+    }
+}
+
+kernel void gemma4_attention_decode_context_q8(
+    device const uchar* values [[buffer(2)]],
+    device const float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const float* denom_in [[buffer(13)]],
+    constant uint& n_blocks [[buffer(14)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint head = tg.x;
+    if (head >= n_heads) return;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
+    const uint score_base = head * position_count;
+    const float inv = 1.0f / denom_in[head];
+    const uint stride = 32u * n_blocks;
+
+    for (uint dim = lane + tg.y * 32u; dim < head_dim; dim += stride) {
+        const uint block = dim / 32u;
+        const uint in_block = dim - block * 32u;
+        float acc = 0.0f;
+        for (uint p = 0; p < position_count; ++p) {
+            device const uchar* wire =
+                values + kv_base + p * position_stride + block * 34u;
+            const float d = float(*reinterpret_cast<device const half*>(wire));
+            const float v = d * float(reinterpret_cast<device const char*>(wire + 2u)[in_block]);
+            acc += scores[score_base + p] * inv * v;
+        }
+        output[q_base + dim] = acc;
+    }
+}
+
+kernel void gemma4_attention_decode_scores_batch_k_q8(
+    device const float* query [[buffer(0)]],
+    device const uchar* keys [[buffer(1)]],
+    device float* scores [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& base_position [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_blocks [[buffer(14)]],
+    constant uint& sliding_window [[buffer(15)]],
+    constant uint& max_positions [[buffer(16)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint head = tg.x;
+    const uint cand = tg.z;
+    if (head >= n_heads) return;
+    const uint q_base = (cand * n_heads + head) * head_dim;
+    const uint score_base = (cand * n_heads + head) * max_positions;
+    const uint filled = base_position + cand + 1u;
+    const uint win_start =
+        (sliding_window > 0u && filled > sliding_window) ? (filled - sliding_window) : 0u;
+    const uint position_count = filled - win_start;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride
+        + win_start * position_stride;
+    const uint stride = 32u * n_blocks;
+
+    for (uint p = lane + tg.y * 32u; p < position_count; p += stride) {
+        device const uchar* row = keys + kv_base + p * position_stride;
+        float s = 0.0f;
+        float block_scale = 0.0f;
+        for (uint d_idx = 0; d_idx < head_dim; ++d_idx) {
+            const uint block = d_idx / 32u;
+            const uint in_block = d_idx - block * 32u;
+            device const uchar* wire = row + block * 34u;
+            if (in_block == 0u) {
+                block_scale = float(*reinterpret_cast<device const half*>(wire));
+            }
+            const float kval = block_scale
+                * float(reinterpret_cast<device const char*>(wire + 2u)[in_block]);
+            s += query[q_base + d_idx] * kval;
+        }
+        scores[score_base + p] = s * scale;
+    }
+}
+
+kernel void gemma4_attention_decode_context_batch_k_q8(
+    device const uchar* values [[buffer(2)]],
+    device const float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& base_position [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const float* denom_in [[buffer(13)]],
+    constant uint& n_blocks [[buffer(14)]],
+    constant uint& sliding_window [[buffer(15)]],
+    constant uint& max_positions [[buffer(16)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint head = tg.x;
+    const uint cand = tg.z;
+    if (head >= n_heads) return;
+    const uint q_base = (cand * n_heads + head) * head_dim;
+    const uint score_base = (cand * n_heads + head) * max_positions;
+    const uint filled = base_position + cand + 1u;
+    const uint win_start =
+        (sliding_window > 0u && filled > sliding_window) ? (filled - sliding_window) : 0u;
+    const uint position_count = filled - win_start;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride
+        + win_start * position_stride;
+    const float inv = 1.0f / denom_in[cand * n_heads + head];
+    const uint stride = 32u * n_blocks;
+
+    for (uint dim = lane + tg.y * 32u; dim < head_dim; dim += stride) {
+        const uint block = dim / 32u;
+        const uint in_block = dim - block * 32u;
+        float acc = 0.0f;
+        for (uint p = 0; p < position_count; ++p) {
+            device const uchar* wire =
+                values + kv_base + p * position_stride + block * 34u;
+            const float d = float(*reinterpret_cast<device const half*>(wire));
+            const float v = d * float(reinterpret_cast<device const char*>(wire + 2u)[in_block]);
+            acc += scores[score_base + p] * inv * v;
+        }
+        output[q_base + dim] = acc;
+    }
+}
+
 // f16-KV variant of attention_decode_f32: identical math, K/V read as half and converted
 // per element (the scores/output stay f32).
 kernel void attention_decode_kv16(
@@ -8669,7 +8868,6 @@ kernel void kv_scatter_batch_kvq8(
         cache_v[dst + 2 + i] = uchar(char(clamp(int(round(src_v[src + i] * vinv)), -127, 127)));
     }
 }
-
 
 // Fused per-layer RoPE + KV scatter + Q half-convert for the attention-as-matmul
 // prefill path (requires full rotary coverage: half_rope * 2 == head_dim). One
@@ -11926,6 +12124,22 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .get_function("attention_decode_context_batch_k_f32", None)
                 .ok()
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
+            let gemma4_attention_decode_scores_q8_pipeline = elementwise_library
+                .get_function("gemma4_attention_decode_scores_q8", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
+            let gemma4_attention_decode_context_q8_pipeline = elementwise_library
+                .get_function("gemma4_attention_decode_context_q8", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
+            let gemma4_attention_decode_scores_batch_k_q8_pipeline = elementwise_library
+                .get_function("gemma4_attention_decode_scores_batch_k_q8", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
+            let gemma4_attention_decode_context_batch_k_q8_pipeline = elementwise_library
+                .get_function("gemma4_attention_decode_context_batch_k_q8", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let nvfp4_block_ksplit_f32y_wire_function = library
                 .get_function("nvfp4_block_linear_row_ksplit_f32y_wire", None)
                 .ok()?;
@@ -12267,6 +12481,10 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_scores_batch_k_pipeline,
                 attention_decode_softmax_batch_k_pipeline,
                 attention_decode_context_batch_k_pipeline,
+                gemma4_attention_decode_scores_q8_pipeline,
+                gemma4_attention_decode_context_q8_pipeline,
+                gemma4_attention_decode_scores_batch_k_q8_pipeline,
+                gemma4_attention_decode_context_batch_k_q8_pipeline,
                 nvfp4_block_ksplit_f32y_wire_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline,
@@ -24089,6 +24307,105 @@ const GEMMA4_GHOST_26B_GLOBAL_KV_HEADS: usize = 2;
 #[cfg(target_os = "macos")]
 const GEMMA4_GHOST_26B_GLOBAL_LAYERS: [usize; 5] = [5, 11, 17, 23, 29];
 
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_Q8_MIRROR_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_Q8_MIRROR";
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_Q8_READ_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_Q8_READ";
+
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_ghost_q8_qualification_from_env() -> Result<Gemma4GhostQ8Qualification, String>
+{
+    let mirror = gemma4_ghost_q8_env_value(GEMMA4_GHOST_Q8_MIRROR_ENV)?;
+    let read = gemma4_ghost_q8_env_value(GEMMA4_GHOST_Q8_READ_ENV)?;
+    gemma4_ghost_q8_qualification_from(mirror.as_deref(), read.as_deref())
+}
+
+/// Qualification mode for Gemma target KV. F32 remains authoritative in every
+/// mode; `Mirror` prices only Q8 allocation/write overhead, while `Read` sends
+/// target attention through the mirror. MTP always borrows the f32 buffers.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gemma4GhostQ8Qualification {
+    Off,
+    Mirror,
+    Read,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4GhostQ8Qualification {
+    pub(crate) fn mirror(self) -> bool {
+        self != Self::Off
+    }
+
+    pub(crate) fn read(self) -> bool {
+        self == Self::Read
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Mirror => "mirror",
+            Self::Read => "read",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_ghost_q8_qualification_from(
+    mirror: Option<&str>,
+    read: Option<&str>,
+) -> Result<Gemma4GhostQ8Qualification, String> {
+    let parse = |name: &str, value: Option<&str>| -> Result<bool, String> {
+        match value {
+            None | Some("0") => Ok(false),
+            Some("1") => Ok(true),
+            Some(other) => Err(format!("invalid {name}={other:?}; expected literal 0 or 1")),
+        }
+    };
+    let mirror = parse(GEMMA4_GHOST_Q8_MIRROR_ENV, mirror)?;
+    let read = parse(GEMMA4_GHOST_Q8_READ_ENV, read)?;
+    match (mirror, read) {
+        (false, false) => Ok(Gemma4GhostQ8Qualification::Off),
+        (true, false) => Ok(Gemma4GhostQ8Qualification::Mirror),
+        (true, true) => Ok(Gemma4GhostQ8Qualification::Read),
+        (false, true) => Err(format!(
+            "{GEMMA4_GHOST_Q8_READ_ENV}=1 requires {GEMMA4_GHOST_Q8_MIRROR_ENV}=1"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_ghost_q8_env_value(name: &str) -> Result<Option<String>, String> {
+    match std::env::var_os(name) {
+        None => Ok(None),
+        Some(value) => value
+            .into_string()
+            .map(Some)
+            .map_err(|_| format!("invalid {name}: value is not UTF-8; expected literal 0 or 1")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_ghost_q8_row_bytes(head_dim: usize) -> Option<usize> {
+    head_dim.is_multiple_of(32).then_some(head_dim / 32 * 34)
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_ghost_q8_capacity_bytes(
+    layers: &[Gemma4ResidentLayer],
+    capacity: usize,
+) -> Option<usize> {
+    layers.iter().try_fold(0usize, |total, layer| {
+        let row_bytes = gemma4_ghost_q8_row_bytes(layer.head_dim)?;
+        total.checked_add(
+            2usize
+                .checked_mul(layer.n_kv_heads)?
+                .checked_mul(capacity)?
+                .checked_mul(row_bytes)?,
+        )
+    })
+}
+
 // Official Gemma 4 MTP assistants borrow the final target layer of each
 // attention flavor: layer 28 for sliding attention and layer 29 for full
 // attention. Keep this mapping adjacent to the target geometry contract so a
@@ -24183,6 +24500,10 @@ pub(crate) struct Gemma4GhostCommonGeometry {
 pub(crate) struct Gemma4GhostCommonAllocationLedger {
     pub(crate) kv_capacity_bytes: u64,
     pub(crate) kv_explicitly_touched_bytes: u64,
+    /// Additional default-off Q8 mirror capacity. The authoritative f32
+    /// capacity above is retained in both qualification modes.
+    pub(crate) q8_kv_mirror_capacity_bytes: u64,
+    pub(crate) q8_kv_mirror_explicitly_touched_bytes: u64,
     pub(crate) verifier_scratch_capacity_bytes: u64,
     pub(crate) verifier_scratch_explicitly_touched_bytes: u64,
     pub(crate) non_kv_scratch_capacity_bytes: u64,
@@ -24726,6 +25047,9 @@ pub(crate) struct Gemma4GhostCommonMetal {
     is_sliding: Vec<bool>,
     cache_k: Vec<Buffer>,
     cache_v: Vec<Buffer>,
+    q8_cache_k: Option<Vec<Buffer>>,
+    q8_cache_v: Option<Vec<Buffer>>,
+    q8_qualification: Gemma4GhostQ8Qualification,
     hidden: Buffer,
     attention_output: Buffer,
     shared_output: Buffer,
@@ -24912,6 +25236,14 @@ pub struct ChainedRoundHostLedger {
     pub kv_capacity: u32,
     pub kv_bytes: u64,
     pub kv_filled: u32,
+    /// Q8 qualification receipt. These fields distinguish write-overhead
+    /// (`mirror=1, read=0`) from the bandwidth experiment (`read=1`).
+    pub q8_kv_mirror: bool,
+    pub q8_kv_read: bool,
+    pub q8_kv_capacity_bytes: u64,
+    pub q8_kv_write_bytes: u64,
+    pub q8_kv_logical_read_bytes: u64,
+    pub q8_kv_encode_ms: f64,
     pub expert_waves_sum: u32,
     pub expert_waves_max: u32,
     pub selected_experts_dropped: u32,
@@ -27152,12 +27484,31 @@ impl Gemma4GhostCommonMetal {
         post_norm_1: Vec<Vec<f32>>,
         max_positions: usize,
     ) -> Option<Self> {
+        let q8_qualification = match gemma4_ghost_q8_qualification_from_env() {
+            Ok(mode) => mode,
+            Err(error) => {
+                eprintln!(
+                    "[gemma4 q8 qualification] requested=invalid effective=refused reason={error}"
+                );
+                return None;
+            }
+        };
+        Self::new_26b_with_q8_qualification(layers, post_norm_1, max_positions, q8_qualification)
+    }
+
+    pub(crate) fn new_26b_with_q8_qualification(
+        layers: Vec<Gemma4ResidentLayer>,
+        post_norm_1: Vec<Vec<f32>>,
+        max_positions: usize,
+        q8_qualification: Gemma4GhostQ8Qualification,
+    ) -> Option<Self> {
         Self::new_inner(
             layers,
             post_norm_1,
             max_positions,
             GEMMA4_GHOST_26B_SLIDING_WINDOW,
             true,
+            q8_qualification,
         )
     }
 
@@ -27168,7 +27519,14 @@ impl Gemma4GhostCommonMetal {
         max_positions: usize,
         sliding_window: usize,
     ) -> Option<Self> {
-        Self::new_inner(layers, post_norm_1, max_positions, sliding_window, false)
+        Self::new_inner(
+            layers,
+            post_norm_1,
+            max_positions,
+            sliding_window,
+            false,
+            Gemma4GhostQ8Qualification::Off,
+        )
     }
 
     fn new_inner(
@@ -27177,6 +27535,7 @@ impl Gemma4GhostCommonMetal {
         max_positions: usize,
         sliding_window: usize,
         strict_26b: bool,
+        q8_qualification: Gemma4GhostQ8Qualification,
     ) -> Option<Self> {
         if layers.is_empty()
             || layers.len() != post_norm_1.len()
@@ -27319,6 +27678,29 @@ impl Gemma4GhostCommonMetal {
         }
 
         let kernel = metal_linear_kernel()?;
+        if q8_qualification.mirror() && !strict_26b {
+            eprintln!(
+                "[gemma4 q8 qualification] requested={} effective=refused reason=exact-26b-only",
+                q8_qualification.name()
+            );
+            return None;
+        }
+        let read_pipelines_ready = kernel.gemma4_attention_decode_scores_q8_pipeline.is_some()
+            && kernel.gemma4_attention_decode_context_q8_pipeline.is_some()
+            && kernel
+                .gemma4_attention_decode_scores_batch_k_q8_pipeline
+                .is_some()
+            && kernel
+                .gemma4_attention_decode_context_batch_k_q8_pipeline
+                .is_some()
+            && kernel.attention_decode_softmax_batch_k_pipeline.is_some();
+        if q8_qualification.read() && !read_pipelines_ready {
+            eprintln!(
+                "[gemma4 q8 qualification] requested={} effective=refused reason=required-metal-pipeline-unavailable",
+                q8_qualification.name()
+            );
+            return None;
+        }
         let buffer = |bytes: usize| {
             kernel
                 .device
@@ -27378,6 +27760,36 @@ impl Gemma4GhostCommonMetal {
                 .checked_mul(layer.head_dim)?;
             cache_k.push(f32_buffer(elements)?);
             cache_v.push(f32_buffer(elements)?);
+        }
+        let (q8_cache_k, q8_cache_v) = if q8_qualification.mirror() {
+            let mut keys = Vec::with_capacity(layers.len());
+            let mut values = Vec::with_capacity(layers.len());
+            for layer in &layers {
+                let row_bytes = gemma4_ghost_q8_row_bytes(layer.head_dim)?;
+                let bytes = layer
+                    .n_kv_heads
+                    .checked_mul(kv_capacity)?
+                    .checked_mul(row_bytes)?;
+                keys.push(buffer(bytes));
+                values.push(buffer(bytes));
+            }
+            (Some(keys), Some(values))
+        } else {
+            (None, None)
+        };
+        if q8_qualification.mirror() {
+            static Q8_RECEIPT_PRINTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !Q8_RECEIPT_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let q8_bytes = gemma4_ghost_q8_capacity_bytes(&layers, kv_capacity)?;
+                eprintln!(
+                    "[gemma4 q8 qualification] requested_mirror=1 requested_read={} effective={} primary=f32 mtp=f32 capacity={} mirror_format=q8_0 mirror_bytes={} read_kernels=split3",
+                    u8::from(q8_qualification.read()),
+                    q8_qualification.name(),
+                    kv_capacity,
+                    q8_bytes,
+                );
+            }
         }
 
         let attention = Gemma4GhostAttentionScratch {
@@ -27467,6 +27879,9 @@ impl Gemma4GhostCommonMetal {
             is_sliding,
             cache_k,
             cache_v,
+            q8_cache_k,
+            q8_cache_v,
+            q8_qualification,
             hidden: f32_buffer(hidden)?,
             attention_output: f32_buffer(hidden)?,
             shared_output: f32_buffer(hidden)?,
@@ -27509,6 +27924,13 @@ impl Gemma4GhostCommonMetal {
             .cache_k
             .iter()
             .chain(&self.cache_v)
+            .map(|buffer| buffer.length())
+            .sum();
+        let q8_kv_mirror_capacity_bytes = self
+            .q8_cache_k
+            .iter()
+            .flat_map(|buffers| buffers.iter())
+            .chain(self.q8_cache_v.iter().flat_map(|buffers| buffers.iter()))
             .map(|buffer| buffer.length())
             .sum();
         let verifier_scratch_capacity_bytes = self.resident_scratch.allocation_capacity_bytes();
@@ -27579,6 +28001,8 @@ impl Gemma4GhostCommonMetal {
             kv_capacity_bytes,
             // Newly allocated K/V buffers are not initialized by this load.
             kv_explicitly_touched_bytes: 0,
+            q8_kv_mirror_capacity_bytes,
+            q8_kv_mirror_explicitly_touched_bytes: 0,
             verifier_scratch_capacity_bytes,
             verifier_scratch_explicitly_touched_bytes,
             non_kv_scratch_capacity_bytes,
@@ -27625,6 +28049,14 @@ impl Gemma4GhostCommonMetal {
             .min(self.kv_capacity);
         let mut new_k = Vec::with_capacity(self.layers.len());
         let mut new_v = Vec::with_capacity(self.layers.len());
+        let mut new_q8_k = self
+            .q8_qualification
+            .mirror()
+            .then(|| Vec::with_capacity(self.layers.len()));
+        let mut new_q8_v = self
+            .q8_qualification
+            .mirror()
+            .then(|| Vec::with_capacity(self.layers.len()));
         for layer in &self.layers {
             let elements = match layer
                 .n_kv_heads
@@ -27645,6 +28077,28 @@ impl Gemma4GhostCommonMetal {
                     .device
                     .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared),
             );
+            if let (Some(keys), Some(values)) = (new_q8_k.as_mut(), new_q8_v.as_mut()) {
+                let Some(row_bytes) = gemma4_ghost_q8_row_bytes(layer.head_dim) else {
+                    return false;
+                };
+                let Some(bytes) = layer
+                    .n_kv_heads
+                    .checked_mul(new_cap)
+                    .and_then(|value| value.checked_mul(row_bytes))
+                else {
+                    return false;
+                };
+                keys.push(
+                    kernel
+                        .device
+                        .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared),
+                );
+                values.push(
+                    kernel
+                        .device
+                        .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared),
+                );
+            }
         }
         if filled > 0 {
             let cb = kernel.queue.new_command_buffer();
@@ -27670,6 +28124,35 @@ impl Gemma4GhostCommonMetal {
                         dst,
                         run,
                     );
+                    if let (Some(old_keys), Some(old_values), Some(new_keys), Some(new_values)) = (
+                        self.q8_cache_k.as_ref(),
+                        self.q8_cache_v.as_ref(),
+                        new_q8_k.as_ref(),
+                        new_q8_v.as_ref(),
+                    ) {
+                        let Some(q8_row_bytes) = gemma4_ghost_q8_row_bytes(layer.head_dim) else {
+                            return false;
+                        };
+                        let q8_run = filled as u64 * q8_row_bytes as u64;
+                        let q8_src = (h * old_cap) as u64 * q8_row_bytes as u64;
+                        let q8_dst = (h * new_cap) as u64 * q8_row_bytes as u64;
+                        blit.copy_from_buffer(
+                            &old_keys[layer_idx],
+                            q8_src,
+                            &new_keys[layer_idx],
+                            q8_dst,
+                            q8_run,
+                        );
+                        blit.copy_from_buffer(
+                            &old_values[layer_idx],
+                            q8_src,
+                            &new_values[layer_idx],
+                            q8_dst,
+                            q8_run,
+                        );
+                    } else if self.q8_qualification.mirror() {
+                        return false;
+                    }
                 }
             }
             blit.end_encoding();
@@ -27681,6 +28164,8 @@ impl Gemma4GhostCommonMetal {
         }
         self.cache_k = new_k;
         self.cache_v = new_v;
+        self.q8_cache_k = new_q8_k;
+        self.q8_cache_v = new_q8_v;
         self.kv_capacity = new_cap;
         let mut kv_elements = 0usize;
         for layer in &self.layers {
@@ -27690,10 +28175,13 @@ impl Gemma4GhostCommonMetal {
         self.geometry.kv_elements = kv_elements;
         self.geometry.kv_bytes = kv_elements * 4;
         eprintln!(
-            "[gemma4-ghost-common] f32 KV grown to {} positions ({:.2} GiB allocated, cap {})",
+            "[gemma4-ghost-common] f32 KV grown to {} positions ({:.2} GiB allocated, cap {}), q8_mirror={} q8_mirror_mib={:.2}",
             new_cap,
             self.geometry.kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            self.max_positions
+            self.max_positions,
+            u8::from(self.q8_qualification.mirror()),
+            gemma4_ghost_q8_capacity_bytes(&self.layers, new_cap).unwrap_or(0) as f64
+                / (1024.0 * 1024.0),
         );
         true
     }
@@ -27911,12 +28399,6 @@ impl Gemma4GhostCommonMetal {
                 self.max_positions
             )));
         }
-        if !self.ensure_kv_capacity(positions) {
-            return Err(fail(format!(
-                "could not grow f32 KV to {positions} positions (cap {})",
-                self.max_positions
-            )));
-        }
         if keys.len() != self.layers.len() || values.len() != self.layers.len() {
             return Err(fail(format!(
                 "KV layer count mismatch: keys={}, values={}, Metal={}",
@@ -27951,6 +28433,165 @@ impl Gemma4GhostCommonMetal {
                     return Err(fail(format!(
                         "layer {layer_idx} position {position} contains non-finite KV data"
                     )));
+                }
+            }
+        }
+
+        // Build compact replacement mirror rows with the production GPU
+        // scatter before touching either retained cache. Processing one layer
+        // at a time keeps the only f32 staging allocation bounded to that
+        // layer's live rows. Every fallible quantization command completes
+        // before cache growth, f32 publication, or the logical watermark, so a
+        // refused import remains atomic and prefix/appended rows cannot acquire
+        // different CPU-vs-GPU quantization bytes.
+        let q8_import = if self.q8_qualification.mirror() {
+            let Some(kernel) = metal_linear_kernel() else {
+                return Err(fail("Metal kernel unavailable for Q8 import".to_owned()));
+            };
+            let mut mirror_keys = Vec::with_capacity(self.layers.len());
+            let mut mirror_values = Vec::with_capacity(self.layers.len());
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let row_bytes = gemma4_ghost_q8_row_bytes(layer.head_dim)
+                    .ok_or_else(|| fail(format!("layer {layer_idx} Q8 row geometry refused")))?;
+                let bytes = layer
+                    .n_kv_heads
+                    .checked_mul(positions)
+                    .and_then(|value| value.checked_mul(row_bytes))
+                    .ok_or_else(|| fail(format!("layer {layer_idx} Q8 import size overflow")))?;
+                let key_mirror = kernel
+                    .device
+                    .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+                let value_mirror = kernel
+                    .device
+                    .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+                let kv_dim = layer.n_kv_heads * layer.head_dim;
+                let live_elements = positions
+                    .checked_mul(kv_dim)
+                    .ok_or_else(|| fail(format!("layer {layer_idx} Q8 staging size overflow")))?;
+                let key_staging = kernel.device.new_buffer(
+                    (live_elements * 4).max(4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let value_staging = kernel.device.new_buffer(
+                    (live_elements * 4).max(4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                for position in 0..positions {
+                    // SAFETY: row widths and staging lengths were validated.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            keys[layer_idx][position].as_ptr(),
+                            key_staging.contents().cast::<f32>().add(position * kv_dim),
+                            kv_dim,
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            values[layer_idx][position].as_ptr(),
+                            value_staging
+                                .contents()
+                                .cast::<f32>()
+                                .add(position * kv_dim),
+                            kv_dim,
+                        );
+                    }
+                }
+                let command_buffer = kernel.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                if !encode_gemma4_q8_mirror_scatter_batch(
+                    encoder,
+                    kernel,
+                    &key_staging,
+                    &value_staging,
+                    &key_mirror,
+                    &value_mirror,
+                    layer.head_dim,
+                    layer.n_kv_heads,
+                    positions,
+                    0,
+                    positions,
+                ) {
+                    encoder.end_encoding();
+                    return Err(fail(format!("layer {layer_idx} Q8 import encode refused")));
+                }
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+                    return Err(fail(format!(
+                        "layer {layer_idx} Q8 import command failed: {}",
+                        command_buffer_error_details(command_buffer)
+                    )));
+                }
+                mirror_keys.push(key_mirror);
+                mirror_values.push(value_mirror);
+            }
+            Some((mirror_keys, mirror_values))
+        } else {
+            None
+        };
+
+        // Growth is itself transactional. Delay it until every input row and
+        // every fallible Q8 staging command has succeeded so malformed or
+        // unquantizable imports cannot change retained handles or capacity.
+        if !self.ensure_kv_capacity(positions) {
+            return Err(fail(format!(
+                "could not grow f32/Q8 KV to {positions} positions (max {})",
+                self.max_positions
+            )));
+        }
+
+        if let Some((compact_keys, compact_values)) = q8_import.as_ref() {
+            let (Some(mirror_keys), Some(mirror_values)) =
+                (self.q8_cache_k.as_ref(), self.q8_cache_v.as_ref())
+            else {
+                return Err(fail(
+                    "Q8 mirror allocation disappeared during import".to_owned(),
+                ));
+            };
+            if mirror_keys.len() != self.layers.len() || mirror_values.len() != self.layers.len() {
+                return Err(fail("Q8 mirror layer count is incomplete".to_owned()));
+            }
+            // Validate every destination before the first coherent-memory
+            // copy. Compact quantization command buffers are already complete
+            // under the runtime mutex, so CPU publication is infallible and
+            // avoids a partially failed blit corrupting the old logical cache.
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let row_bytes = gemma4_ghost_q8_row_bytes(layer.head_dim)
+                    .ok_or_else(|| fail(format!("layer {layer_idx} Q8 row geometry refused")))?;
+                let required = layer
+                    .n_kv_heads
+                    .checked_mul(self.kv_stride())
+                    .and_then(|value| value.checked_mul(row_bytes))
+                    .ok_or_else(|| fail(format!("layer {layer_idx} Q8 publish size overflow")))?;
+                if mirror_keys[layer_idx].length() < required as u64
+                    || mirror_values[layer_idx].length() < required as u64
+                {
+                    return Err(fail(format!(
+                        "layer {layer_idx} Q8 mirror capacity is shorter than {required} bytes"
+                    )));
+                }
+            }
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let row_bytes = gemma4_ghost_q8_row_bytes(layer.head_dim)
+                    .expect("Q8 publication geometry was validated");
+                let run = (positions * row_bytes) as u64;
+                for head in 0..layer.n_kv_heads {
+                    let src = head * positions * row_bytes;
+                    let dst = head * self.kv_stride() * row_bytes;
+                    // SAFETY: source/destination lengths and disjoint head
+                    // runs were checked above; StorageModeShared is coherent
+                    // after the completed quantization command.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            compact_keys[layer_idx].contents().cast::<u8>().add(src),
+                            mirror_keys[layer_idx].contents().cast::<u8>().add(dst),
+                            run as usize,
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            compact_values[layer_idx].contents().cast::<u8>().add(src),
+                            mirror_values[layer_idx].contents().cast::<u8>().add(dst),
+                            run as usize,
+                        );
+                    }
                 }
             }
         }
@@ -28373,26 +29014,82 @@ impl Gemma4GhostCommonMetal {
         encoder.set_buffer(10, Some(&a.kv16_write), 0);
         dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
 
+        if self.q8_qualification.mirror() {
+            let (Some(q8_keys), Some(q8_values)) =
+                (self.q8_cache_k.as_ref(), self.q8_cache_v.as_ref())
+            else {
+                encoder.end_encoding();
+                return None;
+            };
+            if !encode_gemma4_q8_mirror_scatter(
+                encoder,
+                kernel,
+                &a.key_normed,
+                &a.value_normed,
+                q8_keys.get(layer_idx)?,
+                q8_values.get(layer_idx)?,
+                layer.head_dim,
+                layer.n_kv_heads,
+                self.kv_stride(),
+                position,
+            ) {
+                encoder.end_encoding();
+                return None;
+            }
+            encoder.memory_barrier_with_resources(&[&q8_keys[layer_idx], &q8_values[layer_idx]]);
+        }
+
         // The exact 26B head widths (256/512) use the bit-identical split-three
         // f32 attention implementation. Its denominator and block scalars are
         // persistent here rather than borrowed from the global scratch pool.
-        encode_attention_split3(
-            encoder,
-            kernel,
-            &a.query_normed,
-            &self.cache_k[layer_idx],
-            &self.cache_v[layer_idx],
-            &a.scores,
-            &a.denom,
-            &a.context,
-            &a.attention_scalar,
-            &a.attention_blocks,
-            layer.n_heads,
-            layer.head_dim,
-            position_count,
-            0,
-            0,
-        );
+        let q8_read_ok = if self.q8_qualification.read() {
+            let (Some(q8_keys), Some(q8_values)) =
+                (self.q8_cache_k.as_ref(), self.q8_cache_v.as_ref())
+            else {
+                encoder.end_encoding();
+                return None;
+            };
+            encode_gemma4_attention_split3_q8(
+                encoder,
+                kernel,
+                &a.query_normed,
+                q8_keys.get(layer_idx)?,
+                q8_values.get(layer_idx)?,
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                self.kv_stride(),
+                0,
+                0,
+            )
+        } else {
+            encode_attention_split3(
+                encoder,
+                kernel,
+                &a.query_normed,
+                &self.cache_k[layer_idx],
+                &self.cache_v[layer_idx],
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                &a.attention_blocks,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                0,
+                0,
+            );
+            true
+        };
+        if !q8_read_ok {
+            encoder.end_encoding();
+            return None;
+        }
         encode_quantize(
             encoder,
             kernel,
@@ -28456,6 +29153,7 @@ impl Gemma4GhostCommonMetal {
             layer: layer_idx,
             position,
             dispatches: (if layer.v_w.is_some() { 17 } else { 16 })
+                + u32::from(self.q8_qualification.mirror())
                 + if include_router { 4 } else { 0 },
             streamed_weight_bytes: (streamed_weight_bytes + router_weight_bytes) as u64,
             readback_bytes: if include_router { (128 * 4) as u64 } else { 0 },
@@ -28688,23 +29386,69 @@ impl Gemma4GhostCommonMetal {
         encoder.set_buffer(10, Some(&a.kv16_write), 0);
         dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
 
-        encode_attention_split3(
-            encoder,
-            kernel,
-            &a.query_normed,
-            &self.cache_k[layer_idx],
-            &self.cache_v[layer_idx],
-            &a.scores,
-            &a.denom,
-            &a.context,
-            &a.attention_scalar,
-            &a.attention_blocks,
-            layer.n_heads,
-            layer.head_dim,
-            position_count,
-            0,
-            0,
-        );
+        if self.q8_qualification.mirror() {
+            let q8_keys = self.q8_cache_k.as_ref()?;
+            let q8_values = self.q8_cache_v.as_ref()?;
+            if !encode_gemma4_q8_mirror_scatter(
+                encoder,
+                kernel,
+                &a.key_normed,
+                &a.value_normed,
+                q8_keys.get(layer_idx)?,
+                q8_values.get(layer_idx)?,
+                layer.head_dim,
+                layer.n_kv_heads,
+                self.kv_stride(),
+                position,
+            ) {
+                return None;
+            }
+            encoder.memory_barrier_with_resources(&[&q8_keys[layer_idx], &q8_values[layer_idx]]);
+        }
+
+        let q8_read_ok = if self.q8_qualification.read() {
+            let q8_keys = self.q8_cache_k.as_ref()?;
+            let q8_values = self.q8_cache_v.as_ref()?;
+            encode_gemma4_attention_split3_q8(
+                encoder,
+                kernel,
+                &a.query_normed,
+                q8_keys.get(layer_idx)?,
+                q8_values.get(layer_idx)?,
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                self.kv_stride(),
+                0,
+                0,
+            )
+        } else {
+            encode_attention_split3(
+                encoder,
+                kernel,
+                &a.query_normed,
+                &self.cache_k[layer_idx],
+                &self.cache_v[layer_idx],
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                &a.attention_blocks,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                0,
+                0,
+            );
+            true
+        };
+        if !q8_read_ok {
+            return None;
+        }
         encode_quantize(
             encoder,
             kernel,
@@ -29708,6 +30452,40 @@ impl Gemma4GhostCommonMetal {
         ledger.kv_capacity = self.kv_capacity as u32;
         ledger.kv_bytes = self.geometry.kv_bytes as u64;
         ledger.kv_filled = (start_pos + k_tokens) as u32;
+        ledger.q8_kv_mirror = self.q8_qualification.mirror();
+        ledger.q8_kv_read = self.q8_qualification.read();
+        ledger.q8_kv_capacity_bytes = if self.q8_qualification.mirror() {
+            gemma4_ghost_q8_capacity_bytes(&self.layers, self.kv_stride()).unwrap_or(0) as u64
+        } else {
+            0
+        };
+        if self.q8_qualification.mirror() {
+            for layer in &self.layers {
+                let row_bytes = gemma4_ghost_q8_row_bytes(layer.head_dim).unwrap_or(0) as u64;
+                ledger.q8_kv_write_bytes = ledger.q8_kv_write_bytes.saturating_add(
+                    2u64.saturating_mul(layer.n_kv_heads as u64)
+                        .saturating_mul(k_tokens as u64)
+                        .saturating_mul(row_bytes),
+                );
+                if self.q8_qualification.read() {
+                    let mut causal_rows = 0u64;
+                    for candidate in 0..k_tokens {
+                        let filled = start_pos + candidate + 1;
+                        let window_start = layer
+                            .sliding_window
+                            .map_or(0, |window| filled.saturating_sub(window));
+                        causal_rows =
+                            causal_rows.saturating_add(filled.saturating_sub(window_start) as u64);
+                    }
+                    ledger.q8_kv_logical_read_bytes =
+                        ledger.q8_kv_logical_read_bytes.saturating_add(
+                            2u64.saturating_mul(layer.n_heads as u64)
+                                .saturating_mul(causal_rows)
+                                .saturating_mul(row_bytes),
+                        );
+                }
+            }
+        }
         ledger.overflow_slots = if file_mapped_demand {
             0
         } else {
@@ -30538,6 +31316,51 @@ impl Gemma4GhostCommonMetal {
                 );
             }
 
+            // Both the fused and split f32 writer arms above leave the exact
+            // post-K-norm/RoPE K and weightless-RMS V in kn_batch/vn_batch.
+            // Mirror from those common sources once, after the arm, so local
+            // and global layers cannot acquire different Q8 conventions.
+            if self.q8_qualification.mirror() {
+                let q8_encode_started = std::time::Instant::now();
+                let (Some(q8_keys), Some(q8_values)) =
+                    (self.q8_cache_k.as_ref(), self.q8_cache_v.as_ref())
+                else {
+                    eprintln!("[metal chained q8] rejected: admitted mirror buffers disappeared");
+                    self.last_chained_ledger = ledger;
+                    return false;
+                };
+                let (Some(q8_key), Some(q8_value)) =
+                    (q8_keys.get(layer_idx), q8_values.get(layer_idx))
+                else {
+                    eprintln!(
+                        "[metal chained q8] rejected: layer {layer_idx} mirror buffer missing"
+                    );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                };
+                if !encode_gemma4_q8_mirror_scatter_batch(
+                    encoder,
+                    kernel,
+                    &self.resident_scratch.kn_batch,
+                    &self.resident_scratch.vn_batch,
+                    q8_key,
+                    q8_value,
+                    layer.head_dim,
+                    layer.n_kv_heads,
+                    self.kv_stride(),
+                    start_pos,
+                    k_tokens,
+                ) {
+                    eprintln!(
+                        "[metal chained q8] rejected: layer {layer_idx} mirror scatter encode failed"
+                    );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+                encoder.memory_barrier_with_resources(&[q8_key, q8_value]);
+                ledger.q8_kv_encode_ms += q8_encode_started.elapsed().as_secs_f64() * 1000.0;
+            }
+
             encoder.memory_barrier_with_resources(&[
                 &self.cache_k[layer_idx],
                 &self.cache_v[layer_idx],
@@ -30570,25 +31393,65 @@ impl Gemma4GhostCommonMetal {
                 *(a.add(44) as *mut u32) = self.max_positions as u32;
             }
 
-            let batched_ok = encode_attention_split3_batch_k(
-                encoder,
-                kernel,
-                &self.resident_scratch.qn_batch,
-                &self.cache_k[layer_idx],
-                &self.cache_v[layer_idx],
-                &self.resident_scratch.scores_buf,
-                &layer.denom_buf,
-                &self.resident_scratch.ctx_batch,
-                &layer.attn_scalar,
-                layer.n_heads,
-                layer.head_dim,
-                max_pos_count,
-                k_tokens,
-                sliding_window,
-                self.max_positions as u32,
-            );
+            let q8_attention_encode_started = std::time::Instant::now();
+            let batched_ok = if self.q8_qualification.read() {
+                let (Some(q8_keys), Some(q8_values)) =
+                    (self.q8_cache_k.as_ref(), self.q8_cache_v.as_ref())
+                else {
+                    eprintln!("[metal chained q8] rejected: read mode lost mirror buffers");
+                    self.last_chained_ledger = ledger;
+                    return false;
+                };
+                encode_gemma4_attention_split3_batch_k_q8(
+                    encoder,
+                    kernel,
+                    &self.resident_scratch.qn_batch,
+                    &q8_keys[layer_idx],
+                    &q8_values[layer_idx],
+                    &self.resident_scratch.scores_buf,
+                    &layer.denom_buf,
+                    &self.resident_scratch.ctx_batch,
+                    &layer.attn_scalar,
+                    layer.n_heads,
+                    layer.head_dim,
+                    max_pos_count,
+                    k_tokens,
+                    sliding_window,
+                    self.max_positions as u32,
+                    self.kv_stride(),
+                )
+            } else {
+                encode_attention_split3_batch_k(
+                    encoder,
+                    kernel,
+                    &self.resident_scratch.qn_batch,
+                    &self.cache_k[layer_idx],
+                    &self.cache_v[layer_idx],
+                    &self.resident_scratch.scores_buf,
+                    &layer.denom_buf,
+                    &self.resident_scratch.ctx_batch,
+                    &layer.attn_scalar,
+                    layer.n_heads,
+                    layer.head_dim,
+                    max_pos_count,
+                    k_tokens,
+                    sliding_window,
+                    self.max_positions as u32,
+                )
+            };
+            if self.q8_qualification.read() {
+                ledger.q8_kv_encode_ms +=
+                    q8_attention_encode_started.elapsed().as_secs_f64() * 1000.0;
+            }
 
             if !batched_ok {
+                if self.q8_qualification.read() {
+                    eprintln!(
+                        "[metal chained q8] rejected: layer {layer_idx} batch-K Q8 attention unavailable"
+                    );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
                 for i in 0..k_tokens {
                     let q_off = (i * q_dim * 4) as u64;
                     let position = start_pos + i;
@@ -35491,6 +36354,383 @@ pub(crate) fn encode_attention_split3_batch_k(
     );
     e.memory_barrier_with_resources(&[out]);
 
+    true
+}
+
+/// Gemma-only Q8 mirror reader for scalar K=1 target attention. It retains the
+/// established split-three softmax and loop topology; only K/V loads decode a
+/// 34-byte Q8_0 block. The f32 scalar block remains the source of logical
+/// geometry, while cache strides are translated from elements to bytes here.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_attention_split3_q8(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    scores: &Buffer,
+    denom: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    kv_capacity: usize,
+    query_off: u64,
+    out_off: u64,
+) -> bool {
+    let (Some(scores_pipe), Some(context_pipe)) = (
+        &k.gemma4_attention_decode_scores_q8_pipeline,
+        &k.gemma4_attention_decode_context_q8_pipeline,
+    ) else {
+        return false;
+    };
+    let Some(row_bytes) = gemma4_ghost_q8_row_bytes(head_dim) else {
+        return false;
+    };
+    let (n_heads_u32, head_dim_u32, pos_count_u32, group_u32, scale_f32, f32_base_offset) = unsafe {
+        let p = scalar.contents() as *const u32;
+        (
+            *p,
+            *p.add(1),
+            *p.add(2),
+            *p.add(3),
+            *(p.add(4) as *const f32),
+            *p.add(7),
+        )
+    };
+    if n_heads_u32 as usize != n_heads
+        || head_dim_u32 as usize != head_dim
+        || pos_count_u32 as usize != position_count
+        || head_dim == 0
+        || !(f32_base_offset as usize).is_multiple_of(head_dim)
+    {
+        return false;
+    }
+    let window_start = f32_base_offset as usize / head_dim;
+    let Some(kv_head_stride) = kv_capacity.checked_mul(row_bytes) else {
+        return false;
+    };
+    let Some(kv_base_offset) = window_start.checked_mul(row_bytes) else {
+        return false;
+    };
+    let Ok(position_stride_u32) = u32::try_from(row_bytes) else {
+        return false;
+    };
+    let Ok(kv_head_stride_u32) = u32::try_from(kv_head_stride) else {
+        return false;
+    };
+    let Ok(kv_base_offset_u32) = u32::try_from(kv_base_offset) else {
+        return false;
+    };
+    let score_blocks = position_count.div_ceil(32).max(1);
+    let dim_blocks = head_dim.div_ceil(32).max(1);
+    let score_blocks_u32 = score_blocks as u32;
+    let dim_blocks_u32 = dim_blocks as u32;
+    let tg32 = metal::MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+
+    e.set_compute_pipeline_state(scores_pipe);
+    e.set_buffer(0, Some(query), query_off);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &pos_count_u32 as *const u32 as *const _);
+    e.set_bytes(8, 4, &group_u32 as *const u32 as *const _);
+    e.set_bytes(9, 4, &scale_f32 as *const f32 as *const _);
+    e.set_bytes(10, 4, &position_stride_u32 as *const u32 as *const _);
+    e.set_bytes(11, 4, &kv_head_stride_u32 as *const u32 as *const _);
+    e.set_bytes(12, 4, &kv_base_offset_u32 as *const u32 as *const _);
+    e.set_bytes(14, 4, &score_blocks_u32 as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: score_blocks as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+
+    // Deliberately reuse the exact f32 softmax phase.
+    e.set_compute_pipeline_state(&k.attention_decode_softmax_pipeline);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &pos_count_u32 as *const u32 as *const _);
+    e.set_buffer(13, Some(denom), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        tg32,
+    );
+
+    e.set_compute_pipeline_state(context_pipe);
+    e.set_buffer(2, Some(values), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_buffer(4, Some(out), out_off);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &pos_count_u32 as *const u32 as *const _);
+    e.set_bytes(8, 4, &group_u32 as *const u32 as *const _);
+    e.set_bytes(10, 4, &position_stride_u32 as *const u32 as *const _);
+    e.set_bytes(11, 4, &kv_head_stride_u32 as *const u32 as *const _);
+    e.set_bytes(12, 4, &kv_base_offset_u32 as *const u32 as *const _);
+    e.set_buffer(13, Some(denom), 0);
+    e.set_bytes(14, 4, &dim_blocks_u32 as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: dim_blocks as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_attention_split3_batch_k_q8(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    scores: &Buffer,
+    denom: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    max_position_count: usize,
+    k_tokens: usize,
+    sliding_window: u32,
+    max_positions: u32,
+    kv_capacity: usize,
+) -> bool {
+    let (Some(scores_pipe), Some(softmax_pipe), Some(context_pipe)) = (
+        &k.gemma4_attention_decode_scores_batch_k_q8_pipeline,
+        &k.attention_decode_softmax_batch_k_pipeline,
+        &k.gemma4_attention_decode_context_batch_k_q8_pipeline,
+    ) else {
+        return false;
+    };
+    let Some(row_bytes) = gemma4_ghost_q8_row_bytes(head_dim) else {
+        return false;
+    };
+    let (n_heads_u32, head_dim_u32, base_pos_u32, group_u32, scale_f32, f32_base_offset) = unsafe {
+        let p = scalar.contents() as *const u32;
+        (
+            *p,
+            *p.add(1),
+            *p.add(2),
+            *p.add(3),
+            *(p.add(4) as *const f32),
+            *p.add(7),
+        )
+    };
+    if n_heads_u32 as usize != n_heads
+        || head_dim_u32 as usize != head_dim
+        || head_dim == 0
+        || !(f32_base_offset as usize).is_multiple_of(head_dim)
+    {
+        return false;
+    }
+    let base_row = f32_base_offset as usize / head_dim;
+    let Some(kv_head_stride) = kv_capacity.checked_mul(row_bytes) else {
+        return false;
+    };
+    let Some(kv_base_offset) = base_row.checked_mul(row_bytes) else {
+        return false;
+    };
+    let (Ok(position_stride_u32), Ok(kv_head_stride_u32), Ok(kv_base_offset_u32)) = (
+        u32::try_from(row_bytes),
+        u32::try_from(kv_head_stride),
+        u32::try_from(kv_base_offset),
+    ) else {
+        return false;
+    };
+    let score_blocks = max_position_count.div_ceil(32).max(1);
+    let dim_blocks = head_dim.div_ceil(32).max(1);
+    let score_blocks_u32 = score_blocks as u32;
+    let dim_blocks_u32 = dim_blocks as u32;
+    let tg32 = metal::MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+
+    e.set_compute_pipeline_state(scores_pipe);
+    e.set_buffer(0, Some(query), 0);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &base_pos_u32 as *const u32 as *const _);
+    e.set_bytes(8, 4, &group_u32 as *const u32 as *const _);
+    e.set_bytes(9, 4, &scale_f32 as *const f32 as *const _);
+    e.set_bytes(10, 4, &position_stride_u32 as *const u32 as *const _);
+    e.set_bytes(11, 4, &kv_head_stride_u32 as *const u32 as *const _);
+    e.set_bytes(12, 4, &kv_base_offset_u32 as *const u32 as *const _);
+    e.set_bytes(14, 4, &score_blocks_u32 as *const u32 as *const _);
+    e.set_bytes(15, 4, &sliding_window as *const u32 as *const _);
+    e.set_bytes(16, 4, &max_positions as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: score_blocks as u64,
+            depth: k_tokens as u64,
+        },
+        tg32,
+    );
+    e.memory_barrier_with_resources(&[scores]);
+
+    e.set_compute_pipeline_state(softmax_pipe);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &base_pos_u32 as *const u32 as *const _);
+    e.set_buffer(13, Some(denom), 0);
+    e.set_bytes(15, 4, &sliding_window as *const u32 as *const _);
+    e.set_bytes(16, 4, &max_positions as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: k_tokens as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+    e.memory_barrier_with_resources(&[scores, denom]);
+
+    e.set_compute_pipeline_state(context_pipe);
+    e.set_buffer(2, Some(values), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_buffer(4, Some(out), 0);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &base_pos_u32 as *const u32 as *const _);
+    e.set_bytes(8, 4, &group_u32 as *const u32 as *const _);
+    e.set_bytes(10, 4, &position_stride_u32 as *const u32 as *const _);
+    e.set_bytes(11, 4, &kv_head_stride_u32 as *const u32 as *const _);
+    e.set_bytes(12, 4, &kv_base_offset_u32 as *const u32 as *const _);
+    e.set_buffer(13, Some(denom), 0);
+    e.set_bytes(14, 4, &dim_blocks_u32 as *const u32 as *const _);
+    e.set_bytes(15, 4, &sliding_window as *const u32 as *const _);
+    e.set_bytes(16, 4, &max_positions as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: dim_blocks as u64,
+            depth: k_tokens as u64,
+        },
+        tg32,
+    );
+    e.memory_barrier_with_resources(&[out]);
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_q8_mirror_scatter(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    src_k: &Buffer,
+    src_v: &Buffer,
+    dst_k: &Buffer,
+    dst_v: &Buffer,
+    head_dim: usize,
+    kv_heads: usize,
+    capacity: usize,
+    position: usize,
+) -> bool {
+    let Some(total_blocks) = kv_heads
+        .checked_mul(head_dim)
+        .and_then(|value| value.checked_div(32))
+    else {
+        return false;
+    };
+    let (Ok(head_dim), Ok(capacity), Ok(position), Ok(total_blocks)) = (
+        u32::try_from(head_dim),
+        u32::try_from(capacity),
+        u32::try_from(position),
+        u32::try_from(total_blocks),
+    ) else {
+        return false;
+    };
+    e.set_compute_pipeline_state(&k.kv_scatter_kvq8_pipeline);
+    e.set_buffer(0, Some(src_k), 0);
+    e.set_buffer(1, Some(src_v), 0);
+    e.set_buffer(2, Some(dst_k), 0);
+    e.set_buffer(3, Some(dst_v), 0);
+    e.set_bytes(4, 4, &head_dim as *const u32 as *const _);
+    e.set_bytes(5, 4, &capacity as *const u32 as *const _);
+    e.set_bytes(6, 4, &position as *const u32 as *const _);
+    e.set_bytes(7, 4, &total_blocks as *const u32 as *const _);
+    dispatch_1d(e, &k.kv_scatter_kvq8_pipeline, total_blocks as usize);
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_q8_mirror_scatter_batch(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    src_k: &Buffer,
+    src_v: &Buffer,
+    dst_k: &Buffer,
+    dst_v: &Buffer,
+    head_dim: usize,
+    kv_heads: usize,
+    capacity: usize,
+    base_position: usize,
+    k_tokens: usize,
+) -> bool {
+    let Some(total_blocks) = kv_heads
+        .checked_mul(head_dim)
+        .and_then(|value| value.checked_div(32))
+    else {
+        return false;
+    };
+    let (Ok(head_dim), Ok(capacity), Ok(base_position), Ok(total_blocks)) = (
+        u32::try_from(head_dim),
+        u32::try_from(capacity),
+        u32::try_from(base_position),
+        u32::try_from(total_blocks),
+    ) else {
+        return false;
+    };
+    e.set_compute_pipeline_state(&k.kv_scatter_batch_kvq8_pipeline);
+    e.set_buffer(0, Some(src_k), 0);
+    e.set_buffer(1, Some(src_v), 0);
+    e.set_buffer(2, Some(dst_k), 0);
+    e.set_buffer(3, Some(dst_v), 0);
+    e.set_bytes(4, 4, &head_dim as *const u32 as *const _);
+    e.set_bytes(5, 4, &capacity as *const u32 as *const _);
+    e.set_bytes(6, 4, &base_position as *const u32 as *const _);
+    e.set_bytes(7, 4, &total_blocks as *const u32 as *const _);
+    let width = k
+        .kv_scatter_batch_kvq8_pipeline
+        .thread_execution_width()
+        .max(1);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (total_blocks as u64).div_ceil(width),
+            height: k_tokens as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
     true
 }
 
@@ -52271,6 +53511,349 @@ kernel void sample_active_expert_records(
         assert_eq!(GEMMA4_GHOST_26B_HIDDEN, 2_816);
         assert_eq!(GEMMA4_GHOST_26B_SHARED_FF, 2_112);
         assert_eq!(GEMMA4_GHOST_26B_SLIDING_WINDOW, 1_024);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_q8_qualification_flags_and_wide_geometry_fail_closed() {
+        use super::Gemma4GhostQ8Qualification::{Mirror, Off, Read};
+
+        assert_eq!(
+            super::gemma4_ghost_q8_qualification_from(None, None),
+            Ok(Off)
+        );
+        assert_eq!(
+            super::gemma4_ghost_q8_qualification_from(Some("0"), Some("0")),
+            Ok(Off)
+        );
+        assert_eq!(
+            super::gemma4_ghost_q8_qualification_from(Some("1"), None),
+            Ok(Mirror)
+        );
+        assert_eq!(
+            super::gemma4_ghost_q8_qualification_from(Some("1"), Some("1")),
+            Ok(Read)
+        );
+        assert!(super::gemma4_ghost_q8_qualification_from(None, Some("1"))
+            .unwrap_err()
+            .contains("requires"));
+        assert!(super::gemma4_ghost_q8_qualification_from(Some("true"), None).is_err());
+        assert!(super::gemma4_ghost_q8_qualification_from(Some("1"), Some("yes")).is_err());
+
+        assert_eq!(super::gemma4_ghost_q8_row_bytes(256), Some(272));
+        assert_eq!(super::gemma4_ghost_q8_row_bytes(512), Some(544));
+        assert_eq!(super::gemma4_ghost_q8_row_bytes(255), None);
+        let local_q8 = 25 * 2 * GEMMA4_GHOST_26B_LOCAL_KV_HEADS * 272;
+        let global_q8 = 5 * 2 * GEMMA4_GHOST_26B_GLOBAL_KV_HEADS * 544;
+        assert_eq!(local_q8 + global_q8, 119_680);
+        assert_eq!((local_q8 + global_q8) * 192, 22_978_560);
+        assert_eq!((local_q8 + global_q8) * 4_096, 490_209_280);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q8_scalar_and_batch_scatter_are_raw_byte_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal Q8 scatter pipelines");
+        for head_dim in [256usize, 512] {
+            let kv_heads = 2usize;
+            let positions = 4usize;
+            let kv_dim = kv_heads * head_dim;
+            let row_bytes = gemma4_ghost_q8_row_bytes(head_dim).unwrap();
+            let cache_bytes = kv_heads * positions * row_bytes;
+            let keys: Vec<f32> = (0..positions * kv_dim)
+                .map(|i| (((i * 37 + 11) % 251) as f32 - 125.0) * 0.003_7)
+                .collect();
+            let values: Vec<f32> = (0..positions * kv_dim)
+                .map(|i| (((i * 29 + 17) % 239) as f32 - 119.0) * 0.004_1)
+                .collect();
+            let f32_buffer = |values: &[f32]| {
+                let buffer = kernel.device.new_buffer(
+                    (values.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                write_buffer_f32(&buffer, values);
+                buffer
+            };
+            let keys_batch = f32_buffer(&keys);
+            let values_batch = f32_buffer(&values);
+            let mut keys_rows = Vec::with_capacity(positions);
+            let mut values_rows = Vec::with_capacity(positions);
+            for position in 0..positions {
+                keys_rows.push(f32_buffer(
+                    &keys[position * kv_dim..(position + 1) * kv_dim],
+                ));
+                values_rows.push(f32_buffer(
+                    &values[position * kv_dim..(position + 1) * kv_dim],
+                ));
+            }
+            let new_cache = || {
+                let buffer = kernel
+                    .device
+                    .new_buffer(cache_bytes as u64, MTLResourceOptions::StorageModeShared);
+                write_buffer_u8(&buffer, &vec![0u8; cache_bytes]);
+                buffer
+            };
+            let batch_k = new_cache();
+            let batch_v = new_cache();
+            let scalar_k = new_cache();
+            let scalar_v = new_cache();
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            assert!(encode_gemma4_q8_mirror_scatter_batch(
+                encoder,
+                kernel,
+                &keys_batch,
+                &values_batch,
+                &batch_k,
+                &batch_v,
+                head_dim,
+                kv_heads,
+                positions,
+                0,
+                positions,
+            ));
+            for position in 0..positions {
+                assert!(encode_gemma4_q8_mirror_scatter(
+                    encoder,
+                    kernel,
+                    &keys_rows[position],
+                    &values_rows[position],
+                    &scalar_k,
+                    &scalar_v,
+                    head_dim,
+                    kv_heads,
+                    positions,
+                    position,
+                ));
+            }
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+            let bytes = |buffer: &Buffer| unsafe {
+                std::slice::from_raw_parts(buffer.contents().cast::<u8>(), cache_bytes).to_vec()
+            };
+            assert_eq!(bytes(&batch_k), bytes(&scalar_k), "K head_dim={head_dim}");
+            assert_eq!(bytes(&batch_v), bytes(&scalar_v), "V head_dim={head_dim}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q8_split3_batch_matches_wide_dequantized_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal Gemma Q8 split3 pipelines");
+        // Exact production width/group pairs, with fewer KV heads where that
+        // does not change the GQA mapping under test.
+        for (head_dim, n_heads, group, sliding_window) in
+            [(256usize, 4usize, 2usize, 4u32), (512, 8, 8, 0)]
+        {
+            let n_kv_heads = n_heads / group;
+            let base_position = 3usize;
+            let k_tokens = 3usize;
+            let positions = base_position + k_tokens;
+            let capacity = 8usize;
+            let kv_dim = n_kv_heads * head_dim;
+            let q_dim = n_heads * head_dim;
+            let row_bytes = gemma4_ghost_q8_row_bytes(head_dim).unwrap();
+            let cache_bytes = n_kv_heads * capacity * row_bytes;
+            let keys: Vec<f32> = (0..positions * kv_dim)
+                .map(|i| (((i * 31 + 7) % 257) as f32 - 128.0) * 0.002_9)
+                .collect();
+            let values: Vec<f32> = (0..positions * kv_dim)
+                .map(|i| (((i * 43 + 19) % 263) as f32 - 131.0) * 0.002_3)
+                .collect();
+            let query: Vec<f32> = (0..k_tokens * q_dim)
+                .map(|i| (((i * 23 + 5) % 251) as f32 - 125.0) * 0.003_1)
+                .collect();
+            let upload_f32 = |values: &[f32]| {
+                let buffer = kernel.device.new_buffer(
+                    (values.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                write_buffer_f32(&buffer, values);
+                buffer
+            };
+            let keys_in = upload_f32(&keys);
+            let values_in = upload_f32(&values);
+            let query_in = upload_f32(&query);
+            let cache_k = kernel
+                .device
+                .new_buffer(cache_bytes as u64, MTLResourceOptions::StorageModeShared);
+            let cache_v = kernel
+                .device
+                .new_buffer(cache_bytes as u64, MTLResourceOptions::StorageModeShared);
+            let scores = kernel.device.new_buffer(
+                (k_tokens * n_heads * capacity * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let denom = kernel.device.new_buffer(
+                (k_tokens * n_heads * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let output = kernel.device.new_buffer(
+                (k_tokens * q_dim * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let scalar = kernel
+                .device
+                .new_buffer(48, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents().cast::<u8>();
+                *p.cast::<u32>() = n_heads as u32;
+                *p.add(4).cast::<u32>() = head_dim as u32;
+                *p.add(8).cast::<u32>() = base_position as u32;
+                *p.add(12).cast::<u32>() = group as u32;
+                *p.add(16).cast::<f32>() = 1.0;
+                *p.add(20).cast::<u32>() = head_dim as u32;
+                *p.add(24).cast::<u32>() = (capacity * head_dim) as u32;
+                *p.add(28).cast::<u32>() = 0;
+            }
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            assert!(encode_gemma4_q8_mirror_scatter_batch(
+                encoder, kernel, &keys_in, &values_in, &cache_k, &cache_v, head_dim, n_kv_heads,
+                capacity, 0, positions,
+            ));
+            encoder.memory_barrier_with_resources(&[&cache_k, &cache_v]);
+            assert!(encode_gemma4_attention_split3_batch_k_q8(
+                encoder,
+                kernel,
+                &query_in,
+                &cache_k,
+                &cache_v,
+                &scores,
+                &denom,
+                &output,
+                &scalar,
+                n_heads,
+                head_dim,
+                positions,
+                k_tokens,
+                sliding_window,
+                capacity as u32,
+                capacity,
+            ));
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+
+            let dequant = |buffer: &Buffer, head: usize, position: usize, dim: usize| unsafe {
+                let block = dim / 32;
+                let in_block = dim % 32;
+                let offset = (head * capacity + position) * row_bytes + block * 34;
+                let wire = buffer.contents().cast::<u8>().add(offset);
+                let scale = f16_bits_to_f32(u16::from_le_bytes([*wire, *wire.add(1)]));
+                scale * (*wire.add(2 + in_block) as i8) as f32
+            };
+            let mut expected = vec![0.0f32; k_tokens * q_dim];
+            for candidate in 0..k_tokens {
+                let filled = base_position + candidate + 1;
+                let window_start = if sliding_window > 0 {
+                    filled.saturating_sub(sliding_window as usize)
+                } else {
+                    0
+                };
+                for head in 0..n_heads {
+                    let kv_head = head / group;
+                    let q_base = (candidate * n_heads + head) * head_dim;
+                    let mut row_scores = Vec::with_capacity(filled - window_start);
+                    for position in window_start..filled {
+                        let mut score = 0.0f32;
+                        for dim in 0..head_dim {
+                            score +=
+                                query[q_base + dim] * dequant(&cache_k, kv_head, position, dim);
+                        }
+                        row_scores.push(score);
+                    }
+                    let maximum = row_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let denominator = row_scores
+                        .iter()
+                        .map(|score| (*score - maximum).exp())
+                        .sum::<f32>();
+                    for dim in 0..head_dim {
+                        let mut context = 0.0f32;
+                        for (index, position) in (window_start..filled).enumerate() {
+                            context += ((row_scores[index] - maximum).exp() / denominator)
+                                * dequant(&cache_v, kv_head, position, dim);
+                        }
+                        expected[q_base + dim] = context;
+                    }
+                }
+            }
+            let mut actual = vec![0.0f32; expected.len()];
+            read_buffer_f32(&output, &mut actual);
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                let tolerance = 4.0e-4f32.max(want.abs() * 4.0e-4);
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "head_dim={head_dim} group={group} output={index} got={got} want={want} tolerance={tolerance}"
+                );
+            }
+
+            // Exercise the scalar target reader over the final candidate's
+            // exact causal/window slice, using the same Q8 cache bytes.
+            let scalar_position_count = if sliding_window > 0 {
+                positions.min(sliding_window as usize)
+            } else {
+                positions
+            };
+            let scalar_window_start = positions - scalar_position_count;
+            unsafe {
+                let p = scalar.contents().cast::<u8>();
+                *p.add(8).cast::<u32>() = scalar_position_count as u32;
+                *p.add(28).cast::<u32>() = (scalar_window_start * head_dim) as u32;
+            }
+            let scalar_scores = kernel.device.new_buffer(
+                (n_heads * scalar_position_count * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let scalar_denom = kernel
+                .device
+                .new_buffer((n_heads * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let scalar_output = kernel
+                .device
+                .new_buffer((q_dim * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            assert!(encode_gemma4_attention_split3_q8(
+                encoder,
+                kernel,
+                &query_in,
+                &cache_k,
+                &cache_v,
+                &scalar_scores,
+                &scalar_denom,
+                &scalar_output,
+                &scalar,
+                n_heads,
+                head_dim,
+                scalar_position_count,
+                capacity,
+                ((k_tokens - 1) * q_dim * 4) as u64,
+                0,
+            ));
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+            let mut scalar_actual = vec![0.0f32; q_dim];
+            read_buffer_f32(&scalar_output, &mut scalar_actual);
+            let scalar_expected = &expected[(k_tokens - 1) * q_dim..k_tokens * q_dim];
+            for (index, (&got, &want)) in scalar_actual.iter().zip(scalar_expected).enumerate() {
+                let tolerance = 4.0e-4f32.max(want.abs() * 4.0e-4);
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "scalar head_dim={head_dim} group={group} output={index} got={got} want={want} tolerance={tolerance}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]

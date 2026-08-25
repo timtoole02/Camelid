@@ -7073,6 +7073,10 @@ enum GhostPrefillPlan {
     HybridChunk,
 }
 
+fn ghost_prefill_requires_kv_import(plan: GhostPrefillPlan) -> bool {
+    plan == GhostPrefillPlan::HybridChunk
+}
+
 fn select_ghost_prefill_plan(
     chunk_eligible: bool,
     hybrid_enabled: bool,
@@ -9989,6 +9993,18 @@ impl GhostMetalExpertRuntime {
                     led.gpu_resid_ms,
                     led.gpu_busy_ms,
                 );
+                if led.q8_kv_mirror {
+                    eprintln!(
+                        "[metal chained q8] mode={} primary=f32 mtp=f32 mirror_format=q8_0 mirror_capacity_bytes={} quantized_write_bytes={} logical_attention_read_bytes={} host_encode={:.3}ms attention_gpu_stage={:.3}ms stage_split={}",
+                        if led.q8_kv_read { "read" } else { "mirror" },
+                        led.q8_kv_capacity_bytes,
+                        led.q8_kv_write_bytes,
+                        led.q8_kv_logical_read_bytes,
+                        led.q8_kv_encode_ms,
+                        led.gpu_attn_ms,
+                        if led.gpu_stage_split_measured { "measured" } else { "per-cb" },
+                    );
+                }
             }
         }
         fold_chained_fill_payload_totals(
@@ -12159,6 +12175,7 @@ fn materialize_observed_ghost_common_resident_layers(
 fn finish_ghost_common_metal(
     prepared: GhostCommonMetalPrepared,
     layers: &[LayerWeights],
+    q8_qualification: crate::metal::Gemma4GhostQ8Qualification,
 ) -> Option<GhostCommonMetalBuild> {
     let GhostCommonMetalPrepared {
         resident_layers,
@@ -12216,8 +12233,12 @@ fn finish_ghost_common_metal(
             })
             .collect()
     });
-    let mut common =
-        crate::metal::Gemma4GhostCommonMetal::new_26b(resident_layers, post_norm_1, max_positions)?;
+    let mut common = crate::metal::Gemma4GhostCommonMetal::new_26b_with_q8_qualification(
+        resident_layers,
+        post_norm_1,
+        max_positions,
+        q8_qualification,
+    )?;
     if !common.configure_moe(moe_configs) {
         return None;
     }
@@ -12238,6 +12259,7 @@ fn build_ghost_common_metal(
     g: &Gemma4Metadata,
     layers: &[LayerWeights],
     max_positions: usize,
+    q8_qualification: crate::metal::Gemma4GhostQ8Qualification,
 ) -> Result<Option<GhostCommonMetalBuild>> {
     Ok(prepare_ghost_common_metal(
         path,
@@ -12250,7 +12272,7 @@ fn build_ghost_common_metal(
         max_positions,
         false,
     )?
-    .and_then(|prepared| finish_ghost_common_metal(prepared, layers)))
+    .and_then(|prepared| finish_ghost_common_metal(prepared, layers, q8_qualification)))
 }
 
 /// A loaded Gemma 4 model ready to generate.
@@ -12286,6 +12308,11 @@ pub struct Gemma4Runtime {
     /// remains the permanent fallback for the rest of the session.
     #[cfg(target_os = "macos")]
     metal_q4_experts: std::sync::Mutex<Option<GhostMetalExpertRuntime>>,
+    /// Immutable qualification admission. Once either Q8 mode is effective,
+    /// every request must stay on the exact Ghost Metal common core; a CPU,
+    /// missing-lane, or f32-only fallback is a typed error.
+    #[cfg(target_os = "macos")]
+    ghost_q8_qualification_fail_closed: bool,
     /// The common-core KV cache is model-owned. Hold this for a complete public
     /// generation request so two callers cannot interleave position-zero resets
     /// and token steps on the same persistent Metal buffers.
@@ -13381,8 +13408,14 @@ pub struct Gemma4GhostLoadAllocationLedger {
     pub common_resident_layer_aux_transient_peak_capacity_bytes: u64,
     pub common_resident_layer_aux_transient_peak_explicitly_touched_bytes: u64,
     pub common_kv_capacity_positions: u64,
+    /// Authoritative f32 K/V capacity (unchanged by Q8 qualification).
     pub common_kv_bytes: u64,
     pub common_kv_explicitly_touched_bytes: u64,
+    /// Additional default-off Q8 mirror retained beside the authoritative f32
+    /// cache. Kept separate so load receipts cannot mistake mirror capacity for
+    /// a primary-cache replacement or undercount the qualification lane.
+    pub common_q8_kv_mirror_bytes: u64,
+    pub common_q8_kv_mirror_explicitly_touched_bytes: u64,
     pub verifier_scratch_capacity_bytes: u64,
     pub verifier_scratch_explicitly_touched_bytes: u64,
     pub common_non_kv_scratch_capacity_bytes: u64,
@@ -15288,6 +15321,12 @@ impl Gemma4Runtime {
         }
 
         #[cfg(target_os = "macos")]
+        let ghost_q8_qualification = crate::metal::gemma4_ghost_q8_qualification_from_env()
+            .map_err(BackendError::InvalidModelMetadata)?;
+        #[cfg(target_os = "macos")]
+        let ghost_q8_qualification_fail_closed = ghost_q8_qualification.mirror();
+
+        #[cfg(target_os = "macos")]
         let metal_q4_experts = {
             let flag = |name: &str| {
                 std::env::var(name).is_ok_and(|value| {
@@ -15353,6 +15392,18 @@ impl Gemma4Runtime {
             } else {
                 false
             };
+            // The mode was parsed exactly once before any Metal allocation and
+            // is passed unchanged into the common-core constructor and runtime
+            // fallback guard.
+            let q8_qualification_requested = ghost_q8_qualification_fail_closed;
+            if q8_qualification_requested
+                && (!enabled || !common_enabled || !exact_geometry || !exact_records)
+            {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "Gemma Q8 KV qualification was explicitly requested, but the exact Ghost Metal slots/common/26B record geometry is unavailable; refusing CPU or f32-control fallback"
+                        .into(),
+                ));
+            }
             let common_max_positions = || {
                 std::env::var("CAMELID_GEMMA4_GHOST_METAL_CONTEXT")
                     .ok()
@@ -15605,11 +15656,12 @@ impl Gemma4Runtime {
                     mut common,
                     wire_q4_payload_bytes: _,
                     wire_q4_allocation_bytes: _,
-                } = finish_ghost_common_metal(prepared, &layers).ok_or_else(|| {
-                    BackendError::UnsupportedModelArchitecture(
-                        "observed Ghost common KV/scratch construction failed".into(),
-                    )
-                })?;
+                } = finish_ghost_common_metal(prepared, &layers, ghost_q8_qualification)
+                    .ok_or_else(|| {
+                        BackendError::UnsupportedModelArchitecture(
+                            "observed Ghost common KV/scratch construction failed".into(),
+                        )
+                    })?;
                 let q4_simd_fast = common.enable_fused_fast_q4(fused_fast);
                 let geometry = common.geometry();
                 let allocation = common.allocation_ledger();
@@ -15621,6 +15673,10 @@ impl Gemma4Runtime {
                     observer.ledger.common_kv_bytes = allocation.kv_capacity_bytes;
                     observer.ledger.common_kv_explicitly_touched_bytes =
                         allocation.kv_explicitly_touched_bytes;
+                    observer.ledger.common_q8_kv_mirror_bytes =
+                        allocation.q8_kv_mirror_capacity_bytes;
+                    observer.ledger.common_q8_kv_mirror_explicitly_touched_bytes =
+                        allocation.q8_kv_mirror_explicitly_touched_bytes;
                     observer.ledger.verifier_scratch_capacity_bytes =
                         allocation.verifier_scratch_capacity_bytes;
                     observer.ledger.verifier_scratch_explicitly_touched_bytes =
@@ -15748,9 +15804,11 @@ impl Gemma4Runtime {
                 }
                 runtime.log_startup_admission(demand_load_only, block_count, fused_fast);
                 eprintln!(
-                    "[gemma4-ghost-common] OBSERVED: Q4 common + KV/scratch + empty slots active, context cap={} KV={:.2}GiB mode={} q4-row={}",
+                    "[gemma4-ghost-common] OBSERVED: Q4 common + KV/scratch + empty slots active, context cap={} f32_KV={:.2}GiB q8_mirror={:.2}GiB mode={} q4-row={}",
                     geometry.max_positions,
                     allocation.kv_capacity_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    allocation.q8_kv_mirror_capacity_bytes as f64
+                        / (1024.0 * 1024.0 * 1024.0),
                     if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
                     if q4_simd_fast { "simdgroup-ordered" } else { "scalar-ordered" },
                 );
@@ -15767,6 +15825,7 @@ impl Gemma4Runtime {
                         &g,
                         &layers,
                         common_max_positions(),
+                        ghost_q8_qualification,
                     ) {
                         Ok(Some(build)) => {
                             let GhostCommonMetalBuild {
@@ -15808,6 +15867,15 @@ impl Gemma4Runtime {
                 } else {
                     None
                 };
+                if q8_qualification_requested
+                    && allocation_order == GhostMetalAllocationOrder::CommonThenSlots
+                    && common_before_slots.is_none()
+                {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma Q8 KV qualification common-core construction was refused; refusing CPU fallback"
+                            .into(),
+                    ));
+                }
                 if file_mapped_experts
                     && (!enabled
                         || !common_enabled
@@ -15853,6 +15921,12 @@ impl Gemma4Runtime {
                 } else {
                     None
                 };
+                if q8_qualification_requested && runtime.is_none() {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma Q8 KV qualification could not allocate persistent Ghost Metal slots; refusing CPU fallback"
+                            .into(),
+                    ));
+                }
                 if common_enabled {
                     if let Some(lane) = runtime.as_mut() {
                         let built_common = match allocation_order {
@@ -15861,10 +15935,17 @@ impl Gemma4Runtime {
                             }
                             GhostMetalAllocationOrder::SlotsThenCommon => build_common(),
                         };
+                        if q8_qualification_requested && built_common.is_none() {
+                            return Err(BackendError::UnsupportedModelArchitecture(
+                                "Gemma Q8 KV qualification common-core construction was refused; refusing CPU fallback"
+                                    .into(),
+                            ));
+                        }
                         if let Some((mut common, q4_simd_fast)) = built_common {
                             let geometry = common.geometry();
+                            let common_allocation = common.allocation_ledger();
                             eprintln!(
-                                "[gemma4-ghost-common] ACTIVE: full Metal common core, context cap={} positions, allocated KV={} ({:.2}GiB of {:.2}GiB at cap), router/shared/expert/tail device-chained, mode={}, q4-row={}",
+                                "[gemma4-ghost-common] ACTIVE: full Metal common core, context cap={} positions, allocated f32_KV={} ({:.2}GiB of {:.2}GiB at cap), q8_mirror_bytes={} ({:.2}GiB), router/shared/expert/tail device-chained, mode={}, q4-row={}",
                                 geometry.max_positions,
                                 geometry.kv_capacity,
                                 geometry.kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -15872,6 +15953,9 @@ impl Gemma4Runtime {
                                     / geometry.kv_capacity.max(1) as f64)
                                     * (geometry.kv_bytes as f64
                                         / (1024.0 * 1024.0 * 1024.0)),
+                                common_allocation.q8_kv_mirror_capacity_bytes,
+                                common_allocation.q8_kv_mirror_capacity_bytes as f64
+                                    / (1024.0 * 1024.0 * 1024.0),
                                 if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
                                 if q4_simd_fast { "simdgroup-ordered" } else { "scalar-ordered" },
                             );
@@ -15918,6 +16002,21 @@ impl Gemma4Runtime {
                     .expect("observed cache check retains its observer")
                     .ledger
                     .host_cache_resident_bytes = 0;
+            }
+            if q8_qualification_requested {
+                let runtime = lane.as_mut().ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "Gemma Q8 KV qualification lost its Ghost Metal runtime before load completed"
+                            .into(),
+                    )
+                })?;
+                if runtime.common.is_none() {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma Q8 KV qualification lost its common Metal core before load completed"
+                            .into(),
+                    ));
+                }
+                runtime.cpu_fallback_forbidden = true;
             }
             std::sync::Mutex::new(lane)
         };
@@ -16226,6 +16325,8 @@ impl Gemma4Runtime {
             ghost_moe_cache,
             #[cfg(target_os = "macos")]
             metal_q4_experts,
+            #[cfg(target_os = "macos")]
+            ghost_q8_qualification_fail_closed,
             #[cfg(target_os = "macos")]
             ghost_common_generation: std::sync::Mutex::new(()),
             #[cfg(target_os = "macos")]
@@ -16931,6 +17032,12 @@ impl Gemma4Runtime {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let Some(runtime) = guard.as_mut() else {
+                if self.ghost_q8_qualification_fail_closed {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma Q8 KV qualification has no Ghost Metal runtime at prefill admission; refusing CPU prefill"
+                            .into(),
+                    ));
+                }
                 return Ok(select_ghost_prefill_plan(
                     chunk_eligible,
                     hybrid_enabled,
@@ -16952,6 +17059,16 @@ impl Gemma4Runtime {
                 required_positions,
                 common_capacity,
             );
+            if self.ghost_q8_qualification_fail_closed
+                && matches!(
+                    plan,
+                    GhostPrefillPlan::ScalarCpu | GhostPrefillPlan::CpuChunk
+                )
+            {
+                return Err(BackendError::UnsupportedModelArchitecture(format!(
+                    "Gemma Q8 KV qualification could not admit a Metal prefill for {required_positions} required positions; refusing CPU fallback"
+                )));
+            }
             if let Some(common) = runtime.common.as_mut() {
                 common.reset_sequence();
             }
@@ -17006,11 +17123,24 @@ impl Gemma4Runtime {
                     )
                 })?;
                 let Some(runtime) = guard.as_mut() else {
+                    if self.ghost_q8_qualification_fail_closed {
+                        return Err(BackendError::UnsupportedModelArchitecture(
+                            "Gemma Q8 KV qualification lost its Ghost Metal runtime during hybrid prefill; refusing CPU fallback"
+                                .into(),
+                        ));
+                    }
                     return Ok(false);
                 };
                 if runtime.sequence_mode != GhostMetalSequenceMode::HybridPrefill
                     || !ghost_metal_acceleration_enabled()
                 {
+                    if self.ghost_q8_qualification_fail_closed {
+                        return Err(BackendError::UnsupportedModelArchitecture(format!(
+                            "Gemma Q8 KV qualification hybrid handoff was unavailable (mode={:?}, gpu={}); refusing CPU fallback",
+                            runtime.sequence_mode,
+                            u8::from(ghost_metal_acceleration_enabled()),
+                        )));
+                    }
                     runtime.prefill_round = false;
                     runtime.sequence_mode = GhostMetalSequenceMode::Cpu;
                     if let Some(common) = runtime.common.as_mut() {
@@ -17019,6 +17149,12 @@ impl Gemma4Runtime {
                     return Ok(false);
                 }
                 let Some(common) = runtime.common.as_mut() else {
+                    if self.ghost_q8_qualification_fail_closed {
+                        return Err(BackendError::UnsupportedModelArchitecture(
+                            "Gemma Q8 KV qualification lost its common Metal core during hybrid prefill; refusing CPU fallback"
+                                .into(),
+                        ));
+                    }
                     runtime.prefill_round = false;
                     runtime.sequence_mode = GhostMetalSequenceMode::Cpu;
                     return Ok(false);
@@ -17029,6 +17165,11 @@ impl Gemma4Runtime {
                     match common.import_position_major_kv(kc, vc, positions) {
                         Ok(()) => true,
                         Err(error) => {
+                            if self.ghost_q8_qualification_fail_closed {
+                                return Err(BackendError::InvalidTensorData(format!(
+                                    "Gemma Q8 KV qualification CPU-prefill import failed closed: {error}"
+                                )));
+                            }
                             eprintln!(
                                 "[gemma4-ghost-common] CPU prefill KV import refused: {error}; continuing this request on CPU"
                             );
@@ -17194,6 +17335,12 @@ impl Gemma4Runtime {
             BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
         })?;
         let Some(runtime) = guard.as_mut() else {
+            if self.ghost_q8_qualification_fail_closed {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "Gemma Q8 KV qualification has no Ghost Metal runtime at scalar dispatch; refusing CPU fallback"
+                        .into(),
+                ));
+            }
             return Ok(None);
         };
 
@@ -17206,12 +17353,18 @@ impl Gemma4Runtime {
                 GhostMetalSequenceMode::Idle | GhostMetalSequenceMode::Metal
             )
         {
-            runtime.sequence_mode = if gpu_allowed
+            let metal_ready = gpu_allowed
                 && runtime
                     .common
                     .as_ref()
-                    .is_some_and(crate::metal::Gemma4GhostCommonMetal::moe_configured)
-            {
+                    .is_some_and(crate::metal::Gemma4GhostCommonMetal::moe_configured);
+            if self.ghost_q8_qualification_fail_closed && !metal_ready {
+                return Err(BackendError::UnsupportedModelArchitecture(format!(
+                    "Gemma Q8 KV qualification could not start scalar Metal at position zero (gpu={}, common_ready=0); refusing CPU fallback",
+                    u8::from(gpu_allowed),
+                )));
+            }
+            runtime.sequence_mode = if metal_ready {
                 if let Some(common) = runtime.common.as_mut() {
                     common.reset_sequence();
                 }
@@ -17223,7 +17376,15 @@ impl Gemma4Runtime {
         match runtime.sequence_mode {
             GhostMetalSequenceMode::Cpu
             | GhostMetalSequenceMode::HybridPrefill
-            | GhostMetalSequenceMode::Idle => return Ok(None),
+            | GhostMetalSequenceMode::Idle => {
+                if self.ghost_q8_qualification_fail_closed {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma Q8 KV qualification reached a non-Metal scalar sequence mode ({:?}); refusing CPU fallback",
+                        runtime.sequence_mode,
+                    )));
+                }
+                return Ok(None);
+            }
             GhostMetalSequenceMode::Metal if !gpu_allowed => {
                 return Err(BackendError::UnsupportedModelArchitecture(
                     "Ghost common Metal was disabled during an active request; retry the request so Camelid can select one KV lane from position zero".into(),
@@ -17555,7 +17716,7 @@ impl Gemma4Runtime {
                 }
                 Ok(Some(output))
             }
-            Err(error) if pos == 0 => {
+            Err(error) if pos == 0 && !self.ghost_q8_qualification_fail_closed => {
                 eprintln!(
                     "[gemma4-ghost-common] first-position Metal attempt failed: {error}; restarting this request on the CPU lane"
                 );
@@ -17564,6 +17725,12 @@ impl Gemma4Runtime {
                     common.reset_sequence();
                 }
                 Ok(None)
+            }
+            Err(error) if self.ghost_q8_qualification_fail_closed => {
+                runtime.sequence_mode = GhostMetalSequenceMode::Idle;
+                Err(BackendError::UnsupportedModelArchitecture(format!(
+                    "Gemma Q8 KV qualification failed closed at scalar position {pos}: {error}"
+                )))
             }
             Err(error) => {
                 runtime.sequence_mode = GhostMetalSequenceMode::Idle;
@@ -17653,6 +17820,11 @@ impl Gemma4Runtime {
     /// attend over nothing. Fail closed instead of producing wrong logits.
     #[cfg(target_os = "macos")]
     fn guard_cpu_kv_lane(&self, pos: usize, kc: &[Vec<Vec<f32>>]) -> Result<()> {
+        if self.ghost_q8_qualification_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma Q8 KV qualification fell through to the CPU scalar lane at position {pos}; refusing fallback"
+            )));
+        }
         if pos > 0 && self.ghost_metal_q4_is_enabled() && kc.iter().all(|layer| layer.is_empty()) {
             return Err(BackendError::InvalidModelMetadata(format!(
                 "Gemma 4 scalar step at position {pos} fell through to the CPU KV lane \
@@ -18775,6 +18947,17 @@ impl Gemma4Runtime {
     ) -> Result<Gemma4SpeculativeStepResult> {
         self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
+        if self.ghost_q8_qualification_fail_closed
+            && (!ghost_metal_acceleration_enabled()
+                || !self.supports_chunk_forward()
+                || self.metal_q6k_head.is_none())
+        {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "Gemma Q8 KV qualification could not admit the complete Metal speculative verifier (GPU/chunk/head); refusing CPU fallback"
+                    .into(),
+            ));
+        }
+        #[cfg(target_os = "macos")]
         if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
             if let Some(head) = self.metal_q6k_head.as_ref() {
                 let kk = tokens.len();
@@ -18930,6 +19113,11 @@ impl Gemma4Runtime {
                             target_hidden_normalized,
                         });
                     }
+                }
+                if self.ghost_q8_qualification_fail_closed {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma Q8 KV qualification Metal speculative verifier/head failed at position {start_pos} (K={kk}); refusing CPU replay"
+                    )));
                 }
             }
         }
@@ -19128,6 +19316,11 @@ impl Gemma4Runtime {
                     kk,
                     ledger,
                 ));
+            }
+            if self.ghost_q8_qualification_fail_closed && !gpu_chained_round_ok {
+                return Err(BackendError::UnsupportedModelArchitecture(format!(
+                    "Gemma Q8 KV qualification could not execute the chained Metal chunk at position {start_pos} (K={kk}); refusing CPU fallback"
+                )));
             }
         }
 
@@ -21342,6 +21535,12 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<(Gemma4StepOutput, TokenStepProfile)> {
         self.invalidate_mtp_prefill_seed();
+        #[cfg(target_os = "macos")]
+        if self.ghost_q8_qualification_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma Q8 KV qualification refuses direct profiled CPU/f32 step_range at position {pos}; use the admitted Ghost Metal entrypoint"
+            )));
+        }
         let hidden = self.config.embedding_length as usize;
         let heads = self.config.attention_head_count as usize;
         let ple_dim = self.g.per_layer_input_dim as usize;
@@ -21764,6 +21963,12 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<Gemma4StepOutput> {
         self.invalidate_mtp_prefill_seed();
+        #[cfg(target_os = "macos")]
+        if self.ghost_q8_qualification_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma Q8 KV qualification refuses direct CPU/f32 step_range at position {pos}; use the admitted Ghost Metal entrypoint"
+            )));
+        }
         self.step_range_with_head(token, pos, h_in, kc, vc, true)
     }
 
@@ -22137,7 +22342,7 @@ impl Gemma4Runtime {
                 let mut rows = self.step_chunk_with_head(tokens, start_pos, kc, vc, false, None)?;
                 logits = rows.pop().expect("non-empty prefill chunk has logits");
             }
-            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
+            if ghost_prefill_requires_kv_import(plan) {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
             }
             #[cfg(target_os = "macos")]
@@ -22318,7 +22523,7 @@ impl Gemma4Runtime {
             if should_cancel() {
                 return Ok(None);
             }
-            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
+            if ghost_prefill_requires_kv_import(plan) {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
                 // Import is synchronous but can copy a large context. Observe a
                 // disconnect that arrived during it before starting decode; the
@@ -31107,7 +31312,7 @@ mod scalar_prefill_head_tests {
 
 #[cfg(test)]
 mod ghost_hybrid_prefill_plan_tests {
-    use super::{select_ghost_prefill_plan, GhostPrefillPlan};
+    use super::{ghost_prefill_requires_kv_import, select_ghost_prefill_plan, GhostPrefillPlan};
 
     #[test]
     fn multi_token_common_prefill_defaults_to_hybrid_but_has_a_scalar_kill_switch() {
@@ -31135,6 +31340,12 @@ mod ghost_hybrid_prefill_plan_tests {
             select_ghost_prefill_plan(false, true, 1, 4127, Some(4096)),
             GhostPrefillPlan::ScalarCpu
         );
+        assert!(!ghost_prefill_requires_kv_import(
+            GhostPrefillPlan::ScalarMetal
+        ));
+        assert!(ghost_prefill_requires_kv_import(
+            GhostPrefillPlan::HybridChunk
+        ));
     }
 }
 
