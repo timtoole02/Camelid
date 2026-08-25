@@ -60,6 +60,17 @@ const FULL_HEAD_DIM: usize = 512;
 const FULL_KV_HEADS: usize = 2;
 const MTP_CHAIN_MAX_DRAFTS: usize = 16;
 const MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX: usize = 3;
+const MTP_DEVICE_CHAIN_K4_WARM_DRAFTS: usize = MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX + 1;
+const MTP_DEVICE_CHAIN_DISPATCHES_PER_DRAFT: usize = 112;
+const MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES: usize =
+    MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * MTP_DEVICE_CHAIN_DISPATCHES_PER_DRAFT + 1;
+const MTP_DEVICE_CHAIN_K4_WARM_RESTORE_BYTES: usize =
+    (MTP_DEVICE_CHAIN_K4_WARM_DRAFTS + 1) * TARGET_HIDDEN * std::mem::size_of::<f32>()
+        + MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * std::mem::size_of::<u32>();
+const TARGET_Q6K_VALUES_PER_BLOCK: usize = 256;
+const TARGET_Q6K_WIRE_BYTES_PER_BLOCK: usize = 210;
+const TARGET_Q6K_ROW_BYTES: usize =
+    (TARGET_HIDDEN / TARGET_Q6K_VALUES_PER_BLOCK) * TARGET_Q6K_WIRE_BYTES_PER_BLOCK;
 const MTP_STEP3_LOGIT_TRACE_ENV: &str = "CAMELID_GEMMA4_MTP_STEP3_LOGIT_TRACE";
 const MTP_LOGIT_TRACE_DRAFT_INDEX_ENV: &str = "CAMELID_GEMMA4_MTP_LOGIT_TRACE_DRAFT_INDEX";
 // Official Gemma 4 proportional RoPE keeps the normal split-half geometry for
@@ -1796,7 +1807,7 @@ pub struct Gemma4MtpResidentLedger {
 
 /// Per-proposal byte accounting. `target_kv_read_bytes` is the exact logical K
 /// plus V span traversed by the three sliding and one full attention layers.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Gemma4MtpProposalLedger {
     pub assistant_matrix_bytes: u64,
     /// Unique physical capacity of the borrowed target layer-28/layer-29 K/V
@@ -1845,6 +1856,12 @@ struct PendingMtpStageSnapshot {
     count: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MtpDeviceChainInvocation {
+    Production,
+    TargetFreeK4Warmup,
+}
+
 /// Explicit, default-off native assistant. The established path retains a
 /// locked BF16 file mapping; full-Q4 releases it after every matrix and norm
 /// needed at runtime has been copied into independently owned Metal buffers.
@@ -1870,6 +1887,36 @@ pub struct Gemma4MtpAssistantMetal {
 
 fn shared_buffer(device: &Device, bytes: usize) -> Buffer {
     device.new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+}
+
+fn read_buffer_prefix_bytes(buffer: &Buffer, byte_len: usize) -> Result<Vec<u8>> {
+    let buffer_len = usize::try_from(buffer.length())
+        .map_err(|_| invalid("Metal buffer length exceeds usize"))?;
+    if byte_len > buffer_len {
+        return Err(invalid(format!(
+            "Metal buffer prefix read {byte_len} exceeds buffer length {buffer_len}"
+        )));
+    }
+    let mut bytes = vec![0u8; byte_len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(buffer.contents().cast::<u8>(), bytes.as_mut_ptr(), byte_len);
+    }
+    Ok(bytes)
+}
+
+fn write_buffer_prefix_bytes(buffer: &Buffer, bytes: &[u8]) -> Result<()> {
+    let buffer_len = usize::try_from(buffer.length())
+        .map_err(|_| invalid("Metal buffer length exceeds usize"))?;
+    if bytes.len() > buffer_len {
+        return Err(invalid(format!(
+            "Metal buffer prefix write {} exceeds buffer length {buffer_len}",
+            bytes.len()
+        )));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.contents().cast::<u8>(), bytes.len());
+    }
+    Ok(())
 }
 
 fn bf16_bits_to_f32(bits: u16) -> f32 {
@@ -2356,6 +2403,141 @@ impl Gemma4MtpAssistantMetal {
             self.propose_with_queue(&zero_target, &zero_target, target_kv, private_queue)?;
         self.last_proposal_ledger = previous_ledger;
         Ok(proposal.timing)
+    }
+
+    /// Warm the exact four-draft, step-3-capturing device-chain command graph
+    /// on its private queue without borrowing any target-owned resource. The
+    /// compact Q6_K binding contains one all-zero row and advertises a one-token
+    /// synthetic vocabulary, so feedback can never address beyond that row.
+    #[doc(hidden)]
+    pub fn warm_target_free_device_chain_k4_step3_capture(
+        &mut self,
+    ) -> Result<Gemma4MtpProposalTiming> {
+        let kernel =
+            metal_linear_kernel().ok_or_else(|| invalid("Metal common core disappeared"))?;
+        let local_elements = LOCAL_KV_HEADS * LOCAL_HEAD_DIM;
+        let full_elements = FULL_KV_HEADS * FULL_HEAD_DIM;
+        let sliding_key = f32_buffer(&kernel.device, &vec![0.0; local_elements]);
+        let sliding_value = f32_buffer(&kernel.device, &vec![0.0; local_elements]);
+        let full_key = f32_buffer(&kernel.device, &vec![0.0; full_elements]);
+        let full_value = f32_buffer(&kernel.device, &vec![0.0; full_elements]);
+        let target_kv = Gemma4MtpTargetKvView {
+            sliding: Gemma4MtpTargetKvLayerView {
+                layer_index: 28,
+                key: &sliding_key,
+                value: &sliding_value,
+                logical_len: 1,
+                kv_stride: 1,
+                kv_heads: LOCAL_KV_HEADS,
+                head_dim: LOCAL_HEAD_DIM,
+                sliding_window: Some(LOCAL_WINDOW),
+            },
+            full: Gemma4MtpTargetKvLayerView {
+                layer_index: 29,
+                key: &full_key,
+                value: &full_value,
+                logical_len: 1,
+                kv_stride: 1,
+                kv_heads: FULL_KV_HEADS,
+                head_dim: FULL_HEAD_DIM,
+                sliding_window: None,
+            },
+        };
+
+        let target_embedding_buffer = shared_buffer(&kernel.device, TARGET_Q6K_ROW_BYTES);
+        write_buffer_prefix_bytes(&target_embedding_buffer, &vec![0u8; TARGET_Q6K_ROW_BYTES])?;
+        let target_embedding = Gemma4MtpTargetEmbeddingView {
+            buffer: &target_embedding_buffer,
+            byte_offset: 0,
+            byte_len: TARGET_Q6K_ROW_BYTES,
+            hidden: TARGET_HIDDEN,
+            vocab: 1,
+            format: Gemma4MtpTargetEmbeddingFormat::Q6K,
+        };
+        let zero_recurrent = vec![0.0f32; TARGET_HIDDEN];
+
+        let recurrent_bytes = TARGET_HIDDEN * std::mem::size_of::<f32>();
+        let chain_recurrent_bytes = MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * recurrent_bytes;
+        let token_bytes = MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * std::mem::size_of::<u32>();
+        let saved_recurrent =
+            read_buffer_prefix_bytes(&self.scratch.recurrent_hidden, recurrent_bytes)?;
+        let saved_chain_recurrent =
+            read_buffer_prefix_bytes(&self.scratch.chain_recurrent_hidden, chain_recurrent_bytes)?;
+        let saved_tokens = read_buffer_prefix_bytes(&self.scratch.output_token, token_bytes)?;
+        let previous_ledger = self.last_proposal_ledger;
+
+        let warm_result = self.propose_chain_device_resident_with_step3_logit_capture_inner(
+            0,
+            &zero_recurrent,
+            target_kv,
+            target_embedding,
+            MTP_DEVICE_CHAIN_K4_WARM_DRAFTS,
+            &[],
+            true,
+            MtpDeviceChainInvocation::TargetFreeK4Warmup,
+        );
+
+        // Attempt every restoration before propagating either a warm failure or
+        // a restoration failure. No result path may expose synthetic recurrence,
+        // feedback tokens, or the synthetic per-proposal ledger.
+        let recurrent_restore =
+            write_buffer_prefix_bytes(&self.scratch.recurrent_hidden, &saved_recurrent);
+        let chain_recurrent_restore =
+            write_buffer_prefix_bytes(&self.scratch.chain_recurrent_hidden, &saved_chain_recurrent);
+        let token_restore = write_buffer_prefix_bytes(&self.scratch.output_token, &saved_tokens);
+        self.last_proposal_ledger = previous_ledger;
+        recurrent_restore?;
+        chain_recurrent_restore?;
+        token_restore?;
+
+        let proposals = warm_result?;
+        let returned_drafts = proposals.len();
+        let tokens_zero = proposals.iter().all(|proposal| proposal.token == 0);
+        let recurrent_zero = proposals.iter().all(|proposal| {
+            proposal
+                .recurrent_hidden
+                .iter()
+                .all(|value| value.to_bits() & 0x7fff_ffff == 0)
+        });
+        let step3_snapshot_zero = proposals
+            .get(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX)
+            .and_then(|proposal| proposal.step3_assistant_logits.as_ref())
+            .is_some_and(|logits| {
+                logits.len() == VOCAB
+                    && logits
+                        .iter()
+                        .all(|value| value.to_bits() & 0x7fff_ffff == 0)
+            });
+        if returned_drafts != MTP_DEVICE_CHAIN_K4_WARM_DRAFTS
+            || !tokens_zero
+            || !recurrent_zero
+            || !step3_snapshot_zero
+        {
+            return Err(invalid(format!(
+                "target-free K4 device-chain warmup invariant failed: returned_drafts={returned_drafts} tokens_zero={} recurrent_zero={} step3_snapshot_zero={}",
+                usize::from(tokens_zero),
+                usize::from(recurrent_zero),
+                usize::from(step3_snapshot_zero),
+            )));
+        }
+        let timing = proposals
+            .first()
+            .expect("four-draft warmup invariant checked")
+            .timing;
+        eprintln!(
+            "[gemma4-mtp device-chain-warmup] graph=k4-step3-capture requested_drafts={} returned_drafts={} command_buffers=1 commits=1 waits=1 dispatches={} queue=private-device-chain explicit_step3_capture=1 synthetic_embedding_rows=1 synthetic_embedding_bytes={} synthetic_vocab=1 synthetic_kv_len=1 target_buffers_borrowed=0 tokens_zero=1 recurrent_zero=1 step3_snapshot_zero=1 recurrent_hidden_restored=1 chain_recurrent_restored=1 token_scratch_restored=1 restored_scratch_bytes={} ledger_restored=1 target_state_mutation=0 output_published=0 encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
+            MTP_DEVICE_CHAIN_K4_WARM_DRAFTS,
+            returned_drafts,
+            MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES,
+            TARGET_Q6K_ROW_BYTES,
+            MTP_DEVICE_CHAIN_K4_WARM_RESTORE_BYTES,
+            timing.encode_us,
+            timing.wait_us,
+            timing.gpu_us,
+            timing.kernel_us,
+            timing.wall_us,
+        );
+        Ok(timing)
     }
 
     /// Run one official assistant proposal against the target's scoped shared
@@ -3033,6 +3215,30 @@ impl Gemma4MtpAssistantMetal {
         eot: &[u32],
         capture_step3_logits: bool,
     ) -> Result<Vec<Gemma4MtpProposal>> {
+        self.propose_chain_device_resident_with_step3_logit_capture_inner(
+            anchor_token,
+            initial_recurrent_hidden,
+            target_kv,
+            target_embedding,
+            draft_limit,
+            eot,
+            capture_step3_logits,
+            MtpDeviceChainInvocation::Production,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propose_chain_device_resident_with_step3_logit_capture_inner(
+        &mut self,
+        anchor_token: u32,
+        initial_recurrent_hidden: &[f32],
+        target_kv: Gemma4MtpTargetKvView<'_>,
+        target_embedding: Gemma4MtpTargetEmbeddingView<'_>,
+        draft_limit: usize,
+        eot: &[u32],
+        capture_step3_logits: bool,
+        invocation: MtpDeviceChainInvocation,
+    ) -> Result<Vec<Gemma4MtpProposal>> {
         if draft_limit == 0 {
             return Ok(Vec::new());
         }
@@ -3064,7 +3270,14 @@ impl Gemma4MtpAssistantMetal {
             ));
         }
         let device_registry_id = self.queue.device().registry_id();
-        validate_target_embedding(&target_embedding, device_registry_id)?;
+        match invocation {
+            MtpDeviceChainInvocation::Production => {
+                validate_target_embedding(&target_embedding, device_registry_id)?;
+            }
+            MtpDeviceChainInvocation::TargetFreeK4Warmup => {
+                validate_target_free_device_chain_embedding(&target_embedding, device_registry_id)?;
+            }
+        }
         validate_target_kv_device(&target_kv, device_registry_id)?;
 
         let wall_started = Instant::now();
@@ -3379,17 +3592,19 @@ impl Gemma4MtpAssistantMetal {
                 break;
             }
         }
-        eprintln!(
-            "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format={} matrix_bytes_per_draft={} encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
-            proposals.len(),
-            if self.full_q4.is_some() { "q4_0_all" } else if self.q4_embedding.is_some() { "bf16_q4_0_head" } else { "bf16" },
-            self.assistant_matrix_bytes_per_proposal(),
-            total_timing.encode_us,
-            total_timing.wait_us,
-            total_timing.gpu_us,
-            total_timing.kernel_us,
-            total_timing.wall_us,
-        );
+        if invocation == MtpDeviceChainInvocation::Production {
+            eprintln!(
+                "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format={} matrix_bytes_per_draft={} encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
+                proposals.len(),
+                if self.full_q4.is_some() { "q4_0_all" } else if self.q4_embedding.is_some() { "bf16_q4_0_head" } else { "bf16" },
+                self.assistant_matrix_bytes_per_proposal(),
+                total_timing.encode_us,
+                total_timing.wait_us,
+                total_timing.gpu_us,
+                total_timing.kernel_us,
+                total_timing.wall_us,
+            );
+        }
         self.last_proposal_ledger = Some(ledger);
         Ok(proposals)
     }
@@ -4671,20 +4886,18 @@ fn validate_target_embedding_geometry(
     byte_len: usize,
     buffer_len: usize,
 ) -> Result<()> {
-    const Q6K_VALUES: usize = 256;
-    const Q6K_WIRE: usize = 210;
     if format != Gemma4MtpTargetEmbeddingFormat::Q6K
         || hidden != TARGET_HIDDEN
         || vocab != VOCAB
-        || !hidden.is_multiple_of(Q6K_VALUES)
+        || !hidden.is_multiple_of(TARGET_Q6K_VALUES_PER_BLOCK)
     {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "Gemma 4 MTP device-chain target embedding mismatch: format={format:?} hidden={hidden} vocab={vocab}; expected Q6_K {VOCAB}x{TARGET_HIDDEN}"
         )));
     }
     let expected_len = vocab
-        .checked_mul(hidden / Q6K_VALUES)
-        .and_then(|value| value.checked_mul(Q6K_WIRE))
+        .checked_mul(hidden / TARGET_Q6K_VALUES_PER_BLOCK)
+        .and_then(|value| value.checked_mul(TARGET_Q6K_WIRE_BYTES_PER_BLOCK))
         .ok_or_else(|| invalid("target embedding byte length overflow"))?;
     let byte_end = byte_offset
         .checked_add(byte_len)
@@ -4695,6 +4908,29 @@ fn validate_target_embedding_geometry(
     {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "Gemma 4 MTP device-chain target embedding range mismatch: offset={byte_offset} bytes={byte_len} buffer={buffer_len}; expected bytes={expected_len} with 2-byte alignment"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_target_free_device_chain_embedding_geometry(
+    format: Gemma4MtpTargetEmbeddingFormat,
+    hidden: usize,
+    vocab: usize,
+    byte_offset: usize,
+    byte_len: usize,
+    buffer_len: usize,
+) -> Result<()> {
+    if format != Gemma4MtpTargetEmbeddingFormat::Q6K
+        || hidden != TARGET_HIDDEN
+        || !hidden.is_multiple_of(TARGET_Q6K_VALUES_PER_BLOCK)
+        || vocab != 1
+        || byte_offset != 0
+        || byte_len != TARGET_Q6K_ROW_BYTES
+        || buffer_len != TARGET_Q6K_ROW_BYTES
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Gemma 4 MTP target-free device-chain embedding mismatch: format={format:?} hidden={hidden} vocab={vocab} offset={byte_offset} bytes={byte_len} buffer={buffer_len}; expected one exact Q6_K {TARGET_HIDDEN}-wide row ({TARGET_Q6K_ROW_BYTES} bytes) at offset zero"
         )));
     }
     Ok(())
@@ -4723,6 +4959,34 @@ fn validate_target_embedding(
     if actual_device_registry_id != required_device_registry_id {
         return Err(invalid(format!(
             "target embedding Metal device {actual_device_registry_id} differs from assistant device {required_device_registry_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_target_free_device_chain_embedding(
+    view: &Gemma4MtpTargetEmbeddingView<'_>,
+    required_device_registry_id: u64,
+) -> Result<()> {
+    validate_target_free_device_chain_embedding_geometry(
+        view.format(),
+        view.hidden(),
+        view.vocab(),
+        view.byte_offset(),
+        view.byte_len(),
+        usize::try_from(view.buffer().length())
+            .map_err(|_| invalid("target-free embedding buffer length exceeds usize"))?,
+    )?;
+    if view.buffer().storage_mode() != MTLStorageMode::Shared {
+        return Err(invalid(format!(
+            "target-free embedding storage mode is {:?}, expected Shared private warmup storage",
+            view.buffer().storage_mode()
+        )));
+    }
+    let actual_device_registry_id = view.buffer().device().registry_id();
+    if actual_device_registry_id != required_device_registry_id {
+        return Err(invalid(format!(
+            "target-free embedding Metal device {actual_device_registry_id} differs from assistant device {required_device_registry_id}"
         )));
     }
     Ok(())
@@ -5079,6 +5343,28 @@ mod tests {
     }
 
     #[test]
+    fn target_free_device_chain_warmup_pins_k4_step3_graph_and_restore_geometry() {
+        let recurrent_bytes = TARGET_HIDDEN * std::mem::size_of::<f32>();
+        let chain_recurrent_bytes = MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * recurrent_bytes;
+        let token_bytes = MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * std::mem::size_of::<u32>();
+
+        assert_eq!(MTP_DEVICE_CHAIN_K4_WARM_DRAFTS, 4);
+        assert_eq!(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX, 3);
+        assert!(mtp_step3_logit_capture_enabled_values(None, true));
+        assert_eq!(MTP_DEVICE_CHAIN_DISPATCHES_PER_DRAFT, 112);
+        assert_eq!(MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES, 4 * 112 + 1);
+        assert_eq!(recurrent_bytes, 11_264);
+        assert_eq!(chain_recurrent_bytes, 45_056);
+        assert_eq!(token_bytes, 16);
+        assert_eq!(
+            recurrent_bytes + chain_recurrent_bytes + token_bytes,
+            56_336
+        );
+        assert_eq!(MTP_DEVICE_CHAIN_K4_WARM_RESTORE_BYTES, 56_336);
+        assert_eq!(TARGET_Q6K_ROW_BYTES, 2_310);
+    }
+
+    #[test]
     fn indexed_logit_trace_accepts_only_a_bounded_zero_based_draft_index() {
         assert_eq!(mtp_logit_trace_draft_index_value(None), None);
         assert_eq!(mtp_logit_trace_draft_index_value(Some("")), None);
@@ -5395,6 +5681,74 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "loads and quantizes the pinned 800 MiB official artifact"]
+    fn official_full_q4_k4_device_chain_warmup_restores_exact_private_state() {
+        fn pattern(byte_len: usize, salt: u8) -> Vec<u8> {
+            (0..byte_len)
+                .map(|index| (index as u8).wrapping_mul(37).wrapping_add(salt))
+                .collect()
+        }
+
+        let path = Path::new(OFFICIAL_STAGED_ASSISTANT_PATH);
+        assert!(path.is_file(), "missing official assistant at {path:?}");
+        let mut assistant = Gemma4MtpAssistantMetal::load_with_full_q4(path, true)
+            .expect("load official full-Q4 assistant");
+
+        let recurrent_bytes = TARGET_HIDDEN * std::mem::size_of::<f32>();
+        let chain_recurrent_bytes = MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * recurrent_bytes;
+        let token_bytes = MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * std::mem::size_of::<u32>();
+        assert_eq!(
+            recurrent_bytes + chain_recurrent_bytes + token_bytes,
+            56_336
+        );
+
+        let recurrent_before = pattern(recurrent_bytes, 11);
+        let chain_recurrent_before = pattern(chain_recurrent_bytes, 29);
+        let tokens_before = pattern(token_bytes, 47);
+        write_buffer_prefix_bytes(&assistant.scratch.recurrent_hidden, &recurrent_before)
+            .expect("seed recurrent scratch");
+        write_buffer_prefix_bytes(
+            &assistant.scratch.chain_recurrent_hidden,
+            &chain_recurrent_before,
+        )
+        .expect("seed chain recurrent scratch");
+        write_buffer_prefix_bytes(&assistant.scratch.output_token, &tokens_before)
+            .expect("seed token scratch");
+        let ledger_before = Some(Gemma4MtpProposalLedger {
+            assistant_matrix_bytes: 101,
+            borrowed_target_kv_capacity_bytes: 103,
+            target_kv_read_bytes: 107,
+            dynamic_attention_scratch_bytes: 109,
+            readback_bytes: 113,
+        });
+        assistant.last_proposal_ledger = ledger_before;
+
+        assistant
+            .warm_target_free_device_chain_k4_step3_capture()
+            .expect("run target-free K4 step-3-capturing device-chain warmup");
+
+        assert_eq!(
+            read_buffer_prefix_bytes(&assistant.scratch.recurrent_hidden, recurrent_bytes)
+                .expect("read restored recurrent scratch"),
+            recurrent_before,
+        );
+        assert_eq!(
+            read_buffer_prefix_bytes(
+                &assistant.scratch.chain_recurrent_hidden,
+                chain_recurrent_bytes,
+            )
+            .expect("read restored chain recurrent scratch"),
+            chain_recurrent_before,
+        );
+        assert_eq!(
+            read_buffer_prefix_bytes(&assistant.scratch.output_token, token_bytes)
+                .expect("read restored token scratch"),
+            tokens_before,
+        );
+        assert_eq!(assistant.last_proposal_ledger, ledger_before);
+    }
+
+    #[test]
     fn device_chain_embedding_geometry_admits_only_exact_q6k_target() {
         let bytes = VOCAB * (TARGET_HIDDEN / 256) * 210;
         validate_target_embedding_geometry(
@@ -5440,6 +5794,93 @@ mod tests {
             4_096 + bytes - 1,
         )
         .is_err());
+    }
+
+    #[test]
+    fn target_free_device_chain_embedding_geometry_admits_only_one_exact_q6k_row() {
+        validate_target_free_device_chain_embedding_geometry(
+            Gemma4MtpTargetEmbeddingFormat::Q6K,
+            TARGET_HIDDEN,
+            1,
+            0,
+            TARGET_Q6K_ROW_BYTES,
+            TARGET_Q6K_ROW_BYTES,
+        )
+        .unwrap();
+
+        // The compact warm-only binding must remain impossible to admit through
+        // the production full-vocabulary validator.
+        assert!(validate_target_embedding_geometry(
+            Gemma4MtpTargetEmbeddingFormat::Q6K,
+            TARGET_HIDDEN,
+            1,
+            0,
+            TARGET_Q6K_ROW_BYTES,
+            TARGET_Q6K_ROW_BYTES,
+        )
+        .is_err());
+
+        let malformed = [
+            (
+                Gemma4MtpTargetEmbeddingFormat::Q4K,
+                TARGET_HIDDEN,
+                1,
+                0,
+                TARGET_Q6K_ROW_BYTES,
+                TARGET_Q6K_ROW_BYTES,
+            ),
+            (
+                Gemma4MtpTargetEmbeddingFormat::Q6K,
+                TARGET_HIDDEN - 1,
+                1,
+                0,
+                TARGET_Q6K_ROW_BYTES,
+                TARGET_Q6K_ROW_BYTES,
+            ),
+            (
+                Gemma4MtpTargetEmbeddingFormat::Q6K,
+                TARGET_HIDDEN,
+                2,
+                0,
+                TARGET_Q6K_ROW_BYTES,
+                TARGET_Q6K_ROW_BYTES,
+            ),
+            (
+                Gemma4MtpTargetEmbeddingFormat::Q6K,
+                TARGET_HIDDEN,
+                1,
+                2,
+                TARGET_Q6K_ROW_BYTES,
+                TARGET_Q6K_ROW_BYTES + 2,
+            ),
+            (
+                Gemma4MtpTargetEmbeddingFormat::Q6K,
+                TARGET_HIDDEN,
+                1,
+                0,
+                TARGET_Q6K_ROW_BYTES - 1,
+                TARGET_Q6K_ROW_BYTES,
+            ),
+            (
+                Gemma4MtpTargetEmbeddingFormat::Q6K,
+                TARGET_HIDDEN,
+                1,
+                0,
+                TARGET_Q6K_ROW_BYTES,
+                TARGET_Q6K_ROW_BYTES + 1,
+            ),
+        ];
+        for (format, hidden, vocab, byte_offset, byte_len, buffer_len) in malformed {
+            assert!(validate_target_free_device_chain_embedding_geometry(
+                format,
+                hidden,
+                vocab,
+                byte_offset,
+                byte_len,
+                buffer_len,
+            )
+            .is_err());
+        }
     }
 
     #[test]

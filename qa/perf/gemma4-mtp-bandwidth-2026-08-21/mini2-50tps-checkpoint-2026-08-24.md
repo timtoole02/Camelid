@@ -320,6 +320,44 @@ variability dominated the end-to-end ABBA. Evidence is local under:
 - `demand-promotion-runner/runs/mini2-h58-abba-b2-h58`;
 - `demand-promotion-runner/runs/mini2-h58-abba-a2-h49`.
 
+## Exact K4 device-chain load-warm closure (H59)
+
+H59 tested the smallest target-free load warm that executes the production
+device-chain shape actually used at the first verifier boundary: exactly four
+drafts with explicit step-3 logit capture. The experiment is strict
+default-off behind `CAMELID_GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP=1`, subordinate
+to both assistant load warmup and the device-chain opt-in. It uses private zero
+KV and input buffers, publishes no output, and restores exactly 56,336 bytes of
+recurrent/token scratch plus the prior proposal ledger. The measured binary
+SHA-256 was
+`7184d5bfa12301a02f82eaba4321ce8e4966b5292edf411611936c903d1c02be`.
+
+The focused parser, command-graph, and compact single-row Q6_K geometry gates
+passed 3/3. The ignored official-artifact restoration gate also passed: all
+56,336 scratch bytes and the prior ledger were bit-exact after the warm, the
+shared production graph issued 449 dispatches, and no proposal output was
+published.
+
+The two Mini2 post-build measurements were:
+
+| run | lane | warm graph kernel us | first real K4 kernel us | round-0 assistant ms | exact | swap | peak child bytes | peak wired bytes | receipt |
+|---|---|---:|---:|---:|---|---|---:|---:|---|
+| `mini2-h59-postbuild-warmup1-h58` | H58 discarded control | — | 26,479 | 88.14 | 48/48 | zero | 6,920,551,328 | 8,226,832,384 | refused only by the post-exit rusage-zero race |
+| `mini2-h59-postbuild-warmup2-h59` | H59 candidate | 85 | 27,947 | 83.36 | 48/48 | zero | 6,959,512,504 | 8,277,360,640 | clean |
+
+H59 reduced round-0 assistant time by 4.78 ms, below the 15 ms continuation
+gate. More decisively, the real first K4 remained far above the 5 ms go gate
+and worsened by 1,468 us relative to the H58 control. H59 is therefore an
+immediate **NO-GO**; no ABBA was run. Evidence remains local under:
+
+- `demand-promotion-runner/runs/mini2-h59-postbuild-warmup1-h58`;
+- `demand-promotion-runner/runs/mini2-h59-postbuild-warmup2-h59`.
+
+After measurement, a source-only compatibility fix restored the legacy
+production device-chain log field sequence required by strict QA. The new
+warm-specific telemetry is unchanged. Because H59 had already failed its
+immediate gate, no rebuild was warranted.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -336,6 +374,7 @@ Profiles and executable for this checkpoint:
 - `H56-mtp-assistant-router-probe`
 - `H57-mtp-private-queue-warmup`
 - `H58-moe-mma-k16`
+- `H59-mtp-device-chain-k4-warmup`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -350,6 +389,9 @@ Profiles and executable for this checkpoint:
 - H58 Mini2 executable: `/Users/timtoole/bin/camelid-h58-67412568314c`
 - H58 SHA-256:
   `67412568314ca1e9c9e2ef2076f490c6fbd51b4dd0d46c98841886fd507fbff7`
+- H59 measured Mini2 executable: `/Users/timtoole/bin/camelid-h59-7184d5bfa123`
+- H59 measured binary SHA-256:
+  `7184d5bfa12301a02f82eaba4321ce8e4966b5292edf411611936c903d1c02be`
 
 ## Validation and provenance
 
@@ -373,6 +415,9 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - H57 parser/subordinate-warmup configuration: 3/3;
 - H58 strict selector and raw K13/K14/K16 plus split-range parity: 3/3,
   with the ignored nine-sample K13/K14 timing gate run separately;
+- H59 parser, exact K4 + step-3 graph, and compact Q6_K geometry: 3/3;
+- H59 ignored official-artifact restoration: pass, with 56,336 scratch bytes
+  plus the prior ledger restored exactly, 449 dispatches, and no output;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

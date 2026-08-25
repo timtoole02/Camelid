@@ -45,6 +45,9 @@ const GEMMA4_MTP_LOAD_WARMUP_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_WARMUP";
 const GEMMA4_MTP_PRIVATE_QUEUE_WARMUP_ENV: &str = "CAMELID_GEMMA4_MTP_PRIVATE_QUEUE_WARMUP";
 
 #[cfg(target_os = "macos")]
+const GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP_ENV: &str = "CAMELID_GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP";
+
+#[cfg(target_os = "macos")]
 fn parse_gemma4_mtp_full_q4_required(value: Option<&str>) -> std::result::Result<bool, String> {
     match value {
         None | Some("0") => Ok(false),
@@ -127,13 +130,55 @@ fn gemma4_mtp_private_queue_warmup_from_environment() -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
+fn parse_gemma4_mtp_device_chain_k4_warmup(
+    value: Option<&str>,
+) -> std::result::Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) => Err(format!(
+            "{GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP_ENV} must be 0, 1, false, or true, got {value:?}"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp_device_chain_k4_warmup_from_environment() -> Result<bool> {
+    let value = match std::env::var(GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP_ENV} must contain Unicode text"
+            )));
+        }
+    };
+    parse_gemma4_mtp_device_chain_k4_warmup(value.as_deref())
+        .map_err(BackendError::InvalidModelMetadata)
+}
+
+#[cfg(target_os = "macos")]
 fn validate_gemma4_mtp_warmup_configuration(
     load_warmup: bool,
     private_queue_warmup: bool,
+    device_chain_k4_warmup: bool,
+    device_chain_requested: bool,
 ) -> std::result::Result<(), String> {
     if private_queue_warmup && !load_warmup {
         return Err(format!(
             "{GEMMA4_MTP_PRIVATE_QUEUE_WARMUP_ENV}=1 requires {GEMMA4_MTP_LOAD_WARMUP_ENV}=1"
+        ));
+    }
+    if device_chain_k4_warmup && !load_warmup {
+        return Err(format!(
+            "{GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP_ENV}=1 requires {GEMMA4_MTP_LOAD_WARMUP_ENV}=1"
+        ));
+    }
+    if device_chain_k4_warmup && !device_chain_requested {
+        return Err(format!(
+            "{GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP_ENV}=1 requires CAMELID_GEMMA4_MTP_DEVICE_CHAIN=1"
         ));
     }
     Ok(())
@@ -142,8 +187,9 @@ fn validate_gemma4_mtp_warmup_configuration(
 #[cfg(all(test, target_os = "macos"))]
 mod mtp_profile_env_tests {
     use super::{
-        parse_gemma4_mtp_full_q4_required, parse_gemma4_mtp_load_warmup,
-        parse_gemma4_mtp_private_queue_warmup, validate_gemma4_mtp_warmup_configuration,
+        parse_gemma4_mtp_device_chain_k4_warmup, parse_gemma4_mtp_full_q4_required,
+        parse_gemma4_mtp_load_warmup, parse_gemma4_mtp_private_queue_warmup,
+        validate_gemma4_mtp_warmup_configuration,
     };
 
     #[test]
@@ -184,15 +230,44 @@ mod mtp_profile_env_tests {
         assert!(parse_gemma4_mtp_private_queue_warmup(Some("yes")).is_err());
         assert!(parse_gemma4_mtp_private_queue_warmup(Some("")).is_err());
         assert_eq!(
-            validate_gemma4_mtp_warmup_configuration(false, false),
+            validate_gemma4_mtp_warmup_configuration(false, false, false, false),
             Ok(())
         );
         assert_eq!(
-            validate_gemma4_mtp_warmup_configuration(true, false),
+            validate_gemma4_mtp_warmup_configuration(true, false, false, false),
             Ok(())
         );
-        assert_eq!(validate_gemma4_mtp_warmup_configuration(true, true), Ok(()));
-        assert!(validate_gemma4_mtp_warmup_configuration(false, true).is_err());
+        assert_eq!(
+            validate_gemma4_mtp_warmup_configuration(true, true, false, false),
+            Ok(())
+        );
+        assert!(validate_gemma4_mtp_warmup_configuration(false, true, false, false).is_err());
+    }
+
+    #[test]
+    fn device_chain_k4_warmup_is_explicit_and_requires_load_plus_device_chain() {
+        assert_eq!(parse_gemma4_mtp_device_chain_k4_warmup(None), Ok(false));
+        assert_eq!(
+            parse_gemma4_mtp_device_chain_k4_warmup(Some("0")),
+            Ok(false)
+        );
+        assert_eq!(
+            parse_gemma4_mtp_device_chain_k4_warmup(Some("FALSE")),
+            Ok(false)
+        );
+        assert_eq!(parse_gemma4_mtp_device_chain_k4_warmup(Some("1")), Ok(true));
+        assert_eq!(
+            parse_gemma4_mtp_device_chain_k4_warmup(Some("TrUe")),
+            Ok(true)
+        );
+        assert!(parse_gemma4_mtp_device_chain_k4_warmup(Some("yes")).is_err());
+        assert!(parse_gemma4_mtp_device_chain_k4_warmup(Some("")).is_err());
+        assert!(validate_gemma4_mtp_warmup_configuration(false, false, true, true).is_err());
+        assert!(validate_gemma4_mtp_warmup_configuration(true, false, true, false).is_err());
+        assert_eq!(
+            validate_gemma4_mtp_warmup_configuration(true, false, true, true),
+            Ok(())
+        );
     }
 }
 
@@ -15692,8 +15767,19 @@ impl Gemma4Runtime {
             let full_q4_required = gemma4_mtp_full_q4_required_from_environment()?;
             let load_warmup = gemma4_mtp_load_warmup_from_environment()?;
             let private_queue_warmup = gemma4_mtp_private_queue_warmup_from_environment()?;
-            validate_gemma4_mtp_warmup_configuration(load_warmup, private_queue_warmup)
-                .map_err(BackendError::InvalidModelMetadata)?;
+            let device_chain_k4_warmup = gemma4_mtp_device_chain_k4_warmup_from_environment()?;
+            let device_chain_requested = if device_chain_k4_warmup {
+                crate::metal::device_chain_requested_from_environment()?
+            } else {
+                false
+            };
+            validate_gemma4_mtp_warmup_configuration(
+                load_warmup,
+                private_queue_warmup,
+                device_chain_k4_warmup,
+                device_chain_requested,
+            )
+            .map_err(BackendError::InvalidModelMetadata)?;
             let assistant_path =
                 std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH").map(std::path::PathBuf::from);
             match assistant_path {
@@ -15738,6 +15824,15 @@ impl Gemma4Runtime {
                                     timing.kernel_us,
                                     timing.wall_us,
                                 );
+                                if device_chain_k4_warmup {
+                                    assistant
+                                        .warm_target_free_device_chain_k4_step3_capture()
+                                        .map_err(|error| {
+                                            BackendError::InvalidModelMetadata(format!(
+                                                "{GEMMA4_MTP_DEVICE_CHAIN_K4_WARMUP_ENV}=1 target-free assistant device-chain warmup failed: {error}"
+                                            ))
+                                        })?;
+                                }
                             }
                             eprintln!(
                                 "[gemma4-mtp] MTP QAT assistant loaded from {:?} lm_head={} matrices={} (speculative enabled)",
