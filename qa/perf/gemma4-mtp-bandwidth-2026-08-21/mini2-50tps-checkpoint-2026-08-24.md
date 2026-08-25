@@ -455,10 +455,31 @@ actually succeeds; raw environment eligibility cannot claim activation.
 The guarded release executable is
 `/Users/timtoole/bin/camelid-h64-b60fe01705e6`, SHA-256
 `b60fe01705e6745c7d4d46ddbeea110befa5cfde01730e0934ff8dcb406721f6`.
-The first post-build H55 warmup was correctly refused before child launch
-because the host already had 21,654 swapped pages at the watchdog baseline.
-No model process started and no throughput result was recorded. H64 remains a
-**PENDING CLEAN-HOST MINI2 A/B**, not a promotion or no-go.
+After Mini2 was restarted, the clean-host sequence discarded one H55 warmup
+and one H64 warmup, then measured H55/H64/H64/H55 with the same immutable
+executable. Every measured run produced 48/48 exact token parity, started and
+ended with zero swap, recorded zero swap-in/out deltas, and stayed below the
+7.5 GiB child-physical and 8 GiB host-wired limits.
+
+| lane | request wall | throughput | assistant | verifier | demand read wall | terminal GPU | peak child physical | peak host wired |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| H55 A1 | 1,523.74 ms | 31.5014 tok/s | 222.26 ms | 1,301.17 ms | 634.4 ms | 694.9 ms | 6,949,190,560 B | 8,144,797,696 B |
+| H64 B1 | 1,492.79 ms | 32.1546 tok/s | 225.41 ms | 1,267.11 ms | 605.4 ms | 697.7 ms | 7,151,139,768 B | 8,162,689,024 B |
+| H64 B2 | 1,500.51 ms | 31.9891 tok/s | 226.62 ms | 1,273.44 ms | 598.0 ms | 705.4 ms | 7,151,418,272 B | 8,193,916,928 B |
+| H55 A2 | 1,456.93 ms | 32.9460 tok/s | 225.81 ms | 1,230.72 ms | 558.7 ms | 707.8 ms | 7,151,614,880 B | 8,191,868,928 B |
+
+The H55 mean was 1,490.34 ms / 32.2237 tok/s; the H64 mean was
+1,496.65 ms / 32.0718 tok/s. H64 therefore regressed request wall by 6.32 ms,
+verifier wall by 4.33 ms, and throughput by 0.47%. Mean demand-read wall also
+regressed by 1.15 ms while terminal GPU time was effectively flat. Round 0's
+mean verifier wall regressed by 6.82 ms, independently failing the 5 ms
+per-round guardrail. Both candidate runs reported exactly 119 authoritative
+launches (`30,30,29,30`), eight readers, no fallback chunking, and no command,
+slot-policy, or record-byte mutation, so attribution was successful.
+
+H64 is a **NO-GO**. Adaptive authoritative-read fanout is not the missing
+latency recovery on this Mini2 lane; the default-off source remains for
+reproducibility.
 
 Profiles and executable for this checkpoint:
 
@@ -497,7 +518,7 @@ Profiles and executable for this checkpoint:
 - H59 measured Mini2 executable: `/Users/timtoole/bin/camelid-h59-7184d5bfa123`
 - H59 measured binary SHA-256:
   `7184d5bfa12301a02f82eaba4321ce8e4966b5292edf411611936c903d1c02be`
-- H64 pending Mini2 executable: `/Users/timtoole/bin/camelid-h64-b60fe01705e6`
+- H64 measured Mini2 executable: `/Users/timtoole/bin/camelid-h64-b60fe01705e6`
 - H64 SHA-256:
   `b60fe01705e6745c7d4d46ddbeea110befa5cfde01730e0934ff8dcb406721f6`
 
@@ -541,8 +562,9 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
   paired median delta; fail-fast no-go with no Mini2 run or profile;
 - H64 strict admission/attribution/fanout/source gates: 5/5; existing exact
   chunk equality, aligned/gapless production plan, joined read-failure,
-  payload-identity, and H55 command-plan gates passed; the first Mini2 warmup
-  was refused before child launch because baseline swap was nonzero;
+  payload-identity, and H55 command-plan gates passed; post-restart Mini2
+  warmups plus H55/H64/H64/H55 measured 32.2237 tok/s control versus 32.0718
+  tok/s candidate, with 48/48 parity and zero swap throughout; no-go;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 
