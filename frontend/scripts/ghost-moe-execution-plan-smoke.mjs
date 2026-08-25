@@ -5,7 +5,14 @@ import { readFileSync } from 'node:fs'
 import {
   describeExecutionPlan,
   executionRuntimeFields,
+  GEMMA4_MINI2_WEBUI_PROFILE_ID,
 } from '../src/lib/executionPlan.js'
+
+assert.equal(
+  GEMMA4_MINI2_WEBUI_PROFILE_ID,
+  'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1',
+  'the frontend receipt must stay pinned to the exact promoted Mini2 runtime profile',
+)
 
 const baseGhostRuntime = {
   status: 'online',
@@ -86,7 +93,13 @@ assert.deepEqual(
     gemma4_ghost_common_metal_active: false,
     gemma4_ghost_experts_metal_active: true,
     gemma4_ghost_head_metal_active: false,
+    gemma4_mtp_assistant_loaded: true,
+    gemma4_mtp_full_q4_active: true,
+    gemma4_ghost_exact_expert_policy_active: true,
+    gemma4_ghost_common_metal_context_capacity: 1024,
+    gemma4_ghost_runtime_profile: GEMMA4_MINI2_WEBUI_PROFILE_ID,
     gemma4_ghost_backend: 'metal',
+    gemma4_ghost_catalog_managed: null,
     gemma4_ghost_common_gpu_active: false,
     gemma4_ghost_experts_gpu_active: true,
     gemma4_ghost_head_gpu_active: false,
@@ -98,7 +111,13 @@ assert.deepEqual(
     gemma4_ghost_common_metal_active: false,
     gemma4_ghost_experts_metal_active: true,
     gemma4_ghost_head_metal_active: false,
+    gemma4_mtp_assistant_loaded: true,
+    gemma4_mtp_full_q4_active: true,
+    gemma4_ghost_exact_expert_policy_active: true,
+    gemma4_ghost_common_metal_context_capacity: 1024,
+    gemma4_ghost_runtime_profile: GEMMA4_MINI2_WEBUI_PROFILE_ID,
     gemma4_ghost_backend: 'metal',
+    gemma4_ghost_catalog_managed: null,
     gemma4_ghost_common_gpu_active: false,
     gemma4_ghost_experts_gpu_active: true,
     gemma4_ghost_head_gpu_active: false,
@@ -111,6 +130,33 @@ assert.equal(
   null,
   'malformed health values must fail closed instead of producing a GPU claim',
 )
+assert.equal(
+  executionRuntimeFields({ gemma4_mtp_full_q4_active: 'true' }).gemma4_mtp_full_q4_active,
+  null,
+  'malformed MTP health values must fail closed',
+)
+assert.equal(
+  executionRuntimeFields({ gemma4_ghost_exact_expert_policy_active: 'true' })
+    .gemma4_ghost_exact_expert_policy_active,
+  null,
+  'malformed expert-policy health values must fail closed',
+)
+for (const malformed of ['1024', 0, -1, 1.5, Number.NaN]) {
+  assert.equal(
+    executionRuntimeFields({ gemma4_ghost_common_metal_context_capacity: malformed })
+      .gemma4_ghost_common_metal_context_capacity,
+    null,
+    `malformed Ghost context capacity must fail closed: ${String(malformed)}`,
+  )
+}
+for (const profile of [undefined, null, '', 'mini2-future-profile']) {
+  assert.equal(
+    executionRuntimeFields({ gemma4_ghost_runtime_profile: profile })
+      .gemma4_ghost_runtime_profile,
+    null,
+    `missing or wrong runtime profiles must fail closed: ${String(profile)}`,
+  )
+}
 assert.equal(
   executionRuntimeFields({ gemma4_ghost_execution_mode: 'future_metal' })
     .gemma4_ghost_execution_mode,

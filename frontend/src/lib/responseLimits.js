@@ -11,10 +11,9 @@ import { findCompatibilityHint, isExactCompatibilityHint } from './capabilities.
 export const MAX_RESPONSE_TOKENS = 1000000
 export const MIN_RESPONSE_TOKENS = 1
 export const GEMMA4_MIN_CHAT_TOKENS = 8
-// Ghost's default common-core Metal cache holds 4,096 positions. Keeping the
-// WebUI reply allowance at 512 leaves a conservative 3,584-position envelope
-// for ordinary prompts/history instead of letting the global 8,192 default
-// force CPU common execution before position zero.
+// This is the Ghost WebUI's general reply ceiling, not a claim about the live
+// KV allocation. /v1/health reports the constructed common-Metal capacity; the
+// helpers below further shrink this ceiling to that runtime's remaining room.
 export const GEMMA4_GHOST_WEBUI_MAX_TOKENS = 512
 // BitNet-b1.58-2B-4T is useful interactively at a short, bounded first-turn
 // budget. A valid per-model setting remains authoritative; this ceiling only
@@ -104,22 +103,51 @@ export function gemma4ChatTokenFloorForModel(capabilities, model) {
     : null
 }
 
-export function gemma4GhostChatTokenCap(serveLane = '') {
-  const lane = String(serveLane || '').trim().toLowerCase().replace(/-/g, '_')
-  return lane === 'ghost_moe' ? GEMMA4_GHOST_WEBUI_MAX_TOKENS : null
+function positiveInteger(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
-export function applyGemma4GhostChatTokenCap(value, serveLane = '') {
+export function gemma4GhostRuntimeContextCapacity(serveLane = '', value = null) {
+  const lane = String(serveLane || '').trim().toLowerCase().replace(/-/g, '_')
+  return lane === 'ghost_moe' ? positiveInteger(value) : null
+}
+
+export function gemma4GhostChatTokenCap(serveLane = '', {
+  contextCapacity = null,
+  promptTokens = null,
+} = {}) {
+  const lane = String(serveLane || '').trim().toLowerCase().replace(/-/g, '_')
+  if (lane !== 'ghost_moe') return null
+
+  const capacity = gemma4GhostRuntimeContextCapacity(lane, contextCapacity)
+  const prompt = Number.isFinite(promptTokens) ? Math.max(0, Math.ceil(promptTokens)) : null
+  const remaining = capacity === null
+    ? GEMMA4_GHOST_WEBUI_MAX_TOKENS
+    : prompt === null
+      ? capacity
+      : Math.max(MIN_RESPONSE_TOKENS, capacity - prompt)
+  return Math.min(GEMMA4_GHOST_WEBUI_MAX_TOKENS, remaining)
+}
+
+export function applyGemma4GhostChatTokenCap(value, serveLane = '', options = {}) {
   const configured = Number.isFinite(Number(value))
     ? Math.max(MIN_RESPONSE_TOKENS, Math.round(Number(value)))
     : MIN_RESPONSE_TOKENS
-  const cap = gemma4GhostChatTokenCap(serveLane)
+  const cap = gemma4GhostChatTokenCap(serveLane, options)
   return cap === null ? configured : Math.min(configured, cap)
 }
 
 export function modelContextLength(model) {
   const value = Number(model?.meta?.n_ctx_train)
   return Number.isFinite(value) && value > 0 ? value : null
+}
+
+// The loaded model's training context is descriptive metadata. A live Ghost
+// common-Metal allocation is the tighter operational limit and therefore wins
+// for send-time validation; other lanes keep the model metadata unchanged.
+export function effectiveChatContextLength(model, serveLane = '', ghostMetalCapacity = null) {
+  return gemma4GhostRuntimeContextCapacity(serveLane, ghostMetalCapacity)
+    ?? modelContextLength(model)
 }
 
 /* Highest bounded-context window whose pack status is validated on the exact
@@ -182,20 +210,20 @@ export function validateResponseLength({ value, contextLength = null, verifiedBo
 
 /* Send-time budget check. The response limit is an UPPER BOUND: the backend
    clamps it to the room left in the context window, so exceeding it is a
-   non-blocking notice, not an error. The only hard failure is a prompt that
-   already fills the whole context (no room to generate), which the backend
-   rejects with context_length_exceeded. Prompt size is a client estimate. */
+   non-blocking notice, not an error. The hard failure is a prompt that already
+   fills the whole context, because speculative verification requires an open
+   position. Prompt size is a client estimate. */
 export function validateSendBudget({ promptTokens, maxTokens, contextLength }) {
   if (contextLength === null || !Number.isFinite(promptTokens)) return { level: 'ok' }
-  if (promptTokens >= contextLength) {
+  const room = contextLength - promptTokens
+  if (room <= 0) {
     return {
       level: 'error',
       code: 'prompt_fills_context',
-      message: `This prompt (~${promptTokens.toLocaleString()} tokens, estimated) fills the model’s ${contextLength.toLocaleString()}-token context, leaving no room for a reply. Shorten the prompt or load a longer-context model.`,
+      message: `This prompt (~${promptTokens.toLocaleString()} tokens, estimated) fills or exceeds the model’s ${contextLength.toLocaleString()}-token context, leaving no room for a reply. Shorten the prompt or load a longer-context model.`,
     }
   }
-  if (promptTokens + maxTokens > contextLength) {
-    const room = contextLength - promptTokens
+  if (maxTokens > room) {
     return {
       level: 'notice',
       code: 'response_auto_limited',

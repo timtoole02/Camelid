@@ -77,6 +77,7 @@ const TARGET_Q6K_ROW_BYTES: usize =
     (TARGET_HIDDEN / TARGET_Q6K_VALUES_PER_BLOCK) * TARGET_Q6K_WIRE_BYTES_PER_BLOCK;
 const MTP_STEP3_LOGIT_TRACE_ENV: &str = "CAMELID_GEMMA4_MTP_STEP3_LOGIT_TRACE";
 const MTP_LOGIT_TRACE_DRAFT_INDEX_ENV: &str = "CAMELID_GEMMA4_MTP_LOGIT_TRACE_DRAFT_INDEX";
+const MTP_SPEC_TIMING_ENV: &str = "CAMELID_GEMMA4_SPEC_TIMING";
 const MTP_BF16_PRODUCER_FUSION_ENV: &str = "CAMELID_GEMMA4_MTP_BF16_PRODUCER_FUSION";
 const MTP_BF16_LATTICE_LOADS_ENV: &str = "CAMELID_GEMMA4_MTP_BF16_LATTICE_LOADS";
 const MTP_BF16_LATTICE_DISPATCHES_ELIDED: usize = 0;
@@ -1592,6 +1593,14 @@ fn mtp_step3_logit_trace_enabled_value(value: Option<&str>) -> bool {
             "1" | "true" | "on" | "yes"
         )
     })
+}
+
+fn mtp_spec_timing_enabled_value(value: Option<&str>) -> bool {
+    value.is_some()
+}
+
+fn mtp_spec_timing_enabled() -> bool {
+    mtp_spec_timing_enabled_value(std::env::var(MTP_SPEC_TIMING_ENV).ok().as_deref())
 }
 
 fn mtp_step3_logit_capture_enabled_values(
@@ -4116,41 +4125,43 @@ impl Gemma4MtpAssistantMetal {
             } else {
                 (0, 0)
             };
-            eprintln!(
-                "[gemma4-mtp bf16-lattice-loads] requested_drafts={draft_limit} returned_drafts={} target_logical_k={} enabled={} direct_query_qk={} direct_probability_context={} bf16_round_ops_elided_per_draft={} bf16_round_ops_elided_total={} dispatches_elided={} bytes_elided={} scratch_bytes_added={}",
-                proposals.len(),
-                logical_len,
-                usize::from(self.bf16_lattice_loads),
-                usize::from(self.bf16_lattice_loads),
-                usize::from(self.bf16_lattice_loads),
-                lattice_rounds_per_draft,
-                lattice_rounds_total,
-                MTP_BF16_LATTICE_DISPATCHES_ELIDED,
-                MTP_BF16_LATTICE_BYTES_ELIDED,
-                MTP_BF16_LATTICE_SCRATCH_BYTES_ADDED,
-            );
-            eprintln!(
-                "[gemma4-mtp bf16-producer-fusion] requested_drafts={draft_limit} returned_drafts={} enabled={} standalone_round_dispatches_per_draft={} standalone_round_elements_per_draft={} standalone_round_rw_bytes_per_draft={} elided_round_dispatches_per_draft={} elided_round_elements_per_draft={} elided_round_rw_bytes_per_draft={}",
-                proposals.len(),
-                usize::from(self.bf16_producer_fusion),
-                if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT },
-                if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT },
-                if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT },
-                if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT } else { 0 },
-                if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT } else { 0 },
-                if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT } else { 0 },
-            );
-            eprintln!(
-                "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format={} matrix_bytes_per_draft={} encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
-                proposals.len(),
-                if self.full_q4.is_some() { "q4_0_all" } else if self.q4_embedding.is_some() { "bf16_q4_0_head" } else { "bf16" },
-                self.assistant_matrix_bytes_per_proposal(),
-                total_timing.encode_us,
-                total_timing.wait_us,
-                total_timing.gpu_us,
-                total_timing.kernel_us,
-                total_timing.wall_us,
-            );
+            if mtp_spec_timing_enabled() {
+                eprintln!(
+                    "[gemma4-mtp bf16-lattice-loads] requested_drafts={draft_limit} returned_drafts={} target_logical_k={} enabled={} direct_query_qk={} direct_probability_context={} bf16_round_ops_elided_per_draft={} bf16_round_ops_elided_total={} dispatches_elided={} bytes_elided={} scratch_bytes_added={}",
+                    proposals.len(),
+                    logical_len,
+                    usize::from(self.bf16_lattice_loads),
+                    usize::from(self.bf16_lattice_loads),
+                    usize::from(self.bf16_lattice_loads),
+                    lattice_rounds_per_draft,
+                    lattice_rounds_total,
+                    MTP_BF16_LATTICE_DISPATCHES_ELIDED,
+                    MTP_BF16_LATTICE_BYTES_ELIDED,
+                    MTP_BF16_LATTICE_SCRATCH_BYTES_ADDED,
+                );
+                eprintln!(
+                    "[gemma4-mtp bf16-producer-fusion] requested_drafts={draft_limit} returned_drafts={} enabled={} standalone_round_dispatches_per_draft={} standalone_round_elements_per_draft={} standalone_round_rw_bytes_per_draft={} elided_round_dispatches_per_draft={} elided_round_elements_per_draft={} elided_round_rw_bytes_per_draft={}",
+                    proposals.len(),
+                    usize::from(self.bf16_producer_fusion),
+                    if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT },
+                    if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT },
+                    if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT },
+                    if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT } else { 0 },
+                    if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT } else { 0 },
+                    if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT } else { 0 },
+                );
+                eprintln!(
+                    "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format={} matrix_bytes_per_draft={} encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
+                    proposals.len(),
+                    if self.full_q4.is_some() { "q4_0_all" } else if self.q4_embedding.is_some() { "bf16_q4_0_head" } else { "bf16" },
+                    self.assistant_matrix_bytes_per_proposal(),
+                    total_timing.encode_us,
+                    total_timing.wait_us,
+                    total_timing.gpu_us,
+                    total_timing.kernel_us,
+                    total_timing.wall_us,
+                );
+            }
         }
         self.last_proposal_ledger = Some(ledger);
         Ok(proposals)
@@ -6059,6 +6070,14 @@ mod tests {
         assert!(mtp_step3_logit_trace_enabled_value(Some(" TrUe ")));
         assert!(mtp_step3_logit_trace_enabled_value(Some("ON")));
         assert!(mtp_step3_logit_trace_enabled_value(Some("yes")));
+    }
+
+    #[test]
+    fn recurring_timing_receipts_preserve_spec_timing_presence_semantics() {
+        assert!(!mtp_spec_timing_enabled_value(None));
+        assert!(mtp_spec_timing_enabled_value(Some("")));
+        assert!(mtp_spec_timing_enabled_value(Some("0")));
+        assert!(mtp_spec_timing_enabled_value(Some("1")));
     }
 
     #[test]

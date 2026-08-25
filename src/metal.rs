@@ -25579,6 +25579,14 @@ fn validate_live_sequential_probe_receipt(
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_receipt_logging_enabled(
+    probe_admitted: bool,
+    ghost_metal_timing: bool,
+) -> bool {
+    probe_admitted && ghost_metal_timing
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(any(target_os = "macos", test))]
 fn format_live_sequential_probe_receipt(
@@ -26788,9 +26796,10 @@ mod hot_cold_overlap_plan_tests {
         hot_cold_compact_slot_table, hot_cold_split_slot_tables, live_sequential_cold_candidates,
         live_sequential_format_ms, live_sequential_format_ratio,
         live_sequential_probe_cap_lattice_valid, live_sequential_probe_layer_observation_valid,
-        live_sequential_probe_observe_layer, live_sequential_probe_summary_lattice_valid,
-        live_sequential_probe_tally, live_sequential_receipt_wall_us, partition_exact_union_by_hot,
-        plan_retained_cold_layer, retained_cold_compact_slot_table,
+        live_sequential_probe_observe_layer, live_sequential_probe_receipt_logging_enabled,
+        live_sequential_probe_summary_lattice_valid, live_sequential_probe_tally,
+        live_sequential_receipt_wall_us, partition_exact_union_by_hot, plan_retained_cold_layer,
+        retained_cold_compact_slot_table,
         summarize_live_sequential_probe, validate_live_sequential_probe_receipt,
         ColdRecurrenceTally, CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
         Gemma4RetainedColdPlacement, LiveSequentialProbeSummary, LiveSequentialProbeTally,
@@ -26803,6 +26812,14 @@ mod hot_cold_overlap_plan_tests {
             mask[expert] = true;
         }
         mask
+    }
+
+    #[test]
+    fn live_sequential_receipt_logging_requires_admission_and_timing() {
+        assert!(!live_sequential_probe_receipt_logging_enabled(false, false));
+        assert!(!live_sequential_probe_receipt_logging_enabled(false, true));
+        assert!(!live_sequential_probe_receipt_logging_enabled(true, false));
+        assert!(live_sequential_probe_receipt_logging_enabled(true, true));
     }
 
     #[test]
@@ -34984,7 +35001,11 @@ impl Gemma4GhostCommonMetal {
                 "[metal chained cold-recurrence] sample=skipped reason=incomplete-exact-layer-sample observed_layers={cold_recurrence_observed_layers} expected_layers={n_layers} policy_mutation=0 start_pos={start_pos} K={k_tokens}"
             );
         }
-        if live_sequential_probe_admitted {
+        if live_sequential_probe_receipt_logging_enabled(
+            live_sequential_probe_admitted,
+            std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        ) {
             let receipt = live_sequential_observations
                 .as_deref()
                 .zip(live_sequential_read_wall_ms.as_deref())

@@ -2156,6 +2156,116 @@ const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
     46, 56, 59, 56, 58, 51,
 ];
 
+/// Immutable identifier for the exact no-watchdog interactive Mini2 profile
+/// promoted by the current API/WebUI evidence bundle. Changing any runtime
+/// shape or named scheduling selector requires a new identifier and evidence.
+pub const GEMMA4_MINI2_WEBUI_PROFILE_ID: &str =
+    "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1";
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Gemma4Mini2WebuiProfileFacts {
+    hot_slots_per_layer: Vec<usize>,
+    hybrid_mapped: bool,
+    cpu_fallback_forbidden: bool,
+    common_context_capacity: Option<usize>,
+    zero_host_cache: bool,
+    tied_head_loaded: bool,
+    mtp_loaded: bool,
+    mtp_full_q4: bool,
+    exact_expert_policy: bool,
+    exact_environment: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_mini2_webui_profile_admitted(facts: &Gemma4Mini2WebuiProfileFacts) -> bool {
+    ghost_metal_live_sequential_mini2_hot_profile_admitted(&facts.hot_slots_per_layer)
+        && facts.hybrid_mapped
+        && facts.cpu_fallback_forbidden
+        && facts.common_context_capacity == Some(1_024)
+        && facts.zero_host_cache
+        && facts.tied_head_loaded
+        && facts.mtp_loaded
+        && facts.mtp_full_q4
+        && facts.exact_expert_policy
+        && facts.exact_environment
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mini2_webui_environment_matches() -> bool {
+    let exact = |name: &str, expected: &str| {
+        std::env::var(name).as_deref() == Ok(expected)
+    };
+    let exact_pairs = [
+        ("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0"),
+        ("CAMELID_GEMMA4_GHOST_METAL", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_SLOTS", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_TURBO", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_COMMON", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_CONTEXT", "1024"),
+        ("CAMELID_GEMMA4_KV_INIT", "192"),
+        ("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT", "0"),
+        ("CAMELID_GEMMA4_GHOST_READ_THREADS", "8"),
+        (GHOST_METAL_DEMAND_LOAD_ONLY_ENV, "1"),
+        (GHOST_METAL_FILE_MAPPED_EXPERTS_ENV, "1"),
+        (GHOST_METAL_HYBRID_HOT_SLOTS_ENV, "32"),
+        (
+            GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV,
+            "60,64,45,43,40,41,44,42,47,46,40,41,44,46,42,50,40,39,46,47,41,46,45,43,46,56,59,56,58,51",
+        ),
+        (GHOST_METAL_HYBRID_HOT_PROFILE_FREE_ENV, "1"),
+        (GHOST_METAL_DECODE_PROMOTION_ENV, "0"),
+        ("CAMELID_GEMMA4_SLOT_PIN", "0"),
+        ("CAMELID_GEMMA4_GHOST_METAL_HOT_PIN", "0"),
+        ("CAMELID_GEMMA4_VICTIM_CACHE", "0"),
+        ("CAMELID_GEMMA4_VICTIM_MB", "0"),
+        ("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS", "0"),
+        ("CAMELID_GEMMA4_CHAINED_PREDICT", "0"),
+        ("CAMELID_SPEC_DECODE", "off"),
+        ("CAMELID_GEMMA4_SPEC_K1_LANE", "chained"),
+        ("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "15"),
+        ("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS", "15"),
+        (GEMMA4_MTP_ADAPTIVE_WIDTH_ENV, "1"),
+        ("CAMELID_GEMMA4_MTP_DEVICE_CHAIN", "1"),
+        (GEMMA4_MTP_FULL_Q4_ENV, "1"),
+        (GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP_ENV, "1"),
+        (GEMMA4_MTP_LOAD_WARMUP_ENV, "1"),
+        (GEMMA4_MTP_BOUNDARY_ARBITRATION_ENV, "1"),
+        ("CAMELID_GEMMA4_DENSE_K8_GENERIC", "1"),
+        ("CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT", "1"),
+        ("CAMELID_GEMMA4_MOE_MMA_K16", "1"),
+        ("CAMELID_GEMMA4_MTP_BF16_PRODUCER_FUSION", "1"),
+        ("CAMELID_GEMMA4_MTP_BF16_LATTICE_LOADS", "1"),
+        (GHOST_METAL_HYBRID_DEMAND_PROMOTION_ENV, "1"),
+        (GHOST_METAL_HYBRID_HOT_COLD_OVERLAP_ENV, "1"),
+        (GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV, "0"),
+        (GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV, "1"),
+        (GHOST_METAL_DIRECT_STAGE_READ_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_STAGE_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_ENV, "1"),
+        (GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV, "1"),
+        (GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL_ENV, "1"),
+    ];
+    let no_neighboring_selectors = std::env::vars_os().all(|(name, _)| {
+        let name = name.to_string_lossy();
+        let profile_scoped = name.starts_with("CAMELID_GEMMA4_")
+            || name.starts_with("CAMELID_SPEC_")
+            || name.starts_with("CAMELID_GHOST_");
+        !profile_scoped
+            || name == "CAMELID_GEMMA4_MTP_ASSISTANT_PATH"
+            || exact_pairs.iter().any(|(allowed, _)| name == *allowed)
+    });
+    exact_pairs
+        .iter()
+        .all(|(name, expected)| exact(name, expected))
+        && std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
+            .is_some_and(|path| !path.is_empty())
+        && no_neighboring_selectors
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn ghost_metal_live_sequential_mini2_hot_profile_admitted(profile: &[usize]) -> bool {
     profile == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
@@ -2246,6 +2356,11 @@ const GHOST_METAL_EXACT_RESIDENCY_TRACE_ENV: &str =
 /// prompt-only route recency/chunk-presence scores at the prefill handoff.
 const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF";
+/// Default-off H71 subordinate policy: when the prompt route union does not
+/// fill a layer's fixed footprint, retain deterministically ranked identities
+/// that already occupy that layer. The parent H71 selector remains mandatory.
+const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL";
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP: usize = 8;
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16: usize = 16;
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS: usize =
@@ -2481,6 +2596,19 @@ fn ghost_metal_prompt_ranked_hot_handoff_from(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+    prompt_ranked_enabled: bool,
+    resident_fill_enabled: bool,
+) -> bool {
+    prompt_ranked_enabled && resident_fill_enabled
+}
+
 #[cfg(target_os = "macos")]
 fn ghost_metal_prompt_ranked_hot_handoff_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2491,6 +2619,23 @@ fn ghost_metal_prompt_ranked_hot_handoff_enabled() -> bool {
                 .as_deref(),
         )
     })
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_prompt_ranked_hot_handoff_resident_fill_enabled(
+    prompt_ranked_enabled: bool,
+) -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+        prompt_ranked_enabled,
+        *FLAG.get_or_init(|| {
+            ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(
+                std::env::var(GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        }),
+    )
 }
 
 /// Stable, fail-closed candidate construction. Earlier sources have strict
@@ -2536,16 +2681,22 @@ fn deterministic_sparse_decay_candidates(scores: &[f32], top_n: usize) -> Vec<us
 
 /// Choose exactly the fixed physical footprint from identities observed in
 /// the current prompt. Scores are maintained by `record_layer_routes`; stable
-/// expert-ID ties make the handoff deterministic. No decode route or output is
-/// available when this function runs.
+/// expert-ID ties make the handoff deterministic. The legacy path fails closed
+/// when any prompt layer is underfilled. A caller that explicitly supplies
+/// resident identities may use them, ranked by the same score/ID order, solely
+/// to preserve the fixed footprint without introducing another read. No decode
+/// route or output is available when this function runs.
 #[cfg(any(target_os = "macos", test))]
 fn prompt_ranked_hot_handoff_routes(
     prompt_unions: &[[u64; 2]],
     prompt_scores: &[Vec<f32>],
+    resident_experts: Option<&[Vec<usize>]>,
     capacities: &[usize],
 ) -> Option<Vec<Vec<usize>>> {
     if prompt_unions.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS
         || prompt_scores.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS
+        || resident_experts
+            .is_some_and(|residents| residents.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS)
         || !ghost_metal_live_sequential_mini2_hot_profile_admitted(capacities)
     {
         return None;
@@ -2554,22 +2705,70 @@ fn prompt_ranked_hot_handoff_routes(
         .iter()
         .zip(prompt_scores)
         .zip(capacities)
-        .map(|((union, scores), &capacity)| {
+        .enumerate()
+        .map(|(layer_idx, ((union, scores), &capacity))| {
             if scores.len() != 128 || scores.iter().any(|score| !score.is_finite()) {
                 return None;
             }
             let mut ranked = (0..128)
                 .filter(|&expert| (union[expert / 64] & (1u64 << (expert % 64))) != 0)
                 .collect::<Vec<_>>();
-            if ranked.len() < capacity {
-                return None;
-            }
             ranked
                 .sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b)));
+            if ranked.len() < capacity {
+                let residents = resident_experts?.get(layer_idx)?;
+                let mut resident_seen = [false; 128];
+                for &expert in residents {
+                    if expert >= 128 || resident_seen[expert] {
+                        return None;
+                    }
+                    resident_seen[expert] = true;
+                }
+                let mut selected = [false; 128];
+                for &expert in &ranked {
+                    selected[expert] = true;
+                }
+                let mut resident_padding = residents
+                    .iter()
+                    .copied()
+                    .filter(|&expert| !selected[expert])
+                    .collect::<Vec<_>>();
+                resident_padding.sort_unstable_by(|&a, &b| {
+                    scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b))
+                });
+                let missing = capacity - ranked.len();
+                if resident_padding.len() < missing {
+                    return None;
+                }
+                ranked.extend(resident_padding.into_iter().take(missing));
+            }
             ranked.truncate(capacity);
             Some(ranked)
         })
         .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prompt_ranked_hot_handoff_receipt_labels(
+    admitted: bool,
+    resident_fill_enabled: bool,
+) -> (&'static str, &'static str) {
+    if !admitted {
+        (
+            "baseline-interval-union-or-latest-route",
+            "expert-id-asc-or-route-order",
+        )
+    } else if resident_fill_enabled {
+        (
+            "current-prompt-exact-route-union-plus-resident-padding",
+            "prompt-decay-score-desc-then-resident-score-desc-expert-id-asc",
+        )
+    } else {
+        (
+            "current-prompt-exact-route-union",
+            "decay-score-desc-expert-id-asc",
+        )
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3265,13 +3464,39 @@ fn ghost_metal_chained_prediction_allowed(
     k_tokens: usize,
     exact_repeat: bool,
     prediction_forced: bool,
+    allow_dropped_experts: bool,
 ) -> bool {
-    let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     !demand_load_only
         && !suppress_prediction
         && k_tokens > 1
-        && (exact_repeat || prediction_forced || allow_drop)
+        && (exact_repeat || prediction_forced || allow_dropped_experts)
+}
+
+/// Construction-time policy for the only Ghost-Metal escape hatch that can
+/// intentionally omit a selected expert. Keep parsing separate from the live
+/// environment so both the support receipt and every decode decision use the
+/// same immutable value for the lifetime of the loaded runtime.
+#[cfg(any(target_os = "macos", test))]
+fn ghost_allow_dropped_experts_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_allow_dropped_experts_from_environment() -> bool {
+    ghost_allow_dropped_experts_from(
+        std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_exact_expert_policy_admitted(
+    ghost_moe_active: bool,
+    metal_experts_active: bool,
+    allow_dropped_experts: bool,
+) -> bool {
+    ghost_moe_active && metal_experts_active && !allow_dropped_experts
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3998,6 +4223,10 @@ struct GhostMetalExpertRuntime {
     engine: crate::metal::Gemma4Q4ExpertMetal,
     layers: Vec<GhostMetalExpertLayer>,
     fused_fast: bool,
+    /// Immutable construction-time capture of the explicit lossy expert
+    /// escape hatch. Runtime routing never re-reads process environment, so a
+    /// later mutation cannot invalidate the policy reported to health/API.
+    allow_dropped_experts: bool,
     /// Latched at construction so a later environment mutation cannot turn a
     /// bounded or mapped correctness refusal into CPU fallback.
     cpu_fallback_forbidden: bool,
@@ -7716,6 +7945,7 @@ impl GhostMetalExpertRuntime {
             engine,
             layers,
             fused_fast,
+            allow_dropped_experts: ghost_allow_dropped_experts_from_environment(),
             cpu_fallback_forbidden: bounded_record_failclose,
             common: None,
             sequence_mode: GhostMetalSequenceMode::Idle,
@@ -8046,6 +8276,7 @@ impl GhostMetalExpertRuntime {
             engine,
             layers,
             fused_fast,
+            allow_dropped_experts: ghost_allow_dropped_experts_from_environment(),
             cpu_fallback_forbidden: true,
             common: None,
             sequence_mode: GhostMetalSequenceMode::Idle,
@@ -8456,6 +8687,8 @@ impl GhostMetalExpertRuntime {
             })
             .collect();
         let prompt_ranked_requested = ghost_metal_prompt_ranked_hot_handoff_enabled();
+        let prompt_ranked_resident_fill_enabled =
+            ghost_metal_prompt_ranked_hot_handoff_resident_fill_enabled(prompt_ranked_requested);
         let capacities = self
             .layers
             .iter()
@@ -8467,9 +8700,22 @@ impl GhostMetalExpertRuntime {
         self.prompt_ranked_handoff_armed = false;
         let prompt_ranked_routes = prompt_ranked_shape_admitted
             .then(|| {
+                let resident_experts = prompt_ranked_resident_fill_enabled.then(|| {
+                    self.layers
+                        .iter()
+                        .map(|layer| {
+                            (0..128)
+                                .filter(|&expert| {
+                                    layer.directory.lookup_resident_slot(expert).is_some()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                });
                 prompt_ranked_hot_handoff_routes(
                     &self.prompt_ranked_route_union,
                     &self.prompt_ranked_route_scores,
+                    resident_experts.as_deref(),
                     &capacities,
                 )
             })
@@ -8513,9 +8759,9 @@ impl GhostMetalExpertRuntime {
             .collect::<Vec<_>>();
         let occupied_total = installed_routes.iter().map(Vec::len).sum::<usize>();
         // This is the terminal promotion belonging to the prompt interval,
-        // merely delayed to the explicit handoff barrier. Prompt ranking only
-        // bounds and reorders identities from that already-recorded union; it
-        // never introduces a decode-derived or external profile identity.
+        // merely delayed to the explicit handoff barrier. Prompt ranking owns
+        // selection; the subordinate opt-in may retain already-resident
+        // identities solely to pad an underfilled layer without another read.
         if let Some(common) = self.common.as_mut() {
             use std::sync::atomic::Ordering::Relaxed;
             common.last_chained_ledger.nvme_ms = counters.nvme_us.load(Relaxed) as f64 / 1_000.0;
@@ -8533,17 +8779,10 @@ impl GhostMetalExpertRuntime {
         );
 
         if prompt_ranked_requested {
-            let (receipt_source, receipt_ranking) = if prompt_ranked_admitted {
-                (
-                    "current-prompt-exact-route-union",
-                    "decay-score-desc-expert-id-asc",
-                )
-            } else {
-                (
-                    "baseline-interval-union-or-latest-route",
-                    "expert-id-asc-or-route-order",
-                )
-            };
+            let (receipt_source, receipt_ranking) = prompt_ranked_hot_handoff_receipt_labels(
+                prompt_ranked_admitted,
+                prompt_ranked_resident_fill_enabled,
+            );
             let selected_masks = routes
                 .iter()
                 .enumerate()
@@ -8876,6 +9115,7 @@ impl GhostMetalExpertRuntime {
             k_tokens,
             exact_repeat,
             chained_predict_forced(),
+            self.allow_dropped_experts,
         );
         // The pre-router speculative fill wants a PREDICTION of what this layer
         // will route, and "every expert currently resident" is not one: under
@@ -9334,6 +9574,7 @@ impl GhostMetalExpertRuntime {
         };
         let ready_stage_buf_for_fill = ready_stage_buf.clone();
         let live_sequential_stage_for_fill = live_sequential_stage.clone();
+        let allow_dropped_experts = self.allow_dropped_experts;
         let layers_ref = &mut self.layers;
         let mut three_wave_pending: Option<CompactThreeWaveDemandPlan> = None;
         let mut slot_filler = ghost_cache.map(|cache| {
@@ -9713,9 +9954,7 @@ impl GhostMetalExpertRuntime {
                     return true;
                 }
 
-                let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
-                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                if allow_drop {
+                if allow_dropped_experts {
                     for e in 0..128 {
                         let s = layer.directory.resident_slot_table[e];
                         updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
@@ -12830,6 +13069,11 @@ pub struct Gemma4Runtime {
     /// never contend on that execution mutex.
     #[cfg(target_os = "macos")]
     mtp_assistant_health: Gemma4MtpAssistantHealth,
+    /// Immutable load-time receipt for the exact Mini2 WebUI profile. Live
+    /// accelerator switches remain separate health gates; this identifier can
+    /// never be minted by a merely similar ad-hoc Metal configuration.
+    #[cfg(target_os = "macos")]
+    ghost_webui_profile_receipt: Option<&'static str>,
     /// Non-zero only between an exact seeded prefill and the one generation
     /// call allowed to consume it. Every target-state mutation clears it.
     mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64,
@@ -14348,6 +14592,7 @@ fn mtp_scheduled_verify_width(
 }
 
 const MTP_ADAPTIVE_BASE_VERIFY_K: usize = 10;
+const MTP_ADAPTIVE_MIN_VERIFY_K: usize = 4;
 
 fn mtp_initial_verify_width(adaptive: bool, max_verify_k: usize) -> usize {
     if adaptive {
@@ -14370,8 +14615,25 @@ fn mtp_next_verify_width(
     if accepted_drafts == proposed_drafts {
         current_verify_k.saturating_add(1).min(max_verify_k)
     } else {
-        max_verify_k.min(MTP_ADAPTIVE_BASE_VERIFY_K)
+        let floor = max_verify_k.min(MTP_ADAPTIVE_MIN_VERIFY_K);
+        accepted_drafts
+            .min(proposed_drafts)
+            .saturating_add(2)
+            .max(floor)
+            .min(max_verify_k)
     }
+}
+
+fn mtp_spec_timing_enabled_value(value: Option<&str>) -> bool {
+    value.is_some()
+}
+
+fn mtp_spec_timing_enabled() -> bool {
+    mtp_spec_timing_enabled_value(
+        std::env::var("CAMELID_GEMMA4_SPEC_TIMING")
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn mtp_code_output_hint(prompt: &str) -> bool {
@@ -16731,6 +16993,33 @@ impl Gemma4Runtime {
                 .as_ref()
                 .is_some_and(crate::metal::Gemma4MtpAssistantMetal::full_q4_enabled),
         };
+        #[cfg(target_os = "macos")]
+        let ghost_webui_profile_receipt = metal_q4_experts.lock().ok().and_then(|guard| {
+            let lane = guard.as_ref()?;
+            let facts = Gemma4Mini2WebuiProfileFacts {
+                hot_slots_per_layer: lane
+                    .layers
+                    .iter()
+                    .map(|layer| layer.slots.writable_slot_count())
+                    .collect(),
+                hybrid_mapped: lane.has_hybrid_mapped_backing(),
+                cpu_fallback_forbidden: lane.cpu_fallback_forbidden(),
+                common_context_capacity: lane
+                    .common
+                    .as_ref()
+                    .map(crate::metal::Gemma4GhostCommonMetal::max_positions),
+                zero_host_cache: ghost_moe_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.budget_bytes == 0),
+                tied_head_loaded: metal_q6k_head.is_some(),
+                mtp_loaded: mtp_assistant_health.loaded,
+                mtp_full_q4: mtp_assistant_health.full_q4_active,
+                exact_expert_policy: ghost_moe_cache.is_some() && !lane.allow_dropped_experts,
+                exact_environment: gemma4_mini2_webui_environment_matches(),
+            };
+            gemma4_mini2_webui_profile_admitted(&facts)
+                .then_some(GEMMA4_MINI2_WEBUI_PROFILE_ID)
+        });
         let runtime = Self {
             tokenizer,
             first_layer: range.start,
@@ -16763,6 +17052,8 @@ impl Gemma4Runtime {
             mtp_assistant: std::sync::Mutex::new(mtp_assistant),
             #[cfg(target_os = "macos")]
             mtp_assistant_health,
+            #[cfg(target_os = "macos")]
+            ghost_webui_profile_receipt,
             mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64::new(0),
             layers,
             config,
@@ -16883,6 +17174,75 @@ impl Gemma4Runtime {
         #[cfg(not(target_os = "macos"))]
         {
             Gemma4GhostMetalComponents::default()
+        }
+    }
+
+    /// Live dispatch eligibility for every Ghost-Metal component. This is the
+    /// same predicate used by prefill and decode, including the explicit
+    /// `CAMELID_GEMMA4_GHOST_METAL=0` opt-out, the runtime GPU switch, and
+    /// deterministic mode.
+    pub fn ghost_metal_acceleration_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            ghost_metal_acceleration_enabled()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Immutable identifier for the exact load-time Mini2 WebUI profile, or
+    /// `None` for every neighboring/ad-hoc Ghost configuration.
+    pub fn ghost_webui_profile_receipt(&self) -> Option<&'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.ghost_webui_profile_receipt
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Whether this live Ghost-Metal expert runtime was constructed under the
+    /// exact fail-closed policy: a Ghost source is bound, the Metal expert lane
+    /// is still owned, and the dropped-expert escape hatch was not enabled.
+    /// This is a load-time policy receipt; it never re-reads process environment.
+    pub fn ghost_exact_expert_policy_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let metal = self.metal_q4_experts.lock().ok();
+            let lane = metal.as_deref().and_then(Option::as_ref);
+            ghost_exact_expert_policy_admitted(
+                self.ghost_moe_cache.is_some(),
+                lane.is_some(),
+                lane.is_some_and(|lane| lane.allow_dropped_experts),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Actual capacity of the currently owned, fully configured Ghost common
+    /// Metal core. The value comes from the constructed Metal object rather
+    /// than the mutable environment used to request its load-time allocation.
+    pub fn ghost_metal_context_capacity(&self) -> Option<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            let guard = self.metal_q4_experts.lock().ok()?;
+            guard
+                .as_ref()?
+                .common
+                .as_ref()
+                .filter(|common| common.moe_configured())
+                .map(crate::metal::Gemma4GhostCommonMetal::max_positions)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
         }
     }
 
@@ -18516,6 +18876,7 @@ impl Gemma4Runtime {
         let mut current_verify_k = mtp_initial_verify_width(adaptive_width, max_verify_k);
         let mut width_schedule_round_index = 0usize;
         let device_chain_requested = crate::metal::device_chain_requested_from_environment()?;
+        let spec_timing = mtp_spec_timing_enabled();
 
         let generation_started = std::time::Instant::now();
         if kc.len() != self.layers.len() || vc.len() != self.layers.len() {
@@ -19156,14 +19517,16 @@ impl Gemma4Runtime {
                 total_wall_us: mtp_us_saturating(round_started.elapsed().as_micros()),
             });
             let round = output.rounds.last().expect("round present");
-            eprintln!(
-                "[mtp round] #{round_index} wall={:.2}ms (assistant={:.2}ms, verifier={:.2}ms) accepted={}/{}",
-                round.total_wall_us as f64 / 1000.0,
-                assistant_wall_us as f64 / 1000.0,
-                verify_wall_us as f64 / 1000.0,
-                accepted_drafts,
-                round.verifier_k
-            );
+            if spec_timing {
+                eprintln!(
+                    "[mtp round] #{round_index} wall={:.2}ms (assistant={:.2}ms, verifier={:.2}ms) accepted={}/{}",
+                    round.total_wall_us as f64 / 1000.0,
+                    assistant_wall_us as f64 / 1000.0,
+                    verify_wall_us as f64 / 1000.0,
+                    accepted_drafts,
+                    round.verifier_k
+                );
+            }
             if let Some(cb) = on_round.as_deref_mut() {
                 cb(round);
             }
@@ -29225,6 +29588,48 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn mini2_webui_profile_receipt_fails_closed_on_every_runtime_dimension() {
+        let exact = Gemma4Mini2WebuiProfileFacts {
+            hot_slots_per_layer: GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE.to_vec(),
+            hybrid_mapped: true,
+            cpu_fallback_forbidden: true,
+            common_context_capacity: Some(1_024),
+            zero_host_cache: true,
+            tied_head_loaded: true,
+            mtp_loaded: true,
+            mtp_full_q4: true,
+            exact_expert_policy: true,
+            exact_environment: true,
+        };
+        assert!(gemma4_mini2_webui_profile_admitted(&exact));
+
+        let mut neighbors = Vec::new();
+        let mut wrong_slots = exact.clone();
+        wrong_slots.hot_slots_per_layer.swap(0, 1);
+        neighbors.push(wrong_slots);
+        for mutate in [
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.hybrid_mapped = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.cpu_fallback_forbidden = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.zero_host_cache = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.tied_head_loaded = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.mtp_loaded = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.mtp_full_q4 = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.exact_expert_policy = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.exact_environment = false,
+        ] {
+            let mut neighbor = exact.clone();
+            mutate(&mut neighbor);
+            neighbors.push(neighbor);
+        }
+        let mut wrong_context = exact.clone();
+        wrong_context.common_context_capacity = Some(2_048);
+        neighbors.push(wrong_context);
+        assert!(neighbors
+            .iter()
+            .all(|facts| !gemma4_mini2_webui_profile_admitted(facts)));
+    }
+
+    #[test]
     fn live_sequential_predict_probe_is_exact_positive_and_default_off() {
         assert!(!ghost_metal_live_sequential_predict_probe_from(None));
         assert!(ghost_metal_live_sequential_predict_probe_from(Some("1")));
@@ -29258,6 +29663,30 @@ mod mtp_target_seam_tests {
                 "unexpected prompt-ranked handoff admission for {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_ranked_resident_fill_is_exact_positive_default_off_and_subordinate() {
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(None));
+        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(Some(value)),
+                "unexpected resident-fill admission for {value:?}"
+            );
+        }
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+            false, false
+        ));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+            false, true
+        ));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+            true, false
+        ));
+        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+            true, true
+        ));
     }
 
     #[test]
@@ -29671,6 +30100,7 @@ mod mtp_target_seam_tests {
         let routes = prompt_ranked_hot_handoff_routes(
             &unions,
             &scores,
+            None,
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
         )
         .expect("exact H49 prompt ranking");
@@ -29681,23 +30111,104 @@ mod mtp_target_seam_tests {
 
         let mut wrong_capacity = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
         wrong_capacity.swap(0, 1);
-        assert!(prompt_ranked_hot_handoff_routes(&unions, &scores, &wrong_capacity).is_none());
+        assert!(prompt_ranked_hot_handoff_routes(
+            &unions,
+            &scores,
+            None,
+            &wrong_capacity
+        )
+        .is_none());
         let mut nonfinite = scores.clone();
         nonfinite[4][9] = f32::NAN;
         assert!(prompt_ranked_hot_handoff_routes(
             &unions,
             &nonfinite,
+            None,
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
         )
         .is_none());
-        let mut underfilled = unions.clone();
+    }
+
+    #[test]
+    fn prompt_ranked_handoff_legacy_underfill_preserves_fail_closed_fallback() {
+        let mut underfilled = vec![[u64::MAX; 2]; 30];
         underfilled[0] = [0xff, 0];
+        let scores = vec![vec![0.0; 128]; 30];
         assert!(prompt_ranked_hot_handoff_routes(
             &underfilled,
             &scores,
+            None,
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
         )
         .is_none());
+    }
+
+    #[test]
+    fn prompt_ranked_handoff_resident_fill_pads_deterministically_and_fails_closed() {
+        let mut underfilled = vec![[u64::MAX; 2]; 30];
+        underfilled[0] = [0xff, 0];
+        let mut scores = vec![vec![0.0; 128]; 30];
+        for layer_scores in &mut scores {
+            layer_scores[100] = 3.0;
+            layer_scores[101] = 2.0;
+        }
+        let residents = vec![(0..128).collect::<Vec<_>>(); 30];
+        let padded = prompt_ranked_hot_handoff_routes(
+            &underfilled,
+            &scores,
+            Some(residents.as_slice()),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .expect("resident identities pad an underfilled prompt layer");
+        assert_eq!(
+            padded[0].len(),
+            GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE[0]
+        );
+        assert_eq!(padded[0][..8], [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(padded[0][8..10], [100, 101]);
+
+        let no_residents = vec![Vec::new(); 30];
+        assert!(prompt_ranked_hot_handoff_routes(
+            &underfilled,
+            &scores,
+            Some(no_residents.as_slice()),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .is_none());
+        let mut duplicate_resident = residents.clone();
+        duplicate_resident[0].push(0);
+        assert!(prompt_ranked_hot_handoff_routes(
+            &underfilled,
+            &scores,
+            Some(duplicate_resident.as_slice()),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn prompt_ranked_handoff_receipt_labels_preserve_legacy_bytes_by_default() {
+        assert_eq!(
+            prompt_ranked_hot_handoff_receipt_labels(true, false),
+            (
+                "current-prompt-exact-route-union",
+                "decay-score-desc-expert-id-asc"
+            )
+        );
+        assert_eq!(
+            prompt_ranked_hot_handoff_receipt_labels(true, true),
+            (
+                "current-prompt-exact-route-union-plus-resident-padding",
+                "prompt-decay-score-desc-then-resident-score-desc-expert-id-asc"
+            )
+        );
+        assert_eq!(
+            prompt_ranked_hot_handoff_receipt_labels(false, true),
+            (
+                "baseline-interval-union-or-latest-route",
+                "expert-id-asc-or-route-order"
+            )
+        );
     }
 
     #[test]
@@ -30592,12 +31103,24 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
-    fn mtp_adaptive_width_resets_on_rejection_and_fixed_mode_does_not_move() {
+    fn mtp_adaptive_width_backs_off_from_acceptance_and_fixed_mode_does_not_move() {
         assert_eq!(mtp_initial_verify_width(false, 12), 12);
         assert_eq!(mtp_next_verify_width(false, 12, 12, 7, 3), 12);
         assert_eq!(mtp_initial_verify_width(true, 8), 8);
         assert_eq!(mtp_next_verify_width(true, 12, 11, 10, 10), 12);
-        assert_eq!(mtp_next_verify_width(true, 12, 12, 11, 7), 10);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 4), 6);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 3), 5);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 0), 4);
+        assert_eq!(mtp_next_verify_width(true, 12, 12, 11, 10), 12);
+        assert_eq!(mtp_next_verify_width(true, 3, 3, 2, 0), 3);
+    }
+
+    #[test]
+    fn mtp_round_timing_log_preserves_spec_timing_presence_semantics() {
+        assert!(!mtp_spec_timing_enabled_value(None));
+        assert!(mtp_spec_timing_enabled_value(Some("")));
+        assert!(mtp_spec_timing_enabled_value(Some("0")));
+        assert!(mtp_spec_timing_enabled_value(Some("1")));
     }
 
     #[test]
@@ -33222,23 +33745,42 @@ mod ghost_moe_wire_tests {
     #[test]
     fn metal_demand_only_never_selects_all_layer_predicted_schedule() {
         assert!(ghost_metal_chained_prediction_allowed(
-            false, false, 8, true, false
+            false, false, 8, true, false, false
         ));
         assert!(ghost_metal_chained_prediction_allowed(
-            false, false, 8, false, true
+            false, false, 8, false, true, false
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            true, false, 8, true, true
+            true, false, 8, true, true, true
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            false, true, 8, true, true
+            false, true, 8, true, true, true
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            false, false, 1, true, true
+            false, false, 1, true, true, true
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            false, false, 8, false, false
+            false, false, 8, false, false, false
         ));
+        assert!(ghost_metal_chained_prediction_allowed(
+            false, false, 8, false, false, true
+        ));
+    }
+
+    #[test]
+    fn dropped_expert_policy_is_exactly_parsed_and_requires_a_live_ghost_metal_lane() {
+        for admitted in ["1", "true", "TRUE", "True"] {
+            assert!(ghost_allow_dropped_experts_from(Some(admitted)));
+        }
+        for refused in ["", "0", "false", "yes", "on", "01", " 1", "1 "] {
+            assert!(!ghost_allow_dropped_experts_from(Some(refused)));
+        }
+        assert!(!ghost_allow_dropped_experts_from(None));
+
+        assert!(ghost_exact_expert_policy_admitted(true, true, false));
+        assert!(!ghost_exact_expert_policy_admitted(false, true, false));
+        assert!(!ghost_exact_expert_policy_admitted(true, false, false));
+        assert!(!ghost_exact_expert_policy_admitted(true, true, true));
     }
 
     #[cfg(target_os = "macos")]

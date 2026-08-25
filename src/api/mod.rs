@@ -753,7 +753,8 @@ pub struct HealthResponse {
     pub gemma4_available: bool,
     /// Concrete Gemma 4 serving lane for the active model. Together with the
     /// Ghost marker/component health below, this keeps support scoped to the
-    /// validated distributed and catalog-managed Windows CUDA lanes.
+    /// validated distributed, catalog-managed Windows CUDA, and exact Mini2
+    /// full-Metal/MTP lanes.
     pub gemma4_serve_lane: Option<Gemma4ServeLane>,
     /// Effective common-core accelerator for the active single-node Ghost-MoE
     /// runtime. `Some(true)` means the exact common Metal runtime was admitted
@@ -763,6 +764,17 @@ pub struct HealthResponse {
     /// registry transitions report `None` so the UI never infers a GPU from a
     /// stale load-time plan.
     pub gemma4_ghost_common_metal_active: Option<bool>,
+    /// Actual position capacity of the constructed full-common Metal KV lane.
+    /// This may be much smaller than GGUF `n_ctx_train`; clients must use this
+    /// runtime value when budgeting a Ghost-MoE conversation.
+    pub gemma4_ghost_common_metal_context_capacity: Option<u32>,
+    /// Construction-time proof that the local Ghost expert lane is exact and
+    /// the dropped-expert escape hatch is disabled. `None` means this is not a
+    /// local Ghost-Metal runtime.
+    pub gemma4_ghost_exact_expert_policy_active: Option<bool>,
+    /// Immutable load-time identifier for the exact evidenced Mini2 serving
+    /// profile. Similar full-Metal configurations deliberately report `None`.
+    pub gemma4_ghost_runtime_profile: Option<String>,
     /// Effective high-level Ghost-MoE execution shape after applying the live
     /// GPU switch and deterministic-mode gate.
     pub gemma4_ghost_execution_mode: Option<Gemma4GhostExecutionMode>,
@@ -3505,10 +3517,18 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     // take the stateful CUDA generation lock. Then apply both live dispatch
     // gates so POST /api/runtime/gpu and deterministic mode are reflected on
     // the very next health poll without a model reload.
-    let metal_constructed = gemma4_runtime
+    let metal_dispatch_active = gemma4_runtime
+        .as_deref()
+        .is_some_and(Gemma4ServeRuntime::ghost_metal_acceleration_active);
+    let metal_owned_components = gemma4_runtime
         .as_deref()
         .map(Gemma4ServeRuntime::ghost_metal_components_constructed)
         .unwrap_or_default();
+    let metal_constructed = if metal_dispatch_active {
+        metal_owned_components
+    } else {
+        Default::default()
+    };
     let cuda_constructed = gemma4_runtime
         .as_deref()
         .map(Gemma4ServeRuntime::ghost_cuda_components_constructed)
@@ -3524,6 +3544,30 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     let mtp_assistant_health = gemma4_runtime
         .as_deref()
         .and_then(Gemma4ServeRuntime::mtp_assistant_health);
+    let ghost_common_metal_context_capacity = ghost_execution
+        .filter(|health| health.common_metal_active)
+        .and_then(|_| {
+            gemma4_runtime
+                .as_deref()
+                .and_then(Gemma4ServeRuntime::ghost_metal_context_capacity)
+        })
+        .and_then(|capacity| capacity.try_into().ok());
+    let ghost_exact_expert_policy_active = (gemma4_serve_lane
+        == Some(Gemma4ServeLane::GhostMoe)
+        && metal_owned_components.experts)
+        .then(|| {
+            gemma4_runtime
+                .as_deref()
+                .is_some_and(Gemma4ServeRuntime::ghost_exact_expert_policy_active)
+        });
+    let ghost_runtime_profile = (gemma4_serve_lane == Some(Gemma4ServeLane::GhostMoe))
+        .then(|| {
+            gemma4_runtime
+                .as_deref()
+                .and_then(Gemma4ServeRuntime::ghost_webui_profile_receipt)
+                .map(str::to_owned)
+        })
+        .flatten();
     let slot = state.engine.slot_snapshot();
     HealthResponse {
         ok: true,
@@ -3542,6 +3586,9 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         gemma4_available,
         gemma4_serve_lane,
         gemma4_ghost_common_metal_active: ghost_execution.map(|health| health.common_metal_active),
+        gemma4_ghost_common_metal_context_capacity: ghost_common_metal_context_capacity,
+        gemma4_ghost_exact_expert_policy_active: ghost_exact_expert_policy_active,
+        gemma4_ghost_runtime_profile: ghost_runtime_profile,
         gemma4_ghost_execution_mode: ghost_execution.map(|health| health.mode),
         gemma4_mtp_assistant_loaded: mtp_assistant_health.map(|health| health.0),
         gemma4_mtp_full_q4_active: mtp_assistant_health.map(|health| health.1),
@@ -3660,6 +3707,9 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         gemma4_available: false,
         gemma4_serve_lane: None,
         gemma4_ghost_common_metal_active: None,
+        gemma4_ghost_common_metal_context_capacity: None,
+        gemma4_ghost_exact_expert_policy_active: None,
+        gemma4_ghost_runtime_profile: None,
         gemma4_ghost_execution_mode: None,
         gemma4_mtp_assistant_loaded: None,
         gemma4_mtp_full_q4_active: None,
@@ -3814,6 +3864,18 @@ mod gemma4_serve_lane_health_tests {
             serde_json::Value::Null
         );
         assert_eq!(
+            value["gemma4_ghost_common_metal_context_capacity"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_exact_expert_policy_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_runtime_profile"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
             value["gemma4_ghost_execution_mode"],
             serde_json::Value::Null
         );
@@ -3847,6 +3909,18 @@ mod gemma4_serve_lane_health_tests {
         assert_eq!(value["gemma4_serve_lane"], serde_json::Value::Null);
         assert_eq!(
             value["gemma4_ghost_common_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_common_metal_context_capacity"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_exact_expert_policy_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_runtime_profile"],
             serde_json::Value::Null
         );
         assert_eq!(
@@ -4057,6 +4131,10 @@ mod gemma4_serve_lane_health_tests {
     fn ghost_execution_health_serializes_mode_and_false_components() {
         let mut response = busy_health_response(&AppState::default());
         response.gemma4_ghost_common_metal_active = Some(false);
+        response.gemma4_ghost_common_metal_context_capacity = Some(1_024);
+        response.gemma4_ghost_exact_expert_policy_active = Some(true);
+        response.gemma4_ghost_runtime_profile =
+            Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID.into());
         response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::HybridMetal);
         response.gemma4_ghost_experts_metal_active = Some(true);
         response.gemma4_ghost_head_metal_active = Some(false);
@@ -4068,6 +4146,12 @@ mod gemma4_serve_lane_health_tests {
         response.gemma4_mtp_full_q4_active = Some(true);
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["gemma4_ghost_common_metal_active"], false);
+        assert_eq!(value["gemma4_ghost_common_metal_context_capacity"], 1_024);
+        assert_eq!(value["gemma4_ghost_exact_expert_policy_active"], true);
+        assert_eq!(
+            value["gemma4_ghost_runtime_profile"],
+            crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID
+        );
         assert_eq!(value["gemma4_ghost_execution_mode"], "hybrid_metal");
         assert_eq!(value["gemma4_ghost_experts_metal_active"], true);
         assert_eq!(value["gemma4_ghost_head_metal_active"], false);
@@ -5730,7 +5814,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q4_0 (QAT rows)",
                 status: "supported_named_exact_rows_only",
-                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either two-Mac distributed serve or the catalog-managed Windows CUDA Ghost-MoE lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
+                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through two-Mac distributed serve, the catalog-managed Windows CUDA Ghost-MoE lane, or the exact macOS aarch64 Apple M4 full-Metal Ghost-MoE/MTP lane whose reconciled execution plan attests the prepared target hash, Mini2 host envelope, and every required live component; partial Metal shapes and other Apple hosts remain experimental. The Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
             },
             SupportItem {
                 id: "TQ2_0",
@@ -6581,18 +6665,18 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 family: "gemma4_a4b_moe_decoder",
                 quantization: "Q4_0",
                 status: "supported_exact_row_smoke",
-                support_scope: "exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only",
+                support_scope: "exact_row_distributed_or_apple_m4_full_metal_ghost_moe_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "the 13.4GB full row is not laptop-VRAM-resident and requires either two-node distributed serving or the catalog-prepared Windows CUDA Ghost-MoE lane; the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, cross-platform Ghost promotion, normalized performance/RSS gate, or durable current-head refresh exists yet",
+                full_support_blockers: "the 13.4GB full row is not laptop-VRAM-resident, so current single-node support is restricted to the exact macOS aarch64 Apple M4 full-Metal Ghost-MoE/MTP shape; the catalog-prepared Windows CUDA implementation has retained performance/correctness evidence but its v1 marker does not cryptographically bind the current sparse-shadow and cghost bytes, so frontend promotion is withheld pending a digest-bound install receipt; the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, broader Apple-host or cross-platform Ghost promotion, or normalized performance/RSS gate exists yet",
                 metadata_parses: "validated_including_moe_expert_count_router_and_dual_ffn_norms",
                 tokenizer_works: "validated_for_gemma4_spm_with_forced_bos_workaround",
                 tensors_load: "validated_mmap_wire_backed_q4_0_experts_q6_k_head_layer_range_shards",
-                generation_runs: "distributed_two_node_api_chat_completions_and_sse_smoke_plus_windows_cuda_ghost_moe_serve",
+                generation_runs: "distributed_two_node_api_chat_completions_and_sse_smoke_plus_windows_cuda_ghost_moe_serve_plus_apple_m4_full_metal_mtp_short_chat_and_frozen_48_token_smoke",
                 parity_audited: "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node_and_windows_cuda_ghost_dp4a_matches_cpu_oracle",
                 performance_measured: "windows_rtx_3060_laptop_256_token_ghost_decode_12_29_tok_s_sustained_14_73_tok_s_fastest_8_token_window",
-                frontend_load_path_verified: "catalog_managed_ghost_pair_auto_detected_by_models_load_plus_distributed_runtime_flag",
-                frontend_readiness_gate: "green for distributed serve, or for the exact catalog-managed Ghost pair when health reports ghost_moe with CUDA common, routed experts, and head active; CPU, Metal, and ad-hoc Ghost runs remain experimental",
-                tested_context: "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
+                frontend_load_path_verified: "distributed_runtime_flag_plus_direct_hot_pair_current_api_webui_smoke_admitted_only_by_hash_host_exact_policy_immutable_profile_and_reconciled_apple_m4_full_metal_mtp_execution_plan; catalog_cuda_v1_marker_held_until_digest_bound_install_receipt",
+                frontend_readiness_gate: "green for distributed serve; the catalog-managed Windows CUDA implementation remains runnable/evidenced but is not green because its v1 marker does not cryptographically bind the current sparse-shadow and cghost bytes; or green for the exact macOS aarch64 Apple M4 Ghost lane only when health reports gemma4_serve_lane=ghost_moe, backend=gemma4-runtime, gemma4_ghost_backend=metal, gemma4_ghost_execution_mode=full_common_metal, common/experts/head Metal active, common/experts/head GPU active, gemma4_ghost_exact_expert_policy_active=true, gemma4_ghost_common_metal_context_capacity>=1024, gemma4_ghost_runtime_profile=mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1, gemma4_mtp_assistant_loaded=true, gemma4_mtp_full_q4_active=true, and execution_plan reports support_level=supported_exact_row_smoke, selected_backend=gemma4_ghost_moe_metal_runtime, prefill_path=gemma4_ghost_moe_metal_prefill, and decode_path=gemma4_ghost_moe_metal_speculative_decode. That reconciled support level is fail-closed on the exact prepared target sha256, immutable runtime-profile receipt, and Mini2 Mac16,10 / Apple M4 / macOS 26.5.x envelope. CPU, CUDA without a digest-bound install receipt, dropped-expert policy, missing or neighboring runtime profiles, undersized context, other hosts, wrong bytes, hybrid/partial Metal, and other ad-hoc Ghost shapes remain experimental",
+                tested_context: "distributed_and_catalog_windows_cuda_short_smokes_plus_exact_apple_m4_frozen_prompt_to_position_152_and_current_short_api_sse_webui_smoke_no_bounded_context_pack",
                 chat_template_renderer: "gemma4_marker",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
@@ -6614,8 +6698,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "windows_cuda_ghost_moe_256_token_decode",
                 latest_checked_result: "pass",
                 latest_checked_output: "12.29 tok/s sustained; token sequence preserved",
-                evidence: "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve. The supported single-node claim covers this row only, and only through this catalog-managed Windows CUDA Ghost lane; ad-hoc, CPU, and Metal Ghost runs remain experimental. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
-                next_step: "commit a normalized browser/API evidence bundle and bounded-context ladder for Windows Ghost-MoE, then validate the same prepared-artifact flow on additional NVIDIA memory tiers before widening the scope",
+                evidence: "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve; that evidence is retained, but current frontend promotion is withheld because the v1 durable marker does not cryptographically revalidate both prepared artifacts. The exact direct-load macOS profile is anchored by qa/perf/gemma4-mtp-bandwidth-2026-08-21/h69-final-result-2026-08-25.md (frozen 48/48 target sequence on Mac16,10 under the 1,408-slot profile) and qa/evidence-bundles/gemma4-26b-a4b-m4-metal-webui-20260825/manifest.json (current API/SSE/WebUI and fail-closed health gate). It is admitted only when live health proves backend=gemma4-runtime, ghost_moe, metal/full_common_metal, all common/expert/head Metal and backend-neutral GPU components active, exact non-dropping expert policy, the immutable mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1 runtime-profile receipt, the evidenced 1,024-position allocation, and the full-Q4 MTP assistant, while the reconciled execution plan reports supported_exact_row_smoke plus gemma4_ghost_moe_metal_runtime / gemma4_ghost_moe_metal_prefill / gemma4_ghost_moe_metal_speculative_decode. The backend grants that plan verdict only for prepared target sha256 66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d on the Mac16,10 / Apple M4 / macOS 26.5.x host envelope. This does not promote other Apple hardware, CUDA without a digest-bound install receipt, missing or neighboring runtime profiles, dropped-expert or undersized-context configurations, CPU or hybrid/partial Metal, neighboring files/quants, or other ad-hoc Ghost shapes. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
+                next_step: "add bounded-context ladders and normalized performance/RSS evidence for the exact Apple M4 lane; add and validate a digest-bound sparse-shadow+cghost install receipt before restoring Windows CUDA frontend promotion; then validate prepared-artifact flows on additional hardware before widening either scope",
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_tq2_0",
@@ -10242,6 +10326,48 @@ async fn gemma4_prompt_token_count(
     }
 }
 
+/// Keep a request on the constructed full-common Metal lane instead of
+/// silently selecting the CPU/storage prefill path when prompt + reply exceeds
+/// its real KV allocation. Seeded widened MTP may forward every token in its
+/// terminal verify chunk, so serving reserves one position instead of relying
+/// on the scalar first-token-from-prompt-logits optimization.
+fn gemma4_max_tokens_for_runtime_context(
+    prompt_tokens: usize,
+    requested_max_tokens: usize,
+    metal_context_capacity: Option<usize>,
+) -> std::result::Result<usize, usize> {
+    let Some(capacity) = metal_context_capacity else {
+        return Ok(requested_max_tokens);
+    };
+    if prompt_tokens >= capacity {
+        return Err(capacity);
+    }
+    Ok(requested_max_tokens.min(capacity - prompt_tokens))
+}
+
+fn gemma4_context_bounded_max_tokens(
+    runtime: &Gemma4ServeRuntime,
+    prompt_tokens: usize,
+    requested_max_tokens: usize,
+    parameter: &'static str,
+) -> std::result::Result<usize, Response> {
+    gemma4_max_tokens_for_runtime_context(
+        prompt_tokens,
+        requested_max_tokens,
+        runtime.active_ghost_metal_context_capacity(),
+    )
+    .map_err(|capacity| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+            format!(
+                "the rendered Gemma 4 prompt is {prompt_tokens} tokens, filling or exceeding the live Metal context capacity of {capacity}; shorten the conversation or start a new chat"
+            ),
+            Some(parameter),
+        )
+    })
+}
+
 enum Gemma4StreamItem {
     Delta(String),
     Complete { completion_tokens: usize },
@@ -10319,6 +10445,51 @@ impl Gemma4ServeRuntime {
             } => *ghost_components,
             _ => Default::default(),
         }
+    }
+
+    /// Construction-time exactness policy for the local Ghost expert lane.
+    /// Other serve variants cannot inherit the narrow Mini2 support claim.
+    fn ghost_exact_expert_policy_active(&self) -> bool {
+        match self {
+            Self::Local(runtime) => runtime.ghost_exact_expert_policy_active(),
+            _ => false,
+        }
+    }
+
+    /// The exact live predicate used by local Ghost prefill and decode. It
+    /// includes the explicit Ghost-Metal opt-out in addition to the global GPU
+    /// and deterministic-mode switches.
+    fn ghost_metal_acceleration_active(&self) -> bool {
+        match self {
+            Self::Local(runtime) => runtime.ghost_metal_acceleration_active(),
+            _ => false,
+        }
+    }
+
+    fn ghost_webui_profile_receipt(&self) -> Option<&'static str> {
+        match self {
+            Self::Local(runtime) => runtime.ghost_webui_profile_receipt(),
+            _ => None,
+        }
+    }
+
+    /// Actual capacity of the constructed full-common Metal KV lane. This is
+    /// runtime truth, not the model's much larger training-context metadata.
+    fn ghost_metal_context_capacity(&self) -> Option<usize> {
+        match self {
+            Self::Local(runtime) => runtime.ghost_metal_context_capacity(),
+            _ => None,
+        }
+    }
+
+    /// Capacity is a serving constraint only while the common Metal lane is
+    /// eligible for this request. A live GPU opt-out or deterministic-mode
+    /// switch selects CPU/storage, whose context must not inherit a dormant
+    /// Metal allocation limit.
+    fn active_ghost_metal_context_capacity(&self) -> Option<usize> {
+        self.ghost_metal_acceleration_active()
+            .then(|| self.ghost_metal_context_capacity())
+            .flatten()
     }
 
     /// Count the exact BOS-bearing token sequence this active runtime will
@@ -10736,7 +10907,21 @@ async fn gemma4_completion_nonstreaming(
             Some("prompt"),
         );
     };
-    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
+    let requested_max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
+    {
+        Ok(count) => count,
+        Err(response) => return response,
+    };
+    let max_tokens = match gemma4_context_bounded_max_tokens(
+        runtime.as_ref(),
+        prompt_tokens,
+        requested_max_tokens,
+        "prompt",
+    ) {
+        Ok(max_tokens) => max_tokens,
+        Err(response) => return response,
+    };
     let t_generate = std::time::Instant::now();
     let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
@@ -10760,7 +10945,7 @@ async fn gemma4_completion_nonstreaming(
             "logprobs": null,
             "finish_reason": gemma4_finish_reason(ids.len(), max_tokens),
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "usage": gemma4_usage(prompt_tokens, ids.len()),
         "camelid": {
             "generated_token_ids": ids,
             // Wall-clock totals only: the gemma4 lane does not (yet) report
@@ -10791,7 +10976,21 @@ async fn gemma4_completion_streaming(
             Some("prompt"),
         );
     };
-    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
+    let requested_max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
+    {
+        Ok(count) => count,
+        Err(response) => return response,
+    };
+    let max_tokens = match gemma4_context_bounded_max_tokens(
+        runtime.as_ref(),
+        prompt_tokens,
+        requested_max_tokens,
+        "prompt",
+    ) {
+        Ok(max_tokens) => max_tokens,
+        Err(response) => return response,
+    };
     let created = unix_secs();
 
     let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
@@ -10848,9 +11047,9 @@ async fn gemma4_completion_streaming(
                 "model": id,
                 "choices": [{ "index": 0, "text": "", "logprobs": null, "finish_reason": finish_reason }],
                 "usage": {
-                    "prompt_tokens": 0,
+                    "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
-                    "total_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
                 },
             });
             yield Ok(Event::default().data(done.to_string()));
@@ -10868,10 +11067,19 @@ async fn gemma4_chat_nonstreaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
-    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
+    let requested_max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
     {
         Ok(count) => count,
+        Err(response) => return response,
+    };
+    let max_tokens = match gemma4_context_bounded_max_tokens(
+        runtime.as_ref(),
+        prompt_tokens,
+        requested_max_tokens,
+        "messages",
+    ) {
+        Ok(max_tokens) => max_tokens,
         Err(response) => return response,
     };
     let t_generate = std::time::Instant::now();
@@ -11008,6 +11216,26 @@ fn gemma4_hybrid_telemetry_for_response<'a, T>(
 #[cfg(test)]
 mod gemma4_hybrid_response_tests {
     use super::*;
+
+    #[test]
+    fn live_metal_context_clamps_reply_instead_of_silently_falling_back_to_cpu() {
+        assert_eq!(
+            gemma4_max_tokens_for_runtime_context(900, 512, Some(1_024)),
+            Ok(124)
+        );
+        assert_eq!(
+            gemma4_max_tokens_for_runtime_context(1_024, 512, Some(1_024)),
+            Err(1_024)
+        );
+        assert_eq!(
+            gemma4_max_tokens_for_runtime_context(1_023, 512, Some(1_024)),
+            Ok(1)
+        );
+        assert_eq!(
+            gemma4_max_tokens_for_runtime_context(900, 512, None),
+            Ok(512)
+        );
+    }
 
     #[test]
     fn hybrid_telemetry_is_embedded_only_when_present() {
@@ -13923,11 +14151,20 @@ async fn gemma4_chat_streaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
-    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
+    let requested_max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let created = unix_secs();
     let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
     {
         Ok(count) => count,
+        Err(response) => return response,
+    };
+    let max_tokens = match gemma4_context_bounded_max_tokens(
+        runtime.as_ref(),
+        prompt_tokens,
+        requested_max_tokens,
+        "messages",
+    ) {
+        Ok(max_tokens) => max_tokens,
         Err(response) => return response,
     };
 
@@ -14082,7 +14319,13 @@ async fn load_model_from_path_with_activation(
                         .await
                         .contains_key(requested_id)
                 {
-                    load_gemma4_serve_runtime(state, requested_id, &existing.path).await?;
+                    load_gemma4_serve_runtime(
+                        state,
+                        requested_id,
+                        &existing.path,
+                        &existing.lane.gguf_sha256,
+                    )
+                    .await?;
                 }
                 // Apply the same healing rule to runnable-only rows. A prior
                 // runtime construction failure or cancelled load must not turn
@@ -14164,8 +14407,6 @@ async fn load_model_from_path_with_activation(
         &loaded.path,
         &loaded.lane.gguf_sha256,
     );
-    log_selected_execution_plan(&outcome.plan);
-
     // Runnable-only models are published atomically with their runtime. Build
     // the bridge before inserting LoadedModel/active state so a tokenizer or
     // graph refusal cannot leave a partial id that the idempotent fast path
@@ -14198,7 +14439,7 @@ async fn load_model_from_path_with_activation(
     // load a serve runtime so /v1/chat can route to it. Fail clearly on error â€” never
     // silently fall back to the Llama path (which would produce garbage here).
     if gemma4_serve_enabled() && model_family(&loaded.gguf) == "gemma4" {
-        load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
+        load_gemma4_serve_runtime(state, &id, &loaded.path, &loaded.lane.gguf_sha256).await?;
     }
 
     // DiffusionGemma serve path (additive, on by default; opt-out CAMELID_DG_SERVE=0):
@@ -14207,6 +14448,14 @@ async fn load_model_from_path_with_activation(
     // so /v1/chat routes to the diffusion lane instead.
     if dg_serve_enabled() && is_dg_serve_arch(loaded.gguf.architecture().unwrap_or_default()) {
         load_dg_serve_runtime(state, &id, &loaded.path).await?;
+    }
+
+    // Runtime construction is the authority for specialized serving lanes.
+    // In particular, Ghost-MoE is selected after the generic GGUF planner has
+    // run, so logging before its runtime exists used to claim CPU even while
+    // the full Metal target was live. Log the reconciled, published plan.
+    if let Some(plan) = state.execution_plans.read().await.get(&id) {
+        log_selected_execution_plan(plan);
     }
 
     Ok(loaded)
@@ -14308,6 +14557,239 @@ async fn clear_gemma4_serve_runtime(state: &AppState, id: &str) {
     state.gemma4_catalog_managed_ghosts.write().await.remove(id);
 }
 
+/// Exact prepared target bytes used by the Mini2 Metal Ghost-MoE smoke and
+/// performance campaign. The prepared `.hot.gguf` is deliberately separate
+/// from the public catalog artifact: the digest, not its mutable metadata name,
+/// is what lets a live runtime inherit this narrow support claim.
+const GEMMA4_26B_A4B_HOT_GGUF_SHA256: &str =
+    "66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d";
+
+const GEMMA4_GHOST_METAL_BACKEND: &str = "gemma4_ghost_moe_metal_runtime";
+const GEMMA4_GHOST_METAL_PREFILL: &str = "gemma4_ghost_moe_metal_prefill";
+const GEMMA4_GHOST_METAL_DECODE: &str = "gemma4_ghost_moe_metal_speculative_decode";
+const GEMMA4_GHOST_HYBRID_METAL_BACKEND: &str =
+    "gemma4_ghost_moe_hybrid_metal_runtime";
+const GEMMA4_GHOST_HYBRID_METAL_PREFILL: &str = "gemma4_ghost_moe_hybrid_metal_prefill";
+const GEMMA4_GHOST_HYBRID_METAL_DECODE: &str = "gemma4_ghost_moe_hybrid_metal_decode";
+const GEMMA4_GHOST_METAL_DECODE_WITHOUT_MTP: &str = "gemma4_ghost_moe_metal_decode";
+
+fn gemma4_metal_ghost_support_scope_matches(
+    operating_system: &str,
+    architecture: &str,
+    model_identifier: Option<&str>,
+    cpu_model: Option<&str>,
+    operating_system_version: Option<&str>,
+    supported_profile_selected: bool,
+) -> bool {
+    supported_profile_selected
+        && operating_system == "macos"
+        && architecture == "aarch64"
+        && model_identifier == Some("Mac16,10")
+        && cpu_model == Some("Apple M4")
+        && operating_system_version.is_some_and(|version| {
+            version == "26.5" || version.starts_with("26.5.")
+        })
+}
+
+fn gemma4_metal_ghost_supported_on_current_host() -> bool {
+    if !crate::execution_plan::supported_profile_selected() {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        static HOST_FACTS: OnceLock<(String, String, String)> = OnceLock::new();
+        let (model_identifier, cpu_model, operating_system_version) = HOST_FACTS.get_or_init(|| {
+            (
+                lfm2_support_command_output("sysctl", &["-n", "hw.model"])
+                    .unwrap_or_else(|| "unknown".into()),
+                lfm2_support_command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+                    .unwrap_or_else(|| "unknown".into()),
+                lfm2_support_command_output("sw_vers", &["-productVersion"])
+                    .unwrap_or_else(|| "unknown".into()),
+            )
+        });
+        return gemma4_metal_ghost_support_scope_matches(
+            env::consts::OS,
+            env::consts::ARCH,
+            Some(model_identifier),
+            Some(cpu_model),
+            Some(operating_system_version),
+            true,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+fn replace_execution_plan_support_level(plan: &mut ExecutionPlan, support_level: &str) {
+    plan.support_level = support_level.to_string();
+    if let Some(reason) = plan
+        .reasons
+        .iter_mut()
+        .find(|reason| reason.starts_with("support_level="))
+    {
+        *reason = format!("support_level={support_level}");
+    } else {
+        plan.reasons.push(format!("support_level={support_level}"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_gemma4_runtime_execution_plan(
+    plan: &mut ExecutionPlan,
+    lane: Gemma4ServeLane,
+    model_sha256: &str,
+    catalog_managed_ghost: bool,
+    metal: crate::gemma4_runtime::Gemma4GhostMetalComponents,
+    cuda_common: bool,
+    cuda_experts: bool,
+    cuda_head: bool,
+    mtp_assistant: Option<(bool, bool)>,
+    exact_expert_policy_active: bool,
+    metal_context_capacity: Option<usize>,
+    metal_runtime_profile: Option<&str>,
+    metal_host_supported: bool,
+) {
+    if lane != Gemma4ServeLane::GhostMoe || plan.model_family != "gemma4" {
+        return;
+    }
+
+    // Drop the generic planner's pre-runtime Gemma explanation. It was true of
+    // the provisional plan but becomes actively misleading once Ghost-MoE has
+    // constructed a different serving engine.
+    plan.reasons
+        .retain(|reason| !reason.starts_with("gemma4 row:"));
+    plan.selected_q8_path = "gemma4_ghost_q4_0_wire".into();
+    plan.fallback_path = "gemma4_ghost_moe_cpu_storage_fallback_path".into();
+
+    if metal.common || metal.experts || metal.head {
+        let full_metal = metal.common && metal.experts && metal.head;
+        let (assistant_loaded, assistant_full_q4) = mtp_assistant.unwrap_or((false, false));
+        let full_mtp = assistant_loaded && assistant_full_q4;
+        plan.selected_backend = if full_metal {
+            GEMMA4_GHOST_METAL_BACKEND
+        } else {
+            GEMMA4_GHOST_HYBRID_METAL_BACKEND
+        }
+        .into();
+        plan.prefill_path = if full_metal {
+            GEMMA4_GHOST_METAL_PREFILL
+        } else {
+            GEMMA4_GHOST_HYBRID_METAL_PREFILL
+        }
+        .into();
+        plan.prefill_runtime_policy = if full_metal {
+            "request_bounded_full_metal_common_with_exact_cpu_handoff"
+        } else {
+            "partial_metal_components_with_cpu_storage_fallback"
+        }
+        .into();
+        plan.decode_path = if full_metal && full_mtp {
+            GEMMA4_GHOST_METAL_DECODE
+        } else if full_metal {
+            GEMMA4_GHOST_METAL_DECODE_WITHOUT_MTP
+        } else {
+            GEMMA4_GHOST_HYBRID_METAL_DECODE
+        }
+        .into();
+        plan.cuda_resident_active = false;
+
+        let exact_artifact = model_sha256.eq_ignore_ascii_case(GEMMA4_26B_A4B_HOT_GGUF_SHA256);
+        let evidenced_context = metal_context_capacity.is_some_and(|capacity| capacity >= 1_024);
+        let exact_profile = metal_runtime_profile
+            == Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID);
+        let exact_runtime_shape =
+            full_metal && full_mtp && exact_expert_policy_active && exact_profile;
+        let supported = exact_artifact
+            && exact_runtime_shape
+            && evidenced_context
+            && plan.quant_type == "Q4_0"
+            && metal_host_supported;
+        replace_execution_plan_support_level(
+            plan,
+            if supported {
+                "supported_exact_row_smoke"
+            } else {
+                "unknown_or_unvalidated"
+            },
+        );
+        plan.reasons.push(format!(
+            "live Ghost-MoE Metal runtime: common={} experts={} head={} mtp_assistant={} mtp_full_q4={} exact_expert_policy={} context_capacity={} runtime_profile={}",
+            metal.common,
+            metal.experts,
+            metal.head,
+            assistant_loaded,
+            assistant_full_q4,
+            exact_expert_policy_active,
+            metal_context_capacity
+                .map(|capacity| capacity.to_string())
+                .unwrap_or_else(|| "none".into()),
+            metal_runtime_profile.unwrap_or("none"),
+        ));
+        plan.reasons.push(if exact_artifact {
+            "prepared Gemma 4 26B-A4B target sha256 matches the Mini2 smoke artifact".into()
+        } else {
+            "support withheld: prepared Gemma 4 26B-A4B target sha256 does not match the Mini2 smoke artifact".into()
+        });
+        return;
+    }
+
+    if cuda_common || cuda_experts || cuda_head {
+        let full_cuda = cuda_common && cuda_experts && cuda_head;
+        plan.selected_backend = if full_cuda {
+            "gemma4_ghost_moe_cuda_runtime"
+        } else {
+            "gemma4_ghost_moe_hybrid_cuda_runtime"
+        }
+        .into();
+        plan.prefill_path = if full_cuda {
+            "gemma4_ghost_moe_cuda_prefill"
+        } else {
+            "gemma4_ghost_moe_hybrid_cuda_prefill"
+        }
+        .into();
+        plan.prefill_runtime_policy = if full_cuda {
+            "catalog_prepared_ghost_prefill"
+        } else {
+            "partial_cuda_components_with_cpu_storage_fallback"
+        }
+        .into();
+        plan.decode_path = if full_cuda {
+            "gemma4_ghost_moe_cuda_decode"
+        } else {
+            "gemma4_ghost_moe_hybrid_cuda_decode"
+        }
+        .into();
+        plan.cuda_resident_active = full_cuda;
+        // The v1 durable marker authenticates names/configuration, not the
+        // current sparse-shadow and cghost bytes. Keep the live CUDA labels,
+        // but do not mint a supported plan until the install receipt binds and
+        // revalidates both artifacts cryptographically.
+        replace_execution_plan_support_level(plan, "unknown_or_unvalidated");
+        plan.reasons.push(format!(
+            "live Ghost-MoE CUDA runtime: common={cuda_common} experts={cuda_experts} head={cuda_head} catalog_managed={catalog_managed_ghost}"
+        ));
+        if full_cuda && catalog_managed_ghost {
+            plan.reasons.push(
+                "support withheld: catalog marker does not cryptographically bind the current sparse-shadow and cghost bytes"
+                    .into(),
+            );
+        }
+        return;
+    }
+
+    plan.selected_backend = "gemma4_ghost_moe_cpu_storage_runtime".into();
+    plan.prefill_path = "gemma4_ghost_moe_cpu_prefill".into();
+    plan.prefill_runtime_policy = "always_retained_reference_path".into();
+    plan.decode_path = "gemma4_ghost_moe_cpu_decode".into();
+    plan.cuda_resident_active = false;
+    replace_execution_plan_support_level(plan, "unknown_or_unvalidated");
+    plan.reasons
+        .push("live Ghost-MoE runtime has no constructed accelerator components".into());
+}
+
 /// Load (or reload) the gemma4 serve runtime for a model id. With
 /// CAMELID_GEMMA4_WORKER + CAMELID_GEMMA4_SPLIT set, the runtime is the
 /// distributed layer-sharding lane (master shard locally, tail layers on the
@@ -14316,6 +14798,7 @@ async fn load_gemma4_serve_runtime(
     state: &AppState,
     id: &str,
     model_path: &std::path::Path,
+    model_sha256: &str,
 ) -> std::result::Result<(), BackendError> {
     // A failed reload must never leave a stale lane claim attached to an old
     // runtime. Health remains conservative until the replacement is complete.
@@ -14479,11 +14962,40 @@ async fn load_gemma4_serve_runtime(
             Gemma4ServeRuntime::Cuda { .. } => Gemma4ServeLane::Cuda,
         }
     };
-    state
-        .gemma4_runtimes
-        .write()
-        .await
-        .insert(id.to_string(), Arc::new(runtime));
+    let metal_components = if runtime.ghost_metal_acceleration_active() {
+        runtime.ghost_metal_components_constructed()
+    } else {
+        Default::default()
+    };
+    let cuda_components = runtime.ghost_cuda_components_constructed();
+    let mtp_assistant = runtime.mtp_assistant_health();
+    let exact_expert_policy_active = runtime.ghost_exact_expert_policy_active();
+    let metal_context_capacity = runtime.active_ghost_metal_context_capacity();
+    let metal_runtime_profile = runtime.ghost_webui_profile_receipt();
+    // Resolve host facts before taking an async registry lock. Reconcile the
+    // provisional generic plan before the runtime becomes visible, then
+    // publish lane/catalog metadata before inserting the runtime last. A
+    // health reader therefore sees either not-ready or a self-consistent live
+    // Ghost runtime; it cannot observe Metal generation beside the old CPU
+    // execution plan.
+    let metal_host_supported = gemma4_metal_ghost_supported_on_current_host();
+    if let Some(plan) = state.execution_plans.write().await.get_mut(id) {
+        reconcile_gemma4_runtime_execution_plan(
+            plan,
+            lane,
+            model_sha256,
+            catalog_managed_ghost,
+            metal_components,
+            cuda_components.common,
+            cuda_components.experts,
+            cuda_components.head,
+            mtp_assistant,
+            exact_expert_policy_active,
+            metal_context_capacity,
+            metal_runtime_profile,
+            metal_host_supported,
+        );
+    }
     state
         .gemma4_serve_lanes
         .write()
@@ -14496,6 +15008,11 @@ async fn load_gemma4_serve_runtime(
             .await
             .insert(id.to_string(), true);
     }
+    state
+        .gemma4_runtimes
+        .write()
+        .await
+        .insert(id.to_string(), Arc::new(runtime));
     tracing::info!(model = %id, lane = ?lane, "gemma4 runtime loaded for serve path");
     Ok(())
 }
@@ -27405,6 +27922,351 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_metal_ghost_support_scope_is_exactly_the_mini2_envelope() {
+        for version in ["26.5", "26.5.2"] {
+            assert!(gemma4_metal_ghost_support_scope_matches(
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some(version),
+                true,
+            ));
+        }
+        for (os, arch, model, cpu, version, profile) in [
+            ("linux", "aarch64", Some("Mac16,10"), Some("Apple M4"), Some("26.5.2"), true),
+            ("macos", "x86_64", Some("Mac16,10"), Some("Apple M4"), Some("26.5.2"), true),
+            ("macos", "aarch64", Some("Mac15,3"), Some("Apple M3"), Some("26.5.2"), true),
+            ("macos", "aarch64", Some("Mac16,10"), Some("Apple M4"), Some("26.6"), true),
+            ("macos", "aarch64", Some("Mac16,10"), Some("Apple M4"), Some("26.5.2"), false),
+        ] {
+            assert!(!gemma4_metal_ghost_support_scope_matches(
+                os, arch, model, cpu, version, profile,
+            ));
+        }
+    }
+
+    fn provisional_gemma4_ghost_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            profile: ExecutionProfile::Auto,
+            operating_system: "macos".into(),
+            architecture: "aarch64".into(),
+            platform_label: "macOS arm64 Apple Silicon".into(),
+            cpu_model: "Apple M4".into(),
+            cpu_features: vec!["i8mm".into()],
+            model_family: "gemma4".into(),
+            quant_type: "Q4_0".into(),
+            exact_model_row: "26B_dequant_it_hf".into(),
+            support_level: "unknown_or_unvalidated".into(),
+            selected_backend: "gemma4_cpu_runtime".into(),
+            selected_q8_path: "gemma4_cpu_wire".into(),
+            prefill_path: "gemma4_cpu_prefill".into(),
+            prefill_runtime_policy: "always_retained_reference_path".into(),
+            decode_path: "gemma4_cpu_decode".into(),
+            thread_count: 10,
+            diagnostics_status: "standard diagnostics".into(),
+            fallback_path: "gemma4_cpu_runtime_fallback_path".into(),
+            cuda_resident_active: false,
+            reasons: vec![
+                "support_level=unknown_or_unvalidated".into(),
+                "gemma4 row: provisional CPU plan".into(),
+            ],
+        }
+    }
+
+    fn reconcile_exact_metal_ghost(plan: &mut ExecutionPlan, sha256: &str, host: bool) {
+        reconcile_gemma4_runtime_execution_plan(
+            plan,
+            Gemma4ServeLane::GhostMoe,
+            sha256,
+            false,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: true,
+                head: true,
+            },
+            false,
+            false,
+            false,
+            Some((true, true)),
+            true,
+            Some(1_024),
+            Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
+            host,
+        );
+    }
+
+    #[test]
+    fn reconciled_gemma4_plan_reports_the_live_full_metal_path() {
+        let mut plan = provisional_gemma4_ghost_plan();
+        reconcile_exact_metal_ghost(&mut plan, GEMMA4_26B_A4B_HOT_GGUF_SHA256, true);
+
+        assert_eq!(plan.support_level, "supported_exact_row_smoke");
+        assert_eq!(plan.selected_backend, GEMMA4_GHOST_METAL_BACKEND);
+        assert_eq!(plan.prefill_path, GEMMA4_GHOST_METAL_PREFILL);
+        assert_eq!(plan.decode_path, GEMMA4_GHOST_METAL_DECODE);
+        assert!(!plan.cuda_resident_active);
+        assert!(!plan
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("gemma4 row:")));
+    }
+
+    #[test]
+    fn reconciled_gemma4_plan_fails_closed_for_neighboring_shapes() {
+        let mut wrong_sha = provisional_gemma4_ghost_plan();
+        reconcile_exact_metal_ghost(&mut wrong_sha, "00", true);
+        assert_eq!(wrong_sha.support_level, "unknown_or_unvalidated");
+
+        let mut wrong_host = provisional_gemma4_ghost_plan();
+        reconcile_exact_metal_ghost(
+            &mut wrong_host,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+        );
+        assert_eq!(wrong_host.support_level, "unknown_or_unvalidated");
+
+        let mut partial = provisional_gemma4_ghost_plan();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut partial,
+            Gemma4ServeLane::GhostMoe,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: true,
+                head: false,
+            },
+            false,
+            false,
+            false,
+            Some((true, true)),
+            true,
+            Some(1_024),
+            Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
+            true,
+        );
+        assert_eq!(partial.support_level, "unknown_or_unvalidated");
+
+        let mut no_mtp = provisional_gemma4_ghost_plan();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut no_mtp,
+            Gemma4ServeLane::GhostMoe,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: true,
+                head: true,
+            },
+            false,
+            false,
+            false,
+            Some((true, false)),
+            true,
+            Some(1_024),
+            Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
+            true,
+        );
+        assert_eq!(no_mtp.support_level, "unknown_or_unvalidated");
+
+        let mut neighboring_profile = provisional_gemma4_ghost_plan();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut neighboring_profile,
+            Gemma4ServeLane::GhostMoe,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: true,
+                head: true,
+            },
+            false,
+            false,
+            false,
+            Some((true, true)),
+            true,
+            Some(1_024),
+            None,
+            true,
+        );
+        assert_eq!(
+            neighboring_profile.support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut dropped_experts = provisional_gemma4_ghost_plan();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut dropped_experts,
+            Gemma4ServeLane::GhostMoe,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: true,
+                head: true,
+            },
+            false,
+            false,
+            false,
+            Some((true, true)),
+            false,
+            Some(1_024),
+            Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
+            true,
+        );
+        assert_eq!(
+            dropped_experts.support_level,
+            "unknown_or_unvalidated"
+        );
+
+        let mut undersized_context = provisional_gemma4_ghost_plan();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut undersized_context,
+            Gemma4ServeLane::GhostMoe,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: true,
+                head: true,
+            },
+            false,
+            false,
+            false,
+            Some((true, true)),
+            true,
+            Some(512),
+            Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
+            true,
+        );
+        assert_eq!(
+            undersized_context.support_level,
+            "unknown_or_unvalidated"
+        );
+    }
+
+    #[test]
+    fn reconciled_gemma4_plan_labels_partial_accelerators_as_hybrid() {
+        let mut partial_metal = provisional_gemma4_ghost_plan();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut partial_metal,
+            Gemma4ServeLane::GhostMoe,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: false,
+                head: false,
+            },
+            false,
+            false,
+            false,
+            Some((false, false)),
+            true,
+            Some(1_024),
+            Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
+            true,
+        );
+        assert_eq!(
+            partial_metal.selected_backend,
+            GEMMA4_GHOST_HYBRID_METAL_BACKEND
+        );
+        assert_eq!(
+            partial_metal.decode_path,
+            GEMMA4_GHOST_HYBRID_METAL_DECODE
+        );
+        assert_eq!(partial_metal.support_level, "unknown_or_unvalidated");
+
+        let mut partial_cuda = provisional_gemma4_ghost_plan();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut partial_cuda,
+            Gemma4ServeLane::GhostMoe,
+            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
+            false,
+            Default::default(),
+            true,
+            false,
+            true,
+            None,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            partial_cuda.selected_backend,
+            "gemma4_ghost_moe_hybrid_cuda_runtime"
+        );
+        assert!(!partial_cuda.cuda_resident_active);
+        assert_eq!(partial_cuda.support_level, "unknown_or_unvalidated");
+    }
+
+    #[test]
+    fn reconciled_gemma4_plan_withholds_cuda_support_without_a_digest_bound_install_receipt() {
+        let mut catalog = provisional_gemma4_ghost_plan();
+        catalog.operating_system = "windows".into();
+        catalog.architecture = "x86_64".into();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut catalog,
+            Gemma4ServeLane::GhostMoe,
+            "catalog-shadow-digest",
+            true,
+            Default::default(),
+            true,
+            true,
+            true,
+            None,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(catalog.support_level, "unknown_or_unvalidated");
+        assert_eq!(catalog.selected_backend, "gemma4_ghost_moe_cuda_runtime");
+        assert!(catalog.reasons.iter().any(|reason| {
+            reason.contains("does not cryptographically bind the current sparse-shadow")
+        }));
+
+        let mut ad_hoc = catalog.clone();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut ad_hoc,
+            Gemma4ServeLane::GhostMoe,
+            "catalog-shadow-digest",
+            false,
+            Default::default(),
+            true,
+            true,
+            true,
+            None,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(ad_hoc.support_level, "unknown_or_unvalidated");
+
+        let mut wrong_host = catalog.clone();
+        wrong_host.operating_system = "linux".into();
+        reconcile_gemma4_runtime_execution_plan(
+            &mut wrong_host,
+            Gemma4ServeLane::GhostMoe,
+            "catalog-shadow-digest",
+            true,
+            Default::default(),
+            true,
+            true,
+            true,
+            None,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(wrong_host.support_level, "unknown_or_unvalidated");
+    }
+
+    #[test]
     fn phi3_support_scope_is_windows_x86_64_only() {
         assert!(phi3_support_scope_matches("windows", "x86_64"));
         assert!(!phi3_support_scope_matches("windows", "aarch64"));
@@ -28008,6 +28870,85 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_scope_gemma4_26b_to_evidenced_serve_shapes() {
+        let response = capabilities_response();
+        let target = response
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "gemma4_26b_a4b_it_q4_0")
+            .expect("Gemma 4 26B A4B row should stay advertised");
+
+        assert_eq!(target.status, "supported_exact_row_smoke");
+        assert_eq!(
+            target.support_scope,
+            "exact_row_distributed_or_catalog_windows_cuda_or_apple_m4_full_metal_ghost_moe_smoke_only"
+        );
+        for required in [
+            "gemma4_serve_lane=ghost_moe",
+            "backend=gemma4-runtime",
+            "gemma4_ghost_backend=metal",
+            "gemma4_ghost_execution_mode=full_common_metal",
+            "common/experts/head Metal active",
+            "common/experts/head GPU active",
+            "gemma4_ghost_exact_expert_policy_active=true",
+            "gemma4_ghost_common_metal_context_capacity>=1024",
+            "gemma4_mtp_assistant_loaded=true",
+            "gemma4_mtp_full_q4_active=true",
+            "support_level=supported_exact_row_smoke",
+            "selected_backend=gemma4_ghost_moe_metal_runtime",
+            "prefill_path=gemma4_ghost_moe_metal_prefill",
+            "decode_path=gemma4_ghost_moe_metal_speculative_decode",
+        ] {
+            assert!(
+                target.frontend_readiness_gate.contains(required),
+                "Gemma 4 26B frontend gate must name required Metal evidence: {required}"
+            );
+        }
+        assert!(target.frontend_readiness_gate.contains("macOS aarch64 Apple M4"));
+        assert!(target
+            .frontend_readiness_gate
+            .contains("hybrid/partial Metal"));
+        assert!(target
+            .generation_runs
+            .contains("apple_m4_full_metal_mtp_short_chat_and_frozen_48_token_smoke"));
+        assert!(target
+            .frontend_load_path_verified
+            .contains("hash_host_exact_policy_and_reconciled_apple_m4_full_metal_mtp_execution_plan"));
+        assert!(target
+            .frontend_readiness_gate
+            .contains("exact prepared target sha256"));
+        assert!(target
+            .frontend_readiness_gate
+            .contains("Mac16,10 / Apple M4 / macOS 26.5.x"));
+        assert!(target
+            .evidence
+            .contains("gemma4-26b-a4b-m4-metal-webui-20260825/manifest.json"));
+        assert!(target.evidence.contains(
+            "66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d"
+        ));
+        assert!(target
+            .evidence
+            .contains("gemma4_ghost_moe_metal_speculative_decode"));
+        assert!(target.evidence.contains("neighboring files/quants"));
+        // The latest checked performance bucket remains the committed CUDA receipt;
+        // adding a runtime-shape gate must not manufacture a Metal benchmark claim.
+        assert_eq!(
+            target.latest_checked_bucket,
+            "windows_cuda_ghost_moe_256_token_decode"
+        );
+
+        let q4 = response
+            .supported_quantization
+            .iter()
+            .find(|item| item.id == "Q4_0 (QAT rows)")
+            .expect("Q4_0 QAT support row should stay advertised");
+        assert!(q4.notes.contains("macOS aarch64 Apple M4 full-Metal"));
+        assert!(q4
+            .notes
+            .contains("partial Metal shapes and other Apple hosts remain experimental"));
+    }
+
+    #[test]
     fn capabilities_support_statuses_stay_exact_row_allowlisted() {
         let response = capabilities_response();
         let supported_row_ids = response
@@ -28038,9 +28979,9 @@ mod tests {
                 // memory-bound); promotion bundle + WebUI closure committed.
                 "gemma4_12b_it_q8_0",
                 // 26B A4B QAT (Q4_0 experts + Q6_K head) is supported_exact_row_smoke
-                // SCOPED TO the same two-Mac distributed lane: full basic_v1 parity
-                // pack (2/5 full + 3/5 probe-verified frontiers) + distributed serve
-                // smoke committed; 13.4GB row is memory-infeasible single-node.
+                // SCOPED TO two-Mac distributed serve, catalog Windows CUDA Ghost,
+                // and the exact Apple M4 full-Metal/MTP shape. Partial/ad-hoc Ghost
+                // shapes and other Apple hosts remain experimental.
                 "gemma4_26b_a4b_it_q4_0",
                 // Ternary TQ2_0 (qwen3 arch) single-node CPU completion-smoke lane:
                 // streams TQ2_0 + Q6_K head (4B in 3GB RAM), 3/4 probe prompts
@@ -37434,6 +38375,15 @@ fn numerical_variance_compatibility_row_ids() -> &'static std::collections::Hash
 /// what made every pinned row read "Experimental" in v0.6.0. See
 /// `classify_model_lane_with_verified_sha256` for that boundary.
 const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
+    // Prepared sparse target used by the Mac16,10 full-Metal Ghost-MoE lane.
+    // This is not the public catalog GGUF: expert records are paired with the
+    // fingerprinted v3 `.cghost`, so only these exact target bytes inherit the
+    // narrow Mini2 smoke claim.
+    (
+        "gemma-4-26B_q4_0-it.hot.gguf",
+        "gemma4_26b_a4b_it_q4_0",
+        "66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d",
+    ),
     // HF pristine upload; local recompute matches the HF LFS oid (9,527,500,992 B).
     (
         "ornith-1.0-9b-Q8_0.gguf",

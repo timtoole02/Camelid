@@ -34,8 +34,14 @@ const GHOST_EXECUTION_MODES = new Set([
 
 const GHOST_BACKENDS = new Set(['cpu', 'metal', 'cuda'])
 
+export const GEMMA4_MINI2_WEBUI_PROFILE_ID = 'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1'
+
 function optionalBoolean(value) {
   return typeof value === 'boolean' ? value : null
+}
+
+function optionalPositiveInteger(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
 function ghostComponentSummary({ accelerator, common, experts, head }) {
@@ -53,6 +59,13 @@ export function executionRuntimeFields(health) {
     gemma4_ghost_common_metal_active: optionalBoolean(health?.gemma4_ghost_common_metal_active),
     gemma4_ghost_experts_metal_active: optionalBoolean(health?.gemma4_ghost_experts_metal_active),
     gemma4_ghost_head_metal_active: optionalBoolean(health?.gemma4_ghost_head_metal_active),
+    gemma4_mtp_assistant_loaded: optionalBoolean(health?.gemma4_mtp_assistant_loaded),
+    gemma4_mtp_full_q4_active: optionalBoolean(health?.gemma4_mtp_full_q4_active),
+    gemma4_ghost_exact_expert_policy_active: optionalBoolean(health?.gemma4_ghost_exact_expert_policy_active),
+    gemma4_ghost_common_metal_context_capacity: optionalPositiveInteger(health?.gemma4_ghost_common_metal_context_capacity),
+    gemma4_ghost_runtime_profile: health?.gemma4_ghost_runtime_profile === GEMMA4_MINI2_WEBUI_PROFILE_ID
+      ? GEMMA4_MINI2_WEBUI_PROFILE_ID
+      : null,
     gemma4_ghost_backend: GHOST_BACKENDS.has(ghostBackend) ? ghostBackend : null,
     gemma4_ghost_catalog_managed: optionalBoolean(health?.gemma4_ghost_catalog_managed),
     gemma4_ghost_common_gpu_active: optionalBoolean(health?.gemma4_ghost_common_gpu_active),

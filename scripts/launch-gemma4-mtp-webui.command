@@ -11,7 +11,10 @@ readonly port=${CAMELID_GEMMA4_WEBUI_PORT:-8181}
 readonly model=${CAMELID_GEMMA4_WEBUI_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
 readonly cghost=${CAMELID_GEMMA4_WEBUI_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
 readonly assistant=${CAMELID_GEMMA4_WEBUI_ASSISTANT:-/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
-readonly profile=39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37
+# Literal 1,408-slot Mini2 footprint used by the checked H71 descendant. The
+# profile remains fixed so a launcher edit cannot silently widen resident
+# memory. Context is separately exposed by health and enforced per request.
+readonly profile=60,64,45,43,40,41,44,42,47,46,40,41,44,46,42,50,40,39,46,47,41,46,45,43,46,56,59,56,58,51
 
 typeset binary=${CAMELID_GEMMA4_WEBUI_BINARY:-}
 if [[ -z "$binary" ]]; then
@@ -72,6 +75,7 @@ print "Starting the exact Gemma 4 MTP WebUI on http://127.0.0.1:$port ..."
   CAMELID_GEMMA4_GHOST_METAL_TURBO=1 \
   CAMELID_GEMMA4_GHOST_METAL_COMMON=1 \
   CAMELID_GEMMA4_GHOST_METAL_CONTEXT=1024 \
+  CAMELID_GEMMA4_KV_INIT=192 \
   CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT=0 \
   CAMELID_GEMMA4_GHOST_READ_THREADS=8 \
   CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY=1 \
@@ -79,7 +83,6 @@ print "Starting the exact Gemma 4 MTP WebUI on http://127.0.0.1:$port ..."
   CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32 \
   CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER="$profile" \
   CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION=0 \
-  CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=1 \
   CAMELID_GEMMA4_SLOT_PIN=0 \
   CAMELID_GEMMA4_GHOST_METAL_HOT_PIN=0 \
   CAMELID_GEMMA4_VICTIM_CACHE=0 \
@@ -88,14 +91,32 @@ print "Starting the exact Gemma 4 MTP WebUI on http://127.0.0.1:$port ..."
   CAMELID_GEMMA4_CHAINED_PREDICT=0 \
   CAMELID_SPEC_DECODE=off \
   CAMELID_GEMMA4_SPEC_K1_LANE=chained \
-  CAMELID_GEMMA4_SPEC_CHUNK_MAX=8 \
-  CAMELID_GEMMA4_SPEC_DRAFT_TOKENS=8 \
+  CAMELID_GEMMA4_SPEC_CHUNK_MAX=15 \
+  CAMELID_GEMMA4_SPEC_DRAFT_TOKENS=15 \
+  CAMELID_GEMMA4_MTP_ADAPTIVE_WIDTH=1 \
   CAMELID_GEMMA4_MTP_ASSISTANT_PATH="$assistant" \
   CAMELID_GEMMA4_MTP_DEVICE_CHAIN=1 \
   CAMELID_GEMMA4_MTP_FULL_Q4=1 \
   CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP=1 \
+  CAMELID_GEMMA4_MTP_LOAD_WARMUP=1 \
+  CAMELID_GEMMA4_MTP_BOUNDARY_ARBITRATION=1 \
   CAMELID_GEMMA4_DENSE_K8_GENERIC=1 \
   CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT=1 \
+  CAMELID_GEMMA4_MOE_MMA_K16=1 \
+  CAMELID_GEMMA4_MTP_BF16_PRODUCER_FUSION=1 \
+  CAMELID_GEMMA4_MTP_BF16_LATTICE_LOADS=1 \
+  CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION=1 \
+  CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_PROFILE_FREE=1 \
+  CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP=1 \
+  CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH=0 \
+  CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_SINGLE_DOWN=1 \
+  CAMELID_GEMMA4_GHOST_METAL_DIRECT_STAGE_READ=1 \
+  CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE=1 \
+  CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE=1 \
+  CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT=1 \
+  CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER=1 \
+  CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF=1 \
+  CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL=1 \
   "$binary" serve \
     --addr "127.0.0.1:$port" \
     --model "$model" \
@@ -122,8 +143,15 @@ for _ in {1..900}; do
         .gemma4_ghost_common_metal_active == true and
         .gemma4_ghost_experts_metal_active == true and
         .gemma4_ghost_head_metal_active == true and
+        .gemma4_ghost_common_metal_context_capacity == 1024 and
+        .gemma4_ghost_exact_expert_policy_active == true and
+        .gemma4_ghost_runtime_profile == "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1" and
         .gemma4_mtp_assistant_loaded == true and
-        .gemma4_mtp_full_q4_active == true
+        .gemma4_mtp_full_q4_active == true and
+        .execution_plan.support_level == "supported_exact_row_smoke" and
+        .execution_plan.selected_backend == "gemma4_ghost_moe_metal_runtime" and
+        .execution_plan.prefill_path == "gemma4_ghost_moe_metal_prefill" and
+        .execution_plan.decode_path == "gemma4_ghost_moe_metal_speculative_decode"
       ' >/dev/null 2>&1; then
       ready=1
       break
