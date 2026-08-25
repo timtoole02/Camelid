@@ -408,6 +408,36 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
                 with self.assertRaisesRegex(ANALYZER.ReceiptError, "environment selected cap"):
                     ANALYZER.analyze(run_dir)
 
+    def test_environment_accepts_only_literal_exact_residency_trace_selector(self) -> None:
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.EXACT_RESIDENCY_TRACE_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            result = ANALYZER.analyze(run_dir)
+        self.assertEqual(result["integrity"]["stage_cap"], 8)
+
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.EXACT_RESIDENCY_TRACE_SELECTOR] = "true"
+            write_manifest(run_dir / "env.txt", values)
+            with self.assertRaisesRegex(ANALYZER.ReceiptError, "must be exactly 1"):
+                ANALYZER.analyze(run_dir)
+
+    def test_environment_accepts_only_literal_prompt_ranked_handoff_selector(self) -> None:
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            result = ANALYZER.analyze(run_dir)
+        self.assertEqual(result["integrity"]["stage_cap"], 8)
+
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "true"
+            write_manifest(run_dir / "env.txt", values)
+            with self.assertRaisesRegex(ANALYZER.ReceiptError, "must be exactly 1"):
+                ANALYZER.analyze(run_dir)
+
     def test_probe_rejects_unknown_missing_and_duplicate_fields(self) -> None:
         for mutation in ("unknown", "missing", "duplicate"):
             with self.subTest(mutation=mutation), fixture() as run_dir:

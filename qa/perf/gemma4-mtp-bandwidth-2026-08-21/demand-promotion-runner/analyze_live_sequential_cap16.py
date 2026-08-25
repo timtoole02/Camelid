@@ -129,6 +129,10 @@ PROFILE_FILE = Path(__file__).resolve().parent / "env" / PROFILE_NAME
 CAP16_PROFILE_NAME = "H69-live-hidden-sequential-fast-predict-dual-reader-kv192-cap16"
 CAP16_PROFILE_FILE = Path(__file__).resolve().parent / "env" / CAP16_PROFILE_NAME
 STAGE_CAP16_SELECTOR = "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16"
+EXACT_RESIDENCY_TRACE_SELECTOR = "CAMELID_GEMMA4_GHOST_METAL_EXACT_RESIDENCY_TRACE"
+PROMPT_RANKED_HOT_HANDOFF_SELECTOR = (
+    "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF"
+)
 REQUEST_FILE = Path(__file__).resolve().parent / "request-48-plain.json"
 EXPECTED_TOKEN_FILE = (
     Path(__file__).resolve().parent.parent
@@ -679,6 +683,18 @@ def _sha256(path: Path, label: str) -> str:
 
 def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
     observed = parse_env_manifest(run_dir / "env.txt")
+    trace_selector_value = observed.get(EXACT_RESIDENCY_TRACE_SELECTOR)
+    if trace_selector_value not in (None, "1"):
+        raise ReceiptError(
+            "exact-residency trace selector must be exactly 1 when present, "
+            f"got {trace_selector_value!r}"
+        )
+    prompt_ranked_value = observed.get(PROMPT_RANKED_HOT_HANDOFF_SELECTOR)
+    if prompt_ranked_value not in (None, "1"):
+        raise ReceiptError(
+            "prompt-ranked hot handoff selector must be exactly 1 when present, "
+            f"got {prompt_ranked_value!r}"
+        )
     selector_value = observed.get(STAGE_CAP16_SELECTOR)
     if selector_value is None:
         expected = _parse_profile(PROFILE_FILE)
@@ -689,7 +705,17 @@ def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
     else:
         raise ReceiptError(f"cap16 stage selector must be exactly 1, got {selector_value!r}")
     metadata = COMMON_ENV_METADATA | PROVENANCE_ENV_METADATA
-    _expect_fields(observed, set(expected) | metadata, "environment manifest")
+    optional_trace = (
+        {EXACT_RESIDENCY_TRACE_SELECTOR} if trace_selector_value == "1" else set()
+    )
+    optional_prompt_ranked = (
+        {PROMPT_RANKED_HOT_HANDOFF_SELECTOR} if prompt_ranked_value == "1" else set()
+    )
+    _expect_fields(
+        observed,
+        set(expected) | metadata | optional_trace | optional_prompt_ranked,
+        "environment manifest",
+    )
     for key, expected_value in expected.items():
         observed_value = observed[key]
         if key == "CAMELID_GEMMA4_MTP_ASSISTANT_PATH":

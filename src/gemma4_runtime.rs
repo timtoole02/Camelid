@@ -2237,6 +2237,15 @@ const GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV: &str =
 /// Admission is deliberately stricter than the parent stage selector below.
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16";
+/// Observation-only exact route/residency trace for offline placement work.
+/// This is not inherited by H49/H69: a dedicated literal-1 selector is
+/// required so ordinary throughput receipts do not pay formatting/log I/O.
+const GHOST_METAL_EXACT_RESIDENCY_TRACE_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_EXACT_RESIDENCY_TRACE";
+/// Default-off H71 policy: select the fixed Mini2 hot footprint from exact
+/// prompt-only route recency/frequency at the existing prefill handoff.
+const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF";
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP: usize = 8;
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16: usize = 16;
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS: usize =
@@ -2450,6 +2459,40 @@ fn ghost_metal_live_sequential_stage_cap16_enabled() -> bool {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_exact_residency_trace_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_exact_residency_trace_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        ghost_metal_exact_residency_trace_from(
+            std::env::var(GHOST_METAL_EXACT_RESIDENCY_TRACE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_prompt_ranked_hot_handoff_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_prompt_ranked_hot_handoff_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        ghost_metal_prompt_ranked_hot_handoff_from(
+            std::env::var(GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 /// Stable, fail-closed candidate construction. Earlier sources have strict
 /// priority; duplicates and invalid canonical IDs never consume capacity.
 /// A final canonical source may be supplied by probes to keep every compared
@@ -2491,6 +2534,47 @@ fn deterministic_sparse_decay_candidates(scores: &[f32], top_n: usize) -> Vec<us
         .collect()
 }
 
+/// Choose exactly the fixed physical footprint from identities observed in
+/// the current prompt. Scores are maintained by `record_layer_routes`; stable
+/// expert-ID ties make the handoff deterministic. No decode route or output is
+/// available when this function runs.
+#[cfg(any(target_os = "macos", test))]
+fn prompt_ranked_hot_handoff_routes(
+    prompt_unions: &[[u64; 2]],
+    prompt_scores: &[Vec<f32>],
+    capacities: &[usize],
+) -> Option<Vec<Vec<usize>>> {
+    if prompt_unions.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS
+        || prompt_scores.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS
+        || !ghost_metal_live_sequential_mini2_hot_profile_admitted(capacities)
+    {
+        return None;
+    }
+    prompt_unions
+        .iter()
+        .zip(prompt_scores)
+        .zip(capacities)
+        .map(|((union, scores), &capacity)| {
+            if scores.len() != 128 || scores.iter().any(|score| !score.is_finite()) {
+                return None;
+            }
+            let mut ranked = (0..128)
+                .filter(|&expert| (union[expert / 64] & (1u64 << (expert % 64))) != 0)
+                .collect::<Vec<_>>();
+            if ranked.len() < capacity {
+                return None;
+            }
+            ranked.sort_unstable_by(|&a, &b| {
+                scores[b]
+                    .total_cmp(&scores[a])
+                    .then_with(|| a.cmp(&b))
+            });
+            ranked.truncate(capacity);
+            Some(ranked)
+        })
+        .collect()
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn sparse_expert_mask_hex(experts: &[usize]) -> Option<String> {
     let mut seen = [false; 128];
@@ -2503,6 +2587,168 @@ fn sparse_expert_mask_hex(experts: &[usize]) -> Option<String> {
         mask[expert / 64] |= 1u64 << (expert % 64);
     }
     Some(format!("{:016x}{:016x}", mask[1], mask[0]))
+}
+
+/// Exact trace truth has a wider legal union domain than the historical sparse
+/// prediction probe: K rows may route up to eight new identities each.
+#[cfg(any(target_os = "macos", test))]
+fn exact_residency_route_truth_valid(
+    exact_routes: &[Vec<usize>],
+    k_tokens: usize,
+    ledger_unique_per_layer: &[u16],
+    ledger_unique_sum: u32,
+) -> bool {
+    let max_union = k_tokens.saturating_mul(8).min(128);
+    (1..=16).contains(&k_tokens)
+        && exact_routes.len() == 30
+        && ledger_unique_per_layer.len() >= 30
+        && exact_routes.iter().enumerate().all(|(layer, route)| {
+            (8..=max_union).contains(&route.len())
+                && sparse_expert_mask_hex(route).is_some()
+                && ledger_unique_per_layer[layer] as usize == route.len()
+        })
+        && exact_routes.iter().map(Vec::len).sum::<usize>() == ledger_unique_sum as usize
+}
+
+/// Render one observation-only decode-residency trace after the exact router
+/// has fixed every union. The trace contains identities only: it owns no cache,
+/// slot, table, I/O, output, or routing authority.
+#[cfg(any(target_os = "macos", test))]
+#[allow(clippy::too_many_arguments)]
+fn format_exact_residency_trace(
+    round_seq: u32,
+    start_pos: usize,
+    k_tokens: usize,
+    h49_execution_shape: bool,
+    stage_cap: usize,
+    exact_routes: &[Vec<usize>],
+    hot_at_start: &[[bool; 128]],
+    capacities: &[usize],
+    wave_load_ms_per_layer: &[f64],
+    ledger_unique_per_layer: &[u16],
+    ledger_unique_sum: u32,
+) -> std::result::Result<String, &'static str> {
+    const LAYERS: usize = 30;
+    if !h49_execution_shape
+        || stage_cap != GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP
+        || exact_routes.len() != LAYERS
+        || hot_at_start.len() != LAYERS
+        || capacities.len() != LAYERS
+        || wave_load_ms_per_layer.len() != LAYERS
+        || ledger_unique_per_layer.len() < LAYERS
+        || !exact_residency_route_truth_valid(
+            exact_routes,
+            k_tokens,
+            ledger_unique_per_layer,
+            ledger_unique_sum,
+        )
+    {
+        return Err("route-shape");
+    }
+
+    let mut route_masks = Vec::with_capacity(LAYERS);
+    let mut resident_masks = Vec::with_capacity(LAYERS);
+    let mut cold_masks = Vec::with_capacity(LAYERS);
+    let mut route_sizes = Vec::with_capacity(LAYERS);
+    let mut resident_sizes = Vec::with_capacity(LAYERS);
+    let mut cold_sizes = Vec::with_capacity(LAYERS);
+    let mut wave_load_ms = Vec::with_capacity(LAYERS);
+    let mut resident_hits = 0usize;
+    let mut cold_records = 0usize;
+    let mut capacity_total = 0usize;
+    let mut resident_total = 0usize;
+    let mut total_wave_load_us = 0u64;
+
+    for layer_idx in 0..LAYERS {
+        let capacity = capacities[layer_idx];
+        if capacity == 0 || capacity > 128 {
+            return Err("capacity-domain");
+        }
+        let layer_wave_ms = wave_load_ms_per_layer[layer_idx];
+        if !layer_wave_ms.is_finite() || layer_wave_ms < 0.0 || layer_wave_ms > 1.0e9 {
+            return Err("wave-domain");
+        }
+        let layer_wave_us = (layer_wave_ms * 1_000.0).round() as u64;
+        total_wave_load_us = total_wave_load_us
+            .checked_add(layer_wave_us)
+            .ok_or("wave-overflow")?;
+        capacity_total = capacity_total
+            .checked_add(capacity)
+            .ok_or("capacity-overflow")?;
+        let resident = hot_at_start[layer_idx]
+            .iter()
+            .enumerate()
+            .filter_map(|(expert, &hot)| hot.then_some(expert))
+            .collect::<Vec<_>>();
+        if resident.len() > capacity {
+            return Err("resident-capacity");
+        }
+        resident_total = resident_total
+            .checked_add(resident.len())
+            .ok_or("resident-overflow")?;
+        let cold = exact_routes[layer_idx]
+            .iter()
+            .copied()
+            .filter(|&expert| !hot_at_start[layer_idx][expert])
+            .collect::<Vec<_>>();
+        let hits = exact_routes[layer_idx].len().saturating_sub(cold.len());
+        resident_hits = resident_hits.checked_add(hits).ok_or("hit-overflow")?;
+        cold_records = cold_records
+            .checked_add(cold.len())
+            .ok_or("cold-overflow")?;
+
+        route_masks.push(format!(
+            "L{layer_idx}:{}",
+            sparse_expert_mask_hex(&exact_routes[layer_idx]).ok_or("route-mask")?
+        ));
+        resident_masks.push(format!(
+            "L{layer_idx}:{}",
+            sparse_expert_mask_hex(&resident).ok_or("resident-mask")?
+        ));
+        cold_masks.push(format!(
+            "L{layer_idx}:{}",
+            sparse_expert_mask_hex(&cold).ok_or("cold-mask")?
+        ));
+        route_sizes.push(exact_routes[layer_idx].len().to_string());
+        resident_sizes.push(resident.len().to_string());
+        cold_sizes.push(cold.len().to_string());
+        wave_load_ms.push(format!("{}.{:03}", layer_wave_us / 1_000, layer_wave_us % 1_000));
+    }
+    let exact_unique_records = usize::try_from(ledger_unique_sum).map_err(|_| "unique-domain")?;
+    if resident_hits.checked_add(cold_records) != Some(exact_unique_records) {
+        return Err("identity-accounting");
+    }
+
+    Ok(format!(
+        concat!(
+            "[gemma4 exact-residency trace] schema=1 requested=1 admitted=1 truth_valid=1 ",
+            "scope=successful-target-decode-round profile=mini2-h49-1408 ",
+            "round_seq={round_seq} start_pos={start_pos} K={k_tokens} layers=30 experts=128 ",
+            "stage_cap={stage_cap} capacity_total={capacity_total} resident_total={resident_total} ",
+            "exact_unique_records={exact_unique_records} ",
+            "resident_hits={resident_hits} cold_records={cold_records} ",
+            "total_wave_load_ms={}.{:03} capacities={} route_sizes={} ",
+            "resident_sizes={} cold_sizes={} wave_load_ms_per_layer={} ",
+            "route_masks={} resident_masks={} cold_masks={} ",
+            "timing=post-tied-head-output-fixed output_mutation=0 io_mutation=0 ",
+            "expert_read_mutation=0 slot_policy_mutation=0 table_mutation=0 ",
+            "route_mutation=0 routing_authority=exact-router throughput_eligible=0"
+        ),
+        total_wave_load_us / 1_000,
+        total_wave_load_us % 1_000,
+        capacities
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        route_sizes.join(","),
+        resident_sizes.join(","),
+        cold_sizes.join(","),
+        wave_load_ms.join(","),
+        route_masks.join("/"),
+        resident_masks.join("/"),
+        cold_masks.join("/"),
+    ))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -8122,7 +8368,7 @@ impl GhostMetalExpertRuntime {
             return true;
         }
 
-        let routes: Vec<Vec<usize>> = self
+        let baseline_routes: Vec<Vec<usize>> = self
             .routed_expert_interval_union
             .iter()
             .enumerate()
@@ -8138,6 +8384,33 @@ impl GhostMetalExpertRuntime {
                 experts
             })
             .collect();
+        let prompt_ranked_requested = ghost_metal_prompt_ranked_hot_handoff_enabled();
+        let capacities = self
+            .layers
+            .iter()
+            .map(|layer| layer.slots.writable_slot_count())
+            .collect::<Vec<_>>();
+        let prompt_ranked_admitted = prompt_ranked_requested
+            && self.layers.len() == GHOST_METAL_HYBRID_PROFILE_LAYERS
+            && self.layers.iter().all(|layer| layer.slots.is_hybrid_mapped())
+            && !self.hybrid_decode_promotion_enabled
+            && ghost_metal_hybrid_demand_promotion_enabled()
+            && ghost_metal_hybrid_demand_promotion_fill_enabled()
+            && ghost_metal_hybrid_hot_cold_overlap_enabled()
+            && std::env::var(GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV)
+                .is_ok_and(|value| value == "0")
+            && ghost_metal_live_sequential_mini2_hot_profile_admitted(&capacities);
+        let prompt_ranked_routes = prompt_ranked_admitted
+            .then(|| {
+                prompt_ranked_hot_handoff_routes(
+                    &self.routed_expert_interval_union,
+                    &self.expert_decay_scores,
+                    &capacities,
+                )
+            })
+            .flatten();
+        let prompt_ranked_effective = prompt_ranked_routes.is_some();
+        let routes = prompt_ranked_routes.unwrap_or(baseline_routes);
         let counters = WaveFillCounters::default();
         let started = std::time::Instant::now();
         let ok = fill_chained_hybrid_hot_layers(
@@ -8147,11 +8420,10 @@ impl GhostMetalExpertRuntime {
             &counters,
             self.chained_round_seq,
         );
-        // This is the terminal promotion belonging to the final prefill
-        // round, merely delayed to the explicit handoff barrier. Keep the
-        // latest-round receipt exact: its hot/mapped partition predicts these
-        // loads because `routes` is that same final routed union and the real
-        // directory has not changed since the command materialized its table.
+        // This is the terminal promotion belonging to the prompt interval,
+        // merely delayed to the explicit handoff barrier. Prompt ranking only
+        // bounds and reorders identities from that already-recorded union; it
+        // never introduces a decode-derived or external profile identity.
         if let Some(common) = self.common.as_mut() {
             use std::sync::atomic::Ordering::Relaxed;
             common.last_chained_ledger.nvme_ms = counters.nvme_us.load(Relaxed) as f64 / 1_000.0;
@@ -8167,6 +8439,18 @@ impl GhostMetalExpertRuntime {
             &mut self.chained_demand_loads,
             &counters,
         );
+
+        if prompt_ranked_requested {
+            eprintln!(
+                "[gemma4 prompt-ranked hot handoff] schema=1 requested=1 admitted={} effective={} fill_ok={} source=current-prompt-exact-route-union ranking=decay-score-desc-expert-id-asc layers={} selected_records={} capacity_total={} output_mutation=0 route_mutation=0 routing_authority=exact-router",
+                u8::from(prompt_ranked_admitted),
+                u8::from(prompt_ranked_effective),
+                u8::from(ok),
+                routes.len(),
+                routes.iter().map(Vec::len).sum::<usize>(),
+                capacities.iter().sum::<usize>(),
+            );
+        }
 
         if ghost_metal_timing_enabled() {
             use std::sync::atomic::Ordering::Relaxed;
@@ -9444,7 +9728,7 @@ impl GhostMetalExpertRuntime {
         } else {
             &empty_unions
         };
-        let mut assistant_router_probe_wave_load_ms =
+        let mut observation_wave_load_ms =
             [0.0f64; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS];
         let mut ok = {
             let Some(common) = self.common.as_mut() else {
@@ -9480,7 +9764,7 @@ impl GhostMetalExpertRuntime {
                 !self.prefill_round,
                 assistant_router_probe_truth
                     .is_some()
-                    .then_some(&mut assistant_router_probe_wave_load_ms),
+                    .then_some(&mut observation_wave_load_ms),
             )
         };
         // The direct retained callback bypasses the ordinary `StageCold`
@@ -9585,11 +9869,15 @@ impl GhostMetalExpertRuntime {
                     if let Some(common) = self.common.as_ref() {
                         let ledger = &common.last_chained_ledger;
                         *output = Some(Gemma4MtpAssistantRouterProbeTruth {
+                            round_seq,
                             start_pos,
                             k_tokens,
+                            h49_execution_shape: live_sequential_h49_execution_shape,
+                            live_sequential_stage_cap,
+                            capacities: live_sequential_hot_profile.unwrap_or([0; 30]),
                             exact_routes: collected_routes.clone(),
                             hot_at_start,
-                            wave_load_ms_per_layer: assistant_router_probe_wave_load_ms,
+                            wave_load_ms_per_layer: observation_wave_load_ms,
                             ledger_unique_per_layer: ledger.unique_per_layer,
                             ledger_unique_sum: ledger.unique_experts_sum,
                         });
@@ -14429,8 +14717,12 @@ struct Gemma4MtpAssistantRouterProbeSource {
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone)]
 struct Gemma4MtpAssistantRouterProbeTruth {
+    round_seq: u32,
     start_pos: usize,
     k_tokens: usize,
+    h49_execution_shape: bool,
+    live_sequential_stage_cap: usize,
+    capacities: [usize; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS],
     exact_routes: Vec<Vec<usize>>,
     hot_at_start: [[bool; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
         GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS],
@@ -17062,6 +17354,14 @@ impl Gemma4Runtime {
             if let Some(common) = runtime.common.as_mut() {
                 common.reset_sequence();
             }
+            if ghost_metal_prompt_ranked_hot_handoff_enabled() {
+                for union in &mut runtime.routed_expert_interval_union {
+                    union.fill(0);
+                }
+                for scores in &mut runtime.expert_decay_scores {
+                    scores.fill(0.0);
+                }
+            }
             runtime.prefill_round = false;
             runtime.sequence_mode = match plan {
                 GhostPrefillPlan::ScalarCpu | GhostPrefillPlan::CpuChunk => {
@@ -18882,6 +19182,8 @@ impl Gemma4Runtime {
     ) -> Result<Gemma4SpeculativeStepResult> {
         self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
+        let exact_residency_trace_requested = ghost_metal_exact_residency_trace_enabled();
+        #[cfg(target_os = "macos")]
         if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
             if let Some(head) = self.metal_q6k_head.as_ref() {
                 let kk = tokens.len();
@@ -18986,8 +19288,8 @@ impl Gemma4Runtime {
                             ghost_cache,
                             previous_cold_stage,
                             &mut hs_buf,
-                            assistant_router_probe_source
-                                .is_some()
+                            (assistant_router_probe_source.is_some()
+                                || exact_residency_trace_requested)
                                 .then_some(&mut assistant_router_probe_truth),
                         );
                         if !gpu_chained_round_ok {
@@ -19025,6 +19327,11 @@ impl Gemma4Runtime {
                         // logits. H56 may spend CPU time replaying assistant
                         // rows, but it cannot feed any result back into this
                         // already-complete verifier or its target state.
+                        if exact_residency_trace_requested {
+                            self.emit_exact_residency_trace(
+                                assistant_router_probe_truth.as_ref(),
+                            );
+                        }
                         if let Some(source) = assistant_router_probe_source {
                             self.emit_mtp_assistant_router_probe(
                                 source,
@@ -19039,6 +19346,11 @@ impl Gemma4Runtime {
                     }
                 }
             }
+        }
+
+        #[cfg(target_os = "macos")]
+        if exact_residency_trace_requested {
+            self.emit_exact_residency_trace(None);
         }
 
         let mut hidden_rows = Vec::new();
@@ -19990,6 +20302,40 @@ impl Gemma4Runtime {
             gemma4_live_ranked_router_candidates_from_logits(&logits, rows, moe.n_expert, top_k)
         })
         .unwrap_or_default()
+    }
+
+    /// Default-off H70 diagnostic. The caller invokes this only after the
+    /// exact tied head has fixed acceptance and next logits. It formats frozen
+    /// route/residency truth and cannot mutate the verifier or its I/O path.
+    #[cfg(target_os = "macos")]
+    fn emit_exact_residency_trace(
+        &self,
+        truth: Option<&Gemma4MtpAssistantRouterProbeTruth>,
+    ) {
+        let Some(truth) = truth else {
+            eprintln!(
+                "[gemma4 exact-residency trace] schema=1 requested=1 admitted=0 truth_valid=0 reason=chained-truth-unavailable throughput_eligible=0"
+            );
+            return;
+        };
+        match format_exact_residency_trace(
+            truth.round_seq,
+            truth.start_pos,
+            truth.k_tokens,
+            truth.h49_execution_shape,
+            truth.live_sequential_stage_cap,
+            &truth.exact_routes,
+            &truth.hot_at_start,
+            &truth.capacities,
+            &truth.wave_load_ms_per_layer,
+            &truth.ledger_unique_per_layer,
+            truth.ledger_unique_sum,
+        ) {
+            Ok(receipt) => eprintln!("{receipt}"),
+            Err(reason) => eprintln!(
+                "[gemma4 exact-residency trace] schema=1 requested=1 admitted=0 truth_valid=0 reason={reason} throughput_eligible=0"
+            ),
+        }
     }
 
     /// H56 diagnostic only. The caller invokes this after the exact tied head
@@ -28763,6 +29109,30 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn exact_residency_trace_is_exact_positive_and_default_off() {
+        assert!(!ghost_metal_exact_residency_trace_from(None));
+        assert!(ghost_metal_exact_residency_trace_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !ghost_metal_exact_residency_trace_from(Some(value)),
+                "unexpected exact-residency trace admission for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_ranked_hot_handoff_is_exact_positive_and_default_off() {
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_from(None));
+        assert!(ghost_metal_prompt_ranked_hot_handoff_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !ghost_metal_prompt_ranked_hot_handoff_from(Some(value)),
+                "unexpected prompt-ranked handoff admission for {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mtp_assistant_router_probe_is_exact_positive_and_default_off() {
         assert!(!gemma4_mtp_assistant_router_probe_from(None));
         assert!(gemma4_mtp_assistant_router_probe_from(Some("1")));
@@ -29163,6 +29533,46 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn prompt_ranked_handoff_is_exact_capacity_stable_and_fail_closed() {
+        let unions = vec![[u64::MAX; 2]; 30];
+        let mut scores = vec![vec![0.0; 128]; 30];
+        for layer_scores in &mut scores {
+            layer_scores[100] = 3.0;
+            layer_scores[101] = 2.0;
+        }
+        let routes = prompt_ranked_hot_handoff_routes(
+            &unions,
+            &scores,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .expect("exact H49 prompt ranking");
+        assert_eq!(routes.len(), 30);
+        assert_eq!(routes.iter().map(Vec::len).sum::<usize>(), 1_408);
+        assert!(routes.iter().all(|route| route[0..2] == [100, 101]));
+        assert!(routes.iter().all(|route| route[2] == 0));
+
+        let mut wrong_capacity = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
+        wrong_capacity.swap(0, 1);
+        assert!(prompt_ranked_hot_handoff_routes(&unions, &scores, &wrong_capacity).is_none());
+        let mut nonfinite = scores.clone();
+        nonfinite[4][9] = f32::NAN;
+        assert!(prompt_ranked_hot_handoff_routes(
+            &unions,
+            &nonfinite,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .is_none());
+        let mut underfilled = unions.clone();
+        underfilled[0] = [0xff, 0];
+        assert!(prompt_ranked_hot_handoff_routes(
+            &underfilled,
+            &scores,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn sparse_truth_refuses_empty_invalid_or_unreconciled_layers() {
         let valid_layer = (0..8).collect::<Vec<_>>();
         let valid = vec![valid_layer.clone(); 30];
@@ -29178,6 +29588,176 @@ mod mtp_target_seam_tests {
         assert!(!sparse_route_truth_valid(&duplicate, 30, &counts, 240));
         assert!(!sparse_route_truth_valid(&valid, 30, &counts, 239));
         assert!(!sparse_route_truth_valid(&valid[..29], 30, &counts, 232));
+    }
+
+    #[test]
+    fn exact_residency_trace_binds_all_thirty_route_resident_and_cold_masks() {
+        let routes = vec![(120..128).collect::<Vec<_>>(); 30];
+        let mut hot = [[false; 128]; 30];
+        for (layer_idx, &capacity) in GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+            .iter()
+            .enumerate()
+        {
+            hot[layer_idx][..capacity].fill(true);
+        }
+        let counts = [8u16; 30];
+        let receipt = format_exact_residency_trace(
+            41,
+            104,
+            14,
+            true,
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+            &routes,
+            hot.as_slice(),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+            &[1.0; 30],
+            &counts,
+            240,
+        )
+        .expect("valid exact-residency observation");
+        assert!(receipt.starts_with(
+            "[gemma4 exact-residency trace] schema=1 requested=1 admitted=1 truth_valid=1 scope=successful-target-decode-round profile=mini2-h49-1408 round_seq=41 start_pos=104 K=14 layers=30 experts=128 stage_cap=8"
+        ));
+        assert!(receipt.contains(
+            "capacity_total=1408 resident_total=1408 exact_unique_records=240 resident_hits=0 cold_records=240"
+        ));
+        assert!(receipt.contains(
+            "route_masks=L0:ff000000000000000000000000000000/"
+        ));
+        assert!(receipt.contains(
+            "cold_masks=L0:ff000000000000000000000000000000/"
+        ));
+        assert!(receipt.ends_with(
+            "route_mutation=0 routing_authority=exact-router throughput_eligible=0"
+        ));
+
+        let mut duplicate = routes.clone();
+        duplicate[3][7] = 126;
+        assert_eq!(
+            format_exact_residency_trace(
+                41,
+                104,
+                14,
+                true,
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                &duplicate,
+                hot.as_slice(),
+                &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+                &[1.0; 30],
+                &counts,
+                240,
+            ),
+            Err("route-shape")
+        );
+    }
+
+    #[test]
+    fn exact_residency_trace_accepts_wide_k14_truth_and_underfilled_residency() {
+        let routes = vec![(0..65).collect::<Vec<_>>(); 30];
+        let hot = [[false; 128]; 30];
+        let counts = [65u16; 30];
+        let receipt = format_exact_residency_trace(
+            42,
+            118,
+            14,
+            true,
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+            &routes,
+            hot.as_slice(),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+            &[0.0; 30],
+            &counts,
+            1_950,
+        )
+        .expect("K14 may expose more than the historical 64-ID probe cap");
+        assert!(receipt.contains("resident_total=0 exact_unique_records=1950"));
+        assert!(receipt.contains("resident_sizes=0,0,0,0,0,0,0,0,0,0"));
+    }
+
+    #[test]
+    fn exact_residency_trace_refuses_profile_ledger_identity_and_wall_drift() {
+        let routes = vec![(120..128).collect::<Vec<_>>(); 30];
+        let hot = [[false; 128]; 30];
+        let counts = [8u16; 30];
+        let render = |h49_execution_shape: bool,
+                      stage_cap: usize,
+                      routes: &[Vec<usize>],
+                      walls: &[f64],
+                      counts: &[u16],
+                      sum: u32| {
+            format_exact_residency_trace(
+                41,
+                104,
+                14,
+                h49_execution_shape,
+                stage_cap,
+                routes,
+                hot.as_slice(),
+                &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+                walls,
+                counts,
+                sum,
+            )
+        };
+        assert_eq!(
+            render(
+                false,
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                &routes,
+                &[1.0; 30],
+                &counts,
+                240,
+            ),
+            Err("route-shape")
+        );
+        assert_eq!(
+            render(
+                true,
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16,
+                &routes,
+                &[1.0; 30],
+                &counts,
+                240,
+            ),
+            Err("route-shape")
+        );
+        assert_eq!(
+            render(
+                true,
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                &routes,
+                &[1.0; 30],
+                &counts,
+                239,
+            ),
+            Err("route-shape")
+        );
+        let mut out_of_range = routes.clone();
+        out_of_range[0][0] = 128;
+        assert_eq!(
+            render(
+                true,
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                &out_of_range,
+                &[1.0; 30],
+                &counts,
+                240,
+            ),
+            Err("route-shape")
+        );
+        let mut walls = [1.0; 30];
+        walls[7] = f64::NAN;
+        assert_eq!(
+            render(
+                true,
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                &routes,
+                &walls,
+                &counts,
+                240,
+            ),
+            Err("wave-domain")
+        );
     }
 
     fn exact_hybrid_snapshot(
