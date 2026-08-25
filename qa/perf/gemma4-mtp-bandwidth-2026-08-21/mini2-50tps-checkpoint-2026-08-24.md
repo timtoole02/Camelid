@@ -394,6 +394,22 @@ H61 is therefore a source-history **NO-GO**. No H61 profile was created, no
 source candidate was retained, and no build, focused test, benchmark, binary,
 or Mini2 run was performed.
 
+## Exact assistant BF16 lattice-load closure (H62)
+
+H62 is a strict default-off assistant experiment behind
+`CAMELID_GEMMA4_MTP_BF16_LATTICE_LOADS=1`. It removes only the idempotent BF16
+rounding on the already-lattice-valued query loads in QK and probability loads
+in context; target K/V loads retain their BF16 rounding, and dispatch, byte,
+and scratch accounting remain unchanged. The five focused exact gates passed
+5/5, and both production QK/context oracle tests passed.
+
+The ignored exact timing workload covers 44 drafts, 218,767,360 eliminated
+scalar BF16 rounds, and 528 attention dispatches. Its medians were 55,186
+us/request for control and 52,099 us/request for the candidate, a 3,087
+us/request saving. That is below the required 5,000 us continuation gate, so
+H62 is a **NO-GO** and no Mini2 run was performed. The default-off source and
+`H62-mtp-bf16-lattice-loads` profile remain in the branch for reproducibility.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -412,6 +428,7 @@ Profiles and executable for this checkpoint:
 - `H58-moe-mma-k16`
 - `H59-mtp-device-chain-k4-warmup`
 - `H60-mtp-bf16-producer-fusion`
+- `H62-mtp-bf16-lattice-loads`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -460,6 +477,10 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
   fused, saving 2,427 us/request against the required 5,000 us gate;
 - H61 source-history audit: commit `9b28d3f9` already covered the exact
   runtime-width staged family, including SG4/TB8; no new execution occurred;
+- H62 focused exact lattice-load gates: 5/5 plus two production oracle passes;
+  ignored exact 44-draft timing median 55,186 us control versus 52,099 us
+  candidate, saving 3,087 us/request against the required 5,000 us gate over
+  218,767,360 eliminated rounds and 528 attention dispatches; no Mini2 run;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

@@ -78,6 +78,11 @@ const TARGET_Q6K_ROW_BYTES: usize =
 const MTP_STEP3_LOGIT_TRACE_ENV: &str = "CAMELID_GEMMA4_MTP_STEP3_LOGIT_TRACE";
 const MTP_LOGIT_TRACE_DRAFT_INDEX_ENV: &str = "CAMELID_GEMMA4_MTP_LOGIT_TRACE_DRAFT_INDEX";
 const MTP_BF16_PRODUCER_FUSION_ENV: &str = "CAMELID_GEMMA4_MTP_BF16_PRODUCER_FUSION";
+const MTP_BF16_LATTICE_LOADS_ENV: &str = "CAMELID_GEMMA4_MTP_BF16_LATTICE_LOADS";
+const MTP_BF16_LATTICE_DISPATCHES_ELIDED: usize = 0;
+const MTP_BF16_LATTICE_BYTES_ELIDED: usize = 0;
+const MTP_BF16_LATTICE_SCRATCH_BYTES_ADDED: usize = 0;
+const MTP_BF16_LATTICE_CANDIDATE_PSOS_COMPILED: usize = 2;
 // Official Gemma 4 proportional RoPE keeps the normal split-half geometry for
 // the entire 512-wide head, but gives only the first quarter of dimensions a
 // non-zero angle: 512 * 0.25 / 2 = 64 active pairs.  In particular, pair d is
@@ -97,6 +102,23 @@ const fn mtp_device_chain_k4_warm_dispatches(bf16_producer_fusion: bool) -> usiz
     } else {
         MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES
     }
+}
+
+/// Scalar BF16 RNE operations skipped by the H62 attention consumers for one
+/// assistant draft at a particular target logical K. Query is reused once per
+/// visible key in QK and each probability is reused once per output dimension
+/// in context, so both sides contribute the same count. Dispatches, bytes and
+/// scratch are unchanged.
+fn mtp_bf16_lattice_rounds_elided_per_draft(logical_len: usize) -> Option<usize> {
+    let (_, local_count) = assistant_local_attention_bounds(logical_len);
+    let local_q_dim = N_HEADS.checked_mul(LOCAL_HEAD_DIM)?;
+    let full_q_dim = N_HEADS.checked_mul(FULL_HEAD_DIM)?;
+    let local = 3usize
+        .checked_mul(2)?
+        .checked_mul(local_q_dim)?
+        .checked_mul(local_count)?;
+    let full = 2usize.checked_mul(full_q_dim)?.checked_mul(logical_len)?;
+    local.checked_add(full)
 }
 
 const MTP_SHADER: &str = r#"
@@ -365,6 +387,15 @@ inline float4 mtp_load_rounded_bf16x4(
         mtp_round_bf16(values[base + 3]));
 }
 
+// H62 is admitted only for buffers whose producer has already stored widened
+// BF16. Every production query offset is float4-aligned: head dimensions are
+// 256/512 and the pinned QK loop advances in multiples of four.
+inline float4 mtp_load_bf16_latticex4(
+    device const float* values,
+    uint base) {
+    return *reinterpret_cast<device const float4*>(values + base);
+}
+
 // Pinned ATen AArch64 BF16 QK dot: eight float4 accumulators, 4/2/1 fold,
 // then vaddvq_f32's adjacent-pair horizontal order. One lane still owns each
 // position in a 32-position stripe, so only the arithmetic flavor changes.
@@ -413,6 +444,68 @@ kernel void mtp_attention_scores_bf16_f32(
             acc6 += mtp_load_rounded_bf16x4(query, q_base + d + 24) *
                     mtp_load_rounded_bf16x4(keys, k_base + d + 24);
             acc7 += mtp_load_rounded_bf16x4(query, q_base + d + 28) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 28);
+        }
+        acc0 += acc4;
+        acc1 += acc5;
+        acc2 += acc6;
+        acc3 += acc7;
+        acc0 += acc2;
+        acc1 += acc3;
+        acc0 += acc1;
+        const float dot = (acc0.x + acc0.y) + (acc0.z + acc0.w);
+        scores[score_base + p] = mtp_round_bf16(dot * scale);
+    }
+}
+
+// Exact H62 twin of mtp_attention_scores_bf16_f32. RoPE has already stored
+// query as widened BF16, so its idempotent RNE load may be removed. Target KV
+// remains f32 and deliberately retains RNE at every key load.
+kernel void mtp_attention_scores_bf16_lattice_query_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant float& scale [[buffer(7)]],
+    constant uint& position_stride [[buffer(8)]],
+    constant uint& kv_head_stride [[buffer(9)]],
+    constant uint& kv_base_offset [[buffer(10)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= n_heads || (head_dim & 31u) != 0u) return;
+    const uint kv_head = head / group;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + kv_head * kv_head_stride;
+    const uint score_base = head * position_count;
+    for (uint p = lane; p < position_count; p += 32) {
+        const uint k_base = kv_base + p * position_stride;
+        float4 acc0 = 0.0f;
+        float4 acc1 = 0.0f;
+        float4 acc2 = 0.0f;
+        float4 acc3 = 0.0f;
+        float4 acc4 = 0.0f;
+        float4 acc5 = 0.0f;
+        float4 acc6 = 0.0f;
+        float4 acc7 = 0.0f;
+        for (uint d = 0; d < head_dim; d += 32) {
+            acc0 += mtp_load_bf16_latticex4(query, q_base + d + 0) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 0);
+            acc1 += mtp_load_bf16_latticex4(query, q_base + d + 4) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 4);
+            acc2 += mtp_load_bf16_latticex4(query, q_base + d + 8) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 8);
+            acc3 += mtp_load_bf16_latticex4(query, q_base + d + 12) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 12);
+            acc4 += mtp_load_bf16_latticex4(query, q_base + d + 16) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 16);
+            acc5 += mtp_load_bf16_latticex4(query, q_base + d + 20) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 20);
+            acc6 += mtp_load_bf16_latticex4(query, q_base + d + 24) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 24);
+            acc7 += mtp_load_bf16_latticex4(query, q_base + d + 28) *
                     mtp_load_rounded_bf16x4(keys, k_base + d + 28);
         }
         acc0 += acc4;
@@ -488,6 +581,57 @@ kernel void mtp_attention_context_bf16_f32(
             const uint absolute_position = compact_base + p;
             const float product =
                 mtp_round_bf16(probabilities[score_base + p]) *
+                mtp_round_bf16(values[kv_base + p * position_stride + d]);
+            if (absolute_position >= physical_vector_end) {
+                p0 += product;
+            } else {
+                switch (absolute_position & 3u) {
+                    case 0u: p0 += product; break;
+                    case 1u: p1 += product; break;
+                    case 2u: p2 += product; break;
+                    default: p3 += product; break;
+                }
+            }
+        }
+        const float result = ((p0 + p1) + p2) + p3;
+        output[q_base + d] = mtp_round_bf16(result);
+    }
+}
+
+// Exact H62 twin of mtp_attention_context_bf16_f32. Softmax stores widened
+// BF16 probabilities in place, so their idempotent RNE load may be removed.
+// Target V remains f32 and deliberately retains RNE at every value load.
+kernel void mtp_attention_context_bf16_lattice_probabilities_f32(
+    device const float* values [[buffer(0)]],
+    device const float* probabilities [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    constant uint& compact_base [[buffer(10)]],
+    constant uint& physical_logical_k [[buffer(11)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= n_heads || position_stride == 0u ||
+        compact_base + position_count != physical_logical_k) return;
+    const uint kv_head = head / group;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + kv_head * kv_head_stride;
+    const uint score_base = head * position_count;
+    const uint physical_vector_end = physical_logical_k & ~3u;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float p0 = 0.0f;
+        float p1 = 0.0f;
+        float p2 = 0.0f;
+        float p3 = 0.0f;
+        for (uint p = 0; p < position_count; ++p) {
+            const uint absolute_position = compact_base + p;
+            const float product =
+                probabilities[score_base + p] *
                 mtp_round_bf16(values[kv_base + p * position_stride + d]);
             if (absolute_position >= physical_vector_end) {
                 p0 += product;
@@ -1258,6 +1402,10 @@ fn parse_bf16_producer_fusion_opt_in(
     parse_device_chain_opt_in(value)
 }
 
+fn parse_bf16_lattice_loads_opt_in(value: Option<&str>) -> std::result::Result<bool, &'static str> {
+    parse_device_chain_opt_in(value)
+}
+
 fn mtp_step3_logit_trace_enabled_value(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| {
         matches!(
@@ -1321,6 +1469,20 @@ fn bf16_producer_fusion_requested_from_environment() -> Result<bool> {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Err(std::env::VarError::NotUnicode(_)) => Err(invalid(format!(
             "{MTP_BF16_PRODUCER_FUSION_ENV} must contain Unicode text"
+        ))),
+    }
+}
+
+fn bf16_lattice_loads_requested_from_environment() -> Result<bool> {
+    match std::env::var(MTP_BF16_LATTICE_LOADS_ENV) {
+        Ok(value) => parse_bf16_lattice_loads_opt_in(Some(&value)).map_err(|detail| {
+            invalid(format!(
+                "{MTP_BF16_LATTICE_LOADS_ENV} {detail}, got {value:?}"
+            ))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid(format!(
+            "{MTP_BF16_LATTICE_LOADS_ENV} must contain Unicode text"
         ))),
     }
 }
@@ -1682,10 +1844,12 @@ struct MtpPipelines {
     rope_bf16: ComputePipelineState,
     gelu_mul_bf16: ComputePipelineState,
     attention_scores_bf16: ComputePipelineState,
+    attention_scores_bf16_lattice_query: ComputePipelineState,
     #[cfg(test)]
     attention_scores_legacy_bf16: ComputePipelineState,
     attention_softmax_bf16: ComputePipelineState,
     attention_context_bf16: ComputePipelineState,
+    attention_context_bf16_lattice_probabilities: ComputePipelineState,
     #[cfg(test)]
     attention_context_legacy_bf16: ComputePipelineState,
     rms_norm_aten_f32: ComputePipelineState,
@@ -1755,12 +1919,18 @@ impl MtpPipelines {
             rope_bf16: pipeline("mtp_rope_split_bf16_f32")?,
             gelu_mul_bf16: pipeline("mtp_gelu_tanh_mul_bf16_f32")?,
             attention_scores_bf16: pipeline("mtp_attention_scores_bf16_f32")?,
+            attention_scores_bf16_lattice_query: pipeline(
+                "mtp_attention_scores_bf16_lattice_query_f32",
+            )?,
             #[cfg(test)]
             attention_scores_legacy_bf16: test_diagnostic_pipeline(
                 "mtp_test_attention_scores_legacy_bf16_f32",
             )?,
             attention_softmax_bf16: pipeline("mtp_attention_softmax_bf16_f32")?,
             attention_context_bf16: pipeline("mtp_attention_context_bf16_f32")?,
+            attention_context_bf16_lattice_probabilities: pipeline(
+                "mtp_attention_context_bf16_lattice_probabilities_f32",
+            )?,
             #[cfg(test)]
             attention_context_legacy_bf16: test_diagnostic_pipeline(
                 "mtp_test_attention_context_legacy_bf16_f32",
@@ -1776,12 +1946,20 @@ impl MtpPipelines {
         &self.bf16_gemv
     }
 
-    fn selected_attention_scores_bf16(&self) -> &ComputePipelineState {
-        &self.attention_scores_bf16
+    fn selected_attention_scores_bf16(&self, bf16_lattice_loads: bool) -> &ComputePipelineState {
+        if bf16_lattice_loads {
+            &self.attention_scores_bf16_lattice_query
+        } else {
+            &self.attention_scores_bf16
+        }
     }
 
-    fn selected_attention_context_bf16(&self) -> &ComputePipelineState {
-        &self.attention_context_bf16
+    fn selected_attention_context_bf16(&self, bf16_lattice_loads: bool) -> &ComputePipelineState {
+        if bf16_lattice_loads {
+            &self.attention_context_bf16_lattice_probabilities
+        } else {
+            &self.attention_context_bf16
+        }
     }
 }
 
@@ -1937,6 +2115,7 @@ pub struct Gemma4MtpAssistantMetal {
     scratch: MtpScratch,
     queue: metal::CommandQueue,
     bf16_producer_fusion: bool,
+    bf16_lattice_loads: bool,
     resident_ledger: Gemma4MtpResidentLedger,
     last_proposal_ledger: Option<Gemma4MtpProposalLedger>,
     source_path: PathBuf,
@@ -2162,17 +2341,19 @@ impl Gemma4MtpAssistantMetal {
     pub fn load(path: &Path) -> Result<Self> {
         let full_q4 = full_q4_requested_from_environment()?;
         let bf16_producer_fusion = bf16_producer_fusion_requested_from_environment()?;
-        Self::load_with_options(path, full_q4, bf16_producer_fusion)
+        let bf16_lattice_loads = bf16_lattice_loads_requested_from_environment()?;
+        Self::load_with_options(path, full_q4, bf16_producer_fusion, bf16_lattice_loads)
     }
 
     fn load_with_full_q4(path: &Path, full_q4_requested: bool) -> Result<Self> {
-        Self::load_with_options(path, full_q4_requested, false)
+        Self::load_with_options(path, full_q4_requested, false, false)
     }
 
     fn load_with_options(
         path: &Path,
         full_q4_requested: bool,
         bf16_producer_fusion: bool,
+        bf16_lattice_loads: bool,
     ) -> Result<Self> {
         let load_started = Instant::now();
         validate_official_config(path)?;
@@ -2389,6 +2570,16 @@ impl Gemma4MtpAssistantMetal {
                 0
             },
         );
+        eprintln!(
+            "[gemma4-mtp bf16-lattice-loads] enabled={} direct_query_qk={} direct_probability_context={} dispatches_elided={} bytes_elided={} scratch_bytes_added={} candidate_psos_compiled={}",
+            usize::from(bf16_lattice_loads),
+            usize::from(bf16_lattice_loads),
+            usize::from(bf16_lattice_loads),
+            MTP_BF16_LATTICE_DISPATCHES_ELIDED,
+            MTP_BF16_LATTICE_BYTES_ELIDED,
+            MTP_BF16_LATTICE_SCRATCH_BYTES_ADDED,
+            MTP_BF16_LATTICE_CANDIDATE_PSOS_COMPILED,
+        );
 
         Ok(Self {
             weight_file,
@@ -2403,6 +2594,7 @@ impl Gemma4MtpAssistantMetal {
             scratch,
             queue: kernel.device.new_command_queue(),
             bf16_producer_fusion,
+            bf16_lattice_loads,
             resident_ledger,
             last_proposal_ledger: None,
             source_path: path.to_path_buf(),
@@ -3727,6 +3919,29 @@ impl Gemma4MtpAssistantMetal {
             }
         }
         if invocation == MtpDeviceChainInvocation::Production {
+            let (lattice_rounds_per_draft, lattice_rounds_total) = if self.bf16_lattice_loads {
+                let per_draft = mtp_bf16_lattice_rounds_elided_per_draft(logical_len)
+                    .ok_or_else(|| invalid("BF16 lattice-load accounting overflow"))?;
+                let total = per_draft
+                    .checked_mul(draft_limit)
+                    .ok_or_else(|| invalid("BF16 lattice-load request accounting overflow"))?;
+                (per_draft, total)
+            } else {
+                (0, 0)
+            };
+            eprintln!(
+                "[gemma4-mtp bf16-lattice-loads] requested_drafts={draft_limit} returned_drafts={} target_logical_k={} enabled={} direct_query_qk={} direct_probability_context={} bf16_round_ops_elided_per_draft={} bf16_round_ops_elided_total={} dispatches_elided={} bytes_elided={} scratch_bytes_added={}",
+                proposals.len(),
+                logical_len,
+                usize::from(self.bf16_lattice_loads),
+                usize::from(self.bf16_lattice_loads),
+                usize::from(self.bf16_lattice_loads),
+                lattice_rounds_per_draft,
+                lattice_rounds_total,
+                MTP_BF16_LATTICE_DISPATCHES_ELIDED,
+                MTP_BF16_LATTICE_BYTES_ELIDED,
+                MTP_BF16_LATTICE_SCRATCH_BYTES_ADDED,
+            );
             eprintln!(
                 "[gemma4-mtp bf16-producer-fusion] requested_drafts={draft_limit} returned_drafts={} enabled={} standalone_round_dispatches_per_draft={} standalone_round_elements_per_draft={} standalone_round_rw_bytes_per_draft={} elided_round_dispatches_per_draft={} elided_round_elements_per_draft={} elided_round_rw_bytes_per_draft={}",
                 proposals.len(),
@@ -3882,6 +4097,7 @@ impl Gemma4MtpAssistantMetal {
             &self.scratch.context,
             attention_scalar,
             N_HEADS,
+            self.bf16_lattice_loads,
             #[cfg(test)]
             layer_index,
             #[cfg(test)]
@@ -4352,6 +4568,7 @@ fn encode_attention_bf16(
     output: &Buffer,
     scalar: &Buffer,
     head_count: usize,
+    bf16_lattice_loads: bool,
     #[cfg(test)] layer_index: usize,
     #[cfg(test)] position_count: usize,
     #[cfg(test)] context_elements: usize,
@@ -4370,7 +4587,8 @@ fn encode_attention_bf16(
     #[cfg(test)]
     let checkpoint_columns = stage_attention_checkpoint_columns(layer_index, position_count);
 
-    encoder.set_compute_pipeline_state(pipelines.selected_attention_scores_bf16());
+    encoder
+        .set_compute_pipeline_state(pipelines.selected_attention_scores_bf16(bf16_lattice_loads));
     encoder.set_buffer(0, Some(query), 0);
     encoder.set_buffer(1, Some(keys), 0);
     encoder.set_buffer(2, Some(scores), 0);
@@ -4415,7 +4633,8 @@ fn encode_attention_bf16(
         pending_stage_snapshots,
     );
 
-    encoder.set_compute_pipeline_state(pipelines.selected_attention_context_bf16());
+    encoder
+        .set_compute_pipeline_state(pipelines.selected_attention_context_bf16(bf16_lattice_loads));
     encoder.set_buffer(0, Some(values), 0);
     encoder.set_buffer(1, Some(scores), 0);
     encoder.set_buffer(2, Some(output), 0);
@@ -5537,6 +5756,73 @@ mod tests {
     }
 
     #[test]
+    fn bf16_lattice_loads_are_explicit_default_off_and_fail_closed() {
+        assert_eq!(parse_bf16_lattice_loads_opt_in(None), Ok(false));
+        assert_eq!(parse_bf16_lattice_loads_opt_in(Some("0")), Ok(false));
+        assert_eq!(parse_bf16_lattice_loads_opt_in(Some("FALSE")), Ok(false));
+        assert_eq!(parse_bf16_lattice_loads_opt_in(Some("1")), Ok(true));
+        assert_eq!(parse_bf16_lattice_loads_opt_in(Some("TrUe")), Ok(true));
+        assert!(parse_bf16_lattice_loads_opt_in(Some("yes")).is_err());
+        assert!(parse_bf16_lattice_loads_opt_in(Some("")).is_err());
+    }
+
+    fn mtp_shader_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing shader section start {start:?}"));
+        let source = &source[start..];
+        let end = source
+            .find(end)
+            .unwrap_or_else(|| panic!("missing shader section end {end:?}"));
+        &source[..end]
+    }
+
+    #[test]
+    fn bf16_lattice_loads_source_scope_pins_bf16_producers_and_f32_kv_consumers() {
+        let control_qk = mtp_shader_section(
+            MTP_SHADER,
+            "kernel void mtp_attention_scores_bf16_f32(",
+            "kernel void mtp_attention_scores_bf16_lattice_query_f32(",
+        );
+        assert!(control_qk.contains("mtp_load_rounded_bf16x4(query"));
+        assert!(control_qk.contains("mtp_load_rounded_bf16x4(keys"));
+
+        let lattice_qk = mtp_shader_section(
+            MTP_SHADER,
+            "kernel void mtp_attention_scores_bf16_lattice_query_f32(",
+            "kernel void mtp_attention_softmax_bf16_f32(",
+        );
+        assert!(lattice_qk.contains("mtp_load_bf16_latticex4(query"));
+        assert!(!lattice_qk.contains("mtp_load_rounded_bf16x4(query"));
+        assert!(lattice_qk.contains("mtp_load_rounded_bf16x4(keys"));
+        assert!(!lattice_qk.contains("mtp_load_bf16_latticex4(keys"));
+
+        let control_context = mtp_shader_section(
+            MTP_SHADER,
+            "kernel void mtp_attention_context_bf16_f32(",
+            "kernel void mtp_attention_context_bf16_lattice_probabilities_f32(",
+        );
+        assert!(control_context.contains("mtp_round_bf16(probabilities"));
+        assert!(control_context.contains("mtp_round_bf16(values"));
+
+        let lattice_context = mtp_shader_section(
+            MTP_SHADER,
+            "kernel void mtp_attention_context_bf16_lattice_probabilities_f32(",
+            "// Pinned ATen contiguous-f32 RMS",
+        );
+        assert!(lattice_context.contains("probabilities[score_base + p] *"));
+        assert!(!lattice_context.contains("mtp_round_bf16(probabilities"));
+        assert!(lattice_context.contains("mtp_round_bf16(values"));
+
+        // The candidate is sound only because both query and probability
+        // producers store widened BF16 before these consumers execute.
+        assert!(MTP_SHADER.contains("data[dim0] = mtp_round_bf16(first + first_cross)"));
+        assert!(MTP_SHADER.contains("mtp_round_bf16(scores[score_base + p] / denominator)"));
+        assert!(MTP_TEST_DIAGNOSTIC_SHADER
+            .contains("mtp_test_round_bf16(scores[score_base + p] * reciprocal)"));
+    }
+
+    #[test]
     fn step3_logit_trace_is_default_off_and_accepts_only_explicit_truthy_values() {
         assert!(!mtp_step3_logit_trace_enabled_value(None));
         assert!(!mtp_step3_logit_trace_enabled_value(Some("0")));
@@ -5597,6 +5883,37 @@ mod tests {
             44 * MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT,
             17_661_952
         );
+    }
+
+    #[test]
+    fn bf16_lattice_loads_accounting_pins_the_exact_44_proposal_request() {
+        let request_rounds = [(13usize, 104usize), (12, 118), (13, 131), (6, 145)];
+        let expected_per_draft = [4_259_840usize, 4_833_280, 5_365_760, 5_939_200];
+        assert_eq!(
+            request_rounds
+                .iter()
+                .map(|(drafts, _)| drafts)
+                .sum::<usize>(),
+            44
+        );
+        for ((_, logical_k), expected) in request_rounds.iter().zip(expected_per_draft) {
+            assert_eq!(
+                mtp_bf16_lattice_rounds_elided_per_draft(*logical_k),
+                Some(expected)
+            );
+        }
+        let request_total = request_rounds
+            .iter()
+            .map(|(drafts, logical_k)| {
+                drafts * mtp_bf16_lattice_rounds_elided_per_draft(*logical_k).unwrap()
+            })
+            .sum::<usize>();
+        assert_eq!(request_total, 218_767_360);
+        assert_eq!(44 * 4 * 3, 528);
+        assert_eq!(MTP_BF16_LATTICE_DISPATCHES_ELIDED, 0);
+        assert_eq!(MTP_BF16_LATTICE_BYTES_ELIDED, 0);
+        assert_eq!(MTP_BF16_LATTICE_SCRATCH_BYTES_ADDED, 0);
+        assert_eq!(MTP_BF16_LATTICE_CANDIDATE_PSOS_COMPILED, 2);
     }
 
     #[test]
@@ -7137,6 +7454,292 @@ mod tests {
         );
     }
 
+    struct Bf16LatticeAttentionBenchRound {
+        drafts: usize,
+        logical_k: usize,
+        local_scalar: Buffer,
+        full_scalar: Buffer,
+    }
+
+    struct Bf16LatticeAttentionBench {
+        local_query: Buffer,
+        local_keys: Buffer,
+        local_values: Buffer,
+        local_scores: Buffer,
+        local_output: Buffer,
+        full_query: Buffer,
+        full_keys: Buffer,
+        full_values: Buffer,
+        full_scores: Buffer,
+        full_output: Buffer,
+        rounds: Vec<Bf16LatticeAttentionBenchRound>,
+    }
+
+    impl Bf16LatticeAttentionBench {
+        fn new(device: &Device) -> Self {
+            const KV_STRIDE: usize = 192;
+            const MAX_LOGICAL_K: usize = 145;
+            let local_query_values =
+                bf16_lattice_test_values(N_HEADS * LOCAL_HEAD_DIM, 0x9100, false);
+            let local_key_values =
+                dirty_low16_test_values(LOCAL_KV_HEADS * KV_STRIDE * LOCAL_HEAD_DIM, 0x9200);
+            let local_value_values =
+                dirty_low16_test_values(LOCAL_KV_HEADS * KV_STRIDE * LOCAL_HEAD_DIM, 0x9300);
+            let full_query_values =
+                bf16_lattice_test_values(N_HEADS * FULL_HEAD_DIM, 0x9400, false);
+            let full_key_values =
+                dirty_low16_test_values(FULL_KV_HEADS * KV_STRIDE * FULL_HEAD_DIM, 0x9500);
+            let full_value_values =
+                dirty_low16_test_values(FULL_KV_HEADS * KV_STRIDE * FULL_HEAD_DIM, 0x9600);
+            let rounds = [(13usize, 104usize), (12, 118), (13, 131), (6, 145)]
+                .into_iter()
+                .map(|(drafts, logical_k)| Bf16LatticeAttentionBenchRound {
+                    drafts,
+                    logical_k,
+                    local_scalar: test_attention_scalar(
+                        device,
+                        N_HEADS,
+                        LOCAL_HEAD_DIM,
+                        logical_k,
+                        N_HEADS / LOCAL_KV_HEADS,
+                        KV_STRIDE,
+                        0,
+                        logical_k,
+                    ),
+                    full_scalar: test_attention_scalar(
+                        device,
+                        N_HEADS,
+                        FULL_HEAD_DIM,
+                        logical_k,
+                        N_HEADS / FULL_KV_HEADS,
+                        KV_STRIDE,
+                        0,
+                        logical_k,
+                    ),
+                })
+                .collect();
+            Self {
+                local_query: f32_buffer(device, &local_query_values),
+                local_keys: f32_buffer(device, &local_key_values),
+                local_values: f32_buffer(device, &local_value_values),
+                local_scores: shared_buffer(
+                    device,
+                    N_HEADS * MAX_LOGICAL_K * std::mem::size_of::<f32>(),
+                ),
+                local_output: shared_buffer(
+                    device,
+                    N_HEADS * LOCAL_HEAD_DIM * std::mem::size_of::<f32>(),
+                ),
+                full_query: f32_buffer(device, &full_query_values),
+                full_keys: f32_buffer(device, &full_key_values),
+                full_values: f32_buffer(device, &full_value_values),
+                full_scores: shared_buffer(
+                    device,
+                    N_HEADS * MAX_LOGICAL_K * std::mem::size_of::<f32>(),
+                ),
+                full_output: shared_buffer(
+                    device,
+                    N_HEADS * FULL_HEAD_DIM * std::mem::size_of::<f32>(),
+                ),
+                rounds,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_bf16_lattice_attention_bench_layer(
+        encoder: &metal::ComputeCommandEncoderRef,
+        pipelines: &MtpPipelines,
+        query: &Buffer,
+        keys: &Buffer,
+        values: &Buffer,
+        scores: &Buffer,
+        output: &Buffer,
+        scalar: &Buffer,
+        lattice_loads: bool,
+    ) {
+        let groups = MTLSize {
+            width: N_HEADS as u64,
+            height: 1,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        encoder.set_compute_pipeline_state(pipelines.selected_attention_scores_bf16(lattice_loads));
+        encoder.set_buffer(0, Some(query), 0);
+        encoder.set_buffer(1, Some(keys), 0);
+        encoder.set_buffer(2, Some(scores), 0);
+        for index in 0..8u64 {
+            encoder.set_buffer(3 + index, Some(scalar), index * 4);
+        }
+        encoder.dispatch_thread_groups(groups, threads);
+
+        encoder.set_compute_pipeline_state(&pipelines.attention_softmax_bf16);
+        encoder.set_buffer(0, Some(scores), 0);
+        encoder.set_buffer(1, Some(scalar), 0);
+        encoder.set_buffer(2, Some(scalar), 8);
+        encoder.dispatch_thread_groups(groups, threads);
+
+        encoder
+            .set_compute_pipeline_state(pipelines.selected_attention_context_bf16(lattice_loads));
+        encoder.set_buffer(0, Some(values), 0);
+        encoder.set_buffer(1, Some(scores), 0);
+        encoder.set_buffer(2, Some(output), 0);
+        encoder.set_buffer(3, Some(scalar), 0);
+        encoder.set_buffer(4, Some(scalar), 4);
+        encoder.set_buffer(5, Some(scalar), 8);
+        encoder.set_buffer(6, Some(scalar), 12);
+        encoder.set_buffer(7, Some(scalar), 20);
+        encoder.set_buffer(8, Some(scalar), 24);
+        encoder.set_buffer(9, Some(scalar), 28);
+        encoder.set_buffer(10, Some(scalar), 32);
+        encoder.set_buffer(11, Some(scalar), 36);
+        encoder.dispatch_thread_groups(groups, threads);
+    }
+
+    fn time_bf16_lattice_attention_request(
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        buffers: &Bf16LatticeAttentionBench,
+        lattice_loads: bool,
+    ) -> u128 {
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        for round in &buffers.rounds {
+            for _ in 0..round.drafts {
+                for _ in 0..3 {
+                    encode_bf16_lattice_attention_bench_layer(
+                        encoder,
+                        pipelines,
+                        &buffers.local_query,
+                        &buffers.local_keys,
+                        &buffers.local_values,
+                        &buffers.local_scores,
+                        &buffers.local_output,
+                        &round.local_scalar,
+                        lattice_loads,
+                    );
+                }
+                encode_bf16_lattice_attention_bench_layer(
+                    encoder,
+                    pipelines,
+                    &buffers.full_query,
+                    &buffers.full_keys,
+                    &buffers.full_values,
+                    &buffers.full_scores,
+                    &buffers.full_output,
+                    &round.full_scalar,
+                    lattice_loads,
+                );
+            }
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let (gpu_us, _) = command_buffer_gpu_times_us(command_buffer);
+        gpu_us
+    }
+
+    fn read_bf16_lattice_bench_outputs(buffers: &Bf16LatticeAttentionBench) -> Vec<u32> {
+        let mut local = vec![0.0f32; N_HEADS * LOCAL_HEAD_DIM];
+        let mut full = vec![0.0f32; N_HEADS * FULL_HEAD_DIM];
+        read_buffer_f32(&buffers.local_output, &mut local);
+        read_buffer_f32(&buffers.full_output, &mut full);
+        local.into_iter().chain(full).map(f32::to_bits).collect()
+    }
+
+    #[test]
+    #[ignore = "real-Metal exact 44-proposal BF16 lattice-load timing gate"]
+    fn bf16_lattice_loads_exact_44_proposal_interleaved_timing() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP BF16 lattice-load benchmark: no Metal device");
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP kernels");
+        let buffers = Bf16LatticeAttentionBench::new(&kernel.device);
+        assert_eq!(
+            buffers
+                .rounds
+                .iter()
+                .map(|round| round.drafts)
+                .sum::<usize>(),
+            44
+        );
+        // This is a continuation/admission microbenchmark, not a request-wall
+        // prediction: 528 attention dispatches share one command buffer and
+        // deliberately reuse the same compact buffers across all 44 drafts.
+        assert_eq!(44 * 4 * 3, 528);
+        let round_ops = buffers
+            .rounds
+            .iter()
+            .map(|round| {
+                round.drafts * mtp_bf16_lattice_rounds_elided_per_draft(round.logical_k).unwrap()
+            })
+            .sum::<usize>();
+        assert_eq!(round_ops, 218_767_360);
+
+        let _ = time_bf16_lattice_attention_request(kernel, &pipelines, &buffers, false);
+        let control_bits = read_bf16_lattice_bench_outputs(&buffers);
+        let _ = time_bf16_lattice_attention_request(kernel, &pipelines, &buffers, true);
+        let lattice_bits = read_bf16_lattice_bench_outputs(&buffers);
+        assert_eq!(lattice_bits, control_bits, "timing workload output drifted");
+
+        for _ in 0..2 {
+            let _ = time_bf16_lattice_attention_request(kernel, &pipelines, &buffers, false);
+            let _ = time_bf16_lattice_attention_request(kernel, &pipelines, &buffers, true);
+        }
+
+        let mut control = Vec::with_capacity(9);
+        let mut lattice = Vec::with_capacity(9);
+        for sample in 0..9 {
+            if sample % 2 == 0 {
+                control.push(time_bf16_lattice_attention_request(
+                    kernel, &pipelines, &buffers, false,
+                ));
+                lattice.push(time_bf16_lattice_attention_request(
+                    kernel, &pipelines, &buffers, true,
+                ));
+            } else {
+                lattice.push(time_bf16_lattice_attention_request(
+                    kernel, &pipelines, &buffers, true,
+                ));
+                control.push(time_bf16_lattice_attention_request(
+                    kernel, &pipelines, &buffers, false,
+                ));
+            }
+        }
+        let median = |samples: &[u128]| {
+            let mut ordered = samples.to_vec();
+            ordered.sort_unstable();
+            ordered[ordered.len() / 2]
+        };
+        let control_median_us = median(&control);
+        let lattice_median_us = median(&lattice);
+        let saving_us = control_median_us as i128 - lattice_median_us as i128;
+        eprintln!(
+            "[gemma4-mtp bf16-lattice-loads benchmark] drafts=44 request_segments=13@104,12@118,13@131,6@145 exactness_runs_per_path=1 warmups_per_path=2 premeasurement_runs_per_path=3 samples=9 control_gpu_us={} lattice_gpu_us={} saving_us={} bf16_round_ops_elided=218767360 attention_dispatches=528 command_buffers=1 buffers_reused=1 admission_only=1 dispatches_elided=0 bytes_elided=0 scratch_bytes_added=0",
+            control_median_us,
+            lattice_median_us,
+            saving_us,
+        );
+        for sample in 0..9 {
+            eprintln!(
+                "[gemma4-mtp bf16-lattice-loads benchmark] sample={} control_gpu_us={} lattice_gpu_us={}",
+                sample,
+                control[sample],
+                lattice[sample],
+            );
+        }
+        assert!(
+            saving_us >= 5_000,
+            "BF16 lattice loads saved only {saving_us} us; require at least 5000 us/request"
+        );
+    }
+
     #[test]
     fn metal_bf16_gemv_matches_synthetic_reference() {
         let Some(kernel) = metal_linear_kernel() else {
@@ -7342,6 +7945,7 @@ mod tests {
                 f32_to_bf16_rne_bits(scores[0])
             };
             assert_eq!(run(&pipelines.attention_scores_bf16), 49_680);
+            assert_eq!(run(&pipelines.attention_scores_bf16_lattice_query), 49_680);
             assert_eq!(run(&pipelines.attention_scores_legacy_bf16), 49_681);
         }
     }
@@ -7425,6 +8029,304 @@ mod tests {
         result
     }
 
+    fn bf16_lattice_test_values(count: usize, seed: u32, positive: bool) -> Vec<f32> {
+        let (mut values, _) = deterministic_bf16_values(count, seed, 116, 10);
+        if positive {
+            for value in &mut values {
+                *value = value.abs();
+            }
+        }
+        assert!(values.iter().all(|value| value.to_bits() & 0xffff == 0));
+        values
+    }
+
+    fn dirty_low16_test_values(count: usize, seed: u32) -> Vec<f32> {
+        let (values, _) = deterministic_bf16_values(count, seed, 116, 10);
+        let values: Vec<f32> = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let low = ((index as u32).wrapping_mul(0x9e37).wrapping_add(seed) & 0xffff) | 1;
+                f32::from_bits(value.to_bits() | low)
+            })
+            .collect();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.iter().all(|value| value.to_bits() & 0xffff != 0));
+        values
+    }
+
+    fn test_attention_scalar(
+        device: &Device,
+        head_count: usize,
+        head_dim: usize,
+        position_count: usize,
+        group: usize,
+        kv_stride: usize,
+        compact_base: usize,
+        physical_logical_k: usize,
+    ) -> Buffer {
+        let scalar = shared_buffer(device, 40);
+        let words = [
+            head_count as u32,
+            head_dim as u32,
+            position_count as u32,
+            group as u32,
+            1.0f32.to_bits(),
+            head_dim as u32,
+            (kv_stride * head_dim) as u32,
+            (compact_base * head_dim) as u32,
+            compact_base as u32,
+            physical_logical_k as u32,
+        ];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                words.as_ptr(),
+                scalar.contents().cast::<u32>(),
+                words.len(),
+            );
+        }
+        scalar
+    }
+
+    #[test]
+    fn bf16_lattice_loads_match_raw_u32_at_local_and_full_production_widths() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP test kernels");
+        const KV_STRIDE: usize = 192;
+        for (name, head_dim, kv_heads, logical_k) in [
+            ("local", LOCAL_HEAD_DIM, LOCAL_KV_HEADS, 145usize),
+            ("full", FULL_HEAD_DIM, FULL_KV_HEADS, 145usize),
+        ] {
+            let group = N_HEADS / kv_heads;
+            let query = bf16_lattice_test_values(N_HEADS * head_dim, head_dim as u32, false);
+            let keys = dirty_low16_test_values(kv_heads * KV_STRIDE * head_dim, 0x5130);
+            let control_scores = run_test_attention_scores(
+                kernel,
+                pipelines.selected_attention_scores_bf16(false),
+                &query,
+                &keys,
+                N_HEADS,
+                head_dim,
+                logical_k,
+                group,
+                head_dim,
+                KV_STRIDE * head_dim,
+                0,
+            );
+            let lattice_scores = run_test_attention_scores(
+                kernel,
+                pipelines.selected_attention_scores_bf16(true),
+                &query,
+                &keys,
+                N_HEADS,
+                head_dim,
+                logical_k,
+                group,
+                head_dim,
+                KV_STRIDE * head_dim,
+                0,
+            );
+            assert_eq!(
+                raw_f32_bits(&lattice_scores),
+                raw_f32_bits(&control_scores),
+                "{name} QK direct-query load drifted"
+            );
+
+            let probabilities =
+                bf16_lattice_test_values(N_HEADS * logical_k, 0x6200 + head_dim as u32, true);
+            let values = dirty_low16_test_values(kv_heads * KV_STRIDE * head_dim, 0x7310);
+            let control_context = run_test_attention_context(
+                kernel,
+                pipelines.selected_attention_context_bf16(false),
+                &probabilities,
+                &values,
+                N_HEADS,
+                head_dim,
+                logical_k,
+                group,
+                head_dim,
+                KV_STRIDE * head_dim,
+                0,
+                0,
+                logical_k,
+            );
+            let lattice_context = run_test_attention_context(
+                kernel,
+                pipelines.selected_attention_context_bf16(true),
+                &probabilities,
+                &values,
+                N_HEADS,
+                head_dim,
+                logical_k,
+                group,
+                head_dim,
+                KV_STRIDE * head_dim,
+                0,
+                0,
+                logical_k,
+            );
+            assert_eq!(
+                raw_f32_bits(&lattice_context),
+                raw_f32_bits(&control_context),
+                "{name} context direct-probability load drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_lattice_loads_preserve_shared_buffer_alias_and_sentinel_guards() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP test kernels");
+        const HEAD_DIM: usize = 32;
+        const POSITIONS: usize = 3;
+        const POISON_BITS: u32 = 0x7fc1_2345;
+        let poison = f32::from_bits(POISON_BITS);
+
+        let q_start = 4usize;
+        let k_start = q_start + HEAD_DIM + 4;
+        let score_start = k_start + POSITIONS * HEAD_DIM + 4;
+        let qk_len = score_start + POSITIONS + 4;
+        let mut qk_backing = vec![poison; qk_len];
+        qk_backing[q_start..q_start + HEAD_DIM]
+            .copy_from_slice(&bf16_lattice_test_values(HEAD_DIM, 0x8110, false));
+        qk_backing[k_start..k_start + POSITIONS * HEAD_DIM]
+            .copy_from_slice(&dirty_low16_test_values(POSITIONS * HEAD_DIM, 0x8220));
+        let qk_scalar = test_attention_scalar(
+            &kernel.device,
+            1,
+            HEAD_DIM,
+            POSITIONS,
+            1,
+            POSITIONS,
+            0,
+            POSITIONS,
+        );
+        let run_qk = |pipeline: &ComputePipelineState| {
+            let backing = f32_buffer(&kernel.device, &qk_backing);
+            let command_buffer = kernel.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&backing), (q_start * 4) as u64);
+            encoder.set_buffer(1, Some(&backing), (k_start * 4) as u64);
+            encoder.set_buffer(2, Some(&backing), (score_start * 4) as u64);
+            for index in 0..8u64 {
+                encoder.set_buffer(3 + index, Some(&qk_scalar), index * 4);
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let mut output = vec![0.0f32; qk_len];
+            read_buffer_f32(&backing, &mut output);
+            output
+        };
+        let qk_control = run_qk(&pipelines.attention_scores_bf16);
+        let qk_lattice = run_qk(&pipelines.attention_scores_bf16_lattice_query);
+        assert_eq!(raw_f32_bits(&qk_lattice), raw_f32_bits(&qk_control));
+        for index in 0..qk_len {
+            if !(score_start..score_start + POSITIONS).contains(&index) {
+                assert_eq!(qk_lattice[index].to_bits(), qk_backing[index].to_bits());
+            }
+        }
+        assert!(qk_lattice[score_start..score_start + POSITIONS]
+            .iter()
+            .any(|value| value.to_bits() != POISON_BITS));
+
+        let value_start = 4usize;
+        let probability_start = value_start + POSITIONS * HEAD_DIM + 4;
+        let output_start = probability_start + POSITIONS + 5;
+        let context_len = output_start + HEAD_DIM + 4;
+        let mut context_backing = vec![poison; context_len];
+        context_backing[value_start..value_start + POSITIONS * HEAD_DIM]
+            .copy_from_slice(&dirty_low16_test_values(POSITIONS * HEAD_DIM, 0x8330));
+        context_backing[probability_start..probability_start + POSITIONS]
+            .copy_from_slice(&bf16_lattice_test_values(POSITIONS, 0x8440, true));
+        let context_scalar = test_attention_scalar(
+            &kernel.device,
+            1,
+            HEAD_DIM,
+            POSITIONS,
+            1,
+            POSITIONS,
+            0,
+            POSITIONS,
+        );
+        let run_context = |pipeline: &ComputePipelineState| {
+            let backing = f32_buffer(&kernel.device, &context_backing);
+            let command_buffer = kernel.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&backing), (value_start * 4) as u64);
+            encoder.set_buffer(
+                1,
+                Some(&backing),
+                (probability_start * std::mem::size_of::<f32>()) as u64,
+            );
+            encoder.set_buffer(2, Some(&backing), (output_start * 4) as u64);
+            encoder.set_buffer(3, Some(&context_scalar), 0);
+            encoder.set_buffer(4, Some(&context_scalar), 4);
+            encoder.set_buffer(5, Some(&context_scalar), 8);
+            encoder.set_buffer(6, Some(&context_scalar), 12);
+            encoder.set_buffer(7, Some(&context_scalar), 20);
+            encoder.set_buffer(8, Some(&context_scalar), 24);
+            encoder.set_buffer(9, Some(&context_scalar), 28);
+            encoder.set_buffer(10, Some(&context_scalar), 32);
+            encoder.set_buffer(11, Some(&context_scalar), 36);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let mut output = vec![0.0f32; context_len];
+            read_buffer_f32(&backing, &mut output);
+            output
+        };
+        let context_control = run_context(&pipelines.attention_context_bf16);
+        let context_lattice = run_context(&pipelines.attention_context_bf16_lattice_probabilities);
+        assert_eq!(
+            raw_f32_bits(&context_lattice),
+            raw_f32_bits(&context_control)
+        );
+        for index in 0..context_len {
+            if !(output_start..output_start + HEAD_DIM).contains(&index) {
+                assert_eq!(
+                    context_lattice[index].to_bits(),
+                    context_backing[index].to_bits()
+                );
+            }
+        }
+        assert!(context_lattice[output_start..output_start + HEAD_DIM]
+            .iter()
+            .any(|value| value.to_bits() != POISON_BITS));
+    }
+
     #[test]
     fn production_context_uses_explicit_physical_k_phase_and_tail() {
         let Some(kernel) = metal_linear_kernel() else {
@@ -7490,6 +8392,15 @@ mod tests {
         );
         assert_eq!(
             run(
+                &pipelines.attention_context_bf16_lattice_probabilities,
+                &local_probabilities,
+                &local_values,
+                6,
+            ),
+            0x3c2a
+        );
+        assert_eq!(
+            run(
                 &pipelines.attention_context_legacy_bf16,
                 &local_probabilities,
                 &local_values,
@@ -7510,6 +8421,15 @@ mod tests {
         assert_eq!(
             run(
                 &pipelines.attention_context_bf16,
+                &full_probabilities,
+                &full_values,
+                0,
+            ),
+            0xc32c
+        );
+        assert_eq!(
+            run(
+                &pipelines.attention_context_bf16_lattice_probabilities,
                 &full_probabilities,
                 &full_values,
                 0,
