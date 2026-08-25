@@ -33447,7 +33447,7 @@ impl Gemma4GhostCommonMetal {
                                     hot_wave.len(),
                                     cold_wave.len(),
                                 ) {
-                                    return None;
+                                    return false;
                                 }
                                 if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
                                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -33649,7 +33649,7 @@ impl Gemma4GhostCommonMetal {
                                         hot_wave.len(),
                                         cold_wave.len(),
                                     ) {
-                                        return None;
+                                        return false;
                                     }
                                     if let Some(plan) = retained_plan {
                                         let hits = plan.retained.len();
