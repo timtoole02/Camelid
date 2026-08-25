@@ -455,13 +455,41 @@ class WatchdogBoundaryTests(unittest.TestCase):
         telemetry.lib = mock.Mock()
         telemetry.lib.proc_pid_rusage.return_value = 0
 
-        with mock.patch.object(watchdog.os, "kill") as kill:
+        with mock.patch.object(watchdog.os, "kill") as kill, mock.patch.object(
+            watchdog.time, "sleep"
+        ) as sleep:
             with self.assertRaisesRegex(
                 watchdog.ProcessAccountingError,
                 "returned zero resident/footprint bytes",
             ):
                 telemetry.sample_process(pid)
+        self.assertEqual(kill.call_args_list, [mock.call(pid, 0), mock.call(pid, 0)])
+        sleep.assert_called_once_with(0.005)
+
+    def test_live_new_member_zero_rusage_retries_once_then_succeeds(self) -> None:
+        pid = 4322
+        telemetry = object.__new__(watchdog.NativeTelemetry)
+        telemetry.lib = mock.Mock()
+
+        def rusage_side_effect(
+            _pid: int, _flavor: int, usage_pointer: object
+        ) -> int:
+            if telemetry.lib.proc_pid_rusage.call_count == 2:
+                usage_pointer._obj.resident_size = 10
+                usage_pointer._obj.phys_footprint = 20
+            return 0
+
+        telemetry.lib.proc_pid_rusage.side_effect = rusage_side_effect
+        with mock.patch.object(watchdog.os, "kill") as kill, mock.patch.object(
+            watchdog.time, "sleep"
+        ) as sleep:
+            sample = telemetry.sample_process(pid)
+
+        self.assertEqual(sample["rss_bytes"], 10)
+        self.assertEqual(sample["physical_footprint_bytes"], 20)
+        self.assertEqual(sample["accounting_attempts"], 2)
         kill.assert_called_once_with(pid, 0)
+        sleep.assert_called_once_with(0.005)
 
     def test_zero_rusage_with_esrch_is_typed_as_disappeared(self) -> None:
         pid = 4322

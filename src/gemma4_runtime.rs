@@ -1990,6 +1990,25 @@ const GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE: [usize; 30] = [
     74, 96, 62, 60, 76, 53, 62, 64, 64, 96, 96, 96, 76, 80, 96, 63, 52, 51, 58, 60, 53, 59, 64, 76,
     59, 70, 73, 69, 72, 70,
 ];
+/// Exact projected-memory-safe Mini2 shape. This proportional 1,408-slot descendant of
+/// the previously exact H13 distribution leaves measured headroom below both
+/// watchdog ceilings while retaining its per-layer weighting. Keeping the
+/// literal frozen prevents a merely same-total profile from silently changing
+/// the I/O and physical-footprint contract.
+const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS: usize = 1_408;
+const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
+    60, 64, 45, 43, 40, 41, 44, 42, 47, 46, 40, 41, 44, 46, 42, 50, 40, 39, 46, 47, 41, 46, 45, 43,
+    46, 56, 59, 56, 58, 51,
+];
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_hot_profile_admitted(profile: &[usize]) -> bool {
+    (profile == GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE
+        && profile.iter().copied().sum::<usize>() == GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS)
+        || (profile == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+            && profile.iter().copied().sum::<usize>()
+                == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS)
+}
 /// Default-off exact I/O A/B for the compact cold stage. When the host expert
 /// cache is deliberately disabled, read each selected record directly into
 /// its final Metal stage slot instead of allocating an intermediate record and
@@ -2034,6 +2053,12 @@ const GHOST_METAL_SPARSE_PREDICT_CAP: usize = 48;
 /// slot, table, command buffer, route, or fallback decision.
 const GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE";
+/// H56 observation-only replay of the official assistant's post-projection
+/// recurrent rows through all 30 target routers. The rows are frozen before
+/// verification, but projection and comparison run only after the exact target
+/// head has fixed the verifier output. No candidate from this probe is ever
+/// passed to a stage, slot filler, route table, or execution admission path.
+const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_ENV: &str = "CAMELID_GEMMA4_MTP_ASSISTANT_ROUTER_PROBE";
 /// Exact H40-only consumer for the live sequential signal. Private bounded
 /// readers may prepare next-layer cold records, but exact demand never waits
 /// for them and remains the only authority for slots and routing.
@@ -2121,6 +2146,23 @@ fn ghost_metal_live_sequential_predict_probe_enabled() -> bool {
     *FLAG.get_or_init(|| {
         ghost_metal_live_sequential_predict_probe_from(
             std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_mtp_assistant_router_probe_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp_assistant_router_probe_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        gemma4_mtp_assistant_router_probe_from(
+            std::env::var(GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_ENV)
                 .ok()
                 .as_deref(),
         )
@@ -5588,9 +5630,10 @@ fn plan_compact_three_wave_direct_from_live(
 }
 
 /// After Metal commits the static-hot GateUp command, launch authoritative
-/// demand I/O first and then copy ready Boxes. Thus demand reads overlap both
-/// ready-copy and ready GateUp, while every CPU destination remains disjoint
-/// from every committed GPU resource.
+/// demand I/O first and then copy ready Boxes. H54 subsequently overlaps the
+/// reads with ready GateUp; H55 preserves the read/copy overlap but defers all
+/// cold GateUp to its terminal command. Every CPU destination remains
+/// disjoint from every committed GPU resource.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn launch_compact_three_wave_direct(
@@ -7262,6 +7305,11 @@ impl GhostMetalExpertRuntime {
                     / (1024.0 * 1024.0),
                 GHOST_METAL_OVERFLOW_SLOTS,
             );
+            if crate::metal::gemma4_hybrid_async_two_wave_collapse_enabled() {
+                eprintln!(
+                    "[gemma4-ghost-metal] exact async two-wave collapse armed: admitted_layer_hot_commands=1 admitted_layer_terminal_cold_commands=1 admitted_layer_command_buffers=2 routing_authority=exact-router down_passes=1 fallback=current-exact"
+                );
+            }
         }
         Ok(Self {
             engine,
@@ -7823,7 +7871,11 @@ impl GhostMetalExpertRuntime {
         ghost_cache: Option<&GhostMoeExpertCache>,
         previous_cold_stage: Option<&PreviousColdRoundStage>,
         out_rows: &mut [Vec<f32>],
+        mut assistant_router_probe_truth: Option<&mut Option<Gemma4MtpAssistantRouterProbeTruth>>,
     ) -> bool {
+        if let Some(output) = assistant_router_probe_truth.as_deref_mut() {
+            *output = None;
+        }
         let k_tokens = hidden_rows.len();
         let was_prefill_round = self.prefill_round;
         // Fail closed across every early return. Only the complete successful
@@ -8126,16 +8178,17 @@ impl GhostMetalExpertRuntime {
                     ghost_metal_previous_cold_stage_direct_enabled(),
                 )
             });
-        let live_sequential_h40_shape = live_sequential_predictor.is_some()
+        let live_sequential_hot_profile: Option<[usize; GHOST_METAL_HYBRID_PROFILE_LAYERS]> =
+            (self.layers.len() == GHOST_METAL_HYBRID_PROFILE_LAYERS).then(|| {
+                std::array::from_fn(|layer_idx| self.layers[layer_idx].slots.writable_slot_count())
+            });
+        let live_sequential_profile_shape = live_sequential_predictor.is_some()
             && direct_stage_read_active
             && hot_cold_overlap_active
             && !ghost_metal_hybrid_demand_promotion_prefetch_enabled()
-            && self.layers.len() == GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE.len()
-            && self
-                .layers
-                .iter()
-                .zip(GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE)
-                .all(|(layer, expected)| layer.slots.writable_slot_count() == expected);
+            && live_sequential_hot_profile
+                .as_ref()
+                .is_some_and(|profile| ghost_metal_live_sequential_hot_profile_admitted(profile));
         let live_sequential_stage_cap = GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP;
         let live_sequential_stage_workers = if live_sequential_stage_requested
             && ghost_metal_live_sequential_stage_dual_reader_enabled()
@@ -8146,7 +8199,8 @@ impl GhostMetalExpertRuntime {
         };
         let live_sequential_fast_predict =
             live_sequential_stage_requested && ghost_metal_live_sequential_fast_predict_enabled();
-        let live_sequential_stage = if live_sequential_stage_requested && live_sequential_h40_shape
+        let live_sequential_stage = if live_sequential_stage_requested
+            && live_sequential_profile_shape
         {
             ghost_cache.and_then(|cache| {
                 let file = Arc::clone(&cache.file);
@@ -8229,7 +8283,7 @@ impl GhostMetalExpertRuntime {
 
         let three_wave_gateup_active = ghost_metal_three_wave_gateup_requested()
             && !self.prefill_round
-            && live_sequential_h40_shape
+            && live_sequential_profile_shape
             && live_sequential_stage.is_some()
             && previous_cold_stage.is_none()
             && !retained_cold_direct_bank_fill_active
@@ -8837,6 +8891,8 @@ impl GhostMetalExpertRuntime {
         } else {
             &empty_unions
         };
+        let mut assistant_router_probe_wave_load_ms =
+            [0.0f64; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS];
         let mut ok = {
             let Some(common) = self.common.as_mut() else {
                 return false;
@@ -8862,12 +8918,15 @@ impl GhostMetalExpertRuntime {
                     .then_some(hot_at_start.as_slice()),
                 live_sequential_predictor.take(),
                 live_sequential_stage_launcher_fn,
-                live_sequential_h40_shape,
+                live_sequential_profile_shape,
                 pong_slab_for_gpu.as_ref(),
                 gpu_unions,
                 fill_pong_fn,
                 &wave1_refs,
                 !self.prefill_round,
+                assistant_router_probe_truth
+                    .is_some()
+                    .then_some(&mut assistant_router_probe_wave_load_ms),
             )
         };
         // The direct retained callback bypasses the ordinary `StageCold`
@@ -8957,12 +9016,33 @@ impl GhostMetalExpertRuntime {
                 ghost_cache,
                 None,
                 out_rows,
+                assistant_router_probe_truth.as_deref_mut(),
             );
             self.suppress_prediction = false;
             return retry;
         }
         self.last_chained_k = Some(k_tokens);
         self.last_chained_succeeded = ok;
+        if ok {
+            if let Some(output) = assistant_router_probe_truth.as_deref_mut() {
+                if self.layers.len() == GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS
+                    && collected_routes.len() == GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS
+                {
+                    if let Some(common) = self.common.as_ref() {
+                        let ledger = &common.last_chained_ledger;
+                        *output = Some(Gemma4MtpAssistantRouterProbeTruth {
+                            start_pos,
+                            k_tokens,
+                            exact_routes: collected_routes.clone(),
+                            hot_at_start,
+                            wave_load_ms_per_layer: assistant_router_probe_wave_load_ms,
+                            ledger_unique_per_layer: ledger.unique_per_layer,
+                            ledger_unique_sum: ledger.unique_experts_sum,
+                        });
+                    }
+                }
+            }
+        }
         if ok {
             self.last_chained_sig = Some(chunk_sig);
             // Feed the per-K sweep accounting from this round's ledger: the
@@ -13748,6 +13828,234 @@ struct Gemma4SpeculativeStepResult {
     target_hidden_normalized: Option<Vec<f32>>,
 }
 
+const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS: usize = 30;
+const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN: usize = 2_816;
+const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS: usize = 128;
+const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_TOP_K: usize = 8;
+
+/// Request-local H56 source. The official assistant already applied its
+/// learned `[2816,1024]` post projection; these widened BF16 values are copied
+/// only to keep their identity and lifetime explicit across the synchronous
+/// target verifier call.
+#[derive(Debug, Clone, PartialEq)]
+struct Gemma4MtpAssistantRouterProbeSource {
+    start_pos: usize,
+    k_tokens: usize,
+    source_rows: usize,
+    hidden: usize,
+    flat_hidden_rows: Vec<f32>,
+}
+
+/// Exact target observations frozen by the chained lane before it releases
+/// the verifier back to the tied head. They are read only after that head has
+/// fixed acceptance and logits.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone)]
+struct Gemma4MtpAssistantRouterProbeTruth {
+    start_pos: usize,
+    k_tokens: usize,
+    exact_routes: Vec<Vec<usize>>,
+    hot_at_start: [[bool; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
+        GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS],
+    wave_load_ms_per_layer: [f64; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS],
+    ledger_unique_per_layer: [u16; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS],
+    ledger_unique_sum: u32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Gemma4MtpAssistantRouterProbeLayerTally {
+    hits: u32,
+    actual_cold: u32,
+    predicted_cold: u32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Gemma4MtpAssistantRouterProbeSummary {
+    compared_layers: u32,
+    hits: u32,
+    actual_cold: u32,
+    predicted_cold: u32,
+    read_wall_ms: f64,
+    projected_saved_ms: f64,
+}
+
+/// Freeze exactly K-1 official recurrent rows. Proposal row j was produced
+/// while the assistant consumed verifier input row j, so it covers target rows
+/// `0..K-2`; there is intentionally no fabricated row for the final verifier
+/// token.
+#[cfg(any(target_os = "macos", test))]
+fn freeze_mtp_assistant_router_probe_source<'a>(
+    start_pos: usize,
+    k_tokens: usize,
+    hidden: usize,
+    recurrent_rows: impl IntoIterator<Item = &'a [f32]>,
+) -> Option<Gemma4MtpAssistantRouterProbeSource> {
+    if hidden != GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN || !(2..=16).contains(&k_tokens) {
+        return None;
+    }
+    let rows = recurrent_rows.into_iter().collect::<Vec<_>>();
+    if rows.len().checked_add(1)? != k_tokens || rows.is_empty() || rows.len() > 15 {
+        return None;
+    }
+    let elements = rows.len().checked_mul(hidden)?;
+    let mut flat_hidden_rows = Vec::with_capacity(elements);
+    for row in &rows {
+        if row.len() != hidden || row.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        flat_hidden_rows.extend_from_slice(row);
+    }
+    if flat_hidden_rows.len() != elements {
+        return None;
+    }
+    Some(Gemma4MtpAssistantRouterProbeSource {
+        start_pos,
+        k_tokens,
+        source_rows: rows.len(),
+        hidden,
+        flat_hidden_rows,
+    })
+}
+
+/// Filter immutable start-of-round hot identities before applying the payload
+/// cap, then compare with the target router's exact union. Invalid identities
+/// invalidate only this observation.
+#[cfg(any(target_os = "macos", test))]
+fn mtp_assistant_router_probe_layer_tally(
+    ranked: &[usize],
+    actual: &[usize],
+    hot_at_start: &[bool; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS],
+    cap: usize,
+) -> Option<Gemma4MtpAssistantRouterProbeLayerTally> {
+    if cap == 0 {
+        return None;
+    }
+    let mut ranked_seen = [false; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
+    let mut predicted = [false; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
+    let mut predicted_cold = 0u32;
+    for &expert in ranked {
+        if expert >= ranked_seen.len() || ranked_seen[expert] {
+            return None;
+        }
+        ranked_seen[expert] = true;
+        if !hot_at_start[expert] && predicted_cold < cap.min(128) as u32 {
+            predicted[expert] = true;
+            predicted_cold = predicted_cold.saturating_add(1);
+        }
+    }
+
+    let mut actual_seen = [false; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
+    let mut actual_cold = 0u32;
+    let mut hits = 0u32;
+    for &expert in actual {
+        if expert >= actual_seen.len() || actual_seen[expert] {
+            return None;
+        }
+        actual_seen[expert] = true;
+        if !hot_at_start[expert] {
+            actual_cold = actual_cold.saturating_add(1);
+            hits = hits.saturating_add(u32::from(predicted[expert]));
+        }
+    }
+    Some(Gemma4MtpAssistantRouterProbeLayerTally {
+        hits,
+        actual_cold,
+        predicted_cold,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn summarize_mtp_assistant_router_probe(
+    tallies: &[Option<Gemma4MtpAssistantRouterProbeLayerTally>],
+    wave_load_ms_per_layer: &[f64],
+) -> Option<Gemma4MtpAssistantRouterProbeSummary> {
+    if tallies.len() != wave_load_ms_per_layer.len() {
+        return None;
+    }
+    let mut summary = Gemma4MtpAssistantRouterProbeSummary::default();
+    for (tally, &read_wall_ms) in tallies.iter().zip(wave_load_ms_per_layer) {
+        let Some(tally) = tally else {
+            continue;
+        };
+        if !read_wall_ms.is_finite() || read_wall_ms < 0.0 {
+            return None;
+        }
+        summary.compared_layers = summary.compared_layers.saturating_add(1);
+        summary.hits = summary.hits.saturating_add(tally.hits);
+        summary.actual_cold = summary.actual_cold.saturating_add(tally.actual_cold);
+        summary.predicted_cold = summary.predicted_cold.saturating_add(tally.predicted_cold);
+        summary.read_wall_ms += read_wall_ms;
+        if tally.actual_cold != 0 {
+            summary.projected_saved_ms +=
+                read_wall_ms * f64::from(tally.hits) / f64::from(tally.actual_cold);
+        }
+    }
+    Some(summary)
+}
+
+/// Allocate a true round-global cold-record budget without pretending that
+/// confidence scores from different target routers are calibrated. Each
+/// layer's immutable start-hot identities are removed first, then rank 0 is
+/// offered to layers 0..29, followed by rank 1, and so on until `budget` is
+/// exhausted. This rank-major/layer-stable policy is deterministic and bounds
+/// total false positives to the literal 64/96-record request budget.
+#[cfg(any(target_os = "macos", test))]
+fn mtp_assistant_router_probe_global_budget_tallies(
+    ranked_per_layer: &[Vec<usize>],
+    actual_per_layer: &[Vec<usize>],
+    hot_at_start: &[[bool; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS]],
+    budget: usize,
+) -> Option<Vec<Option<Gemma4MtpAssistantRouterProbeLayerTally>>> {
+    if budget == 0
+        || ranked_per_layer.len() != GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS
+        || actual_per_layer.len() != ranked_per_layer.len()
+        || hot_at_start.len() != ranked_per_layer.len()
+    {
+        return None;
+    }
+    let mut cold_ranked = Vec::with_capacity(ranked_per_layer.len());
+    for (layer, ranked) in ranked_per_layer.iter().enumerate() {
+        let mut seen = [false; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
+        let mut cold = Vec::with_capacity(ranked.len());
+        for &expert in ranked {
+            if expert >= seen.len() || seen[expert] {
+                return None;
+            }
+            seen[expert] = true;
+            if !hot_at_start[layer][expert] {
+                cold.push(expert);
+            }
+        }
+        cold_ranked.push(cold);
+    }
+
+    let mut selected = vec![Vec::<usize>::new(); ranked_per_layer.len()];
+    let max_rank = cold_ranked.iter().map(Vec::len).max().unwrap_or(0);
+    let mut selected_records = 0usize;
+    'rank: for rank in 0..max_rank {
+        for layer in 0..cold_ranked.len() {
+            if let Some(&expert) = cold_ranked[layer].get(rank) {
+                selected[layer].push(expert);
+                selected_records += 1;
+                if selected_records == budget {
+                    break 'rank;
+                }
+            }
+        }
+    }
+
+    selected
+        .iter()
+        .zip(actual_per_layer)
+        .zip(hot_at_start)
+        .map(|((ranked, actual), hot)| {
+            mtp_assistant_router_probe_layer_tally(ranked, actual, hot, usize::MAX).map(Some)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Gemma4ChunkRoundProfile {
     pub wall_clock_ms: f64,
@@ -16996,7 +17304,7 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<(Gemma4MtpVerifyResult, u64, u64)> {
         self.verify_mtp_round_timed_with_previous_cold_stage(
-            tokens, drafts, start_pos, kc, vc, None,
+            tokens, drafts, start_pos, kc, vc, None, None,
         )
     }
 
@@ -17009,6 +17317,7 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
         previous_cold_stage: Option<&PreviousColdRoundStage>,
+        assistant_router_probe_source: Option<&Gemma4MtpAssistantRouterProbeSource>,
     ) -> Result<(Gemma4MtpVerifyResult, u64, u64)> {
         let gpu_before = mtp_target_gpu_snapshot();
         let started = std::time::Instant::now();
@@ -17019,6 +17328,7 @@ impl Gemma4Runtime {
             kc,
             vc,
             previous_cold_stage,
+            assistant_router_probe_source,
         );
         let wall_us = mtp_us_saturating(started.elapsed().as_micros());
         let gpu_us = mtp_target_gpu_delta(gpu_before, mtp_target_gpu_snapshot());
@@ -17682,6 +17992,29 @@ impl Gemma4Runtime {
             let mut chunk = Vec::with_capacity(1 + proposed_drafts.len());
             chunk.push(anchor);
             chunk.extend_from_slice(&proposed_drafts);
+            // H56 freezes only the official assistant's widened recurrent
+            // rows, after any boundary suffix regeneration has produced the
+            // final proposal sequence. The copy has no connection to target
+            // routing, staging, or I/O; all router projections are deferred
+            // until the exact target tied head has fixed this verifier round.
+            let assistant_router_probe_source =
+                gemma4_mtp_assistant_router_probe_enabled().then(|| {
+                    freeze_mtp_assistant_router_probe_source(
+                        pos,
+                        chunk.len(),
+                        self.config.embedding_length as usize,
+                        proposals
+                            .iter()
+                            .map(|proposal| proposal.recurrent_hidden.as_slice()),
+                    )
+                    .unwrap_or_else(|| Gemma4MtpAssistantRouterProbeSource {
+                        start_pos: pos,
+                        k_tokens: chunk.len(),
+                        source_rows: proposals.len(),
+                        hidden: self.config.embedding_length as usize,
+                        flat_hidden_rows: Vec::new(),
+                    })
+                });
             let previous_cold_stage_for_verify = previous_cold_stage
                 .as_ref()
                 .filter(|stage| stage.matches(pos, chunk.len()));
@@ -17703,6 +18036,7 @@ impl Gemma4Runtime {
                 kc,
                 vc,
                 previous_cold_stage_for_verify,
+                assistant_router_probe_source.as_ref(),
             );
             let (verified, verify_wall_us, verify_gpu_us) = match verify {
                 Ok(result) => result,
@@ -17859,8 +18193,8 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<(usize, Vec<f32>)> {
-        let result =
-            self.step_chunk_speculative_inner(tokens, drafts, start_pos, kc, vc, false, None)?;
+        let result = self
+            .step_chunk_speculative_inner(tokens, drafts, start_pos, kc, vc, false, None, None)?;
         Ok((result.accepted_drafts, result.next_logits))
     }
 
@@ -17882,7 +18216,7 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<Gemma4MtpVerifyResult> {
         self.step_chunk_speculative_mtp_experiment_with_previous_cold_stage(
-            tokens, drafts, start_pos, kc, vc, None,
+            tokens, drafts, start_pos, kc, vc, None, None,
         )
     }
 
@@ -17894,6 +18228,7 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
         previous_cold_stage: Option<&PreviousColdRoundStage>,
+        assistant_router_probe_source: Option<&Gemma4MtpAssistantRouterProbeSource>,
     ) -> Result<Gemma4MtpVerifyResult> {
         const EXACT_MAX_VERIFY_TOKENS: usize = crate::metal::GEMMA4_RESIDENT_MAX_BATCH;
         if tokens.is_empty()
@@ -17914,6 +18249,7 @@ impl Gemma4Runtime {
             vc,
             true,
             previous_cold_stage,
+            assistant_router_probe_source,
         )?;
         Ok(Gemma4MtpVerifyResult {
             accepted_drafts: result.accepted_drafts,
@@ -17935,6 +18271,7 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
         capture_target_hidden: bool,
         previous_cold_stage: Option<&PreviousColdRoundStage>,
+        assistant_router_probe_source: Option<&Gemma4MtpAssistantRouterProbeSource>,
     ) -> Result<Gemma4SpeculativeStepResult> {
         self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
@@ -17957,6 +18294,7 @@ impl Gemma4Runtime {
                 let mut gpu_chained_round_ok = false;
                 let mut chained_refusal_ledger = None;
                 let mut chained_fallback_forbidden = false;
+                let mut assistant_router_probe_truth = None;
 
                 let theta_local = (0..self.layers.len())
                     .find(|&l| self.g.is_sliding_layer(l))
@@ -18041,6 +18379,9 @@ impl Gemma4Runtime {
                             ghost_cache,
                             previous_cold_stage,
                             &mut hs_buf,
+                            assistant_router_probe_source
+                                .is_some()
+                                .then_some(&mut assistant_router_probe_truth),
                         );
                         if !gpu_chained_round_ok {
                             let ledger = lane.last_chained_ledger();
@@ -18073,6 +18414,16 @@ impl Gemma4Runtime {
                                 )
                             })
                             .transpose()?;
+                        // The tied head has now fixed `j` and the exact next
+                        // logits. H56 may spend CPU time replaying assistant
+                        // rows, but it cannot feed any result back into this
+                        // already-complete verifier or its target state.
+                        if let Some(source) = assistant_router_probe_source {
+                            self.emit_mtp_assistant_router_probe(
+                                source,
+                                assistant_router_probe_truth.as_ref(),
+                            );
+                        }
                         return Ok(Gemma4SpeculativeStepResult {
                             accepted_drafts: j,
                             next_logits: logits,
@@ -18117,6 +18468,13 @@ impl Gemma4Runtime {
                 )
             })
             .transpose()?;
+        #[cfg(target_os = "macos")]
+        if let Some(source) = assistant_router_probe_source {
+            // CPU fallback has exact output but no chained-lane truth. Emit a
+            // bounded diagnostic refusal; never convert it into inference
+            // failure and never attempt router projections without truth.
+            self.emit_mtp_assistant_router_probe(source, None);
+        }
         Ok(Gemma4SpeculativeStepResult {
             accepted_drafts: j,
             next_logits,
@@ -18255,6 +18613,7 @@ impl Gemma4Runtime {
                             ghost_cache,
                             None,
                             &mut hs_buf,
+                            None,
                         );
                         if !gpu_chained_round_ok {
                             chained_refusal_ledger = Some(lane.last_chained_ledger());
@@ -19024,6 +19383,186 @@ impl Gemma4Runtime {
             gemma4_live_ranked_router_candidates_from_logits(&logits, rows, moe.n_expert, top_k)
         })
         .unwrap_or_default()
+    }
+
+    /// H56 diagnostic only. The caller invokes this after the exact tied head
+    /// has fixed acceptance and next logits. It owns no mutable model, lane,
+    /// cache, stage, slot, table, or routing reference, and every malformed
+    /// observation is reduced to one receipt rather than an inference error.
+    #[cfg(target_os = "macos")]
+    fn emit_mtp_assistant_router_probe(
+        &self,
+        source: &Gemma4MtpAssistantRouterProbeSource,
+        truth: Option<&Gemma4MtpAssistantRouterProbeTruth>,
+    ) {
+        let emit_refusal = |reason: &str| {
+            eprintln!(
+                "[gemma4 mtp-assistant-router probe] schema=2 admitted=0 reason={reason} timing=post-verifier-output-fixed scope=round source=official-post-projection-recurrent-bf16 start_pos={} K={} source_rows={} missing_final_rows=1 target_layers=30 attempted_layers=0 failures=1 hidden={} experts=128 predictor_top_k_per_row=8 predict_us=0 truth_valid=0 eligible=0 hot_start_records=0 exact_unique_records=0 cap4_hits=0 cap4_actual_cold=0 cap4_predicted_cold=0 cap4_recall=na cap4_precision=na cap4_projected_saved_ms=0.000 cap8_hits=0 cap8_actual_cold=0 cap8_predicted_cold=0 cap8_recall=na cap8_precision=na cap8_projected_saved_ms=0.000 global_policy=rank-major-layer-stable-cold-after-hot-filter global64_budget=64 global64_hits=0 global64_actual_cold=0 global64_selected_records=0 global64_false_positives=0 global64_recall=na global64_precision=na global64_projected_read_wall_saved_ms=0.000 global64_go_recall30_saved50=0 global64_go_recall35_saved50=0 global96_budget=96 global96_hits=0 global96_actual_cold=0 global96_selected_records=0 global96_false_positives=0 global96_recall=na global96_precision=na global96_projected_read_wall_saved_ms=0.000 global96_go_recall30_saved50=0 global96_go_recall35_saved50=0 total_wave_load_ms=0.000 output_mutation=0 io_mutation=0 expert_read_mutation=0 slot_policy_mutation=0 table_mutation=0 route_mutation=0 routing_authority=exact-router hidden_dump=0 logit_dump=0",
+                source.start_pos,
+                source.k_tokens,
+                source.source_rows,
+                source.hidden,
+            );
+        };
+
+        let Some(expected_elements) = source.source_rows.checked_mul(source.hidden) else {
+            emit_refusal("source-size-overflow");
+            return;
+        };
+        if source.hidden != GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN
+            || source.k_tokens < 2
+            || source.k_tokens > crate::metal::GEMMA4_RESIDENT_MAX_BATCH
+            || source.source_rows.checked_add(1) != Some(source.k_tokens)
+            || source.flat_hidden_rows.len() != expected_elements
+            || source
+                .flat_hidden_rows
+                .iter()
+                .any(|value| !value.is_finite())
+            || self.layers.len() != GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS
+        {
+            emit_refusal("source-shape");
+            return;
+        }
+        let Some(truth) = truth else {
+            emit_refusal("chained-truth-unavailable");
+            return;
+        };
+        if truth.start_pos != source.start_pos
+            || truth.k_tokens != source.k_tokens
+            || !sparse_route_truth_valid(
+                &truth.exact_routes,
+                GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS,
+                &truth.ledger_unique_per_layer,
+                truth.ledger_unique_sum,
+            )
+            || truth
+                .wave_load_ms_per_layer
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            emit_refusal("exact-truth-invalid");
+            return;
+        }
+
+        // All 30 SGEMMs are intentionally here, after output is fixed. The
+        // same frozen rows are replayed independently through each target
+        // layer router; this is a predictor-quality observation, never an
+        // assertion that assistant and target layer hidden semantics match.
+        let predict_started = std::time::Instant::now();
+        let mut ranked_per_layer = Vec::with_capacity(GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS);
+        let mut failures = 0u32;
+        for layer_idx in 0..GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS {
+            let ranked = self.predict_next_layer_routes_top_k_ranked_batched(
+                layer_idx,
+                &source.flat_hidden_rows,
+                source.source_rows,
+                GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_TOP_K,
+            );
+            failures = failures.saturating_add(u32::from(ranked.is_empty()));
+            ranked_per_layer.push(ranked);
+        }
+        let predict_us = predict_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let eligible = failures == 0;
+
+        let cap_tallies = |cap: usize| {
+            ranked_per_layer
+                .iter()
+                .zip(&truth.exact_routes)
+                .zip(&truth.hot_at_start)
+                .map(|((ranked, actual), hot)| {
+                    eligible
+                        .then(|| mtp_assistant_router_probe_layer_tally(ranked, actual, hot, cap))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+        };
+        let cap4 =
+            summarize_mtp_assistant_router_probe(&cap_tallies(4), &truth.wave_load_ms_per_layer)
+                .unwrap_or_default();
+        let cap8 =
+            summarize_mtp_assistant_router_probe(&cap_tallies(8), &truth.wave_load_ms_per_layer)
+                .unwrap_or_default();
+        let global_summary = |budget: usize| {
+            eligible
+                .then(|| {
+                    mtp_assistant_router_probe_global_budget_tallies(
+                        &ranked_per_layer,
+                        &truth.exact_routes,
+                        &truth.hot_at_start,
+                        budget,
+                    )
+                })
+                .flatten()
+                .and_then(|tallies| {
+                    summarize_mtp_assistant_router_probe(&tallies, &truth.wave_load_ms_per_layer)
+                })
+                .unwrap_or_default()
+        };
+        let global64 = global_summary(64);
+        let global96 = global_summary(96);
+        let ratio = |numerator: u32, denominator: u32| {
+            (denominator != 0)
+                .then(|| format!("{:.6}", f64::from(numerator) / f64::from(denominator)))
+                .unwrap_or_else(|| "na".into())
+        };
+        let recall_value = |summary: Gemma4MtpAssistantRouterProbeSummary| {
+            (summary.actual_cold != 0)
+                .then(|| f64::from(summary.hits) / f64::from(summary.actual_cold))
+                .unwrap_or(0.0)
+        };
+        let go = |summary: Gemma4MtpAssistantRouterProbeSummary, recall_floor: f64| {
+            eligible && summary.projected_saved_ms >= 50.0 && recall_value(summary) >= recall_floor
+        };
+        let hot_start_records = truth
+            .hot_at_start
+            .iter()
+            .map(|layer| layer.iter().filter(|&&hot| hot).count())
+            .sum::<usize>();
+        let total_wave_load_ms = truth.wave_load_ms_per_layer.iter().sum::<f64>();
+
+        eprintln!(
+            "[gemma4 mtp-assistant-router probe] schema=2 admitted=1 timing=post-verifier-output-fixed scope=round source=official-post-projection-recurrent-bf16 start_pos={} K={} source_rows={} missing_final_rows=1 target_layers=30 attempted_layers=30 failures={} hidden={} experts=128 predictor_top_k_per_row=8 predict_us={} truth_valid=1 eligible={} hot_start_records={} exact_unique_records={} cap4_hits={} cap4_actual_cold={} cap4_predicted_cold={} cap4_recall={} cap4_precision={} cap4_projected_saved_ms={:.3} cap8_hits={} cap8_actual_cold={} cap8_predicted_cold={} cap8_recall={} cap8_precision={} cap8_projected_saved_ms={:.3} global_policy=rank-major-layer-stable-cold-after-hot-filter global64_budget=64 global64_hits={} global64_actual_cold={} global64_selected_records={} global64_false_positives={} global64_recall={} global64_precision={} global64_projected_read_wall_saved_ms={:.3} global64_go_recall30_saved50={} global64_go_recall35_saved50={} global96_budget=96 global96_hits={} global96_actual_cold={} global96_selected_records={} global96_false_positives={} global96_recall={} global96_precision={} global96_projected_read_wall_saved_ms={:.3} global96_go_recall30_saved50={} global96_go_recall35_saved50={} total_wave_load_ms={:.3} output_mutation=0 io_mutation=0 expert_read_mutation=0 slot_policy_mutation=0 table_mutation=0 route_mutation=0 routing_authority=exact-router hidden_dump=0 logit_dump=0",
+            source.start_pos,
+            source.k_tokens,
+            source.source_rows,
+            failures,
+            source.hidden,
+            predict_us,
+            u8::from(eligible),
+            hot_start_records,
+            truth.ledger_unique_sum,
+            cap4.hits,
+            cap4.actual_cold,
+            cap4.predicted_cold,
+            ratio(cap4.hits, cap4.actual_cold),
+            ratio(cap4.hits, cap4.predicted_cold),
+            cap4.projected_saved_ms,
+            cap8.hits,
+            cap8.actual_cold,
+            cap8.predicted_cold,
+            ratio(cap8.hits, cap8.actual_cold),
+            ratio(cap8.hits, cap8.predicted_cold),
+            cap8.projected_saved_ms,
+            global64.hits,
+            global64.actual_cold,
+            global64.predicted_cold,
+            global64.predicted_cold.saturating_sub(global64.hits),
+            ratio(global64.hits, global64.actual_cold),
+            ratio(global64.hits, global64.predicted_cold),
+            global64.projected_saved_ms,
+            u8::from(go(global64, 0.30)),
+            u8::from(go(global64, 0.35)),
+            global96.hits,
+            global96.actual_cold,
+            global96.predicted_cold,
+            global96.predicted_cold.saturating_sub(global96.hits),
+            ratio(global96.hits, global96.actual_cold),
+            ratio(global96.hits, global96.predicted_cold),
+            global96.projected_saved_ms,
+            u8::from(go(global96, 0.30)),
+            u8::from(go(global96, 0.35)),
+            total_wave_load_ms,
+        );
     }
 
     /// Layer-major sibling of [`Self::moe_layer_ffn`] for Ghost prompt chunks.
@@ -27551,6 +28090,54 @@ mod mtp_target_seam_tests {
     use super::*;
 
     #[test]
+    fn live_sequential_hot_profile_admission_is_exact_and_memory_bounded() {
+        assert_eq!(
+            GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE
+                .iter()
+                .sum::<usize>(),
+            GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS
+        );
+        assert_eq!(
+            GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+                .iter()
+                .sum::<usize>(),
+            GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS
+        );
+        assert!(ghost_metal_live_sequential_hot_profile_admitted(
+            &GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE
+        ));
+        assert!(ghost_metal_live_sequential_hot_profile_admitted(
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+        ));
+
+        let mut permuted = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
+        permuted.swap(0, 1);
+        assert!(!ghost_metal_live_sequential_hot_profile_admitted(&permuted));
+        let mut smaller = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
+        smaller[0] -= 1;
+        assert!(!ghost_metal_live_sequential_hot_profile_admitted(&smaller));
+        let mut larger = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
+        larger[0] += 1;
+        assert!(!ghost_metal_live_sequential_hot_profile_admitted(&larger));
+        assert!(!ghost_metal_live_sequential_hot_profile_admitted(
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE[..29]
+        ));
+        assert!(!ghost_metal_retained_cold_bank_admitted(
+            true,
+            true,
+            30,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
     fn live_sequential_predict_probe_is_exact_positive_and_default_off() {
         assert!(!ghost_metal_live_sequential_predict_probe_from(None));
         assert!(ghost_metal_live_sequential_predict_probe_from(Some("1")));
@@ -27560,6 +28147,130 @@ mod mtp_target_seam_tests {
                 "unexpected live sequential probe admission for {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn mtp_assistant_router_probe_is_exact_positive_and_default_off() {
+        assert!(!gemma4_mtp_assistant_router_probe_from(None));
+        assert!(gemma4_mtp_assistant_router_probe_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !gemma4_mtp_assistant_router_probe_from(Some(value)),
+                "unexpected assistant-router probe admission for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_assistant_router_probe_freezes_exactly_k_minus_one_valid_rows() {
+        let rows = (0..7)
+            .map(|row| vec![row as f32; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN])
+            .collect::<Vec<_>>();
+        let frozen = freeze_mtp_assistant_router_probe_source(
+            41,
+            8,
+            GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN,
+            rows.iter().map(Vec::as_slice),
+        )
+        .expect("valid K-1 official rows");
+        assert_eq!(frozen.start_pos, 41);
+        assert_eq!(frozen.k_tokens, 8);
+        assert_eq!(frozen.source_rows, 7);
+        assert_eq!(
+            frozen.flat_hidden_rows.len(),
+            7 * GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN
+        );
+        assert!(freeze_mtp_assistant_router_probe_source(
+            41,
+            7,
+            GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN,
+            rows.iter().map(Vec::as_slice),
+        )
+        .is_none());
+        assert!(freeze_mtp_assistant_router_probe_source(
+            41,
+            1,
+            GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN,
+            std::iter::empty(),
+        )
+        .is_none());
+        let wrong_width = vec![vec![0.0; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN - 1]];
+        assert!(freeze_mtp_assistant_router_probe_source(
+            41,
+            2,
+            GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN,
+            wrong_width.iter().map(Vec::as_slice),
+        )
+        .is_none());
+        let mut nonfinite = vec![vec![0.0; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN]];
+        nonfinite[0][17] = f32::NAN;
+        assert!(freeze_mtp_assistant_router_probe_source(
+            41,
+            2,
+            GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN,
+            nonfinite.iter().map(Vec::as_slice),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn mtp_assistant_router_probe_filters_hot_and_projects_wave_accounting() {
+        let mut hot = [false; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
+        hot[0] = true;
+        let first = mtp_assistant_router_probe_layer_tally(&[0, 1, 2, 3], &[0, 2, 4], &hot, 2)
+            .expect("valid identities");
+        assert_eq!(
+            first,
+            Gemma4MtpAssistantRouterProbeLayerTally {
+                hits: 1,
+                actual_cold: 2,
+                predicted_cold: 2,
+            }
+        );
+        assert!(mtp_assistant_router_probe_layer_tally(&[1, 1], &[2], &hot, 2).is_none());
+        let second = Gemma4MtpAssistantRouterProbeLayerTally {
+            hits: 2,
+            actual_cold: 4,
+            predicted_cold: 3,
+        };
+        let summary =
+            summarize_mtp_assistant_router_probe(&[Some(first), Some(second)], &[30.0, 10.0])
+                .expect("matching finite wave ledger");
+        assert_eq!(summary.compared_layers, 2);
+        assert_eq!(summary.hits, 3);
+        assert_eq!(summary.actual_cold, 6);
+        assert_eq!(summary.predicted_cold, 5);
+        assert_eq!(summary.read_wall_ms, 40.0);
+        assert_eq!(summary.projected_saved_ms, 20.0);
+    }
+
+    #[test]
+    fn mtp_assistant_router_probe_global_budgets_are_true_and_layer_stable() {
+        let ranked = (0..GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS)
+            .map(|_| vec![0, 1, 2, 3])
+            .collect::<Vec<_>>();
+        let actual = (0..GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS)
+            .map(|_| vec![0, 2])
+            .collect::<Vec<_>>();
+        let hot = [[false; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS];
+            GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS];
+        let global64 = mtp_assistant_router_probe_global_budget_tallies(&ranked, &actual, &hot, 64)
+            .expect("global64 accounting");
+        let global64 =
+            summarize_mtp_assistant_router_probe(&global64, &[1.0; 30]).expect("global64 summary");
+        assert_eq!(global64.predicted_cold, 64);
+        assert_eq!(global64.hits, 34);
+        assert_eq!(global64.actual_cold, 60);
+        assert_eq!(global64.projected_saved_ms, 17.0);
+
+        let global96 = mtp_assistant_router_probe_global_budget_tallies(&ranked, &actual, &hot, 96)
+            .expect("global96 accounting");
+        let global96 =
+            summarize_mtp_assistant_router_probe(&global96, &[1.0; 30]).expect("global96 summary");
+        assert_eq!(global96.predicted_cold, 96);
+        assert_eq!(global96.hits, 60);
+        assert_eq!(global96.actual_cold, 60);
+        assert_eq!(global96.projected_saved_ms, 30.0);
     }
 
     #[test]

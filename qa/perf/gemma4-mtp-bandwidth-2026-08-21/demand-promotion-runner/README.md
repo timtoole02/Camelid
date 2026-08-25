@@ -1,10 +1,11 @@
 # Demand-promotion A/B runner
 
-The harness behind `../mapped-cold-round-cost-2026-08-24.md`. Unlike
-`../hybrid-hot48-runner/`, this one is **not** a fail-closed proof gate: it has
-no watchdog, no baseline settle, and no provenance freeze. It is a fast A/B
-loop — one run is ~10 s once the binary exists — for comparing execution
-profiles against a fixed prompt and checking the emitted token IDs.
+The harness behind `../mapped-cold-round-cost-2026-08-24.md`. It began as a
+fast exploratory loop, but the Mini2 50 tok/s campaign now runs it through the
+same fail-closed watchdog boundary: strict child/wired ceilings, zero current
+swap, no swap-in/out growth, isolated process-group accounting, frozen binary
+and environment provenance, and mandatory 48/48 token parity. One run remains
+roughly 10 seconds once the binary exists.
 
 Use `../hybrid-hot48-runner/run_50tps_gate.zsh` when you need a receipt.
 Note that gate's `env -i` list is frozen, so it does **not** pass any of the
@@ -97,6 +98,9 @@ construction; check `exact_prefix_len == 48` instead.
 | `H52-k16-7-step3-rejection-rank-probe` | Diagnostic width/rank profile retained for reproducibility; superseded by the narrower H53 rejection probe |
 | `H53-k16-draft10-rank-probe` | Diagnostic K16 run; exact at 34.06 tok/s, but the decisive target token ranked 20th at draft index 10, closing the width-only shortcut |
 | `H54-three-wave-live-ready-gateup` | Exact three-wave hot/ready/demand GateUp overlap; 36.25 tok/s, zero swap, no-go because 82 extra GPU submissions erased the hidden I/O gain |
+| `H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control` | Strict-memory H49 control: exact frozen 1,408-slot profile and KV192; ABBA mean 31.74 tok/s, zero swap |
+| `H55-async-two-wave-collapse` | H54 submission recovery: exact two-command hot/terminal path; strict-memory ABBA mean 31.45 tok/s versus H49 31.74, no-go |
+| `H56-mtp-assistant-router-probe` | Read-only assistant-hidden router projection; global-96 residual-cold recall 4.63% and 31.61 ms projected savings, so predictive host staging is closed |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 

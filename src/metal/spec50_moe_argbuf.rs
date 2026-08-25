@@ -4246,6 +4246,238 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_moe_async_two_wave_terminal_is_raw_bit_exact_and_hot_resource_disjoint() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP async-two-wave argbuf parity gate: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP async-two-wave argbuf parity gate: Tier-2 unavailable");
+            return;
+        }
+
+        const HOT: usize = 3;
+        const COLD: usize = SYNTHETIC_EXPERTS - HOT;
+        for (ready_count, demand_count, variant) in [
+            (2, COLD - 2, "mixed"),
+            (0, COLD, "ready-empty"),
+            (COLD, 0, "demand-empty"),
+        ] {
+            assert_eq!(ready_count + demand_count, COLD);
+            let (records, copied_slab) = synthetic_slot_backings(device);
+            let ready_slab = new_buffer(device, ready_count.max(1) * S50_SLOT_STRIDE);
+            let demand_slab = new_buffer(device, demand_count.max(1) * S50_SLOT_STRIDE);
+            for slot in 0..ready_count {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        records[HOT + slot].contents().cast::<u8>(),
+                        ready_slab
+                            .contents()
+                            .cast::<u8>()
+                            .add(slot * S50_SLOT_STRIDE),
+                        S50_SLOT_STRIDE,
+                    );
+                }
+            }
+            for slot in 0..demand_count {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        records[HOT + ready_count + slot].contents().cast::<u8>(),
+                        demand_slab
+                            .contents()
+                            .cast::<u8>()
+                            .add(slot * S50_SLOT_STRIDE),
+                        S50_SLOT_STRIDE,
+                    );
+                }
+            }
+
+            let hot_records = records[..HOT].to_vec();
+            let hot_offsets = vec![0; HOT];
+            let mut full_records = hot_records.clone();
+            let mut full_offsets = hot_offsets.clone();
+            for slot in 0..ready_count {
+                full_records.push(ready_slab.clone());
+                full_offsets.push(slot * S50_SLOT_STRIDE);
+            }
+            for slot in 0..demand_count {
+                full_records.push(demand_slab.clone());
+                full_offsets.push(slot * S50_SLOT_STRIDE);
+            }
+            let hot_slots = (0..HOT).collect::<Vec<_>>();
+            let all_slots = (0..SYNTHETIC_EXPERTS).collect::<Vec<_>>();
+            let cold_slots = (HOT..SYNTHETIC_EXPERTS).collect::<Vec<_>>();
+            let hot_table = Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+                device,
+                HOT,
+                &hot_slots,
+                &hot_records,
+                &hot_offsets,
+                0,
+                None,
+            )
+            .expect("H55 hot-only table");
+            let full_table = Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+                device,
+                SYNTHETIC_EXPERTS,
+                &all_slots,
+                &full_records,
+                &full_offsets,
+                0,
+                None,
+            )
+            .expect("H55 full terminal table");
+            assert_eq!(hot_table.bound_record_count(), HOT);
+            assert_eq!(full_table.bound_record_count(), SYNTHETIC_EXPERTS);
+            assert!(hot_table.records.iter().all(|record| {
+                !super::same_metal_buffer(record, &ready_slab)
+                    && !super::same_metal_buffer(record, &demand_slab)
+            }));
+            assert_eq!(
+                full_table
+                    .records
+                    .iter()
+                    .any(|record| super::same_metal_buffer(record, &ready_slab)),
+                ready_count > 0
+            );
+            assert_eq!(
+                full_table
+                    .records
+                    .iter()
+                    .any(|record| super::same_metal_buffer(record, &demand_slab)),
+                demand_count > 0
+            );
+
+            let copied = spec50_moe_pipelines(device).expect("copied-slab SPEC50 pipelines");
+            let buffers = Buffers::new(device);
+            for k in 1..=MAX_K {
+                let routing = build_synthetic_routing(k);
+                buffers.upload(&routing);
+                buffers.zero_outputs();
+
+                let oracle = kernel.queue.new_command_buffer();
+                let oracle_enc = oracle.new_compute_command_encoder();
+                encode_spec50_gateup(
+                    oracle_enc,
+                    &copied.gateup,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    &copied_slab,
+                    0,
+                    &buffers.work,
+                    &buffers.copy_scales,
+                    &buffers.copy_quants,
+                    SYNTHETIC_EXPERTS as u32,
+                    k as u32,
+                    None,
+                    None,
+                );
+                oracle_enc
+                    .memory_barrier_with_resources(&[&buffers.copy_scales, &buffers.copy_quants]);
+                encode_spec50_down(
+                    oracle_enc,
+                    &copied.down,
+                    &buffers.copy_scales,
+                    &buffers.copy_quants,
+                    &copied_slab,
+                    0,
+                    &buffers.routes,
+                    &buffers.work,
+                    &buffers.copy_down,
+                    k as u32,
+                    None,
+                );
+                oracle_enc.end_encoding();
+                oracle.commit();
+
+                let hot_cb = kernel.queue.new_command_buffer();
+                let hot_enc = hot_cb.new_compute_command_encoder();
+                assert_eq!(
+                    hot_table.declare_active_slots(hot_enc, &hot_slots),
+                    Some(HOT)
+                );
+                assert!(hot_table.encode_chained_gateup_k8_range(
+                    hot_enc,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    &buffers.work,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    0,
+                    HOT,
+                    k,
+                ));
+                hot_enc.end_encoding();
+
+                let terminal_cb = kernel.queue.new_command_buffer();
+                let terminal_enc = terminal_cb.new_compute_command_encoder();
+                assert_eq!(
+                    full_table.declare_active_slots(terminal_enc, &cold_slots),
+                    Some(ready_count + demand_count)
+                );
+                assert!(full_table.encode_chained_gateup_k8_range(
+                    terminal_enc,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    &buffers.work,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    HOT,
+                    ready_count + demand_count,
+                    k,
+                ));
+                terminal_enc
+                    .memory_barrier_with_resources(&[&buffers.arg_scales, &buffers.arg_quants]);
+                assert_eq!(
+                    full_table.declare_active_slots(terminal_enc, &all_slots),
+                    Some(SYNTHETIC_EXPERTS)
+                );
+                assert!(full_table.encode_chained_down_k8(
+                    terminal_enc,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    &buffers.routes,
+                    &buffers.work,
+                    &buffers.arg_down,
+                    k,
+                ));
+                terminal_enc.end_encoding();
+
+                hot_cb.commit();
+                terminal_cb.commit();
+                terminal_cb.wait_until_completed();
+                assert_eq!(hot_cb.status(), MTLCommandBufferStatus::Completed);
+                assert_eq!(
+                    terminal_cb.status(),
+                    MTLCommandBufferStatus::Completed,
+                    "async-two-wave {variant} K={k} command failed: {}",
+                    command_buffer_error_details(terminal_cb)
+                );
+
+                let scale_bytes = SYNTHETIC_EXPERTS * k * S50_DOWN_BLOCKS * 4;
+                let quant_bytes = SYNTHETIC_EXPERTS * k * S50_FF;
+                let down_bytes = k * S50_HIDDEN * 4;
+                assert_raw_eq(
+                    &format!("async-two-wave {variant} K={k} GateUp scales"),
+                    &read_bytes(&buffers.copy_scales, scale_bytes),
+                    &read_bytes(&buffers.arg_scales, scale_bytes),
+                );
+                assert_raw_eq(
+                    &format!("async-two-wave {variant} K={k} GateUp quants"),
+                    &read_bytes(&buffers.copy_quants, quant_bytes),
+                    &read_bytes(&buffers.arg_quants, quant_bytes),
+                );
+                assert_raw_eq(
+                    &format!("async-two-wave {variant} K={k} Down output"),
+                    &read_bytes(&buffers.copy_down, down_bytes),
+                    &read_bytes(&buffers.arg_down, down_bytes),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gemma4_moe_slot_arg_table_head_k1_all_modes_raw_bit_parity() {
         let Some(kernel) = metal_linear_kernel() else {
             eprintln!("SKIP anonymous HEAD argbuf parity gate: no Metal device");

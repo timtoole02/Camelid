@@ -182,12 +182,53 @@ submissions raised slot wait by 26.4 ms and GPU time by 3.9 ms; verifier wall
 improved only 2.73 ms versus the same-state H49 control. H54 is therefore an
 exact architectural proof, not a throughput promotion.
 
-The next bounded revision will keep the immediate hot GateUp command, preserve
-the concurrent demand-read/ready-copy host staging, then fuse ready and demand
-GateUp into one terminal command with the sole Down and tail. At the observed
-layer mix that removes all 82 extra submissions and returns the sparse verifier
-to the H49 command count. This cleanup alone is not projected to reach 40 tok/s;
-it creates the lower-overhead exact base needed for the next compute change.
+## Strict memory reset and H55/H56 closure
+
+The later hard gate requires child physical footprint below 7.5 GiB and host
+wired memory below 8 GiB, in addition to zero swap. Under that stronger
+contract, the 2,100-slot historical H49 profile is not admissible: its full
+prefill reached 2,048 live records and crossed the child-footprint ceiling.
+The exact Mini2 lane was therefore reset to a frozen proportional 1,408-slot,
+30-layer profile with `KV_INIT=192`. The runtime admits only that literal (or
+the legacy H40 literal), so a merely same-total distribution cannot silently
+change the memory/I/O contract.
+
+This reset changes the safe baseline. After two discarded warmups, an H49/H55/
+H55/H49 sequence measured:
+
+| run | lane | tok/s | exact | peak child bytes | peak wired bytes |
+|---|---|---:|---:|---:|---:|
+| A1 | H49 control | 30.67 | 48/48 | 7,126,776,736 | 8,280,227,840 |
+| B1 | H55 | 31.81 | 48/48 | 6,944,406,408 | 8,268,021,760 |
+| B2 | H55 | 31.08 | 48/48 | 7,155,121,080 | 8,298,168,320 |
+| A2 | H49 control | 32.80 | 48/48 | 7,126,875,016 | 8,308,162,560 |
+
+All four receipts had zero current swap, no swap-in/out growth, clean process
+group exit, and explicit `exact_match_expected: true`. H49 averaged 31.735
+tok/s; H55 averaged 31.445 tok/s, a 0.29 tok/s (0.91%) regression.
+
+H55 does implement the intended two-command sparse layer: commit hot GateUp,
+launch ready copies and demand reads, encode the terminal command concurrently,
+join and validate I/O, then commit one cold GateUp + Down + tail command. The
+production telemetry observed that path on 119 mixed layers per request. It
+recovers H54's submission shape, but the safe 1,408-slot lane exposes roughly
+640--660 MiB of cold reads per round and run-to-run read variance dominates the
+small overlap benefit. H55 is an exact architectural result, not a promotion.
+
+H56 then projected the assistant's official post-projection recurrent rows
+through the target routers without mutating output, I/O, experts, slots,
+tables, routing, or policy. Across the four exact verifier rounds:
+
+| budget | hits / actual cold | recall | precision | projected saved wall |
+|---|---:|---:|---:|---:|
+| global 64 | 41 / 1,230 | 3.33% | 16.02% | 23.06 ms/request |
+| global 96 | 57 / 1,230 | 4.63% | 14.84% | 31.61 ms/request |
+
+Both miss the required 30--35% residual-cold recall and 50 ms savings gates by
+a wide margin. The H56 receipt remained 48/48 exact with zero swap; peak child
+footprint was 6,944,570,296 bytes and peak wired memory was 8,442,789,888 bytes.
+Pre-verifier predictive host staging is therefore closed. Work pivots directly
+to assistant and target compute.
 
 H50 tested the earlier complementary pre-assistant reuse hypothesis described
 at the H49 checkpoint. Its exact regression closes that path at a 96-record
@@ -204,10 +245,17 @@ Profiles and executable for this checkpoint:
 - `H52-k16-7-step3-rejection-rank-probe`
 - `H53-k16-draft10-rank-probe`
 - `H54-three-wave-live-ready-gateup`
+- `H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control`
+- `H55-async-two-wave-collapse`
+- `H56-mtp-assistant-router-probe`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
 - H54 SHA-256: `f7f96177a700332aa1486ed0100cc475bffa72d3881ee1d06872972c3e28194f`
+- H55/H56 strict-memory executable:
+  `/Users/timtoole/bin/camelid-h56-0c269ac41c12`
+- H55/H56 SHA-256:
+  `0c269ac41c126388581675fef21c1f6e7f9417ae4485608bf5b358fe59e03ba3`
 
 ## Validation and provenance
 
@@ -225,6 +273,10 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - predictive record staging lifecycle, concurrency, cancellation, and global
   permit tests: 20/20;
 - K9–K12 specialized/general GateUp raw-bit parity (H31 research lane);
+- exact 1,408-slot profile admission: 1/1;
+- H55 parser/plan/raw-bit terminal parity: 3/3;
+- H56 parser/source/tally/global-budget accounting: 4/4;
+- watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 
 Branch: `codex/gemma4-50tps-v2`. The Mini2 source, profiles, checkpoint notes,

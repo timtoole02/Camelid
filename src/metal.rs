@@ -864,6 +864,28 @@ fn gemma4_hybrid_three_wave_gateup_enabled() -> bool {
     })
 }
 
+/// `CAMELID_GEMMA4_GHOST_METAL_ASYNC_TWO_WAVE_COLLAPSE=1`: retain H54's
+/// authoritative demand launch followed by ready-copy overlap, but defer the
+/// complete cold GateUp range to one terminal command after demand joins. The
+/// hot-only command remains immediate. Default off so H54 remains available
+/// unchanged under its original flag.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_hybrid_async_two_wave_collapse_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_hybrid_async_two_wave_collapse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gemma4_hybrid_async_two_wave_collapse_from(
+            std::env::var("CAMELID_GEMMA4_GHOST_METAL_ASYNC_TWO_WAVE_COLLAPSE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 /// The argument-buffer GateUp and Down kernels carry exact accumulator layouts
 /// through the widened speculative ceiling. Keep this separate from the env
 /// switch so width admission is directly testable and cannot silently drift
@@ -14113,6 +14135,12 @@ impl Gemma4Q4HybridExpertSource {
             hot_offsets.push(0usize);
         }
         drop(published);
+        if hot_records.iter().any(|record| {
+            std::ptr::eq::<metal::BufferRef>(&**record, &**ready_slab)
+                || std::ptr::eq::<metal::BufferRef>(&**record, &**demand_slab)
+        }) {
+            return None;
+        }
 
         let mut ready_records = hot_records.clone();
         let mut ready_offsets = hot_offsets.clone();
@@ -14161,6 +14189,120 @@ impl Gemma4Q4HybridExpertSource {
                 None,
             )?;
         Some((hot_table, ready_table, full_table, lease))
+    }
+
+    /// Build H55's hot-only and full terminal tables from one directory
+    /// snapshot. No command can bind a CPU-written ready or demand resource
+    /// until the terminal command, which is committed only after both sources
+    /// have been validated complete.
+    fn materialize_hot_ready_demand_terminal_tables(
+        self: &std::sync::Arc<Self>,
+        hot_experts: &[usize],
+        ready_experts: &[usize],
+        ready_slab: &Buffer,
+        demand_experts: &[usize],
+        demand_slab: &Buffer,
+    ) -> Option<(
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        std::sync::Arc<Gemma4Q4HybridBindingLease>,
+    )> {
+        let hot_count = hot_experts.len();
+        let unique = hot_count
+            .checked_add(ready_experts.len())?
+            .checked_add(demand_experts.len())?;
+        if hot_experts.is_empty()
+            || ready_experts.len().checked_add(demand_experts.len())? == 0
+            || unique > 128
+            || std::ptr::eq::<metal::BufferRef>(&**ready_slab, &**demand_slab)
+        {
+            return None;
+        }
+        let mut seen = [false; 128];
+        for &expert in hot_experts
+            .iter()
+            .chain(ready_experts)
+            .chain(demand_experts)
+        {
+            if expert >= 128 || seen[expert] {
+                return None;
+            }
+            seen[expert] = true;
+        }
+
+        loop {
+            let state = self.lease_state.load(std::sync::atomic::Ordering::Acquire);
+            if state < 0 || state == isize::MAX {
+                return None;
+            }
+            if self
+                .lease_state
+                .compare_exchange_weak(
+                    state,
+                    state + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let lease = std::sync::Arc::new(Gemma4Q4HybridBindingLease {
+            source: std::sync::Arc::clone(self),
+        });
+        let published = self.hot_slot_ids.read().ok()?;
+        let mut hot_records = Vec::with_capacity(hot_count);
+        let mut hot_offsets = Vec::with_capacity(hot_count);
+        for &expert in hot_experts {
+            let physical_slot = published
+                .iter()
+                .position(|published_expert| *published_expert == Some(expert))?;
+            hot_records.push(self.hot_records.get(physical_slot)?.clone());
+            hot_offsets.push(0usize);
+        }
+        drop(published);
+        if hot_records.iter().any(|record| {
+            std::ptr::eq::<metal::BufferRef>(&**record, &**ready_slab)
+                || std::ptr::eq::<metal::BufferRef>(&**record, &**demand_slab)
+        }) {
+            return None;
+        }
+
+        let mut full_records = hot_records.clone();
+        let mut full_offsets = hot_offsets.clone();
+        for slot in 0..ready_experts.len() {
+            full_records.push(ready_slab.clone());
+            full_offsets.push(slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
+        }
+        for slot in 0..demand_experts.len() {
+            full_records.push(demand_slab.clone());
+            full_offsets.push(slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
+        }
+
+        let kernel = metal_linear_kernel()?;
+        let hot_slots = (0..hot_count).collect::<Vec<_>>();
+        let full_slots = (0..unique).collect::<Vec<_>>();
+        let hot_table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+            &kernel.device,
+            hot_count,
+            &hot_slots,
+            &hot_records,
+            &hot_offsets,
+            0,
+            None,
+        )?;
+        let full_table =
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+                &kernel.device,
+                unique,
+                &full_slots,
+                &full_records,
+                &full_offsets,
+                0,
+                None,
+            )?;
+        Some((hot_table, full_table, lease))
     }
 
     /// Build separate retained-bank tables from one hot-directory snapshot.
@@ -14615,6 +14757,39 @@ impl Gemma4Q4ExpertSlotBinding {
                         },
                         Self::HybridMappedTable {
                             table: std::sync::Arc::new(ready_table),
+                            _lease: std::sync::Arc::clone(&lease),
+                        },
+                        Self::HybridMappedTable {
+                            table: std::sync::Arc::new(full_table),
+                            _lease: lease,
+                        },
+                    )
+                }),
+            _ => None,
+        }
+    }
+
+    fn materialize_hot_ready_demand_terminal_tables(
+        &self,
+        hot_experts: &[usize],
+        ready_experts: &[usize],
+        ready_slab: &Buffer,
+        demand_experts: &[usize],
+        demand_slab: &Buffer,
+    ) -> Option<(Self, Self)> {
+        match self {
+            Self::HybridMappedSource(source) => source
+                .materialize_hot_ready_demand_terminal_tables(
+                    hot_experts,
+                    ready_experts,
+                    ready_slab,
+                    demand_experts,
+                    demand_slab,
+                )
+                .map(|(hot_table, full_table, lease)| {
+                    (
+                        Self::HybridMappedTable {
+                            table: std::sync::Arc::new(hot_table),
                             _lease: std::sync::Arc::clone(&lease),
                         },
                         Self::HybridMappedTable {
@@ -25127,6 +25302,40 @@ fn hot_ready_demand_compact_slot_table(
     Some(table)
 }
 
+/// H55 keeps H54's exact compact `[hot | ready | demand]` layout but executes
+/// it with two expert command buffers: immediate hot-only GateUp, then the
+/// complete cold suffix GateUp plus the sole Down/tail after authoritative
+/// demand has joined.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Gemma4AsyncTwoWaveCommandPlan {
+    hot_gateup: (usize, usize),
+    terminal_gateup: (usize, usize),
+    command_buffers: usize,
+    route_passes: usize,
+    down_passes: usize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_async_two_wave_command_plan(
+    hot_count: usize,
+    ready_count: usize,
+    demand_count: usize,
+) -> Option<Gemma4AsyncTwoWaveCommandPlan> {
+    let cold_count = ready_count.checked_add(demand_count)?;
+    let unique = hot_count.checked_add(cold_count)?;
+    if hot_count == 0 || cold_count == 0 || unique > 128 {
+        return None;
+    }
+    Some(Gemma4AsyncTwoWaveCommandPlan {
+        hot_gateup: (0, hot_count),
+        terminal_gateup: (hot_count, cold_count),
+        command_buffers: 2,
+        route_passes: 1,
+        down_passes: 1,
+    })
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Gemma4RetainedColdHit {
@@ -29325,12 +29534,13 @@ impl Gemma4GhostCommonMetal {
             &mut dyn FnMut(usize, &[f32], usize) -> Option<Vec<usize>>,
         >,
         mut live_sequential_stage_launcher: Option<&mut dyn FnMut(usize, &[usize]) -> bool>,
-        live_sequential_h40_shape: bool,
+        live_sequential_profile_shape: bool,
         pong_slab: Option<&Buffer>,
         predicted_unions: &[Vec<usize>],
         mut fill_pong_wave: Option<&mut dyn FnMut(usize, &[usize], &mut [u32; 128])>,
         wave1_slabs: &[&Buffer],
         is_decode_round: bool,
+        mut observation_wave_load_ms_per_layer: Option<&mut [f64; 30]>,
     ) -> bool {
         let k_tokens = hidden_rows.len();
         if k_tokens == 0 || k_tokens > GEMMA4_RESIDENT_MAX_BATCH {
@@ -29717,7 +29927,7 @@ impl Gemma4GhostCommonMetal {
         let hot_cold_three_wave_candidate = hot_cold_single_down
             && is_decode_round
             && !hot_cold_overlap_publish
-            && live_sequential_h40_shape
+            && live_sequential_profile_shape
             && gemma4_hybrid_three_wave_gateup_enabled()
             && ready_stage_slot_count == 8
             && ready_stage_slab.is_some_and(|slab| {
@@ -29737,6 +29947,8 @@ impl Gemma4GhostCommonMetal {
                 .as_ref()
                 .is_some_and(|layers| layers.len() == n_layers);
         let hot_cold_three_wave_round = hot_cold_three_wave_candidate && !retained_cold_bank_round;
+        let hot_cold_async_two_wave_round =
+            hot_cold_three_wave_round && gemma4_hybrid_async_two_wave_collapse_enabled();
         let retained_cold_direct_bank_round = retained_cold_bank_round
             && retained_cold_direct_bank_fill
             && retained_cold_direct_filler.is_some()
@@ -29854,7 +30066,7 @@ impl Gemma4GhostCommonMetal {
         let mut pending_retained_cold_publish: Option<Gemma4PendingRetainedColdPublish> = None;
         let live_sequential_probe_requested = live_sequential_predictor.is_some();
         let live_sequential_probe_admitted = live_sequential_probe_requested
-            && live_sequential_h40_shape
+            && live_sequential_profile_shape
             && record_demand
             && file_mapped_demand
             && is_decode_round
@@ -29871,7 +30083,7 @@ impl Gemma4GhostCommonMetal {
         if live_sequential_probe_requested && !live_sequential_probe_admitted {
             eprintln!(
                 "[metal live-sequential-predict probe] schema=1 admitted=0 start_pos={start_pos} K={k_tokens} h40_shape={} record_demand={} file_mapped={} decode={} hot_cold_overlap={} single_down={} publish={} retained_bank={} unified={} filler={} hot_snapshot={} output_mutation=0 io_mutation=0 slot_mutation=0",
-                u8::from(live_sequential_h40_shape),
+                u8::from(live_sequential_profile_shape),
                 u8::from(record_demand),
                 u8::from(file_mapped_demand),
                 u8::from(is_decode_round),
@@ -29910,6 +30122,11 @@ impl Gemma4GhostCommonMetal {
                 let elapsed_ms = $elapsed_ms;
                 ledger.wave_load_ms += elapsed_ms;
                 if let Some(per_layer) = live_sequential_read_wall_ms.as_mut() {
+                    if let Some(value) = per_layer.get_mut($layer_idx) {
+                        *value += elapsed_ms;
+                    }
+                }
+                if let Some(per_layer) = observation_wave_load_ms_per_layer.as_deref_mut() {
                     if let Some(value) = per_layer.get_mut($layer_idx) {
                         *value += elapsed_ms;
                     }
@@ -31304,27 +31521,59 @@ impl Gemma4GhostCommonMetal {
                                 &ready_wave,
                                 &demand_wave,
                             );
-                            let bindings = slot_binding.materialize_hot_ready_demand_stage_tables(
-                                &hot_wave,
-                                &ready_wave,
-                                ready_slab,
-                                &demand_wave,
-                                stage_slab,
-                            );
+                            let bindings = if hot_cold_async_two_wave_round {
+                                slot_binding
+                                    .materialize_hot_ready_demand_terminal_tables(
+                                        &hot_wave,
+                                        &ready_wave,
+                                        ready_slab,
+                                        &demand_wave,
+                                        stage_slab,
+                                    )
+                                    .map(|(hot, full)| (hot, None, full))
+                            } else {
+                                slot_binding
+                                    .materialize_hot_ready_demand_stage_tables(
+                                        &hot_wave,
+                                        &ready_wave,
+                                        ready_slab,
+                                        &demand_wave,
+                                        stage_slab,
+                                    )
+                                    .map(|(hot, ready, full)| (hot, Some(ready), full))
+                            };
                             let encode_started = std::time::Instant::now();
                             let encoded = compact_table.zip(bindings).and_then(
                                 |(compact_table, (hot_binding, ready_binding, full_binding))| {
                                     let hot_count = hot_wave.len();
                                     let ready_end = hot_count.checked_add(ready_wave.len())?;
+                                    let async_two_wave_plan = hot_cold_async_two_wave_round
+                                        .then(|| {
+                                            gemma4_async_two_wave_command_plan(
+                                                hot_count,
+                                                ready_wave.len(),
+                                                demand_wave.len(),
+                                            )
+                                        })
+                                        .flatten();
+                                    let ready_binding_exact = if hot_cold_async_two_wave_round {
+                                        ready_binding.is_none()
+                                    } else {
+                                        ready_binding.as_ref().is_some_and(|binding| {
+                                            binding.record_table().is_some_and(|table| {
+                                                table.slot_count() == ready_end
+                                                    && table.bound_record_count() == ready_end
+                                            })
+                                        })
+                                    };
                                     if ready_end.checked_add(demand_wave.len()) != Some(unique)
+                                        || (hot_cold_async_two_wave_round
+                                            && async_two_wave_plan.is_none())
                                         || hot_binding.record_table().is_none_or(|table| {
                                             table.slot_count() != hot_count
                                                 || table.bound_record_count() != hot_count
                                         })
-                                        || ready_binding.record_table().is_none_or(|table| {
-                                            table.slot_count() != ready_end
-                                                || table.bound_record_count() != ready_end
-                                        })
+                                        || !ready_binding_exact
                                         || full_binding.record_table().is_none_or(|table| {
                                             table.slot_count() != unique
                                                 || table.bound_record_count() != unique
@@ -31335,7 +31584,10 @@ impl Gemma4GhostCommonMetal {
 
                                     let hot_cb = kernel.queue.new_command_buffer().to_owned();
                                     let hot_enc = hot_cb.new_compute_command_encoder();
-                                    let hot_slots = (0..hot_count).collect::<Vec<_>>();
+                                    let hot_gateup = async_two_wave_plan
+                                        .map_or((0, hot_count), |plan| plan.hot_gateup);
+                                    let hot_end = hot_gateup.0.checked_add(hot_gateup.1)?;
+                                    let hot_slots = (hot_gateup.0..hot_end).collect::<Vec<_>>();
                                     let hot_ok = self.encode_moe_topk_only(
                                         kernel,
                                         hot_enc,
@@ -31352,55 +31604,63 @@ impl Gemma4GhostCommonMetal {
                                         &hot_slots,
                                         layer_idx,
                                         k_tokens,
-                                        0,
-                                        hot_count,
+                                        hot_gateup.0,
+                                        hot_gateup.1,
                                     );
                                     hot_enc.end_encoding();
                                     if !hot_ok {
                                         return None;
                                     }
 
-                                    let ready_cb = if ready_wave.is_empty() {
-                                        None
-                                    } else {
-                                        let cb = kernel.queue.new_command_buffer().to_owned();
-                                        let enc = cb.new_compute_command_encoder();
-                                        let ready_slots =
-                                            (hot_count..ready_end).collect::<Vec<_>>();
-                                        let all_slots = (0..unique).collect::<Vec<_>>();
-                                        let mut ok = self.encode_moe_record_gateup_range(
-                                            enc,
-                                            &ready_binding,
-                                            &ready_slots,
-                                            layer_idx,
-                                            k_tokens,
-                                            hot_count,
-                                            ready_wave.len(),
-                                        );
-                                        if demand_wave.is_empty() {
-                                            ok =
-                                                ok && self.encode_moe_down(
-                                                    kernel,
-                                                    enc,
-                                                    &full_binding,
-                                                    Some(&all_slots),
-                                                    layer_idx,
-                                                    k_tokens,
-                                                    &self.resident_scratch.gpu_moe_acc,
-                                                    0,
-                                                    None,
-                                                ) && self.encode_layer_tail(
-                                                    kernel, enc, layer_idx, k_tokens,
-                                                );
-                                        }
-                                        enc.end_encoding();
-                                        if !ok {
-                                            return None;
-                                        }
-                                        Some(cb)
-                                    };
+                                    let ready_cb =
+                                        if hot_cold_async_two_wave_round || ready_wave.is_empty() {
+                                            None
+                                        } else {
+                                            let ready_binding = ready_binding.as_ref()?;
+                                            let cb = kernel.queue.new_command_buffer().to_owned();
+                                            let enc = cb.new_compute_command_encoder();
+                                            let ready_slots =
+                                                (hot_count..ready_end).collect::<Vec<_>>();
+                                            let all_slots = (0..unique).collect::<Vec<_>>();
+                                            let mut ok = self.encode_moe_record_gateup_range(
+                                                enc,
+                                                ready_binding,
+                                                &ready_slots,
+                                                layer_idx,
+                                                k_tokens,
+                                                hot_count,
+                                                ready_wave.len(),
+                                            );
+                                            if demand_wave.is_empty() {
+                                                ok =
+                                                    ok && self.encode_moe_down(
+                                                        kernel,
+                                                        enc,
+                                                        &full_binding,
+                                                        Some(&all_slots),
+                                                        layer_idx,
+                                                        k_tokens,
+                                                        &self.resident_scratch.gpu_moe_acc,
+                                                        0,
+                                                        None,
+                                                    ) && self.encode_layer_tail(
+                                                        kernel, enc, layer_idx, k_tokens,
+                                                    );
+                                            }
+                                            enc.end_encoding();
+                                            if !ok {
+                                                return None;
+                                            }
+                                            Some(cb)
+                                        };
 
-                                    let demand_cb = if demand_wave.is_empty() {
+                                    // H55 deliberately defers terminal command encoding until
+                                    // after the hot command is committed and the cold I/O has
+                                    // launched. Metal command construction then overlaps the
+                                    // ready copies and demand reads instead of delaying both.
+                                    let demand_cb = if hot_cold_async_two_wave_round
+                                        || demand_wave.is_empty()
+                                    {
                                         None
                                     } else {
                                         let cb = kernel.queue.new_command_buffer().to_owned();
@@ -31450,12 +31710,13 @@ impl Gemma4GhostCommonMetal {
                                 compact_table,
                                 hot_cb,
                                 ready_cb,
-                                demand_cb,
+                                mut demand_cb,
                                 hot_binding,
                                 ready_binding,
                                 full_binding,
                             )) = encoded
                             {
+                                let mut ready_binding = ready_binding;
                                 unsafe {
                                     let dest =
                                         moe_layer.expert_to_slot_table.contents() as *mut u32;
@@ -31502,6 +31763,10 @@ impl Gemma4GhostCommonMetal {
                                 let mut ready_committed = false;
                                 if ready_exact {
                                     if let Some(ready_cb) = ready_cb.as_ref() {
+                                        let Some(ready_binding) = ready_binding.take() else {
+                                            self.last_chained_ledger = ledger;
+                                            return false;
+                                        };
                                         stamp.start(GPU_STAGE_GATEUP);
                                         stamp.push_current(ready_cb);
                                         ready_cb.commit();
@@ -31521,11 +31786,67 @@ impl Gemma4GhostCommonMetal {
                                             );
                                         }
                                     } else {
-                                        drop(ready_binding);
+                                        drop(ready_binding.take());
                                     }
                                 } else {
-                                    drop(ready_binding);
+                                    drop(ready_binding.take());
                                 }
+
+                                // H55's critical ordering is:
+                                //   commit hot -> launch cold I/O -> encode terminal ->
+                                //   join cold I/O -> commit terminal.
+                                // If terminal encoding fails, still join/reap the owned I/O,
+                                // retire the hot command, and fall through to exact fallback.
+                                let mut terminal_encode_ms = 0.0f64;
+                                let async_terminal_encoded = if hot_cold_async_two_wave_round
+                                    && ready_exact
+                                {
+                                    let terminal_encode_started = std::time::Instant::now();
+                                    demand_cb = gemma4_async_two_wave_command_plan(
+                                        hot_wave.len(),
+                                        ready_wave.len(),
+                                        demand_wave.len(),
+                                    )
+                                    .and_then(|plan| {
+                                        let cb = kernel.queue.new_command_buffer().to_owned();
+                                        let enc = cb.new_compute_command_encoder();
+                                        let terminal_end = plan
+                                            .terminal_gateup
+                                            .0
+                                            .checked_add(plan.terminal_gateup.1)?;
+                                        let terminal_slots = (plan.terminal_gateup.0..terminal_end)
+                                            .collect::<Vec<_>>();
+                                        let all_slots = (0..unique).collect::<Vec<_>>();
+                                        let ok = self.encode_moe_record_gateup_range(
+                                            enc,
+                                            &full_binding,
+                                            &terminal_slots,
+                                            layer_idx,
+                                            k_tokens,
+                                            plan.terminal_gateup.0,
+                                            plan.terminal_gateup.1,
+                                        ) && self.encode_moe_down(
+                                            kernel,
+                                            enc,
+                                            &full_binding,
+                                            Some(&all_slots),
+                                            layer_idx,
+                                            k_tokens,
+                                            &self.resident_scratch.gpu_moe_acc,
+                                            0,
+                                            None,
+                                        ) && self
+                                            .encode_layer_tail(kernel, enc, layer_idx, k_tokens);
+                                        enc.end_encoding();
+                                        ok.then_some(cb)
+                                    });
+                                    terminal_encode_ms =
+                                        terminal_encode_started.elapsed().as_secs_f64() * 1000.0;
+                                    ledger.encode_ms += terminal_encode_ms;
+                                    demand_cb.is_some()
+                                } else {
+                                    !hot_cold_async_two_wave_round
+                                };
 
                                 let demand_started = std::time::Instant::now();
                                 let mut demand_table = [u32::MAX; 128];
@@ -31546,7 +31867,8 @@ impl Gemma4GhostCommonMetal {
                                 } else {
                                     compact_stage_slot_table(&demand_wave)
                                 };
-                                let demand_exact = demand_joined
+                                let demand_exact = async_terminal_encoded
+                                    && demand_joined
                                     && expected_demand_table == Some(demand_table)
                                     && (demand_wave.is_empty()
                                         || wave_slots_ready(
@@ -31583,9 +31905,19 @@ impl Gemma4GhostCommonMetal {
                                     cb_closed = true;
                                     layer_committed = true;
                                     ledger.overlap_layers = ledger.overlap_layers.saturating_add(1);
-                                    let command_count = 1usize
-                                        + usize::from(!ready_wave.is_empty())
-                                        + usize::from(!demand_wave.is_empty());
+                                    let command_count = if hot_cold_async_two_wave_round {
+                                        gemma4_async_two_wave_command_plan(
+                                            hot_wave.len(),
+                                            ready_wave.len(),
+                                            demand_wave.len(),
+                                        )
+                                        .expect("H55 plan was validated before command commit")
+                                        .command_buffers
+                                    } else {
+                                        1usize
+                                            + usize::from(!ready_wave.is_empty())
+                                            + usize::from(!demand_wave.is_empty())
+                                    };
                                     ledger.expert_waves_sum = ledger
                                         .expert_waves_sum
                                         .saturating_add(command_count.saturating_sub(1) as u32);
@@ -31603,13 +31935,23 @@ impl Gemma4GhostCommonMetal {
                                     if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING").is_ok_and(
                                         |value| value == "1" || value.eq_ignore_ascii_case("true"),
                                     ) {
-                                        eprintln!(
-                                            "[metal chained three-wave] layer={layer_idx} hot={} ready={} demand={} active={} route_passes=1 down_passes=1 merge_passes=0 plan={plan_ms:.2}ms launch={launch_ms:.2}ms demand_join={demand_ms:.2}ms",
-                                            hot_wave.len(),
-                                            ready_wave.len(),
-                                            demand_wave.len(),
-                                            unique,
-                                        );
+                                        if hot_cold_async_two_wave_round {
+                                            eprintln!(
+                                                "[metal chained async-two-wave] layer={layer_idx} hot={} ready={} demand={} active={} command_buffers=2 route_passes=1 down_passes=1 merge_passes=0 order=hot-commit,io-launch,terminal-encode,io-join,terminal-commit plan={plan_ms:.2}ms launch={launch_ms:.2}ms terminal_encode={terminal_encode_ms:.2}ms demand_join={demand_ms:.2}ms",
+                                                hot_wave.len(),
+                                                ready_wave.len(),
+                                                demand_wave.len(),
+                                                unique,
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[metal chained three-wave] layer={layer_idx} hot={} ready={} demand={} active={} route_passes=1 down_passes=1 merge_passes=0 plan={plan_ms:.2}ms launch={launch_ms:.2}ms demand_join={demand_ms:.2}ms",
+                                                hot_wave.len(),
+                                                ready_wave.len(),
+                                                demand_wave.len(),
+                                                unique,
+                                            );
+                                        }
                                     }
                                     encode_clock = std::time::Instant::now();
                                 } else {
@@ -33692,7 +34034,7 @@ impl Gemma4GhostCommonMetal {
                 })
                 .unwrap_or_default();
             eprintln!(
-                "[metal live-sequential-predict probe] schema=1 admitted=1 profile=H40-direct-stage-single-down-publish0 start_pos={start_pos} K={k_tokens} source=post-attention-slab-b target=next-layer-exact-union first_target_layer=1 eligible_layers={} attempted_layers={live_sequential_attempts} failures={live_sequential_failures} truth_valid={} predict_us={live_sequential_predict_us} predictor_top_k_per_row=8 cap4_hits={} cap4_actual_cold={} cap4_predicted_cold={} cap4_recall={} cap4_precision={} cap4_read_wall_ms={:.3} cap4_projected_saved_ms={:.3} cap4_read_wall_weighted_recall={} cap8_hits={} cap8_actual_cold={} cap8_predicted_cold={} cap8_recall={} cap8_precision={} cap8_read_wall_ms={:.3} cap8_projected_saved_ms={:.3} cap8_read_wall_weighted_recall={} total_wave_load_ms={:.3} projection=record-linear-per-layer-wave-load-ceiling stage_admitted={} stage_launch_attempts={live_sequential_stage_launch_attempts} stage_launches={live_sequential_stage_launches} stage_launch_failures={live_sequential_stage_launch_failures} stage_candidates={live_sequential_stage_candidates} readiness_measured={} contention_measured={} output_mutation=0 io_mutation={} slot_policy_mutation=0 routing_authority=exact-router cap8_candidates={} cap8_layers={}",
+                "[metal live-sequential-predict probe] schema=1 admitted=1 profile=exact-live-sequential-hot-shape start_pos={start_pos} K={k_tokens} source=post-attention-slab-b target=next-layer-exact-union first_target_layer=1 eligible_layers={} attempted_layers={live_sequential_attempts} failures={live_sequential_failures} truth_valid={} predict_us={live_sequential_predict_us} predictor_top_k_per_row=8 cap4_hits={} cap4_actual_cold={} cap4_predicted_cold={} cap4_recall={} cap4_precision={} cap4_read_wall_ms={:.3} cap4_projected_saved_ms={:.3} cap4_read_wall_weighted_recall={} cap8_hits={} cap8_actual_cold={} cap8_predicted_cold={} cap8_recall={} cap8_precision={} cap8_read_wall_ms={:.3} cap8_projected_saved_ms={:.3} cap8_read_wall_weighted_recall={} total_wave_load_ms={:.3} projection=record-linear-per-layer-wave-load-ceiling stage_admitted={} stage_launch_attempts={live_sequential_stage_launch_attempts} stage_launches={live_sequential_stage_launches} stage_launch_failures={live_sequential_stage_launch_failures} stage_candidates={live_sequential_stage_candidates} readiness_measured={} contention_measured={} output_mutation=0 io_mutation={} slot_policy_mutation=0 routing_authority=exact-router cap8_candidates={} cap8_layers={}",
                 n_layers.saturating_sub(1),
                 u8::from(truth_valid),
                 cap4.hits,
@@ -46689,6 +47031,38 @@ mod tests {
         assert!(super::hot_ready_demand_compact_slot_table(&[1], &[], &[]).is_none());
         assert!(super::hot_ready_demand_compact_slot_table(&[1], &[1], &[2]).is_none());
         assert!(super::hot_ready_demand_compact_slot_table(&[128], &[1], &[]).is_none());
+    }
+
+    #[test]
+    fn async_two_wave_collapse_is_explicit_and_default_off() {
+        assert!(!super::gemma4_hybrid_async_two_wave_collapse_from(None));
+        assert!(super::gemma4_hybrid_async_two_wave_collapse_from(Some("1")));
+        for value in ["", "0", "true", "yes", "2"] {
+            assert!(
+                !super::gemma4_hybrid_async_two_wave_collapse_from(Some(value)),
+                "unexpected H55 admission for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_two_wave_command_plan_covers_mixed_and_empty_cold_sides() {
+        for (hot, ready, demand) in [(3, 2, 4), (3, 0, 4), (3, 4, 0)] {
+            let plan = super::gemma4_async_two_wave_command_plan(hot, ready, demand)
+                .expect("valid exact H55 partition");
+            assert_eq!(plan.hot_gateup, (0, hot));
+            assert_eq!(plan.terminal_gateup, (hot, ready + demand));
+            assert_eq!(plan.command_buffers, 2);
+            assert_eq!(plan.route_passes, 1);
+            assert_eq!(plan.down_passes, 1);
+            assert_eq!(
+                plan.hot_gateup.1 + plan.terminal_gateup.1,
+                hot + ready + demand
+            );
+        }
+        assert!(super::gemma4_async_two_wave_command_plan(0, 1, 1).is_none());
+        assert!(super::gemma4_async_two_wave_command_plan(3, 0, 0).is_none());
+        assert!(super::gemma4_async_two_wave_command_plan(120, 8, 1).is_none());
     }
 
     #[cfg(target_os = "macos")]

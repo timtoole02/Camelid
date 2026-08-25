@@ -307,31 +307,43 @@ class NativeTelemetry:
         }
 
     def sample_process(self, pid: int) -> dict[str, int]:
-        usage = RusageInfoV2()
-        ctypes.set_errno(0)
-        result = self.lib.proc_pid_rusage(
-            pid, RUSAGE_INFO_V2, ctypes.byref(usage)
-        )
-        if result != 0:
-            err = ctypes.get_errno()
-            _raise_process_accounting_error(
-                pid,
-                f"proc_pid_rusage({pid}) failed: result={result}, errno={err}",
+        # Darwin can briefly return an all-zero rusage record for a newly
+        # spawned, still-live process-group member. Retry that exact state once
+        # after 5 ms. Every syscall error, disappearance, and second zero still
+        # fails closed; the bounded retry only removes the observed birth race.
+        for accounting_attempt in range(1, 3):
+            usage = RusageInfoV2()
+            ctypes.set_errno(0)
+            result = self.lib.proc_pid_rusage(
+                pid, RUSAGE_INFO_V2, ctypes.byref(usage)
             )
-        if usage.resident_size == 0 or usage.phys_footprint == 0:
-            _raise_process_accounting_error(
-                pid,
-                f"proc_pid_rusage({pid}) returned zero resident/footprint bytes",
+            if result != 0:
+                err = ctypes.get_errno()
+                _raise_process_accounting_error(
+                    pid,
+                    f"proc_pid_rusage({pid}) failed: result={result}, errno={err}",
+                )
+            if usage.resident_size != 0 and usage.phys_footprint != 0:
+                return {
+                    "pid": pid,
+                    "rss_bytes": int(usage.resident_size),
+                    "physical_footprint_bytes": int(usage.phys_footprint),
+                    "wired_bytes": int(usage.wired_size),
+                    "pageins": int(usage.pageins),
+                    "disk_read_bytes": int(usage.diskio_bytesread),
+                    "disk_written_bytes": int(usage.diskio_byteswritten),
+                    "accounting_attempts": accounting_attempt,
+                }
+            message = (
+                f"proc_pid_rusage({pid}) returned zero resident/footprint bytes"
             )
-        return {
-            "pid": pid,
-            "rss_bytes": int(usage.resident_size),
-            "physical_footprint_bytes": int(usage.phys_footprint),
-            "wired_bytes": int(usage.wired_size),
-            "pageins": int(usage.pageins),
-            "disk_read_bytes": int(usage.diskio_bytesread),
-            "disk_written_bytes": int(usage.diskio_byteswritten),
-        }
+            if not _pid_exists(pid):
+                raise ProcessDisappeared(pid, message)
+            if accounting_attempt == 2:
+                raise ProcessAccountingError(pid, message)
+            time.sleep(0.005)
+
+        raise AssertionError("bounded process-accounting retry exhausted")
 
     def process_group_pids(self, process_group: int) -> list[int]:
         pids = (ctypes.c_int * MAX_PROCESS_GROUP_MEMBERS)()
