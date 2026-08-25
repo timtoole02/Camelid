@@ -4156,17 +4156,11 @@ mod gemma4_serve_lane_health_tests {
         .expect("loaded Ghost runtime has health state");
         assert!(!execution.common_metal_active, "the live GPU switch is off");
         assert_eq!(
-            gemma4_ghost_constructed_context_capacity(
-                Some(Gemma4ServeLane::GhostMoe),
-                Some(1_024),
-            ),
+            gemma4_ghost_constructed_context_capacity(Some(Gemma4ServeLane::GhostMoe), Some(1_024),),
             Some(1_024),
         );
         assert_eq!(
-            gemma4_ghost_constructed_context_capacity(
-                Some(Gemma4ServeLane::Local),
-                Some(1_024),
-            ),
+            gemma4_ghost_constructed_context_capacity(Some(Gemma4ServeLane::Local), Some(1_024),),
             None,
             "a neighboring Gemma 4 lane must not inherit Ghost capacity",
         );
