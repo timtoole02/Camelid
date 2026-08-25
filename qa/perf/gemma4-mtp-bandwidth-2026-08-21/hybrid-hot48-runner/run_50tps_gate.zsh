@@ -8,12 +8,14 @@ readonly MIN_FREE_MEMORY_PERCENT=20
 readonly PROFILE=39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37
 readonly script_dir=${0:A:h}
 readonly repo_root=$(/usr/bin/git -C "$script_dir" rev-parse --show-toplevel)
+readonly operator_home=${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}
+readonly model_root=${CAMELID_MODEL_ROOT:-$operator_home/models}
 readonly source_commit=$(/usr/bin/git -C "$repo_root" rev-parse HEAD)
 readonly target_dir=$(cd "$repo_root" && /usr/bin/env cargo metadata --no-deps --format-version 1 | /usr/bin/jq -r .target_directory)
 readonly binary=${CAMELID_50TPS_BINARY:-"$target_dir/release/camelid"}
-readonly model=${CAMELID_50TPS_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
-readonly cghost=${CAMELID_50TPS_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
-readonly assistant=${CAMELID_50TPS_ASSISTANT:-/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
+readonly model=${CAMELID_50TPS_MODEL:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
+readonly cghost=${CAMELID_50TPS_CGHOST:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
+readonly assistant=${CAMELID_50TPS_ASSISTANT:-$model_root/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
 readonly request="$script_dir/request-48.json"
 readonly expected="$script_dir/expected-48-token-ids.json"
 readonly REQUEST_SHA256=b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939
@@ -95,7 +97,7 @@ free_percent=$(/usr/bin/memory_pressure -Q | /usr/bin/awk '/free percentage/ {gs
 } > "$receipt_root/baseline.txt"
 
 /usr/bin/env -i \
-  HOME=/Users/timtoole \
+  HOME="$operator_home" \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   TMPDIR=/tmp \
   CAMELID_GHOST_ALLOW_LEGACY_SPARSE=0 \

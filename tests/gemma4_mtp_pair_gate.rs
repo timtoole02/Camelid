@@ -20,6 +20,8 @@
 //! cargo test --test gemma4_mtp_pair_gate -- --ignored --nocapture
 //! ```
 
+mod support;
+
 use std::{
     collections::BTreeMap,
     env,
@@ -39,9 +41,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_SOURCE_TARGET: &str = "/Volumes/Untitled/models/gemma-4-26B_q4_0-it.gguf";
-const DEFAULT_RUNTIME_TARGET: &str = "/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf";
-const DEFAULT_CGHOST: &str = "/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost";
-const DEFAULT_ASSISTANT_DIR: &str = "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant";
+const DEFAULT_RUNTIME_TARGET: &str = "gemma-4-26B_q4_0-it.gguf";
+const DEFAULT_CGHOST: &str = "gemma-4-26B_q4_0-it.cghost";
+const DEFAULT_ASSISTANT_DIR: &str = "gemma4-26b-a4b-mtp-qat-assistant";
 
 const ASSISTANT_REPOSITORY: &str = "google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant";
 const ASSISTANT_REVISION: &str = "9537141506fe8875b3ed45b264af13580cb29166";
@@ -149,9 +151,14 @@ impl GateReport {
 }
 
 fn env_path(name: &str, fallback: &str) -> PathBuf {
-    env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(fallback))
+    env::var_os(name).map(PathBuf::from).unwrap_or_else(|| {
+        let fallback = PathBuf::from(fallback);
+        if fallback.is_absolute() {
+            fallback
+        } else {
+            PathBuf::from(support::model_root()).join(fallback)
+        }
+    })
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {

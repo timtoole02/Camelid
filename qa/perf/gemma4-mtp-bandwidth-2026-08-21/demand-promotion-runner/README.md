@@ -111,7 +111,7 @@ the cap16 selector. Manual point samples remain non-qualifying safety evidence.
 ## Run one
 
 ```sh
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh \
+CAM_SESSION_PID=$$ $CAMELID_OPERATOR_BIN/cam-lock.sh \
   qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cfg.zsh \
   my-label \
   qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/env/H2-proportional

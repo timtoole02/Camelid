@@ -57,6 +57,8 @@ pub use error::{BackendError, Result};
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
     use std::sync::{Condvar, Mutex, MutexGuard};
     use std::thread::ThreadId;
 
@@ -149,5 +151,36 @@ pub(crate) mod test_support {
         TestEnvGuard {
             _env_guard: env_guard,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn model_path(relative: &str) -> PathBuf {
+        let root = std::env::var_os("CAMELID_MODEL_ROOT")
+            .filter(|root| !root.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .filter(|home| !home.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("models")
+            });
+        root.join(relative)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn canonical_operator_home() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)?;
+        if !home.is_absolute() || home.parent().is_none() {
+            return None;
+        }
+        let canonical = home.canonicalize().ok()?;
+        canonical.parent().is_some().then_some(canonical)
     }
 }

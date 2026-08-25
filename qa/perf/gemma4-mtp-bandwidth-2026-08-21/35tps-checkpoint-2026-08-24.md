@@ -60,7 +60,7 @@ small deltas, then:
    precision to beat its overfetch and eviction cost.
 
 Every build and model run must remain wrapped in
-`/Users/timtoole/bin/cam-lock.sh`.
+`$CAMELID_OPERATOR_BIN/cam-lock.sh`.
 
 ## FreeToken-derived implementation boundary
 

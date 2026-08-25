@@ -2,7 +2,16 @@
 """Summarize a NIM pilot report + watchdog into the facts that matter."""
 import json, sys, os
 
-D = sys.argv[1] if len(sys.argv) > 1 else '/Users/timtoole/models/gemma4-mtp-pair/runs/mtp-nim-table32.qHR2Wmcz'
+operator_home = os.environ.get("CAMELID_OPERATOR_HOME") or os.environ.get("HOME")
+if not operator_home:
+    raise RuntimeError("set CAMELID_OPERATOR_HOME or HOME")
+model_root = os.environ.get("CAMELID_MODEL_ROOT") or os.path.join(operator_home, "models")
+D = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else os.environ.get("CAMELID_NIM_PILOT_RUN_DIR")
+    or os.path.join(model_root, "gemma4-mtp-pair", "runs", "mtp-nim-table32.qHR2Wmcz")
+)
 rep = os.path.join(D, 'nim-pilot-report.json')
 wd  = os.path.join(D, 'nim-watchdog.jsonl')
 

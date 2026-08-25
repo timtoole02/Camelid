@@ -8,6 +8,8 @@
 //! - Process RSS, macOS compressed memory, swap usage
 //! - 48-token deterministic parity verification against llama.cpp oracle
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, process::Command, time::Instant};
 
@@ -83,10 +85,10 @@ fn get_macos_vm_info() -> (String, String) {
 fn test_gemma4_26b_lock_baseline() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf"));
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost"));
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!(

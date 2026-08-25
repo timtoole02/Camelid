@@ -24959,6 +24959,7 @@ impl ChainedRoundHostLedger {
     /// records and staged mapped-cold records; keeping those counts separate is
     /// required for the strict hybrid receipt to prove the hot capacity rather
     /// than misclassifying the full active union as anonymous-hot.
+    #[cfg(any(target_os = "macos", test))]
     fn record_hybrid_bound_partition(
         &mut self,
         layer_idx: usize,
@@ -49696,9 +49697,7 @@ mod tests {
         }
         let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
-            });
+            .unwrap_or_else(|| crate::test_support::model_path("gemma-4-26B_q4_0-it.cghost"));
         if !cghost_path.is_file() {
             eprintln!(
                 "SKIP Tier-2 expert slab probe: {} not found",
@@ -51696,9 +51695,7 @@ kernel void sample_active_expert_records(
         let path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                std::path::PathBuf::from(
-                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
-                )
+                crate::test_support::model_path("gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
             });
         if !path.is_file() {
             return;

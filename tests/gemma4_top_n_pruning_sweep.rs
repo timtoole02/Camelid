@@ -3,6 +3,8 @@
 //! Sweeps Top-N candidate prefetch widths (N = 8, 9, 10, 11, 12, 14, 16)
 //! to find the smallest N that produces ZERO physical NVMe demand faults inside verification.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
@@ -35,8 +37,8 @@ struct PruningSweepResult {
 
 #[test]
 fn test_genuine_gemma4_top_n_pruning_sweep_k8() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

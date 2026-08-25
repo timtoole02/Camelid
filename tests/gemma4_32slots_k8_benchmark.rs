@@ -2,6 +2,8 @@
 //!
 //! Eliminates slot table thrashing so that all Top-12 candidate experts remain resident simultaneously.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
@@ -19,8 +21,8 @@ fn get_page_faults() -> (u64, u64) {
 
 #[test]
 fn test_genuine_gemma4_32slots_k8() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

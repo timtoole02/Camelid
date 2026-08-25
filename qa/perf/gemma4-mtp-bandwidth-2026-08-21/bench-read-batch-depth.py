@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Does small per-layer batch size explain 1.87 GB/s vs the device's 2.60?"""
 import os, time, random, threading, fcntl
-PATH="/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost"
+operator_home = os.environ.get("CAMELID_OPERATOR_HOME") or os.environ.get("HOME")
+if not operator_home:
+    raise RuntimeError("set CAMELID_OPERATOR_HOME or HOME")
+model_root = os.environ.get("CAMELID_MODEL_ROOT") or os.path.join(operator_home, "models")
+PATH = os.environ.get("CAMELID_GEMMA4_CGHOST") or os.path.join(
+    model_root, "gemma4-mtp-pair", "gemma-4-26B_q4_0-it.v3.cghost"
+)
 REC=3_345_408; F_NOCACHE=48
 nrec=os.path.getsize(PATH)//REC
 random.seed(7)

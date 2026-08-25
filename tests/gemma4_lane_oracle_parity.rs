@@ -33,6 +33,8 @@
 //!   LANEP_CACHE_MIB   host expert cache MiB (default 2900)
 //!   LANEP_SOFT        report divergences without failing (diagnosis runs)
 
+mod support;
+
 use camelid::gemma4_runtime::{gemma4_stop_token_ids, Gemma4Runtime};
 use std::{path::PathBuf, time::Instant};
 
@@ -101,10 +103,10 @@ fn prompts() -> Vec<(&'static str, String)> {
 fn gemma4_lane_oracle_parity() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf"));
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost"));
     if !model_path.exists() || !cghost_path.exists() {
         eprintln!("model pair missing; skipping");
         return;

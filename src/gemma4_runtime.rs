@@ -34023,9 +34023,7 @@ mod ghost_moe_wire_tests {
         let path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                std::path::PathBuf::from(
-                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
-                )
+                crate::test_support::model_path("gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
             });
         if !path.is_file() {
             return;

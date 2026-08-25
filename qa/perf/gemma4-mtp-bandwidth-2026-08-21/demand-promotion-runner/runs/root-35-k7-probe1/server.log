@@ -1,6 +1,6 @@
 [hw] GPU: Apple M4 | Metal compute | unified-memory yes | GPU-resident inference available
 [hw] CPU: 10 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 9.6 GiB free / 16.0 GiB total
-  Diagnostics log: /Users/timtoole/.local/state/Camelid/logs/camelid.log
+  Diagnostics log: $CAMELID_STATE_DIR/logs/camelid.log
 [gemma4-ghost] CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY=1: background target readahead skipped
 [gemma4-ghost-metal] per-layer slot distribution enabled: total 2640 slots (8.26 GiB resident) across 30 layers
 [metal qkv occupancy] orig max_threads/TG=1024 texw=32 tmem=0 | fused_rms max_threads/TG=1024 texw=32 tmem=0 (lower max_threads/TG ⇒ more registers / lower occupancy)
@@ -16,7 +16,7 @@
 [metal] CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT=1 exact RB2/SG4 dispatch active
 [gemma4-mtp full-q4] enabled=true source_sha256=c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801 matrices=23 packed_bytes=236077056 bf16_matrix_bytes=839385088 quantize_us=62302 norms_quantized=false fallback=false
 [gemma4-mtp full-q4 residency] source_retained=false mapped_bytes=0 locked_bytes=0 resident_pages=0 total_pages=0 packed_bytes=236077056
-[gemma4-mtp] MTP QAT assistant loaded from "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors" lm_head=q4_0 matrices=q4_0_all (speculative enabled)
+[gemma4-mtp] MTP QAT assistant loaded from "$CAMELID_MODEL_ROOT/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors" lm_head=q4_0 matrices=q4_0_all (speculative enabled)
 
   ðŸª Warming up the GPU (building the resident engine, one-time)â€¦
 [gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 static_k8_dense=off runtime_k_dense=on

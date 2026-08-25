@@ -24,9 +24,11 @@ readonly runner=$repo/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runne
 readonly watchdog=$repo/qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/run_load_only_watchdog.py
 readonly manual_safety_sampler=${0:A:h}/capture_manual_safety.py
 readonly binary=${CAMELID_BENCH_BINARY:-/Volumes/Untitled/cargo-targets/global/release/camelid}
-readonly model=/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf
-readonly cghost=/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost
-readonly assistant=/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
+readonly operator_home=${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}
+readonly model_root=${CAMELID_MODEL_ROOT:-$operator_home/models}
+readonly model=$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf
+readonly cghost=$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost
+readonly assistant=$model_root/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
 readonly request=${CAMELID_BENCH_REQUEST:-${0:A:h}/request-48-plain.json}
 readonly expected_token_ids=$runner/expected-48-token-ids.json
 readonly out=${CAMELID_BENCH_OUT:-${0:A:h}/runs}/$label
@@ -152,7 +154,7 @@ add_env_value() {
   record_manifest_value "$key" "$value"
 }
 
-add_env_value HOME /Users/timtoole
+add_env_value HOME "$operator_home"
 add_env_value PATH /usr/bin:/bin:/usr/sbin:/sbin
 add_env_value TMPDIR /tmp
 while IFS= read -r line; do

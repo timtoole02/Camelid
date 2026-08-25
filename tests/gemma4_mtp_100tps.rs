@@ -1,3 +1,5 @@
+mod support;
+
 use camelid::gemma4_runtime::{gemma4_stop_token_ids, Gemma4Runtime};
 use camelid::metal::Gemma4MtpAssistantMetal;
 use std::{path::PathBuf, time::Instant};
@@ -7,33 +9,34 @@ fn test_gemma4_mtp_100_tokens_per_second_with_bit_exact_parity() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
+            if PathBuf::from(support::model_root())
+                .join("gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
                 .exists()
             {
-                PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
+                PathBuf::from(support::model_root())
+                    .join("gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
             } else {
-                PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf")
+                PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf")
             }
         });
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
+            if PathBuf::from(support::model_root())
+                .join("gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
                 .exists()
             {
-                PathBuf::from(
-                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
-                )
+                PathBuf::from(support::model_root())
+                    .join("gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
             } else {
-                PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
+                PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost")
             }
         });
     let assistant_path = std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(
-                "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors",
-            )
+            PathBuf::from(support::model_root())
+                .join("gemma4-26b-a4b-mtp-qat-assistant/model.safetensors")
         });
 
     std::env::set_var("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0");

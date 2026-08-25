@@ -1,5 +1,7 @@
 //! Layer-by-Layer and Checkpoint-by-Checkpoint Parity Diagnostic for Gemma 4 26B-A4B MoE
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
@@ -25,8 +27,8 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
 
 #[test]
 fn test_layer_by_layer_parity_diagnosis_k2() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
