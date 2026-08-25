@@ -1886,9 +1886,7 @@ mod tests {
         let candidates = (0..18).map(|expert| key(20, expert)).collect::<Vec<_>>();
         stage.launch(20, candidates).unwrap();
 
-        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| {
-            snapshot.reads_succeeded == 16
-        });
+        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| snapshot.reads_succeeded == 16);
         assert_eq!(snapshot.candidates, 16);
         assert_eq!(snapshot.reads_started, 16);
         let ready = stage.seal_layer(20);

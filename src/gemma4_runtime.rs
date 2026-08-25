@@ -2159,8 +2159,7 @@ const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
 #[cfg(any(target_os = "macos", test))]
 fn ghost_metal_live_sequential_mini2_hot_profile_admitted(profile: &[usize]) -> bool {
     profile == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
-        && profile.iter().copied().sum::<usize>()
-            == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS
+        && profile.iter().copied().sum::<usize>() == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2249,8 +2248,7 @@ const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_PAYLOAD_BYTES: usize =
 const _: () = assert!(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_PAYLOAD_BYTES == 8 * 3_345_408);
 #[cfg(target_os = "macos")]
 const _: () = assert!(
-    GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES
-        == crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES
+    GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES == crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES
 );
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS: usize = 2;
 
@@ -8676,8 +8674,7 @@ impl GhostMetalExpertRuntime {
                 ghost_metal_live_sequential_mini2_hot_profile_admitted(profile)
             })
             && !crate::metal::gemma4_hybrid_hot_cold_overlap_publish_enabled()
-            && std::env::var(GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV)
-                .is_ok_and(|value| value == "1")
+            && std::env::var(GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV).is_ok_and(|value| value == "1")
             && !std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_MAPPED_WAVE")
                 .is_ok_and(|value| value == "1")
             && previous_cold_stage.is_none()
@@ -8688,8 +8685,7 @@ impl GhostMetalExpertRuntime {
                 .is_some_and(|common| common.retained_cold_slot_count() == 0)
             && !std::env::var("CAMELID_GEMMA4_CHAINED_STAGE_PROFILE")
                 .is_ok_and(|value| value == "1")
-            && !std::env::var("CAMELID_GEMMA4_DUMP_LAYERS")
-                .is_ok_and(|value| value == "1");
+            && !std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|value| value == "1");
         let live_sequential_stage_cap = ghost_metal_live_sequential_stage_cap(
             ghost_metal_live_sequential_stage_cap16_enabled(),
             GhostMetalLiveSequentialCap16Lane {
@@ -28999,10 +28995,7 @@ mod mtp_target_seam_tests {
             crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES,
             GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES
         );
-        assert_eq!(
-            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS,
-            8
-        );
+        assert_eq!(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS, 8);
         assert_eq!(
             GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_PAYLOAD_BYTES,
             8 * 3_345_408
