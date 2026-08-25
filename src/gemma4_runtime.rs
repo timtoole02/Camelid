@@ -31010,8 +31010,8 @@ mod mtp_target_seam_tests {
 
         let mut neighboring = mini2;
         for (layer, delta) in [(0usize, -1i64), (1, 1)] {
-            let slots = (neighboring.per_layer[layer].anonymous_slot_capacity as i64 + delta)
-                as u64;
+            let slots =
+                (neighboring.per_layer[layer].anonymous_slot_capacity as i64 + delta) as u64;
             neighboring.per_layer[layer].anonymous_slot_capacity = slots;
             neighboring.per_layer[layer].anonymous_slot_capacity_bytes =
                 slots * HYBRID_TELEMETRY_STRIDE_BYTES;
