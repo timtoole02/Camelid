@@ -2160,7 +2160,7 @@ const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
 /// promoted by the current API/WebUI evidence bundle. Changing any runtime
 /// shape or named scheduling selector requires a new identifier and evidence.
 pub const GEMMA4_MINI2_WEBUI_PROFILE_ID: &str =
-    "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1";
+    "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v2";
 
 /// Exact expert payload paired with the prepared target above. The profile
 /// receipt is minted only after hashing the complete bytes through the same
@@ -14011,9 +14011,9 @@ fn exact_hybrid_telemetry_geometry(
     let layers = HYBRID_TELEMETRY_LAYERS as u64;
     let logical_total = layers.checked_mul(HYBRID_TELEMETRY_LOGICAL_PER_LAYER)?;
     // Schema v2 admits exactly the frozen aggregate-960 Hot32/profile family,
-    // runtime-only uniform Hot40, or runtime-only uniform Hot48. Mixed or
-    // uneven experiment totals intentionally fall back to the 960 expectation
-    // and refuse.
+    // the exact uneven 1,408-record Mini2 serving profile, and the runtime-only
+    // uniform Hot40/Hot48 experiments. Other mixed or uneven totals
+    // intentionally fall back to the 960 expectation and refuse.
     let uniform_hot40 = snapshot.per_layer.len() == HYBRID_TELEMETRY_LAYERS
         && snapshot
             .per_layer
@@ -14024,14 +14024,21 @@ fn exact_hybrid_telemetry_geometry(
             .per_layer
             .iter()
             .all(|layer| layer.anonymous_slot_capacity == HYBRID_TELEMETRY_HOT48_PER_LAYER);
-    let hot_per_layer = if uniform_hot40 {
-        HYBRID_TELEMETRY_HOT40_PER_LAYER
+    let exact_mini2_profile = snapshot.per_layer.len() == HYBRID_TELEMETRY_LAYERS
+        && snapshot
+            .per_layer
+            .iter()
+            .zip(GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE)
+            .all(|(layer, slots)| layer.anonymous_slot_capacity == slots as u64);
+    let hot_total = if uniform_hot40 {
+        layers.checked_mul(HYBRID_TELEMETRY_HOT40_PER_LAYER)?
     } else if uniform_hot48 {
-        HYBRID_TELEMETRY_HOT48_PER_LAYER
+        layers.checked_mul(HYBRID_TELEMETRY_HOT48_PER_LAYER)?
+    } else if exact_mini2_profile {
+        GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS as u64
     } else {
-        HYBRID_TELEMETRY_HOT_PER_LAYER
+        layers.checked_mul(HYBRID_TELEMETRY_HOT_PER_LAYER)?
     };
-    let hot_total = layers.checked_mul(hot_per_layer)?;
     let hot_bytes = hot_total.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
     let mapped_span = logical_total.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
     if snapshot.layer_count != HYBRID_TELEMETRY_LAYERS as u32
@@ -14687,7 +14694,7 @@ fn mtp_scheduled_verify_width(
 }
 
 const MTP_ADAPTIVE_BASE_VERIFY_K: usize = 10;
-const MTP_ADAPTIVE_MIN_VERIFY_K: usize = 4;
+const MTP_ADAPTIVE_MIN_VERIFY_K: usize = 2;
 
 fn mtp_initial_verify_width(adaptive: bool, max_verify_k: usize) -> usize {
     if adaptive {
@@ -30667,6 +30674,25 @@ mod mtp_target_seam_tests {
         }
     }
 
+    fn set_profiled_hybrid_hot_capacity(
+        snapshot: &mut Gemma4RoutedExpertResidencySnapshot,
+        profile: &[usize; HYBRID_TELEMETRY_LAYERS],
+    ) {
+        let hot_total = profile.iter().sum::<usize>() as u64;
+        let hot_bytes = hot_total * HYBRID_TELEMETRY_STRIDE_BYTES;
+        snapshot.anonymous_slot_capacity = hot_total;
+        snapshot.anonymous_slot_capacity_bytes = hot_bytes;
+        snapshot.physical_base_slot_budget = hot_total;
+        snapshot.physical_base_slot_budget_bytes = hot_bytes;
+        for (layer, &slots) in snapshot.per_layer.iter_mut().zip(profile) {
+            let slots = slots as u64;
+            layer.anonymous_slot_capacity = slots;
+            layer.anonymous_slot_capacity_bytes = slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+            layer.physical_base_slot_budget = slots;
+            layer.physical_base_slot_budget_bytes = slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+        }
+    }
+
     fn k8_round_input() -> Gemma4HybridRoundInput {
         Gemma4HybridRoundInput {
             round_index: 0,
@@ -30957,6 +30983,45 @@ mod mtp_target_seam_tests {
         assert!(
             exact_hybrid_telemetry_geometry(&mixed_hot40).is_none(),
             "aggregate 1,200 is not sufficient: every layer must be exactly 40"
+        );
+    }
+
+    #[test]
+    fn hybrid_telemetry_schema_v2_whitelists_exact_mini2_profile_only() {
+        let mut mini2 = exact_hybrid_snapshot(10, None, 0, 0);
+        set_profiled_hybrid_hot_capacity(
+            &mut mini2,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        );
+        let geometry = exact_hybrid_telemetry_geometry(&mini2)
+            .expect("exact uneven Mini2 profile is receiptable");
+        assert_eq!(geometry.anonymous_hot_capacity_slots, 1_408);
+        assert_eq!(
+            geometry
+                .per_layer
+                .iter()
+                .map(|layer| layer.anonymous_hot_capacity_slots)
+                .collect::<Vec<_>>(),
+            GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+                .iter()
+                .map(|&slots| slots as u64)
+                .collect::<Vec<_>>()
+        );
+
+        let mut neighboring = mini2;
+        for (layer, delta) in [(0usize, -1i64), (1, 1)] {
+            let slots = (neighboring.per_layer[layer].anonymous_slot_capacity as i64 + delta)
+                as u64;
+            neighboring.per_layer[layer].anonymous_slot_capacity = slots;
+            neighboring.per_layer[layer].anonymous_slot_capacity_bytes =
+                slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+            neighboring.per_layer[layer].physical_base_slot_budget = slots;
+            neighboring.per_layer[layer].physical_base_slot_budget_bytes =
+                slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+        }
+        assert!(
+            exact_hybrid_telemetry_geometry(&neighboring).is_none(),
+            "a same-total neighboring 1,408-slot profile must fail closed"
         );
     }
 
@@ -31276,9 +31341,10 @@ mod mtp_target_seam_tests {
         assert_eq!(mtp_next_verify_width(true, 12, 11, 10, 10), 12);
         assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 4), 6);
         assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 3), 5);
-        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 0), 4);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 0), 2);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 1), 3);
         assert_eq!(mtp_next_verify_width(true, 12, 12, 11, 10), 12);
-        assert_eq!(mtp_next_verify_width(true, 3, 3, 2, 0), 3);
+        assert_eq!(mtp_next_verify_width(true, 3, 3, 2, 0), 2);
     }
 
     #[test]

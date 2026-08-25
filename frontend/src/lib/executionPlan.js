@@ -34,7 +34,7 @@ const GHOST_EXECUTION_MODES = new Set([
 
 const GHOST_BACKENDS = new Set(['cpu', 'metal', 'cuda'])
 
-export const GEMMA4_MINI2_WEBUI_PROFILE_ID = 'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1'
+export const GEMMA4_MINI2_WEBUI_PROFILE_ID = 'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v2'
 
 function optionalBoolean(value) {
   return typeof value === 'boolean' ? value : null

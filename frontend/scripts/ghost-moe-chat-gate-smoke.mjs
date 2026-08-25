@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { getChatGateState } from '../src/lib/chatGate.js'
 
-const MINI2_RUNTIME_PROFILE = 'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1'
+const MINI2_RUNTIME_PROFILE = 'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v2'
 
 const gemma426bRow = {
   id: 'gemma4_26b_a4b_it_q4_0',

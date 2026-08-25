@@ -145,7 +145,7 @@ for _ in {1..900}; do
         .gemma4_ghost_head_metal_active == true and
         .gemma4_ghost_common_metal_context_capacity == 1024 and
         .gemma4_ghost_exact_expert_policy_active == true and
-        .gemma4_ghost_runtime_profile == "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1" and
+        .gemma4_ghost_runtime_profile == "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v2" and
         .gemma4_mtp_assistant_loaded == true and
         .gemma4_mtp_full_q4_active == true and
         .execution_plan.support_level == "supported_exact_row_smoke" and
