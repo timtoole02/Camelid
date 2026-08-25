@@ -2677,7 +2677,7 @@ fn format_exact_residency_trace(
             .enumerate()
             .filter_map(|(expert, &hot)| hot.then_some(expert))
             .collect::<Vec<_>>();
-        if resident.len() > capacity {
+        if resident.len() != capacity {
             return Err("resident-capacity");
         }
         resident_total = resident_total
@@ -2749,6 +2749,15 @@ fn format_exact_residency_trace(
         route_masks.join("/"),
         resident_masks.join("/"),
         cold_masks.join("/"),
+        round_seq = round_seq,
+        start_pos = start_pos,
+        k_tokens = k_tokens,
+        stage_cap = stage_cap,
+        capacity_total = capacity_total,
+        resident_total = resident_total,
+        exact_unique_records = exact_unique_records,
+        resident_hits = resident_hits,
+        cold_records = cold_records,
     ))
 }
 
@@ -4000,15 +4009,16 @@ struct GhostMetalExpertRuntime {
     /// eligible to drive exact previous-cold staging.
     latest_routed_experts_from_successful_decode: bool,
     /// Exact routed identities observed since the latest telemetry interval
-    /// boundary (or runtime construction for epoch zero). The default lane is
-    /// observation-only; H71 may read a request-local reset interval once at
-    /// the prefill handoff, never during target routing.
+    /// boundary (or runtime construction for epoch zero). This remains
+    /// observation-only; H71 owns separate request-local union/score storage.
     routed_expert_interval_union: Vec<[u64; 2]>,
     routed_expert_interval_epoch: u64,
     expert_decay_scores: Vec<Vec<f32>>,
     /// Request-local H71 admission, latched before prompt position zero. A
     /// malformed selector or non-H49 geometry cannot reset baseline history.
     prompt_ranked_handoff_armed: bool,
+    prompt_ranked_route_union: Vec<[u64; 2]>,
+    prompt_ranked_route_scores: Vec<Vec<f32>>,
     /// Canonical experts consumed through a hybrid mixed table and eligible
     /// for promotion only after that layer's command reaches terminal status.
     pending_hybrid_promotions: Vec<Vec<usize>>,
@@ -7715,6 +7725,8 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
             prompt_ranked_handoff_armed: false,
+            prompt_ranked_route_union: vec![[0; 2]; layer_count],
+            prompt_ranked_route_scores: vec![vec![0.0f32; 128]; layer_count],
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
             hybrid_decode_promotion_enabled: true,
             hybrid_hot_admission: None,
@@ -8043,6 +8055,8 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
             prompt_ranked_handoff_armed: false,
+            prompt_ranked_route_union: vec![[0; 2]; layer_count],
+            prompt_ranked_route_scores: vec![vec![0.0f32; 128]; layer_count],
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
             hybrid_decode_promotion_enabled,
             hybrid_hot_admission,
@@ -8347,6 +8361,25 @@ impl GhostMetalExpertRuntime {
                 }
             }
         }
+        if self.prompt_ranked_handoff_armed {
+            if let Some(union) = self.prompt_ranked_route_union.get_mut(layer_idx) {
+                for &expert in experts {
+                    if expert < 128 {
+                        union[expert / 64] |= 1u64 << (expert % 64);
+                    }
+                }
+            }
+            if let Some(scores) = self.prompt_ranked_route_scores.get_mut(layer_idx) {
+                for score in scores.iter_mut() {
+                    *score *= 0.85;
+                }
+                for &expert in experts {
+                    if let Some(score) = scores.get_mut(expert) {
+                        *score += 1.0;
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn top_speculative_candidates(&self, layer_idx: usize, top_n: usize) -> Vec<usize> {
@@ -8435,8 +8468,8 @@ impl GhostMetalExpertRuntime {
         let prompt_ranked_routes = prompt_ranked_admitted
             .then(|| {
                 prompt_ranked_hot_handoff_routes(
-                    &self.routed_expert_interval_union,
-                    &self.expert_decay_scores,
+                    &self.prompt_ranked_route_union,
+                    &self.prompt_ranked_route_scores,
                     &capacities,
                 )
             })
@@ -17441,10 +17474,10 @@ impl Gemma4Runtime {
                 && plan == GhostPrefillPlan::HybridChunk
                 && runtime.prompt_ranked_hot_handoff_shape_admitted();
             if runtime.prompt_ranked_handoff_armed {
-                for union in &mut runtime.routed_expert_interval_union {
+                for union in &mut runtime.prompt_ranked_route_union {
                     union.fill(0);
                 }
-                for scores in &mut runtime.expert_decay_scores {
+                for scores in &mut runtime.prompt_ranked_route_scores {
                     scores.fill(0.0);
                 }
             }
@@ -29728,11 +29761,34 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
-    fn exact_residency_trace_accepts_wide_k14_truth_and_underfilled_residency() {
+    fn exact_residency_trace_accepts_wide_k14_truth_but_refuses_underfill() {
         let routes = vec![(0..65).collect::<Vec<_>>(); 30];
-        let hot = [[false; 128]; 30];
+        let mut hot = [[false; 128]; 30];
         let counts = [65u16; 30];
-        let receipt = format_exact_residency_trace(
+        assert_eq!(
+            format_exact_residency_trace(
+            42,
+            118,
+            14,
+            true,
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+            &routes,
+            hot.as_slice(),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+            &[0.0; 30],
+            &counts,
+            1_950,
+            ),
+            Err("resident-capacity")
+        );
+
+        for (layer, &capacity) in GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+            .iter()
+            .enumerate()
+        {
+            hot[layer][..capacity].fill(true);
+        }
+        format_exact_residency_trace(
             42,
             118,
             14,
@@ -29746,8 +29802,6 @@ mod mtp_target_seam_tests {
             1_950,
         )
         .expect("K14 may expose more than the historical 64-ID probe cap");
-        assert!(receipt.contains("resident_total=0 exact_unique_records=1950"));
-        assert!(receipt.contains("resident_sizes=0,0,0,0,0,0,0,0,0,0"));
     }
 
     #[test]

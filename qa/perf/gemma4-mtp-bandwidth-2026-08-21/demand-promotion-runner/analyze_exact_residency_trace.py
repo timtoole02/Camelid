@@ -386,6 +386,20 @@ def analyze_run(run_dir, control_run_dir):
     comparable_trace_environment.pop(h69.EXACT_RESIDENCY_TRACE_SELECTOR)
     require(comparable_trace_environment == control_environment,
             "trace/control environment or provenance differs beyond the trace selector")
+    trace_handoff_masks = h69.validate_prompt_ranked_handoff(log, environment)
+    control_handoff_masks = h69.validate_prompt_ranked_handoff(
+        control_log, control_environment
+    )
+    require(trace_handoff_masks == control_handoff_masks,
+            "trace/control prompt-ranked handoff identities differ")
+    if trace_handoff_masks is not None:
+        for round_index, trace in enumerate(traces):
+            observed_masks = [
+                sum(1 << expert for expert in trace["residents"][layer])
+                for layer in range(LAYERS)
+            ]
+            require(observed_masks == trace_handoff_masks,
+                    f"trace round {round_index} residency differs from H71 handoff")
     result["run"] = run_path.name
     result["clean_control_run"] = control_path.name
     result["source_commit"] = environment["source_commit"]

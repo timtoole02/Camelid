@@ -281,7 +281,9 @@ def _parse_handoff_masks(raw: str, label: str) -> list[int]:
     return masks
 
 
-def validate_prompt_ranked_handoff(log: str, environment: dict[str, str]) -> bool:
+def validate_prompt_ranked_handoff(
+    log: str, environment: dict[str, str]
+) -> list[int] | None:
     lines = [
         line for line in log.splitlines() if line.startswith(PROMPT_RANKED_HANDOFF_PREFIX)
     ]
@@ -289,7 +291,7 @@ def validate_prompt_ranked_handoff(log: str, environment: dict[str, str]) -> boo
     if not requested:
         if lines:
             raise ReceiptError("unselected prompt-ranked handoff receipt is present")
-        return False
+        return None
     if len(lines) != 1:
         raise ReceiptError(f"prompt-ranked profile requires exactly one handoff receipt, got {len(lines)}")
     fields = _parse_fields(
@@ -338,7 +340,7 @@ def validate_prompt_ranked_handoff(log: str, environment: dict[str, str]) -> boo
             raise ReceiptError(f"prompt-ranked L{layer} selected/resident identities differ")
         if selected_mask.bit_count() != capacity:
             raise ReceiptError(f"prompt-ranked L{layer} identity count differs from capacity")
-    return True
+    return resident
 
 
 def _parse_uint(raw: str, label: str, *, maximum: int | None = None) -> int:
@@ -1345,7 +1347,7 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     validate_health(run_dir, environment)
     validate_response(run_dir)
     log = _read_text(run_dir / "server.log", "server log")
-    prompt_ranked_handoff_effective = validate_prompt_ranked_handoff(log, environment)
+    prompt_ranked_handoff_masks = validate_prompt_ranked_handoff(log, environment)
     probes, stages = parse_observations(log)
     stage_caps = {stage["cap"] for stage in stages}
     if len(stage_caps) != 1:
@@ -1484,7 +1486,7 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "observation_only": stage_cap == 8,
             "projected_savings_are_measured": False,
             "throughput_promotion_allowed": False,
-            "prompt_ranked_hot_handoff_effective": prompt_ranked_handoff_effective,
+            "prompt_ranked_hot_handoff_effective": prompt_ranked_handoff_masks is not None,
         },
         "safety": safety,
         "rounds": rounds,
