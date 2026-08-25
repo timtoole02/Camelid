@@ -77,7 +77,6 @@
         "exact_row_chatml_thinking_disabled_gpu_resident_smoke_only",
         "exact_row_chatml_thinking_disabled_smoke_only",
         "exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only",
-        "exact_row_distributed_or_catalog_windows_cuda_or_apple_m4_full_metal_ghost_moe_smoke_only",
         "exact_row_distributed_or_apple_m4_full_metal_ghost_moe_smoke_only",
         "exact_row_distributed_serve_smoke_only",
         "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",

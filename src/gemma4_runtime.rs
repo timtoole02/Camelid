@@ -2162,6 +2162,27 @@ const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
 pub const GEMMA4_MINI2_WEBUI_PROFILE_ID: &str =
     "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1";
 
+/// Exact expert payload paired with the prepared target above. The profile
+/// receipt is minted only after hashing the complete bytes through the same
+/// read-only mapping that serves expert records; sampled source-identity
+/// islands alone are insufficient for a verified serving claim.
+const GEMMA4_MINI2_CGHOST_SHA256: &str =
+    "b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4CghostArtifactReceipt {
+    pub logical_bytes: u64,
+    pub sha256: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn gemma4_mini2_cghost_artifact_admitted(receipt: &Gemma4CghostArtifactReceipt) -> bool {
+    receipt.logical_bytes == crate::ghost_install::GEMMA4_26B_GHOST_CGHOST_BYTES
+        && receipt
+            .sha256
+            .eq_ignore_ascii_case(GEMMA4_MINI2_CGHOST_SHA256)
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Gemma4Mini2WebuiProfileFacts {
@@ -2174,6 +2195,7 @@ struct Gemma4Mini2WebuiProfileFacts {
     mtp_loaded: bool,
     mtp_full_q4: bool,
     exact_expert_policy: bool,
+    cghost_artifact: Option<Gemma4CghostArtifactReceipt>,
     exact_environment: bool,
 }
 
@@ -2188,7 +2210,34 @@ fn gemma4_mini2_webui_profile_admitted(facts: &Gemma4Mini2WebuiProfileFacts) -> 
         && facts.mtp_loaded
         && facts.mtp_full_q4
         && facts.exact_expert_policy
+        && facts
+            .cghost_artifact
+            .as_ref()
+            .is_some_and(gemma4_mini2_cghost_artifact_admitted)
         && facts.exact_environment
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_cghost_artifact_receipt(ghost: &GhostFile) -> Result<Gemma4CghostArtifactReceipt> {
+    const HASH_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+    let Some(mapping) = ghost.wire_mapping() else {
+        return Err(BackendError::InvalidModelMetadata(
+            "exact Gemma 4 cghost receipt requires a retained read-only mapping".into(),
+        ));
+    };
+    let file_len = mapping.file_len();
+    let mut hasher = Sha256::new();
+    let mut offset = 0u64;
+    while offset < file_len {
+        let len = usize::try_from((file_len - offset).min(HASH_CHUNK_BYTES as u64))
+            .expect("hash chunk is bounded by usize");
+        hasher.update(mapping.bytes(offset, len)?);
+        offset += len as u64;
+    }
+    Ok(Gemma4CghostArtifactReceipt {
+        logical_bytes: file_len,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2766,7 +2815,7 @@ fn prompt_ranked_hot_handoff_receipt_labels(
         )
     } else if resident_fill_enabled {
         (
-            "current-prompt-exact-route-union-plus-resident-padding",
+            "current-prompt-exact-route-union-resident-padding-enabled",
             "prompt-decay-score-desc-then-resident-score-desc-expert-id-asc",
         )
     } else {
@@ -7634,6 +7683,38 @@ enum GhostMetalSequenceMode {
     /// chunks. Decode may switch to Metal only after an atomic cache import.
     HybridPrefill,
     Metal,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4MtpRequestAdmission {
+    CpuPinned,
+    MetalReady,
+    RefuseGpuChanged,
+    RefuseTargetState,
+}
+
+#[cfg(target_os = "macos")]
+fn classify_mtp_request_lane(
+    mode: Option<GhostMetalSequenceMode>,
+    gpu_enabled: bool,
+    target_kv_len: Option<usize>,
+    expected_kv_len: usize,
+) -> Gemma4MtpRequestAdmission {
+    match mode {
+        None | Some(GhostMetalSequenceMode::Cpu) => Gemma4MtpRequestAdmission::CpuPinned,
+        Some(GhostMetalSequenceMode::Metal) if !gpu_enabled => {
+            Gemma4MtpRequestAdmission::RefuseGpuChanged
+        }
+        Some(GhostMetalSequenceMode::Metal) if target_kv_len == Some(expected_kv_len) => {
+            Gemma4MtpRequestAdmission::MetalReady
+        }
+        Some(GhostMetalSequenceMode::Metal)
+        | Some(GhostMetalSequenceMode::Idle)
+        | Some(GhostMetalSequenceMode::HybridPrefill) => {
+            Gemma4MtpRequestAdmission::RefuseTargetState
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13080,6 +13161,11 @@ pub struct Gemma4Runtime {
     /// never be minted by a merely similar ad-hoc Metal configuration.
     #[cfg(target_os = "macos")]
     ghost_webui_profile_receipt: Option<&'static str>,
+    /// Full-file identity captured from the same opened mapping used by the
+    /// expert reader. Reconciliation consumes this receipt independently of
+    /// the summarized serving-profile identifier.
+    #[cfg(target_os = "macos")]
+    ghost_cghost_artifact_receipt: Option<Gemma4CghostArtifactReceipt>,
     /// Non-zero only between an exact seeded prefill and the one generation
     /// call allowed to consume it. Every target-state mutation clears it.
     mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64,
@@ -15449,7 +15535,18 @@ impl Gemma4Runtime {
             ))
         })?;
         let ghost = Arc::new(GhostFile::open_with_options(cghost, evict_page_cache)?);
-        Self::load_layer_range_impl(path, None, Some((ghost, budget_bytes)), None)
+        #[cfg(target_os = "macos")]
+        let cghost_artifact = gemma4_mini2_webui_environment_matches()
+            .then(|| gemma4_cghost_artifact_receipt(&ghost))
+            .transpose()?;
+        #[cfg(not(target_os = "macos"))]
+        let cghost_artifact = None;
+        Self::load_layer_range_impl(
+            path,
+            None,
+            Some((ghost, budget_bytes, cghost_artifact)),
+            None,
+        )
     }
 
     /// Construct and retain the exact Ghost target for an isolated residency
@@ -15512,7 +15609,7 @@ impl Gemma4Runtime {
         let runtime = Self::load_layer_range_impl(
             path,
             None,
-            Some((ghost, budget_bytes)),
+            Some((ghost, budget_bytes, None)),
             Some(&mut observer),
         )?;
         let target_mapping = observer.target_mapping.as_ref().cloned().ok_or_else(|| {
@@ -15813,7 +15910,7 @@ impl Gemma4Runtime {
     fn load_layer_range_impl(
         path: &Path,
         range: Option<std::ops::Range<usize>>,
-        ghost_moe: Option<(Arc<GhostFile>, usize)>,
+        ghost_moe: Option<(Arc<GhostFile>, usize, Option<Gemma4CghostArtifactReceipt>)>,
         mut load_observer: Option<&mut Gemma4GhostLoadObserver<'_>>,
     ) -> Result<Self> {
         let gguf = read_metadata(path)?;
@@ -15836,7 +15933,7 @@ impl Gemma4Runtime {
         })?;
         let binding = Gemma4Binding::bind(&gguf, &config)?;
         let validated_ghost_moe = match ghost_moe {
-            Some((ghost, budget_bytes)) => {
+            Some((ghost, budget_bytes, cghost_artifact)) => {
                 let moe = config.moe.as_ref().ok_or_else(|| {
                     BackendError::UnsupportedModelArchitecture(
                         "ghost MoE mode requires a Gemma 4 mixture-of-experts model".into(),
@@ -15861,7 +15958,7 @@ impl Gemma4Runtime {
                     )));
                 }
                 ghost.validate_moe_source_identity(path, &binding, moe.expert_count as usize)?;
-                Some((ghost, budget_bytes))
+                Some((ghost, budget_bytes, cghost_artifact))
             }
             None => None,
         };
@@ -15869,9 +15966,11 @@ impl Gemma4Runtime {
         // Only the observed load-only path defers the empty cache object until
         // after its target-mapping callback, making the phase boundary literal.
         let mut ghost_moe_cache = if load_observer.is_none() {
-            validated_ghost_moe.as_ref().map(|(ghost, budget_bytes)| {
-                Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
-            })
+            validated_ghost_moe
+                .as_ref()
+                .map(|(ghost, budget_bytes, _)| {
+                    Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
+                })
         } else {
             None
         };
@@ -15919,9 +16018,11 @@ impl Gemma4Runtime {
             observer.bind_target_mapping(Arc::clone(&mmap));
         }
         if ghost_moe_cache.is_none() {
-            ghost_moe_cache = validated_ghost_moe.as_ref().map(|(ghost, budget_bytes)| {
-                Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
-            });
+            ghost_moe_cache = validated_ghost_moe
+                .as_ref()
+                .map(|(ghost, budget_bytes, _)| {
+                    Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
+                });
         }
         if load_observer.is_none() && !ghost_metal_demand_load_only_from_env() {
             let mmap = mmap.clone();
@@ -16996,6 +17097,10 @@ impl Gemma4Runtime {
                 .is_some_and(crate::metal::Gemma4MtpAssistantMetal::full_q4_enabled),
         };
         #[cfg(target_os = "macos")]
+        let ghost_cghost_artifact_receipt = validated_ghost_moe
+            .as_ref()
+            .and_then(|(_, _, receipt)| receipt.clone());
+        #[cfg(target_os = "macos")]
         let ghost_webui_profile_receipt = metal_q4_experts.lock().ok().and_then(|guard| {
             let lane = guard.as_ref()?;
             let facts = Gemma4Mini2WebuiProfileFacts {
@@ -17017,6 +17122,7 @@ impl Gemma4Runtime {
                 mtp_loaded: mtp_assistant_health.loaded,
                 mtp_full_q4: mtp_assistant_health.full_q4_active,
                 exact_expert_policy: ghost_moe_cache.is_some() && !lane.allow_dropped_experts,
+                cghost_artifact: ghost_cghost_artifact_receipt.clone(),
                 exact_environment: gemma4_mini2_webui_environment_matches(),
             };
             gemma4_mini2_webui_profile_admitted(&facts).then_some(GEMMA4_MINI2_WEBUI_PROFILE_ID)
@@ -17055,6 +17161,8 @@ impl Gemma4Runtime {
             mtp_assistant_health,
             #[cfg(target_os = "macos")]
             ghost_webui_profile_receipt,
+            #[cfg(target_os = "macos")]
+            ghost_cghost_artifact_receipt,
             mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64::new(0),
             layers,
             config,
@@ -17199,6 +17307,20 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             self.ghost_webui_profile_receipt
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Full expert-artifact identity captured at load from the same mapping
+    /// that backs routed reads. Only the exact environment pays this one-time
+    /// full-file hash; neighboring/ad-hoc lanes return `None`.
+    pub fn ghost_cghost_artifact_receipt(&self) -> Option<&Gemma4CghostArtifactReceipt> {
+        #[cfg(target_os = "macos")]
+        {
+            self.ghost_cghost_artifact_receipt.as_ref()
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -18660,18 +18782,43 @@ impl Gemma4Runtime {
     }
 
     #[cfg(target_os = "macos")]
+    fn mtp_request_uses_metal(&self, expected_kv_len: usize) -> Result<bool> {
+        let guard = self.metal_q4_experts.lock().map_err(|_| {
+            BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
+        })?;
+        let mode = guard.as_ref().map(|lane| lane.sequence_mode);
+        let target_kv_len = guard
+            .as_ref()
+            .and_then(|lane| lane.common.as_ref())
+            .filter(|common| common.moe_configured())
+            .and_then(|common| common.with_mtp_target_kv(|view| view.logical_len()));
+        match classify_mtp_request_lane(
+            mode,
+            ghost_metal_acceleration_enabled(),
+            target_kv_len,
+            expected_kv_len,
+        ) {
+            Gemma4MtpRequestAdmission::CpuPinned => Ok(false),
+            Gemma4MtpRequestAdmission::MetalReady => Ok(true),
+            Gemma4MtpRequestAdmission::RefuseGpuChanged => {
+                Err(BackendError::RuntimeShapeMismatch(
+                    "Gemma 4 GPU acceleration changed after Metal prefill; retry so one KV lane is selected from position zero".into(),
+                ))
+            }
+            Gemma4MtpRequestAdmission::RefuseTargetState => {
+                Err(BackendError::RuntimeShapeMismatch(format!(
+                    "Gemma 4 MTP target state is not ready at the prompt boundary: mode={mode:?} target_kv_len={target_kv_len:?} expected={expected_kv_len}"
+                )))
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn require_mtp_target_kv_len(&self, expected: usize) -> Result<()> {
-        let actual = self
-            .with_mtp_target_kv_experiment(|view| view.logical_len())?
-            .ok_or_else(|| {
-                BackendError::InvalidModelMetadata(
-                    "Gemma 4 MTP requires the strict 26B Metal target shared-KV path".into(),
-                )
-            })?;
-        if actual != expected {
-            return Err(BackendError::RuntimeShapeMismatch(format!(
-                "Gemma 4 MTP target KV length is {actual}, expected {expected}"
-            )));
+        if !self.mtp_request_uses_metal(expected)? {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "Gemma 4 MTP cannot run on a request pinned to the CPU KV lane".into(),
+            ));
         }
         Ok(())
     }
@@ -19681,7 +19828,7 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         let exact_residency_trace_requested = ghost_metal_exact_residency_trace_enabled();
         #[cfg(target_os = "macos")]
-        if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
+        if self.ghost_metal_q4_is_enabled() && self.supports_chunk_forward() {
             if let Some(head) = self.metal_q6k_head.as_ref() {
                 let kk = tokens.len();
                 let hidden = self.config.embedding_length as usize;
@@ -20512,10 +20659,10 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             ghost_metal_acceleration_enabled()
-                && self
-                    .metal_q4_experts
-                    .lock()
-                    .is_ok_and(|lane| lane.is_some())
+                && self.metal_q4_experts.lock().is_ok_and(|lane| {
+                    lane.as_ref()
+                        .is_some_and(|lane| lane.sequence_mode != GhostMetalSequenceMode::Cpu)
+                })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -23433,6 +23580,7 @@ impl Gemma4Runtime {
         mut should_cancel: C,
         mut hybrid_telemetry_out: Option<&mut Option<Gemma4HybridTelemetry>>,
     ) -> Result<Gemma4GenerationOutcome> {
+        let _gpu_accel_generation = crate::cuda::gpu_accel_generation_guard();
         #[cfg(target_os = "macos")]
         let _ghost_common_request = self.lock_ghost_common_generation()?;
         #[cfg(target_os = "macos")]
@@ -23492,37 +23640,39 @@ impl Gemma4Runtime {
 
         #[cfg(target_os = "macos")]
         {
-            let mut guard = self.mtp_assistant.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(assistant) = guard.as_mut() {
-                // The experiment may fall back to its BF16 tied projection if
-                // Q4 packing failed at load. Generation remains available, but
-                // the strict receipt is omitted rather than mislabelling it.
-                if !assistant.q4_head_enabled() {
-                    hybrid_collector = None;
-                }
-                let mut stream_tokens = Vec::new();
-                let mut emit_committed = |round: &Gemma4MtpGenerationRound| {
-                    if let Some(collector) = hybrid_collector.as_mut() {
-                        collector.capture_round(
-                            Gemma4HybridRoundInput::from(round),
-                            self.routed_expert_residency_snapshot(),
-                        );
+            let mtp_request_uses_metal = self.mtp_request_uses_metal(prompt_tokens.len())?;
+            if mtp_request_uses_metal {
+                let mut guard = self.mtp_assistant.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(assistant) = guard.as_mut() {
+                    // The experiment may fall back to its BF16 tied projection if
+                    // Q4 packing failed at load. Generation remains available, but
+                    // the strict receipt is omitted rather than mislabelling it.
+                    if !assistant.q4_head_enabled() {
+                        hybrid_collector = None;
                     }
-                    if let Some(on_delta_fn) = on_delta.as_mut() {
-                        for &t in &round.committed_tokens {
-                            stream_tokens.push(t);
-                            if let Ok(full) = self.tokenizer.decode(&stream_tokens, true) {
-                                if let Some(delta) = full.strip_prefix(&emitted) {
-                                    if !delta.is_empty() {
-                                        on_delta_fn(delta);
-                                        emitted = full;
+                    let mut stream_tokens = Vec::new();
+                    let mut emit_committed = |round: &Gemma4MtpGenerationRound| {
+                        if let Some(collector) = hybrid_collector.as_mut() {
+                            collector.capture_round(
+                                Gemma4HybridRoundInput::from(round),
+                                self.routed_expert_residency_snapshot(),
+                            );
+                        }
+                        if let Some(on_delta_fn) = on_delta.as_mut() {
+                            for &t in &round.committed_tokens {
+                                stream_tokens.push(t);
+                                if let Ok(full) = self.tokenizer.decode(&stream_tokens, true) {
+                                    if let Some(delta) = full.strip_prefix(&emitted) {
+                                        if !delta.is_empty() {
+                                            on_delta_fn(delta);
+                                            emitted = full;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                };
-                let result = self
+                    };
+                    let result = self
                     .generate_mtp_assistant_experiment_cancellable_with_prefill_seed_and_boundary_hint(
                         assistant,
                         &mut kc,
@@ -23536,31 +23686,32 @@ impl Gemma4Runtime {
                         &mut (|| should_cancel()),
                         Some(&mut emit_committed),
                     )?;
-                drop(emit_committed);
-                if result.aborted {
-                    return Ok(Gemma4GenerationOutcome::Cancelled {
-                        generated_tokens: result.generated_tokens.len(),
+                    drop(emit_committed);
+                    if result.aborted {
+                        return Ok(Gemma4GenerationOutcome::Cancelled {
+                            generated_tokens: result.generated_tokens.len(),
+                        });
+                    }
+                    let hybrid_telemetry = hybrid_collector.take().and_then(|collector| {
+                        collector.finish(
+                            self.routed_expert_residency_snapshot(),
+                            result.generated_tokens.len(),
+                            usize::from(result.terminal_unforwarded_target_token.is_some()),
+                        )
+                    });
+                    if let Some(output) = hybrid_telemetry_out.as_mut() {
+                        **output = hybrid_telemetry;
+                    }
+                    let text = if on_delta.is_some() {
+                        emitted
+                    } else {
+                        self.tokenizer.decode(&result.generated_tokens, true)?
+                    };
+                    return Ok(Gemma4GenerationOutcome::Complete {
+                        text,
+                        token_ids: result.generated_tokens,
                     });
                 }
-                let hybrid_telemetry = hybrid_collector.take().and_then(|collector| {
-                    collector.finish(
-                        self.routed_expert_residency_snapshot(),
-                        result.generated_tokens.len(),
-                        usize::from(result.terminal_unforwarded_target_token.is_some()),
-                    )
-                });
-                if let Some(output) = hybrid_telemetry_out.as_mut() {
-                    **output = hybrid_telemetry;
-                }
-                let text = if on_delta.is_some() {
-                    emitted
-                } else {
-                    self.tokenizer.decode(&result.generated_tokens, true)?
-                };
-                return Ok(Gemma4GenerationOutcome::Complete {
-                    text,
-                    token_ids: result.generated_tokens,
-                });
             }
         }
 
@@ -29600,6 +29751,10 @@ mod mtp_target_seam_tests {
             mtp_loaded: true,
             mtp_full_q4: true,
             exact_expert_policy: true,
+            cghost_artifact: Some(Gemma4CghostArtifactReceipt {
+                logical_bytes: crate::ghost_install::GEMMA4_26B_GHOST_CGHOST_BYTES,
+                sha256: GEMMA4_MINI2_CGHOST_SHA256.into(),
+            }),
             exact_environment: true,
         };
         assert!(gemma4_mini2_webui_profile_admitted(&exact));
@@ -29616,6 +29771,7 @@ mod mtp_target_seam_tests {
             |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.mtp_loaded = false,
             |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.mtp_full_q4 = false,
             |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.exact_expert_policy = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.cghost_artifact = None,
             |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.exact_environment = false,
         ] {
             let mut neighbor = exact.clone();
@@ -29625,6 +29781,20 @@ mod mtp_target_seam_tests {
         let mut wrong_context = exact.clone();
         wrong_context.common_context_capacity = Some(2_048);
         neighbors.push(wrong_context);
+        let mut wrong_cghost_digest = exact.clone();
+        wrong_cghost_digest
+            .cghost_artifact
+            .as_mut()
+            .expect("exact fixture has cghost receipt")
+            .sha256 = "0".repeat(64);
+        neighbors.push(wrong_cghost_digest);
+        let mut wrong_cghost_size = exact.clone();
+        wrong_cghost_size
+            .cghost_artifact
+            .as_mut()
+            .expect("exact fixture has cghost receipt")
+            .logical_bytes += 1;
+        neighbors.push(wrong_cghost_size);
         assert!(neighbors
             .iter()
             .all(|facts| !gemma4_mini2_webui_profile_admitted(facts)));
@@ -30191,7 +30361,7 @@ mod mtp_target_seam_tests {
         assert_eq!(
             prompt_ranked_hot_handoff_receipt_labels(true, true),
             (
-                "current-prompt-exact-route-union-plus-resident-padding",
+                "current-prompt-exact-route-union-resident-padding-enabled",
                 "prompt-decay-score-desc-then-resident-score-desc-expert-id-asc"
             )
         );
@@ -32560,6 +32730,11 @@ mod ghost_hybrid_prefill_plan_tests {
             select_ghost_prefill_plan(false, true, 1, 4127, Some(4096)),
             GhostPrefillPlan::ScalarCpu
         );
+        assert_eq!(
+            select_ghost_prefill_plan(true, true, 32, 63, None),
+            GhostPrefillPlan::CpuChunk,
+            "a disabled GPU pins the request to CPU from position zero"
+        );
     }
 }
 
@@ -32577,6 +32752,43 @@ mod ghost_moe_wire_tests {
         assert!(!ghost_metal_acceleration_allowed(false, false));
         assert!(!ghost_metal_acceleration_allowed(true, true));
         assert!(!ghost_metal_acceleration_allowed(true, false));
+    }
+
+    #[test]
+    fn mtp_request_lane_never_reenters_metal_after_cpu_prefill() {
+        use Gemma4MtpRequestAdmission::{
+            CpuPinned, MetalReady, RefuseGpuChanged, RefuseTargetState,
+        };
+
+        assert_eq!(classify_mtp_request_lane(None, true, None, 64), CpuPinned);
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Cpu), false, None, 64),
+            CpuPinned
+        );
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Cpu), true, Some(64), 64),
+            CpuPinned,
+            "turning the GPU on after CPU prefill cannot change the request lane"
+        );
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Metal), true, Some(64), 64),
+            MetalReady
+        );
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Metal), false, Some(64), 64),
+            RefuseGpuChanged
+        );
+        for (mode, kv_len) in [
+            (GhostMetalSequenceMode::Metal, None),
+            (GhostMetalSequenceMode::Metal, Some(63)),
+            (GhostMetalSequenceMode::Idle, Some(64)),
+            (GhostMetalSequenceMode::HybridPrefill, Some(64)),
+        ] {
+            assert_eq!(
+                classify_mtp_request_lane(Some(mode), true, kv_len, 64),
+                RefuseTargetState
+            );
+        }
     }
 
     #[test]
@@ -32665,6 +32877,27 @@ mod ghost_moe_wire_tests {
         file.write_all(&cursor.to_le_bytes()).unwrap();
         drop(file);
         (dir, path)
+    }
+
+    #[test]
+    fn cghost_full_artifact_receipt_detects_unsampled_padding_changes() {
+        let (_dir, path) = cache_fixture(1, 1);
+        let before_file = GhostFile::open(&path).expect("open cghost before mutation");
+        let before = gemma4_cghost_artifact_receipt(&before_file).expect("hash cghost mapping");
+        drop(before_file);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open cghost padding for mutation");
+        file.seek(SeekFrom::Start(32)).unwrap();
+        file.write_all(&[1]).unwrap();
+        drop(file);
+
+        let after_file = GhostFile::open(&path).expect("layout survives padding mutation");
+        let after = gemma4_cghost_artifact_receipt(&after_file).expect("rehash cghost mapping");
+        assert_eq!(before.logical_bytes, after.logical_bytes);
+        assert_ne!(before.sha256, after.sha256);
     }
 
     #[test]

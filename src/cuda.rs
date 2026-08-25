@@ -159,6 +159,18 @@ pub fn gpu_acceleration_info() -> GpuAccelerationInfo {
 // Defaults ON whenever either supported GPU backend is present, so the app uses the
 // accelerator out of the box. 0 = uninitialised, 1 = disabled, 2 = enabled.
 static GPU_ACCEL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// A generation holds the read side while its request-owned KV lane is live;
+/// UI/CLI transitions take the write side. This keeps a mutable process-wide
+/// switch from changing underneath stateful Metal/CUDA sequence data.
+static GPU_ACCEL_TRANSITION: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Pin the process-wide acceleration setting for one stateful generation.
+/// Backend capability checks remain live; only operator transitions wait.
+pub(crate) fn gpu_accel_generation_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+    GPU_ACCEL_TRANSITION
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Whether the platform-neutral GPU acceleration control is enabled. On by default
 /// when CUDA or Metal is present; flipped by the UI toggle. Independent of the CUDA
@@ -181,6 +193,9 @@ pub fn gpu_accel_enabled() -> bool {
 /// Dispatch still checks backend capability, so enabling it on a host without CUDA
 /// or Metal is harmless.
 pub fn set_gpu_accel_enabled(enabled: bool) {
+    let _transition = GPU_ACCEL_TRANSITION
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     GPU_ACCEL_STATE.store(
         if enabled { 2 } else { 1 },
         std::sync::atomic::Ordering::Relaxed,
