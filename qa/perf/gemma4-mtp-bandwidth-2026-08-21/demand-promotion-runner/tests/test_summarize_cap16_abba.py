@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -72,6 +73,83 @@ class Cap16AbbaThroughputTest(unittest.TestCase):
         for lines in (wrong_width, wrong_emitted):
             with self.subTest(lines=lines), self.assertRaises(SUMMARIZER.ReceiptError):
                 self.parse(lines)
+
+    def test_balanced_overaccept_and_underaccept_fail_closed(self) -> None:
+        balanced_but_impossible = [
+            round_line(0, "250.00", 14, 14),
+            round_line(1, "250.00", 11, 13),
+            round_line(2, "250.00", 13, 14),
+            round_line(3, "250.00", 6, 7),
+        ]
+        with self.assertRaisesRegex(
+            SUMMARIZER.ReceiptError, "exactly K-1"
+        ):
+            self.parse(balanced_but_impossible)
+
+    def test_noncanonical_or_extra_mtp_round_lines_fail_closed(self) -> None:
+        valid = [
+            round_line(0, "250.00", 13, 14),
+            round_line(1, "250.00", 12, 13),
+            round_line(2, "250.00", 13, 14),
+            round_line(3, "250.00", 6, 7),
+        ]
+        cases = (
+            valid[:2] + [valid[2] + " trailing"] + valid[3:],
+            valid + ["[mtp round] malformed-but-previously-ignored"],
+            [valid[0].replace("wall=250.00", "wall=0250.00")] + valid[1:],
+            ["prefix " + valid[0]] + valid[1:],
+        )
+        for lines in cases:
+            with self.subTest(lines=lines), self.assertRaises(
+                SUMMARIZER.ReceiptError
+            ):
+                self.parse(lines)
+
+    def test_response_annotations_cannot_mask_frozen_token_drift(self) -> None:
+        expected = SUMMARIZER.expected_token_ids()
+        response = {
+            "usage": {"completion_tokens": 48},
+            "camelid": {
+                "exact_match_expected": True,
+                "exact_match_count": 48,
+                "generated_token_ids": expected.copy(),
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "response.json"
+            path.write_text(json.dumps(response), encoding="utf-8")
+            SUMMARIZER.validate_response(path)
+
+            response["camelid"]["generated_token_ids"][17] += 1
+            path.write_text(json.dumps(response), encoding="utf-8")
+            with self.assertRaisesRegex(
+                SUMMARIZER.ReceiptError, "differs from the frozen"
+            ):
+                SUMMARIZER.validate_response(path)
+
+    def test_response_rejects_boolean_token_or_numeric_annotation(self) -> None:
+        expected = SUMMARIZER.expected_token_ids()
+        response = {
+            "usage": {"completion_tokens": 48},
+            "camelid": {
+                "exact_match_expected": True,
+                "exact_match_count": 48.0,
+                "generated_token_ids": expected.copy(),
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "response.json"
+            path.write_text(json.dumps(response), encoding="utf-8")
+            with self.assertRaisesRegex(SUMMARIZER.ReceiptError, "not exact 48/48"):
+                SUMMARIZER.validate_response(path)
+
+            response["camelid"]["exact_match_count"] = 48
+            response["camelid"]["generated_token_ids"][0] = True
+            path.write_text(json.dumps(response), encoding="utf-8")
+            with self.assertRaisesRegex(
+                SUMMARIZER.ReceiptError, "nonnegative integer IDs"
+            ):
+                SUMMARIZER.validate_response(path)
 
 
 if __name__ == "__main__":

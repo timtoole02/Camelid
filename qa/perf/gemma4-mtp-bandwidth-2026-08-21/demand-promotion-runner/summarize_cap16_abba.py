@@ -14,12 +14,21 @@ from summarize import read_env_manifest
 SELECTOR = "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16"
 EXPECTED_CAP16 = (False, True, True, False)
 MTP_ROUND_RE = re.compile(
-    r"\[mtp round\] #(\d+) wall=([\d.]+)ms "
-    r"\(assistant=[\d.]+ms, verifier=[\d.]+ms\) accepted=(\d+)/(\d+)"
+    r"\[mtp round\] #((?:0|[1-9][0-9]*)) "
+    r"wall=((?:0|[1-9][0-9]*)\.[0-9]{2})ms "
+    r"\(assistant=(?:0|[1-9][0-9]*)\.[0-9]{2}ms, "
+    r"verifier=(?:0|[1-9][0-9]*)\.[0-9]{2}ms\) "
+    r"accepted=((?:0|[1-9][0-9]*))/((?:0|[1-9][0-9]*))"
 )
 EXPECTED_MTP_WIDTHS = (14, 13, 14, 7)
 CANONICAL_REQUEST = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "request-48-plain.json"
+)
+EXPECTED_TOKEN_IDS = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "../hybrid-hot48-runner/expected-48-token-ids.json",
+    )
 )
 
 
@@ -40,6 +49,29 @@ def require(condition, message):
         raise ReceiptError(message)
 
 
+def sha256_file(path, label):
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError as error:
+        raise ReceiptError(f"cannot hash {label} {path}: {error}") from error
+
+
+def expected_token_ids():
+    require(
+        os.path.isfile(EXPECTED_TOKEN_IDS) and not os.path.islink(EXPECTED_TOKEN_IDS),
+        f"frozen token fixture is absent, non-regular, or a symlink: {EXPECTED_TOKEN_IDS}",
+    )
+    expected = load_json(EXPECTED_TOKEN_IDS)
+    require(
+        type(expected) is list
+        and len(expected) == 48
+        and all(type(token) is int and token >= 0 for token in expected),
+        f"frozen token fixture is not exactly 48 nonnegative integer IDs: {EXPECTED_TOKEN_IDS}",
+    )
+    return expected
+
+
 def decode_throughput(log_path):
     try:
         with open(log_path, encoding="utf-8", errors="strict") as handle:
@@ -47,8 +79,19 @@ def decode_throughput(log_path):
     except (OSError, UnicodeError) as error:
         raise ReceiptError(f"cannot read {log_path}: {error}") from error
 
-    rounds = MTP_ROUND_RE.findall(log)
-    require(len(rounds) == 4, f"expected exactly four MTP rounds in {log_path}")
+    round_lines = [
+        line for line in log.splitlines() if "[mtp round" in line
+    ]
+    require(
+        len(round_lines) == 4,
+        f"expected exactly four MTP round lines in {log_path}",
+    )
+    matches = [MTP_ROUND_RE.fullmatch(line) for line in round_lines]
+    require(
+        all(match is not None for match in matches),
+        f"MTP round line is noncanonical in {log_path}",
+    )
+    rounds = [match.groups() for match in matches]
     require(
         [int(index) for index, _, _, _ in rounds] == list(range(4)),
         f"MTP round indices are not exactly 0,1,2,3 in {log_path}",
@@ -57,13 +100,18 @@ def decode_throughput(log_path):
         tuple(int(width) for _, _, _, width in rounds) == EXPECTED_MTP_WIDTHS,
         f"MTP verifier widths are not {EXPECTED_MTP_WIDTHS} in {log_path}",
     )
+    require(
+        all(int(accepted) == int(width) - 1 for _, _, accepted, width in rounds),
+        f"every MTP round must accept exactly K-1 drafts in {log_path}",
+    )
 
     try:
-        wall_ms = sum((Decimal(wall) for _, wall, _, _ in rounds), Decimal(0))
+        walls_ms = [Decimal(wall) for _, wall, _, _ in rounds]
+        wall_ms = sum(walls_ms, Decimal(0))
         accepted = sum(int(count) for _, _, count, _ in rounds)
     except (InvalidOperation, ValueError) as error:
         raise ReceiptError(f"malformed decode rounds in {log_path}") from error
-    require(wall_ms > 0, f"nonpositive decode wall in {log_path}")
+    require(all(wall > 0 for wall in walls_ms), f"nonpositive decode wall in {log_path}")
 
     count = len(rounds)
     emitted = accepted + count
@@ -93,14 +141,29 @@ def validate_response(path):
     camelid = response.get("camelid")
     require(isinstance(camelid, dict), f"missing camelid response data in {path}")
     require(camelid.get("exact_match_expected") is True, f"token parity failed in {path}")
-    require(camelid.get("exact_match_count") == 48, f"not exact 48/48 in {path}")
+    require(
+        type(camelid.get("exact_match_count")) is int
+        and camelid["exact_match_count"] == 48,
+        f"not exact 48/48 in {path}",
+    )
     usage = response.get("usage")
     require(isinstance(usage, dict), f"missing response usage in {path}")
-    require(usage.get("completion_tokens") == 48,
-            f"completion count is not 48 in {path}")
+    require(
+        type(usage.get("completion_tokens")) is int
+        and usage["completion_tokens"] == 48,
+        f"completion count is not 48 in {path}",
+    )
     generated = camelid.get("generated_token_ids")
-    require(isinstance(generated, list) and len(generated) == 48,
-            f"generated token vector is not length 48 in {path}")
+    require(
+        type(generated) is list
+        and len(generated) == 48
+        and all(type(token) is int and token >= 0 for token in generated),
+        f"generated token vector is not exactly 48 nonnegative integer IDs in {path}",
+    )
+    require(
+        generated == expected_token_ids(),
+        f"generated token vector differs from the frozen 48-token fixture in {path}",
+    )
 
 
 def read_run(run_dir, expect_cap16):
@@ -117,13 +180,16 @@ def read_run(run_dir, expect_cap16):
     require(env.get("source_tree_clean") == "1", f"source tree was dirty in {env_path}")
     require(env.get("request") == CANONICAL_REQUEST,
             f"canonical request path drift in {env_path}")
-    try:
-        with open(CANONICAL_REQUEST, "rb") as handle:
-            request_sha256 = hashlib.sha256(handle.read()).hexdigest()
-    except OSError as error:
-        raise ReceiptError(f"cannot hash canonical request {CANONICAL_REQUEST}: {error}") from error
+    request_sha256 = sha256_file(CANONICAL_REQUEST, "canonical request")
     require(env.get("request_sha256") == request_sha256,
             f"canonical request digest drift in {env_path}")
+    expected_token_ids_sha256 = sha256_file(
+        EXPECTED_TOKEN_IDS, "frozen token fixture"
+    )
+    require(
+        env.get("expected_token_ids_sha256") == expected_token_ids_sha256,
+        f"frozen token fixture digest drift in {env_path}",
+    )
     require(env.get("CAMELID_GEMMA4_KV_INIT") == "192", f"KV_INIT drift in {env_path}")
     require(env.get("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER") ==
             "60,64,45,43,40,41,44,42,47,46,40,41,44,46,42,50,40,39,46,47,41,46,45,43,46,56,59,56,58,51",
