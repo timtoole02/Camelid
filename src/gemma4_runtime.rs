@@ -29807,7 +29807,13 @@ mod mtp_target_seam_tests {
     #[test]
     fn exact_residency_trace_refuses_profile_ledger_identity_and_wall_drift() {
         let routes = vec![(120..128).collect::<Vec<_>>(); 30];
-        let hot = [[false; 128]; 30];
+        let mut hot = [[false; 128]; 30];
+        for (layer, &capacity) in GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+            .iter()
+            .enumerate()
+        {
+            hot[layer][..capacity].fill(true);
+        }
         let counts = [8u16; 30];
         let render = |h49_execution_shape: bool,
                       stage_cap: usize,
