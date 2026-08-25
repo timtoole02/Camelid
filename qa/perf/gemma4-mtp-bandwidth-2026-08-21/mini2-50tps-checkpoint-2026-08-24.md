@@ -432,6 +432,34 @@ terminal shape therefore reverses the dense H58 microbenchmark win.
 H63 is a **NO-GO** and no Mini2 run or profile was produced. The default-off
 source and exact timing gate remain in the branch as the closure evidence.
 
+## Exact H55 authoritative-read fanout candidate (H64)
+
+H64 reuses H44's exact adaptive positioned-read splitter only inside H55's
+authoritative `StageColdLaunch`. It is strict default-off behind
+`CAMELID_GEMMA4_GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ=1` and requires the
+decode-only H55 configuration, direct-stage reads, an eight-thread read pool,
+zero host-cache budget, and no retained-cold or configured previous-cold
+stage. One through seven demand records receive the established capped fanout
+`4,4,3,2,2,2,2`; eight or more retain one positioned read per record. The
+record bytes, destination slab, slot policy, GPU work, command buffers, and
+fallback are unchanged.
+
+The five focused flag, admission, prior-stage exclusion, actual-launch
+attribution, fanout, and source-containment gates passed. Existing chunked
+reader gates also passed for byte equality with the single reader, exact
+aligned/gapless production ranges, joined truncated-read failure, and sampled
+payload identity. The existing H55 parser and two-command plan gates passed.
+`active=1` telemetry is emitted only after the authoritative launch helper
+actually succeeds; raw environment eligibility cannot claim activation.
+
+The guarded release executable is
+`/Users/timtoole/bin/camelid-h64-b60fe01705e6`, SHA-256
+`b60fe01705e6745c7d4d46ddbeea110befa5cfde01730e0934ff8dcb406721f6`.
+The first post-build H55 warmup was correctly refused before child launch
+because the host already had 21,654 swapped pages at the watchdog baseline.
+No model process started and no throughput result was recorded. H64 remains a
+**PENDING CLEAN-HOST MINI2 A/B**, not a promotion or no-go.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -451,6 +479,7 @@ Profiles and executable for this checkpoint:
 - `H59-mtp-device-chain-k4-warmup`
 - `H60-mtp-bf16-producer-fusion`
 - `H62-mtp-bf16-lattice-loads`
+- `H64-async-two-wave-chunked-read`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -468,6 +497,9 @@ Profiles and executable for this checkpoint:
 - H59 measured Mini2 executable: `/Users/timtoole/bin/camelid-h59-7184d5bfa123`
 - H59 measured binary SHA-256:
   `7184d5bfa12301a02f82eaba4321ce8e4966b5292edf411611936c903d1c02be`
+- H64 pending Mini2 executable: `/Users/timtoole/bin/camelid-h64-b60fe01705e6`
+- H64 SHA-256:
+  `b60fe01705e6745c7d4d46ddbeea110befa5cfde01730e0934ff8dcb406721f6`
 
 ## Validation and provenance
 
@@ -507,6 +539,10 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
   exact production-histogram timing failed the first one-hot round with
   10,649 us established versus 16,010 us terminal-cold MMA and a -5,551 us
   paired median delta; fail-fast no-go with no Mini2 run or profile;
+- H64 strict admission/attribution/fanout/source gates: 5/5; existing exact
+  chunk equality, aligned/gapless production plan, joined read-failure,
+  payload-identity, and H55 command-plan gates passed; the first Mini2 warmup
+  was refused before child launch because baseline swap was nonzero;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

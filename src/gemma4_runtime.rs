@@ -2132,6 +2132,12 @@ const GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV: &str =
 /// records use a separate bounded Metal slab while authoritative direct reads
 /// write the disjoint demand slab. The full-union Down remains single.
 const GHOST_METAL_THREE_WAVE_GATEUP_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_THREE_WAVE_GATEUP";
+/// Exact H55-only opt-in for restoring read-pool queue depth when live-stage
+/// hits leave fewer authoritative demand records than read workers. It changes
+/// only the positioned-read fanout inside `StageColdLaunch`; the established
+/// fallback, slot policy, byte count, and command schedule remain unchanged.
+const GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ";
 const GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH";
 const GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS: usize = 2_100;
@@ -4174,6 +4180,10 @@ struct WaveFillCounters {
     chunked_read_records: std::sync::atomic::AtomicUsize,
     chunked_read_preads: std::sync::atomic::AtomicUsize,
     chunked_read_max_chunks: std::sync::atomic::AtomicUsize,
+    /// Successful H64 StageColdLaunch callbacks. Eligibility alone never
+    /// advances this counter, so request telemetry cannot attribute retained
+    /// chunking or an uninvoked/fallback launch to H64.
+    async_two_wave_chunked_read_actual_launches: std::sync::atomic::AtomicUsize,
     /// Host-cache -> slot memcpy time (the non-disk part of a fill).
     copy_us: std::sync::atomic::AtomicU64,
     /// Slot-directory plan outcomes across every wave fill of the round.
@@ -4323,6 +4333,11 @@ fn ghost_metal_retained_cold_chunked_read_from(value: Option<&str>) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn ghost_metal_async_two_wave_chunked_read_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_retained_cold_direct_bank_fill_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
@@ -4333,6 +4348,18 @@ fn ghost_metal_retained_cold_chunked_read_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         ghost_metal_retained_cold_chunked_read_from(
             std::env::var(GHOST_METAL_RETAINED_COLD_CHUNKED_READ_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_async_two_wave_chunked_read_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ghost_metal_async_two_wave_chunked_read_from(
+            std::env::var(GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ_ENV)
                 .ok()
                 .as_deref(),
         )
@@ -4362,6 +4389,41 @@ fn ghost_metal_retained_cold_chunks_per_record(
     } else {
         read_threads.div_ceil(record_jobs).min(4)
     }
+}
+
+/// Keep H64 subordinate to the exact H55 schedule and the receipted eight-way
+/// read pool. Each argument is explicit so model-free tests can prove that no
+/// adjacent fill path silently inherits the positioned-read fanout.
+#[cfg(any(target_os = "macos", test))]
+#[allow(clippy::too_many_arguments)]
+fn ghost_metal_async_two_wave_chunked_read_admitted(
+    requested: bool,
+    prefill_round: bool,
+    direct_stage_read_active: bool,
+    three_wave_gateup_active: bool,
+    async_two_wave_collapse_active: bool,
+    zero_cache_budget: bool,
+    retained_cold_bank_absent: bool,
+    previous_cold_stage_feature_absent: bool,
+    read_threads: usize,
+) -> bool {
+    requested
+        && !prefill_round
+        && direct_stage_read_active
+        && three_wave_gateup_active
+        && async_two_wave_collapse_active
+        && zero_cache_budget
+        && retained_cold_bank_absent
+        && previous_cold_stage_feature_absent
+        && read_threads == 8
+}
+
+/// H64 is active only after Metal invokes StageColdLaunch and its host launch
+/// helper succeeds. Keeping this predicate separate from admission prevents a
+/// configured-but-unused candidate from publishing active telemetry.
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_async_two_wave_chunked_read_telemetry_active(actual_launches: u32) -> bool {
+    actual_launches > 0
 }
 
 /// Assign only enough per-record positioned reads to occupy the read pool.
@@ -4689,6 +4751,186 @@ mod direct_stage_read_policy_tests {
         assert!(retained_cold_direct_read_jobs(&[], &[], 6, 3).is_none());
         assert!(retained_cold_direct_read_jobs(&[9, 9], &[], 6, 3).is_none());
         assert!(retained_cold_direct_read_jobs(&[9, 2, 7], &[], 6, 2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod async_two_wave_chunked_read_policy_tests {
+    use super::{
+        ghost_metal_async_two_wave_chunked_read_admitted,
+        ghost_metal_async_two_wave_chunked_read_from,
+        ghost_metal_async_two_wave_chunked_read_telemetry_active,
+        ghost_metal_retained_cold_chunks_per_record,
+    };
+
+    #[test]
+    fn h64_async_two_wave_chunked_read_flag_and_admission_are_strict() {
+        assert!(!ghost_metal_async_two_wave_chunked_read_from(None));
+        assert!(ghost_metal_async_two_wave_chunked_read_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "1\n", "2"] {
+            assert!(
+                !ghost_metal_async_two_wave_chunked_read_from(Some(value)),
+                "unexpected H64 flag admission for {value:?}",
+            );
+        }
+
+        let admitted = |requested,
+                        prefill,
+                        direct_stage,
+                        three_wave,
+                        async_two_wave,
+                        zero_cache,
+                        retained_absent,
+                        previous_feature_absent,
+                        read_threads| {
+            ghost_metal_async_two_wave_chunked_read_admitted(
+                requested,
+                prefill,
+                direct_stage,
+                three_wave,
+                async_two_wave,
+                zero_cache,
+                retained_absent,
+                previous_feature_absent,
+                read_threads,
+            )
+        };
+        assert!(admitted(true, false, true, true, true, true, true, true, 8));
+        assert!(!admitted(
+            false, false, true, true, true, true, true, true, 8
+        ));
+        assert!(!admitted(true, true, true, true, true, true, true, true, 8));
+        assert!(!admitted(
+            true, false, false, true, true, true, true, true, 8
+        ));
+        assert!(!admitted(
+            true, false, true, false, true, true, true, true, 8
+        ));
+        assert!(!admitted(
+            true, false, true, true, false, true, true, true, 8
+        ));
+        assert!(!admitted(
+            true, false, true, true, true, false, true, true, 8
+        ));
+        assert!(!admitted(
+            true, false, true, true, true, true, false, true, 8
+        ));
+        assert!(!admitted(
+            true, false, true, true, true, true, true, false, 8
+        ));
+        for read_threads in [0, 1, 4, 7, 9, 12] {
+            assert!(!admitted(
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                read_threads,
+            ));
+        }
+    }
+
+    #[test]
+    fn h64_async_two_wave_chunked_read_refuses_previous_stage_feature_configuration() {
+        assert!(!ghost_metal_async_two_wave_chunked_read_admitted(
+            true, false, true, true, true, true, true, false, 8,
+        ));
+
+        let source = include_str!("gemma4_runtime.rs");
+        let policy_start = source
+            .rfind("let async_two_wave_chunked_read_requested =")
+            .expect("H64 production policy start");
+        let policy_tail = &source[policy_start..];
+        let policy_end = policy_tail
+            .find("if allow_predicted")
+            .expect("H64 production policy end");
+        let policy_source = &policy_tail[..policy_end];
+        assert!(
+            policy_source.contains("ghost_metal_previous_cold_stage_records().is_none()"),
+            "H64 must refuse the configured previous-stage feature even when this round has no stage object",
+        );
+        assert!(policy_source.contains("async_two_wave_previous_cold_stage_feature_absent"));
+    }
+
+    #[test]
+    fn h64_async_two_wave_chunked_read_attribution_requires_actual_launch() {
+        assert!(!ghost_metal_async_two_wave_chunked_read_telemetry_active(0));
+        assert!(ghost_metal_async_two_wave_chunked_read_telemetry_active(1));
+        assert!(ghost_metal_async_two_wave_chunked_read_telemetry_active(
+            u32::MAX
+        ));
+    }
+
+    #[test]
+    fn h64_async_two_wave_chunked_read_uses_capped_idle_worker_policy() {
+        let expected = [1, 4, 4, 3, 2, 2, 2, 2, 1, 1];
+        for (record_jobs, expected_chunks) in expected.into_iter().enumerate() {
+            assert_eq!(
+                ghost_metal_retained_cold_chunks_per_record(true, record_jobs, 8),
+                expected_chunks,
+                "unexpected H64 chunk fanout for {record_jobs} demand records",
+            );
+        }
+        for record_jobs in 0..=9 {
+            assert_eq!(
+                ghost_metal_retained_cold_chunks_per_record(false, record_jobs, 8),
+                1,
+            );
+        }
+    }
+
+    #[test]
+    fn h64_async_two_wave_chunked_read_is_stage_cold_launch_only() {
+        let source = include_str!("gemma4_runtime.rs");
+        let closure_start = source
+            .rfind("let mut three_wave_pending: Option<CompactThreeWaveDemandPlan>")
+            .expect("three-wave slot-filler start");
+        let closure_tail = &source[closure_start..];
+        let closure_end = closure_tail
+            .find("let mut retained_direct_filler")
+            .expect("three-wave slot-filler end");
+        let closure_source = &closure_tail[..closure_end];
+
+        let launch_start = closure_source
+            .find("Gemma4Q4SlotFillPhase::StageColdLaunch")
+            .expect("StageColdLaunch branch");
+        let demand_start = closure_source[launch_start..]
+            .find("Gemma4Q4SlotFillPhase::StageColdDemand")
+            .map(|offset| launch_start + offset)
+            .expect("StageColdDemand branch");
+        let launch_source = &closure_source[launch_start..demand_start];
+        assert!(launch_source.contains("async_two_wave_chunked_read_eligible"));
+        assert!(launch_source.contains("retained_cold_chunked_read_active"));
+        let launch_call = launch_source
+            .find("if !launch_compact_three_wave_direct(")
+            .expect("authoritative StageColdLaunch helper call");
+        let actual_counter = launch_source
+            .find(".async_two_wave_chunked_read_actual_launches")
+            .expect("H64 actual launch receipt");
+        let helper_refusal = launch_source[launch_call..]
+            .find("return false;")
+            .map(|offset| launch_call + offset)
+            .expect("failed StageColdLaunch helper refusal");
+        assert!(
+            launch_call < helper_refusal && helper_refusal < actual_counter,
+            "H64 attribution must follow a successful StageColdLaunch helper call",
+        );
+
+        let fallback_start = closure_source[demand_start..]
+            .find("Gemma4Q4SlotFillPhase::StageCold {")
+            .map(|offset| demand_start + offset)
+            .expect("established StageCold fallback");
+        let publish_start = closure_source[fallback_start..]
+            .find("Gemma4Q4SlotFillPhase::PublishCold")
+            .map(|offset| fallback_start + offset)
+            .expect("PublishCold branch");
+        let fallback_source = &closure_source[fallback_start..publish_start];
+        assert!(fallback_source.contains("retained_cold_chunked_read_active"));
+        assert!(!fallback_source.contains("async_two_wave_chunked_read_eligible"));
+        assert!(!fallback_source.contains("async_two_wave_chunked_read_actual_launches"));
     }
 }
 
@@ -5797,7 +6039,8 @@ fn launch_compact_three_wave_direct(
     ready_slot_table: &mut [u32; 128],
     counters: &WaveFillCounters,
     live_stage: &LiveSequentialRoundStage,
-    chunked_read_enabled: bool,
+    retained_cold_chunked_read_enabled: bool,
+    async_two_wave_chunked_read_eligible: bool,
 ) -> bool {
     use rayon::prelude::*;
     use std::sync::atomic::Ordering::Relaxed;
@@ -5840,7 +6083,7 @@ fn launch_compact_three_wave_direct(
             return false;
         };
         let chunks_per_record = ghost_metal_retained_cold_chunks_per_record(
-            chunked_read_enabled,
+            retained_cold_chunked_read_enabled || async_two_wave_chunked_read_eligible,
             plan.jobs.len(),
             pool.current_num_threads(),
         );
@@ -8437,6 +8680,55 @@ impl GhostMetalExpertRuntime {
             && previous_cold_stage.is_none()
             && !retained_cold_direct_bank_fill_active
             && self.hybrid_ready_stage.is_some();
+        let async_two_wave_chunked_read_requested =
+            ghost_metal_async_two_wave_chunked_read_enabled();
+        let async_two_wave_collapse_active =
+            crate::metal::gemma4_hybrid_async_two_wave_collapse_enabled();
+        let (async_two_wave_zero_cache_budget, async_two_wave_read_threads) = ghost_cache
+            .map(|cache| {
+                (
+                    cache.budget_bytes == 0,
+                    cache
+                        .read_pool
+                        .as_ref()
+                        .map_or(0, |pool| pool.current_num_threads()),
+                )
+            })
+            .unwrap_or((false, 0));
+        let async_two_wave_retained_cold_bank_absent = self
+            .common
+            .as_ref()
+            .is_some_and(|common| common.retained_cold_slot_count() == 0);
+        let async_two_wave_previous_cold_stage_feature_absent =
+            ghost_metal_previous_cold_stage_records().is_none();
+        let async_two_wave_chunked_read_eligible = ghost_metal_async_two_wave_chunked_read_admitted(
+            async_two_wave_chunked_read_requested,
+            self.prefill_round,
+            direct_stage_read_active,
+            three_wave_gateup_active,
+            async_two_wave_collapse_active,
+            async_two_wave_zero_cache_budget,
+            async_two_wave_retained_cold_bank_absent,
+            async_two_wave_previous_cold_stage_feature_absent,
+            async_two_wave_read_threads,
+        );
+        if async_two_wave_chunked_read_requested
+            && !self.prefill_round
+            && !async_two_wave_chunked_read_eligible
+            && ghost_metal_timing_enabled()
+        {
+            eprintln!(
+                "[gemma4-ghost-metal] async-two-wave chunked read refused: prefill={} direct_stage={} three_wave={} async_two_wave={} zero_cache={} retained_bank_absent={} previous_stage_feature_absent={} read_threads={} required_read_threads=8",
+                u8::from(self.prefill_round),
+                u8::from(direct_stage_read_active),
+                u8::from(three_wave_gateup_active),
+                u8::from(async_two_wave_collapse_active),
+                u8::from(async_two_wave_zero_cache_budget),
+                u8::from(async_two_wave_retained_cold_bank_absent),
+                u8::from(async_two_wave_previous_cold_stage_feature_absent),
+                async_two_wave_read_threads,
+            );
+        }
 
         if allow_predicted && !hot_cold_overlap_freeze_hot {
             if let Some(cache) = ghost_cache {
@@ -8588,8 +8880,14 @@ impl GhostMetalExpertRuntime {
                         &fill_counters,
                         live_stage,
                         retained_cold_chunked_read_active,
+                        async_two_wave_chunked_read_eligible,
                     ) {
                         return false;
+                    }
+                    if async_two_wave_chunked_read_eligible {
+                        fill_counters
+                            .async_two_wave_chunked_read_actual_launches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     return true;
                 }
@@ -9433,6 +9731,13 @@ impl GhostMetalExpertRuntime {
                 .load(Relaxed)
                 .min(u16::MAX as usize)
                 as u16;
+            common
+                .last_chained_ledger
+                .async_two_wave_chunked_read_actual_launches = fill_counters
+                .async_two_wave_chunked_read_actual_launches
+                .load(Relaxed)
+                .min(u32::MAX as usize)
+                as u32;
             common.last_chained_ledger.mapped_readahead_advised_records = fill_counters
                 .mapped_readahead_advised_records
                 .load(Relaxed)
@@ -9600,6 +9905,22 @@ impl GhostMetalExpertRuntime {
                         / (1024.0 * 1024.0),
                     led.mapped_readahead_previous_union_enqueue_us as f64 / 1000.0,
                 );
+                if ghost_metal_async_two_wave_chunked_read_telemetry_active(
+                    led.async_two_wave_chunked_read_actual_launches,
+                ) {
+                    eprintln!(
+                        "[metal chained async-two-wave chunked-read] active=1 actual_launches={} scope=stage-cold-launch-only fallback_chunking=0 read_threads={} demand_loads={} disk_bytes={} record_bytes={} disk_time={:.1}ms chunked_records={} chunked_preads={} max_chunks_per_record={} command_schedule_mutation=0 slot_policy_mutation=0",
+                        led.async_two_wave_chunked_read_actual_launches,
+                        async_two_wave_read_threads,
+                        led.demand_loads,
+                        led.nvme_bytes,
+                        crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES,
+                        led.nvme_ms,
+                        led.chunked_read_records,
+                        led.chunked_read_preads,
+                        led.chunked_read_max_chunks,
+                    );
+                }
                 if led.retained_cold_active {
                     eprintln!(
                         "[metal chained retained ledger] active=1 hits={} fresh={} blits={} direct_bank_fills={} avoided_bytes={} fresh_bytes={} eliminated_copy_traffic_bytes={} chunked_records={} chunked_preads={} max_chunks_per_record={}",

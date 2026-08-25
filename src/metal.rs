@@ -24815,6 +24815,9 @@ pub struct ChainedRoundHostLedger {
     pub chunked_read_records: u32,
     pub chunked_read_preads: u32,
     pub chunked_read_max_chunks: u16,
+    /// Successful H64 StageColdLaunch callbacks. This is actual invocation
+    /// telemetry, not an environment/admission-policy prediction.
+    pub async_two_wave_chunked_read_actual_launches: u32,
     pub prefetch_ms: f64,
     pub setup_ms: f64,
     pub final_wait_ms: f64,
