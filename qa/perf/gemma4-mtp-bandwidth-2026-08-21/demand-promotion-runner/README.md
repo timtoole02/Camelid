@@ -37,13 +37,16 @@ worktree with:
 ```sh
 ssh mini2 '
   set -euo pipefail
-  cd /Users/timtoole/camelid-h69-src
+  repo=/path/to/camelid-h69-src
+  binary=/path/to/camelid-h69-target/release/camelid
+  receipts=/path/to/camelid-h69-receipts
+  cd "$repo"
   CAM_SESSION_PID=$$ \
   CARGO_BUILD_JOBS=2 \
   CAMELID_BENCH_NO_WATCHDOG=1 \
-  CAMELID_BENCH_BINARY=/Users/timtoole/camelid-h69-target/release/camelid \
-  CAMELID_BENCH_OUT=/Users/timtoole/camelid-h69-receipts \
-    /Users/timtoole/bin/cam-lock.sh \
+  CAMELID_BENCH_BINARY="$binary" \
+  CAMELID_BENCH_OUT="$receipts" \
+    "$HOME/bin/cam-lock.sh" \
     qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cfg.zsh \
     mini2-h69-observation-1 \
     qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/env/H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control
@@ -55,10 +58,12 @@ write the request-level GO/NO-GO receipt with:
 
 ```sh
 ssh mini2 '
-  cd /Users/timtoole/camelid-h69-src
+  repo=/path/to/camelid-h69-src
+  receipts=/path/to/camelid-h69-receipts
+  cd "$repo"
   python3 qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/analyze_live_sequential_cap16.py \
-    /Users/timtoole/camelid-h69-receipts/mini2-h69-observation-1 \
-    --output /Users/timtoole/camelid-h69-receipts/mini2-h69-observation-1/analysis.json
+    "$receipts/mini2-h69-observation-1" \
+    --output "$receipts/mini2-h69-observation-1/analysis.json"
 '
 ```
 
@@ -85,9 +90,12 @@ Run a no-watchdog cap8/cap16/cap16/cap8 campaign on Mini2 with one fresh label:
 
 ```sh
 ssh mini2 '
-  cd /Users/timtoole/camelid-h69-src
-  CAMELID_BENCH_BINARY=/Users/timtoole/camelid-h69-target/release/camelid \
-  CAMELID_BENCH_OUT=/Users/timtoole/camelid-h69-receipts \
+  repo=/path/to/camelid-h69-src
+  binary=/path/to/camelid-h69-target/release/camelid
+  receipts=/path/to/camelid-h69-receipts
+  cd "$repo"
+  CAMELID_BENCH_BINARY="$binary" \
+  CAMELID_BENCH_OUT="$receipts" \
     qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cap16_abba_no_watchdog.zsh \
     mini2-h69-cap16-abba1
 '
@@ -172,7 +180,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H34-hot-cold-overlap-h2-fixed14-boundary-single-down` | Fixed K14; first exact four-pass improvement, 29.52–29.68 tok/s |
 | `H36-hot-cold-overlap-h2-schedule14-13-14-single-down` | Exact zero-waste `14,13,14,7` schedule; 30.82 tok/s |
 | `H38-hot-cold-overlap-h2-schedule14-13-14-direct-stage` | H36 plus direct-to-stage expert reads; 32.54–32.98 tok/s |
-| `H40-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100` | **Promoted Mini2 profile:** 34.69, 35.28, 35.08 tok/s exact; zero swap |
+| `H40-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100` | Historical 2,100-slot checkpoint: 34.69, 35.28, 35.08 tok/s exact with zero swap; the later physical-footprint treaty rejects this lane |
 | `H41-hot-cold-overlap-schedule14-13-14-direct-stage-hot2200` | 2,200-slot capacity check; exact but no faster, 34.77–34.93 tok/s |
 | `H42-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-rebalanced` | Same-memory rebalancing closure; exact at 34.82 tok/s, no-go |
 | `H43-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6` | Six retained cold records/layer; exact at 33.53 and 33.42 tok/s, zero swap, no-go |
@@ -181,7 +189,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H46-live-hidden-sequential-probe` | Observation-only live next-layer predictor; exact, cap-eight truth hits 318, weighted recall 54.91% |
 | `H47-live-hidden-sequential-stage-cap8` | Exact one-reader private cap-eight stage; 34.69–36.51 tok/s, modest gain, scalar predictor too costly |
 | `H48-live-hidden-sequential-fast-predict` | H47 plus batched Accelerate SGEMM predictor; exact at 36.22 tok/s, one-reader readiness limited |
-| `H49-live-hidden-sequential-fast-predict-dual-reader` | H48 plus a second private reader under the same cap; exact at 36.84 tok/s, zero swap; current research best |
+| `H49-live-hidden-sequential-fast-predict-dual-reader` | Historical 2,100-slot high-water mark: exact at 36.84 tok/s with zero swap; footprint-inadmissible under the later treaty |
 | `H50-live-hidden-dual-previous-cold96` | H49 plus capped previous-round staging; exact at 34.74 tok/s, zero swap, no-go |
 | `H51-live-hidden-fast-dual-k16x3` | Three K16 verifier passes; exact at 34.08 tok/s, zero swap, no-go |
 | `H52-k16-7-step3-rejection-rank-probe` | Diagnostic width/rank profile retained for reproducibility; superseded by the narrower H53 rejection probe |

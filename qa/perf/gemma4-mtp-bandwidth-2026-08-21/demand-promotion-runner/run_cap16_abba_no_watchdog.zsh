@@ -2,7 +2,7 @@
 # Run one clean Mini2 cap8/cap16/cap16/cap8 campaign under cam-lock.
 set -euo pipefail
 
-readonly lock=/Users/timtoole/bin/cam-lock.sh
+readonly lock=${CAMELID_CAM_LOCK:-$HOME/bin/cam-lock.sh}
 readonly script=${0:A}
 readonly here=${script:h}
 

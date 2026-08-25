@@ -12,13 +12,17 @@ with a 35.28 tok/s peak. See
 [`mini2-50tps-checkpoint-2026-08-24.md`](mini2-50tps-checkpoint-2026-08-24.md)
 for the original receipts and decomposition.
 
-The best observation under the literal 1,408-slot profile was an exploratory
-32.2565 tok/s stack. It combined the request-local H71 prompt-ranked handoff
-with the retained H58 GateUp MMA, H60 BF16 producer fusion, and H62 BF16 lattice
-load selectors. It was exact 48/48 at 1,488.07 ms, but it was a single manual
-no-watchdog observation and is not proposed for promotion.
+The best observation under the literal 1,408-slot profile was an ad hoc
+32.2565 tok/s selector stack with no dedicated checked-in profile. It combined
+the request-local H71 prompt-ranked handoff with the retained H58 GateUp MMA,
+H60 BF16 producer fusion, and H62 BF16 lattice-load selectors. It was exact
+48/48 at 1,488.07 ms, but it was a single manual no-watchdog observation and is
+not proposed for promotion.
 
-## Strict-footprint measurements
+## Literal 1,408-slot strict-profile observations
+
+These observations were manual and non-qualifying; “strict-profile” describes
+the configured physical footprint, not continuous safety qualification.
 
 Every throughput below is `48 / sum(four MTP round walls)`. Every counted run
 produced the exact expected 48-token sequence with the required effective
@@ -51,8 +55,8 @@ the mismatch as `physical_demand_identity_bound=false` and the result as
 
 H72 traced the real H71 handoff. Its four wave-load totals were 216.918,
 173.254, 144.163, and 59.599 ms. Round zero alone exceeded the approximately
-59 ms total I/O margin available at 50 tok/s, closing fixed prompt residency
-and later-round reuse as standalone paths to the target.
+59 ms total I/O margin available at 50 tok/s. The current H71 implementation
+therefore did not demonstrate a standalone path to the target.
 
 ## Safety and provenance
 
@@ -78,9 +82,10 @@ sanitized aggregate results needed for review.
 
 - Historical exact peak: **36.84 tok/s**, footprint-inadmissible under the
   later treaty.
-- Best strict 1,408-slot observation: **32.2565 tok/s**, exploratory and
-  non-qualifying.
+- Best 1,408-slot strict-profile manual observation: **32.2565 tok/s**, ad hoc
+  and non-qualifying.
 - 50 tok/s: **not achieved**.
 - H69 cap 16: no-go.
-- Fixed prompt/future-route residency: cannot reach 50 by itself.
+- Fixed prompt/future-route residency: no promotion justified by the current
+  evidence.
 - All new runtime behavior remains default-off and exact-router-authoritative.
