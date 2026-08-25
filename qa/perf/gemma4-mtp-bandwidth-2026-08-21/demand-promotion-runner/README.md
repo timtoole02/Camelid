@@ -11,6 +11,66 @@ Use `../hybrid-hot48-runner/run_50tps_gate.zsh` when you need a receipt.
 Note that gate's `env -i` list is frozen, so it does **not** pass any of the
 switches below; it must be edited before it can see them.
 
+### Explicit no-watchdog observation mode
+
+`run_cfg.zsh` retains the strict watchdog by default. Setting
+`CAMELID_BENCH_NO_WATCHDOG=1` is an explicit research-only escape hatch for a
+single observation request. It runs the server in an isolated process group
+with no continuously sampling or terminating watchdog. The runner still
+requires a clean source worktree, binds the binary's embedded full source
+commit at readiness, records that commit plus binary/runner/expected-token
+SHA-256 provenance, requires exact 48/48 output, and samples swap counters,
+pressure, wired memory, RSS, and physical footprint before launch, at
+readiness, and immediately after the request.
+
+The resulting `manual-safety.json` is always marked `qualifying=false` and
+`point_samples_only=true`. Passing point samples do not prove that the
+unsampled intervals stayed within a memory limit, so this mode cannot produce
+zero-swap qualification or promotion evidence. It is only a fast discriminator.
+The outer Mini2 serialization lock remains mandatory.
+
+H69 has no new performance profile. The corrected cap-4/8/16 observation is
+activated by the existing default-off probe switch already present in the
+literal 1,408-slot H49 control. Run exactly one observation from the clean H69
+worktree with:
+
+```sh
+ssh mini2 '
+  set -euo pipefail
+  cd /Users/timtoole/camelid-h69-src
+  CAM_SESSION_PID=$$ \
+  CARGO_BUILD_JOBS=2 \
+  CAMELID_BENCH_NO_WATCHDOG=1 \
+  CAMELID_BENCH_BINARY=/Users/timtoole/camelid-h69-target/release/camelid \
+  CAMELID_BENCH_OUT=/Users/timtoole/camelid-h69-receipts \
+    /Users/timtoole/bin/cam-lock.sh \
+    qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cfg.zsh \
+    mini2-h69-observation-1 \
+    qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/env/H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control
+'
+```
+
+After the locked request completes, fail closed over the run directory and
+write the request-level GO/NO-GO receipt with:
+
+```sh
+ssh mini2 '
+  cd /Users/timtoole/camelid-h69-src
+  python3 qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/analyze_live_sequential_cap16.py \
+    /Users/timtoole/camelid-h69-receipts/mini2-h69-observation-1 \
+    --output /Users/timtoole/camelid-h69-receipts/mini2-h69-observation-1/analysis.json
+'
+```
+
+The analyzer can return a projection verdict from this mode, but its safety
+evidence remains explicitly non-qualifying.
+
+That exact inherited profile preserves `CAMELID_GEMMA4_KV_INIT=192`, the
+literal 1,408-slot per-layer list, direct stage reads, Accelerate SGEMM fast
+prediction, two private readers, and the `14,13,14,7` effective verifier
+schedule. The H49 cap-eight stage remains the only I/O mutation; cap 4 and cap
+16 are observation-only prices of the same ranked vector.
+
 ## Run one
 
 ```sh

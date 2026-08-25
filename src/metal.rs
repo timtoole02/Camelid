@@ -25070,6 +25070,173 @@ struct LiveSequentialProbeTally {
     predicted_cold: u32,
 }
 
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_LAYER_COUNT: usize = 30;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_FIRST_LAYER: usize = 1;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_CAP4: usize = 4;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_CAP8: usize = 8;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_CAP16: usize = 16;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_RECEIPT_US_PER_MS: f64 = 1_000.0;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_RECEIPT_MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// One atomic H69 observation for a layer. All three tallies and both emitted
+/// identity lists are derived together from one immutable ranked vector, one
+/// immutable start-of-round hot mask, and one exact routed union.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSequentialProbeLayerObservation {
+    cap4: LiveSequentialProbeTally,
+    cap8: LiveSequentialProbeTally,
+    cap16: LiveSequentialProbeTally,
+    cap8_candidates: Vec<usize>,
+    cap16_candidates: Vec<usize>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_cap_lattice_valid(
+    cap4: LiveSequentialProbeTally,
+    cap8: LiveSequentialProbeTally,
+    cap16: LiveSequentialProbeTally,
+) -> bool {
+    let tally_valid = |tally: LiveSequentialProbeTally, cap: usize| {
+        u32::try_from(cap).is_ok_and(|cap| tally.predicted_cold <= cap)
+            && tally.hits <= tally.actual_cold
+            && tally.hits <= tally.predicted_cold
+    };
+    tally_valid(cap4, LIVE_SEQUENTIAL_PROBE_CAP4)
+        && tally_valid(cap8, LIVE_SEQUENTIAL_PROBE_CAP8)
+        && tally_valid(cap16, LIVE_SEQUENTIAL_PROBE_CAP16)
+        && cap4.actual_cold == cap8.actual_cold
+        && cap8.actual_cold == cap16.actual_cold
+        && cap4.hits <= cap8.hits
+        && cap8.hits <= cap16.hits
+        && cap4.predicted_cold <= cap8.predicted_cold
+        && cap8.predicted_cold <= cap16.predicted_cold
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_layer_observation_valid(
+    observation: &LiveSequentialProbeLayerObservation,
+) -> bool {
+    if !live_sequential_probe_cap_lattice_valid(
+        observation.cap4,
+        observation.cap8,
+        observation.cap16,
+    ) {
+        return false;
+    }
+    let predicted4 = observation.cap4.predicted_cold as usize;
+    let predicted8 = observation.cap8.predicted_cold as usize;
+    let predicted16 = observation.cap16.predicted_cold as usize;
+    if predicted4 != predicted8.min(LIVE_SEQUENTIAL_PROBE_CAP4)
+        || predicted8 != predicted16.min(LIVE_SEQUENTIAL_PROBE_CAP8)
+        || predicted8 != observation.cap8_candidates.len()
+        || predicted16 != observation.cap16_candidates.len()
+        || observation.cap8_candidates.len() > observation.cap16_candidates.len()
+        || observation.cap8_candidates
+            != observation.cap16_candidates[..observation.cap8_candidates.len()]
+    {
+        return false;
+    }
+    let mut seen = [false; 128];
+    for &expert in &observation.cap16_candidates {
+        if expert >= seen.len() || seen[expert] {
+            return false;
+        }
+        seen[expert] = true;
+    }
+    true
+}
+
+/// Produce the cap-4/8/16 observation in one pass over each immutable input.
+/// The helper owns no execution state and does not issue, widen, or publish
+/// any read. Invalid identities or arithmetic refuse only this observation.
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_observe_layer(
+    ranked: &[usize],
+    actual_union: &[usize],
+    hot_at_start: &[bool; 128],
+) -> Option<LiveSequentialProbeLayerObservation> {
+    if ranked.is_empty() {
+        return None;
+    }
+
+    let mut ranked_seen = [false; 128];
+    let mut candidate_rank = [u8::MAX; 128];
+    let mut cap16_candidates = Vec::with_capacity(LIVE_SEQUENTIAL_PROBE_CAP16);
+    for &expert in ranked {
+        if expert >= ranked_seen.len() || ranked_seen[expert] {
+            return None;
+        }
+        ranked_seen[expert] = true;
+        if !hot_at_start[expert] && cap16_candidates.len() < LIVE_SEQUENTIAL_PROBE_CAP16 {
+            candidate_rank[expert] = u8::try_from(cap16_candidates.len()).ok()?;
+            cap16_candidates.push(expert);
+        }
+    }
+    let cap8_candidates = cap16_candidates
+        .iter()
+        .copied()
+        .take(LIVE_SEQUENTIAL_PROBE_CAP8)
+        .collect::<Vec<_>>();
+
+    let mut actual_seen = [false; 128];
+    let mut actual_cold = 0u32;
+    let mut hits4 = 0u32;
+    let mut hits8 = 0u32;
+    let mut hits16 = 0u32;
+    for &expert in actual_union {
+        if expert >= actual_seen.len() || actual_seen[expert] {
+            return None;
+        }
+        actual_seen[expert] = true;
+        if hot_at_start[expert] {
+            continue;
+        }
+        actual_cold = actual_cold.checked_add(1)?;
+        let rank = candidate_rank[expert];
+        if rank != u8::MAX {
+            hits16 = hits16.checked_add(1)?;
+            if usize::from(rank) < LIVE_SEQUENTIAL_PROBE_CAP8 {
+                hits8 = hits8.checked_add(1)?;
+            }
+            if usize::from(rank) < LIVE_SEQUENTIAL_PROBE_CAP4 {
+                hits4 = hits4.checked_add(1)?;
+            }
+        }
+    }
+
+    let predicted16 = u32::try_from(cap16_candidates.len()).ok()?;
+    let predicted8 = u32::try_from(cap8_candidates.len()).ok()?;
+    let predicted4 = u32::try_from(cap8_candidates.len().min(LIVE_SEQUENTIAL_PROBE_CAP4)).ok()?;
+    let observation = LiveSequentialProbeLayerObservation {
+        cap4: LiveSequentialProbeTally {
+            hits: hits4,
+            actual_cold,
+            predicted_cold: predicted4,
+        },
+        cap8: LiveSequentialProbeTally {
+            hits: hits8,
+            actual_cold,
+            predicted_cold: predicted8,
+        },
+        cap16: LiveSequentialProbeTally {
+            hits: hits16,
+            actual_cold,
+            predicted_cold: predicted16,
+        },
+        cap8_candidates,
+        cap16_candidates,
+    };
+    live_sequential_probe_layer_observation_valid(&observation).then_some(observation)
+}
+
 /// Validate one deterministic ranked list and return its bounded cold prefix.
 /// Immutable start-of-round residency is filtered before `cap`, so a hot
 /// candidate never consumes speculative payload capacity. The helper owns no
@@ -25122,26 +25289,87 @@ fn live_sequential_probe_tally(
         }
         actual_seen[expert] = true;
         if !hot_at_start[expert] {
-            actual_cold += 1;
-            hits += u32::from(predicted[expert]);
+            actual_cold = actual_cold.checked_add(1)?;
+            hits = hits.checked_add(u32::from(predicted[expert]))?;
         }
     }
     Some(LiveSequentialProbeTally {
         hits,
         actual_cold,
-        predicted_cold: cold_candidates.len().min(u32::MAX as usize) as u32,
+        predicted_cold: u32::try_from(cold_candidates.len()).ok()?,
     })
 }
 
 #[cfg(any(target_os = "macos", test))]
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LiveSequentialProbeSummary {
     compared_layers: u32,
     hits: u32,
     actual_cold: u32,
     predicted_cold: u32,
-    read_wall_ms: f64,
-    projected_saved_ms: f64,
+    read_wall_us: u64,
+    projected_saved_us: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_summary_lattice_valid(
+    cap4: LiveSequentialProbeSummary,
+    cap8: LiveSequentialProbeSummary,
+    cap16: LiveSequentialProbeSummary,
+) -> bool {
+    let summary_valid = |summary: LiveSequentialProbeSummary| {
+        summary.hits <= summary.actual_cold
+            && summary.hits <= summary.predicted_cold
+            && summary.projected_saved_us <= summary.read_wall_us
+    };
+    summary_valid(cap4)
+        && summary_valid(cap8)
+        && summary_valid(cap16)
+        && cap4.compared_layers == cap8.compared_layers
+        && cap8.compared_layers == cap16.compared_layers
+        && cap4.actual_cold == cap8.actual_cold
+        && cap8.actual_cold == cap16.actual_cold
+        && cap4.hits <= cap8.hits
+        && cap8.hits <= cap16.hits
+        && cap4.predicted_cold <= cap8.predicted_cold
+        && cap8.predicted_cold <= cap16.predicted_cold
+        && cap4.read_wall_us == cap8.read_wall_us
+        && cap8.read_wall_us == cap16.read_wall_us
+        && cap4.projected_saved_us <= cap8.projected_saved_us
+        && cap8.projected_saved_us <= cap16.projected_saved_us
+}
+
+/// Quantize one measured wall duration to the schema-2 receipt domain. Every
+/// emitted per-layer and aggregate wall value is an integer number of
+/// microseconds rendered with exactly three decimal millisecond digits.
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_receipt_wall_us(wall_ms: f64) -> Option<u64> {
+    if !wall_ms.is_finite() || wall_ms < 0.0 {
+        return None;
+    }
+    let wall_us = wall_ms * LIVE_SEQUENTIAL_RECEIPT_US_PER_MS;
+    if !wall_us.is_finite() || wall_us > LIVE_SEQUENTIAL_RECEIPT_MAX_EXACT_INTEGER {
+        return None;
+    }
+    Some(wall_us.round() as u64)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_format_ms(wall_us: u64) -> String {
+    format!("{}.{:03}", wall_us / 1_000, wall_us % 1_000)
+}
+
+/// Fixed six-decimal, integer half-up ratio formatting. This avoids making the
+/// strict analyzer reproduce platform floating-point formatting decisions.
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_format_ratio(numerator: u64, denominator: u64) -> String {
+    if denominator == 0 {
+        return "na".to_owned();
+    }
+    const SCALE: u128 = 1_000_000;
+    let scaled =
+        (u128::from(numerator) * SCALE + u128::from(denominator / 2)) / u128::from(denominator);
+    format!("{}.{:06}", scaled / SCALE, scaled % SCALE)
 }
 
 /// Record-linear projection only: for each layer, price the predicted fraction
@@ -25149,32 +25377,353 @@ struct LiveSequentialProbeSummary {
 /// wall. This is a ceiling estimate, not a staging result; the probe performs
 /// no I/O and therefore cannot observe readiness or contention directly.
 #[cfg(any(target_os = "macos", test))]
-fn summarize_live_sequential_probe(
-    tallies: &[Option<LiveSequentialProbeTally>],
-    read_wall_ms: &[f64],
-) -> Option<LiveSequentialProbeSummary> {
-    if tallies.len() != read_wall_ms.len() {
+fn summarize_live_sequential_probe<I>(
+    tallies: I,
+    read_wall_us: &[u64],
+) -> Option<LiveSequentialProbeSummary>
+where
+    I: IntoIterator<Item = Option<LiveSequentialProbeTally>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let tallies = tallies.into_iter();
+    if tallies.len() != read_wall_us.len() {
         return None;
     }
     let mut summary = LiveSequentialProbeSummary::default();
-    for (tally, &wall_ms) in tallies.iter().zip(read_wall_ms) {
+    for (tally, &wall_us) in tallies.zip(read_wall_us) {
         let Some(tally) = tally else {
             continue;
         };
-        if !wall_ms.is_finite() || wall_ms < 0.0 {
+        if tally.hits > tally.actual_cold || tally.hits > tally.predicted_cold {
             return None;
         }
-        summary.compared_layers = summary.compared_layers.saturating_add(1);
-        summary.hits = summary.hits.saturating_add(tally.hits);
-        summary.actual_cold = summary.actual_cold.saturating_add(tally.actual_cold);
-        summary.predicted_cold = summary.predicted_cold.saturating_add(tally.predicted_cold);
-        summary.read_wall_ms += wall_ms;
+        summary.compared_layers = summary.compared_layers.checked_add(1)?;
+        summary.hits = summary.hits.checked_add(tally.hits)?;
+        summary.actual_cold = summary.actual_cold.checked_add(tally.actual_cold)?;
+        summary.predicted_cold = summary.predicted_cold.checked_add(tally.predicted_cold)?;
+        summary.read_wall_us = summary.read_wall_us.checked_add(wall_us)?;
         if tally.actual_cold != 0 {
-            summary.projected_saved_ms +=
-                wall_ms * f64::from(tally.hits) / f64::from(tally.actual_cold);
+            let saved_us = u128::from(wall_us).checked_mul(u128::from(tally.hits))?
+                / u128::from(tally.actual_cold);
+            summary.projected_saved_us = summary
+                .projected_saved_us
+                .checked_add(u64::try_from(saved_us).ok()?)?;
         }
     }
     Some(summary)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSequentialProbeReceipt {
+    cap4: LiveSequentialProbeSummary,
+    cap8: LiveSequentialProbeSummary,
+    cap16: LiveSequentialProbeSummary,
+    cap16_incremental_hits_vs_cap8: u32,
+    cap16_incremental_predicted_vs_cap8: u32,
+    cap16_incremental_saved_us_vs_cap8: u64,
+    total_wave_load_us: u64,
+    cap8_candidates: String,
+    cap16_candidates: String,
+    cap4_layers: String,
+    cap8_layers: String,
+    cap16_layers: String,
+}
+
+/// Validate the complete schema-2 H69 sample before any detailed data is
+/// rendered. A failure returns one compact reason token; callers must not
+/// synthesize missing summaries, identities, or layers as plausible zeros.
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(target_os = "macos", test))]
+fn validate_live_sequential_probe_receipt(
+    observations: &[Option<LiveSequentialProbeLayerObservation>],
+    read_wall_ms: &[f64],
+    n_layers: usize,
+    attempts: u32,
+    failures: u32,
+    accounting_valid: bool,
+    stage_admitted: bool,
+    stage_launch_attempts: u32,
+    stage_launches: u32,
+    stage_launch_failures: u32,
+    stage_candidates: u32,
+    total_wave_load_ms: f64,
+) -> Result<LiveSequentialProbeReceipt, &'static str> {
+    if !accounting_valid {
+        return Err("accounting-overflow");
+    }
+    if n_layers != LIVE_SEQUENTIAL_PROBE_LAYER_COUNT
+        || observations.len() != LIVE_SEQUENTIAL_PROBE_LAYER_COUNT
+        || read_wall_ms.len() != LIVE_SEQUENTIAL_PROBE_LAYER_COUNT
+    {
+        return Err("layer-shape");
+    }
+    let eligible =
+        u32::try_from(LIVE_SEQUENTIAL_PROBE_LAYER_COUNT - LIVE_SEQUENTIAL_PROBE_FIRST_LAYER)
+            .map_err(|_| "eligible-overflow")?;
+    if attempts != eligible || failures != 0 {
+        return Err("attempt-accounting");
+    }
+    if observations[LIVE_SEQUENTIAL_PROBE_FIRST_LAYER - 1].is_some()
+        || observations[LIVE_SEQUENTIAL_PROBE_FIRST_LAYER..]
+            .iter()
+            .any(|observation| {
+                observation.as_ref().is_none_or(|observation| {
+                    !live_sequential_probe_layer_observation_valid(observation)
+                })
+            })
+    {
+        return Err("layer-lattice");
+    }
+
+    let read_wall_us = read_wall_ms
+        .iter()
+        .copied()
+        .map(live_sequential_receipt_wall_us)
+        .collect::<Option<Vec<_>>>()
+        .ok_or("wall-domain")?;
+    let summarize =
+        |select: fn(&LiveSequentialProbeLayerObservation) -> LiveSequentialProbeTally| {
+            summarize_live_sequential_probe(
+                observations
+                    .iter()
+                    .map(|observation| observation.as_ref().map(select)),
+                &read_wall_us,
+            )
+        };
+    let cap4 = summarize(|observation| observation.cap4).ok_or("summary-arithmetic")?;
+    let cap8 = summarize(|observation| observation.cap8).ok_or("summary-arithmetic")?;
+    let cap16 = summarize(|observation| observation.cap16).ok_or("summary-arithmetic")?;
+    if cap4.compared_layers != eligible
+        || cap8.compared_layers != eligible
+        || cap16.compared_layers != eligible
+        || !live_sequential_probe_summary_lattice_valid(cap4, cap8, cap16)
+    {
+        return Err("summary-lattice");
+    }
+    if !stage_admitted
+        || stage_launch_attempts != eligible
+        || stage_launches != eligible
+        || stage_launch_failures != 0
+        || stage_candidates != cap8.predicted_cold
+    {
+        return Err("stage-accounting");
+    }
+
+    let cap16_incremental_hits_vs_cap8 =
+        cap16.hits.checked_sub(cap8.hits).ok_or("increment-order")?;
+    let cap16_incremental_predicted_vs_cap8 = cap16
+        .predicted_cold
+        .checked_sub(cap8.predicted_cold)
+        .ok_or("increment-order")?;
+    let cap16_incremental_saved_us_vs_cap8 = cap16
+        .projected_saved_us
+        .checked_sub(cap8.projected_saved_us)
+        .ok_or("increment-order")?;
+    let total_wave_load_us =
+        live_sequential_receipt_wall_us(total_wave_load_ms).ok_or("total-wall-domain")?;
+
+    let mut cap8_candidate_layers = Vec::with_capacity(eligible as usize);
+    let mut cap16_candidate_layers = Vec::with_capacity(eligible as usize);
+    let mut cap4_layers = Vec::with_capacity(eligible as usize);
+    let mut cap8_layers = Vec::with_capacity(eligible as usize);
+    let mut cap16_layers = Vec::with_capacity(eligible as usize);
+    for layer_idx in LIVE_SEQUENTIAL_PROBE_FIRST_LAYER..LIVE_SEQUENTIAL_PROBE_LAYER_COUNT {
+        let observation = observations[layer_idx].as_ref().ok_or("missing-layer")?;
+        let wall = live_sequential_format_ms(read_wall_us[layer_idx]);
+        let candidate_list = |candidates: &[usize]| {
+            candidates
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        cap8_candidate_layers.push(format!(
+            "L{layer_idx}:{}",
+            candidate_list(&observation.cap8_candidates)
+        ));
+        cap16_candidate_layers.push(format!(
+            "L{layer_idx}:{}",
+            candidate_list(&observation.cap16_candidates)
+        ));
+        let format_layer = |tally: LiveSequentialProbeTally| {
+            format!(
+                "L{layer_idx}:{}/{}/{}@{wall}",
+                tally.hits, tally.actual_cold, tally.predicted_cold
+            )
+        };
+        cap4_layers.push(format_layer(observation.cap4));
+        cap8_layers.push(format_layer(observation.cap8));
+        cap16_layers.push(format_layer(observation.cap16));
+    }
+
+    Ok(LiveSequentialProbeReceipt {
+        cap4,
+        cap8,
+        cap16,
+        cap16_incremental_hits_vs_cap8,
+        cap16_incremental_predicted_vs_cap8,
+        cap16_incremental_saved_us_vs_cap8,
+        total_wave_load_us,
+        cap8_candidates: cap8_candidate_layers.join("/"),
+        cap16_candidates: cap16_candidate_layers.join("/"),
+        cap4_layers: cap4_layers.join(","),
+        cap8_layers: cap8_layers.join(","),
+        cap16_layers: cap16_layers.join(","),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(target_os = "macos", test))]
+fn format_live_sequential_probe_receipt(
+    receipt: &LiveSequentialProbeReceipt,
+    start_pos: usize,
+    k_tokens: usize,
+    attempts: u32,
+    failures: u32,
+    predict_us: u64,
+    stage_launches: u32,
+    stage_launch_failures: u32,
+    stage_candidates: u32,
+) -> String {
+    let eligible = LIVE_SEQUENTIAL_PROBE_LAYER_COUNT - LIVE_SEQUENTIAL_PROBE_FIRST_LAYER;
+    let cap4_hits = receipt.cap4.hits;
+    let cap4_actual_cold = receipt.cap4.actual_cold;
+    let cap4_predicted_cold = receipt.cap4.predicted_cold;
+    let cap4_recall =
+        live_sequential_format_ratio(u64::from(cap4_hits), u64::from(cap4_actual_cold));
+    let cap4_precision =
+        live_sequential_format_ratio(u64::from(cap4_hits), u64::from(cap4_predicted_cold));
+    let cap4_read_wall_ms = live_sequential_format_ms(receipt.cap4.read_wall_us);
+    let cap4_projected_saved_ms = live_sequential_format_ms(receipt.cap4.projected_saved_us);
+    let cap4_read_wall_weighted_recall =
+        live_sequential_format_ratio(receipt.cap4.projected_saved_us, receipt.cap4.read_wall_us);
+
+    let cap8_hits = receipt.cap8.hits;
+    let cap8_actual_cold = receipt.cap8.actual_cold;
+    let cap8_predicted_cold = receipt.cap8.predicted_cold;
+    let cap8_recall =
+        live_sequential_format_ratio(u64::from(cap8_hits), u64::from(cap8_actual_cold));
+    let cap8_precision =
+        live_sequential_format_ratio(u64::from(cap8_hits), u64::from(cap8_predicted_cold));
+    let cap8_read_wall_ms = live_sequential_format_ms(receipt.cap8.read_wall_us);
+    let cap8_projected_saved_ms = live_sequential_format_ms(receipt.cap8.projected_saved_us);
+    let cap8_read_wall_weighted_recall =
+        live_sequential_format_ratio(receipt.cap8.projected_saved_us, receipt.cap8.read_wall_us);
+
+    let cap16_hits = receipt.cap16.hits;
+    let cap16_actual_cold = receipt.cap16.actual_cold;
+    let cap16_predicted_cold = receipt.cap16.predicted_cold;
+    let cap16_recall =
+        live_sequential_format_ratio(u64::from(cap16_hits), u64::from(cap16_actual_cold));
+    let cap16_precision =
+        live_sequential_format_ratio(u64::from(cap16_hits), u64::from(cap16_predicted_cold));
+    let cap16_read_wall_ms = live_sequential_format_ms(receipt.cap16.read_wall_us);
+    let cap16_projected_saved_ms = live_sequential_format_ms(receipt.cap16.projected_saved_us);
+    let cap16_read_wall_weighted_recall =
+        live_sequential_format_ratio(receipt.cap16.projected_saved_us, receipt.cap16.read_wall_us);
+
+    let cap16_incremental_hits_vs_cap8 = receipt.cap16_incremental_hits_vs_cap8;
+    let cap16_incremental_predicted_vs_cap8 = receipt.cap16_incremental_predicted_vs_cap8;
+    let cap16_incremental_precision_vs_cap8 = live_sequential_format_ratio(
+        u64::from(cap16_incremental_hits_vs_cap8),
+        u64::from(cap16_incremental_predicted_vs_cap8),
+    );
+    let cap16_incremental_saved_ms_vs_cap8 =
+        live_sequential_format_ms(receipt.cap16_incremental_saved_us_vs_cap8);
+    let total_wave_load_ms = live_sequential_format_ms(receipt.total_wave_load_us);
+    let cap8_candidates = &receipt.cap8_candidates;
+    let cap16_candidates = &receipt.cap16_candidates;
+    let cap4_layers = &receipt.cap4_layers;
+    let cap8_layers = &receipt.cap8_layers;
+    let cap16_layers = &receipt.cap16_layers;
+
+    format!(
+        concat!(
+            "[metal live-sequential-predict probe] schema=2 admitted=1 ",
+            "profile=exact-live-sequential-hot-shape start_pos={start_pos} K={k_tokens} ",
+            "source=post-attention-slab-b target=next-layer-exact-union ",
+            "first_target_layer=1 eligible={eligible} attempts={attempts} failures={failures} ",
+            "truth_valid=1 predict_us={predict_us} predictor_top_k_per_row=8 probe_caps=4,8,16 ",
+            "cap4_hits={cap4_hits} cap4_actual_cold={cap4_actual_cold} ",
+            "cap4_predicted_cold={cap4_predicted_cold} cap4_recall={cap4_recall} ",
+            "cap4_precision={cap4_precision} cap4_read_wall_ms={cap4_read_wall_ms} ",
+            "cap4_projected_saved_ms={cap4_projected_saved_ms} ",
+            "cap4_read_wall_weighted_recall={cap4_read_wall_weighted_recall} ",
+            "cap8_hits={cap8_hits} cap8_actual_cold={cap8_actual_cold} ",
+            "cap8_predicted_cold={cap8_predicted_cold} cap8_recall={cap8_recall} ",
+            "cap8_precision={cap8_precision} cap8_read_wall_ms={cap8_read_wall_ms} ",
+            "cap8_projected_saved_ms={cap8_projected_saved_ms} ",
+            "cap8_read_wall_weighted_recall={cap8_read_wall_weighted_recall} ",
+            "cap16_hits={cap16_hits} cap16_actual_cold={cap16_actual_cold} ",
+            "cap16_predicted_cold={cap16_predicted_cold} cap16_recall={cap16_recall} ",
+            "cap16_precision={cap16_precision} cap16_read_wall_ms={cap16_read_wall_ms} ",
+            "cap16_projected_saved_ms={cap16_projected_saved_ms} ",
+            "cap16_read_wall_weighted_recall={cap16_read_wall_weighted_recall} ",
+            "cap16_incremental_hits_vs_cap8={cap16_incremental_hits_vs_cap8} ",
+            "cap16_incremental_predicted_vs_cap8={cap16_incremental_predicted_vs_cap8} ",
+            "cap16_incremental_precision_vs_cap8={cap16_incremental_precision_vs_cap8} ",
+            "cap16_incremental_saved_ms_vs_cap8={cap16_incremental_saved_ms_vs_cap8} ",
+            "total_wave_load_ms={total_wave_load_ms} ",
+            "projection=record-linear-per-layer-wave-load-ceiling stage_admitted=1 ",
+            "launches={stage_launches} launch_failures={stage_launch_failures} ",
+            "stage_candidates={stage_candidates} readiness_measured=1 contention_measured=1 ",
+            "output_mutation=0 io_mutation=1 slot_policy_mutation=0 ",
+            "routing_authority=exact-router cap8_candidates={cap8_candidates} ",
+            "cap16_candidates={cap16_candidates} cap4_layers={cap4_layers} ",
+            "cap8_layers={cap8_layers} cap16_layers={cap16_layers}"
+        ),
+        start_pos = start_pos,
+        k_tokens = k_tokens,
+        eligible = eligible,
+        attempts = attempts,
+        failures = failures,
+        predict_us = predict_us,
+        cap4_hits = cap4_hits,
+        cap4_actual_cold = cap4_actual_cold,
+        cap4_predicted_cold = cap4_predicted_cold,
+        cap4_recall = cap4_recall,
+        cap4_precision = cap4_precision,
+        cap4_read_wall_ms = cap4_read_wall_ms,
+        cap4_projected_saved_ms = cap4_projected_saved_ms,
+        cap4_read_wall_weighted_recall = cap4_read_wall_weighted_recall,
+        cap8_hits = cap8_hits,
+        cap8_actual_cold = cap8_actual_cold,
+        cap8_predicted_cold = cap8_predicted_cold,
+        cap8_recall = cap8_recall,
+        cap8_precision = cap8_precision,
+        cap8_read_wall_ms = cap8_read_wall_ms,
+        cap8_projected_saved_ms = cap8_projected_saved_ms,
+        cap8_read_wall_weighted_recall = cap8_read_wall_weighted_recall,
+        cap16_hits = cap16_hits,
+        cap16_actual_cold = cap16_actual_cold,
+        cap16_predicted_cold = cap16_predicted_cold,
+        cap16_recall = cap16_recall,
+        cap16_precision = cap16_precision,
+        cap16_read_wall_ms = cap16_read_wall_ms,
+        cap16_projected_saved_ms = cap16_projected_saved_ms,
+        cap16_read_wall_weighted_recall = cap16_read_wall_weighted_recall,
+        cap16_incremental_hits_vs_cap8 = cap16_incremental_hits_vs_cap8,
+        cap16_incremental_predicted_vs_cap8 = cap16_incremental_predicted_vs_cap8,
+        cap16_incremental_precision_vs_cap8 = cap16_incremental_precision_vs_cap8,
+        cap16_incremental_saved_ms_vs_cap8 = cap16_incremental_saved_ms_vs_cap8,
+        total_wave_load_ms = total_wave_load_ms,
+        stage_launches = stage_launches,
+        stage_launch_failures = stage_launch_failures,
+        stage_candidates = stage_candidates,
+        cap8_candidates = cap8_candidates,
+        cap16_candidates = cap16_candidates,
+        cap4_layers = cap4_layers,
+        cap8_layers = cap8_layers,
+        cap16_layers = cap16_layers,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn format_live_sequential_probe_invalid_receipt(reason: &'static str) -> String {
+    format!(
+        "[metal live-sequential-predict probe] schema=2 admitted=1 truth_valid=0 reason={reason}"
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -26225,15 +26774,20 @@ mod hot_cold_overlap_plan_tests {
     use super::{
         cold_recurrence_tallies, cpu_cold_probe_exact_plan, cpu_cold_probe_expert_checksum,
         cpu_cold_probe_q8_snapshot, exact_cold_mask_from_union, f32_to_f16_bits,
+        format_live_sequential_probe_invalid_receipt, format_live_sequential_probe_receipt,
         gemma4_hybrid_cold_recurrence_probe_from, gemma4_hybrid_cold_recurrence_round_admitted,
         gemma4_hybrid_cpu_cold_probe_from, gemma4_hybrid_cpu_cold_probe_round_admitted,
         gemma4_hybrid_hot_cold_overlap_publish_from, gemma4_hybrid_hot_cold_prefill_from,
         gemma4_hybrid_hot_cold_publication_allowed, gemma4_hybrid_hot_cold_round_kind_admitted,
         hot_cold_compact_slot_table, hot_cold_split_slot_tables, live_sequential_cold_candidates,
-        live_sequential_probe_tally, partition_exact_union_by_hot, plan_retained_cold_layer,
-        retained_cold_compact_slot_table, summarize_live_sequential_probe, ColdRecurrenceTally,
-        CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
-        Gemma4RetainedColdPlacement, LiveSequentialProbeTally,
+        live_sequential_format_ms, live_sequential_format_ratio,
+        live_sequential_probe_cap_lattice_valid, live_sequential_probe_layer_observation_valid,
+        live_sequential_probe_observe_layer, live_sequential_probe_summary_lattice_valid,
+        live_sequential_probe_tally, live_sequential_receipt_wall_us, partition_exact_union_by_hot,
+        plan_retained_cold_layer, retained_cold_compact_slot_table,
+        summarize_live_sequential_probe, validate_live_sequential_probe_receipt,
+        ColdRecurrenceTally, CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
+        Gemma4RetainedColdPlacement, LiveSequentialProbeSummary, LiveSequentialProbeTally,
     };
 
     fn expert_mask(experts: &[usize]) -> [bool; 128] {
@@ -26282,6 +26836,103 @@ mod hot_cold_overlap_plan_tests {
     }
 
     #[test]
+    fn live_sequential_probe_observes_cap4_8_16_atomically_from_one_signal() {
+        let ranked = (0..24).collect::<Vec<_>>();
+        let actual = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+        let ranked_before = ranked.clone();
+        let actual_before = actual.clone();
+        let hot = expert_mask(&[0, 2, 4, 6]);
+
+        let observation = live_sequential_probe_observe_layer(&ranked, &actual, &hot).unwrap();
+        assert_eq!(
+            observation.cap4,
+            LiveSequentialProbeTally {
+                hits: 4,
+                actual_cold: 10,
+                predicted_cold: 4,
+            }
+        );
+        assert_eq!(
+            observation.cap8,
+            LiveSequentialProbeTally {
+                hits: 6,
+                actual_cold: 10,
+                predicted_cold: 8,
+            }
+        );
+        assert_eq!(
+            observation.cap16,
+            LiveSequentialProbeTally {
+                hits: 10,
+                actual_cold: 10,
+                predicted_cold: 16,
+            }
+        );
+        assert_eq!(
+            observation.cap16_candidates,
+            vec![1, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
+        assert_eq!(
+            observation.cap8_candidates,
+            observation.cap16_candidates[..8]
+        );
+        assert!(live_sequential_probe_layer_observation_valid(&observation));
+        assert_eq!(ranked, ranked_before);
+        assert_eq!(actual, actual_before);
+
+        assert!(live_sequential_probe_observe_layer(&[], &actual, &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&[1, 1], &actual, &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&[128], &actual, &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&ranked, &[1, 1], &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&ranked, &[128], &hot).is_none());
+    }
+
+    #[test]
+    fn live_sequential_probe_layer_lattice_rejects_forged_identity_and_counts() {
+        let ranked = (0..24).collect::<Vec<_>>();
+        let actual = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+        let hot = expert_mask(&[0, 2, 4, 6]);
+        let observation = live_sequential_probe_observe_layer(&ranked, &actual, &hot).unwrap();
+        assert!(live_sequential_probe_cap_lattice_valid(
+            observation.cap4,
+            observation.cap8,
+            observation.cap16,
+        ));
+
+        let mut wrong_prefix = observation.clone();
+        wrong_prefix.cap8_candidates.swap(0, 1);
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &wrong_prefix
+        ));
+
+        let mut wrong_cardinality = observation.clone();
+        wrong_cardinality.cap16.predicted_cold = 15;
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &wrong_cardinality
+        ));
+
+        // Keep every prior prefix/lattice/cardinality relationship internally
+        // consistent except the required cap8 == min(8, cap16) width.
+        let mut truncated_cap8 = observation.clone();
+        assert_eq!(truncated_cap8.cap8_candidates.pop(), Some(11));
+        truncated_cap8.cap8.predicted_cold = 7;
+        truncated_cap8.cap8.hits = 5;
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &truncated_cap8
+        ));
+
+        let mut duplicate = observation.clone();
+        duplicate.cap16_candidates[15] = duplicate.cap16_candidates[0];
+        assert!(!live_sequential_probe_layer_observation_valid(&duplicate));
+
+        let mut impossible_hits = observation.clone();
+        impossible_hits.cap8.hits = impossible_hits.cap4.hits - 1;
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &impossible_hits
+        ));
+    }
+
+    #[test]
     fn live_sequential_probe_projects_per_layer_read_wall_only() {
         let tallies = [
             Some(LiveSequentialProbeTally {
@@ -26296,15 +26947,30 @@ mod hot_cold_overlap_plan_tests {
             }),
             None,
         ];
-        let summary = summarize_live_sequential_probe(&tallies, &[30.0, 10.0, 99.0]).unwrap();
+        let summary =
+            summarize_live_sequential_probe(tallies.iter().copied(), &[30_000, 10_000, 99_000])
+                .unwrap();
         assert_eq!(summary.compared_layers, 2);
         assert_eq!(summary.hits, 3);
         assert_eq!(summary.actual_cold, 4);
         assert_eq!(summary.predicted_cold, 6);
-        assert!((summary.read_wall_ms - 40.0).abs() < 1.0e-9);
-        assert!((summary.projected_saved_ms - 30.0).abs() < 1.0e-9);
-        assert!(summarize_live_sequential_probe(&tallies, &[1.0]).is_none());
-        assert!(summarize_live_sequential_probe(&[tallies[0]], &[f64::NAN]).is_none());
+        assert_eq!(summary.read_wall_us, 40_000);
+        assert_eq!(summary.projected_saved_us, 30_000);
+        assert!(summarize_live_sequential_probe(tallies.iter().copied(), &[1]).is_none());
+
+        let overflowing = [
+            Some(LiveSequentialProbeTally {
+                hits: u32::MAX,
+                actual_cold: u32::MAX,
+                predicted_cold: u32::MAX,
+            }),
+            Some(LiveSequentialProbeTally {
+                hits: 1,
+                actual_cold: 1,
+                predicted_cold: 1,
+            }),
+        ];
+        assert!(summarize_live_sequential_probe(overflowing, &[0, 0]).is_none());
     }
 
     #[test]
@@ -26316,13 +26982,185 @@ mod hot_cold_overlap_plan_tests {
         };
         let mut tallies = vec![Some(sample); 30];
         tallies[0] = None;
-        let summary = summarize_live_sequential_probe(&tallies, &[1.0; 30]).unwrap();
+        let summary =
+            summarize_live_sequential_probe(tallies.iter().copied(), &[1_000; 30]).unwrap();
         assert_eq!(summary.compared_layers, 29);
         assert_eq!(summary.hits, 29);
         assert_eq!(summary.actual_cold, 58);
         assert_eq!(summary.predicted_cold, 116);
-        assert!((summary.read_wall_ms - 29.0).abs() < 1.0e-9);
-        assert!((summary.projected_saved_ms - 14.5).abs() < 1.0e-9);
+        assert_eq!(summary.read_wall_us, 29_000);
+        assert_eq!(summary.projected_saved_us, 14_500);
+    }
+
+    #[test]
+    fn live_sequential_probe_receipt_domain_is_fixed_and_nonfinite_fails_closed() {
+        assert_eq!(live_sequential_receipt_wall_us(1.2346), Some(1_235));
+        assert_eq!(live_sequential_format_ms(1_235), "1.235");
+        assert_eq!(live_sequential_format_ratio(1, 3), "0.333333");
+        assert_eq!(live_sequential_format_ratio(2, 3), "0.666667");
+        assert_eq!(live_sequential_format_ratio(0, 0), "na");
+        assert!(live_sequential_receipt_wall_us(-0.001).is_none());
+        assert!(live_sequential_receipt_wall_us(f64::NAN).is_none());
+        assert!(live_sequential_receipt_wall_us(f64::INFINITY).is_none());
+
+        let cap4 = LiveSequentialProbeSummary {
+            compared_layers: 29,
+            hits: 20,
+            actual_cold: 60,
+            predicted_cold: 40,
+            read_wall_us: 100_000,
+            projected_saved_us: 30_000,
+        };
+        let cap8 = LiveSequentialProbeSummary {
+            hits: 30,
+            predicted_cold: 70,
+            projected_saved_us: 45_000,
+            ..cap4
+        };
+        let cap16 = LiveSequentialProbeSummary {
+            hits: 40,
+            predicted_cold: 100,
+            projected_saved_us: 62_500,
+            ..cap4
+        };
+        assert!(live_sequential_probe_summary_lattice_valid(
+            cap4, cap8, cap16
+        ));
+        assert!(!live_sequential_probe_summary_lattice_valid(
+            cap4,
+            cap8,
+            LiveSequentialProbeSummary {
+                projected_saved_us: 44_999,
+                ..cap16
+            },
+        ));
+    }
+
+    #[test]
+    fn live_sequential_probe_schema2_requires_exact_29_layer_truth() {
+        let ranked = (0..24).collect::<Vec<_>>();
+        let actual = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+        let hot = expert_mask(&[0, 2, 4, 6]);
+        let observation = live_sequential_probe_observe_layer(&ranked, &actual, &hot).unwrap();
+        let mut observations = vec![None; 30];
+        for slot in &mut observations[1..] {
+            *slot = Some(observation.clone());
+        }
+        let mut walls = vec![0.0; 30];
+        for wall in &mut walls[1..] {
+            *wall = 1.2346;
+        }
+        let cap8_candidates = 29 * observation.cap8.predicted_cold;
+        let receipt = validate_live_sequential_probe_receipt(
+            &observations,
+            &walls,
+            30,
+            29,
+            0,
+            true,
+            true,
+            29,
+            29,
+            0,
+            cap8_candidates,
+            35.815,
+        )
+        .unwrap();
+        assert_eq!(receipt.cap4.compared_layers, 29);
+        assert_eq!(receipt.cap8.read_wall_us, 35_815);
+        assert_eq!(receipt.cap8.projected_saved_us, 21_489);
+        assert_eq!(receipt.cap16.projected_saved_us, 35_815);
+        assert_eq!(receipt.cap16_incremental_hits_vs_cap8, 116);
+        assert_eq!(receipt.cap16_incremental_predicted_vs_cap8, 232);
+        assert_eq!(receipt.cap16_incremental_saved_us_vs_cap8, 14_326);
+        assert_eq!(receipt.cap8_candidates.matches('/').count(), 28);
+        assert_eq!(receipt.cap16_candidates.matches('/').count(), 28);
+        assert_eq!(receipt.cap4_layers.matches(',').count(), 28);
+        assert!(receipt.cap8_candidates.starts_with("L1:1,3,5,7,8,9,10,11/"));
+        assert!(receipt
+            .cap16_candidates
+            .ends_with("L29:1,3,5,7,8,9,10,11,12,13,14,15,16,17,18,19"));
+        let rendered = format_live_sequential_probe_receipt(
+            &receipt,
+            104,
+            14,
+            29,
+            0,
+            123,
+            29,
+            0,
+            cap8_candidates,
+        );
+        assert!(rendered.contains("schema=2 admitted=1"));
+        assert!(rendered.contains("eligible=29 attempts=29 failures=0 truth_valid=1"));
+        assert!(rendered.contains("predictor_top_k_per_row=8 probe_caps=4,8,16"));
+        assert!(rendered.contains("cap8_read_wall_ms=35.815"));
+        assert!(rendered.contains("cap16_incremental_saved_ms_vs_cap8=14.326"));
+        assert!(rendered.contains("stage_admitted=1 launches=29 launch_failures=0"));
+        assert!(rendered.contains("output_mutation=0 io_mutation=1 slot_policy_mutation=0"));
+        assert!(!rendered.contains("cap16_go"));
+        assert!(!rendered.contains("eligible_layers="));
+        assert!(!rendered.contains("stage_launches="));
+
+        let mut missing = observations.clone();
+        missing[29] = None;
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &missing,
+                &walls,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                29,
+                0,
+                cap8_candidates,
+                35.815,
+            ),
+            Err("layer-lattice")
+        );
+        let mut nonfinite = walls.clone();
+        nonfinite[7] = f64::NAN;
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &observations,
+                &nonfinite,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                29,
+                0,
+                cap8_candidates,
+                35.815,
+            ),
+            Err("wall-domain")
+        );
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &observations,
+                &walls,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                28,
+                0,
+                cap8_candidates,
+                35.815,
+            ),
+            Err("stage-accounting")
+        );
+        assert_eq!(
+            format_live_sequential_probe_invalid_receipt("layer-lattice"),
+            "[metal live-sequential-predict probe] schema=2 admitted=1 truth_valid=0 reason=layer-lattice"
+        );
     }
 
     fn fill_q4_matrix(wire: &mut [u8], rows: usize, blocks: usize, seed: usize) {
@@ -30157,7 +30995,7 @@ impl Gemma4GhostCommonMetal {
             live_sequential_stage_requested && live_sequential_probe_admitted;
         if live_sequential_probe_requested && !live_sequential_probe_admitted {
             eprintln!(
-                "[metal live-sequential-predict probe] schema=1 admitted=0 start_pos={start_pos} K={k_tokens} h40_shape={} record_demand={} file_mapped={} decode={} hot_cold_overlap={} single_down={} publish={} retained_bank={} unified={} filler={} hot_snapshot={} output_mutation=0 io_mutation=0 slot_mutation=0",
+                "[metal live-sequential-predict probe] schema=2 admitted=0 start_pos={start_pos} K={k_tokens} h40_shape={} record_demand={} file_mapped={} decode={} hot_cold_overlap={} single_down={} publish={} retained_bank={} unified={} filler={} hot_snapshot={} output_mutation=0 io_mutation=0 slot_policy_mutation=0",
                 u8::from(live_sequential_profile_shape),
                 u8::from(record_demand),
                 u8::from(file_mapped_demand),
@@ -30179,10 +31017,11 @@ impl Gemma4GhostCommonMetal {
             live_sequential_probe_admitted.then(|| vec![None::<Vec<usize>>; n_layers]);
         let mut live_sequential_failed =
             live_sequential_probe_admitted.then(|| vec![false; n_layers]);
-        let mut live_sequential_cap4 = live_sequential_probe_admitted
-            .then(|| vec![None::<LiveSequentialProbeTally>; n_layers]);
-        let mut live_sequential_cap8 = live_sequential_probe_admitted
-            .then(|| vec![None::<LiveSequentialProbeTally>; n_layers]);
+        // H69's cap-4/8/16 receipt is one atomic observation per layer. The
+        // extra cap-16 identities exist only inside this already default-off
+        // probe lane and never reach the stage launcher or execution tables.
+        let mut live_sequential_observations = live_sequential_probe_admitted
+            .then(|| vec![None::<LiveSequentialProbeLayerObservation>; n_layers]);
         let mut live_sequential_read_wall_ms =
             live_sequential_probe_admitted.then(|| vec![0.0f64; n_layers]);
         let mut live_sequential_predict_us = 0u64;
@@ -30192,6 +31031,16 @@ impl Gemma4GhostCommonMetal {
         let mut live_sequential_stage_launches = 0u32;
         let mut live_sequential_stage_launch_failures = 0u32;
         let mut live_sequential_stage_candidates = 0u32;
+        let mut live_sequential_accounting_valid = true;
+        macro_rules! checked_live_sequential_add {
+            ($counter:ident, $delta:expr) => {{
+                if let Some(next) = $counter.checked_add($delta) {
+                    $counter = next;
+                } else {
+                    live_sequential_accounting_valid = false;
+                }
+            }};
+        }
         macro_rules! account_wave_load {
             ($layer_idx:expr, $elapsed_ms:expr) => {{
                 let elapsed_ms = $elapsed_ms;
@@ -31095,7 +31944,7 @@ impl Gemma4GhostCommonMetal {
                 // exact StageCold work and expert/tail commit.
                 if layer_idx + 1 < n_layers {
                     if let Some(predictor) = live_sequential_predictor.as_deref_mut() {
-                        live_sequential_attempts = live_sequential_attempts.saturating_add(1);
+                        checked_live_sequential_add!(live_sequential_attempts, 1);
                         let next_layer_idx = layer_idx + 1;
                         let flat_hidden = unsafe {
                             std::slice::from_raw_parts(
@@ -31105,8 +31954,9 @@ impl Gemma4GhostCommonMetal {
                         };
                         let predict_started = std::time::Instant::now();
                         let ranked = predictor(next_layer_idx, flat_hidden, k_tokens);
-                        live_sequential_predict_us = live_sequential_predict_us.saturating_add(
-                            predict_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                        checked_live_sequential_add!(
+                            live_sequential_predict_us,
+                            predict_started.elapsed().as_micros().min(u64::MAX as u128) as u64
                         );
                         match ranked {
                             Some(ranked) if !ranked.is_empty() => {
@@ -31115,8 +31965,7 @@ impl Gemma4GhostCommonMetal {
                                 }
                             }
                             _ => {
-                                live_sequential_failures =
-                                    live_sequential_failures.saturating_add(1);
+                                checked_live_sequential_add!(live_sequential_failures, 1);
                                 if let Some(failed) = live_sequential_failed.as_mut() {
                                     failed[next_layer_idx] = true;
                                 }
@@ -31410,21 +32259,15 @@ impl Gemma4GhostCommonMetal {
                             .and_then(|predictions| predictions.get(layer_idx))
                             .and_then(Option::as_deref);
                         let hot = hot_residency_at_start.and_then(|hot| hot.get(layer_idx));
-                        let tallies = ranked.zip(hot).and_then(|(ranked, hot)| {
-                            Some((
-                                live_sequential_probe_tally(ranked, &union, hot, 4)?,
-                                live_sequential_probe_tally(ranked, &union, hot, 8)?,
-                            ))
+                        let observation = ranked.zip(hot).and_then(|(ranked, hot)| {
+                            live_sequential_probe_observe_layer(ranked, &union, hot)
                         });
-                        if let Some((cap4, cap8)) = tallies {
-                            if let Some(per_layer) = live_sequential_cap4.as_mut() {
-                                per_layer[layer_idx] = Some(cap4);
-                            }
-                            if let Some(per_layer) = live_sequential_cap8.as_mut() {
-                                per_layer[layer_idx] = Some(cap8);
+                        if let Some(observation) = observation {
+                            if let Some(per_layer) = live_sequential_observations.as_mut() {
+                                per_layer[layer_idx] = Some(observation);
                             }
                         } else {
-                            live_sequential_failures = live_sequential_failures.saturating_add(1);
+                            checked_live_sequential_add!(live_sequential_failures, 1);
                             if let Some(failed) = live_sequential_failed.as_mut() {
                                 failed[layer_idx] = true;
                             }
@@ -33655,8 +34498,7 @@ impl Gemma4GhostCommonMetal {
             // front of current exact demand. Its target is L+1, and the next
             // layer's exact router remains the sole consumer authority.
             if live_sequential_stage_admitted && layer_idx + 1 < n_layers {
-                live_sequential_stage_launch_attempts =
-                    live_sequential_stage_launch_attempts.saturating_add(1);
+                checked_live_sequential_add!(live_sequential_stage_launch_attempts, 1);
                 let next_layer_idx = layer_idx + 1;
                 let cold_candidates = live_sequential_ranked
                     .as_ref()
@@ -33666,8 +34508,14 @@ impl Gemma4GhostCommonMetal {
                     .and_then(|(ranked, hot)| live_sequential_cold_candidates(ranked, hot, 8));
                 match cold_candidates {
                     Some(candidates) => {
-                        live_sequential_stage_candidates = live_sequential_stage_candidates
-                            .saturating_add(candidates.len().min(u32::MAX as usize) as u32);
+                        if let Ok(candidate_count) = u32::try_from(candidates.len()) {
+                            checked_live_sequential_add!(
+                                live_sequential_stage_candidates,
+                                candidate_count
+                            );
+                        } else {
+                            live_sequential_accounting_valid = false;
+                        }
                         // An empty launch is still meaningful: it replaces any
                         // stale generation so no obsolete private read can
                         // continue merely because every prediction was hot.
@@ -33675,16 +34523,13 @@ impl Gemma4GhostCommonMetal {
                             .as_deref_mut()
                             .is_some_and(|launcher| launcher(next_layer_idx, &candidates));
                         if launched {
-                            live_sequential_stage_launches =
-                                live_sequential_stage_launches.saturating_add(1);
+                            checked_live_sequential_add!(live_sequential_stage_launches, 1);
                         } else {
-                            live_sequential_stage_launch_failures =
-                                live_sequential_stage_launch_failures.saturating_add(1);
+                            checked_live_sequential_add!(live_sequential_stage_launch_failures, 1);
                         }
                     }
                     None => {
-                        live_sequential_stage_launch_failures =
-                            live_sequential_stage_launch_failures.saturating_add(1);
+                        checked_live_sequential_add!(live_sequential_stage_launch_failures, 1);
                     }
                 }
             }
@@ -34082,107 +34927,45 @@ impl Gemma4GhostCommonMetal {
             );
         }
         if live_sequential_probe_admitted {
-            let cap4 = live_sequential_cap4
+            let receipt = live_sequential_observations
                 .as_deref()
                 .zip(live_sequential_read_wall_ms.as_deref())
-                .and_then(|(tallies, wall)| summarize_live_sequential_probe(tallies, wall));
-            let cap8 = live_sequential_cap8
-                .as_deref()
-                .zip(live_sequential_read_wall_ms.as_deref())
-                .and_then(|(tallies, wall)| summarize_live_sequential_probe(tallies, wall));
-            let truth_valid = cap4.zip(cap8).is_some_and(|(cap4, cap8)| {
-                live_sequential_failures == 0
-                    && cap4.compared_layers == live_sequential_attempts
-                    && cap8.compared_layers == live_sequential_attempts
-                    && live_sequential_attempts == n_layers.saturating_sub(1) as u32
-            });
-            let cap4 = cap4.unwrap_or_default();
-            let cap8 = cap8.unwrap_or_default();
-            let ratio = |numerator: u32, denominator: u32| {
-                (denominator != 0)
-                    .then(|| format!("{:.6}", f64::from(numerator) / f64::from(denominator)))
-                    .unwrap_or_else(|| "na".to_owned())
-            };
-            let weighted_recall = |summary: LiveSequentialProbeSummary| {
-                (summary.read_wall_ms > 0.0)
-                    .then(|| format!("{:.6}", summary.projected_saved_ms / summary.read_wall_ms))
-                    .unwrap_or_else(|| "na".to_owned())
-            };
-            let cap8_candidates = live_sequential_ranked
-                .as_deref()
-                .zip(hot_residency_at_start)
-                .map(|(ranked, hot)| {
-                    ranked
-                        .iter()
-                        .zip(hot)
-                        .enumerate()
-                        .skip(1)
-                        .filter_map(|(layer_idx, (ranked, hot))| {
-                            ranked.as_ref().map(|ranked| {
-                                let ids = ranked
-                                    .iter()
-                                    .copied()
-                                    .filter(|&expert| expert < 128 && !hot[expert])
-                                    .take(8)
-                                    .map(|expert| expert.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                format!("L{layer_idx}:{ids}")
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .join("/")
-                })
-                .unwrap_or_default();
-            let cap8_layers = live_sequential_cap8
-                .as_deref()
-                .zip(live_sequential_read_wall_ms.as_deref())
-                .map(|(tallies, wall)| {
-                    tallies
-                        .iter()
-                        .zip(wall)
-                        .enumerate()
-                        .skip(1)
-                        .filter_map(|(layer_idx, (tally, wall_ms))| {
-                            tally.map(|tally| {
-                                format!(
-                                    "L{layer_idx}:{}/{}/{}@{wall_ms:.3}",
-                                    tally.hits, tally.actual_cold, tally.predicted_cold,
-                                )
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .unwrap_or_default();
-            eprintln!(
-                "[metal live-sequential-predict probe] schema=1 admitted=1 profile=exact-live-sequential-hot-shape start_pos={start_pos} K={k_tokens} source=post-attention-slab-b target=next-layer-exact-union first_target_layer=1 eligible_layers={} attempted_layers={live_sequential_attempts} failures={live_sequential_failures} truth_valid={} predict_us={live_sequential_predict_us} predictor_top_k_per_row=8 cap4_hits={} cap4_actual_cold={} cap4_predicted_cold={} cap4_recall={} cap4_precision={} cap4_read_wall_ms={:.3} cap4_projected_saved_ms={:.3} cap4_read_wall_weighted_recall={} cap8_hits={} cap8_actual_cold={} cap8_predicted_cold={} cap8_recall={} cap8_precision={} cap8_read_wall_ms={:.3} cap8_projected_saved_ms={:.3} cap8_read_wall_weighted_recall={} total_wave_load_ms={:.3} projection=record-linear-per-layer-wave-load-ceiling stage_admitted={} stage_launch_attempts={live_sequential_stage_launch_attempts} stage_launches={live_sequential_stage_launches} stage_launch_failures={live_sequential_stage_launch_failures} stage_candidates={live_sequential_stage_candidates} readiness_measured={} contention_measured={} output_mutation=0 io_mutation={} slot_policy_mutation=0 routing_authority=exact-router cap8_candidates={} cap8_layers={}",
-                n_layers.saturating_sub(1),
-                u8::from(truth_valid),
-                cap4.hits,
-                cap4.actual_cold,
-                cap4.predicted_cold,
-                ratio(cap4.hits, cap4.actual_cold),
-                ratio(cap4.hits, cap4.predicted_cold),
-                cap4.read_wall_ms,
-                cap4.projected_saved_ms,
-                weighted_recall(cap4),
-                cap8.hits,
-                cap8.actual_cold,
-                cap8.predicted_cold,
-                ratio(cap8.hits, cap8.actual_cold),
-                ratio(cap8.hits, cap8.predicted_cold),
-                cap8.read_wall_ms,
-                cap8.projected_saved_ms,
-                weighted_recall(cap8),
-                ledger.wave_load_ms,
-                u8::from(live_sequential_stage_admitted),
-                u8::from(live_sequential_stage_admitted),
-                u8::from(live_sequential_stage_admitted),
-                u8::from(live_sequential_stage_admitted),
-                cap8_candidates,
-                cap8_layers,
-            );
+                .ok_or("missing-observation-state")
+                .and_then(|(observations, read_wall_ms)| {
+                    validate_live_sequential_probe_receipt(
+                        observations,
+                        read_wall_ms,
+                        n_layers,
+                        live_sequential_attempts,
+                        live_sequential_failures,
+                        live_sequential_accounting_valid,
+                        live_sequential_stage_admitted,
+                        live_sequential_stage_launch_attempts,
+                        live_sequential_stage_launches,
+                        live_sequential_stage_launch_failures,
+                        live_sequential_stage_candidates,
+                        ledger.wave_load_ms,
+                    )
+                });
+            match receipt {
+                Ok(receipt) => eprintln!(
+                    "{}",
+                    format_live_sequential_probe_receipt(
+                        &receipt,
+                        start_pos,
+                        k_tokens,
+                        live_sequential_attempts,
+                        live_sequential_failures,
+                        live_sequential_predict_us,
+                        live_sequential_stage_launches,
+                        live_sequential_stage_launch_failures,
+                        live_sequential_stage_candidates,
+                    )
+                ),
+                Err(reason) => {
+                    eprintln!("{}", format_live_sequential_probe_invalid_receipt(reason))
+                }
+            }
         }
         self.last_chained_ledger = ledger;
         true
