@@ -174,6 +174,13 @@ class ReceiptError(RuntimeError):
     """The run cannot support an H69 discriminator result."""
 
 
+def popcount(value: int) -> int:
+    """Return a population count on Mini2's pre-3.10 system Python."""
+    if value < 0:
+        raise ReceiptError("cannot count bits in a negative mask")
+    return bin(value).count("1")
+
+
 def _expect_fields(value: dict[str, Any], expected: set[str], label: str) -> None:
     observed = set(value)
     if observed != expected:
@@ -338,7 +345,7 @@ def validate_prompt_ranked_handoff(
     ):
         if selected_mask != resident_mask:
             raise ReceiptError(f"prompt-ranked L{layer} selected/resident identities differ")
-        if selected_mask.bit_count() != capacity:
+        if popcount(selected_mask) != capacity:
             raise ReceiptError(f"prompt-ranked L{layer} identity count differs from capacity")
     return resident
 
