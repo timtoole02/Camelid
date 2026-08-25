@@ -12159,6 +12159,7 @@ fn materialize_observed_ghost_common_resident_layers(
 fn finish_ghost_common_metal(
     prepared: GhostCommonMetalPrepared,
     layers: &[LayerWeights],
+    local_kv_ring_requested: bool,
 ) -> Option<GhostCommonMetalBuild> {
     let GhostCommonMetalPrepared {
         resident_layers,
@@ -12216,8 +12217,12 @@ fn finish_ghost_common_metal(
             })
             .collect()
     });
-    let mut common =
-        crate::metal::Gemma4GhostCommonMetal::new_26b(resident_layers, post_norm_1, max_positions)?;
+    let mut common = crate::metal::Gemma4GhostCommonMetal::new_26b(
+        resident_layers,
+        post_norm_1,
+        max_positions,
+        local_kv_ring_requested,
+    )?;
     if !common.configure_moe(moe_configs) {
         return None;
     }
@@ -12238,6 +12243,7 @@ fn build_ghost_common_metal(
     g: &Gemma4Metadata,
     layers: &[LayerWeights],
     max_positions: usize,
+    local_kv_ring_requested: bool,
 ) -> Result<Option<GhostCommonMetalBuild>> {
     Ok(prepare_ghost_common_metal(
         path,
@@ -12250,7 +12256,7 @@ fn build_ghost_common_metal(
         max_positions,
         false,
     )?
-    .and_then(|prepared| finish_ghost_common_metal(prepared, layers)))
+    .and_then(|prepared| finish_ghost_common_metal(prepared, layers, local_kv_ring_requested)))
 }
 
 /// A loaded Gemma 4 model ready to generate.
@@ -12286,6 +12292,11 @@ pub struct Gemma4Runtime {
     /// remains the permanent fallback for the rest of the session.
     #[cfg(target_os = "macos")]
     metal_q4_experts: std::sync::Mutex<Option<GhostMetalExpertRuntime>>,
+    /// Immutable load-time qualification admission. When true, every target
+    /// forward must use the exact local-ring Ghost Metal common core; CPU,
+    /// missing-lane, and non-ring Metal fallbacks are typed errors.
+    #[cfg(target_os = "macos")]
+    ghost_local_kv_ring_fail_closed: bool,
     /// The common-core KV cache is model-owned. Hold this for a complete public
     /// generation request so two callers cannot interleave position-zero resets
     /// and token steps on the same persistent Metal buffers.
@@ -15288,6 +15299,10 @@ impl Gemma4Runtime {
         }
 
         #[cfg(target_os = "macos")]
+        let ghost_local_kv_ring_fail_closed = crate::metal::gemma4_local_kv_ring_requested()
+            .map_err(BackendError::InvalidModelMetadata)?;
+
+        #[cfg(target_os = "macos")]
         let metal_q4_experts = {
             let flag = |name: &str| {
                 std::env::var(name).is_ok_and(|value| {
@@ -15353,6 +15368,17 @@ impl Gemma4Runtime {
             } else {
                 false
             };
+            // Parsed exactly once before any Metal allocation, then passed
+            // unchanged through construction and every runtime fallback gate.
+            let local_kv_ring_requested = ghost_local_kv_ring_fail_closed;
+            if local_kv_ring_requested
+                && (!enabled || !common_enabled || !exact_geometry || !exact_records)
+            {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "Gemma f32 local-KV ring was explicitly requested, but the exact Ghost Metal slots/common/26B record geometry is unavailable; refusing CPU or non-ring Metal fallback"
+                        .into(),
+                ));
+            }
             let common_max_positions = || {
                 std::env::var("CAMELID_GEMMA4_GHOST_METAL_CONTEXT")
                     .ok()
@@ -15605,11 +15631,12 @@ impl Gemma4Runtime {
                     mut common,
                     wire_q4_payload_bytes: _,
                     wire_q4_allocation_bytes: _,
-                } = finish_ghost_common_metal(prepared, &layers).ok_or_else(|| {
-                    BackendError::UnsupportedModelArchitecture(
-                        "observed Ghost common KV/scratch construction failed".into(),
-                    )
-                })?;
+                } = finish_ghost_common_metal(prepared, &layers, local_kv_ring_requested)
+                    .ok_or_else(|| {
+                        BackendError::UnsupportedModelArchitecture(
+                            "observed Ghost common KV/scratch construction failed".into(),
+                        )
+                    })?;
                 let q4_simd_fast = common.enable_fused_fast_q4(fused_fast);
                 let geometry = common.geometry();
                 let allocation = common.allocation_ledger();
@@ -15767,6 +15794,7 @@ impl Gemma4Runtime {
                         &g,
                         &layers,
                         common_max_positions(),
+                        local_kv_ring_requested,
                     ) {
                         Ok(Some(build)) => {
                             let GhostCommonMetalBuild {
@@ -15808,6 +15836,15 @@ impl Gemma4Runtime {
                 } else {
                     None
                 };
+                if local_kv_ring_requested
+                    && allocation_order == GhostMetalAllocationOrder::CommonThenSlots
+                    && common_before_slots.is_none()
+                {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma f32 local-KV ring common-core construction was refused; refusing CPU or non-ring Metal fallback"
+                            .into(),
+                    ));
+                }
                 if file_mapped_experts
                     && (!enabled
                         || !common_enabled
@@ -15853,6 +15890,12 @@ impl Gemma4Runtime {
                 } else {
                     None
                 };
+                if local_kv_ring_requested && runtime.is_none() {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma f32 local-KV ring could not allocate persistent Ghost Metal slots; refusing CPU or non-ring Metal fallback"
+                            .into(),
+                    ));
+                }
                 if common_enabled {
                     if let Some(lane) = runtime.as_mut() {
                         let built_common = match allocation_order {
@@ -15861,10 +15904,17 @@ impl Gemma4Runtime {
                             }
                             GhostMetalAllocationOrder::SlotsThenCommon => build_common(),
                         };
+                        if local_kv_ring_requested && built_common.is_none() {
+                            return Err(BackendError::UnsupportedModelArchitecture(
+                                "Gemma f32 local-KV ring common-core construction was refused; refusing CPU or non-ring Metal fallback"
+                                    .into(),
+                            ));
+                        }
                         if let Some((mut common, q4_simd_fast)) = built_common {
                             let geometry = common.geometry();
+                            let allocation = common.allocation_ledger();
                             eprintln!(
-                                "[gemma4-ghost-common] ACTIVE: full Metal common core, context cap={} positions, allocated KV={} ({:.2}GiB of {:.2}GiB at cap), router/shared/expert/tail device-chained, mode={}, q4-row={}",
+                                "[gemma4-ghost-common] ACTIVE: full Metal common core, context cap={} positions, allocated KV={} ({:.2}GiB of {:.2}GiB at cap), local_stride={} global_stride={} local_ring={} ring_saved={:.2}MiB, router/shared/expert/tail device-chained, mode={}, q4-row={}",
                                 geometry.max_positions,
                                 geometry.kv_capacity,
                                 geometry.kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -15872,6 +15922,14 @@ impl Gemma4Runtime {
                                     / geometry.kv_capacity.max(1) as f64)
                                     * (geometry.kv_bytes as f64
                                         / (1024.0 * 1024.0 * 1024.0)),
+                                geometry.local_kv_stride,
+                                geometry.global_kv_stride,
+                                usize::from(geometry.local_kv_ring),
+                                allocation
+                                    .kv_full_prefix_equivalent_bytes
+                                    .saturating_sub(allocation.kv_capacity_bytes)
+                                    as f64
+                                    / (1024.0 * 1024.0),
                                 if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
                                 if q4_simd_fast { "simdgroup-ordered" } else { "scalar-ordered" },
                             );
@@ -15918,6 +15976,27 @@ impl Gemma4Runtime {
                     .expect("observed cache check retains its observer")
                     .ledger
                     .host_cache_resident_bytes = 0;
+            }
+            if local_kv_ring_requested {
+                let runtime = lane.as_mut().ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "Gemma f32 local-KV ring lost its Ghost Metal runtime before load completed"
+                            .into(),
+                    )
+                })?;
+                let common = runtime.common.as_ref().ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "Gemma f32 local-KV ring lost its common Metal core before load completed"
+                            .into(),
+                    )
+                })?;
+                if !common.geometry().local_kv_ring {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma f32 local-KV ring common core completed without physical ring geometry"
+                            .into(),
+                    ));
+                }
+                runtime.cpu_fallback_forbidden = true;
             }
             std::sync::Mutex::new(lane)
         };
@@ -16226,6 +16305,8 @@ impl Gemma4Runtime {
             ghost_moe_cache,
             #[cfg(target_os = "macos")]
             metal_q4_experts,
+            #[cfg(target_os = "macos")]
+            ghost_local_kv_ring_fail_closed,
             #[cfg(target_os = "macos")]
             ghost_common_generation: std::sync::Mutex::new(()),
             #[cfg(target_os = "macos")]
@@ -16926,11 +17007,23 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             let gpu_allowed = ghost_metal_acceleration_enabled();
+            if self.ghost_local_kv_ring_fail_closed && !gpu_allowed {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "Gemma f32 local-KV ring was requested, but Ghost Metal acceleration is disabled; refusing a CPU prefill plan"
+                        .into(),
+                ));
+            }
             let mut guard = self
                 .metal_q4_experts
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let Some(runtime) = guard.as_mut() else {
+                if self.ghost_local_kv_ring_fail_closed {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma f32 local-KV ring lost its persistent Ghost Metal lane; refusing a CPU prefill plan"
+                            .into(),
+                    ));
+                }
                 return Ok(select_ghost_prefill_plan(
                     chunk_eligible,
                     hybrid_enabled,
@@ -16942,8 +17035,18 @@ impl Gemma4Runtime {
             let configured_capacity = runtime
                 .common
                 .as_ref()
-                .filter(|common| common.moe_configured())
+                .filter(|common| {
+                    common.moe_configured()
+                        && (!self.ghost_local_kv_ring_fail_closed
+                            || common.geometry().local_kv_ring)
+                })
                 .map(crate::metal::Gemma4GhostCommonMetal::max_positions);
+            if self.ghost_local_kv_ring_fail_closed && configured_capacity.is_none() {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "Gemma f32 local-KV ring common core is missing, unconfigured, or non-ring; refusing a CPU prefill plan"
+                        .into(),
+                ));
+            }
             let common_capacity = gpu_allowed.then_some(configured_capacity).flatten();
             let plan = select_ghost_prefill_plan(
                 chunk_eligible,
@@ -16952,6 +17055,16 @@ impl Gemma4Runtime {
                 required_positions,
                 common_capacity,
             );
+            if self.ghost_local_kv_ring_fail_closed
+                && matches!(
+                    plan,
+                    GhostPrefillPlan::ScalarCpu | GhostPrefillPlan::CpuChunk
+                )
+            {
+                return Err(BackendError::UnsupportedModelArchitecture(format!(
+                    "Gemma f32 local-KV ring cannot admit {required_positions} request positions in the configured Metal context; refusing {plan:?} fallback"
+                )));
+            }
             if let Some(common) = runtime.common.as_mut() {
                 common.reset_sequence();
             }
@@ -17006,6 +17119,12 @@ impl Gemma4Runtime {
                     )
                 })?;
                 let Some(runtime) = guard.as_mut() else {
+                    if self.ghost_local_kv_ring_fail_closed {
+                        return Err(BackendError::UnsupportedModelArchitecture(
+                            "Gemma f32 local-KV ring lost its persistent Metal lane during hybrid prefill handoff"
+                                .into(),
+                        ));
+                    }
                     return Ok(false);
                 };
                 if runtime.sequence_mode != GhostMetalSequenceMode::HybridPrefill
@@ -17016,11 +17135,23 @@ impl Gemma4Runtime {
                     if let Some(common) = runtime.common.as_mut() {
                         common.reset_sequence();
                     }
+                    if self.ghost_local_kv_ring_fail_closed {
+                        return Err(BackendError::UnsupportedModelArchitecture(
+                            "Gemma f32 local-KV ring hybrid prefill handoff lost its exact Metal sequence admission"
+                                .into(),
+                        ));
+                    }
                     return Ok(false);
                 }
                 let Some(common) = runtime.common.as_mut() else {
                     runtime.prefill_round = false;
                     runtime.sequence_mode = GhostMetalSequenceMode::Cpu;
+                    if self.ghost_local_kv_ring_fail_closed {
+                        return Err(BackendError::UnsupportedModelArchitecture(
+                            "Gemma f32 local-KV ring common core disappeared during hybrid prefill handoff"
+                                .into(),
+                        ));
+                    }
                     return Ok(false);
                 };
                 let common_ready = if common.is_at_position(positions) {
@@ -17029,6 +17160,12 @@ impl Gemma4Runtime {
                     match common.import_position_major_kv(kc, vc, positions) {
                         Ok(()) => true,
                         Err(error) => {
+                            if self.ghost_local_kv_ring_fail_closed {
+                                common.reset_sequence();
+                                return Err(BackendError::InvalidTensorData(format!(
+                                    "Gemma f32 local-KV ring CPU-prefill KV import failed closed: {error}"
+                                )));
+                            }
                             eprintln!(
                                 "[gemma4-ghost-common] CPU prefill KV import refused: {error}; continuing this request on CPU"
                             );
@@ -17043,6 +17180,11 @@ impl Gemma4Runtime {
                     let handoff_label = runtime.hybrid_hot_handoff_label();
                     if let Some(cache) = ghost_cache {
                         if !runtime.finish_hybrid_prefill_hot_handoff(cache) {
+                            if self.ghost_local_kv_ring_fail_closed {
+                                return Err(BackendError::InvalidTensorData(format!(
+                                    "Gemma f32 local-KV ring prefill {handoff_label} handoff failed closed"
+                                )));
+                            }
                             eprintln!(
                                 "[gemma4-ghost-metal] prefill {handoff_label} handoff refused; mapped fallback remains authoritative"
                             );
@@ -17050,6 +17192,11 @@ impl Gemma4Runtime {
                     } else {
                         runtime.prefill_round = false;
                         if runtime.has_hybrid_mapped_backing() {
+                            if self.ghost_local_kv_ring_fail_closed {
+                                return Err(BackendError::InvalidModelMetadata(format!(
+                                    "Gemma f32 local-KV ring prefill {handoff_label} handoff lost its canonical cache owner"
+                                )));
+                            }
                             eprintln!(
                                 "[gemma4-ghost-metal] prefill {handoff_label} handoff lost its canonical cache owner; mapped fallback retained"
                             );
@@ -17194,8 +17341,25 @@ impl Gemma4Runtime {
             BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
         })?;
         let Some(runtime) = guard.as_mut() else {
+            if self.ghost_local_kv_ring_fail_closed {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "Gemma f32 local-KV ring lost its persistent Ghost Metal lane during scalar forward"
+                        .into(),
+                ));
+            }
             return Ok(None);
         };
+        if self.ghost_local_kv_ring_fail_closed
+            && !runtime
+                .common
+                .as_ref()
+                .is_some_and(|common| common.moe_configured() && common.geometry().local_kv_ring)
+        {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "Gemma f32 local-KV ring scalar forward found no configured ring common core"
+                    .into(),
+            ));
+        }
 
         // Public generation can pin CPU/Hybrid before position zero. Preserve
         // those decisions; Idle direct callers and a stale/completed Metal
@@ -17206,12 +17370,18 @@ impl Gemma4Runtime {
                 GhostMetalSequenceMode::Idle | GhostMetalSequenceMode::Metal
             )
         {
-            runtime.sequence_mode = if gpu_allowed
+            let metal_ready = gpu_allowed
                 && runtime
                     .common
                     .as_ref()
-                    .is_some_and(crate::metal::Gemma4GhostCommonMetal::moe_configured)
-            {
+                    .is_some_and(crate::metal::Gemma4GhostCommonMetal::moe_configured);
+            if self.ghost_local_kv_ring_fail_closed && !metal_ready {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "Gemma f32 local-KV ring scalar position zero could not select the exact Metal lane"
+                        .into(),
+                ));
+            }
+            runtime.sequence_mode = if metal_ready {
                 if let Some(common) = runtime.common.as_mut() {
                     common.reset_sequence();
                 }
@@ -17223,7 +17393,15 @@ impl Gemma4Runtime {
         match runtime.sequence_mode {
             GhostMetalSequenceMode::Cpu
             | GhostMetalSequenceMode::HybridPrefill
-            | GhostMetalSequenceMode::Idle => return Ok(None),
+            | GhostMetalSequenceMode::Idle => {
+                if self.ghost_local_kv_ring_fail_closed {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma f32 local-KV ring scalar forward reached non-Metal sequence mode {:?}",
+                        runtime.sequence_mode
+                    )));
+                }
+                return Ok(None);
+            }
             GhostMetalSequenceMode::Metal if !gpu_allowed => {
                 return Err(BackendError::UnsupportedModelArchitecture(
                     "Ghost common Metal was disabled during an active request; retry the request so Camelid can select one KV lane from position zero".into(),
@@ -17555,7 +17733,7 @@ impl Gemma4Runtime {
                 }
                 Ok(Some(output))
             }
-            Err(error) if pos == 0 => {
+            Err(error) if pos == 0 && !self.ghost_local_kv_ring_fail_closed => {
                 eprintln!(
                     "[gemma4-ghost-common] first-position Metal attempt failed: {error}; restarting this request on the CPU lane"
                 );
@@ -17602,6 +17780,12 @@ impl Gemma4Runtime {
             };
         }
         #[cfg(target_os = "macos")]
+        if self.ghost_local_kv_ring_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma f32 local-KV ring scalar step at position {pos} fell through without a Metal result"
+            )));
+        }
+        #[cfg(target_os = "macos")]
         self.guard_cpu_kv_lane(pos, kc)?;
         if lane_trace_enabled() {
             eprintln!("[lane] step pos={pos} -> step_range(scalar CPU)");
@@ -17640,6 +17824,12 @@ impl Gemma4Runtime {
             };
         }
         #[cfg(target_os = "macos")]
+        if self.ghost_local_kv_ring_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma f32 local-KV ring headless scalar step at position {pos} fell through without a Metal result"
+            )));
+        }
+        #[cfg(target_os = "macos")]
         self.guard_cpu_kv_lane(pos, kc)?;
         match self.step_range(token, pos, None, kc, vc)? {
             Gemma4StepOutput::Hidden(_) | Gemma4StepOutput::Logits(_) => Ok(()),
@@ -17653,6 +17843,11 @@ impl Gemma4Runtime {
     /// attend over nothing. Fail closed instead of producing wrong logits.
     #[cfg(target_os = "macos")]
     fn guard_cpu_kv_lane(&self, pos: usize, kc: &[Vec<Vec<f32>>]) -> Result<()> {
+        if self.ghost_local_kv_ring_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma f32 local-KV ring forbids the CPU KV lane at position {pos}"
+            )));
+        }
         if pos > 0 && self.ghost_metal_q4_is_enabled() && kc.iter().all(|layer| layer.is_empty()) {
             return Err(BackendError::InvalidModelMetadata(format!(
                 "Gemma 4 scalar step at position {pos} fell through to the CPU KV lane \
@@ -18775,6 +18970,17 @@ impl Gemma4Runtime {
     ) -> Result<Gemma4SpeculativeStepResult> {
         self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
+        if self.ghost_local_kv_ring_fail_closed
+            && (!ghost_metal_acceleration_enabled()
+                || !self.supports_chunk_forward()
+                || self.metal_q6k_head.is_none())
+        {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "Gemma f32 local-KV ring speculative verification requires the exact Ghost Metal chained lane and Metal tied head; refusing an outer CPU/skip fallback"
+                    .into(),
+            ));
+        }
+        #[cfg(target_os = "macos")]
         if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
             if let Some(head) = self.metal_q6k_head.as_ref() {
                 let kk = tokens.len();
@@ -18891,6 +19097,11 @@ impl Gemma4Runtime {
                     }
                 }
 
+                if self.ghost_local_kv_ring_fail_closed && !gpu_chained_round_ok {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma f32 local-KV ring speculative verifier chained dispatch failed at position {start_pos} for K={kk}; refusing CPU verification fallback"
+                    )));
+                }
                 if let Some(ledger) = chained_refusal_ledger.filter(|_| chained_fallback_forbidden)
                 {
                     return Err(bounded_record_chained_refusal(
@@ -18932,6 +19143,14 @@ impl Gemma4Runtime {
                     }
                 }
             }
+        }
+
+        #[cfg(target_os = "macos")]
+        if self.ghost_local_kv_ring_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma f32 local-KV ring speculative verifier did not complete its exact Metal path at position {start_pos} for K={}",
+                tokens.len()
+            )));
         }
 
         let mut hidden_rows = Vec::new();
@@ -19120,6 +19339,11 @@ impl Gemma4Runtime {
                         }
                     }
                 }
+            }
+            if self.ghost_local_kv_ring_fail_closed && !gpu_chained_round_ok {
+                return Err(BackendError::UnsupportedModelArchitecture(format!(
+                    "Gemma f32 local-KV ring chunk forward did not complete the exact chained Metal path at position {start_pos} for K={kk}; refusing CPU attention/KV fallback"
+                )));
             }
             if let Some(ledger) = chained_refusal_ledger.filter(|_| chained_fallback_forbidden) {
                 return Err(bounded_record_chained_refusal(
@@ -19641,12 +19865,24 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             if !ghost_metal_acceleration_enabled() {
+                if self.ghost_local_kv_ring_fail_closed {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma f32 local-KV ring expert layer {} cannot skip disabled Metal acceleration",
+                        ghost.layer_idx
+                    )));
+                }
                 return Ok(None);
             }
             let mut guard = self.metal_q4_experts.lock().map_err(|_| {
                 BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
             })?;
             let Some(lane) = guard.as_mut() else {
+                if self.ghost_local_kv_ring_fail_closed {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma f32 local-KV ring expert layer {} lost its persistent Metal lane",
+                        ghost.layer_idx
+                    )));
+                }
                 return Ok(None);
             };
             let fallback_forbidden = lane.cpu_fallback_forbidden();
@@ -21342,6 +21578,12 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<(Gemma4StepOutput, TokenStepProfile)> {
         self.invalidate_mtp_prefill_seed();
+        #[cfg(target_os = "macos")]
+        if self.ghost_local_kv_ring_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma f32 local-KV ring forbids profiled CPU step_range at position {pos}"
+            )));
+        }
         let hidden = self.config.embedding_length as usize;
         let heads = self.config.attention_head_count as usize;
         let ple_dim = self.g.per_layer_input_dim as usize;
@@ -21779,6 +22021,12 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
         project_head: bool,
     ) -> Result<Gemma4StepOutput> {
+        #[cfg(target_os = "macos")]
+        if self.ghost_local_kv_ring_fail_closed {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma f32 local-KV ring forbids CPU step_range at position {pos}"
+            )));
+        }
         let hidden = self.config.embedding_length as usize;
         let heads = self.config.attention_head_count as usize;
         let ple_dim = self.g.per_layer_input_dim as usize;

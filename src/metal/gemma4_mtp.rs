@@ -520,6 +520,132 @@ kernel void mtp_attention_scores_bf16_lattice_query_f32(
     }
 }
 
+kernel void mtp_attention_scores_bf16_ring_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant float& scale [[buffer(7)]],
+    constant uint& position_stride [[buffer(8)]],
+    constant uint& kv_head_stride [[buffer(9)]],
+    constant uint& kv_base_offset [[buffer(10)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= n_heads || (head_dim & 31u) != 0u || position_stride == 0u ||
+        kv_head_stride < position_stride) return;
+    const uint kv_head = head / group;
+    const uint q_base = head * head_dim;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride;
+    const uint kv_base = kv_head * kv_head_stride;
+    const uint score_base = head * position_count;
+    for (uint p = lane; p < position_count; p += 32) {
+        const uint physical_position = (logical_base + p) % physical_capacity;
+        const uint k_base = kv_base + physical_position * position_stride;
+        float4 acc0 = 0.0f;
+        float4 acc1 = 0.0f;
+        float4 acc2 = 0.0f;
+        float4 acc3 = 0.0f;
+        float4 acc4 = 0.0f;
+        float4 acc5 = 0.0f;
+        float4 acc6 = 0.0f;
+        float4 acc7 = 0.0f;
+        for (uint d = 0; d < head_dim; d += 32) {
+            acc0 += mtp_load_rounded_bf16x4(query, q_base + d + 0) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 0);
+            acc1 += mtp_load_rounded_bf16x4(query, q_base + d + 4) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 4);
+            acc2 += mtp_load_rounded_bf16x4(query, q_base + d + 8) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 8);
+            acc3 += mtp_load_rounded_bf16x4(query, q_base + d + 12) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 12);
+            acc4 += mtp_load_rounded_bf16x4(query, q_base + d + 16) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 16);
+            acc5 += mtp_load_rounded_bf16x4(query, q_base + d + 20) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 20);
+            acc6 += mtp_load_rounded_bf16x4(query, q_base + d + 24) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 24);
+            acc7 += mtp_load_rounded_bf16x4(query, q_base + d + 28) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 28);
+        }
+        acc0 += acc4;
+        acc1 += acc5;
+        acc2 += acc6;
+        acc3 += acc7;
+        acc0 += acc2;
+        acc1 += acc3;
+        acc0 += acc1;
+        const float dot = (acc0.x + acc0.y) + (acc0.z + acc0.w);
+        scores[score_base + p] = mtp_round_bf16(dot * scale);
+    }
+}
+
+kernel void mtp_attention_scores_bf16_lattice_query_ring_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant float& scale [[buffer(7)]],
+    constant uint& position_stride [[buffer(8)]],
+    constant uint& kv_head_stride [[buffer(9)]],
+    constant uint& kv_base_offset [[buffer(10)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= n_heads || (head_dim & 31u) != 0u || position_stride == 0u ||
+        kv_head_stride < position_stride) return;
+    const uint kv_head = head / group;
+    const uint q_base = head * head_dim;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride;
+    const uint kv_base = kv_head * kv_head_stride;
+    const uint score_base = head * position_count;
+    for (uint p = lane; p < position_count; p += 32) {
+        const uint physical_position = (logical_base + p) % physical_capacity;
+        const uint k_base = kv_base + physical_position * position_stride;
+        float4 acc0 = 0.0f;
+        float4 acc1 = 0.0f;
+        float4 acc2 = 0.0f;
+        float4 acc3 = 0.0f;
+        float4 acc4 = 0.0f;
+        float4 acc5 = 0.0f;
+        float4 acc6 = 0.0f;
+        float4 acc7 = 0.0f;
+        for (uint d = 0; d < head_dim; d += 32) {
+            acc0 += mtp_load_bf16_latticex4(query, q_base + d + 0) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 0);
+            acc1 += mtp_load_bf16_latticex4(query, q_base + d + 4) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 4);
+            acc2 += mtp_load_bf16_latticex4(query, q_base + d + 8) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 8);
+            acc3 += mtp_load_bf16_latticex4(query, q_base + d + 12) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 12);
+            acc4 += mtp_load_bf16_latticex4(query, q_base + d + 16) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 16);
+            acc5 += mtp_load_bf16_latticex4(query, q_base + d + 20) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 20);
+            acc6 += mtp_load_bf16_latticex4(query, q_base + d + 24) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 24);
+            acc7 += mtp_load_bf16_latticex4(query, q_base + d + 28) *
+                    mtp_load_rounded_bf16x4(keys, k_base + d + 28);
+        }
+        acc0 += acc4;
+        acc1 += acc5;
+        acc2 += acc6;
+        acc3 += acc7;
+        acc0 += acc2;
+        acc1 += acc3;
+        acc0 += acc1;
+        const float dot = (acc0.x + acc0.y) + (acc0.z + acc0.w);
+        scores[score_base + p] = mtp_round_bf16(dot * scale);
+    }
+}
+
 kernel void mtp_attention_softmax_bf16_f32(
     device float* scores [[buffer(0)]],
     constant uint& n_heads [[buffer(1)]],
@@ -633,6 +759,109 @@ kernel void mtp_attention_context_bf16_lattice_probabilities_f32(
             const float product =
                 probabilities[score_base + p] *
                 mtp_round_bf16(values[kv_base + p * position_stride + d]);
+            if (absolute_position >= physical_vector_end) {
+                p0 += product;
+            } else {
+                switch (absolute_position & 3u) {
+                    case 0u: p0 += product; break;
+                    case 1u: p1 += product; break;
+                    case 2u: p2 += product; break;
+                    default: p3 += product; break;
+                }
+            }
+        }
+        const float result = ((p0 + p1) + p2) + p3;
+        output[q_base + d] = mtp_round_bf16(result);
+    }
+}
+
+kernel void mtp_attention_context_bf16_ring_f32(
+    device const float* values [[buffer(0)]],
+    device const float* probabilities [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    constant uint& compact_base [[buffer(10)]],
+    constant uint& physical_logical_k [[buffer(11)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= n_heads || position_stride == 0u ||
+        kv_head_stride < position_stride ||
+        compact_base + position_count != physical_logical_k) return;
+    const uint kv_head = head / group;
+    const uint q_base = head * head_dim;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride;
+    const uint kv_base = kv_head * kv_head_stride;
+    const uint score_base = head * position_count;
+    const uint physical_vector_end = physical_logical_k & ~3u;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float p0 = 0.0f;
+        float p1 = 0.0f;
+        float p2 = 0.0f;
+        float p3 = 0.0f;
+        for (uint p = 0; p < position_count; ++p) {
+            const uint absolute_position = compact_base + p;
+            const uint physical_position = (logical_base + p) % physical_capacity;
+            const float product =
+                mtp_round_bf16(probabilities[score_base + p]) *
+                mtp_round_bf16(values[kv_base + physical_position * position_stride + d]);
+            if (absolute_position >= physical_vector_end) {
+                p0 += product;
+            } else {
+                switch (absolute_position & 3u) {
+                    case 0u: p0 += product; break;
+                    case 1u: p1 += product; break;
+                    case 2u: p2 += product; break;
+                    default: p3 += product; break;
+                }
+            }
+        }
+        const float result = ((p0 + p1) + p2) + p3;
+        output[q_base + d] = mtp_round_bf16(result);
+    }
+}
+
+kernel void mtp_attention_context_bf16_lattice_probabilities_ring_f32(
+    device const float* values [[buffer(0)]],
+    device const float* probabilities [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    constant uint& compact_base [[buffer(10)]],
+    constant uint& physical_logical_k [[buffer(11)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= n_heads || position_stride == 0u ||
+        kv_head_stride < position_stride ||
+        compact_base + position_count != physical_logical_k) return;
+    const uint kv_head = head / group;
+    const uint q_base = head * head_dim;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride;
+    const uint kv_base = kv_head * kv_head_stride;
+    const uint score_base = head * position_count;
+    const uint physical_vector_end = physical_logical_k & ~3u;
+    for (uint d = lane; d < head_dim; d += 32) {
+        float p0 = 0.0f;
+        float p1 = 0.0f;
+        float p2 = 0.0f;
+        float p3 = 0.0f;
+        for (uint p = 0; p < position_count; ++p) {
+            const uint absolute_position = compact_base + p;
+            const uint physical_position = (logical_base + p) % physical_capacity;
+            const float product = probabilities[score_base + p] *
+                mtp_round_bf16(values[kv_base + physical_position * position_stride + d]);
             if (absolute_position >= physical_vector_end) {
                 p0 += product;
             } else {
@@ -1845,11 +2074,15 @@ struct MtpPipelines {
     gelu_mul_bf16: ComputePipelineState,
     attention_scores_bf16: ComputePipelineState,
     attention_scores_bf16_lattice_query: ComputePipelineState,
+    attention_scores_bf16_ring: ComputePipelineState,
+    attention_scores_bf16_lattice_query_ring: ComputePipelineState,
     #[cfg(test)]
     attention_scores_legacy_bf16: ComputePipelineState,
     attention_softmax_bf16: ComputePipelineState,
     attention_context_bf16: ComputePipelineState,
     attention_context_bf16_lattice_probabilities: ComputePipelineState,
+    attention_context_bf16_ring: ComputePipelineState,
+    attention_context_bf16_lattice_probabilities_ring: ComputePipelineState,
     #[cfg(test)]
     attention_context_legacy_bf16: ComputePipelineState,
     rms_norm_aten_f32: ComputePipelineState,
@@ -1922,6 +2155,10 @@ impl MtpPipelines {
             attention_scores_bf16_lattice_query: pipeline(
                 "mtp_attention_scores_bf16_lattice_query_f32",
             )?,
+            attention_scores_bf16_ring: pipeline("mtp_attention_scores_bf16_ring_f32")?,
+            attention_scores_bf16_lattice_query_ring: pipeline(
+                "mtp_attention_scores_bf16_lattice_query_ring_f32",
+            )?,
             #[cfg(test)]
             attention_scores_legacy_bf16: test_diagnostic_pipeline(
                 "mtp_test_attention_scores_legacy_bf16_f32",
@@ -1930,6 +2167,10 @@ impl MtpPipelines {
             attention_context_bf16: pipeline("mtp_attention_context_bf16_f32")?,
             attention_context_bf16_lattice_probabilities: pipeline(
                 "mtp_attention_context_bf16_lattice_probabilities_f32",
+            )?,
+            attention_context_bf16_ring: pipeline("mtp_attention_context_bf16_ring_f32")?,
+            attention_context_bf16_lattice_probabilities_ring: pipeline(
+                "mtp_attention_context_bf16_lattice_probabilities_ring_f32",
             )?,
             #[cfg(test)]
             attention_context_legacy_bf16: test_diagnostic_pipeline(
@@ -1959,6 +2200,38 @@ impl MtpPipelines {
             &self.attention_context_bf16_lattice_probabilities
         } else {
             &self.attention_context_bf16
+        }
+    }
+
+    fn selected_attention_scores_bf16_for_kv(
+        &self,
+        bf16_lattice_loads: bool,
+        physical_ring: bool,
+    ) -> &ComputePipelineState {
+        if physical_ring {
+            if bf16_lattice_loads {
+                &self.attention_scores_bf16_lattice_query_ring
+            } else {
+                &self.attention_scores_bf16_ring
+            }
+        } else {
+            self.selected_attention_scores_bf16(bf16_lattice_loads)
+        }
+    }
+
+    fn selected_attention_context_bf16_for_kv(
+        &self,
+        bf16_lattice_loads: bool,
+        physical_ring: bool,
+    ) -> &ComputePipelineState {
+        if physical_ring {
+            if bf16_lattice_loads {
+                &self.attention_context_bf16_lattice_probabilities_ring
+            } else {
+                &self.attention_context_bf16_ring
+            }
+        } else {
+            self.selected_attention_context_bf16(bf16_lattice_loads)
         }
     }
 }
@@ -2681,6 +2954,7 @@ impl Gemma4MtpAssistantMetal {
                 kv_heads: LOCAL_KV_HEADS,
                 head_dim: LOCAL_HEAD_DIM,
                 sliding_window: Some(LOCAL_WINDOW),
+                physical_ring: false,
             },
             full: Gemma4MtpTargetKvLayerView {
                 layer_index: 29,
@@ -2691,6 +2965,7 @@ impl Gemma4MtpAssistantMetal {
                 kv_heads: FULL_KV_HEADS,
                 head_dim: FULL_HEAD_DIM,
                 sliding_window: None,
+                physical_ring: false,
             },
         };
         let zero_target = vec![0.0f32; TARGET_HIDDEN];
@@ -2727,6 +3002,7 @@ impl Gemma4MtpAssistantMetal {
                 kv_heads: LOCAL_KV_HEADS,
                 head_dim: LOCAL_HEAD_DIM,
                 sliding_window: Some(LOCAL_WINDOW),
+                physical_ring: false,
             },
             full: Gemma4MtpTargetKvLayerView {
                 layer_index: 29,
@@ -2737,6 +3013,7 @@ impl Gemma4MtpAssistantMetal {
                 kv_heads: FULL_KV_HEADS,
                 head_dim: FULL_HEAD_DIM,
                 sliding_window: None,
+                physical_ring: false,
             },
         };
 
@@ -4098,6 +4375,7 @@ impl Gemma4MtpAssistantMetal {
             attention_scalar,
             N_HEADS,
             self.bf16_lattice_loads,
+            kv.physical_ring(),
             #[cfg(test)]
             layer_index,
             #[cfg(test)]
@@ -4569,6 +4847,7 @@ fn encode_attention_bf16(
     scalar: &Buffer,
     head_count: usize,
     bf16_lattice_loads: bool,
+    physical_ring: bool,
     #[cfg(test)] layer_index: usize,
     #[cfg(test)] position_count: usize,
     #[cfg(test)] context_elements: usize,
@@ -4587,8 +4866,9 @@ fn encode_attention_bf16(
     #[cfg(test)]
     let checkpoint_columns = stage_attention_checkpoint_columns(layer_index, position_count);
 
-    encoder
-        .set_compute_pipeline_state(pipelines.selected_attention_scores_bf16(bf16_lattice_loads));
+    encoder.set_compute_pipeline_state(
+        pipelines.selected_attention_scores_bf16_for_kv(bf16_lattice_loads, physical_ring),
+    );
     encoder.set_buffer(0, Some(query), 0);
     encoder.set_buffer(1, Some(keys), 0);
     encoder.set_buffer(2, Some(scores), 0);
@@ -4633,8 +4913,9 @@ fn encode_attention_bf16(
         pending_stage_snapshots,
     );
 
-    encoder
-        .set_compute_pipeline_state(pipelines.selected_attention_context_bf16(bf16_lattice_loads));
+    encoder.set_compute_pipeline_state(
+        pipelines.selected_attention_context_bf16_for_kv(bf16_lattice_loads, physical_ring),
+    );
     encoder.set_buffer(0, Some(values), 0);
     encoder.set_buffer(1, Some(scores), 0);
     encoder.set_buffer(2, Some(output), 0);
@@ -5461,26 +5742,31 @@ fn validate_target_kv(view: &Gemma4MtpTargetKvView<'_>) -> Result<()> {
         || full.kv_heads() != FULL_KV_HEADS
         || full.head_dim() != FULL_HEAD_DIM
         || full.sliding_window().is_some()
+        || full.physical_ring()
         || sliding.logical_len() != full.logical_len()
-        || sliding.logical_len() > sliding.kv_stride()
+        || (sliding.physical_ring()
+            && sliding.kv_stride() < LOCAL_ATTENTION_SPAN.min(sliding.logical_len()))
+        || (!sliding.physical_ring() && sliding.logical_len() > sliding.kv_stride())
         || full.logical_len() > full.kv_stride()
         || !layer_buffers_cover_capacity(sliding)
         || !layer_buffers_cover_capacity(full)
     {
         return Err(BackendError::RuntimeShapeMismatch(format!(
-            "Gemma 4 MTP target KV geometry mismatch: sliding=(layer {}, len {}, stride {}, heads {}, dim {}, window {:?}), full=(layer {}, len {}, stride {}, heads {}, dim {}, window {:?})",
+            "Gemma 4 MTP target KV geometry mismatch: sliding=(layer {}, len {}, stride {}, heads {}, dim {}, window {:?}, ring={}), full=(layer {}, len {}, stride {}, heads {}, dim {}, window {:?}, ring={})",
             sliding.layer_index(),
             sliding.logical_len(),
             sliding.kv_stride(),
             sliding.kv_heads(),
             sliding.head_dim(),
             sliding.sliding_window(),
+            sliding.physical_ring(),
             full.layer_index(),
             full.logical_len(),
             full.kv_stride(),
             full.kv_heads(),
             full.head_dim(),
             full.sliding_window(),
+            full.physical_ring(),
         )));
     }
     Ok(())
@@ -5588,10 +5874,16 @@ fn write_attention_scalar(
             kv.logical_len()
         )));
     }
-    if kv.logical_len() > kv.kv_stride() {
+    if !kv.physical_ring() && kv.logical_len() > kv.kv_stride() {
         return Err(invalid(format!(
             "attention physical logical K {} exceeds KV stride {}",
             kv.logical_len(),
+            kv.kv_stride()
+        )));
+    }
+    if kv.physical_ring() && position_count > kv.kv_stride() {
+        return Err(invalid(format!(
+            "attention ring suffix {position_count} exceeds KV stride {}",
             kv.kv_stride()
         )));
     }
@@ -6152,6 +6444,7 @@ mod tests {
                     kv_heads: LOCAL_KV_HEADS,
                     head_dim: LOCAL_HEAD_DIM,
                     sliding_window: Some(LOCAL_WINDOW),
+                    physical_ring: false,
                 },
                 full: Gemma4MtpTargetKvLayerView {
                     layer_index: 29,
@@ -6162,6 +6455,7 @@ mod tests {
                     kv_heads: FULL_KV_HEADS,
                     head_dim: FULL_HEAD_DIM,
                     sliding_window: None,
+                    physical_ring: false,
                 },
             };
             let initial_recurrent = vec![0.0f32; TARGET_HIDDEN];
@@ -8089,6 +8383,134 @@ mod tests {
     }
 
     #[test]
+    fn local_target_kv_ring_scores_and_context_match_full_prefix_past_wrap() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP ring kernels");
+        const HEAD_COUNT: usize = 2;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 32;
+        const LOGICAL_LEN: usize = 1_043;
+        const RING_STRIDE: usize = 1_040;
+        const POSITION_COUNT: usize = 1_025;
+        const COMPACT_BASE: usize = LOGICAL_LEN - POSITION_COUNT;
+        const GROUP: usize = HEAD_COUNT / KV_HEADS;
+
+        assert!(LOGICAL_LEN > RING_STRIDE);
+        assert_eq!(POSITION_COUNT, LOCAL_WINDOW + 1);
+        assert_eq!(COMPACT_BASE + POSITION_COUNT, LOGICAL_LEN);
+        assert!(COMPACT_BASE < RING_STRIDE);
+        assert!(LOGICAL_LEN % RING_STRIDE < COMPACT_BASE);
+
+        let query = bf16_lattice_test_values(HEAD_COUNT * HEAD_DIM, 0x71a0, false);
+        let full_keys = dirty_low16_test_values(KV_HEADS * LOGICAL_LEN * HEAD_DIM, 0x72b0);
+        let full_values = dirty_low16_test_values(KV_HEADS * LOGICAL_LEN * HEAD_DIM, 0x73c0);
+        let mut ring_keys = vec![0.0f32; KV_HEADS * RING_STRIDE * HEAD_DIM];
+        let mut ring_values = vec![0.0f32; KV_HEADS * RING_STRIDE * HEAD_DIM];
+        for head in 0..KV_HEADS {
+            for logical in LOGICAL_LEN - RING_STRIDE..LOGICAL_LEN {
+                let physical = logical % RING_STRIDE;
+                let full_base = (head * LOGICAL_LEN + logical) * HEAD_DIM;
+                let ring_base = (head * RING_STRIDE + physical) * HEAD_DIM;
+                ring_keys[ring_base..ring_base + HEAD_DIM]
+                    .copy_from_slice(&full_keys[full_base..full_base + HEAD_DIM]);
+                ring_values[ring_base..ring_base + HEAD_DIM]
+                    .copy_from_slice(&full_values[full_base..full_base + HEAD_DIM]);
+            }
+        }
+
+        // Exercise the same scalar admission used by a real layer-28 view:
+        // logical K has passed physical capacity, while the inclusive 1,025-row
+        // assistant suffix remains entirely retained.
+        let ring_key_buffer = f32_buffer(&kernel.device, &ring_keys);
+        let ring_value_buffer = f32_buffer(&kernel.device, &ring_values);
+        let ring_view = Gemma4MtpTargetKvLayerView {
+            layer_index: 28,
+            key: &ring_key_buffer,
+            value: &ring_value_buffer,
+            logical_len: LOGICAL_LEN,
+            kv_stride: RING_STRIDE,
+            kv_heads: KV_HEADS,
+            head_dim: HEAD_DIM,
+            sliding_window: Some(LOCAL_WINDOW),
+            physical_ring: true,
+        };
+        let admitted_scalar = shared_buffer(&kernel.device, 40);
+        write_attention_scalar(&admitted_scalar, &ring_view, POSITION_COUNT, COMPACT_BASE)
+            .expect("wrapped inclusive local suffix must be admitted");
+
+        let full_scores = run_test_attention_scores(
+            kernel,
+            &pipelines.attention_scores_bf16,
+            &query,
+            &full_keys,
+            HEAD_COUNT,
+            HEAD_DIM,
+            POSITION_COUNT,
+            GROUP,
+            HEAD_DIM,
+            LOGICAL_LEN * HEAD_DIM,
+            COMPACT_BASE * HEAD_DIM,
+        );
+        let ring_scores = run_test_attention_scores(
+            kernel,
+            &pipelines.attention_scores_bf16_ring,
+            &query,
+            &ring_keys,
+            HEAD_COUNT,
+            HEAD_DIM,
+            POSITION_COUNT,
+            GROUP,
+            HEAD_DIM,
+            RING_STRIDE * HEAD_DIM,
+            COMPACT_BASE * HEAD_DIM,
+        );
+        assert_eq!(
+            raw_f32_bits(&ring_scores),
+            raw_f32_bits(&full_scores),
+            "wrapped MTP layer-28 QK scores drifted"
+        );
+
+        let probabilities = bf16_lattice_test_values(HEAD_COUNT * POSITION_COUNT, 0x74d0, true);
+        let full_context = run_test_attention_context(
+            kernel,
+            &pipelines.attention_context_bf16,
+            &probabilities,
+            &full_values,
+            HEAD_COUNT,
+            HEAD_DIM,
+            POSITION_COUNT,
+            GROUP,
+            HEAD_DIM,
+            LOGICAL_LEN * HEAD_DIM,
+            COMPACT_BASE * HEAD_DIM,
+            COMPACT_BASE,
+            LOGICAL_LEN,
+        );
+        let ring_context = run_test_attention_context(
+            kernel,
+            &pipelines.attention_context_bf16_ring,
+            &probabilities,
+            &ring_values,
+            HEAD_COUNT,
+            HEAD_DIM,
+            POSITION_COUNT,
+            GROUP,
+            HEAD_DIM,
+            RING_STRIDE * HEAD_DIM,
+            COMPACT_BASE * HEAD_DIM,
+            COMPACT_BASE,
+            LOGICAL_LEN,
+        );
+        assert_eq!(
+            raw_f32_bits(&ring_context),
+            raw_f32_bits(&full_context),
+            "wrapped MTP layer-28 probability/value context drifted"
+        );
+    }
+
+    #[test]
     fn bf16_lattice_loads_match_raw_u32_at_local_and_full_production_widths() {
         let Some(kernel) = metal_linear_kernel() else {
             return;
@@ -9557,6 +9979,7 @@ mod tests {
                 kv_heads: LOCAL_KV_HEADS,
                 head_dim: LOCAL_HEAD_DIM,
                 sliding_window: Some(LOCAL_WINDOW),
+                physical_ring: false,
             },
             full: Gemma4MtpTargetKvLayerView {
                 layer_index: 29,
@@ -9567,6 +9990,7 @@ mod tests {
                 kv_heads: FULL_KV_HEADS,
                 head_dim: FULL_HEAD_DIM,
                 sliding_window: None,
+                physical_ring: false,
             },
         }
     }
@@ -9826,6 +10250,7 @@ mod tests {
                 kv_heads: LOCAL_KV_HEADS,
                 head_dim: LOCAL_HEAD_DIM,
                 sliding_window: Some(LOCAL_WINDOW),
+                physical_ring: false,
             },
             full: Gemma4MtpTargetKvLayerView {
                 layer_index: 29,
@@ -9836,6 +10261,7 @@ mod tests {
                 kv_heads: FULL_KV_HEADS,
                 head_dim: FULL_HEAD_DIM,
                 sliding_window: None,
+                physical_ring: false,
             },
         };
         let proposal = assistant

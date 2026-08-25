@@ -130,10 +130,13 @@ pub(crate) struct MetalLinearKernel {
     gemma4_fused_post_ffw_residual_pipeline: Option<ComputePipelineState>,
     gemma4_fused_q_norm_rope_batch_pipeline: Option<ComputePipelineState>,
     gemma4_fused_kv_norm_rope_scatter_batch_pipeline: Option<ComputePipelineState>,
+    gemma4_fused_kv_norm_rope_scatter_batch_ring_pipeline: Option<ComputePipelineState>,
     q6k_linear_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_scores_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_softmax_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_context_batch_k_pipeline: Option<ComputePipelineState>,
+    attention_decode_scores_batch_k_ring_pipeline: Option<ComputePipelineState>,
+    attention_decode_context_batch_k_ring_pipeline: Option<ComputePipelineState>,
     nvfp4_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
     #[allow(dead_code)] // batched-column verify GEMV; exercised by the C0 unit test,
@@ -246,12 +249,15 @@ pub(crate) struct MetalLinearKernel {
     attention_decode_scores_pipeline: ComputePipelineState,
     attention_decode_softmax_pipeline: ComputePipelineState,
     attention_decode_context_pipeline: ComputePipelineState,
+    attention_decode_scores_ring_pipeline: Option<ComputePipelineState>,
+    attention_decode_context_ring_pipeline: Option<ComputePipelineState>,
     attention_decode_kv16_pipeline: ComputePipelineState,
     attention_decode_v2_pipeline: ComputePipelineState,
     attention_decode_v2_kv16_pipeline: ComputePipelineState,
     attention_decode_v2_kvq8_pipeline: ComputePipelineState,
     quantize_q8_0_pipeline: ComputePipelineState,
     kv_scatter_pipeline: ComputePipelineState,
+    kv_scatter_ring_pipeline: Option<ComputePipelineState>,
     kv_scatter_kv16_pipeline: ComputePipelineState,
     kv_scatter_kvq8_pipeline: ComputePipelineState,
     f32_to_f16_pipeline: ComputePipelineState,
@@ -261,6 +267,7 @@ pub(crate) struct MetalLinearKernel {
     silu_mul_f16o_pipeline: ComputePipelineState,
     rope_rotate_batch_pipeline: ComputePipelineState,
     kv_scatter_batch_pipeline: ComputePipelineState,
+    kv_scatter_batch_ring_pipeline: Option<ComputePipelineState>,
     kv_scatter_batch_kv16_pipeline: ComputePipelineState,
     kv_scatter_batch_kvq8_pipeline: ComputePipelineState,
     attention_prefill_v3_pipeline: ComputePipelineState,
@@ -6789,6 +6796,87 @@ kernel void gemma4_fused_kv_norm_rope_scatter_batch_f32(
     }
 }
 
+// Ring-only twin of the exact Gemma 4 fused KV path. The arithmetic body is
+// intentionally identical; only the cache destination maps the absolute
+// logical position into the guarded sliding-layer ring.
+kernel void gemma4_fused_kv_norm_rope_scatter_batch_ring_f32(
+    device const float* key [[buffer(0)]],
+    device const float* val [[buffer(1)]],
+    device const float* weight_k [[buffer(2)]],
+    device const float* cos_table [[buffer(3)]],
+    device const float* sin_table [[buffer(4)]],
+    device float* out_kn [[buffer(5)]],
+    device float* out_vn [[buffer(6)]],
+    device float* cache_k [[buffer(7)]],
+    device float* cache_v [[buffer(8)]],
+    constant uint& n_kv_heads [[buffer(9)]],
+    constant uint& head_dim [[buffer(10)]],
+    constant uint& half_rope [[buffer(11)]],
+    constant uint& ring_capacity [[buffer(12)]],
+    constant uint& base_position [[buffer(13)]],
+    constant float& eps [[buffer(14)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (ring_capacity == 0u) return;
+    threadgroup float partial_k[512];
+    threadgroup float partial_v[512];
+    threadgroup float tg_norm_k[512];
+
+    const uint t = group / n_kv_heads;
+    const uint h = group - t * n_kv_heads;
+    const uint base = t * n_kv_heads * head_dim + h * head_dim;
+
+    float vk = 0.0f;
+    float vv = 0.0f;
+    if (tid < head_dim) {
+        vk = key[base + tid];
+        vv = val[base + tid];
+    }
+    partial_k[tid] = vk * vk;
+    partial_v[tid] = vv * vv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = 256; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_k[tid] += partial_k[tid + s];
+            partial_v[tid] += partial_v[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_k = 1.0f / sqrt(partial_k[0] / float(head_dim) + eps);
+    const float normed_k = (vk * inv_k) * (tid < head_dim ? weight_k[tid] : 0.0f);
+    const float inv_v = 1.0f / sqrt(partial_v[0] / float(head_dim) + eps);
+    const float normed_v = vv * inv_v;
+    tg_norm_k[tid] = normed_k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint physical_position = (base_position + t) % ring_capacity;
+    if (tid < head_dim) {
+        const uint dst_pos = (h * ring_capacity + physical_position) * head_dim + tid;
+        cache_v[dst_pos] = normed_v;
+        out_vn[base + tid] = normed_v;
+    }
+
+    if (tid < half_rope) {
+        const float c = cos_table[t * half_rope + tid];
+        const float s = sin_table[t * half_rope + tid];
+        const float x0 = normed_k;
+        const float x1 = tg_norm_k[tid + half_rope];
+        const float r0 = x0 * c - x1 * s;
+        const float r1 = x0 * s + x1 * c;
+
+        out_kn[base + tid] = r0;
+        out_kn[base + tid + half_rope] = r1;
+
+        const uint dst_pos0 =
+            (h * ring_capacity + physical_position) * head_dim + tid;
+        const uint dst_pos1 = dst_pos0 + half_rope;
+        cache_k[dst_pos0] = r0;
+        cache_k[dst_pos1] = r1;
+    }
+}
+
 kernel void silu_mul_f32(
     device const float* gate [[buffer(0)]],
     device const float* up [[buffer(1)]],
@@ -7107,6 +7195,87 @@ kernel void attention_decode_context_f32(
     }
 }
 
+// Ring-only twins of split-three f32 attention. Logical positions remain in
+// ascending order, preserving every floating-point accumulation and softmax
+// fold; only the K/V row address is reduced modulo physical capacity.
+kernel void attention_decode_scores_ring_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_blocks [[buffer(14)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint head = tg.x;
+    if (head >= n_heads || position_stride == 0u ||
+        kv_head_stride < position_stride) return;
+    uint kv_head = head / group;
+    uint q_base = head * head_dim;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride;
+    uint kv_base = kv_head * kv_head_stride;
+    uint score_base = head * position_count;
+    uint stride = 32u * n_blocks;
+
+    for (uint p = lane + tg.y * 32u; p < position_count; p += stride) {
+        uint physical_position = (logical_base + p) % physical_capacity;
+        uint k_base = kv_base + physical_position * position_stride;
+        float s = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * keys[k_base + d];
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+    }
+}
+
+kernel void attention_decode_context_ring_f32(
+    device const float* values [[buffer(2)]],
+    device const float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const float* denom_in [[buffer(13)]],
+    constant uint& n_blocks [[buffer(14)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint head = tg.x;
+    if (head >= n_heads || position_stride == 0u ||
+        kv_head_stride < position_stride) return;
+    uint kv_head = head / group;
+    uint q_base = head * head_dim;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride;
+    uint kv_base = kv_head * kv_head_stride;
+    uint score_base = head * position_count;
+    float inv = 1.0 / denom_in[head];
+    uint stride = 32u * n_blocks;
+
+    for (uint d = lane + tg.y * 32u; d < head_dim; d += stride) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            uint physical_position = (logical_base + p) % physical_capacity;
+            acc += scores[score_base + p] * inv *
+                values[kv_base + physical_position * position_stride + d];
+        }
+        output[q_base + d] = acc;
+    }
+}
+
 kernel void attention_decode_scores_batch_k_f32(
     device const float* query [[buffer(0)]],
     device const float* keys [[buffer(1)]],
@@ -7222,6 +7391,101 @@ kernel void attention_decode_context_batch_k_f32(
         float acc = 0.0;
         for (uint p = 0; p < position_count; ++p) {
             acc += scores[score_base + p] * inv * values[kv_base + p * position_stride + d];
+        }
+        output[q_base + d] = acc;
+    }
+}
+
+kernel void attention_decode_scores_batch_k_ring_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& base_position [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_blocks [[buffer(14)]],
+    constant uint& sliding_window [[buffer(15)]],
+    constant uint& max_positions [[buffer(16)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint head = tg.x;
+    uint cand = tg.z;
+    if (head >= n_heads || position_stride == 0u ||
+        kv_head_stride < position_stride) return;
+    uint kv_head = head / group;
+    uint q_base = (cand * n_heads + head) * head_dim;
+    uint score_base = (cand * n_heads + head) * max_positions;
+
+    uint filled = base_position + cand + 1;
+    uint win_start =
+        (sliding_window > 0 && filled > sliding_window) ? (filled - sliding_window) : 0;
+    uint position_count = filled - win_start;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride + win_start;
+    uint kv_base = kv_head * kv_head_stride;
+    uint stride = 32u * n_blocks;
+
+    for (uint p = lane + tg.y * 32u; p < position_count; p += stride) {
+        uint physical_position = (logical_base + p) % physical_capacity;
+        uint k_base = kv_base + physical_position * position_stride;
+        float s = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * keys[k_base + d];
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+    }
+}
+
+kernel void attention_decode_context_batch_k_ring_f32(
+    device const float* values [[buffer(2)]],
+    device const float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& base_position [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const float* denom_in [[buffer(13)]],
+    constant uint& n_blocks [[buffer(14)]],
+    constant uint& sliding_window [[buffer(15)]],
+    constant uint& max_positions [[buffer(16)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint head = tg.x;
+    uint cand = tg.z;
+    if (head >= n_heads || position_stride == 0u ||
+        kv_head_stride < position_stride) return;
+    uint kv_head = head / group;
+    uint q_base = (cand * n_heads + head) * head_dim;
+    uint score_base = (cand * n_heads + head) * max_positions;
+
+    uint filled = base_position + cand + 1;
+    uint win_start =
+        (sliding_window > 0 && filled > sliding_window) ? (filled - sliding_window) : 0;
+    uint position_count = filled - win_start;
+    const uint physical_capacity = kv_head_stride / position_stride;
+    const uint logical_base = kv_base_offset / position_stride + win_start;
+    uint kv_base = kv_head * kv_head_stride;
+
+    float inv = 1.0 / denom_in[cand * n_heads + head];
+    uint stride = 32u * n_blocks;
+
+    for (uint d = lane + tg.y * 32u; d < head_dim; d += stride) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            uint physical_position = (logical_base + p) % physical_capacity;
+            acc += scores[score_base + p] * inv *
+                values[kv_base + physical_position * position_stride + d];
         }
         output[q_base + d] = acc;
     }
@@ -8170,6 +8434,33 @@ kernel void kv_scatter_f32(
     }
 }
 
+kernel void kv_scatter_ring_f32(
+    device const float* src_k [[buffer(0)]],
+    device const float* src_v [[buffer(1)]],
+    device float* cache_k [[buffer(2)]],
+    device float* cache_v [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& ring_capacity [[buffer(5)]],
+    constant uint& write_position [[buffer(6)]],
+    constant uint& total [[buffer(7)]],
+    device half* cache_k16 [[buffer(8)]],
+    device half* cache_v16 [[buffer(9)]],
+    constant uint& write_kv16 [[buffer(10)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= total || ring_capacity == 0u) return;
+    uint h = i / head_dim;
+    uint d = i % head_dim;
+    uint physical_position = write_position % ring_capacity;
+    uint dst = (h * ring_capacity + physical_position) * head_dim + d;
+    cache_k[dst] = src_k[i];
+    cache_v[dst] = src_v[i];
+    if (write_kv16 != 0) {
+        cache_k16[dst] = half(src_k[i]);
+        cache_v16[dst] = half(src_v[i]);
+    }
+}
+
 // f16-KV variant: the cache stores half-precision K/V (half the bytes per token read back
 // during attention, the dominant growing cost at long context).
 kernel void kv_scatter_kv16(
@@ -8600,6 +8891,36 @@ kernel void kv_scatter_batch_f32(
     // binds 2-byte placeholders, and unguarded writes here sprayed out-of-bounds GPU
     // stores that corrupted neighboring buffers (non-finite logits on every fallback
     // prefill path).
+    if (write_kv16 != 0) {
+        cache_k16[dst] = half(src_k[src]);
+        cache_v16[dst] = half(src_v[src]);
+    }
+}
+
+kernel void kv_scatter_batch_ring_f32(
+    device const float* src_k [[buffer(0)]],
+    device const float* src_v [[buffer(1)]],
+    device float* cache_k [[buffer(2)]],
+    device float* cache_v [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& ring_capacity [[buffer(5)]],
+    constant uint& base_position [[buffer(6)]],
+    constant uint& total [[buffer(7)]],
+    device half* cache_k16 [[buffer(8)]],
+    device half* cache_v16 [[buffer(9)]],
+    constant uint& write_kv16 [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= total || ring_capacity == 0u) return;
+    uint t = gid.y;
+    uint i = gid.x;
+    uint h = i / head_dim;
+    uint d = i % head_dim;
+    uint src = t * total + i;
+    uint physical_position = (base_position + t) % ring_capacity;
+    uint dst = (h * ring_capacity + physical_position) * head_dim + d;
+    cache_k[dst] = src_k[src];
+    cache_v[dst] = src_v[src];
     if (write_kv16 != 0) {
         cache_k16[dst] = half(src_k[src]);
         cache_v16[dst] = half(src_v[src]);
@@ -11467,6 +11788,22 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_decode_context_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_context_function)
                 .ok()?;
+            let attention_decode_scores_ring_pipeline = elementwise_library
+                .get_function("attention_decode_scores_ring_f32", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let attention_decode_context_ring_pipeline = elementwise_library
+                .get_function("attention_decode_context_ring_f32", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let attention_decode_kv16_function = elementwise_library
                 .get_function("attention_decode_kv16", None)
                 .ok()?;
@@ -11503,6 +11840,14 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let kv_scatter_pipeline = device
                 .new_compute_pipeline_state_with_function(&kv_scatter_function)
                 .ok()?;
+            let kv_scatter_ring_pipeline = elementwise_library
+                .get_function("kv_scatter_ring_f32", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let kv_scatter_kv16_function = elementwise_library
                 .get_function("kv_scatter_kv16", None)
                 .ok()?;
@@ -11553,6 +11898,14 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let kv_scatter_batch_pipeline = device
                 .new_compute_pipeline_state_with_function(&kv_scatter_batch_function)
                 .ok()?;
+            let kv_scatter_batch_ring_pipeline = elementwise_library
+                .get_function("kv_scatter_batch_ring_f32", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let kv_scatter_batch_kv16_function = elementwise_library
                 .get_function("kv_scatter_batch_kv16", None)
                 .ok()?;
@@ -11914,6 +12267,10 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .get_function("gemma4_fused_kv_norm_rope_scatter_batch_f32", None)
                 .ok()
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
+            let gemma4_fused_kv_norm_rope_scatter_batch_ring_pipeline = elementwise_library
+                .get_function("gemma4_fused_kv_norm_rope_scatter_batch_ring_f32", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let attention_decode_scores_batch_k_pipeline = elementwise_library
                 .get_function("attention_decode_scores_batch_k_f32", None)
                 .ok()
@@ -11924,6 +12281,14 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let attention_decode_context_batch_k_pipeline = elementwise_library
                 .get_function("attention_decode_context_batch_k_f32", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
+            let attention_decode_scores_batch_k_ring_pipeline = elementwise_library
+                .get_function("attention_decode_scores_batch_k_ring_f32", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
+            let attention_decode_context_batch_k_ring_pipeline = elementwise_library
+                .get_function("attention_decode_context_batch_k_ring_f32", None)
                 .ok()
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let nvfp4_block_ksplit_f32y_wire_function = library
@@ -12263,10 +12628,13 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 gemma4_fused_post_ffw_residual_pipeline,
                 gemma4_fused_q_norm_rope_batch_pipeline,
                 gemma4_fused_kv_norm_rope_scatter_batch_pipeline,
+                gemma4_fused_kv_norm_rope_scatter_batch_ring_pipeline,
                 q6k_linear_batch_k_pipeline,
                 attention_decode_scores_batch_k_pipeline,
                 attention_decode_softmax_batch_k_pipeline,
                 attention_decode_context_batch_k_pipeline,
+                attention_decode_scores_batch_k_ring_pipeline,
+                attention_decode_context_batch_k_ring_pipeline,
                 nvfp4_block_ksplit_f32y_wire_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline,
@@ -12355,12 +12723,15 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_scores_pipeline,
                 attention_decode_softmax_pipeline,
                 attention_decode_context_pipeline,
+                attention_decode_scores_ring_pipeline,
+                attention_decode_context_ring_pipeline,
                 attention_decode_kv16_pipeline,
                 attention_decode_v2_pipeline,
                 attention_decode_v2_kv16_pipeline,
                 attention_decode_v2_kvq8_pipeline,
                 quantize_q8_0_pipeline,
                 kv_scatter_pipeline,
+                kv_scatter_ring_pipeline,
                 kv_scatter_kv16_pipeline,
                 kv_scatter_kvq8_pipeline,
                 f32_to_f16_pipeline,
@@ -12370,6 +12741,7 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 silu_mul_f16o_pipeline,
                 rope_rotate_batch_pipeline,
                 kv_scatter_batch_pipeline,
+                kv_scatter_batch_ring_pipeline,
                 kv_scatter_batch_kv16_pipeline,
                 kv_scatter_batch_kvq8_pipeline,
                 attention_prefill_v3_pipeline,
@@ -24088,6 +24460,67 @@ const GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM: usize = 512;
 const GEMMA4_GHOST_26B_GLOBAL_KV_HEADS: usize = 2;
 #[cfg(target_os = "macos")]
 const GEMMA4_GHOST_26B_GLOBAL_LAYERS: [usize; 5] = [5, 11, 17, 23, 29];
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_LOCAL_KV_RING_ENV: &str = "CAMELID_GEMMA4_LOCAL_KV_RING";
+// The production verifier scatters at most K=16 rows before any candidate
+// reads KV. A 1,024-row target window therefore needs 15 future-row slots in
+// addition to the assistant's inclusive 1,025-row view. Rounding that exact
+// 1,040-row requirement to `window + 16` leaves one guard slot and makes the
+// admission rule explicit rather than depending on verifier scheduling.
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_LOCAL_KV_RING_HEADROOM: usize = 16;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_local_kv_ring_requested() -> Result<bool, String> {
+    match std::env::var_os(GEMMA4_GHOST_LOCAL_KV_RING_ENV) {
+        None => Ok(false),
+        Some(value) => match value.into_string() {
+            Ok(value) if value == "0" => Ok(false),
+            Ok(value) if value == "1" => Ok(true),
+            Ok(value) => Err(format!(
+                "invalid {GEMMA4_GHOST_LOCAL_KV_RING_ENV}={value:?}; expected literal 0 or 1"
+            )),
+            Err(_) => Err(format!(
+                "invalid {GEMMA4_GHOST_LOCAL_KV_RING_ENV}: value is not UTF-8; expected literal 0 or 1"
+            )),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_local_kv_ring_stride(
+    sliding_window: usize,
+    speculative_headroom: usize,
+    max_positions: usize,
+) -> Option<usize> {
+    sliding_window
+        .checked_add(speculative_headroom)
+        .map(|stride| stride.min(max_positions))
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_kv_physical_position(logical_position: usize, stride: usize) -> Option<usize> {
+    if stride == 0 {
+        None
+    } else {
+        Some(logical_position % stride)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_ring_rollback_is_safe(
+    written_logical_len: usize,
+    keep: usize,
+    stride: usize,
+    required_history: usize,
+) -> bool {
+    if stride == 0 || keep > written_logical_len {
+        return false;
+    }
+    let oldest_retained = written_logical_len.saturating_sub(stride);
+    let oldest_required = keep.saturating_sub(required_history);
+    oldest_retained <= oldest_required
+}
 
 // Official Gemma 4 MTP assistants borrow the final target layer of each
 // attention flavor: layer 28 for sliding attention and layer 29 for full
@@ -24170,7 +24603,13 @@ pub(crate) struct Gemma4GhostCommonGeometry {
     pub(crate) local_layers: usize,
     pub(crate) global_layers: usize,
     pub(crate) max_positions: usize,
+    /// Logical capacity of the full-attention layers.
     pub(crate) kv_capacity: usize,
+    /// Physical position stride used by every sliding-attention layer.
+    pub(crate) local_kv_stride: usize,
+    /// Physical position stride used by every full-attention layer.
+    pub(crate) global_kv_stride: usize,
+    pub(crate) local_kv_ring: bool,
     pub(crate) kv_elements: usize,
     pub(crate) kv_bytes: usize,
 }
@@ -24182,6 +24621,12 @@ pub(crate) struct Gemma4GhostCommonGeometry {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Gemma4GhostCommonAllocationLedger {
     pub(crate) kv_capacity_bytes: u64,
+    pub(crate) local_kv_capacity_bytes: u64,
+    pub(crate) global_kv_capacity_bytes: u64,
+    /// Bytes the same logical capacity would consume with full-prefix f32 KV
+    /// on every layer. The difference from `kv_capacity_bytes` is the exact
+    /// physical saving attributable to the local ring.
+    pub(crate) kv_full_prefix_equivalent_bytes: u64,
     pub(crate) kv_explicitly_touched_bytes: u64,
     pub(crate) verifier_scratch_capacity_bytes: u64,
     pub(crate) verifier_scratch_explicitly_touched_bytes: u64,
@@ -24566,7 +25011,10 @@ impl Gemma4GhostCommonPending {
 
 /// One read-only target KV layer borrowed by the isolated Gemma 4 MTP
 /// experiment. Buffers use the common core's head-major layout:
-/// `[kv_head][kv_capacity][head_dim]`; only `logical_len` positions are valid.
+/// `[kv_head][kv_stride][head_dim]`. A sliding view may be a physical ring, in
+/// which case logical position `p` resides at `p % kv_stride`; a full view is a
+/// contiguous prefix. Only the suffix selected by the layer's attention mask
+/// is valid to read.
 ///
 /// The value is constructible only by [`Gemma4GhostCommonMetal`] and is handed
 /// to callers through a scoped callback. It must not be cloned or retained;
@@ -24582,6 +25030,7 @@ pub struct Gemma4MtpTargetKvLayerView<'a> {
     kv_heads: usize,
     head_dim: usize,
     sliding_window: Option<usize>,
+    physical_ring: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -24599,8 +25048,8 @@ impl Gemma4MtpTargetKvLayerView<'_> {
         self.value
     }
 
-    /// Number of cache positions the assistant may attend. Bytes at positions
-    /// `logical_len..kv_stride` are rejected/speculative tail and are invalid.
+    /// Logical target prefix length. This may exceed `kv_stride` for a sliding
+    /// physical ring; callers must use modulo addressing in that case.
     pub fn logical_len(&self) -> usize {
         self.logical_len
     }
@@ -24620,6 +25069,10 @@ impl Gemma4MtpTargetKvLayerView<'_> {
     /// `Some(1024)` for target layer 28; `None` for full-attention layer 29.
     pub fn sliding_window(&self) -> Option<usize> {
         self.sliding_window
+    }
+
+    pub fn physical_ring(&self) -> bool {
+        self.physical_ring
     }
 }
 
@@ -24743,9 +25196,19 @@ pub(crate) struct Gemma4GhostCommonMetal {
     moe: Option<Gemma4GhostMoeScratch>,
     hidden_size: usize,
     max_positions: usize,
+    /// Logical capacity of global/full-attention cache buffers. Sliding layers
+    /// use the corresponding entry in `kv_strides` and may stop growing once
+    /// their physical ring reaches the guarded local span.
     kv_capacity: usize,
+    kv_strides: Vec<usize>,
+    local_kv_ring: bool,
+    local_kv_ring_headroom: usize,
     sliding_window: usize,
     next_position: Vec<usize>,
+    /// Highest absolute write watermark per layer since reset/import. Unlike
+    /// `next_position`, this is not reduced by speculative rollback because
+    /// rejected tail rows still consumed physical ring slots.
+    kv_written_position: Vec<usize>,
     latest_attention_layer: Option<usize>,
     geometry: Gemma4GhostCommonGeometry,
     strict_26b: bool,
@@ -27151,13 +27614,17 @@ impl Gemma4GhostCommonMetal {
         layers: Vec<Gemma4ResidentLayer>,
         post_norm_1: Vec<Vec<f32>>,
         max_positions: usize,
+        local_kv_ring_requested: bool,
     ) -> Option<Self> {
+        let local_ring_headroom =
+            local_kv_ring_requested.then_some(GEMMA4_GHOST_LOCAL_KV_RING_HEADROOM);
         Self::new_inner(
             layers,
             post_norm_1,
             max_positions,
             GEMMA4_GHOST_26B_SLIDING_WINDOW,
             true,
+            local_ring_headroom,
         )
     }
 
@@ -27168,7 +27635,32 @@ impl Gemma4GhostCommonMetal {
         max_positions: usize,
         sliding_window: usize,
     ) -> Option<Self> {
-        Self::new_inner(layers, post_norm_1, max_positions, sliding_window, false)
+        Self::new_inner(
+            layers,
+            post_norm_1,
+            max_positions,
+            sliding_window,
+            false,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_synthetic_with_local_ring(
+        layers: Vec<Gemma4ResidentLayer>,
+        post_norm_1: Vec<Vec<f32>>,
+        max_positions: usize,
+        sliding_window: usize,
+        speculative_headroom: usize,
+    ) -> Option<Self> {
+        Self::new_inner(
+            layers,
+            post_norm_1,
+            max_positions,
+            sliding_window,
+            false,
+            Some(speculative_headroom),
+        )
     }
 
     fn new_inner(
@@ -27177,6 +27669,7 @@ impl Gemma4GhostCommonMetal {
         max_positions: usize,
         sliding_window: usize,
         strict_26b: bool,
+        local_ring_headroom: Option<usize>,
     ) -> Option<Self> {
         if layers.is_empty()
             || layers.len() != post_norm_1.len()
@@ -27208,7 +27701,6 @@ impl Gemma4GhostCommonMetal {
         let mut max_kv_dim = 0usize;
         let mut max_head_dim = 0usize;
         let mut max_ffn_dim = 0usize;
-        let mut kv_elements = 0usize;
         let mut is_sliding = Vec::with_capacity(layers.len());
         for (layer_idx, (layer, post1)) in layers.iter().zip(&post_norm_1).enumerate() {
             let q_dim = layer.n_heads.checked_mul(layer.head_dim)?;
@@ -27271,12 +27763,6 @@ impl Gemma4GhostCommonMetal {
             max_kv_dim = max_kv_dim.max(kv_dim);
             max_head_dim = max_head_dim.max(layer.head_dim);
             max_ffn_dim = max_ffn_dim.max(layer.ffn_dim);
-            kv_elements = kv_elements.checked_add(
-                2usize
-                    .checked_mul(layer.n_kv_heads)?
-                    .checked_mul(kv_capacity)?
-                    .checked_mul(layer.head_dim)?,
-            )?;
         }
         // Resident layers are built without a window (from_wire_pages_owned passes
         // None). RoPE table selection and ISWA both key off layer.sliding_window, so
@@ -27318,7 +27804,55 @@ impl Gemma4GhostCommonMetal {
             return None;
         }
 
+        let local_ring_stride = if let Some(headroom) = local_ring_headroom {
+            gemma4_local_kv_ring_stride(sliding_window, headroom, max_positions)?
+        } else {
+            max_positions
+        };
+        let kv_strides: Vec<usize> = is_sliding
+            .iter()
+            .map(|&sliding| {
+                if sliding && local_ring_headroom.is_some() {
+                    kv_capacity.min(local_ring_stride)
+                } else {
+                    kv_capacity
+                }
+            })
+            .collect();
+        let kv_elements =
+            layers
+                .iter()
+                .zip(&kv_strides)
+                .try_fold(0usize, |total, (layer, &stride)| {
+                    total.checked_add(
+                        2usize
+                            .checked_mul(layer.n_kv_heads)?
+                            .checked_mul(stride)?
+                            .checked_mul(layer.head_dim)?,
+                    )
+                })?;
+
         let kernel = metal_linear_kernel()?;
+        if local_ring_headroom.is_some()
+            && (kernel.kv_scatter_ring_pipeline.is_none()
+                || kernel.kv_scatter_batch_ring_pipeline.is_none()
+                || kernel.attention_decode_scores_ring_pipeline.is_none()
+                || kernel.attention_decode_context_ring_pipeline.is_none()
+                || kernel
+                    .gemma4_fused_kv_norm_rope_scatter_batch_ring_pipeline
+                    .is_none()
+                || kernel
+                    .attention_decode_scores_batch_k_ring_pipeline
+                    .is_none()
+                || kernel
+                    .attention_decode_context_batch_k_ring_pipeline
+                    .is_none())
+        {
+            eprintln!(
+                "[gemma4-ghost-common] {GEMMA4_GHOST_LOCAL_KV_RING_ENV}=1 refused: one or more ring-only Metal pipelines are unavailable"
+            );
+            return None;
+        }
         let buffer = |bytes: usize| {
             kernel
                 .device
@@ -27371,10 +27905,10 @@ impl Gemma4GhostCommonMetal {
         }
         let mut cache_k = Vec::with_capacity(layers.len());
         let mut cache_v = Vec::with_capacity(layers.len());
-        for layer in &layers {
+        for (layer, &stride) in layers.iter().zip(&kv_strides) {
             let elements = layer
                 .n_kv_heads
-                .checked_mul(kv_capacity)?
+                .checked_mul(stride)?
                 .checked_mul(layer.head_dim)?;
             cache_k.push(f32_buffer(elements)?);
             cache_v.push(f32_buffer(elements)?);
@@ -27430,6 +27964,17 @@ impl Gemma4GhostCommonMetal {
             global_layers,
             max_positions,
             kv_capacity,
+            local_kv_stride: is_sliding
+                .iter()
+                .position(|&sliding| sliding)
+                .and_then(|index| kv_strides.get(index).copied())
+                .unwrap_or(kv_capacity),
+            global_kv_stride: is_sliding
+                .iter()
+                .position(|&sliding| !sliding)
+                .and_then(|index| kv_strides.get(index).copied())
+                .unwrap_or(kv_capacity),
+            local_kv_ring: local_ring_headroom.is_some(),
             kv_elements,
             kv_bytes: kv_elements.checked_mul(std::mem::size_of::<f32>())?,
         };
@@ -27462,6 +28007,7 @@ impl Gemma4GhostCommonMetal {
         }
         Some(Self {
             next_position: vec![0; layers.len()],
+            kv_written_position: vec![0; layers.len()],
             layers,
             norms,
             is_sliding,
@@ -27485,6 +28031,9 @@ impl Gemma4GhostCommonMetal {
             hidden_size: hidden,
             max_positions,
             kv_capacity,
+            kv_strides,
+            local_kv_ring: local_ring_headroom.is_some(),
+            local_kv_ring_headroom: local_ring_headroom.unwrap_or(0),
             sliding_window,
             latest_attention_layer: None,
             geometry,
@@ -27510,6 +28059,25 @@ impl Gemma4GhostCommonMetal {
             .iter()
             .chain(&self.cache_v)
             .map(|buffer| buffer.length())
+            .sum();
+        let local_kv_capacity_bytes = self
+            .cache_k
+            .iter()
+            .zip(&self.cache_v)
+            .zip(&self.is_sliding)
+            .filter(|(_, sliding)| **sliding)
+            .map(|((key, value), _)| key.length() + value.length())
+            .sum();
+        let global_kv_capacity_bytes = kv_capacity_bytes - local_kv_capacity_bytes;
+        let kv_full_prefix_equivalent_bytes = self
+            .layers
+            .iter()
+            .map(|layer| {
+                2u64.saturating_mul(layer.n_kv_heads as u64)
+                    .saturating_mul(self.kv_capacity as u64)
+                    .saturating_mul(layer.head_dim as u64)
+                    .saturating_mul(std::mem::size_of::<f32>() as u64)
+            })
             .sum();
         let verifier_scratch_capacity_bytes = self.resident_scratch.allocation_capacity_bytes();
         let verifier_scratch_explicitly_touched_bytes =
@@ -27577,6 +28145,9 @@ impl Gemma4GhostCommonMetal {
 
         Gemma4GhostCommonAllocationLedger {
             kv_capacity_bytes,
+            local_kv_capacity_bytes,
+            global_kv_capacity_bytes,
+            kv_full_prefix_equivalent_bytes,
             // Newly allocated K/V buffers are not initialized by this load.
             kv_explicitly_touched_bytes: 0,
             verifier_scratch_capacity_bytes,
@@ -27592,6 +28163,59 @@ impl Gemma4GhostCommonMetal {
 
     fn kv_stride(&self) -> usize {
         self.kv_capacity
+    }
+
+    fn kv_stride_for_layer(&self, layer_idx: usize) -> Option<usize> {
+        self.kv_strides.get(layer_idx).copied()
+    }
+
+    fn desired_kv_stride(&self, layer_idx: usize, logical_capacity: usize) -> Option<usize> {
+        if self.local_kv_ring && *self.is_sliding.get(layer_idx)? {
+            Some(logical_capacity.min(gemma4_local_kv_ring_stride(
+                self.sliding_window,
+                self.local_kv_ring_headroom,
+                self.max_positions,
+            )?))
+        } else {
+            Some(logical_capacity)
+        }
+    }
+
+    fn refresh_kv_geometry(&mut self) -> bool {
+        let Some(kv_elements) =
+            self.layers
+                .iter()
+                .zip(&self.kv_strides)
+                .try_fold(0usize, |total, (layer, &stride)| {
+                    total.checked_add(
+                        2usize
+                            .checked_mul(layer.n_kv_heads)?
+                            .checked_mul(stride)?
+                            .checked_mul(layer.head_dim)?,
+                    )
+                })
+        else {
+            return false;
+        };
+        self.geometry.kv_capacity = self.kv_capacity;
+        self.geometry.local_kv_stride = self
+            .is_sliding
+            .iter()
+            .position(|&sliding| sliding)
+            .and_then(|index| self.kv_strides.get(index).copied())
+            .unwrap_or(self.kv_capacity);
+        self.geometry.global_kv_stride = self
+            .is_sliding
+            .iter()
+            .position(|&sliding| !sliding)
+            .and_then(|index| self.kv_strides.get(index).copied())
+            .unwrap_or(self.kv_capacity);
+        self.geometry.kv_elements = kv_elements;
+        self.geometry.kv_bytes = match kv_elements.checked_mul(std::mem::size_of::<f32>()) {
+            Some(bytes) => bytes,
+            None => return false,
+        };
+        true
     }
 
     /// Grow exact-f32 K/V buffers so `needed` positions fit. Never reduces
@@ -27623,53 +28247,85 @@ impl Gemma4GhostCommonMetal {
             .max()
             .unwrap_or(0)
             .min(self.kv_capacity);
-        let mut new_k = Vec::with_capacity(self.layers.len());
-        let mut new_v = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
+        let mut replacements: Vec<Option<(Buffer, Buffer, usize)>> =
+            std::iter::repeat_with(|| None)
+                .take(self.layers.len())
+                .collect();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let Some(new_stride) = self.desired_kv_stride(layer_idx, new_cap) else {
+                return false;
+            };
+            if new_stride == self.kv_strides[layer_idx] {
+                continue;
+            }
             let elements = match layer
                 .n_kv_heads
-                .checked_mul(new_cap)
+                .checked_mul(new_stride)
                 .and_then(|v| v.checked_mul(layer.head_dim))
             {
                 Some(e) => e,
                 None => return false,
             };
             let bytes = elements * 4;
-            new_k.push(
-                kernel
-                    .device
-                    .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared),
-            );
-            new_v.push(
-                kernel
-                    .device
-                    .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared),
-            );
+            let key = kernel
+                .device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+            let value = kernel
+                .device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+            replacements[layer_idx] = Some((key, value, new_stride));
         }
-        if filled > 0 {
+        if filled > 0 && replacements.iter().any(Option::is_some) {
             let cb = kernel.queue.new_command_buffer();
             let blit = cb.new_blit_command_encoder();
-            let old_cap = self.kv_capacity;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let Some((new_key, new_value, new_stride)) = replacements[layer_idx].as_ref()
+                else {
+                    continue;
+                };
+                let old_stride = self.kv_strides[layer_idx];
                 let row_bytes = (layer.head_dim * 4) as u64;
-                let run = filled as u64 * row_bytes;
-                for h in 0..layer.n_kv_heads {
-                    let src = (h * old_cap) as u64 * row_bytes;
-                    let dst = (h * new_cap) as u64 * row_bytes;
-                    blit.copy_from_buffer(
-                        &self.cache_k[layer_idx],
-                        src,
-                        &new_k[layer_idx],
-                        dst,
-                        run,
-                    );
-                    blit.copy_from_buffer(
-                        &self.cache_v[layer_idx],
-                        src,
-                        &new_v[layer_idx],
-                        dst,
-                        run,
-                    );
+                let retained = filled.min(old_stride).min(*new_stride);
+                let logical_start = filled.saturating_sub(retained);
+                if logical_start == 0 && filled <= old_stride && filled <= *new_stride {
+                    let run = filled as u64 * row_bytes;
+                    for h in 0..layer.n_kv_heads {
+                        let src = (h * old_stride) as u64 * row_bytes;
+                        let dst = (h * *new_stride) as u64 * row_bytes;
+                        blit.copy_from_buffer(&self.cache_k[layer_idx], src, new_key, dst, run);
+                        blit.copy_from_buffer(&self.cache_v[layer_idx], src, new_value, dst, run);
+                    }
+                } else {
+                    for logical_position in logical_start..filled {
+                        let Some(src_position) =
+                            gemma4_kv_physical_position(logical_position, old_stride)
+                        else {
+                            return false;
+                        };
+                        let Some(dst_position) =
+                            gemma4_kv_physical_position(logical_position, *new_stride)
+                        else {
+                            return false;
+                        };
+                        for h in 0..layer.n_kv_heads {
+                            let src = (h * old_stride + src_position) as u64 * row_bytes;
+                            let dst = (h * *new_stride + dst_position) as u64 * row_bytes;
+                            blit.copy_from_buffer(
+                                &self.cache_k[layer_idx],
+                                src,
+                                new_key,
+                                dst,
+                                row_bytes,
+                            );
+                            blit.copy_from_buffer(
+                                &self.cache_v[layer_idx],
+                                src,
+                                new_value,
+                                dst,
+                                row_bytes,
+                            );
+                        }
+                    }
                 }
             }
             blit.end_encoding();
@@ -27679,20 +28335,26 @@ impl Gemma4GhostCommonMetal {
                 return false;
             }
         }
-        self.cache_k = new_k;
-        self.cache_v = new_v;
-        self.kv_capacity = new_cap;
-        let mut kv_elements = 0usize;
-        for layer in &self.layers {
-            kv_elements += 2 * layer.n_kv_heads * new_cap * layer.head_dim;
+        for (layer_idx, replacement) in replacements.into_iter().enumerate() {
+            if let Some((key, value, stride)) = replacement {
+                self.cache_k[layer_idx] = key;
+                self.cache_v[layer_idx] = value;
+                self.kv_strides[layer_idx] = stride;
+            }
         }
-        self.geometry.kv_capacity = new_cap;
-        self.geometry.kv_elements = kv_elements;
-        self.geometry.kv_bytes = kv_elements * 4;
+        self.kv_capacity = new_cap;
+        if !self.refresh_kv_geometry() {
+            return false;
+        }
+        let full_prefix_bytes = self.allocation_ledger().kv_full_prefix_equivalent_bytes;
         eprintln!(
-            "[gemma4-ghost-common] f32 KV grown to {} positions ({:.2} GiB allocated, cap {})",
+            "[gemma4-ghost-common] f32 KV grown to {} logical positions ({:.2} GiB allocated, {:.2} GiB full-prefix equivalent, local_stride={}, global_stride={}, ring={}, cap={})",
             new_cap,
             self.geometry.kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            full_prefix_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            self.geometry.local_kv_stride,
+            self.geometry.global_kv_stride,
+            self.local_kv_ring,
             self.max_positions
         );
         true
@@ -27880,6 +28542,7 @@ impl Gemma4GhostCommonMetal {
 
     pub(crate) fn reset_sequence(&mut self) {
         self.next_position.fill(0);
+        self.kv_written_position.fill(0);
         self.latest_attention_layer = None;
         self.cold_recurrence_previous = None;
         if let Some(layers) = self.retained_cold_layers.as_mut() {
@@ -27908,12 +28571,6 @@ impl Gemma4GhostCommonMetal {
         if positions == 0 || positions > self.max_positions {
             return Err(fail(format!(
                 "position count {positions} is outside 1..={}",
-                self.max_positions
-            )));
-        }
-        if !self.ensure_kv_capacity(positions) {
-            return Err(fail(format!(
-                "could not grow f32 KV to {positions} positions (cap {})",
                 self.max_positions
             )));
         }
@@ -27955,15 +28612,27 @@ impl Gemma4GhostCommonMetal {
             }
         }
 
+        // Capacity growth is the first mutation. A malformed import therefore
+        // cannot replace buffers or alter a ring watermark before every source
+        // row has passed validation.
+        if !self.ensure_kv_capacity(positions) {
+            return Err(fail(format!(
+                "could not grow f32 KV to {positions} positions (cap {})",
+                self.max_positions
+            )));
+        }
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let stride = self.kv_strides[layer_idx];
             let key_dst = self.cache_k[layer_idx].contents().cast::<f32>();
             let value_dst = self.cache_v[layer_idx].contents().cast::<f32>();
             for position in 0..positions {
+                let destination_position = position % stride;
                 let key = &keys[layer_idx][position];
                 let value = &values[layer_idx][position];
                 for head in 0..layer.n_kv_heads {
                     let src = head * layer.head_dim;
-                    let dst = (head * self.kv_stride() + position) * layer.head_dim;
+                    let dst = (head * stride + destination_position) * layer.head_dim;
                     // SAFETY: all source row widths and destination capacity were
                     // validated above. Each `(head, position)` destination is disjoint.
                     unsafe {
@@ -27982,15 +28651,45 @@ impl Gemma4GhostCommonMetal {
             }
         }
         self.next_position.fill(positions);
+        self.kv_written_position.fill(positions);
         self.latest_attention_layer = None;
         self.cold_recurrence_previous = None;
         Ok(())
     }
 
-    pub(crate) fn truncate_sequence(&mut self, keep: usize) {
+    pub(crate) fn truncate_sequence(&mut self, keep: usize) -> bool {
+        if self.local_kv_ring {
+            let required_history = self
+                .sliding_window
+                .saturating_add(usize::from(self.strict_26b));
+            let safe = self
+                .is_sliding
+                .iter()
+                .enumerate()
+                .filter(|(_, sliding)| **sliding)
+                .all(|(layer_idx, _)| {
+                    gemma4_ring_rollback_is_safe(
+                        self.kv_written_position[layer_idx],
+                        keep,
+                        self.kv_strides[layer_idx],
+                        required_history,
+                    )
+                });
+            if !safe {
+                let written_logical_len =
+                    self.kv_written_position.iter().copied().max().unwrap_or(0);
+                eprintln!(
+                    "[gemma4-ghost-common] refusing unsafe local-KV ring rollback from {written_logical_len} to {keep}; resetting logical watermark"
+                );
+                self.reset_sequence();
+                self.cached_rope = None;
+                return false;
+            }
+        }
         self.next_position.fill(keep);
         self.latest_attention_layer = None;
         self.cached_rope = None;
+        true
     }
 
     pub(crate) fn is_at_position(&self, positions: usize) -> bool {
@@ -28019,14 +28718,15 @@ impl Gemma4GhostCommonMetal {
             return None;
         }
         let (sliding_layer, full_layer) = gemma4_mtp_target_layer_indices(&self.is_sliding)?;
-        let logical_len = gemma4_mtp_logical_kv_len(&self.next_position, self.kv_capacity)?;
+        let logical_len = gemma4_mtp_logical_kv_len(&self.next_position, self.max_positions)?;
         let layer_view = |layer_index: usize, sliding_window: Option<usize>| {
             let layer = self.layers.get(layer_index)?;
             let key = self.cache_k.get(layer_index)?;
             let value = self.cache_v.get(layer_index)?;
+            let kv_stride = *self.kv_strides.get(layer_index)?;
             let required_bytes = layer
                 .n_kv_heads
-                .checked_mul(self.kv_capacity)?
+                .checked_mul(kv_stride)?
                 .checked_mul(layer.head_dim)?
                 .checked_mul(std::mem::size_of::<f32>())?;
             if key.length() < required_bytes as u64 || value.length() < required_bytes as u64 {
@@ -28037,10 +28737,11 @@ impl Gemma4GhostCommonMetal {
                 key,
                 value,
                 logical_len,
-                kv_stride: self.kv_capacity,
+                kv_stride,
                 kv_heads: layer.n_kv_heads,
                 head_dim: layer.head_dim,
                 sliding_window,
+                physical_ring: self.local_kv_ring && self.is_sliding[layer_index],
             })
         };
         let sliding = layer_view(sliding_layer, Some(self.sliding_window))?;
@@ -28233,12 +28934,12 @@ impl Gemma4GhostCommonMetal {
             *attn.add(12).cast::<u32>() = group as u32;
             *attn.add(16).cast::<f32>() = 1.0; // QK norm folds Gemma's scale.
             *attn.add(20).cast::<u32>() = layer.head_dim as u32;
-            *attn.add(24).cast::<u32>() = (self.kv_stride() * layer.head_dim) as u32;
+            *attn.add(24).cast::<u32>() = (self.kv_strides[layer_idx] * layer.head_dim) as u32;
             *attn.add(28).cast::<u32>() = (window_start * layer.head_dim) as u32;
 
             let scatter = a.scatter_scalar.contents().cast::<u32>();
             *scatter = layer.head_dim as u32;
-            *scatter.add(1) = self.kv_stride() as u32;
+            *scatter.add(1) = self.kv_strides[layer_idx] as u32;
             *scatter.add(2) = position as u32;
             *scatter.add(3) = kv_dim as u32;
             *a.kv16_write.contents().cast::<u32>() = 0;
@@ -28358,7 +29059,13 @@ impl Gemma4GhostCommonMetal {
             0,
         );
 
-        encoder.set_compute_pipeline_state(&kernel.kv_scatter_pipeline);
+        let physical_ring = self.local_kv_ring && self.is_sliding[layer_idx];
+        let scatter_pipeline = if physical_ring {
+            kernel.kv_scatter_ring_pipeline.as_ref()?
+        } else {
+            &kernel.kv_scatter_pipeline
+        };
+        encoder.set_compute_pipeline_state(scatter_pipeline);
         encoder.set_buffer(0, Some(&a.key_normed), 0);
         encoder.set_buffer(1, Some(&a.value_normed), 0);
         encoder.set_buffer(2, Some(&self.cache_k[layer_idx]), 0);
@@ -28371,28 +29078,49 @@ impl Gemma4GhostCommonMetal {
         encoder.set_buffer(8, Some(&a.scatter_scalar), 0);
         encoder.set_buffer(9, Some(&a.scatter_scalar), 0);
         encoder.set_buffer(10, Some(&a.kv16_write), 0);
-        dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
+        dispatch_1d(encoder, scatter_pipeline, kv_dim);
 
         // The exact 26B head widths (256/512) use the bit-identical split-three
         // f32 attention implementation. Its denominator and block scalars are
         // persistent here rather than borrowed from the global scratch pool.
-        encode_attention_split3(
-            encoder,
-            kernel,
-            &a.query_normed,
-            &self.cache_k[layer_idx],
-            &self.cache_v[layer_idx],
-            &a.scores,
-            &a.denom,
-            &a.context,
-            &a.attention_scalar,
-            &a.attention_blocks,
-            layer.n_heads,
-            layer.head_dim,
-            position_count,
-            0,
-            0,
-        );
+        if physical_ring {
+            if !encode_attention_split3_ring(
+                encoder,
+                kernel,
+                &a.query_normed,
+                &self.cache_k[layer_idx],
+                &self.cache_v[layer_idx],
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                0,
+                0,
+            ) {
+                return None;
+            }
+        } else {
+            encode_attention_split3(
+                encoder,
+                kernel,
+                &a.query_normed,
+                &self.cache_k[layer_idx],
+                &self.cache_v[layer_idx],
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                &a.attention_blocks,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                0,
+                0,
+            );
+        }
         encode_quantize(
             encoder,
             kernel,
@@ -28439,6 +29167,7 @@ impl Gemma4GhostCommonMetal {
         let encode_us = started.elapsed().as_micros();
 
         self.next_position[layer_idx] = filled;
+        self.kv_written_position[layer_idx] = self.kv_written_position[layer_idx].max(filled);
         self.latest_attention_layer = Some(layer_idx);
         let q4_bytes = |rows: usize, input: usize| rows * (input / 32) * 18;
         let streamed_weight_bytes = q4_bytes(q_dim, self.hidden_size)
@@ -28557,12 +29286,12 @@ impl Gemma4GhostCommonMetal {
             *attn.add(12).cast::<u32>() = group as u32;
             *attn.add(16).cast::<f32>() = 1.0;
             *attn.add(20).cast::<u32>() = layer.head_dim as u32;
-            *attn.add(24).cast::<u32>() = (self.kv_stride() * layer.head_dim) as u32;
+            *attn.add(24).cast::<u32>() = (self.kv_strides[layer_idx] * layer.head_dim) as u32;
             *attn.add(28).cast::<u32>() = (window_start * layer.head_dim) as u32;
 
             let scatter = a.scatter_scalar.contents().cast::<u32>();
             *scatter = layer.head_dim as u32;
-            *scatter.add(1) = self.kv_stride() as u32;
+            *scatter.add(1) = self.kv_strides[layer_idx] as u32;
             *scatter.add(2) = position as u32;
             *scatter.add(3) = kv_dim as u32;
             *a.kv16_write.contents().cast::<u32>() = 0;
@@ -28674,7 +29403,13 @@ impl Gemma4GhostCommonMetal {
             0,
         );
 
-        encoder.set_compute_pipeline_state(&kernel.kv_scatter_pipeline);
+        let physical_ring = self.local_kv_ring && self.is_sliding[layer_idx];
+        let scatter_pipeline = if physical_ring {
+            kernel.kv_scatter_ring_pipeline.as_ref()?
+        } else {
+            &kernel.kv_scatter_pipeline
+        };
+        encoder.set_compute_pipeline_state(scatter_pipeline);
         encoder.set_buffer(0, Some(&a.key_normed), 0);
         encoder.set_buffer(1, Some(&a.value_normed), 0);
         encoder.set_buffer(2, Some(&self.cache_k[layer_idx]), 0);
@@ -28686,25 +29421,46 @@ impl Gemma4GhostCommonMetal {
         encoder.set_buffer(8, Some(&a.scatter_scalar), 0);
         encoder.set_buffer(9, Some(&a.scatter_scalar), 0);
         encoder.set_buffer(10, Some(&a.kv16_write), 0);
-        dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
+        dispatch_1d(encoder, scatter_pipeline, kv_dim);
 
-        encode_attention_split3(
-            encoder,
-            kernel,
-            &a.query_normed,
-            &self.cache_k[layer_idx],
-            &self.cache_v[layer_idx],
-            &a.scores,
-            &a.denom,
-            &a.context,
-            &a.attention_scalar,
-            &a.attention_blocks,
-            layer.n_heads,
-            layer.head_dim,
-            position_count,
-            0,
-            0,
-        );
+        if physical_ring {
+            if !encode_attention_split3_ring(
+                encoder,
+                kernel,
+                &a.query_normed,
+                &self.cache_k[layer_idx],
+                &self.cache_v[layer_idx],
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                0,
+                0,
+            ) {
+                return None;
+            }
+        } else {
+            encode_attention_split3(
+                encoder,
+                kernel,
+                &a.query_normed,
+                &self.cache_k[layer_idx],
+                &self.cache_v[layer_idx],
+                &a.scores,
+                &a.denom,
+                &a.context,
+                &a.attention_scalar,
+                &a.attention_blocks,
+                layer.n_heads,
+                layer.head_dim,
+                position_count,
+                0,
+                0,
+            );
+        }
         encode_quantize(
             encoder,
             kernel,
@@ -29604,6 +30360,13 @@ impl Gemma4GhostCommonMetal {
             eprintln!("[metal chained round] rejected: k_tokens={k_tokens}");
             return false;
         }
+        if self.local_kv_ring && k_tokens > self.local_kv_ring_headroom {
+            eprintln!(
+                "[metal chained round] rejected: local-KV ring headroom {} cannot protect K={k_tokens} speculative rows",
+                self.local_kv_ring_headroom
+            );
+            return false;
+        }
         if expert_bindings.len() < self.layers.len() {
             eprintln!(
                 "[metal chained round] rejected: {} expert bindings for {} layers",
@@ -30211,6 +30974,7 @@ impl Gemma4GhostCommonMetal {
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let norms = &self.norms[layer_idx];
+            let physical_ring = self.local_kv_ring && self.is_sliding[layer_idx];
             // Set when the overlap path already committed this layer's
             // MoE+tail command buffer; the serial tail encode and the
             // end-of-layer commit below are then skipped.
@@ -30341,17 +31105,24 @@ impl Gemma4GhostCommonMetal {
             // correct RoPE tables (cos(1)=0.540302) and batch_k seeing 2 positions.
             // Use the split RMS + rope_rotate + scatter path until fused scatter/RoPE
             // apply is proven at start_pos>0.
-            if let (Some(q_pipe), Some(kv_pipe)) = (
-                kernel.gemma4_fused_q_norm_rope_batch_pipeline.as_ref(),
+            let fused_kv_pipeline = if physical_ring {
+                kernel
+                    .gemma4_fused_kv_norm_rope_scatter_batch_ring_pipeline
+                    .as_ref()
+            } else {
                 kernel
                     .gemma4_fused_kv_norm_rope_scatter_batch_pipeline
-                    .as_ref(),
+                    .as_ref()
+            };
+            if let (Some(q_pipe), Some(kv_pipe)) = (
+                kernel.gemma4_fused_q_norm_rope_batch_pipeline.as_ref(),
+                fused_kv_pipeline,
             ) {
                 let n_heads_u32 = layer.n_heads as u32;
                 let n_kv_heads_u32 = layer.n_kv_heads as u32;
                 let head_dim_u32 = layer.head_dim as u32;
                 let half_rope_u32 = half_rope as u32;
-                let max_positions_u32 = self.kv_stride() as u32;
+                let max_positions_u32 = self.kv_strides[layer_idx] as u32;
                 let start_pos_u32 = start_pos as u32;
                 let eps = layer.eps;
 
@@ -30504,11 +31275,21 @@ impl Gemma4GhostCommonMetal {
                 unsafe {
                     let s = layer.scatter_scalar.contents() as *mut u32;
                     *s = layer.head_dim as u32;
-                    *s.add(1) = self.kv_stride() as u32;
+                    *s.add(1) = self.kv_strides[layer_idx] as u32;
                     *s.add(2) = start_pos as u32;
                     *s.add(3) = kv_dim as u32;
                 }
-                encoder.set_compute_pipeline_state(&kernel.kv_scatter_batch_pipeline);
+                let scatter_pipeline = if physical_ring {
+                    let Some(pipeline) = kernel.kv_scatter_batch_ring_pipeline.as_ref() else {
+                        encoder.end_encoding();
+                        self.last_chained_ledger = ledger;
+                        return false;
+                    };
+                    pipeline
+                } else {
+                    &kernel.kv_scatter_batch_pipeline
+                };
+                encoder.set_compute_pipeline_state(scatter_pipeline);
                 encoder.set_buffer(0, Some(&self.resident_scratch.kn_batch), 0);
                 encoder.set_buffer(1, Some(val_source), 0);
                 encoder.set_buffer(2, Some(&self.cache_k[layer_idx]), 0);
@@ -30520,10 +31301,7 @@ impl Gemma4GhostCommonMetal {
                 encoder.set_buffer(8, Some(&self.resident_scratch.kv16_write), 0);
                 encoder.set_buffer(9, Some(&self.resident_scratch.kv16_write), 0);
                 encoder.set_buffer(10, Some(&self.resident_scratch.kv16_write), 0);
-                let width = kernel
-                    .kv_scatter_batch_pipeline
-                    .thread_execution_width()
-                    .max(1);
+                let width = scatter_pipeline.thread_execution_width().max(1);
                 encoder.dispatch_thread_groups(
                     metal::MTLSize {
                         width: (kv_dim as u64).div_ceil(width),
@@ -30560,7 +31338,7 @@ impl Gemma4GhostCommonMetal {
                 *(a.add(12) as *mut u32) = group;
                 *(a.add(16) as *mut f32) = attn_scale;
                 *(a.add(20) as *mut u32) = layer.head_dim as u32;
-                *(a.add(24) as *mut u32) = (self.kv_stride() * layer.head_dim) as u32;
+                *(a.add(24) as *mut u32) = (self.kv_strides[layer_idx] * layer.head_dim) as u32;
                 *(a.add(28) as *mut u32) = 0;
                 // Offsets 40/44 are sliding_window and max_positions for batch_k.
                 // attn_scalar must be at least 48 bytes; a 32-byte buffer overflowed
@@ -30586,6 +31364,7 @@ impl Gemma4GhostCommonMetal {
                 k_tokens,
                 sliding_window,
                 self.max_positions as u32,
+                physical_ring,
             );
 
             if !batched_ok {
@@ -30605,27 +31384,51 @@ impl Gemma4GhostCommonMetal {
                         *(a.add(12) as *mut u32) = group;
                         *(a.add(16) as *mut f32) = attn_scale;
                         *(a.add(20) as *mut u32) = layer.head_dim as u32;
-                        *(a.add(24) as *mut u32) = (self.kv_stride() * layer.head_dim) as u32;
+                        *(a.add(24) as *mut u32) =
+                            (self.kv_strides[layer_idx] * layer.head_dim) as u32;
                         *(a.add(28) as *mut u32) = kv_base_offset as u32;
                     }
 
-                    encode_attention_split3(
-                        encoder,
-                        kernel,
-                        &self.resident_scratch.qn_batch,
-                        &self.cache_k[layer_idx],
-                        &self.cache_v[layer_idx],
-                        &self.resident_scratch.scores_buf,
-                        &layer.denom_buf,
-                        &self.resident_scratch.ctx_batch,
-                        &layer.attn_scalar,
-                        &layer.blocks_buf,
-                        layer.n_heads,
-                        layer.head_dim,
-                        position_count,
-                        q_off,
-                        q_off,
-                    );
+                    if physical_ring {
+                        if !encode_attention_split3_ring(
+                            encoder,
+                            kernel,
+                            &self.resident_scratch.qn_batch,
+                            &self.cache_k[layer_idx],
+                            &self.cache_v[layer_idx],
+                            &self.resident_scratch.scores_buf,
+                            &layer.denom_buf,
+                            &self.resident_scratch.ctx_batch,
+                            &layer.attn_scalar,
+                            layer.n_heads,
+                            layer.head_dim,
+                            position_count,
+                            q_off,
+                            q_off,
+                        ) {
+                            encoder.end_encoding();
+                            self.last_chained_ledger = ledger;
+                            return false;
+                        }
+                    } else {
+                        encode_attention_split3(
+                            encoder,
+                            kernel,
+                            &self.resident_scratch.qn_batch,
+                            &self.cache_k[layer_idx],
+                            &self.cache_v[layer_idx],
+                            &self.resident_scratch.scores_buf,
+                            &layer.denom_buf,
+                            &self.resident_scratch.ctx_batch,
+                            &layer.attn_scalar,
+                            &layer.blocks_buf,
+                            layer.n_heads,
+                            layer.head_dim,
+                            position_count,
+                            q_off,
+                            q_off,
+                        );
+                    }
                 }
             }
 
@@ -31036,6 +31839,8 @@ impl Gemma4GhostCommonMetal {
                         }
                         last_committed_cb = Some(cb3);
                         self.next_position[layer_idx] = start_pos + k_tokens;
+                        self.kv_written_position[layer_idx] =
+                            self.kv_written_position[layer_idx].max(start_pos + k_tokens);
                         cb_closed = true;
                         layer_committed = true;
                         encode_clock = std::time::Instant::now();
@@ -31221,9 +32026,19 @@ impl Gemma4GhostCommonMetal {
                         let hd = layer.head_dim;
                         let nkv = layer.n_kv_heads;
                         let nh = layer.n_heads;
-                        let mp = self.kv_stride();
+                        let mp = self.kv_strides[layer_idx];
                         let score_mp = self.max_positions;
                         let group = (nh / nkv).max(1);
+                        let filled = start_pos + 1;
+                        let window_start = layer.window_start(filled);
+                        let position_count = filled - window_start;
+                        let physical_position = |logical_position: usize| {
+                            if physical_ring {
+                                logical_position % mp
+                            } else {
+                                logical_position
+                            }
+                        };
                         let q = unsafe {
                             std::slice::from_raw_parts(
                                 self.resident_scratch.qn_batch.contents() as *const f32,
@@ -31261,11 +32076,12 @@ impl Gemma4GhostCommonMetal {
                                 l2(q),
                                 l2(ctx)
                             );
-                        for p in 0..=start_pos {
+                        for p in window_start..=start_pos {
                             let mut krow = Vec::with_capacity(nkv * hd);
                             let mut vrow = Vec::with_capacity(nkv * hd);
+                            let physical = physical_position(p);
                             for h in 0..nkv {
-                                let off = (h * mp + p) * hd;
+                                let off = (h * mp + physical) * hd;
                                 krow.extend_from_slice(&kcache[off..off + hd]);
                                 vrow.extend_from_slice(&vcache[off..off + hd]);
                             }
@@ -31282,9 +32098,10 @@ impl Gemma4GhostCommonMetal {
                             let kvh = head / group;
                             let qh = &q[head * hd..(head + 1) * hd];
                             let sb = head * score_mp;
-                            let mut host_raw = Vec::with_capacity(start_pos + 1);
-                            for p in 0..=start_pos {
-                                let koff = (kvh * mp + p) * hd;
+                            let mut host_raw = Vec::with_capacity(position_count);
+                            for p in window_start..=start_pos {
+                                let physical = physical_position(p);
+                                let koff = (kvh * mp + physical) * hd;
                                 let mut dot = 0.0f32;
                                 for d in 0..hd {
                                     dot += qh[d] * kcache[koff + d];
@@ -31301,27 +32118,28 @@ impl Gemma4GhostCommonMetal {
                                     e
                                 })
                                 .collect();
-                            let gpu_max = (0..=start_pos)
-                                .map(|p| scores[sb + p])
+                            let gpu_max = (0..position_count)
+                                .map(|compact| scores[sb + compact])
                                 .fold(f32::NEG_INFINITY, f32::max);
-                            for p in 0..=start_pos {
-                                let hp = host_prob[p] / den;
+                            for (compact, p) in (window_start..=start_pos).enumerate() {
+                                let hp = host_prob[compact] / den;
                                 let _gp = if gpu_max > 0.0 {
-                                    scores[sb + p] / gpu_max
+                                    scores[sb + compact] / gpu_max
                                 } else {
                                     0.0
                                 };
                                 // gpu scores are exp(raw-max); compare ratios
-                                let hr = host_prob[p] / host_prob[0].max(1e-20);
-                                let gr = scores[sb + p] / scores[sb].max(1e-20);
+                                let hr = host_prob[compact] / host_prob[0].max(1e-20);
+                                let gr = scores[sb + compact] / scores[sb].max(1e-20);
                                 max_score_err = max_score_err.max((hr - gr).abs());
                                 if head < 2 {
                                     lines.push_str(&format!(
-                                            "head{head} p{p}: host_raw={:.5} host_prob={:.5} gpu_exp={:.5} ratio_h={:.5} ratio_g={:.5}\n",
-                                            host_raw[p], hp, scores[sb + p], hr, gr
+                                        "head{head} p{p}: host_raw={:.5} host_prob={:.5} gpu_exp={:.5} ratio_h={:.5} ratio_g={:.5}\n",
+                                            host_raw[compact], hp, scores[sb + compact], hr, gr
                                         ));
                                 }
-                                let voff = (kvh * mp + p) * hd;
+                                let physical = physical_position(p);
+                                let voff = (kvh * mp + physical) * hd;
                                 for d in 0..hd {
                                     host_ctx[head * hd + d] += hp * vcache[voff + d];
                                 }
@@ -33297,6 +34115,8 @@ impl Gemma4GhostCommonMetal {
                 }
             }
             self.next_position[layer_idx] = start_pos + k_tokens;
+            self.kv_written_position[layer_idx] =
+                self.kv_written_position[layer_idx].max(start_pos + k_tokens);
 
             if !layer_committed
                 && std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1")
@@ -35361,6 +36181,122 @@ fn encode_attention_split3(
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
+fn encode_attention_split3_ring(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    scores: &Buffer,
+    denom: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    query_off: u64,
+    out_off: u64,
+) -> bool {
+    let (Some(scores_pipeline), Some(context_pipeline)) = (
+        k.attention_decode_scores_ring_pipeline.as_ref(),
+        k.attention_decode_context_ring_pipeline.as_ref(),
+    ) else {
+        return false;
+    };
+    let score_blocks = position_count.div_ceil(32).max(1);
+    let dim_blocks = head_dim.div_ceil(32).max(1);
+    let (
+        n_heads_u32,
+        head_dim_u32,
+        pos_count_u32,
+        group_u32,
+        scale_f32,
+        pos_stride_u32,
+        kv_head_stride_u32,
+        kv_base_offset_u32,
+    ) = unsafe {
+        let p = scalar.contents() as *const u32;
+        (
+            *p,
+            *p.add(1),
+            *p.add(2),
+            *p.add(3),
+            *(p.add(4) as *const f32),
+            *p.add(5),
+            *p.add(6),
+            *p.add(7),
+        )
+    };
+    let score_blocks_u32 = score_blocks as u32;
+    let dim_blocks_u32 = dim_blocks as u32;
+    let tg32 = metal::MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+
+    e.set_compute_pipeline_state(scores_pipeline);
+    e.set_buffer(0, Some(query), query_off);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &pos_count_u32 as *const u32 as *const _);
+    e.set_bytes(8, 4, &group_u32 as *const u32 as *const _);
+    e.set_bytes(9, 4, &scale_f32 as *const f32 as *const _);
+    e.set_bytes(10, 4, &pos_stride_u32 as *const u32 as *const _);
+    e.set_bytes(11, 4, &kv_head_stride_u32 as *const u32 as *const _);
+    e.set_bytes(12, 4, &kv_base_offset_u32 as *const u32 as *const _);
+    e.set_bytes(14, 4, &score_blocks_u32 as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: score_blocks as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+
+    e.set_compute_pipeline_state(&k.attention_decode_softmax_pipeline);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &pos_count_u32 as *const u32 as *const _);
+    e.set_buffer(13, Some(denom), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        tg32,
+    );
+
+    e.set_compute_pipeline_state(context_pipeline);
+    e.set_buffer(2, Some(values), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_buffer(4, Some(out), out_off);
+    e.set_bytes(5, 4, &n_heads_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const _);
+    e.set_bytes(7, 4, &pos_count_u32 as *const u32 as *const _);
+    e.set_bytes(8, 4, &group_u32 as *const u32 as *const _);
+    e.set_bytes(10, 4, &pos_stride_u32 as *const u32 as *const _);
+    e.set_bytes(11, 4, &kv_head_stride_u32 as *const u32 as *const _);
+    e.set_bytes(12, 4, &kv_base_offset_u32 as *const u32 as *const _);
+    e.set_buffer(13, Some(denom), 0);
+    e.set_bytes(14, 4, &dim_blocks_u32 as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: dim_blocks as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_attention_split3_batch_k(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
@@ -35377,11 +36313,22 @@ pub(crate) fn encode_attention_split3_batch_k(
     k_tokens: usize,
     sliding_window: u32,
     max_positions: u32,
+    physical_ring: bool,
 ) -> bool {
+    let scores_pipe = if physical_ring {
+        k.attention_decode_scores_batch_k_ring_pipeline.as_ref()
+    } else {
+        k.attention_decode_scores_batch_k_pipeline.as_ref()
+    };
+    let ctx_pipe = if physical_ring {
+        k.attention_decode_context_batch_k_ring_pipeline.as_ref()
+    } else {
+        k.attention_decode_context_batch_k_pipeline.as_ref()
+    };
     let (Some(scores_pipe), Some(softmax_pipe), Some(ctx_pipe)) = (
-        &k.attention_decode_scores_batch_k_pipeline,
-        &k.attention_decode_softmax_batch_k_pipeline,
-        &k.attention_decode_context_batch_k_pipeline,
+        scores_pipe,
+        k.attention_decode_softmax_batch_k_pipeline.as_ref(),
+        ctx_pipe,
     ) else {
         return false;
     };
@@ -52300,6 +53247,596 @@ kernel void sample_active_expert_records(
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn metal_gemma4_local_kv_ring_geometry_protects_mtp_and_k16_rollback() {
+        const WINDOW: usize = 1_024;
+        const HEADROOM: usize = 16;
+        const WRITTEN: usize = 4_096;
+        let stride = gemma4_local_kv_ring_stride(WINDOW, HEADROOM, 8_192).unwrap();
+        assert_eq!(stride, 1_040);
+
+        // K=16 writes 16 rows before candidate zero reads. Rejecting all 15
+        // speculative tail rows must retain the assistant's inclusive 1,025
+        // row suffix; one additional rejected row is intentionally refused.
+        assert!(gemma4_ring_rollback_is_safe(
+            WRITTEN,
+            WRITTEN - 15,
+            stride,
+            WINDOW + 1,
+        ));
+        assert!(!gemma4_ring_rollback_is_safe(
+            WRITTEN,
+            WRITTEN - 16,
+            stride,
+            WINDOW + 1,
+        ));
+        assert_eq!(gemma4_kv_physical_position(stride - 1, stride), Some(1_039));
+        assert_eq!(gemma4_kv_physical_position(stride, stride), Some(0));
+        assert_eq!(gemma4_kv_physical_position(stride + 15, stride), Some(15));
+        assert_eq!(gemma4_kv_physical_position(7, 0), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_local_kv_ring_scalar_wrap_matches_full_prefix_and_rolls_back_safely() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const MAX_POSITIONS: usize = 8;
+        const WINDOW: usize = 2;
+        const HEADROOM: usize = 2;
+        const HEAD_DIM: usize = 256;
+
+        let full_fixture = ghost_common_fixture(0x4a11);
+        let ring_fixture = ghost_common_fixture(0x4a11);
+        let mut full = Gemma4GhostCommonMetal::new_synthetic(
+            vec![full_fixture.layer],
+            vec![full_fixture.post_norm_1],
+            MAX_POSITIONS,
+            WINDOW,
+        )
+        .expect("full-prefix control");
+        let mut ring = Gemma4GhostCommonMetal::new_synthetic_with_local_ring(
+            vec![ring_fixture.layer],
+            vec![ring_fixture.post_norm_1],
+            MAX_POSITIONS,
+            WINDOW,
+            HEADROOM,
+        )
+        .expect("local-ring experiment");
+        assert!(!full.geometry().local_kv_ring);
+        assert!(ring.geometry().local_kv_ring);
+        assert_eq!(full.geometry().local_kv_stride, MAX_POSITIONS);
+        assert_eq!(ring.geometry().local_kv_stride, WINDOW + HEADROOM);
+        let full_ledger = full.allocation_ledger();
+        let ring_ledger = ring.allocation_ledger();
+        assert_eq!(
+            ring_ledger.kv_full_prefix_equivalent_bytes,
+            full_ledger.kv_capacity_bytes
+        );
+        assert_eq!(
+            ring_ledger.kv_capacity_bytes * 2,
+            full_ledger.kv_capacity_bytes
+        );
+        assert_eq!(
+            ring_ledger.local_kv_capacity_bytes,
+            ring_ledger.kv_capacity_bytes
+        );
+        assert_eq!(ring_ledger.global_kv_capacity_bytes, 0);
+
+        let cos = vec![1.0f32; HEAD_DIM / 2];
+        let sin = vec![0.0f32; HEAD_DIM / 2];
+        for position in 0..MAX_POSITIONS {
+            let hidden: Vec<f32> = (0..128)
+                .map(|index| (((index * 37 + position * 53 + 11) % 251) as f32 - 125.0) * 0.0031)
+                .collect();
+            let full_output = full
+                .execute_attention(0, &hidden, &cos, &sin, position)
+                .expect("full-prefix scalar attention")
+                .0;
+            let ring_output = ring
+                .execute_attention(0, &hidden, &cos, &sin, position)
+                .expect("ring scalar attention")
+                .0;
+            assert_eq!(
+                ring_output
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                full_output
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "ring diverged at logical position {position}"
+            );
+        }
+
+        assert!(ring.truncate_sequence(MAX_POSITIONS - HEADROOM));
+        assert_eq!(ring.next_position, vec![MAX_POSITIONS - HEADROOM]);
+        assert_eq!(ring.kv_written_position, vec![MAX_POSITIONS]);
+        assert!(!ring.truncate_sequence(MAX_POSITIONS - HEADROOM - 1));
+        assert_eq!(ring.next_position, vec![0]);
+        assert_eq!(ring.kv_written_position, vec![0]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_local_kv_ring_k16_fused_scatter_and_batch_attention_match_full_prefix() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const N_HEADS: usize = 2;
+        const N_KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 256;
+        const HALF_ROPE: usize = HEAD_DIM / 2;
+        const WINDOW: usize = 4;
+        const HEADROOM: usize = 16;
+        const RING_CAPACITY: usize = WINDOW + HEADROOM;
+        const MAX_POSITIONS: usize = 40;
+        const START_POSITION: usize = RING_CAPACITY - 2;
+        const K_TOKENS: usize = 16;
+
+        let kernel = metal_linear_kernel().expect("Metal kernel");
+        let full_fused = kernel
+            .gemma4_fused_kv_norm_rope_scatter_batch_pipeline
+            .as_ref()
+            .expect("full-prefix fused KV pipeline");
+        let ring_fused = kernel
+            .gemma4_fused_kv_norm_rope_scatter_batch_ring_pipeline
+            .as_ref()
+            .expect("ring fused KV pipeline");
+        let ring_split_scatter = kernel
+            .kv_scatter_batch_ring_pipeline
+            .as_ref()
+            .expect("ring split batch scatter pipeline");
+        assert!(kernel
+            .attention_decode_scores_batch_k_ring_pipeline
+            .is_some());
+        assert!(kernel
+            .attention_decode_context_batch_k_ring_pipeline
+            .is_some());
+        let device = &kernel.device;
+        let opts = MTLResourceOptions::StorageModeShared;
+        let f32_buffer = |values: &[f32]| {
+            let buffer = device.new_buffer(std::mem::size_of_val(values) as u64, opts);
+            write_buffer_f32(&buffer, values);
+            buffer
+        };
+        let empty_f32 = |elements: usize| {
+            device.new_buffer((elements * std::mem::size_of::<f32>()) as u64, opts)
+        };
+
+        // The retained prefix fills every physical ring slot that survives the
+        // K=16 speculative writer. Positions 18..33 then cross the physical
+        // boundary while candidate zero still needs logical rows 15..18.
+        let mut full_key_values = vec![0.0f32; MAX_POSITIONS * HEAD_DIM];
+        let mut full_value_values = vec![0.0f32; MAX_POSITIONS * HEAD_DIM];
+        for position in 0..START_POSITION {
+            for dim in 0..HEAD_DIM {
+                full_key_values[position * HEAD_DIM + dim] =
+                    (((position * 131 + dim * 17 + 7) % 509) as f32 - 254.0) * 0.0017;
+                full_value_values[position * HEAD_DIM + dim] =
+                    (((position * 97 + dim * 29 + 11) % 503) as f32 - 251.0) * 0.0013;
+            }
+        }
+        let mut ring_key_values = vec![0.0f32; RING_CAPACITY * HEAD_DIM];
+        let mut ring_value_values = vec![0.0f32; RING_CAPACITY * HEAD_DIM];
+        for position in 0..START_POSITION {
+            let physical = position % RING_CAPACITY;
+            ring_key_values[physical * HEAD_DIM..(physical + 1) * HEAD_DIM]
+                .copy_from_slice(&full_key_values[position * HEAD_DIM..(position + 1) * HEAD_DIM]);
+            ring_value_values[physical * HEAD_DIM..(physical + 1) * HEAD_DIM].copy_from_slice(
+                &full_value_values[position * HEAD_DIM..(position + 1) * HEAD_DIM],
+            );
+        }
+
+        let raw_keys: Vec<f32> = (0..K_TOKENS * HEAD_DIM)
+            .map(|index| (((index * 43 + 19) % 521) as f32 - 260.0) * 0.0019)
+            .collect();
+        let raw_values: Vec<f32> = (0..K_TOKENS * HEAD_DIM)
+            .map(|index| (((index * 61 + 23) % 523) as f32 - 261.0) * 0.0015)
+            .collect();
+        let weight_k: Vec<f32> = (0..HEAD_DIM)
+            .map(|dim| 0.71 + (dim % 31) as f32 * 0.006)
+            .collect();
+        let cos_table: Vec<f32> = (0..K_TOKENS * HALF_ROPE)
+            .map(|index| {
+                let angle =
+                    (index / HALF_ROPE) as f32 * 0.017 + (index % HALF_ROPE) as f32 * 0.0003;
+                angle.cos()
+            })
+            .collect();
+        let sin_table: Vec<f32> = (0..K_TOKENS * HALF_ROPE)
+            .map(|index| {
+                let angle =
+                    (index / HALF_ROPE) as f32 * 0.017 + (index % HALF_ROPE) as f32 * 0.0003;
+                angle.sin()
+            })
+            .collect();
+        let queries: Vec<f32> = (0..K_TOKENS * N_HEADS * HEAD_DIM)
+            .map(|index| (((index * 73 + 31) % 541) as f32 - 270.0) * 0.0011)
+            .collect();
+
+        let raw_key = f32_buffer(&raw_keys);
+        let raw_value = f32_buffer(&raw_values);
+        let weight_k = f32_buffer(&weight_k);
+        let cos_table = f32_buffer(&cos_table);
+        let sin_table = f32_buffer(&sin_table);
+        let query = f32_buffer(&queries);
+        let full_cache_k = f32_buffer(&full_key_values);
+        let full_cache_v = f32_buffer(&full_value_values);
+        let ring_cache_k = f32_buffer(&ring_key_values);
+        let ring_cache_v = f32_buffer(&ring_value_values);
+        let split_ring_cache_k = f32_buffer(&ring_key_values);
+        let split_ring_cache_v = f32_buffer(&ring_value_values);
+        let full_kn = empty_f32(K_TOKENS * HEAD_DIM);
+        let full_vn = empty_f32(K_TOKENS * HEAD_DIM);
+        let ring_kn = empty_f32(K_TOKENS * HEAD_DIM);
+        let ring_vn = empty_f32(K_TOKENS * HEAD_DIM);
+
+        let make_attention_scalar = |physical_capacity: usize| {
+            let scalar = device.new_buffer(48, opts);
+            let words = [
+                N_HEADS as u32,
+                HEAD_DIM as u32,
+                START_POSITION as u32,
+                (N_HEADS / N_KV_HEADS) as u32,
+                1.0f32.to_bits(),
+                HEAD_DIM as u32,
+                (physical_capacity * HEAD_DIM) as u32,
+                0,
+                0,
+                0,
+                WINDOW as u32,
+                MAX_POSITIONS as u32,
+            ];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr(),
+                    scalar.contents().cast::<u32>(),
+                    words.len(),
+                );
+            }
+            scalar
+        };
+        let full_scalar = make_attention_scalar(MAX_POSITIONS);
+        let ring_scalar = make_attention_scalar(RING_CAPACITY);
+        let scores_elements = K_TOKENS * N_HEADS * MAX_POSITIONS;
+        let full_scores = empty_f32(scores_elements);
+        let ring_scores = empty_f32(scores_elements);
+        let full_denom = empty_f32(K_TOKENS * N_HEADS);
+        let ring_denom = empty_f32(K_TOKENS * N_HEADS);
+        let full_output = empty_f32(K_TOKENS * N_HEADS * HEAD_DIM);
+        let ring_output = empty_f32(K_TOKENS * N_HEADS * HEAD_DIM);
+        let split_ring_scores = empty_f32(scores_elements);
+        let split_ring_denom = empty_f32(K_TOKENS * N_HEADS);
+        let split_ring_output = empty_f32(K_TOKENS * N_HEADS * HEAD_DIM);
+        let split_scatter_scalar = device.new_buffer(16, opts);
+        let split_kv16_write = f32_buffer(&[0.0]);
+        unsafe {
+            let scalar = split_scatter_scalar.contents().cast::<u32>();
+            *scalar = HEAD_DIM as u32;
+            *scalar.add(1) = RING_CAPACITY as u32;
+            *scalar.add(2) = START_POSITION as u32;
+            *scalar.add(3) = (N_KV_HEADS * HEAD_DIM) as u32;
+        }
+
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let n_kv_heads_u32 = N_KV_HEADS as u32;
+        let head_dim_u32 = HEAD_DIM as u32;
+        let half_rope_u32 = HALF_ROPE as u32;
+        let start_position_u32 = START_POSITION as u32;
+        let eps = 1.0e-6f32;
+        for (pipeline, capacity, out_kn, out_vn, cache_k, cache_v) in [
+            (
+                full_fused,
+                MAX_POSITIONS,
+                &full_kn,
+                &full_vn,
+                &full_cache_k,
+                &full_cache_v,
+            ),
+            (
+                ring_fused,
+                RING_CAPACITY,
+                &ring_kn,
+                &ring_vn,
+                &ring_cache_k,
+                &ring_cache_v,
+            ),
+        ] {
+            let capacity_u32 = capacity as u32;
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&raw_key), 0);
+            encoder.set_buffer(1, Some(&raw_value), 0);
+            encoder.set_buffer(2, Some(&weight_k), 0);
+            encoder.set_buffer(3, Some(&cos_table), 0);
+            encoder.set_buffer(4, Some(&sin_table), 0);
+            encoder.set_buffer(5, Some(out_kn), 0);
+            encoder.set_buffer(6, Some(out_vn), 0);
+            encoder.set_buffer(7, Some(cache_k), 0);
+            encoder.set_buffer(8, Some(cache_v), 0);
+            encoder.set_bytes(9, 4, &n_kv_heads_u32 as *const u32 as *const _);
+            encoder.set_bytes(10, 4, &head_dim_u32 as *const u32 as *const _);
+            encoder.set_bytes(11, 4, &half_rope_u32 as *const u32 as *const _);
+            encoder.set_bytes(12, 4, &capacity_u32 as *const u32 as *const _);
+            encoder.set_bytes(13, 4, &start_position_u32 as *const u32 as *const _);
+            encoder.set_bytes(14, 4, &eps as *const f32 as *const _);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (N_KV_HEADS * K_TOKENS) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 512,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        encoder.memory_barrier_with_resources(&[
+            &full_cache_k,
+            &full_cache_v,
+            &ring_cache_k,
+            &ring_cache_v,
+            &ring_kn,
+            &ring_vn,
+        ]);
+        encoder.set_compute_pipeline_state(ring_split_scatter);
+        encoder.set_buffer(0, Some(&ring_kn), 0);
+        encoder.set_buffer(1, Some(&ring_vn), 0);
+        encoder.set_buffer(2, Some(&split_ring_cache_k), 0);
+        encoder.set_buffer(3, Some(&split_ring_cache_v), 0);
+        encoder.set_buffer(4, Some(&split_scatter_scalar), 0);
+        encoder.set_buffer(5, Some(&split_scatter_scalar), 4);
+        encoder.set_buffer(6, Some(&split_scatter_scalar), 8);
+        encoder.set_buffer(7, Some(&split_scatter_scalar), 12);
+        encoder.set_buffer(8, Some(&split_kv16_write), 0);
+        encoder.set_buffer(9, Some(&split_kv16_write), 0);
+        encoder.set_buffer(10, Some(&split_kv16_write), 0);
+        let split_scatter_width = ring_split_scatter.thread_execution_width().max(1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: ((N_KV_HEADS * HEAD_DIM) as u64).div_ceil(split_scatter_width),
+                height: K_TOKENS as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: split_scatter_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.memory_barrier_with_resources(&[&split_ring_cache_k, &split_ring_cache_v]);
+        assert!(encode_attention_split3_batch_k(
+            encoder,
+            kernel,
+            &query,
+            &full_cache_k,
+            &full_cache_v,
+            &full_scores,
+            &full_denom,
+            &full_output,
+            &full_scalar,
+            N_HEADS,
+            HEAD_DIM,
+            START_POSITION + K_TOKENS,
+            K_TOKENS,
+            WINDOW as u32,
+            MAX_POSITIONS as u32,
+            false,
+        ));
+        assert!(encode_attention_split3_batch_k(
+            encoder,
+            kernel,
+            &query,
+            &ring_cache_k,
+            &ring_cache_v,
+            &ring_scores,
+            &ring_denom,
+            &ring_output,
+            &ring_scalar,
+            N_HEADS,
+            HEAD_DIM,
+            START_POSITION + K_TOKENS,
+            K_TOKENS,
+            WINDOW as u32,
+            MAX_POSITIONS as u32,
+            true,
+        ));
+        assert!(encode_attention_split3_batch_k(
+            encoder,
+            kernel,
+            &query,
+            &split_ring_cache_k,
+            &split_ring_cache_v,
+            &split_ring_scores,
+            &split_ring_denom,
+            &split_ring_output,
+            &ring_scalar,
+            N_HEADS,
+            HEAD_DIM,
+            START_POSITION + K_TOKENS,
+            K_TOKENS,
+            WINDOW as u32,
+            MAX_POSITIONS as u32,
+            true,
+        ));
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(
+            command_buffer.status(),
+            metal::MTLCommandBufferStatus::Completed
+        );
+
+        let read = |buffer: &Buffer, elements: usize| {
+            let mut values = vec![0.0f32; elements];
+            read_buffer_f32(buffer, &mut values);
+            values
+        };
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&read(&ring_kn, K_TOKENS * HEAD_DIM)),
+            bits(&read(&full_kn, K_TOKENS * HEAD_DIM)),
+            "ring fused K normalization/RoPE drifted"
+        );
+        assert_eq!(
+            bits(&read(&ring_vn, K_TOKENS * HEAD_DIM)),
+            bits(&read(&full_vn, K_TOKENS * HEAD_DIM)),
+            "ring fused V normalization drifted"
+        );
+
+        let full_cache_k = read(&full_cache_k, MAX_POSITIONS * HEAD_DIM);
+        let full_cache_v = read(&full_cache_v, MAX_POSITIONS * HEAD_DIM);
+        let ring_cache_k = read(&ring_cache_k, RING_CAPACITY * HEAD_DIM);
+        let ring_cache_v = read(&ring_cache_v, RING_CAPACITY * HEAD_DIM);
+        let split_ring_cache_k = read(&split_ring_cache_k, RING_CAPACITY * HEAD_DIM);
+        let split_ring_cache_v = read(&split_ring_cache_v, RING_CAPACITY * HEAD_DIM);
+        let retained_start = START_POSITION + K_TOKENS - RING_CAPACITY;
+        for logical in retained_start..START_POSITION + K_TOKENS {
+            let physical = logical % RING_CAPACITY;
+            assert_eq!(
+                bits(&ring_cache_k[physical * HEAD_DIM..(physical + 1) * HEAD_DIM]),
+                bits(&full_cache_k[logical * HEAD_DIM..(logical + 1) * HEAD_DIM]),
+                "ring fused K scatter drifted at logical row {logical}"
+            );
+            assert_eq!(
+                bits(&ring_cache_v[physical * HEAD_DIM..(physical + 1) * HEAD_DIM]),
+                bits(&full_cache_v[logical * HEAD_DIM..(logical + 1) * HEAD_DIM]),
+                "ring fused V scatter drifted at logical row {logical}"
+            );
+            assert_eq!(
+                bits(&split_ring_cache_k[physical * HEAD_DIM..(physical + 1) * HEAD_DIM]),
+                bits(&full_cache_k[logical * HEAD_DIM..(logical + 1) * HEAD_DIM]),
+                "ring split K scatter drifted at logical row {logical}"
+            );
+            assert_eq!(
+                bits(&split_ring_cache_v[physical * HEAD_DIM..(physical + 1) * HEAD_DIM]),
+                bits(&full_cache_v[logical * HEAD_DIM..(logical + 1) * HEAD_DIM]),
+                "ring split V scatter drifted at logical row {logical}"
+            );
+        }
+        let full_output = read(&full_output, K_TOKENS * N_HEADS * HEAD_DIM);
+        let ring_output = read(&ring_output, K_TOKENS * N_HEADS * HEAD_DIM);
+        let split_ring_output = read(&split_ring_output, K_TOKENS * N_HEADS * HEAD_DIM);
+        assert_eq!(
+            bits(&ring_output),
+            bits(&full_output),
+            "K=16 wrap-aware batch attention drifted from full-prefix control"
+        );
+        assert_eq!(
+            bits(&split_ring_output),
+            bits(&full_output),
+            "K=16 split-writer ring batch attention drifted from full-prefix control"
+        );
+        assert!(ring_output.iter().all(|value| value.is_finite()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_local_kv_ring_import_wrap_is_bit_exact_and_atomic() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 256;
+        const WINDOW: usize = 4;
+        const HEADROOM: usize = 2;
+        const RING_STRIDE: usize = WINDOW + HEADROOM;
+        const POSITIONS: usize = 10;
+        const MAX_POSITIONS: usize = 12;
+
+        let fixture = ghost_common_fixture_with_kv_heads(0x61a7, KV_HEADS);
+        let mut common = Gemma4GhostCommonMetal::new_synthetic_with_local_ring(
+            vec![fixture.layer],
+            vec![fixture.post_norm_1],
+            MAX_POSITIONS,
+            WINDOW,
+            HEADROOM,
+        )
+        .expect("synthetic local-ring import fixture");
+        assert_eq!(common.kv_stride_for_layer(0), Some(RING_STRIDE));
+
+        let make_rows = |salt: usize| {
+            (0..POSITIONS)
+                .map(|position| {
+                    (0..KV_HEADS * HEAD_DIM)
+                        .map(|index| {
+                            let bits = (salt + position * 10_000 + index) as u32;
+                            f32::from_bits(0x3f00_0000 | (bits & 0x007f_ffff))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let keys = vec![make_rows(0x101)];
+        let values = vec![make_rows(0x701)];
+        common
+            .import_position_major_kv(&keys, &values, POSITIONS)
+            .expect("wrapped position-major import");
+        assert_eq!(common.next_position, vec![POSITIONS]);
+        assert_eq!(common.kv_written_position, vec![POSITIONS]);
+        assert_eq!(common.kv_stride_for_layer(0), Some(RING_STRIDE));
+
+        let snapshot = |buffer: &Buffer| unsafe {
+            std::slice::from_raw_parts(
+                buffer.contents().cast::<f32>(),
+                KV_HEADS * RING_STRIDE * HEAD_DIM,
+            )
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+        };
+        let assert_retained_suffix = |buffer: &Buffer, rows: &[Vec<f32>]| unsafe {
+            let actual = buffer.contents().cast::<f32>();
+            for logical in POSITIONS - RING_STRIDE..POSITIONS {
+                let physical = logical % RING_STRIDE;
+                for head in 0..KV_HEADS {
+                    for dim in 0..HEAD_DIM {
+                        let got = *actual.add((head * RING_STRIDE + physical) * HEAD_DIM + dim);
+                        let want = rows[logical][head * HEAD_DIM + dim];
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "logical={logical} physical={physical} head={head} dim={dim}"
+                        );
+                    }
+                }
+            }
+        };
+        assert_retained_suffix(&common.cache_k[0], &keys[0]);
+        assert_retained_suffix(&common.cache_v[0], &values[0]);
+
+        let capacity_before = common.kv_capacity;
+        let strides_before = common.kv_strides.clone();
+        let next_before = common.next_position.clone();
+        let written_before = common.kv_written_position.clone();
+        let geometry_before = common.geometry();
+        let key_before = snapshot(&common.cache_k[0]);
+        let value_before = snapshot(&common.cache_v[0]);
+        let mut malformed_keys = keys.clone();
+        malformed_keys[0][POSITIONS - 1].pop();
+        assert!(common
+            .import_position_major_kv(&malformed_keys, &values, POSITIONS)
+            .is_err());
+        assert_eq!(common.kv_capacity, capacity_before);
+        assert_eq!(common.kv_strides, strides_before);
+        assert_eq!(common.next_position, next_before);
+        assert_eq!(common.kv_written_position, written_before);
+        assert_eq!(common.geometry(), geometry_before);
+        assert_eq!(snapshot(&common.cache_k[0]), key_before);
+        assert_eq!(snapshot(&common.cache_v[0]), value_before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn metal_gemma4_ghost_common_imports_position_major_kv_bit_exact_and_atomically() {
         if !detect_metal_device().available {
             return;
@@ -52796,10 +54333,13 @@ kernel void sample_active_expert_records(
         // The production constructor must fail closed on this reduced synthetic
         // geometry before allocating any 26B-sized KV buffers.
         let reduced = ghost_common_fixture(91);
-        assert!(
-            Gemma4GhostCommonMetal::new_26b(vec![reduced.layer], vec![reduced.post_norm_1], 2,)
-                .is_none()
-        );
+        assert!(Gemma4GhostCommonMetal::new_26b(
+            vec![reduced.layer],
+            vec![reduced.post_norm_1],
+            2,
+            false,
+        )
+        .is_none());
     }
 
     #[cfg(target_os = "macos")]
