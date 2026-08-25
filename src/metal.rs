@@ -24980,9 +24980,7 @@ impl ChainedRoundHostLedger {
             return false;
         };
         self.hot_bound_records = self.hot_bound_records.saturating_add(hot_total);
-        self.mapped_bound_records = self
-            .mapped_bound_records
-            .saturating_add(mapped_total);
+        self.mapped_bound_records = self.mapped_bound_records.saturating_add(mapped_total);
         *hot_per_layer = hot_per_layer.saturating_add(hot_layer);
         *mapped_per_layer = mapped_per_layer.saturating_add(mapped_layer);
         true
@@ -26834,11 +26832,10 @@ mod hot_cold_overlap_plan_tests {
         live_sequential_probe_summary_lattice_valid, live_sequential_probe_tally,
         live_sequential_receipt_wall_us, partition_exact_union_by_hot, plan_retained_cold_layer,
         retained_cold_compact_slot_table, summarize_live_sequential_probe,
-        validate_live_sequential_probe_receipt, ColdRecurrenceTally, CpuColdProbeAccounting,
-        ChainedRoundHostLedger, CpuColdProbeRoute, Gemma4RetainedColdHit,
-        Gemma4RetainedColdPlacement,
-        LiveSequentialProbeSummary, LiveSequentialProbeTally, LIVE_SEQUENTIAL_PROBE_CAP16,
-        LIVE_SEQUENTIAL_PROBE_CAP8,
+        validate_live_sequential_probe_receipt, ChainedRoundHostLedger, ColdRecurrenceTally,
+        CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
+        Gemma4RetainedColdPlacement, LiveSequentialProbeSummary, LiveSequentialProbeTally,
+        LIVE_SEQUENTIAL_PROBE_CAP16, LIVE_SEQUENTIAL_PROBE_CAP8,
     };
 
     fn expert_mask(experts: &[usize]) -> [bool; 128] {

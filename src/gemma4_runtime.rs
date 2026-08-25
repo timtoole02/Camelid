@@ -31058,8 +31058,7 @@ mod mtp_target_seam_tests {
                 ..Gemma4RoutedExpertSlotStatsSnapshot::default()
             };
             snapshot.cumulative_chained_demand_loads = 14;
-            snapshot.cumulative_chained_demand_read_bytes =
-                14 * HYBRID_TELEMETRY_RECORD_BYTES;
+            snapshot.cumulative_chained_demand_read_bytes = 14 * HYBRID_TELEMETRY_RECORD_BYTES;
             snapshot
         };
         let round = Gemma4HybridRoundInput {
