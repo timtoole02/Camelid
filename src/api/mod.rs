@@ -3553,8 +3553,7 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
                 .and_then(Gemma4ServeRuntime::ghost_metal_context_capacity)
         })
         .and_then(|capacity| capacity.try_into().ok());
-    let ghost_exact_expert_policy_active = (gemma4_serve_lane
-        == Some(Gemma4ServeLane::GhostMoe)
+    let ghost_exact_expert_policy_active = (gemma4_serve_lane == Some(Gemma4ServeLane::GhostMoe)
         && metal_owned_components.experts)
         .then(|| {
             gemma4_runtime
@@ -14568,8 +14567,7 @@ const GEMMA4_26B_A4B_HOT_GGUF_SHA256: &str =
 const GEMMA4_GHOST_METAL_BACKEND: &str = "gemma4_ghost_moe_metal_runtime";
 const GEMMA4_GHOST_METAL_PREFILL: &str = "gemma4_ghost_moe_metal_prefill";
 const GEMMA4_GHOST_METAL_DECODE: &str = "gemma4_ghost_moe_metal_speculative_decode";
-const GEMMA4_GHOST_HYBRID_METAL_BACKEND: &str =
-    "gemma4_ghost_moe_hybrid_metal_runtime";
+const GEMMA4_GHOST_HYBRID_METAL_BACKEND: &str = "gemma4_ghost_moe_hybrid_metal_runtime";
 const GEMMA4_GHOST_HYBRID_METAL_PREFILL: &str = "gemma4_ghost_moe_hybrid_metal_prefill";
 const GEMMA4_GHOST_HYBRID_METAL_DECODE: &str = "gemma4_ghost_moe_hybrid_metal_decode";
 const GEMMA4_GHOST_METAL_DECODE_WITHOUT_MTP: &str = "gemma4_ghost_moe_metal_decode";
@@ -14587,9 +14585,8 @@ fn gemma4_metal_ghost_support_scope_matches(
         && architecture == "aarch64"
         && model_identifier == Some("Mac16,10")
         && cpu_model == Some("Apple M4")
-        && operating_system_version.is_some_and(|version| {
-            version == "26.5" || version.starts_with("26.5.")
-        })
+        && operating_system_version
+            .is_some_and(|version| version == "26.5" || version.starts_with("26.5."))
 }
 
 fn gemma4_metal_ghost_supported_on_current_host() -> bool {
@@ -14599,16 +14596,17 @@ fn gemma4_metal_ghost_supported_on_current_host() -> bool {
     #[cfg(target_os = "macos")]
     {
         static HOST_FACTS: OnceLock<(String, String, String)> = OnceLock::new();
-        let (model_identifier, cpu_model, operating_system_version) = HOST_FACTS.get_or_init(|| {
-            (
-                lfm2_support_command_output("sysctl", &["-n", "hw.model"])
-                    .unwrap_or_else(|| "unknown".into()),
-                lfm2_support_command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
-                    .unwrap_or_else(|| "unknown".into()),
-                lfm2_support_command_output("sw_vers", &["-productVersion"])
-                    .unwrap_or_else(|| "unknown".into()),
-            )
-        });
+        let (model_identifier, cpu_model, operating_system_version) =
+            HOST_FACTS.get_or_init(|| {
+                (
+                    lfm2_support_command_output("sysctl", &["-n", "hw.model"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sw_vers", &["-productVersion"])
+                        .unwrap_or_else(|| "unknown".into()),
+                )
+            });
         return gemma4_metal_ghost_support_scope_matches(
             env::consts::OS,
             env::consts::ARCH,
@@ -14699,8 +14697,8 @@ fn reconcile_gemma4_runtime_execution_plan(
 
         let exact_artifact = model_sha256.eq_ignore_ascii_case(GEMMA4_26B_A4B_HOT_GGUF_SHA256);
         let evidenced_context = metal_context_capacity.is_some_and(|capacity| capacity >= 1_024);
-        let exact_profile = metal_runtime_profile
-            == Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID);
+        let exact_profile =
+            metal_runtime_profile == Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID);
         let exact_runtime_shape =
             full_metal && full_mtp && exact_expert_policy_active && exact_profile;
         let supported = exact_artifact
@@ -27935,11 +27933,46 @@ mod tests {
             ));
         }
         for (os, arch, model, cpu, version, profile) in [
-            ("linux", "aarch64", Some("Mac16,10"), Some("Apple M4"), Some("26.5.2"), true),
-            ("macos", "x86_64", Some("Mac16,10"), Some("Apple M4"), Some("26.5.2"), true),
-            ("macos", "aarch64", Some("Mac15,3"), Some("Apple M3"), Some("26.5.2"), true),
-            ("macos", "aarch64", Some("Mac16,10"), Some("Apple M4"), Some("26.6"), true),
-            ("macos", "aarch64", Some("Mac16,10"), Some("Apple M4"), Some("26.5.2"), false),
+            (
+                "linux",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+            ),
+            (
+                "macos",
+                "x86_64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac15,3"),
+                Some("Apple M3"),
+                Some("26.5.2"),
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.6"),
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                false,
+            ),
         ] {
             assert!(!gemma4_metal_ghost_support_scope_matches(
                 os, arch, model, cpu, version, profile,
@@ -28020,11 +28053,7 @@ mod tests {
         assert_eq!(wrong_sha.support_level, "unknown_or_unvalidated");
 
         let mut wrong_host = provisional_gemma4_ghost_plan();
-        reconcile_exact_metal_ghost(
-            &mut wrong_host,
-            GEMMA4_26B_A4B_HOT_GGUF_SHA256,
-            false,
-        );
+        reconcile_exact_metal_ghost(&mut wrong_host, GEMMA4_26B_A4B_HOT_GGUF_SHA256, false);
         assert_eq!(wrong_host.support_level, "unknown_or_unvalidated");
 
         let mut partial = provisional_gemma4_ghost_plan();
@@ -28091,10 +28120,7 @@ mod tests {
             None,
             true,
         );
-        assert_eq!(
-            neighboring_profile.support_level,
-            "unknown_or_unvalidated"
-        );
+        assert_eq!(neighboring_profile.support_level, "unknown_or_unvalidated");
 
         let mut dropped_experts = provisional_gemma4_ghost_plan();
         reconcile_gemma4_runtime_execution_plan(
@@ -28116,10 +28142,7 @@ mod tests {
             Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
             true,
         );
-        assert_eq!(
-            dropped_experts.support_level,
-            "unknown_or_unvalidated"
-        );
+        assert_eq!(dropped_experts.support_level, "unknown_or_unvalidated");
 
         let mut undersized_context = provisional_gemma4_ghost_plan();
         reconcile_gemma4_runtime_execution_plan(
@@ -28141,10 +28164,7 @@ mod tests {
             Some(crate::gemma4_runtime::GEMMA4_MINI2_WEBUI_PROFILE_ID),
             true,
         );
-        assert_eq!(
-            undersized_context.support_level,
-            "unknown_or_unvalidated"
-        );
+        assert_eq!(undersized_context.support_level, "unknown_or_unvalidated");
     }
 
     #[test]
@@ -28173,10 +28193,7 @@ mod tests {
             partial_metal.selected_backend,
             GEMMA4_GHOST_HYBRID_METAL_BACKEND
         );
-        assert_eq!(
-            partial_metal.decode_path,
-            GEMMA4_GHOST_HYBRID_METAL_DECODE
-        );
+        assert_eq!(partial_metal.decode_path, GEMMA4_GHOST_HYBRID_METAL_DECODE);
         assert_eq!(partial_metal.support_level, "unknown_or_unvalidated");
 
         let mut partial_cuda = provisional_gemma4_ghost_plan();
@@ -28905,16 +28922,18 @@ mod tests {
                 "Gemma 4 26B frontend gate must name required Metal evidence: {required}"
             );
         }
-        assert!(target.frontend_readiness_gate.contains("macOS aarch64 Apple M4"));
+        assert!(target
+            .frontend_readiness_gate
+            .contains("macOS aarch64 Apple M4"));
         assert!(target
             .frontend_readiness_gate
             .contains("hybrid/partial Metal"));
         assert!(target
             .generation_runs
             .contains("apple_m4_full_metal_mtp_short_chat_and_frozen_48_token_smoke"));
-        assert!(target
-            .frontend_load_path_verified
-            .contains("hash_host_exact_policy_and_reconciled_apple_m4_full_metal_mtp_execution_plan"));
+        assert!(target.frontend_load_path_verified.contains(
+            "hash_host_exact_policy_and_reconciled_apple_m4_full_metal_mtp_execution_plan"
+        ));
         assert!(target
             .frontend_readiness_gate
             .contains("exact prepared target sha256"));
@@ -28924,9 +28943,9 @@ mod tests {
         assert!(target
             .evidence
             .contains("gemma4-26b-a4b-m4-metal-webui-20260825/manifest.json"));
-        assert!(target.evidence.contains(
-            "66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d"
-        ));
+        assert!(target
+            .evidence
+            .contains("66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d"));
         assert!(target
             .evidence
             .contains("gemma4_ghost_moe_metal_speculative_decode"));

@@ -337,7 +337,7 @@ try {
         family: 'gemma4_a4b_moe_decoder',
         quantization: 'Q4_0',
         status: 'supported_exact_row_smoke',
-        support_scope: 'exact_row_distributed_or_catalog_windows_cuda_or_apple_m4_full_metal_ghost_moe_smoke_only',
+      support_scope: 'exact_row_distributed_or_apple_m4_full_metal_ghost_moe_smoke_only',
       },
     ],
   }

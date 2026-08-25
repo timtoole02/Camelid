@@ -2193,9 +2193,7 @@ fn gemma4_mini2_webui_profile_admitted(facts: &Gemma4Mini2WebuiProfileFacts) -> 
 
 #[cfg(target_os = "macos")]
 fn gemma4_mini2_webui_environment_matches() -> bool {
-    let exact = |name: &str, expected: &str| {
-        std::env::var(name).as_deref() == Ok(expected)
-    };
+    let exact = |name: &str, expected: &str| std::env::var(name).as_deref() == Ok(expected);
     let exact_pairs = [
         ("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0"),
         ("CAMELID_GEMMA4_GHOST_METAL", "1"),
@@ -2270,8 +2268,7 @@ fn gemma4_mini2_webui_environment_matches() -> bool {
         .all(|(name, expected)| exact(name, expected))
         && std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
             .is_some_and(|path| !path.is_empty())
-        && std::env::var_os("CAMELID_GEMMA4_GHOST_CGHOST")
-            .is_some_and(|path| !path.is_empty())
+        && std::env::var_os("CAMELID_GEMMA4_GHOST_CGHOST").is_some_and(|path| !path.is_empty())
         && no_neighboring_selectors
 }
 
@@ -14638,11 +14635,7 @@ fn mtp_spec_timing_enabled_value(value: Option<&str>) -> bool {
 }
 
 fn mtp_spec_timing_enabled() -> bool {
-    mtp_spec_timing_enabled_value(
-        std::env::var("CAMELID_GEMMA4_SPEC_TIMING")
-            .ok()
-            .as_deref(),
-    )
+    mtp_spec_timing_enabled_value(std::env::var("CAMELID_GEMMA4_SPEC_TIMING").ok().as_deref())
 }
 
 fn mtp_code_output_hint(prompt: &str) -> bool {
@@ -17026,8 +17019,7 @@ impl Gemma4Runtime {
                 exact_expert_policy: ghost_moe_cache.is_some() && !lane.allow_dropped_experts,
                 exact_environment: gemma4_mini2_webui_environment_matches(),
             };
-            gemma4_mini2_webui_profile_admitted(&facts)
-                .then_some(GEMMA4_MINI2_WEBUI_PROFILE_ID)
+            gemma4_mini2_webui_profile_admitted(&facts).then_some(GEMMA4_MINI2_WEBUI_PROFILE_ID)
         });
         let runtime = Self {
             tokenizer,
@@ -29676,26 +29668,22 @@ mod mtp_target_seam_tests {
 
     #[test]
     fn prompt_ranked_resident_fill_is_exact_positive_default_off_and_subordinate() {
-        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(None));
-        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(Some("1")));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(
+            None
+        ));
+        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(
+            Some("1")
+        ));
         for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
             assert!(
                 !ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(Some(value)),
                 "unexpected resident-fill admission for {value:?}"
             );
         }
-        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
-            false, false
-        ));
-        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
-            false, true
-        ));
-        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
-            true, false
-        ));
-        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
-            true, true
-        ));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(false, false));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(false, true));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(true, false));
+        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(true, true));
     }
 
     #[test]
@@ -30120,13 +30108,9 @@ mod mtp_target_seam_tests {
 
         let mut wrong_capacity = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
         wrong_capacity.swap(0, 1);
-        assert!(prompt_ranked_hot_handoff_routes(
-            &unions,
-            &scores,
-            None,
-            &wrong_capacity
-        )
-        .is_none());
+        assert!(
+            prompt_ranked_hot_handoff_routes(&unions, &scores, None, &wrong_capacity).is_none()
+        );
         let mut nonfinite = scores.clone();
         nonfinite[4][9] = f32::NAN;
         assert!(prompt_ranked_hot_handoff_routes(

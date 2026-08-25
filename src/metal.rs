@@ -26799,11 +26799,11 @@ mod hot_cold_overlap_plan_tests {
         live_sequential_probe_observe_layer, live_sequential_probe_receipt_logging_enabled,
         live_sequential_probe_summary_lattice_valid, live_sequential_probe_tally,
         live_sequential_receipt_wall_us, partition_exact_union_by_hot, plan_retained_cold_layer,
-        retained_cold_compact_slot_table,
-        summarize_live_sequential_probe, validate_live_sequential_probe_receipt,
-        ColdRecurrenceTally, CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
-        Gemma4RetainedColdPlacement, LiveSequentialProbeSummary, LiveSequentialProbeTally,
-        LIVE_SEQUENTIAL_PROBE_CAP16, LIVE_SEQUENTIAL_PROBE_CAP8,
+        retained_cold_compact_slot_table, summarize_live_sequential_probe,
+        validate_live_sequential_probe_receipt, ColdRecurrenceTally, CpuColdProbeAccounting,
+        CpuColdProbeRoute, Gemma4RetainedColdHit, Gemma4RetainedColdPlacement,
+        LiveSequentialProbeSummary, LiveSequentialProbeTally, LIVE_SEQUENTIAL_PROBE_CAP16,
+        LIVE_SEQUENTIAL_PROBE_CAP8,
     };
 
     fn expert_mask(experts: &[usize]) -> [bool; 128] {
