@@ -142,9 +142,9 @@ export function modelContextLength(model) {
   return Number.isFinite(value) && value > 0 ? value : null
 }
 
-// The loaded model's training context is descriptive metadata. A live Ghost
-// common-Metal allocation is the tighter operational limit and therefore wins
-// for send-time validation; other lanes keep the model metadata unchanged.
+// The loaded model's training context is descriptive metadata. A constructed
+// Ghost common-Metal allocation is the tighter operational limit and therefore
+// wins for send-time validation; other lanes keep the model metadata unchanged.
 export function effectiveChatContextLength(model, serveLane = '', ghostMetalCapacity = null) {
   return gemma4GhostRuntimeContextCapacity(serveLane, ghostMetalCapacity)
     ?? modelContextLength(model)
