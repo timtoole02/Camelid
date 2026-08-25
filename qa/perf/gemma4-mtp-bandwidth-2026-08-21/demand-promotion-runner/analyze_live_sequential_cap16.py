@@ -126,6 +126,9 @@ STAGE_FIELDS = {
 
 PROFILE_NAME = "H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control"
 PROFILE_FILE = Path(__file__).resolve().parent / "env" / PROFILE_NAME
+CAP16_PROFILE_NAME = "H69-live-hidden-sequential-fast-predict-dual-reader-kv192-cap16"
+CAP16_PROFILE_FILE = Path(__file__).resolve().parent / "env" / CAP16_PROFILE_NAME
+STAGE_CAP16_SELECTOR = "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16"
 EXPECTED_TOKEN_FILE = (
     Path(__file__).resolve().parent.parent
     / "hybrid-hot48-runner"
@@ -522,8 +525,11 @@ def parse_probe_line(line: str) -> dict[str, Any]:
     if total_wave_load_us < caps[8]["read_wall_us"]:
         raise ReceiptError("total wave load is smaller than the L1-L29 read wall")
     stage_candidates = _parse_uint(fields["stage_candidates"], "stage_candidates")
-    if stage_candidates != caps[8]["predicted_cold"]:
-        raise ReceiptError("probe stage candidate count differs from cap8 prediction total")
+    if stage_candidates not in {
+        caps[8]["predicted_cold"],
+        caps[16]["predicted_cold"],
+    }:
+        raise ReceiptError("probe stage candidate count differs from both executable cap totals")
     return {
         "start_pos": start_pos,
         "K": k_tokens,
@@ -558,7 +564,6 @@ def parse_stage_line(line: str, probe: dict[str, Any]) -> dict[str, Any]:
         "start_pos": probe["start_pos"],
         "K": probe["K"],
         "ok": 1,
-        "cap": 8,
         "workers": 2,
         "workers_started": 2,
         "workers_done": 0,
@@ -577,6 +582,9 @@ def parse_stage_line(line: str, probe: dict[str, Any]) -> dict[str, Any]:
     for key, expected in exact.items():
         if values[key] != expected:
             raise ReceiptError(f"stage requires {key}={expected}, got {values[key]}")
+    stage_cap = values["cap"]
+    if stage_cap not in (8, 16):
+        raise ReceiptError(f"stage cap must be 8 or 16, got {stage_cap}")
     if fields["predict_impl"] != "accelerate-sgemm":
         raise ReceiptError("stage predictor implementation is not accelerate-sgemm")
     if fields["routing_authority"] != "exact-router":
@@ -584,8 +592,8 @@ def parse_stage_line(line: str, probe: dict[str, Any]) -> dict[str, Any]:
     _parse_ms_us(fields["speculative_read_ms"], "stage speculative_read_ms")
     _parse_ms_us(fields["ready_copy_ms"], "stage ready_copy_ms")
 
-    if values["candidates"] != probe["caps"][8]["predicted_cold"]:
-        raise ReceiptError("stage candidates disagree with cap8 predicted total")
+    if values["candidates"] != probe["caps"][stage_cap]["predicted_cold"]:
+        raise ReceiptError(f"stage candidates disagree with cap{stage_cap} predicted total")
     if values["candidates"] != probe["stage_candidates"]:
         raise ReceiptError("runtime probe and stage candidate accounting disagree")
     if values["reads_started"] != (
@@ -606,13 +614,13 @@ def parse_stage_line(line: str, probe: dict[str, Any]) -> dict[str, Any]:
         raise ReceiptError("stage successful-read accounting disagrees")
     if values["ready_hits"] + values["previous_ready_hits"] + values["direct_fallback"] != values["exact_cold"]:
         raise ReceiptError("stage exact-cold accounting disagrees")
-    if values["ready_hits"] > probe["caps"][8]["hits"]:
-        raise ReceiptError("measured ready hits exceed cap8 truth hits")
+    if values["ready_hits"] > probe["caps"][stage_cap]["hits"]:
+        raise ReceiptError(f"measured ready hits exceed cap{stage_cap} truth hits")
     # Probe truth covers L1-L29, while stage accounting also covers L0 and is
     # sampled at a different point in the request.  Keep the signed scope delta:
     # a negative value is observed in valid H49 traces and is not an underflow.
     exact_cold_scope_delta = (
-        values["exact_cold"] - probe["caps"][8]["actual_cold"]
+        values["exact_cold"] - probe["caps"][stage_cap]["actual_cold"]
     )
     # Stage admission can fall back independently for any layer, so probe
     # cold-positive layers do not determine the number of StageCold seals.
@@ -626,12 +634,12 @@ def parse_stage_line(line: str, probe: dict[str, Any]) -> dict[str, Any]:
 
 def _parse_profile(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    for line in _read_text(path, "H49 environment profile").splitlines():
+    for line in _read_text(path, f"{path.name} environment profile").splitlines():
         if not line or line.startswith("#"):
             continue
         key, separator, value = line.partition("=")
         if not separator or ENV_KEY_RE.fullmatch(key) is None or key in values:
-            raise ReceiptError(f"malformed or duplicate H49 profile line {line!r}")
+            raise ReceiptError(f"malformed or duplicate {path.name} profile line {line!r}")
         values[key] = value
     return values
 
@@ -667,8 +675,16 @@ def _sha256(path: Path) -> str:
 
 
 def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
-    expected = _parse_profile(PROFILE_FILE)
     observed = parse_env_manifest(run_dir / "env.txt")
+    selector_value = observed.get(STAGE_CAP16_SELECTOR)
+    if selector_value is None:
+        expected = _parse_profile(PROFILE_FILE)
+        profile_label = "H49 cap8"
+    elif selector_value == "1":
+        expected = _parse_profile(CAP16_PROFILE_FILE)
+        profile_label = "H69 cap16"
+    else:
+        raise ReceiptError(f"cap16 stage selector must be exactly 1, got {selector_value!r}")
     metadata = COMMON_ENV_METADATA | PROVENANCE_ENV_METADATA
     _expect_fields(observed, set(expected) | metadata, "environment manifest")
     for key, expected_value in expected.items():
@@ -677,10 +693,10 @@ def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
             if not observed_value.startswith("/") or not observed_value.endswith(
                 "/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors"
             ):
-                raise ReceiptError("H49 assistant path is absent or unexpected")
+                raise ReceiptError(f"{profile_label} assistant path is absent or unexpected")
         elif observed_value != expected_value:
             raise ReceiptError(
-                f"H49 environment drifted at {key}: expected {expected_value!r}, "
+                f"{profile_label} environment drifted at {key}: expected {expected_value!r}, "
                 f"observed {observed_value!r}"
             )
     slots = [
@@ -688,9 +704,9 @@ def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
         for item in observed["CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER"].split(",")
     ]
     if len(slots) != 30 or sum(slots) != 1_408:
-        raise ReceiptError("H49 environment is not the literal 1,408-slot profile")
+        raise ReceiptError(f"{profile_label} environment is not the literal 1,408-slot profile")
     if observed["CAMELID_GEMMA4_KV_INIT"] != "192":
-        raise ReceiptError("H49 environment is not KV_INIT=192")
+        raise ReceiptError(f"{profile_label} environment is not KV_INIT=192")
     exact_metadata = {
         "manifest_format": "base64-v1",
         "HOME": "/Users/timtoole",
@@ -1217,6 +1233,15 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     validate_response(run_dir)
     log = _read_text(run_dir / "server.log", "server log")
     probes, stages = parse_observations(log)
+    stage_caps = {stage["cap"] for stage in stages}
+    if len(stage_caps) != 1:
+        raise ReceiptError(f"request stage cap changed across rounds: {sorted(stage_caps)!r}")
+    stage_cap = next(iter(stage_caps))
+    environment_stage_cap = 16 if environment.get(STAGE_CAP16_SELECTOR) == "1" else 8
+    if stage_cap != environment_stage_cap:
+        raise ReceiptError(
+            f"stage reported cap={stage_cap}, environment selected cap={environment_stage_cap}"
+        )
 
     cap_totals: dict[int, dict[str, int]] = {}
     for cap in CAPS:
@@ -1242,9 +1267,9 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     if incremental_hits < 0 or incremental_hits > incremental_predicted or incremental_saved_us < 0:
         raise ReceiptError("request incremental projection is impossible")
     ready_hits = sum(stage["ready_hits"] for stage in stages)
-    cap8_hits = cap_totals[8]["hits"]
-    if cap8_hits <= 0 or ready_hits > cap8_hits:
-        raise ReceiptError("request cannot compute a bounded measured cap8 readiness")
+    stage_hits = cap_totals[stage_cap]["hits"]
+    if stage_hits <= 0 or ready_hits > stage_hits:
+        raise ReceiptError(f"request cannot compute a bounded measured cap{stage_cap} readiness")
     saved_threshold_passed = incremental_saved_us >= GO_SAVED_US
     precision_threshold_passed = (
         incremental_hits * GO_PRECISION_DENOMINATOR
@@ -1254,37 +1279,37 @@ def analyze(run_dir: Path) -> dict[str, Any]:
 
     rounds = []
     for probe, stage in zip(probes, stages):
-        rounds.append(
-            {
-                "start_pos": probe["start_pos"],
-                "K": probe["K"],
-                "stage_round_seq": stage["round_seq"],
-                "predict_us": probe["predict_us"],
-                "cap8_ready_hits_measured": stage["ready_hits"],
-                "stage_exact_cold_minus_probe_l1_l29_actual": stage[
-                    "exact_cold_minus_probe_l1_l29_actual"
-                ],
-                "layer0_wave_load_ms": _number(probe["layer0_wave_load_us"], 1_000),
-                "caps": {
-                    str(cap): {
-                        "hits": probe["caps"][cap]["hits"],
-                        "actual_cold": probe["caps"][cap]["actual_cold"],
-                        "predicted_cold": probe["caps"][cap]["predicted_cold"],
-                        "recall": _number(
-                            probe["caps"][cap]["hits"], probe["caps"][cap]["actual_cold"]
-                        ) if probe["caps"][cap]["actual_cold"] else None,
-                        "precision": _number(
-                            probe["caps"][cap]["hits"], probe["caps"][cap]["predicted_cold"]
-                        ) if probe["caps"][cap]["predicted_cold"] else None,
-                        "read_wall_ms": _number(probe["caps"][cap]["read_wall_us"], 1_000),
-                        "projected_saved_ms": _number(
-                            probe["caps"][cap]["projected_saved_us"], 1_000
-                        ),
-                    }
-                    for cap in CAPS
-                },
-            }
-        )
+        round_summary = {
+            "start_pos": probe["start_pos"],
+            "K": probe["K"],
+            "stage_round_seq": stage["round_seq"],
+            "stage_cap": stage_cap,
+            "predict_us": probe["predict_us"],
+            f"cap{stage_cap}_ready_hits_measured": stage["ready_hits"],
+            "stage_exact_cold_minus_probe_l1_l29_actual": stage[
+                "exact_cold_minus_probe_l1_l29_actual"
+            ],
+            "layer0_wave_load_ms": _number(probe["layer0_wave_load_us"], 1_000),
+            "caps": {
+                str(cap): {
+                    "hits": probe["caps"][cap]["hits"],
+                    "actual_cold": probe["caps"][cap]["actual_cold"],
+                    "predicted_cold": probe["caps"][cap]["predicted_cold"],
+                    "recall": _number(
+                        probe["caps"][cap]["hits"], probe["caps"][cap]["actual_cold"]
+                    ) if probe["caps"][cap]["actual_cold"] else None,
+                    "precision": _number(
+                        probe["caps"][cap]["hits"], probe["caps"][cap]["predicted_cold"]
+                    ) if probe["caps"][cap]["predicted_cold"] else None,
+                    "read_wall_ms": _number(probe["caps"][cap]["read_wall_us"], 1_000),
+                    "projected_saved_ms": _number(
+                        probe["caps"][cap]["projected_saved_us"], 1_000
+                    ),
+                }
+                for cap in CAPS
+            },
+        }
+        rounds.append(round_summary)
     request_caps = {
         str(cap): {
             "hits": values["hits"],
@@ -1301,46 +1326,54 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     }
     readiness_adjusted_cap16_us = Decimal(cap_totals[16]["projected_saved_us"]) * Decimal(
         ready_hits
-    ) / Decimal(cap8_hits)
+    ) / Decimal(stage_hits)
     readiness_adjusted_incremental_us = Decimal(incremental_saved_us) * Decimal(ready_hits) / Decimal(
-        cap8_hits
+        stage_hits
+    )
+    request_projection = {
+        "stage_cap": stage_cap,
+        "caps": request_caps,
+        "cap16_incremental_hits_vs_cap8": incremental_hits,
+        "cap16_incremental_predicted_vs_cap8": incremental_predicted,
+        "cap16_incremental_precision_vs_cap8": _number(
+            incremental_hits, incremental_predicted
+        ),
+        "cap16_incremental_projected_saved_ms_vs_cap8": _number(
+            incremental_saved_us, 1_000
+        ),
+        f"measured_cap{stage_cap}_readiness": _number(ready_hits, stage_hits),
+        "readiness_adjusted_cap16_projected_saved_ms": float(
+            readiness_adjusted_cap16_us / Decimal(1_000)
+        ),
+        "readiness_adjusted_cap16_incremental_projected_saved_ms_vs_cap8": float(
+            readiness_adjusted_incremental_us / Decimal(1_000)
+        ),
+    }
+    environment_integrity_key = (
+        "exact_h49_kv192_1408_environment"
+        if stage_cap == 8
+        else "exact_h49_kv192_1408_cap16_descendant_environment"
     )
     return {
         "schema_version": 1,
         "run": run_dir.name,
         "integrity": {
-            "exact_h49_kv192_1408_environment": True,
+            environment_integrity_key: True,
             "exact_48_token_response": True,
             "four_ordered_probe_and_stage_receipts": True,
             "cap_lattice_recomputed": True,
             "stage_accounting_recomputed": True,
+            "stage_cap": stage_cap,
             "safety_mode": safety["mode"],
             "qualifying_safety_receipt": safety["qualifying"],
             "point_samples_only": safety["point_samples_only"],
-            "observation_only": True,
+            "observation_only": stage_cap == 8,
             "projected_savings_are_measured": False,
             "throughput_promotion_allowed": False,
         },
         "safety": safety,
         "rounds": rounds,
-        "request_projection": {
-            "caps": request_caps,
-            "cap16_incremental_hits_vs_cap8": incremental_hits,
-            "cap16_incremental_predicted_vs_cap8": incremental_predicted,
-            "cap16_incremental_precision_vs_cap8": _number(
-                incremental_hits, incremental_predicted
-            ),
-            "cap16_incremental_projected_saved_ms_vs_cap8": _number(
-                incremental_saved_us, 1_000
-            ),
-            "measured_cap8_readiness": _number(ready_hits, cap8_hits),
-            "readiness_adjusted_cap16_projected_saved_ms": float(
-                readiness_adjusted_cap16_us / Decimal(1_000)
-            ),
-            "readiness_adjusted_cap16_incremental_projected_saved_ms_vs_cap8": float(
-                readiness_adjusted_incremental_us / Decimal(1_000)
-            ),
-        },
+        "request_projection": request_projection,
         "decision": {
             "verdict": verdict,
             "saved_threshold_passed": saved_threshold_passed,

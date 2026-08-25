@@ -71,6 +71,35 @@ prediction, two private readers, and the `14,13,14,7` effective verifier
 schedule. The H49 cap-eight stage remains the only I/O mutation; cap 4 and cap
 16 are observation-only prices of the same ranked vector.
 
+### Measured cap16 ABBA
+
+After the observation gate, the sole executable cap16 descendant is
+`env/H69-live-hidden-sequential-fast-predict-dual-reader-kv192-cap16`. It is
+byte-for-byte H49 KV192/1,408 except for
+`CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16=1`. The stage receipt's
+existing `cap` field is authoritative: the analyzer requires every round to
+report cap 8 or 16, reconciles candidates and ready hits against that reported
+cap, and requires the environment selector to agree.
+
+Run a no-watchdog cap8/cap16/cap16/cap8 campaign on Mini2 with one fresh label:
+
+```sh
+ssh mini2 '
+  cd /Users/timtoole/camelid-h69-src
+  CAMELID_BENCH_BINARY=/Users/timtoole/camelid-h69-target/release/camelid \
+  CAMELID_BENCH_OUT=/Users/timtoole/camelid-h69-receipts \
+    qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cap16_abba_no_watchdog.zsh \
+    mini2-h69-cap16-abba1
+'
+```
+
+The helper acquires `cam-lock.sh` once around all four runs, forces the explicit
+manual no-watchdog mode, runs the detailed H69 analyzer after every exact 48/48
+request, refuses to overwrite an existing run, and emits
+`mini2-h69-cap16-abba1-cap16-abba-summary.json`. That summary requires identical
+source, binary, runner, request, and environment provenance after removing only
+the cap16 selector. Manual point samples remain non-qualifying safety evidence.
+
 ## Run one
 
 ```sh
@@ -159,6 +188,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H53-k16-draft10-rank-probe` | Diagnostic K16 run; exact at 34.06 tok/s, but the decisive target token ranked 20th at draft index 10, closing the width-only shortcut |
 | `H54-three-wave-live-ready-gateup` | Exact three-wave hot/ready/demand GateUp overlap; 36.25 tok/s, zero swap, no-go because 82 extra GPU submissions erased the hidden I/O gain |
 | `H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control` | Strict-memory H49 control: exact frozen 1,408-slot profile and KV192; ABBA mean 31.74 tok/s, zero swap |
+| `H69-live-hidden-sequential-fast-predict-dual-reader-kv192-cap16` | H49 KV192/1,408 plus the single default-off cap16 stage selector; measure only against the adjacent H49 control in no-watchdog ABBA |
 | `H55-async-two-wave-collapse` | H54 submission recovery: exact two-command hot/terminal path; strict-memory ABBA mean 31.45 tok/s versus H49 31.74, no-go |
 | `H56-mtp-assistant-router-probe` | Read-only assistant-hidden router projection; global-96 residual-cold recall 4.63% and 31.61 ms projected savings, so predictive host staging is closed |
 | `H57-mtp-private-queue-warmup` | Target-free assistant warmup on the measured chain's private queue; exact strict-memory ABBA mean 31.34 tok/s versus H49 31.38, and the ~23 ms first-chain setup remained, no-go |

@@ -25447,6 +25447,7 @@ fn validate_live_sequential_probe_receipt(
     stage_launches: u32,
     stage_launch_failures: u32,
     stage_candidates: u32,
+    stage_candidate_cap: usize,
     total_wave_load_ms: f64,
 ) -> Result<LiveSequentialProbeReceipt, &'static str> {
     if !accounting_valid {
@@ -25501,11 +25502,16 @@ fn validate_live_sequential_probe_receipt(
     {
         return Err("summary-lattice");
     }
+    let expected_stage_candidates = match stage_candidate_cap {
+        LIVE_SEQUENTIAL_PROBE_CAP8 => cap8.predicted_cold,
+        LIVE_SEQUENTIAL_PROBE_CAP16 => cap16.predicted_cold,
+        _ => return Err("stage-cap"),
+    };
     if !stage_admitted
         || stage_launch_attempts != eligible
         || stage_launches != eligible
         || stage_launch_failures != 0
-        || stage_candidates != cap8.predicted_cold
+        || stage_candidates != expected_stage_candidates
     {
         return Err("stage-accounting");
     }
@@ -26788,6 +26794,7 @@ mod hot_cold_overlap_plan_tests {
         summarize_live_sequential_probe, validate_live_sequential_probe_receipt,
         ColdRecurrenceTally, CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
         Gemma4RetainedColdPlacement, LiveSequentialProbeSummary, LiveSequentialProbeTally,
+        LIVE_SEQUENTIAL_PROBE_CAP16, LIVE_SEQUENTIAL_PROBE_CAP8,
     };
 
     fn expert_mask(experts: &[usize]) -> [bool; 128] {
@@ -27063,6 +27070,7 @@ mod hot_cold_overlap_plan_tests {
             29,
             0,
             cap8_candidates,
+            LIVE_SEQUENTIAL_PROBE_CAP8,
             35.815,
         )
         .unwrap();
@@ -27080,6 +27088,24 @@ mod hot_cold_overlap_plan_tests {
         assert!(receipt
             .cap16_candidates
             .ends_with("L29:1,3,5,7,8,9,10,11,12,13,14,15,16,17,18,19"));
+        let cap16_candidates = 29 * observation.cap16.predicted_cold;
+        let cap16_receipt = validate_live_sequential_probe_receipt(
+            &observations,
+            &walls,
+            30,
+            29,
+            0,
+            true,
+            true,
+            29,
+            29,
+            0,
+            cap16_candidates,
+            LIVE_SEQUENTIAL_PROBE_CAP16,
+            35.815,
+        )
+        .expect("cap16 stage accounting must reconcile against cap16 truth");
+        assert_eq!(cap16_receipt, receipt);
         let rendered = format_live_sequential_probe_receipt(
             &receipt,
             104,
@@ -27117,6 +27143,7 @@ mod hot_cold_overlap_plan_tests {
                 29,
                 0,
                 cap8_candidates,
+                LIVE_SEQUENTIAL_PROBE_CAP8,
                 35.815,
             ),
             Err("layer-lattice")
@@ -27136,6 +27163,7 @@ mod hot_cold_overlap_plan_tests {
                 29,
                 0,
                 cap8_candidates,
+                LIVE_SEQUENTIAL_PROBE_CAP8,
                 35.815,
             ),
             Err("wall-domain")
@@ -27153,9 +27181,28 @@ mod hot_cold_overlap_plan_tests {
                 28,
                 0,
                 cap8_candidates,
+                LIVE_SEQUENTIAL_PROBE_CAP8,
                 35.815,
             ),
             Err("stage-accounting")
+        );
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &observations,
+                &walls,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                29,
+                0,
+                cap8_candidates,
+                12,
+                35.815,
+            ),
+            Err("stage-cap")
         );
         assert_eq!(
             format_live_sequential_probe_invalid_receipt("layer-lattice"),
@@ -30429,6 +30476,7 @@ impl Gemma4GhostCommonMetal {
             &mut dyn FnMut(usize, &[f32], usize) -> Option<Vec<usize>>,
         >,
         mut live_sequential_stage_launcher: Option<&mut dyn FnMut(usize, &[usize]) -> bool>,
+        live_sequential_stage_candidate_cap: usize,
         live_sequential_profile_shape: bool,
         pong_slab: Option<&Buffer>,
         predicted_unions: &[Vec<usize>],
@@ -30991,8 +31039,12 @@ impl Gemma4GhostCommonMetal {
             && slot_filler.is_some()
             && hot_residency_at_start.is_some_and(|hot| hot.len() >= n_layers);
         let live_sequential_stage_requested = live_sequential_stage_launcher.is_some();
-        let live_sequential_stage_admitted =
-            live_sequential_stage_requested && live_sequential_probe_admitted;
+        let live_sequential_stage_admitted = live_sequential_stage_requested
+            && live_sequential_probe_admitted
+            && matches!(
+                live_sequential_stage_candidate_cap,
+                LIVE_SEQUENTIAL_PROBE_CAP8 | LIVE_SEQUENTIAL_PROBE_CAP16
+            );
         if live_sequential_probe_requested && !live_sequential_probe_admitted {
             eprintln!(
                 "[metal live-sequential-predict probe] schema=2 admitted=0 start_pos={start_pos} K={k_tokens} h40_shape={} record_demand={} file_mapped={} decode={} hot_cold_overlap={} single_down={} publish={} retained_bank={} unified={} filler={} hot_snapshot={} output_mutation=0 io_mutation=0 slot_policy_mutation=0",
@@ -31018,8 +31070,8 @@ impl Gemma4GhostCommonMetal {
         let mut live_sequential_failed =
             live_sequential_probe_admitted.then(|| vec![false; n_layers]);
         // H69's cap-4/8/16 receipt is one atomic observation per layer. The
-        // extra cap-16 identities exist only inside this already default-off
-        // probe lane and never reach the stage launcher or execution tables.
+        // extra cap-16 identities remain observation-only unless the exact
+        // default-off cap-16 execution profile above admits the stage launcher.
         let mut live_sequential_observations = live_sequential_probe_admitted
             .then(|| vec![None::<LiveSequentialProbeLayerObservation>; n_layers]);
         let mut live_sequential_read_wall_ms =
@@ -34505,7 +34557,13 @@ impl Gemma4GhostCommonMetal {
                     .and_then(|ranked| ranked.get(next_layer_idx))
                     .and_then(Option::as_deref)
                     .zip(hot_residency_at_start.and_then(|hot| hot.get(next_layer_idx)))
-                    .and_then(|(ranked, hot)| live_sequential_cold_candidates(ranked, hot, 8));
+                    .and_then(|(ranked, hot)| {
+                        live_sequential_cold_candidates(
+                            ranked,
+                            hot,
+                            live_sequential_stage_candidate_cap,
+                        )
+                    });
                 match cold_candidates {
                     Some(candidates) => {
                         if let Ok(candidate_count) = u32::try_from(candidates.len()) {
@@ -34944,6 +35002,7 @@ impl Gemma4GhostCommonMetal {
                         live_sequential_stage_launches,
                         live_sequential_stage_launch_failures,
                         live_sequential_stage_candidates,
+                        live_sequential_stage_candidate_cap,
                         ledger.wave_load_ms,
                     )
                 });

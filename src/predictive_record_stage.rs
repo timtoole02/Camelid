@@ -1878,6 +1878,81 @@ mod tests {
     }
 
     #[test]
+    fn rolling_cap16_returns_rank_nine_through_sixteen_in_candidate_order() {
+        let _serial = test_guard();
+        let loader: PredictiveRecordLoader =
+            Arc::new(|loaded_key| Ok(bytes(loaded_key.expert as u8)));
+        let stage = RollingPredictiveRecordStage::start_with_workers(16, 2, loader).unwrap();
+        let candidates = (0..18).map(|expert| key(20, expert)).collect::<Vec<_>>();
+        stage.launch(20, candidates).unwrap();
+
+        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| {
+            snapshot.reads_succeeded == 16
+        });
+        assert_eq!(snapshot.candidates, 16);
+        assert_eq!(snapshot.reads_started, 16);
+        let ready = stage.seal_layer(20);
+        assert_eq!(ready.len(), 16);
+        for (expert, record) in ready.iter().enumerate() {
+            assert_eq!(record.key, key(20, expert));
+            assert_eq!(record.source, PredictiveRecordSource::Staged);
+            assert_eq!(record.bytes.as_ref(), &[expert as u8; 4]);
+        }
+        let snapshot = stage.snapshot();
+        assert_eq!(snapshot.ready_returned, 16);
+        stop_rolling(&stage);
+    }
+
+    #[test]
+    fn rolling_cap16_dual_reader_stays_private_bounded_and_nonblocking() {
+        let _serial = test_guard();
+        let release_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_gate_for_loader = Arc::clone(&release_gate);
+        let (started_tx, started_rx) = mpsc::channel();
+        let loader: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            started_tx.send(loaded_key).unwrap();
+            let (released, changed) = &*release_gate_for_loader;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            Ok(bytes(loaded_key.expert as u8))
+        });
+
+        let stage = RollingPredictiveRecordStage::start_with_workers(16, 2, loader).unwrap();
+        let candidates = (0..18).map(|expert| key(19, expert)).collect::<Vec<_>>();
+        stage.launch(19, candidates).unwrap();
+
+        let mut started = BTreeSet::new();
+        started.insert(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        started.insert(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(started, BTreeSet::from([key(19, 0), key(19, 1)]));
+        let snapshot = stage.snapshot();
+        assert_eq!(snapshot.candidates, 16);
+        assert_eq!(snapshot.reads_started, 2);
+
+        // A wrong exact layer cannot steal ownership or cancel the generation.
+        assert!(stage.seal_layer(18).is_empty());
+        let seal_started = Instant::now();
+        assert!(stage.seal_layer(19).is_empty());
+        assert!(
+            seal_started.elapsed() < Duration::from_millis(100),
+            "cap16 seal waited for private predictive reads"
+        );
+
+        let (released, changed) = &*release_gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| snapshot.late_discarded == 2);
+        assert_eq!(snapshot.reads_succeeded, 2);
+        assert_eq!(snapshot.ready_returned, 0);
+        stop_rolling(&stage);
+        let snapshot = stage.snapshot();
+        assert!(snapshot.cancelled);
+        assert_eq!(snapshot.workers_done, 2);
+    }
+
+    #[test]
     fn rolling_launch_preserves_first_unique_order_under_hard_cap() {
         let _serial = test_guard();
         let loaded = Arc::new(Mutex::new(Vec::new()));

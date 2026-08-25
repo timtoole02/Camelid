@@ -37,6 +37,9 @@ readonly MAX_HOST_WIRED_BYTES=8589934591
 readonly MAX_PRESSURE_LEVEL_RAW=1
 
 [[ -x $binary ]] || { print -u2 "REFUSED: no binary $binary"; exit 75 }
+[[ -f $request && ! -L $request ]] || {
+  print -u2 "REFUSED: request fixture must be a regular non-symlink file: $request"; exit 75
+}
 [[ $no_watchdog == 0 || $no_watchdog == 1 ]] || {
   print -u2 "REFUSED: CAMELID_BENCH_NO_WATCHDOG must be exactly 0 or 1"; exit 75
 }
@@ -66,7 +69,7 @@ free_percent=$(/usr/bin/memory_pressure -Q | /usr/bin/awk '/free percentage/ {gs
 (( free_percent >= 55 )) || { print -u2 "REFUSED: free memory ${free_percent}% < 55%"; exit 75 }
 
 typeset source_commit source_tree_status source_tree_clean binary_sha binary_size binary_version
-typeset runner_sha manual_safety_sampler_sha supervision_mode
+typeset runner_sha request_sha manual_safety_sampler_sha supervision_mode
 source_commit=$(/usr/bin/git -C "$repo" rev-parse --verify HEAD) || {
   print -u2 "REFUSED: could not resolve source commit in $repo"; exit 75
 }
@@ -96,7 +99,11 @@ binary_version=$("$binary" --version) || {
   print -u2 "REFUSED: binary provenance is malformed"; exit 75
 }
 runner_sha=$(/usr/bin/shasum -a 256 "${0:A}" | /usr/bin/awk '{print $1}')
+request_sha=$(/usr/bin/shasum -a 256 "$request" | /usr/bin/awk '{print $1}')
 manual_safety_sampler_sha=$(/usr/bin/shasum -a 256 "$manual_safety_sampler" | /usr/bin/awk '{print $1}')
+[[ ${#request_sha} == 64 && $request_sha != *[^0-9a-f]* ]] || {
+  print -u2 "REFUSED: request fixture SHA-256 is malformed"; exit 75
+}
 if (( no_watchdog == 1 )); then
   supervision_mode=manual-no-watchdog
 else
@@ -193,6 +200,8 @@ record_manifest_value binary_version "$binary_version"
 record_manifest_value expected_token_ids_sha256 \
   "$(/usr/bin/shasum -a 256 "$expected_token_ids" | /usr/bin/awk '{print $1}')"
 record_manifest_value runner_sha256 "$runner_sha"
+record_manifest_value request "$request"
+record_manifest_value request_sha256 "$request_sha"
 record_manifest_value manual_safety_sampler_sha256 "$manual_safety_sampler_sha"
 print -rl -- "${manifest_lines[@]}" > "$out/env.txt"
 /usr/bin/memory_pressure -Q > $out/pre-memory.txt

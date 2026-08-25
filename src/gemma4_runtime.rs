@@ -2157,12 +2157,17 @@ const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
 ];
 
 #[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_mini2_hot_profile_admitted(profile: &[usize]) -> bool {
+    profile == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+        && profile.iter().copied().sum::<usize>()
+            == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_live_sequential_hot_profile_admitted(profile: &[usize]) -> bool {
     (profile == GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE
         && profile.iter().copied().sum::<usize>() == GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS)
-        || (profile == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
-            && profile.iter().copied().sum::<usize>()
-                == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS)
+        || ghost_metal_live_sequential_mini2_hot_profile_admitted(profile)
 }
 /// Default-off exact I/O A/B for the compact cold stage. When the host expert
 /// cache is deliberately disabled, read each selected record directly into
@@ -2228,8 +2233,63 @@ const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_ENV: &str =
 /// layer. The signal remains advisory and exact StageCold demand is unchanged.
 const GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT";
+/// H70 widens only the private rolling prediction payload. The exact router,
+/// static hot profile, compact Metal stage, and demand reader remain unchanged.
+/// Admission is deliberately stricter than the parent stage selector below.
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16";
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP: usize = 8;
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16: usize = 16;
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS: usize =
+    GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16 - GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP;
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES: usize = 3_345_408;
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_PAYLOAD_BYTES: usize =
+    GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS
+        * GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES;
+const _: () = assert!(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_PAYLOAD_BYTES == 8 * 3_345_408);
+#[cfg(target_os = "macos")]
+const _: () = assert!(
+    GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES
+        == crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES
+);
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS: usize = 2;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GhostMetalLiveSequentialCap16Lane {
+    stage_requested: bool,
+    h49_execution_shape: bool,
+    direct_stage_read_active: bool,
+    fast_predict: bool,
+    dual_reader: bool,
+    workers: usize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_stage_cap16_admitted(
+    selector_requested: bool,
+    lane: GhostMetalLiveSequentialCap16Lane,
+) -> bool {
+    selector_requested
+        && lane.stage_requested
+        && lane.h49_execution_shape
+        && lane.direct_stage_read_active
+        && lane.fast_predict
+        && lane.dual_reader
+        && lane.workers == GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_stage_cap(
+    selector_requested: bool,
+    lane: GhostMetalLiveSequentialCap16Lane,
+) -> usize {
+    if ghost_metal_live_sequential_stage_cap16_admitted(selector_requested, lane) {
+        GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16
+    } else {
+        GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP
+    }
+}
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER: &str =
     "[gemma4-ghost-metal] mapped-cold readahead policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool";
@@ -2369,6 +2429,23 @@ fn ghost_metal_live_sequential_fast_predict_enabled() -> bool {
     *FLAG.get_or_init(|| {
         ghost_metal_live_sequential_fast_predict_from(
             std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_stage_cap16_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_live_sequential_stage_cap16_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        ghost_metal_live_sequential_stage_cap16_from(
+            std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_ENV)
                 .ok()
                 .as_deref(),
         )
@@ -8581,16 +8658,49 @@ impl GhostMetalExpertRuntime {
             && live_sequential_hot_profile
                 .as_ref()
                 .is_some_and(|profile| ghost_metal_live_sequential_hot_profile_admitted(profile));
-        let live_sequential_stage_cap = GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP;
-        let live_sequential_stage_workers = if live_sequential_stage_requested
-            && ghost_metal_live_sequential_stage_dual_reader_enabled()
-        {
+        let live_sequential_dual_reader = live_sequential_stage_requested
+            && ghost_metal_live_sequential_stage_dual_reader_enabled();
+        let live_sequential_stage_workers = if live_sequential_dual_reader {
             GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS
         } else {
             1
         };
         let live_sequential_fast_predict =
             live_sequential_stage_requested && ghost_metal_live_sequential_fast_predict_enabled();
+        // H70 is not a generic capacity knob. Reconstruct the already-receipted
+        // H49 execution envelope before widening private payload ownership:
+        // exact frozen profile, direct stage, single-Down, no publication,
+        // no competing stage/bank, and no diagnostic command schedule.
+        let live_sequential_h49_execution_shape = live_sequential_profile_shape
+            && live_sequential_hot_profile.as_ref().is_some_and(|profile| {
+                ghost_metal_live_sequential_mini2_hot_profile_admitted(profile)
+            })
+            && !crate::metal::gemma4_hybrid_hot_cold_overlap_publish_enabled()
+            && std::env::var(GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV)
+                .is_ok_and(|value| value == "1")
+            && !std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_MAPPED_WAVE")
+                .is_ok_and(|value| value == "1")
+            && previous_cold_stage.is_none()
+            && !ghost_metal_three_wave_gateup_requested()
+            && self
+                .common
+                .as_ref()
+                .is_some_and(|common| common.retained_cold_slot_count() == 0)
+            && !std::env::var("CAMELID_GEMMA4_CHAINED_STAGE_PROFILE")
+                .is_ok_and(|value| value == "1")
+            && !std::env::var("CAMELID_GEMMA4_DUMP_LAYERS")
+                .is_ok_and(|value| value == "1");
+        let live_sequential_stage_cap = ghost_metal_live_sequential_stage_cap(
+            ghost_metal_live_sequential_stage_cap16_enabled(),
+            GhostMetalLiveSequentialCap16Lane {
+                stage_requested: live_sequential_stage_requested,
+                h49_execution_shape: live_sequential_h49_execution_shape,
+                direct_stage_read_active,
+                fast_predict: live_sequential_fast_predict,
+                dual_reader: live_sequential_dual_reader,
+                workers: live_sequential_stage_workers,
+            },
+        );
         let live_sequential_stage = if live_sequential_stage_requested
             && live_sequential_profile_shape
         {
@@ -9365,6 +9475,7 @@ impl GhostMetalExpertRuntime {
                     .then_some(hot_at_start.as_slice()),
                 live_sequential_predictor.take(),
                 live_sequential_stage_launcher_fn,
+                live_sequential_stage_cap,
                 live_sequential_profile_shape,
                 pong_slab_for_gpu.as_ref(),
                 gpu_unions,
@@ -28609,6 +28720,12 @@ mod mtp_target_seam_tests {
         assert!(ghost_metal_live_sequential_hot_profile_admitted(
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
         ));
+        assert!(!ghost_metal_live_sequential_mini2_hot_profile_admitted(
+            &GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE
+        ));
+        assert!(ghost_metal_live_sequential_mini2_hot_profile_admitted(
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+        ));
 
         let mut permuted = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
         permuted.swap(0, 1);
@@ -28821,6 +28938,75 @@ mod mtp_target_seam_tests {
                 "unexpected truthy value: {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn live_sequential_cap16_is_exact_positive_strictly_h49_and_payload_bounded() {
+        assert!(!ghost_metal_live_sequential_stage_cap16_from(None));
+        assert!(ghost_metal_live_sequential_stage_cap16_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", "yes", "2", " 1", "1 "] {
+            assert!(
+                !ghost_metal_live_sequential_stage_cap16_from(Some(value)),
+                "unexpected cap16 selector admission for {value:?}"
+            );
+        }
+
+        let h49 = GhostMetalLiveSequentialCap16Lane {
+            stage_requested: true,
+            h49_execution_shape: true,
+            direct_stage_read_active: true,
+            fast_predict: true,
+            dual_reader: true,
+            workers: GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS,
+        };
+        assert_eq!(ghost_metal_live_sequential_stage_cap(false, h49), 8);
+        assert_eq!(ghost_metal_live_sequential_stage_cap(true, h49), 16);
+
+        let refused = [
+            GhostMetalLiveSequentialCap16Lane {
+                stage_requested: false,
+                ..h49
+            },
+            GhostMetalLiveSequentialCap16Lane {
+                h49_execution_shape: false,
+                ..h49
+            },
+            GhostMetalLiveSequentialCap16Lane {
+                direct_stage_read_active: false,
+                ..h49
+            },
+            GhostMetalLiveSequentialCap16Lane {
+                fast_predict: false,
+                ..h49
+            },
+            GhostMetalLiveSequentialCap16Lane {
+                dual_reader: false,
+                ..h49
+            },
+            GhostMetalLiveSequentialCap16Lane { workers: 1, ..h49 },
+            GhostMetalLiveSequentialCap16Lane { workers: 3, ..h49 },
+        ];
+        for lane in refused {
+            assert!(!ghost_metal_live_sequential_stage_cap16_admitted(
+                true, lane
+            ));
+            assert_eq!(ghost_metal_live_sequential_stage_cap(true, lane), 8);
+        }
+
+        assert_eq!(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES, 3_345_408);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES,
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES
+        );
+        assert_eq!(
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS,
+            8
+        );
+        assert_eq!(
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_PAYLOAD_BYTES,
+            8 * 3_345_408
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -33,14 +33,16 @@ def write_manifest(path: Path, values: dict[str, str]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def manifest_values() -> dict[str, str]:
+def manifest_values(stage_cap: int = 8) -> dict[str, str]:
+    assert stage_cap in (8, 16)
     expected_text = ANALYZER.EXPECTED_TOKEN_FILE.read_bytes()
     values = {
         "HOME": "/Users/timtoole",
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "TMPDIR": "/tmp",
     }
-    for raw in ANALYZER.PROFILE_FILE.read_text(encoding="utf-8").splitlines():
+    profile_file = ANALYZER.CAP16_PROFILE_FILE if stage_cap == 16 else ANALYZER.PROFILE_FILE
+    for raw in profile_file.read_text(encoding="utf-8").splitlines():
         if not raw or raw.startswith("#"):
             continue
         key, value = raw.split("=", 1)
@@ -87,7 +89,8 @@ def cap_values(cap: int) -> dict[str, object]:
     }
 
 
-def probe_line(start_pos: int, k_tokens: int) -> str:
+def probe_line(start_pos: int, k_tokens: int, stage_cap: int = 8) -> str:
+    assert stage_cap in (8, 16)
     caps = {cap: cap_values(cap) for cap in ANALYZER.CAPS}
     fields: dict[str, str] = {
         "schema": "2",
@@ -149,7 +152,7 @@ def probe_line(start_pos: int, k_tokens: int) -> str:
             "stage_admitted": "1",
             "launches": "29",
             "launch_failures": "0",
-            "stage_candidates": str(caps[8]["predicted"]),
+            "stage_candidates": str(caps[stage_cap]["predicted"]),
             "readiness_measured": "1",
             "contention_measured": "1",
             "output_mutation": "0",
@@ -167,20 +170,26 @@ def probe_line(start_pos: int, k_tokens: int) -> str:
     return ANALYZER.PROBE_PREFIX + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
-def stage_line(round_seq: int, start_pos: int, k_tokens: int) -> str:
+def stage_line(round_seq: int, start_pos: int, k_tokens: int, stage_cap: int = 8) -> str:
+    assert stage_cap in (8, 16)
+    ready_hits = 100 if stage_cap == 8 else 160
+    direct_fallback = 240 - ready_hits
+    ready_returned = ready_hits + 10
+    worker_unused_ready = 50 if stage_cap == 8 else 10
+    late_discarded = 200 - ready_returned - worker_unused_ready
     fields = {
         "schema": "1",
         "round_seq": str(round_seq),
         "start_pos": str(start_pos),
         "K": str(k_tokens),
         "ok": "1",
-        "cap": "8",
+        "cap": str(stage_cap),
         "workers": "2",
         "workers_started": "2",
         "workers_done": "0",
         "predict_impl": "accelerate-sgemm",
         "launches": "29",
-        "candidates": "232",
+        "candidates": str(29 * stage_cap),
         "reads_started": "200",
         "reads_succeeded": "200",
         "reads_failed": "0",
@@ -188,15 +197,15 @@ def stage_line(round_seq: int, start_pos: int, k_tokens: int) -> str:
         "speculative_read_ms": "100.000",
         "seals": "30",
         "exact_cold": "240",
-        "ready_hits": "100",
+        "ready_hits": str(ready_hits),
         "previous_ready_hits": "0",
-        "direct_fallback": "140",
+        "direct_fallback": str(direct_fallback),
         "ready_unused": "10",
         "ready_malformed": "0",
         "ready_copy_ms": "5.000",
-        "ready_returned": "110",
-        "worker_unused_ready": "50",
-        "late_discarded": "40",
+        "ready_returned": str(ready_returned),
+        "worker_unused_ready": str(worker_unused_ready),
+        "late_discarded": str(late_discarded),
         "worker_done": "0",
         "cancelled": "0",
         "snapshot_terminal": "0",
@@ -326,14 +335,14 @@ def manual_safety(response_size: int) -> dict[str, object]:
     }
 
 
-def create_fixture(run_dir: Path) -> None:
-    write_manifest(run_dir / "env.txt", manifest_values())
+def create_fixture(run_dir: Path, stage_cap: int = 8) -> None:
+    write_manifest(run_dir / "env.txt", manifest_values(stage_cap))
     write_json(run_dir / "health.json", health())
     write_json(run_dir / "response.json", response())
     lines = []
     for index, (start_pos, k_tokens) in enumerate(ANALYZER.EXPECTED_ROUNDS):
-        lines.append(probe_line(start_pos, k_tokens))
-        lines.append(stage_line(41 + index, start_pos, k_tokens))
+        lines.append(probe_line(start_pos, k_tokens, stage_cap))
+        lines.append(stage_line(41 + index, start_pos, k_tokens, stage_cap))
     (run_dir / "server.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
     write_json(
         run_dir / "manual-safety.json",
@@ -349,11 +358,11 @@ def refresh_report_size(run_dir: Path) -> None:
 
 
 @contextlib.contextmanager
-def fixture():
+def fixture(stage_cap: int = 8):
     with tempfile.TemporaryDirectory() as directory:
         run_dir = Path(directory) / "h69-fixture"
         run_dir.mkdir()
-        create_fixture(run_dir)
+        create_fixture(run_dir, stage_cap)
         yield run_dir
 
 
@@ -377,6 +386,25 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
         self.assertFalse(result["integrity"]["qualifying_safety_receipt"])
         self.assertEqual([item["stage_round_seq"] for item in result["rounds"]], [41, 42, 43, 44])
         self.assertAlmostEqual(result["request_projection"]["measured_cap8_readiness"], 100 / 116)
+
+    def test_valid_cap16_fixture_binds_selector_stage_and_readiness(self) -> None:
+        with fixture(16) as run_dir:
+            result = ANALYZER.analyze(run_dir)
+        self.assertEqual(result["integrity"]["stage_cap"], 16)
+        self.assertTrue(result["integrity"]["exact_h49_kv192_1408_cap16_descendant_environment"])
+        self.assertFalse(result["integrity"]["observation_only"])
+        self.assertAlmostEqual(result["request_projection"]["measured_cap16_readiness"], 160 / 232)
+        self.assertEqual(result["rounds"][0]["cap16_ready_hits_measured"], 160)
+        self.assertNotIn("cap8_ready_hits_measured", result["rounds"][0])
+
+    def test_environment_selector_and_reported_stage_cap_must_agree(self) -> None:
+        for receipt_cap, environment_cap in ((8, 16), (16, 8)):
+            with self.subTest(receipt_cap=receipt_cap, environment_cap=environment_cap), fixture(
+                receipt_cap
+            ) as run_dir:
+                write_manifest(run_dir / "env.txt", manifest_values(environment_cap))
+                with self.assertRaisesRegex(ANALYZER.ReceiptError, "environment selected cap"):
+                    ANALYZER.analyze(run_dir)
 
     def test_probe_rejects_unknown_missing_and_duplicate_fields(self) -> None:
         for mutation in ("unknown", "missing", "duplicate"):
