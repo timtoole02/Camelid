@@ -753,8 +753,9 @@ pub struct HealthResponse {
     pub gemma4_available: bool,
     /// Concrete Gemma 4 serving lane for the active model. Together with the
     /// Ghost marker/component health below, this keeps support scoped to the
-    /// validated distributed, catalog-managed Windows CUDA, and exact Mini2
-    /// full-Metal/MTP lanes.
+    /// validated distributed and exact Mini2 full-Metal/MTP lanes. Catalog
+    /// CUDA remains runnable but unverified until its install receipt binds
+    /// both prepared artifacts cryptographically.
     pub gemma4_serve_lane: Option<Gemma4ServeLane>,
     /// Effective common-core accelerator for the active single-node Ghost-MoE
     /// runtime. `Some(true)` means the exact common Metal runtime was admitted
@@ -5814,7 +5815,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q4_0 (QAT rows)",
                 status: "supported_named_exact_rows_only",
-                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through two-Mac distributed serve, the catalog-managed Windows CUDA Ghost-MoE lane, or the exact macOS aarch64 Apple M4 full-Metal Ghost-MoE/MTP lane whose reconciled execution plan attests the prepared target hash, Mini2 host envelope, and every required live component; partial Metal shapes and other Apple hosts remain experimental. The Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
+                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through two-Mac distributed serve or the exact macOS aarch64 Apple M4 full-Metal Ghost-MoE/MTP lane whose reconciled execution plan attests the prepared target hash, Mini2 host envelope, immutable serving-profile receipt, and every required live component. The catalog-managed Windows CUDA implementation retains its evidence but is unverified until a digest-bound install receipt revalidates both prepared artifacts; partial Metal shapes and other Apple hosts remain experimental. The Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
             },
             SupportItem {
                 id: "TQ2_0",
@@ -28881,7 +28882,7 @@ mod tests {
         assert_eq!(target.status, "supported_exact_row_smoke");
         assert_eq!(
             target.support_scope,
-            "exact_row_distributed_or_catalog_windows_cuda_or_apple_m4_full_metal_ghost_moe_smoke_only"
+            "exact_row_distributed_or_apple_m4_full_metal_ghost_moe_smoke_only"
         );
         for required in [
             "gemma4_serve_lane=ghost_moe",

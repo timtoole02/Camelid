@@ -2207,6 +2207,12 @@ fn gemma4_mini2_webui_environment_matches() -> bool {
         ("CAMELID_GEMMA4_KV_INIT", "192"),
         ("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT", "0"),
         ("CAMELID_GEMMA4_GHOST_READ_THREADS", "8"),
+        ("CAMELID_GEMMA4_GHOST_CACHE_MIB", "0"),
+        ("CAMELID_GEMMA4_GHOST_STRICT_CACHE", "false"),
+        (
+            "CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS",
+            "104,112,92,88,92,80,80,80,80,80,76,76,80,84,80,84,84,88,88,84,84,84,84,88,84,92,96,100,104,112",
+        ),
         (GHOST_METAL_DEMAND_LOAD_ONLY_ENV, "1"),
         (GHOST_METAL_FILE_MAPPED_EXPERTS_ENV, "1"),
         (GHOST_METAL_HYBRID_HOT_SLOTS_ENV, "32"),
@@ -2256,12 +2262,15 @@ fn gemma4_mini2_webui_environment_matches() -> bool {
             || name.starts_with("CAMELID_GHOST_");
         !profile_scoped
             || name == "CAMELID_GEMMA4_MTP_ASSISTANT_PATH"
+            || name == "CAMELID_GEMMA4_GHOST_CGHOST"
             || exact_pairs.iter().any(|(allowed, _)| name == *allowed)
     });
     exact_pairs
         .iter()
         .all(|(name, expected)| exact(name, expected))
         && std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
+            .is_some_and(|path| !path.is_empty())
+        && std::env::var_os("CAMELID_GEMMA4_GHOST_CGHOST")
             .is_some_and(|path| !path.is_empty())
         && no_neighboring_selectors
 }
