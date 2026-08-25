@@ -25264,7 +25264,7 @@ fn live_sequential_cold_candidates(
     Some(cold)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn live_sequential_probe_tally(
     ranked: &[usize],
     actual_union: &[usize],
