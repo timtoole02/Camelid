@@ -37,7 +37,7 @@ def manifest_values(stage_cap: int = 8) -> dict[str, str]:
     assert stage_cap in (8, 16)
     expected_text = ANALYZER.EXPECTED_TOKEN_FILE.read_bytes()
     values = {
-        "HOME": "/Users/benchmark",
+        "HOME": "/opt/benchmark-home",
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "TMPDIR": "/tmp",
     }
