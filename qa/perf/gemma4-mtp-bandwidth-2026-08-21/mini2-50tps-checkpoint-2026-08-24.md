@@ -358,6 +358,21 @@ production device-chain log field sequence required by strict QA. The new
 warm-specific telemetry is unchanged. Because H59 had already failed its
 immediate gate, no rebuild was warranted.
 
+## Exact assistant BF16 producer-fusion closure (H60)
+
+H60 is a strict default-off assistant experiment behind
+`CAMELID_GEMMA4_MTP_BF16_PRODUCER_FUSION=1`. It folds BF16 rounding into the
+RMS, residual-add, and scale producers, conditionally removing 33 standalone
+round dispatches per draft while leaving the control path selected by default.
+The targeted exact raw-u32 parity and accounting tests passed.
+
+The ignored exact 44-proposal microbenchmark discarded two warmups and used
+nine interleaved samples. Its medians were 8,102 us/request for control and
+5,675 us/request for fused, a 2,427 us/request saving. That is below the
+required 5,000 us continuation gate, so H60 is a **NO-GO** and no Mini2 run was
+performed. The default-off source and `H60-mtp-bf16-producer-fusion` profile
+remain in the branch for reproducibility.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -375,6 +390,7 @@ Profiles and executable for this checkpoint:
 - `H57-mtp-private-queue-warmup`
 - `H58-moe-mma-k16`
 - `H59-mtp-device-chain-k4-warmup`
+- `H60-mtp-bf16-producer-fusion`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -418,6 +434,9 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - H59 parser, exact K4 + step-3 graph, and compact Q6_K geometry: 3/3;
 - H59 ignored official-artifact restoration: pass, with 56,336 scratch bytes
   plus the prior ledger restored exactly, 449 dispatches, and no output;
+- H60 targeted raw-u32 producer parity and dispatch/traffic accounting: pass;
+  ignored exact 44-proposal timing median 8,102 us control versus 5,675 us
+  fused, saving 2,427 us/request against the required 5,000 us gate;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

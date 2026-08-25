@@ -62,6 +62,10 @@ const MTP_CHAIN_MAX_DRAFTS: usize = 16;
 const MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX: usize = 3;
 const MTP_DEVICE_CHAIN_K4_WARM_DRAFTS: usize = MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX + 1;
 const MTP_DEVICE_CHAIN_DISPATCHES_PER_DRAFT: usize = 112;
+const MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT: usize = 33;
+const MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT: usize = 50_176;
+const MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT: usize =
+    MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT * std::mem::size_of::<f32>() * 2;
 const MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES: usize =
     MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * MTP_DEVICE_CHAIN_DISPATCHES_PER_DRAFT + 1;
 const MTP_DEVICE_CHAIN_K4_WARM_RESTORE_BYTES: usize =
@@ -73,6 +77,7 @@ const TARGET_Q6K_ROW_BYTES: usize =
     (TARGET_HIDDEN / TARGET_Q6K_VALUES_PER_BLOCK) * TARGET_Q6K_WIRE_BYTES_PER_BLOCK;
 const MTP_STEP3_LOGIT_TRACE_ENV: &str = "CAMELID_GEMMA4_MTP_STEP3_LOGIT_TRACE";
 const MTP_LOGIT_TRACE_DRAFT_INDEX_ENV: &str = "CAMELID_GEMMA4_MTP_LOGIT_TRACE_DRAFT_INDEX";
+const MTP_BF16_PRODUCER_FUSION_ENV: &str = "CAMELID_GEMMA4_MTP_BF16_PRODUCER_FUSION";
 // Official Gemma 4 proportional RoPE keeps the normal split-half geometry for
 // the entire 512-wide head, but gives only the first quarter of dimensions a
 // non-zero angle: 512 * 0.25 / 2 = 64 active pairs.  In particular, pair d is
@@ -84,6 +89,15 @@ const EMBEDDING_BF16_BYTES: u64 = 536_870_912;
 const FULL_Q4_MATRIX_BYTES: u64 = 236_077_056;
 const Q4_0_BLOCK_VALUES: usize = 32;
 const Q4_0_BLOCK_BYTES: usize = 18;
+
+const fn mtp_device_chain_k4_warm_dispatches(bf16_producer_fusion: bool) -> usize {
+    if bf16_producer_fusion {
+        MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES
+            - MTP_DEVICE_CHAIN_K4_WARM_DRAFTS * MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT
+    } else {
+        MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES
+    }
+}
 
 const MTP_SHADER: &str = r#"
 #include <metal_stdlib>
@@ -114,6 +128,24 @@ kernel void mtp_round_bf16_widen_f32(
     constant uint& count [[buffer(1)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid < count) data[gid] = mtp_round_bf16(data[gid]);
+}
+
+kernel void mtp_residual_add_bf16_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = mtp_round_bf16(a[gid] + b[gid]);
+}
+
+kernel void mtp_scale_bf16_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    constant float& scale [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = mtp_round_bf16(input[gid] * scale);
 }
 
 // Test diagnostics must snapshot scratch before the next stage reuses it.
@@ -484,6 +516,7 @@ kernel void mtp_rms_norm_aten_f32(
     constant uint& width [[buffer(3)]],
     constant float& eps [[buffer(4)]],
     constant uint& use_weight [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]) {
     threadgroup float residue[16];
@@ -528,7 +561,9 @@ kernel void mtp_rms_norm_aten_f32(
     for (uint index = tid; index < width; index += 256u) {
         float value = input[base + index] * inverse_rms;
         if (use_weight != 0u) value = value * weight[index];
-        output[base + index] = value;
+        output[base + index] = round_output_bf16 != 0u
+            ? mtp_round_bf16(value)
+            : value;
     }
 }
 
@@ -1217,6 +1252,12 @@ fn parse_full_q4_opt_in(value: Option<&str>) -> std::result::Result<bool, &'stat
     parse_device_chain_opt_in(value)
 }
 
+fn parse_bf16_producer_fusion_opt_in(
+    value: Option<&str>,
+) -> std::result::Result<bool, &'static str> {
+    parse_device_chain_opt_in(value)
+}
+
 fn mtp_step3_logit_trace_enabled_value(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| {
         matches!(
@@ -1267,6 +1308,20 @@ fn full_q4_requested_from_environment() -> Result<bool> {
         Err(std::env::VarError::NotUnicode(_)) => {
             Err(invalid(format!("{NAME} must contain Unicode text")))
         }
+    }
+}
+
+fn bf16_producer_fusion_requested_from_environment() -> Result<bool> {
+    match std::env::var(MTP_BF16_PRODUCER_FUSION_ENV) {
+        Ok(value) => parse_bf16_producer_fusion_opt_in(Some(&value)).map_err(|detail| {
+            invalid(format!(
+                "{MTP_BF16_PRODUCER_FUSION_ENV} {detail}, got {value:?}"
+            ))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid(format!(
+            "{MTP_BF16_PRODUCER_FUSION_ENV} must contain Unicode text"
+        ))),
     }
 }
 
@@ -1615,6 +1670,8 @@ struct MtpPipelines {
     #[cfg(test)]
     bf16_gemv_legacy: ComputePipelineState,
     round_bf16: ComputePipelineState,
+    residual_add_bf16: ComputePipelineState,
+    scale_bf16: ComputePipelineState,
     copy_f32: ComputePipelineState,
     #[cfg(test)]
     copy_row_tail_f32: ComputePipelineState,
@@ -1682,6 +1739,8 @@ impl MtpPipelines {
             #[cfg(test)]
             bf16_gemv_legacy: test_diagnostic_pipeline("mtp_test_bf16_gemv_legacy_f32acc")?,
             round_bf16: pipeline("mtp_round_bf16_widen_f32")?,
+            residual_add_bf16: pipeline("mtp_residual_add_bf16_f32")?,
+            scale_bf16: pipeline("mtp_scale_bf16_f32")?,
             copy_f32: pipeline("mtp_copy_f32")?,
             #[cfg(test)]
             copy_row_tail_f32: test_diagnostic_pipeline("mtp_test_copy_row_tail_f32")?,
@@ -1877,6 +1936,7 @@ pub struct Gemma4MtpAssistantMetal {
     post_projection: TensorRef,
     scratch: MtpScratch,
     queue: metal::CommandQueue,
+    bf16_producer_fusion: bool,
     resident_ledger: Gemma4MtpResidentLedger,
     last_proposal_ledger: Option<Gemma4MtpProposalLedger>,
     source_path: PathBuf,
@@ -2101,10 +2161,19 @@ impl Gemma4MtpAssistantMetal {
     /// offsets, config, file length and SHA-256 are all pinned before mlock.
     pub fn load(path: &Path) -> Result<Self> {
         let full_q4 = full_q4_requested_from_environment()?;
-        Self::load_with_full_q4(path, full_q4)
+        let bf16_producer_fusion = bf16_producer_fusion_requested_from_environment()?;
+        Self::load_with_options(path, full_q4, bf16_producer_fusion)
     }
 
     fn load_with_full_q4(path: &Path, full_q4_requested: bool) -> Result<Self> {
+        Self::load_with_options(path, full_q4_requested, false)
+    }
+
+    fn load_with_options(
+        path: &Path,
+        full_q4_requested: bool,
+        bf16_producer_fusion: bool,
+    ) -> Result<Self> {
         let load_started = Instant::now();
         validate_official_config(path)?;
         let mapping = GgufWireMmap::map(path)?;
@@ -2286,6 +2355,40 @@ impl Gemma4MtpAssistantMetal {
                 weights.layout.matrix_bytes,
             );
         }
+        eprintln!(
+            "[gemma4-mtp bf16-producer-fusion] enabled={} standalone_round_dispatches_per_draft={} standalone_round_elements_per_draft={} standalone_round_rw_bytes_per_draft={} elided_round_dispatches_per_draft={} elided_round_elements_per_draft={} elided_round_rw_bytes_per_draft={} scratch_bytes_added=0",
+            usize::from(bf16_producer_fusion),
+            if bf16_producer_fusion {
+                0
+            } else {
+                MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT
+            },
+            if bf16_producer_fusion {
+                0
+            } else {
+                MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT
+            },
+            if bf16_producer_fusion {
+                0
+            } else {
+                MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT
+            },
+            if bf16_producer_fusion {
+                MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT
+            } else {
+                0
+            },
+            if bf16_producer_fusion {
+                MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT
+            } else {
+                0
+            },
+            if bf16_producer_fusion {
+                MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT
+            } else {
+                0
+            },
+        );
 
         Ok(Self {
             weight_file,
@@ -2299,6 +2402,7 @@ impl Gemma4MtpAssistantMetal {
             post_projection,
             scratch,
             queue: kernel.device.new_command_queue(),
+            bf16_producer_fusion,
             resident_ledger,
             last_proposal_ledger: None,
             source_path: path.to_path_buf(),
@@ -2525,10 +2629,31 @@ impl Gemma4MtpAssistantMetal {
             .expect("four-draft warmup invariant checked")
             .timing;
         eprintln!(
-            "[gemma4-mtp device-chain-warmup] graph=k4-step3-capture requested_drafts={} returned_drafts={} command_buffers=1 commits=1 waits=1 dispatches={} queue=private-device-chain explicit_step3_capture=1 synthetic_embedding_rows=1 synthetic_embedding_bytes={} synthetic_vocab=1 synthetic_kv_len=1 target_buffers_borrowed=0 tokens_zero=1 recurrent_zero=1 step3_snapshot_zero=1 recurrent_hidden_restored=1 chain_recurrent_restored=1 token_scratch_restored=1 restored_scratch_bytes={} ledger_restored=1 target_state_mutation=0 output_published=0 encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
+            "[gemma4-mtp device-chain-warmup] graph=k4-step3-capture requested_drafts={} returned_drafts={} command_buffers=1 commits=1 waits=1 dispatches={} bf16_producer_fusion={} standalone_round_dispatches_per_draft={} standalone_round_rw_bytes_per_draft={} elided_round_dispatches_per_draft={} elided_round_rw_bytes_per_draft={} queue=private-device-chain explicit_step3_capture=1 synthetic_embedding_rows=1 synthetic_embedding_bytes={} synthetic_vocab=1 synthetic_kv_len=1 target_buffers_borrowed=0 tokens_zero=1 recurrent_zero=1 step3_snapshot_zero=1 recurrent_hidden_restored=1 chain_recurrent_restored=1 token_scratch_restored=1 restored_scratch_bytes={} ledger_restored=1 target_state_mutation=0 output_published=0 encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
             MTP_DEVICE_CHAIN_K4_WARM_DRAFTS,
             returned_drafts,
-            MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES,
+            mtp_device_chain_k4_warm_dispatches(self.bf16_producer_fusion),
+            usize::from(self.bf16_producer_fusion),
+            if self.bf16_producer_fusion {
+                0
+            } else {
+                MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT
+            },
+            if self.bf16_producer_fusion {
+                0
+            } else {
+                MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT
+            },
+            if self.bf16_producer_fusion {
+                MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT
+            } else {
+                0
+            },
+            if self.bf16_producer_fusion {
+                MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT
+            } else {
+                0
+            },
             TARGET_Q6K_ROW_BYTES,
             MTP_DEVICE_CHAIN_K4_WARM_RESTORE_BYTES,
             timing.encode_us,
@@ -2719,13 +2844,16 @@ impl Gemma4MtpAssistantMetal {
             &self.final_norm,
             &self.scratch.final_normalized,
             &self.scratch.hidden_rms_scalar,
+            self.bf16_producer_fusion,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.final_normalized,
-            ASSISTANT_HIDDEN,
-        );
+        if !self.bf16_producer_fusion {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.final_normalized,
+                ASSISTANT_HIDDEN,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -3053,13 +3181,16 @@ impl Gemma4MtpAssistantMetal {
                 &self.final_norm,
                 &self.scratch.final_normalized,
                 &self.scratch.hidden_rms_scalar,
+                self.bf16_producer_fusion,
             );
-            encode_round_bf16(
-                encoder,
-                &self.pipelines.round_bf16,
-                &self.scratch.final_normalized,
-                ASSISTANT_HIDDEN,
-            );
+            if !self.bf16_producer_fusion {
+                encode_round_bf16(
+                    encoder,
+                    &self.pipelines.round_bf16,
+                    &self.scratch.final_normalized,
+                    ASSISTANT_HIDDEN,
+                );
+            }
 
             encode_assistant_matrix(
                 encoder,
@@ -3412,13 +3543,16 @@ impl Gemma4MtpAssistantMetal {
                 &self.final_norm,
                 &self.scratch.final_normalized,
                 &self.scratch.hidden_rms_scalar,
+                self.bf16_producer_fusion,
             );
-            encode_round_bf16(
-                encoder,
-                &self.pipelines.round_bf16,
-                &self.scratch.final_normalized,
-                ASSISTANT_HIDDEN,
-            );
+            if !self.bf16_producer_fusion {
+                encode_round_bf16(
+                    encoder,
+                    &self.pipelines.round_bf16,
+                    &self.scratch.final_normalized,
+                    ASSISTANT_HIDDEN,
+                );
+            }
             encode_assistant_matrix(
                 encoder,
                 &self.pipelines,
@@ -3594,6 +3728,17 @@ impl Gemma4MtpAssistantMetal {
         }
         if invocation == MtpDeviceChainInvocation::Production {
             eprintln!(
+                "[gemma4-mtp bf16-producer-fusion] requested_drafts={draft_limit} returned_drafts={} enabled={} standalone_round_dispatches_per_draft={} standalone_round_elements_per_draft={} standalone_round_rw_bytes_per_draft={} elided_round_dispatches_per_draft={} elided_round_elements_per_draft={} elided_round_rw_bytes_per_draft={}",
+                proposals.len(),
+                usize::from(self.bf16_producer_fusion),
+                if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT },
+                if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT },
+                if self.bf16_producer_fusion { 0 } else { MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT },
+                if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT } else { 0 },
+                if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT } else { 0 },
+                if self.bf16_producer_fusion { MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT } else { 0 },
+            );
+            eprintln!(
                 "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format={} matrix_bytes_per_draft={} encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
                 proposals.len(),
                 if self.full_q4.is_some() { "q4_0_all" } else if self.q4_embedding.is_some() { "bf16_q4_0_head" } else { "bf16" },
@@ -3641,13 +3786,16 @@ impl Gemma4MtpAssistantMetal {
             &layer.input_norm,
             &self.scratch.normed,
             &self.scratch.hidden_rms_scalar,
+            self.bf16_producer_fusion,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.normed,
-            ASSISTANT_HIDDEN,
-        );
+        if !self.bf16_producer_fusion {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.normed,
+                ASSISTANT_HIDDEN,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -3686,13 +3834,16 @@ impl Gemma4MtpAssistantMetal {
             N_HEADS,
             head_dim,
             0,
+            self.bf16_producer_fusion,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.query_normed,
-            q_dim,
-        );
+        if !self.bf16_producer_fusion {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.query_normed,
+                q_dim,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -3767,13 +3918,16 @@ impl Gemma4MtpAssistantMetal {
             &layer.post_attention_norm,
             &self.scratch.attention_normalized,
             &self.scratch.hidden_rms_scalar,
+            self.bf16_producer_fusion,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.attention_normalized,
-            ASSISTANT_HIDDEN,
-        );
+        if !self.bf16_producer_fusion {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.attention_normalized,
+                ASSISTANT_HIDDEN,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -3785,19 +3939,25 @@ impl Gemma4MtpAssistantMetal {
         );
         encode_binary(
             encoder,
-            &kernel.residual_add_pipeline,
+            if self.bf16_producer_fusion {
+                &self.pipelines.residual_add_bf16
+            } else {
+                &kernel.residual_add_pipeline
+            },
             &self.scratch.hidden,
             &self.scratch.attention_normalized,
             &self.scratch.attention_residual,
             &self.scratch.hidden_count,
             ASSISTANT_HIDDEN,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.attention_residual,
-            ASSISTANT_HIDDEN,
-        );
+        if !self.bf16_producer_fusion {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.attention_residual,
+                ASSISTANT_HIDDEN,
+            );
+        }
         encode_assistant_rms_norm_f32(
             encoder,
             &self.pipelines,
@@ -3805,13 +3965,16 @@ impl Gemma4MtpAssistantMetal {
             &layer.pre_feedforward_norm,
             &self.scratch.normed,
             &self.scratch.hidden_rms_scalar,
+            self.bf16_producer_fusion,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.normed,
-            ASSISTANT_HIDDEN,
-        );
+        if !self.bf16_producer_fusion {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.normed,
+                ASSISTANT_HIDDEN,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -3893,13 +4056,16 @@ impl Gemma4MtpAssistantMetal {
             &layer.post_feedforward_norm,
             &self.scratch.down_normalized,
             &self.scratch.hidden_rms_scalar,
+            self.bf16_producer_fusion,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.down_normalized,
-            ASSISTANT_HIDDEN,
-        );
+        if !self.bf16_producer_fusion {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.down_normalized,
+                ASSISTANT_HIDDEN,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -3911,33 +4077,48 @@ impl Gemma4MtpAssistantMetal {
         );
         encode_binary(
             encoder,
-            &kernel.residual_add_pipeline,
+            if self.bf16_producer_fusion {
+                &self.pipelines.residual_add_bf16
+            } else {
+                &kernel.residual_add_pipeline
+            },
             &self.scratch.attention_residual,
             &self.scratch.down_normalized,
             &self.scratch.next_hidden,
             &self.scratch.hidden_count,
             ASSISTANT_HIDDEN,
         );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.next_hidden,
-            ASSISTANT_HIDDEN,
-        );
-        encode_scale_f32(
-            encoder,
-            kernel,
-            &self.scratch.next_hidden,
-            &self.scratch.hidden,
-            &layer.scale_scalar,
-            ASSISTANT_HIDDEN,
-        );
-        encode_round_bf16(
-            encoder,
-            &self.pipelines.round_bf16,
-            &self.scratch.hidden,
-            ASSISTANT_HIDDEN,
-        );
+        if self.bf16_producer_fusion {
+            encode_scale_bf16(
+                encoder,
+                &self.pipelines.scale_bf16,
+                &self.scratch.next_hidden,
+                &self.scratch.hidden,
+                &layer.scale_scalar,
+                ASSISTANT_HIDDEN,
+            );
+        } else {
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.next_hidden,
+                ASSISTANT_HIDDEN,
+            );
+            encode_scale_f32(
+                encoder,
+                kernel,
+                &self.scratch.next_hidden,
+                &self.scratch.hidden,
+                &layer.scale_scalar,
+                ASSISTANT_HIDDEN,
+            );
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.hidden,
+                ASSISTANT_HIDDEN,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -4009,6 +4190,22 @@ fn encode_round_bf16(
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(data), 0);
     encoder.set_bytes(1, 4, &count_u32 as *const u32 as *const c_void);
+    dispatch_1d(encoder, pipeline, count);
+}
+
+fn encode_scale_bf16(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    count: usize,
+) {
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input), 0);
+    encoder.set_buffer(1, Some(output), 0);
+    encoder.set_buffer(2, Some(scalar), 0);
+    encoder.set_buffer(3, Some(scalar), 4);
     dispatch_1d(encoder, pipeline, count);
 }
 
@@ -4293,6 +4490,7 @@ fn encode_assistant_aten_rms_norm(
     head_count: usize,
     row_off: u64,
     use_weight: bool,
+    round_output_bf16: bool,
 ) {
     assert!(
         matches!(width, 256 | 512 | 1_024),
@@ -4309,6 +4507,12 @@ fn encode_assistant_aten_rms_norm(
         5,
         std::mem::size_of::<u32>() as u64,
         &use_weight as *const u32 as *const c_void,
+    );
+    let round_output_bf16 = u32::from(round_output_bf16);
+    encoder.set_bytes(
+        6,
+        std::mem::size_of::<u32>() as u64,
+        &round_output_bf16 as *const u32 as *const c_void,
     );
     encoder.dispatch_thread_groups(
         MTLSize {
@@ -4331,6 +4535,7 @@ fn encode_assistant_rms_norm_f32(
     weight: &Buffer,
     output: &Buffer,
     scalar: &Buffer,
+    round_output_bf16: bool,
 ) {
     encode_assistant_aten_rms_norm(
         encoder,
@@ -4343,6 +4548,7 @@ fn encode_assistant_rms_norm_f32(
         1,
         0,
         true,
+        round_output_bf16,
     );
 }
 
@@ -4357,6 +4563,7 @@ fn encode_assistant_rms_norm_per_head(
     head_count: usize,
     head_dim: usize,
     row_off: u64,
+    round_output_bf16: bool,
 ) {
     encode_assistant_aten_rms_norm(
         encoder,
@@ -4369,6 +4576,7 @@ fn encode_assistant_rms_norm_per_head(
         head_count,
         row_off,
         true,
+        round_output_bf16,
     );
 }
 
@@ -5318,6 +5526,17 @@ mod tests {
     }
 
     #[test]
+    fn bf16_producer_fusion_is_explicit_default_off_and_fail_closed() {
+        assert_eq!(parse_bf16_producer_fusion_opt_in(None), Ok(false));
+        assert_eq!(parse_bf16_producer_fusion_opt_in(Some("0")), Ok(false));
+        assert_eq!(parse_bf16_producer_fusion_opt_in(Some("FALSE")), Ok(false));
+        assert_eq!(parse_bf16_producer_fusion_opt_in(Some("1")), Ok(true));
+        assert_eq!(parse_bf16_producer_fusion_opt_in(Some("TrUe")), Ok(true));
+        assert!(parse_bf16_producer_fusion_opt_in(Some("yes")).is_err());
+        assert!(parse_bf16_producer_fusion_opt_in(Some("")).is_err());
+    }
+
+    #[test]
     fn step3_logit_trace_is_default_off_and_accepts_only_explicit_truthy_values() {
         assert!(!mtp_step3_logit_trace_enabled_value(None));
         assert!(!mtp_step3_logit_trace_enabled_value(Some("0")));
@@ -5353,6 +5572,8 @@ mod tests {
         assert!(mtp_step3_logit_capture_enabled_values(None, true));
         assert_eq!(MTP_DEVICE_CHAIN_DISPATCHES_PER_DRAFT, 112);
         assert_eq!(MTP_DEVICE_CHAIN_K4_WARM_DISPATCHES, 4 * 112 + 1);
+        assert_eq!(mtp_device_chain_k4_warm_dispatches(false), 449);
+        assert_eq!(mtp_device_chain_k4_warm_dispatches(true), 317);
         assert_eq!(recurrent_bytes, 11_264);
         assert_eq!(chain_recurrent_bytes, 45_056);
         assert_eq!(token_bytes, 16);
@@ -5362,6 +5583,20 @@ mod tests {
         );
         assert_eq!(MTP_DEVICE_CHAIN_K4_WARM_RESTORE_BYTES, 56_336);
         assert_eq!(TARGET_Q6K_ROW_BYTES, 2_310);
+    }
+
+    #[test]
+    fn bf16_producer_fusion_accounting_pins_the_exact_request_graph() {
+        assert_eq!(MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT, 33);
+        assert_eq!(MTP_STANDALONE_BF16_ROUND_ELEMENTS_PER_DRAFT, 50_176);
+        assert_eq!(MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT, 401_408);
+        assert_eq!(mtp_device_chain_k4_warm_dispatches(false), 449);
+        assert_eq!(mtp_device_chain_k4_warm_dispatches(true), 317);
+        assert_eq!(44 * MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT, 1_452);
+        assert_eq!(
+            44 * MTP_STANDALONE_BF16_ROUND_RW_BYTES_PER_DRAFT,
+            17_661_952
+        );
     }
 
     #[test]
@@ -6043,6 +6278,7 @@ mod tests {
                 head_count,
                 0,
                 true,
+                false,
             );
         } else if head_count == 1 {
             encode_rms_norm_f32(
@@ -6074,6 +6310,461 @@ mod tests {
         let mut output = vec![0.0f32; input.len()];
         read_buffer_f32(&output_buffer, &mut output);
         output
+    }
+
+    fn bf16_fusion_adversarial_finite_values(count: usize, phase: usize) -> Vec<f32> {
+        const EDGE_BITS: [u32; 20] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x8000_0001,
+            0x007f_ffff,
+            0x807f_ffff,
+            0x0080_0000,
+            0x8080_0000,
+            0x3e80_0000,
+            0xbe80_0000,
+            0x3f00_0000,
+            0xbf00_0000,
+            0x3f7f_8000,
+            0xbf7f_8000,
+            0x3f80_8000,
+            0xbf80_8000,
+            0x3f81_8000,
+            0xbf81_8000,
+            0x4000_4000,
+            0xc000_4000,
+        ];
+        (0..count)
+            .map(|index| f32::from_bits(EDGE_BITS[(index + phase) % EDGE_BITS.len()]))
+            .collect()
+    }
+
+    fn raw_f32_bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    fn run_test_rms_bf16_boundary(
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        input: &[f32],
+        weight: &[f32],
+        width: usize,
+        head_count: usize,
+        fused: bool,
+    ) -> Vec<u32> {
+        assert_eq!(input.len(), width * head_count);
+        assert_eq!(weight.len(), width);
+        let input_buffer = f32_buffer(&kernel.device, input);
+        let weight_buffer = f32_buffer(&kernel.device, weight);
+        let output_buffer = shared_buffer(&kernel.device, std::mem::size_of_val(input));
+        let scalar = shared_buffer(&kernel.device, 8);
+        set_rms_scalar(&scalar, width);
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_assistant_aten_rms_norm(
+            encoder,
+            &pipelines.rms_norm_aten_f32,
+            &input_buffer,
+            &weight_buffer,
+            &output_buffer,
+            &scalar,
+            width,
+            head_count,
+            0,
+            true,
+            fused,
+        );
+        if !fused {
+            encode_round_bf16(encoder, &pipelines.round_bf16, &output_buffer, input.len());
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let mut output = vec![0.0f32; input.len()];
+        read_buffer_f32(&output_buffer, &mut output);
+        raw_f32_bits(&output)
+    }
+
+    fn run_test_residual_bf16_boundary(
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        a: &[f32],
+        b: &[f32],
+        fused: bool,
+    ) -> Vec<u32> {
+        assert_eq!(a.len(), b.len());
+        let a_buffer = f32_buffer(&kernel.device, a);
+        let b_buffer = f32_buffer(&kernel.device, b);
+        let output_buffer = shared_buffer(&kernel.device, std::mem::size_of_val(a));
+        let count = shared_buffer(&kernel.device, std::mem::size_of::<u32>());
+        set_count(&count, a.len());
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_binary(
+            encoder,
+            if fused {
+                &pipelines.residual_add_bf16
+            } else {
+                &kernel.residual_add_pipeline
+            },
+            &a_buffer,
+            &b_buffer,
+            &output_buffer,
+            &count,
+            a.len(),
+        );
+        if !fused {
+            encode_round_bf16(encoder, &pipelines.round_bf16, &output_buffer, a.len());
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let mut output = vec![0.0f32; a.len()];
+        read_buffer_f32(&output_buffer, &mut output);
+        raw_f32_bits(&output)
+    }
+
+    fn run_test_scale_bf16_boundary(
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        input: &[f32],
+        scale: f32,
+        fused: bool,
+    ) -> Vec<u32> {
+        let input_buffer = f32_buffer(&kernel.device, input);
+        let output_buffer = shared_buffer(&kernel.device, std::mem::size_of_val(input));
+        let scalar = shared_buffer(&kernel.device, 8);
+        unsafe {
+            let ptr = scalar.contents().cast::<u8>();
+            *ptr.cast::<u32>() = input.len() as u32;
+            *ptr.add(4).cast::<f32>() = scale;
+        }
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        if fused {
+            encode_scale_bf16(
+                encoder,
+                &pipelines.scale_bf16,
+                &input_buffer,
+                &output_buffer,
+                &scalar,
+                input.len(),
+            );
+        } else {
+            encode_scale_f32(
+                encoder,
+                kernel,
+                &input_buffer,
+                &output_buffer,
+                &scalar,
+                input.len(),
+            );
+            encode_round_bf16(encoder, &pipelines.round_bf16, &output_buffer, input.len());
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let mut output = vec![0.0f32; input.len()];
+        read_buffer_f32(&output_buffer, &mut output);
+        raw_f32_bits(&output)
+    }
+
+    struct Bf16ProducerBoundaryBench {
+        hidden_input: Buffer,
+        hidden_weight: Buffer,
+        hidden_output: Buffer,
+        hidden_scalar: Buffer,
+        local_query_input: Buffer,
+        local_query_weight: Buffer,
+        local_query_output: Buffer,
+        local_query_scalar: Buffer,
+        full_query_input: Buffer,
+        full_query_weight: Buffer,
+        full_query_output: Buffer,
+        full_query_scalar: Buffer,
+        residual_a: Buffer,
+        residual_b: Buffer,
+        residual_output: Buffer,
+        hidden_count: Buffer,
+        scale_output: Buffer,
+        scale_scalar: Buffer,
+    }
+
+    impl Bf16ProducerBoundaryBench {
+        fn new(device: &Device) -> Self {
+            let hidden_input_values = bf16_fusion_adversarial_finite_values(ASSISTANT_HIDDEN, 3);
+            let hidden_weight_values: Vec<f32> =
+                bf16_fusion_adversarial_finite_values(ASSISTANT_HIDDEN, 9)
+                    .into_iter()
+                    .map(|value| 1.0f32 + value * 0.125f32)
+                    .collect();
+            let local_query_values =
+                bf16_fusion_adversarial_finite_values(N_HEADS * LOCAL_HEAD_DIM, 5);
+            let local_query_weight_values: Vec<f32> =
+                bf16_fusion_adversarial_finite_values(LOCAL_HEAD_DIM, 11)
+                    .into_iter()
+                    .map(|value| 1.0f32 + value * 0.125f32)
+                    .collect();
+            let full_query_values =
+                bf16_fusion_adversarial_finite_values(N_HEADS * FULL_HEAD_DIM, 7);
+            let full_query_weight_values: Vec<f32> =
+                bf16_fusion_adversarial_finite_values(FULL_HEAD_DIM, 13)
+                    .into_iter()
+                    .map(|value| 1.0f32 + value * 0.125f32)
+                    .collect();
+            let residual_b_values = bf16_fusion_adversarial_finite_values(ASSISTANT_HIDDEN, 17);
+            let hidden_scalar = shared_buffer(device, 8);
+            let local_query_scalar = shared_buffer(device, 8);
+            let full_query_scalar = shared_buffer(device, 8);
+            set_rms_scalar(&hidden_scalar, ASSISTANT_HIDDEN);
+            set_rms_scalar(&local_query_scalar, LOCAL_HEAD_DIM);
+            set_rms_scalar(&full_query_scalar, FULL_HEAD_DIM);
+            let hidden_count = shared_buffer(device, std::mem::size_of::<u32>());
+            set_count(&hidden_count, ASSISTANT_HIDDEN);
+            let scale_scalar = shared_buffer(device, 8);
+            unsafe {
+                let ptr = scale_scalar.contents().cast::<u8>();
+                *ptr.cast::<u32>() = ASSISTANT_HIDDEN as u32;
+                *ptr.add(4).cast::<f32>() = 0.75f32;
+            }
+            Self {
+                hidden_input: f32_buffer(device, &hidden_input_values),
+                hidden_weight: f32_buffer(device, &hidden_weight_values),
+                hidden_output: shared_buffer(device, ASSISTANT_HIDDEN * std::mem::size_of::<f32>()),
+                hidden_scalar,
+                local_query_input: f32_buffer(device, &local_query_values),
+                local_query_weight: f32_buffer(device, &local_query_weight_values),
+                local_query_output: shared_buffer(
+                    device,
+                    N_HEADS * LOCAL_HEAD_DIM * std::mem::size_of::<f32>(),
+                ),
+                local_query_scalar,
+                full_query_input: f32_buffer(device, &full_query_values),
+                full_query_weight: f32_buffer(device, &full_query_weight_values),
+                full_query_output: shared_buffer(
+                    device,
+                    N_HEADS * FULL_HEAD_DIM * std::mem::size_of::<f32>(),
+                ),
+                full_query_scalar,
+                residual_a: f32_buffer(device, &hidden_input_values),
+                residual_b: f32_buffer(device, &residual_b_values),
+                residual_output: shared_buffer(
+                    device,
+                    ASSISTANT_HIDDEN * std::mem::size_of::<f32>(),
+                ),
+                hidden_count,
+                scale_output: shared_buffer(device, ASSISTANT_HIDDEN * std::mem::size_of::<f32>()),
+                scale_scalar,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_bf16_boundary_bench_rms(
+        encoder: &metal::ComputeCommandEncoderRef,
+        pipelines: &MtpPipelines,
+        input: &Buffer,
+        weight: &Buffer,
+        output: &Buffer,
+        scalar: &Buffer,
+        width: usize,
+        head_count: usize,
+        fused: bool,
+    ) {
+        encode_assistant_aten_rms_norm(
+            encoder,
+            &pipelines.rms_norm_aten_f32,
+            input,
+            weight,
+            output,
+            scalar,
+            width,
+            head_count,
+            0,
+            true,
+            fused,
+        );
+        if !fused {
+            encode_round_bf16(encoder, &pipelines.round_bf16, output, width * head_count);
+        }
+    }
+
+    fn encode_bf16_producer_boundary_bench_proposal(
+        encoder: &metal::ComputeCommandEncoderRef,
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        buffers: &Bf16ProducerBoundaryBench,
+        fused: bool,
+    ) {
+        for layer in 0..4 {
+            encode_bf16_boundary_bench_rms(
+                encoder,
+                pipelines,
+                &buffers.hidden_input,
+                &buffers.hidden_weight,
+                &buffers.hidden_output,
+                &buffers.hidden_scalar,
+                ASSISTANT_HIDDEN,
+                1,
+                fused,
+            );
+            let (query_input, query_weight, query_output, query_scalar, head_dim) = if layer < 3 {
+                (
+                    &buffers.local_query_input,
+                    &buffers.local_query_weight,
+                    &buffers.local_query_output,
+                    &buffers.local_query_scalar,
+                    LOCAL_HEAD_DIM,
+                )
+            } else {
+                (
+                    &buffers.full_query_input,
+                    &buffers.full_query_weight,
+                    &buffers.full_query_output,
+                    &buffers.full_query_scalar,
+                    FULL_HEAD_DIM,
+                )
+            };
+            encode_bf16_boundary_bench_rms(
+                encoder,
+                pipelines,
+                query_input,
+                query_weight,
+                query_output,
+                query_scalar,
+                head_dim,
+                N_HEADS,
+                fused,
+            );
+            encode_bf16_boundary_bench_rms(
+                encoder,
+                pipelines,
+                &buffers.hidden_input,
+                &buffers.hidden_weight,
+                &buffers.hidden_output,
+                &buffers.hidden_scalar,
+                ASSISTANT_HIDDEN,
+                1,
+                fused,
+            );
+            encode_binary(
+                encoder,
+                if fused {
+                    &pipelines.residual_add_bf16
+                } else {
+                    &kernel.residual_add_pipeline
+                },
+                &buffers.residual_a,
+                &buffers.residual_b,
+                &buffers.residual_output,
+                &buffers.hidden_count,
+                ASSISTANT_HIDDEN,
+            );
+            if !fused {
+                encode_round_bf16(
+                    encoder,
+                    &pipelines.round_bf16,
+                    &buffers.residual_output,
+                    ASSISTANT_HIDDEN,
+                );
+            }
+            for _ in 0..2 {
+                encode_bf16_boundary_bench_rms(
+                    encoder,
+                    pipelines,
+                    &buffers.hidden_input,
+                    &buffers.hidden_weight,
+                    &buffers.hidden_output,
+                    &buffers.hidden_scalar,
+                    ASSISTANT_HIDDEN,
+                    1,
+                    fused,
+                );
+            }
+            encode_binary(
+                encoder,
+                if fused {
+                    &pipelines.residual_add_bf16
+                } else {
+                    &kernel.residual_add_pipeline
+                },
+                &buffers.residual_a,
+                &buffers.residual_b,
+                &buffers.residual_output,
+                &buffers.hidden_count,
+                ASSISTANT_HIDDEN,
+            );
+            if !fused {
+                encode_round_bf16(
+                    encoder,
+                    &pipelines.round_bf16,
+                    &buffers.residual_output,
+                    ASSISTANT_HIDDEN,
+                );
+            }
+            if fused {
+                encode_scale_bf16(
+                    encoder,
+                    &pipelines.scale_bf16,
+                    &buffers.hidden_input,
+                    &buffers.scale_output,
+                    &buffers.scale_scalar,
+                    ASSISTANT_HIDDEN,
+                );
+            } else {
+                encode_scale_f32(
+                    encoder,
+                    kernel,
+                    &buffers.hidden_input,
+                    &buffers.scale_output,
+                    &buffers.scale_scalar,
+                    ASSISTANT_HIDDEN,
+                );
+                encode_round_bf16(
+                    encoder,
+                    &pipelines.round_bf16,
+                    &buffers.scale_output,
+                    ASSISTANT_HIDDEN,
+                );
+            }
+        }
+        encode_bf16_boundary_bench_rms(
+            encoder,
+            pipelines,
+            &buffers.hidden_input,
+            &buffers.hidden_weight,
+            &buffers.hidden_output,
+            &buffers.hidden_scalar,
+            ASSISTANT_HIDDEN,
+            1,
+            fused,
+        );
+    }
+
+    fn time_bf16_producer_boundary_request(
+        kernel: &MetalLinearKernel,
+        pipelines: &MtpPipelines,
+        buffers: &Bf16ProducerBoundaryBench,
+        fused: bool,
+    ) -> u128 {
+        const REQUEST_DRAFTS: usize = 44;
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        for _ in 0..REQUEST_DRAFTS {
+            encode_bf16_producer_boundary_bench_proposal(
+                encoder, kernel, pipelines, buffers, fused,
+            );
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let (gpu_us, _) = command_buffer_gpu_times_us(command_buffer);
+        gpu_us
     }
 
     fn manifest_string<'a>(manifest: &'a serde_json::Value, path: &[&str]) -> &'a str {
@@ -6317,6 +7008,133 @@ mod tests {
                 "fixture failed to discriminate legacy RMS at width {width}"
             );
         }
+    }
+
+    #[test]
+    fn bf16_producer_fusion_rms_is_raw_u32_identical_at_all_production_widths() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP kernels");
+        for (width, head_count) in [(256usize, 16usize), (512, 16), (1_024, 1)] {
+            let input = bf16_fusion_adversarial_finite_values(width * head_count, width);
+            let raw_weight = bf16_fusion_adversarial_finite_values(width, head_count);
+            let weight: Vec<f32> = raw_weight
+                .into_iter()
+                .map(|value| 1.0f32 + value * 0.125f32)
+                .collect();
+            assert!(input.iter().chain(&weight).all(|value| value.is_finite()));
+            let control = run_test_rms_bf16_boundary(
+                kernel, &pipelines, &input, &weight, width, head_count, false,
+            );
+            let fused = run_test_rms_bf16_boundary(
+                kernel, &pipelines, &input, &weight, width, head_count, true,
+            );
+            assert_eq!(
+                fused, control,
+                "fused RMS BF16 boundary drifted at width={width} heads={head_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_producer_fusion_residual_is_raw_u32_identical_on_edge_values() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP kernels");
+        let mut a = bf16_fusion_adversarial_finite_values(ASSISTANT_HIDDEN, 0);
+        let mut b = bf16_fusion_adversarial_finite_values(ASSISTANT_HIDDEN, 7);
+        a[..6].copy_from_slice(&[
+            0.0f32,
+            -0.0f32,
+            f32::from_bits(0x3f80_8000),
+            f32::from_bits(0x3f81_8000),
+            f32::from_bits(0x0000_0001),
+            f32::from_bits(0x8000_0001),
+        ]);
+        b[..6].copy_from_slice(&[-0.0f32, -0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32]);
+        let control = run_test_residual_bf16_boundary(kernel, &pipelines, &a, &b, false);
+        let fused = run_test_residual_bf16_boundary(kernel, &pipelines, &a, &b, true);
+        assert_eq!(fused, control);
+    }
+
+    #[test]
+    fn bf16_producer_fusion_scale_is_raw_u32_identical_on_edge_values() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP kernels");
+        let input = bf16_fusion_adversarial_finite_values(ASSISTANT_HIDDEN, 13);
+        for scale in [1.0f32, 0.75f32, -0.5f32] {
+            let control = run_test_scale_bf16_boundary(kernel, &pipelines, &input, scale, false);
+            let fused = run_test_scale_bf16_boundary(kernel, &pipelines, &input, scale, true);
+            assert_eq!(fused, control, "fused scale drifted for scale={scale}");
+        }
+    }
+
+    #[test]
+    #[ignore = "real-Metal exact 44-proposal BF16 producer-fusion timing gate"]
+    fn bf16_producer_fusion_exact_44_proposal_microbenchmark() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP BF16 producer-fusion benchmark: no Metal device");
+            return;
+        };
+        let pipelines = MtpPipelines::new(&kernel.device).expect("compile MTP kernels");
+        let buffers = Bf16ProducerBoundaryBench::new(&kernel.device);
+        assert_eq!(MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT, 33);
+        assert_eq!(44 * MTP_STANDALONE_BF16_ROUND_DISPATCHES_PER_DRAFT, 1_452);
+
+        for _ in 0..2 {
+            let _ = time_bf16_producer_boundary_request(kernel, &pipelines, &buffers, false);
+            let _ = time_bf16_producer_boundary_request(kernel, &pipelines, &buffers, true);
+        }
+
+        let mut control = Vec::with_capacity(9);
+        let mut fused = Vec::with_capacity(9);
+        for sample in 0..9 {
+            if sample % 2 == 0 {
+                control.push(time_bf16_producer_boundary_request(
+                    kernel, &pipelines, &buffers, false,
+                ));
+                fused.push(time_bf16_producer_boundary_request(
+                    kernel, &pipelines, &buffers, true,
+                ));
+            } else {
+                fused.push(time_bf16_producer_boundary_request(
+                    kernel, &pipelines, &buffers, true,
+                ));
+                control.push(time_bf16_producer_boundary_request(
+                    kernel, &pipelines, &buffers, false,
+                ));
+            }
+        }
+        let median = |samples: &[u128]| {
+            let mut ordered = samples.to_vec();
+            ordered.sort_unstable();
+            ordered[ordered.len() / 2]
+        };
+        let control_median_us = median(&control);
+        let fused_median_us = median(&fused);
+        let saving_us = control_median_us as i128 - fused_median_us as i128;
+        eprintln!(
+            "[gemma4-mtp bf16-producer-fusion benchmark] drafts=44 warmups_per_path=2 samples=9 control_gpu_us={} fused_gpu_us={} saving_us={} standalone_round_dispatches_elided=1452 standalone_round_rw_bytes_elided=17661952",
+            control_median_us,
+            fused_median_us,
+            saving_us,
+        );
+        for sample in 0..9 {
+            eprintln!(
+                "[gemma4-mtp bf16-producer-fusion benchmark] sample={} control_gpu_us={} fused_gpu_us={}",
+                sample,
+                control[sample],
+                fused[sample],
+            );
+        }
+        assert!(
+            saving_us >= 5_000,
+            "BF16 producer fusion saved only {saving_us} us; require at least 5000 us/request"
+        );
     }
 
     #[test]
