@@ -1548,6 +1548,34 @@ static SPEC50_MOE_ARGBUF_KERNELS: OnceLock<Option<Spec50MoeArgbufKernels>> = Onc
 const ARGBUF_GATEUP_K12_ENV: &str = "CAMELID_GEMMA4_ARGBUF_GATEUP_K12";
 const ARGBUF_GATEUP_MMA_K16_ENV: &str = "CAMELID_GEMMA4_MOE_MMA_K16";
 
+/// Selection policy for one ranged GateUp encode. `ExistingEnv` preserves the
+/// shipping wrapper exactly; the other variants let H55 pin its hot prefix to
+/// the established kernel and make only its joined terminal suffix MMA-eligible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gemma4MoeGateupRangePolicy {
+    ExistingEnv,
+    ForceEstablished,
+    PreferMmaK16,
+}
+
+/// Kernel family actually encoded for a GateUp range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gemma4MoeGateupRangeDispatch {
+    Established,
+    MmaK16,
+    EstablishedMmaUnavailableFallback,
+}
+
+impl Gemma4MoeGateupRangeDispatch {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Established => "established",
+            Self::MmaK16 => "mma-k16",
+            Self::EstablishedMmaUnavailableFallback => "established-mma-unavailable-fallback",
+        }
+    }
+}
+
 fn argbuf_gateup_k12_enabled_from(value: Option<&str>) -> bool {
     value == Some("1")
 }
@@ -1564,7 +1592,7 @@ fn argbuf_gateup_mma_k16_enabled_from(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-fn argbuf_gateup_mma_k16_enabled() -> bool {
+pub(crate) fn argbuf_gateup_mma_k16_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let value = std::env::var(ARGBUF_GATEUP_MMA_K16_ENV).ok();
@@ -1574,6 +1602,36 @@ fn argbuf_gateup_mma_k16_enabled() -> bool {
 
 fn argbuf_gateup_mma_k16_selected(k_candidates: usize, enabled: bool) -> bool {
     enabled && matches!(k_candidates, 13 | 14)
+}
+
+fn argbuf_gateup_range_dispatch(
+    k_candidates: usize,
+    policy: Gemma4MoeGateupRangePolicy,
+    existing_env_enabled: bool,
+    mma_available: bool,
+) -> Option<Gemma4MoeGateupRangeDispatch> {
+    let mma_selected = match policy {
+        Gemma4MoeGateupRangePolicy::ExistingEnv => {
+            argbuf_gateup_mma_k16_selected(k_candidates, existing_env_enabled)
+        }
+        Gemma4MoeGateupRangePolicy::ForceEstablished => false,
+        Gemma4MoeGateupRangePolicy::PreferMmaK16 => matches!(k_candidates, 13 | 14),
+    };
+    if !mma_selected {
+        return Some(Gemma4MoeGateupRangeDispatch::Established);
+    }
+    if mma_available {
+        return Some(Gemma4MoeGateupRangeDispatch::MmaK16);
+    }
+    match policy {
+        Gemma4MoeGateupRangePolicy::PreferMmaK16 => {
+            Some(Gemma4MoeGateupRangeDispatch::EstablishedMmaUnavailableFallback)
+        }
+        Gemma4MoeGateupRangePolicy::ExistingEnv => None,
+        Gemma4MoeGateupRangePolicy::ForceEstablished => {
+            Some(Gemma4MoeGateupRangeDispatch::Established)
+        }
+    }
 }
 
 pub(crate) fn spec50_moe_argbuf_kernels(
@@ -2272,11 +2330,40 @@ impl Gemma4MoeSlotArgTable {
         work_count: usize,
         k_candidates: usize,
     ) -> bool {
+        self.encode_chained_gateup_k8_range_with_policy(
+            encoder,
+            input_scales,
+            input_quants,
+            work_list,
+            output_scales,
+            output_quants,
+            work_base,
+            work_count,
+            k_candidates,
+            Gemma4MoeGateupRangePolicy::ExistingEnv,
+        )
+        .is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_chained_gateup_k8_range_with_policy(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input_scales: &Buffer,
+        input_quants: &Buffer,
+        work_list: &Buffer,
+        output_scales: &Buffer,
+        output_quants: &Buffer,
+        work_base: usize,
+        work_count: usize,
+        k_candidates: usize,
+        policy: Gemma4MoeGateupRangePolicy,
+    ) -> Option<Gemma4MoeGateupRangeDispatch> {
         let Some(work_end) = work_base.checked_add(work_count) else {
-            return false;
+            return None;
         };
         let Some(layout) = gateup_range_layout(work_base, work_count, k_candidates) else {
-            return false;
+            return None;
         };
         let input_scales_end = k_candidates
             .checked_mul(S50_GU_BLOCKS)
@@ -2289,21 +2376,32 @@ impl Gemma4MoeSlotArgTable {
             || !buffer_contains_bytes(output_scales, layout.output_scales_end)
             || !buffer_contains_bytes(output_quants, layout.output_quants_end)
         {
-            return false;
+            return None;
         }
         let Some(kernel) = metal_linear_kernel() else {
-            return false;
+            return None;
         };
         let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
-            return false;
+            return None;
         };
-        if argbuf_gateup_mma_k16_selected(k_candidates, argbuf_gateup_mma_k16_enabled()) {
-            let Some(gateup) = pipelines.gateup_mma_k16.as_ref() else {
+        let Some(dispatch) = argbuf_gateup_range_dispatch(
+            k_candidates,
+            policy,
+            argbuf_gateup_mma_k16_enabled(),
+            pipelines.gateup_mma_k16.is_some(),
+        ) else {
+            if matches!(policy, Gemma4MoeGateupRangePolicy::ExistingEnv) {
                 eprintln!(
                     "[metal] requested {ARGBUF_GATEUP_MMA_K16_ENV}=1 for K={k_candidates}, but the staged-MMA K16 GateUp PSO is unavailable or ineligible"
                 );
-                return false;
-            };
+            }
+            return None;
+        };
+        if dispatch == Gemma4MoeGateupRangeDispatch::MmaK16 {
+            let gateup = pipelines
+                .gateup_mma_k16
+                .as_ref()
+                .expect("MMA dispatch requires the available PSO");
             encode_argbuf_gateup_mma_k16_range(
                 encoder,
                 gateup,
@@ -2317,7 +2415,7 @@ impl Gemma4MoeSlotArgTable {
                 work_count as u32,
                 k_candidates as u32,
             );
-            return true;
+            return Some(dispatch);
         }
         let gateup = if k_candidates <= 8 {
             pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
@@ -2339,7 +2437,7 @@ impl Gemma4MoeSlotArgTable {
             work_count as u32,
             k_candidates as u32,
         );
-        true
+        Some(dispatch)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3101,6 +3199,55 @@ mod tests {
                 "only production K13/K14 may select staged MMA"
             );
             assert!(!argbuf_gateup_mma_k16_selected(k, false));
+
+            assert_eq!(
+                argbuf_gateup_range_dispatch(
+                    k,
+                    Gemma4MoeGateupRangePolicy::ForceEstablished,
+                    true,
+                    true,
+                ),
+                Some(Gemma4MoeGateupRangeDispatch::Established),
+                "H63 hot range must remain established at K{k}",
+            );
+            assert_eq!(
+                argbuf_gateup_range_dispatch(
+                    k,
+                    Gemma4MoeGateupRangePolicy::PreferMmaK16,
+                    false,
+                    true,
+                ),
+                Some(if matches!(k, 13 | 14) {
+                    Gemma4MoeGateupRangeDispatch::MmaK16
+                } else {
+                    Gemma4MoeGateupRangeDispatch::Established
+                }),
+                "H63 terminal selection drift at K{k}",
+            );
+            assert_eq!(
+                argbuf_gateup_range_dispatch(
+                    k,
+                    Gemma4MoeGateupRangePolicy::PreferMmaK16,
+                    false,
+                    false,
+                ),
+                Some(if matches!(k, 13 | 14) {
+                    Gemma4MoeGateupRangeDispatch::EstablishedMmaUnavailableFallback
+                } else {
+                    Gemma4MoeGateupRangeDispatch::Established
+                }),
+                "H63 unavailable-PSO fallback drift at K{k}",
+            );
+            assert_eq!(
+                argbuf_gateup_range_dispatch(
+                    k,
+                    Gemma4MoeGateupRangePolicy::ExistingEnv,
+                    true,
+                    false,
+                ),
+                (!matches!(k, 13 | 14)).then_some(Gemma4MoeGateupRangeDispatch::Established),
+                "existing H58 fail-closed behavior drift at K{k}",
+            );
         }
     }
 
@@ -3294,6 +3441,11 @@ mod tests {
 
     impl Buffers {
         fn new(device: &Device) -> Self {
+            Self::new_with_expert_capacity(device, WIDE_BENCH_EXPERTS)
+        }
+
+        fn new_with_expert_capacity(device: &Device, expert_capacity: usize) -> Self {
+            assert!((1..=EXPERTS).contains(&expert_capacity));
             let mut rng = Rng::new(0xa26b_5001);
             let input_scales = new_buffer(device, WIDE_MAX_K * S50_GU_BLOCKS * 4);
             let scales: Vec<f32> = (0..WIDE_MAX_K * S50_GU_BLOCKS)
@@ -3307,8 +3459,8 @@ mod tests {
                 .collect();
             write_bytes(&input_quants, &quants);
 
-            let scale_len = WIDE_BENCH_EXPERTS * WIDE_MAX_K * S50_DOWN_BLOCKS * 4;
-            let quant_len = WIDE_BENCH_EXPERTS * WIDE_MAX_K * S50_FF;
+            let scale_len = expert_capacity * WIDE_MAX_K * S50_DOWN_BLOCKS * 4;
+            let quant_len = expert_capacity * WIDE_MAX_K * S50_FF;
             let down_len = WIDE_MAX_K * S50_HIDDEN * 4;
             Self {
                 input_scales,
@@ -4287,6 +4439,172 @@ mod tests {
         }
     }
 
+    /// Production-policy proof for H63: the hot prefix stays on the
+    /// established encoder, the terminal cold suffix uses staged MMA, and one
+    /// full-union Down observes byte-identical activations. Entire allocation
+    /// comparisons retain zeroed suffixes as output-bound guards.
+    #[test]
+    fn gemma4_moe_h63_mixed_range_policy_is_raw_bit_exact() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP H63 mixed-range parity: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP H63 mixed-range parity: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        assert!(
+            pipelines.gateup_mma_k16.is_some(),
+            "H63 staged-MMA GateUp pipeline"
+        );
+        let (records, _) = synthetic_slot_backings_count(device, ACTIVE_EXPERTS);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("30-expert anonymous Tier-2 table");
+        let buffers = Buffers::new(device);
+        write_adversarial_wide_gateup_inputs(&buffers);
+
+        for k in [13usize, 14] {
+            let routing = build_routing(k);
+            let unique = routing.active_experts.len();
+            assert_eq!(unique, ACTIVE_EXPERTS, "H63 fixture union drift at K{k}");
+            let all_slots = (0..unique).collect::<Vec<_>>();
+
+            for cold_count in [1usize, 8, 24] {
+                let hot_count = unique - cold_count;
+                let hot_slots = (0..hot_count).collect::<Vec<_>>();
+                let cold_slots = (hot_count..unique).collect::<Vec<_>>();
+                buffers.upload(&routing);
+                buffers.zero_outputs();
+
+                let oracle = kernel.queue.new_command_buffer();
+                let oracle_enc = oracle.new_compute_command_encoder();
+                assert_eq!(
+                    table.declare_active_slots(oracle_enc, &all_slots),
+                    Some(unique)
+                );
+                assert_eq!(
+                    table.encode_chained_gateup_k8_range_with_policy(
+                        oracle_enc,
+                        &buffers.input_scales,
+                        &buffers.input_quants,
+                        &buffers.work,
+                        &buffers.copy_scales,
+                        &buffers.copy_quants,
+                        0,
+                        unique,
+                        k,
+                        Gemma4MoeGateupRangePolicy::ForceEstablished,
+                    ),
+                    Some(Gemma4MoeGateupRangeDispatch::Established),
+                );
+                oracle_enc
+                    .memory_barrier_with_resources(&[&buffers.copy_scales, &buffers.copy_quants]);
+                assert!(table.encode_chained_down_k8(
+                    oracle_enc,
+                    &buffers.copy_scales,
+                    &buffers.copy_quants,
+                    &buffers.routes,
+                    &buffers.work,
+                    &buffers.copy_down,
+                    k,
+                ));
+                oracle_enc.end_encoding();
+
+                let hot = kernel.queue.new_command_buffer();
+                let hot_enc = hot.new_compute_command_encoder();
+                assert_eq!(
+                    table.declare_active_slots(hot_enc, &hot_slots),
+                    Some(hot_count)
+                );
+                assert_eq!(
+                    table.encode_chained_gateup_k8_range_with_policy(
+                        hot_enc,
+                        &buffers.input_scales,
+                        &buffers.input_quants,
+                        &buffers.work,
+                        &buffers.arg_scales,
+                        &buffers.arg_quants,
+                        0,
+                        hot_count,
+                        k,
+                        Gemma4MoeGateupRangePolicy::ForceEstablished,
+                    ),
+                    Some(Gemma4MoeGateupRangeDispatch::Established),
+                );
+                hot_enc.end_encoding();
+
+                let terminal = kernel.queue.new_command_buffer();
+                let terminal_enc = terminal.new_compute_command_encoder();
+                assert_eq!(
+                    table.declare_active_slots(terminal_enc, &cold_slots),
+                    Some(cold_count)
+                );
+                assert_eq!(
+                    table.encode_chained_gateup_k8_range_with_policy(
+                        terminal_enc,
+                        &buffers.input_scales,
+                        &buffers.input_quants,
+                        &buffers.work,
+                        &buffers.arg_scales,
+                        &buffers.arg_quants,
+                        hot_count,
+                        cold_count,
+                        k,
+                        Gemma4MoeGateupRangePolicy::PreferMmaK16,
+                    ),
+                    Some(Gemma4MoeGateupRangeDispatch::MmaK16),
+                );
+                terminal_enc
+                    .memory_barrier_with_resources(&[&buffers.arg_scales, &buffers.arg_quants]);
+                assert_eq!(
+                    table.declare_active_slots(terminal_enc, &all_slots),
+                    Some(unique)
+                );
+                assert!(table.encode_chained_down_k8(
+                    terminal_enc,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    &buffers.routes,
+                    &buffers.work,
+                    &buffers.arg_down,
+                    k,
+                ));
+                terminal_enc.end_encoding();
+
+                oracle.commit();
+                hot.commit();
+                terminal.commit();
+                terminal.wait_until_completed();
+                assert_eq!(oracle.status(), MTLCommandBufferStatus::Completed);
+                assert_eq!(hot.status(), MTLCommandBufferStatus::Completed);
+                assert_eq!(
+                    terminal.status(),
+                    MTLCommandBufferStatus::Completed,
+                    "H63 mixed-range K={k} cold={cold_count} command failed: {}",
+                    command_buffer_error_details(terminal),
+                );
+
+                assert_raw_eq(
+                    &format!("H63 K={k} cold={cold_count} GateUp scales + guard"),
+                    &read_bytes(&buffers.copy_scales, buffers.copy_scales.length() as usize),
+                    &read_bytes(&buffers.arg_scales, buffers.arg_scales.length() as usize),
+                );
+                assert_raw_eq(
+                    &format!("H63 K={k} cold={cold_count} GateUp quants + guard"),
+                    &read_bytes(&buffers.copy_quants, buffers.copy_quants.length() as usize),
+                    &read_bytes(&buffers.arg_quants, buffers.arg_quants.length() as usize),
+                );
+                assert_raw_eq(
+                    &format!("H63 K={k} cold={cold_count} Down + guard"),
+                    &read_bytes(&buffers.copy_down, buffers.copy_down.length() as usize),
+                    &read_bytes(&buffers.arg_down, buffers.arg_down.length() as usize),
+                );
+            }
+        }
+    }
+
     /// Real-Metal proof that both Down scheduling probes preserve every
     /// candidate row's lane ownership, term order, and SIMD reduction bits.
     #[test]
@@ -5059,17 +5377,21 @@ mod tests {
                     hot_table.declare_active_slots(hot_enc, &hot_slots),
                     Some(HOT)
                 );
-                assert!(hot_table.encode_chained_gateup_k8_range(
-                    hot_enc,
-                    &buffers.input_scales,
-                    &buffers.input_quants,
-                    &buffers.work,
-                    &buffers.arg_scales,
-                    &buffers.arg_quants,
-                    0,
-                    HOT,
-                    k,
-                ));
+                assert_eq!(
+                    hot_table.encode_chained_gateup_k8_range_with_policy(
+                        hot_enc,
+                        &buffers.input_scales,
+                        &buffers.input_quants,
+                        &buffers.work,
+                        &buffers.arg_scales,
+                        &buffers.arg_quants,
+                        0,
+                        HOT,
+                        k,
+                        Gemma4MoeGateupRangePolicy::ForceEstablished,
+                    ),
+                    Some(Gemma4MoeGateupRangeDispatch::Established),
+                );
                 hot_enc.end_encoding();
 
                 let terminal_cb = kernel.queue.new_command_buffer();
@@ -5078,17 +5400,21 @@ mod tests {
                     full_table.declare_active_slots(terminal_enc, &cold_slots),
                     Some(ready_count + demand_count)
                 );
-                assert!(full_table.encode_chained_gateup_k8_range(
-                    terminal_enc,
-                    &buffers.input_scales,
-                    &buffers.input_quants,
-                    &buffers.work,
-                    &buffers.arg_scales,
-                    &buffers.arg_quants,
-                    HOT,
-                    ready_count + demand_count,
-                    k,
-                ));
+                assert_eq!(
+                    full_table.encode_chained_gateup_k8_range_with_policy(
+                        terminal_enc,
+                        &buffers.input_scales,
+                        &buffers.input_quants,
+                        &buffers.work,
+                        &buffers.arg_scales,
+                        &buffers.arg_quants,
+                        HOT,
+                        ready_count + demand_count,
+                        k,
+                        Gemma4MoeGateupRangePolicy::PreferMmaK16,
+                    ),
+                    Some(Gemma4MoeGateupRangeDispatch::Established),
+                );
                 terminal_enc
                     .memory_barrier_with_resources(&[&buffers.arg_scales, &buffers.arg_quants]);
                 assert_eq!(
@@ -5360,6 +5686,7 @@ mod tests {
         faults: u64,
         decompressions: u64,
         swapins: u64,
+        swapouts: u64,
     }
 
     #[allow(deprecated)]
@@ -5383,6 +5710,7 @@ mod tests {
             faults: stats.faults,
             decompressions: stats.decompressions,
             swapins: stats.swapins,
+            swapouts: stats.swapouts,
         })
     }
 
@@ -5405,6 +5733,7 @@ mod tests {
         faults: u64,
         decompressions: u64,
         swapins: u64,
+        swapouts: u64,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5502,7 +5831,125 @@ mod tests {
             faults: vm_delta(after, before, |stats| stats.faults),
             decompressions: vm_delta(after, before, |stats| stats.decompressions),
             swapins: vm_delta(after, before, |stats| stats.swapins),
+            swapouts: vm_delta(after, before, |stats| stats.swapouts),
         }
+    }
+
+    /// Repeated-weight timing model for H63's actual terminal-cold range
+    /// histogram. Every tuple is one admitted H55 layer and encodes only its
+    /// cold suffix at the production full-union offset.
+    #[allow(clippy::too_many_arguments)]
+    fn time_terminal_cold_histogram(
+        queue: &metal::CommandQueue,
+        pipeline: &ComputePipelineState,
+        staged_mma: bool,
+        table: &Gemma4MoeSlotArgTable,
+        buffers: &Buffers,
+        work_lists: &[Buffer],
+        ranges: &[(usize, usize)],
+        k: usize,
+    ) -> Timing {
+        assert_eq!(work_lists.len(), ranges.len());
+        buffers.zero_outputs();
+        let before = vm_counters();
+        let started = std::time::Instant::now();
+        let cb = queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        assert_eq!(table.declare_all_records(encoder), table.slot_count());
+        for (layer, &(hot_count, cold_count)) in ranges.iter().enumerate() {
+            assert!(cold_count > 0);
+            assert!(hot_count + cold_count <= table.slot_count());
+            if staged_mma {
+                encode_argbuf_gateup_mma_k16_range(
+                    encoder,
+                    pipeline,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    table.argument_buffer(),
+                    &work_lists[layer],
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    hot_count,
+                    cold_count as u32,
+                    k as u32,
+                );
+            } else {
+                encode_argbuf_gateup_range(
+                    encoder,
+                    pipeline,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    table.argument_buffer(),
+                    &work_lists[layer],
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    hot_count,
+                    cold_count as u32,
+                    k as u32,
+                );
+            }
+        }
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let wall_us = started.elapsed().as_micros();
+        assert_eq!(
+            cb.status(),
+            MTLCommandBufferStatus::Completed,
+            "H63 histogram command failed: {}",
+            command_buffer_error_details(cb),
+        );
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
+        let after = vm_counters();
+        Timing {
+            wall_us,
+            gpu_us,
+            kernel_us,
+            pageins: vm_delta(after, before, |stats| stats.pageins),
+            faults: vm_delta(after, before, |stats| stats.faults),
+            decompressions: vm_delta(after, before, |stats| stats.decompressions),
+            swapins: vm_delta(after, before, |stats| stats.swapins),
+            swapouts: vm_delta(after, before, |stats| stats.swapouts),
+        }
+    }
+
+    fn terminal_histogram_sparse_work_lists(
+        device: &Device,
+        ranges: &[(usize, usize)],
+        k: usize,
+        candidate_bits: usize,
+    ) -> Vec<Buffer> {
+        assert!((1..=k).contains(&candidate_bits));
+        ranges
+            .iter()
+            .enumerate()
+            .map(|(layer, &(hot_count, cold_count))| {
+                let unique = hot_count + cold_count;
+                assert!((1..=EXPERTS).contains(&unique));
+                let mut work = vec![Gemma4UniqueExpertWork::default(); EXPERTS];
+                for slot in 0..unique {
+                    work[slot].expert_weight_offset = (slot * S50_SLOT_STRIDE) as u32;
+                    for bit in 0..candidate_bits {
+                        let token = (layer * 3 + slot * 5 + bit) % k;
+                        work[slot].candidate_mask |= 1u64 << token;
+                    }
+                }
+                assert!(work[..unique].iter().all(|entry| entry.candidate_mask != 0));
+                assert_eq!(
+                    work[..unique]
+                        .iter()
+                        .map(|entry| entry.candidate_mask.count_ones() as usize)
+                        .sum::<usize>(),
+                    unique * candidate_bits,
+                );
+                let buffer = new_buffer(
+                    device,
+                    EXPERTS * std::mem::size_of::<Gemma4UniqueExpertWork>(),
+                );
+                write_bytes(&buffer, &work);
+                buffer
+            })
+            .collect()
     }
 
     fn prepare_down_activations(
@@ -5624,6 +6071,7 @@ mod tests {
             faults: vm_delta(after, before, |stats| stats.faults),
             decompressions: vm_delta(after, before, |stats| stats.decompressions),
             swapins: vm_delta(after, before, |stats| stats.swapins),
+            swapouts: vm_delta(after, before, |stats| stats.swapouts),
         }
     }
 
@@ -5696,6 +6144,7 @@ mod tests {
             faults: vm_delta(after, before, |stats| stats.faults),
             decompressions: vm_delta(after, before, |stats| stats.decompressions),
             swapins: vm_delta(after, before, |stats| stats.swapins),
+            swapouts: vm_delta(after, before, |stats| stats.swapouts),
         }
     }
 
@@ -5763,6 +6212,7 @@ mod tests {
             faults: vm_delta(after, before, |stats| stats.faults),
             decompressions: vm_delta(after, before, |stats| stats.decompressions),
             swapins: vm_delta(after, before, |stats| stats.swapins),
+            swapouts: vm_delta(after, before, |stats| stats.swapouts),
         }
     }
 
@@ -5921,8 +6371,8 @@ mod tests {
                 .chain(&mma13)
                 .chain(&current14)
                 .chain(&mma14)
-                .all(|timing| timing.swapins == 0),
-            "staged-MMA timing gate observed swap-in"
+                .all(|timing| timing.swapins == 0 && timing.swapouts == 0),
+            "staged-MMA timing gate observed swap-in or swap-out"
         );
 
         eprintln!(
@@ -5950,7 +6400,7 @@ mod tests {
         );
         for sample in 0..9 {
             eprintln!(
-                "[spec50-mma-k16-gateup] sample={} K13_current_gpu_us={} K13_mma_gpu_us={} K14_current_gpu_us={} K14_mma_gpu_us={} K13_current_swapins={} K13_mma_swapins={} K14_current_swapins={} K14_mma_swapins={}",
+                "[spec50-mma-k16-gateup] sample={} K13_current_gpu_us={} K13_mma_gpu_us={} K14_current_gpu_us={} K14_mma_gpu_us={} K13_current_swapins={} K13_mma_swapins={} K14_current_swapins={} K14_mma_swapins={} K13_current_swapouts={} K13_mma_swapouts={} K14_current_swapouts={} K14_mma_swapouts={}",
                 sample,
                 current13[sample].gpu_us,
                 mma13[sample].gpu_us,
@@ -5960,8 +6410,463 @@ mod tests {
                 mma13[sample].swapins,
                 current14[sample].swapins,
                 mma14[sample].swapins,
+                current13[sample].swapouts,
+                mma13[sample].swapouts,
+                current14[sample].swapouts,
+                mma14[sample].swapouts,
             );
         }
+    }
+
+    /// H63 continuation gate using the exact admitted-layer hot/cold counts
+    /// observed in the representative H58 B1 request. This is deliberately a
+    /// repeated-weight, GateUp-only model: it isolates the terminal range
+    /// selector without claiming full-request cache or attention effects.
+    #[test]
+    #[ignore = "real-Metal H63 terminal-cold histogram microbenchmark"]
+    fn spec50_h63_terminal_cold_mma_histogram_interleaved_timing() {
+        const EXPERT_CAPACITY: usize = 56;
+        const ROUND0_K14: [(usize, usize); 30] = [
+            (35, 10),
+            (40, 15),
+            (29, 10),
+            (30, 8),
+            (27, 6),
+            (26, 8),
+            (27, 5),
+            (27, 7),
+            (26, 9),
+            (32, 4),
+            (29, 11),
+            (29, 7),
+            (27, 9),
+            (33, 5),
+            (28, 7),
+            (28, 5),
+            (21, 4),
+            (23, 5),
+            (20, 6),
+            (26, 8),
+            (22, 7),
+            (26, 8),
+            (27, 7),
+            (25, 13),
+            (33, 8),
+            (35, 14),
+            (37, 8),
+            (31, 8),
+            (36, 6),
+            (26, 17),
+        ];
+        const ROUND1_K13: [(usize, usize); 30] = [
+            (39, 7),
+            (34, 12),
+            (30, 5),
+            (31, 4),
+            (34, 10),
+            (29, 12),
+            (31, 8),
+            (28, 7),
+            (27, 8),
+            (28, 15),
+            (27, 16),
+            (23, 21),
+            (28, 13),
+            (27, 17),
+            (23, 19),
+            (25, 9),
+            (20, 7),
+            (22, 7),
+            (22, 8),
+            (24, 9),
+            (18, 4),
+            (23, 4),
+            (22, 8),
+            (25, 11),
+            (23, 8),
+            (31, 12),
+            (28, 6),
+            (26, 12),
+            (24, 8),
+            (25, 11),
+        ];
+        const ROUND2_K14: [(usize, usize); 29] = [
+            (45, 10),
+            (45, 10),
+            (31, 9),
+            (30, 6),
+            (29, 13),
+            (25, 13),
+            (28, 12),
+            (29, 14),
+            (28, 13),
+            (24, 17),
+            (14, 19),
+            (18, 19),
+            (20, 17),
+            (19, 21),
+            (24, 13),
+            (19, 15),
+            (25, 12),
+            (21, 13),
+            (22, 12),
+            (24, 9),
+            (23, 10),
+            (22, 14),
+            (24, 17),
+            (32, 10),
+            (30, 7),
+            (32, 6),
+            (30, 9),
+            (31, 7),
+            (28, 11),
+        ];
+
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP H63 histogram benchmark: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP H63 histogram benchmark: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let mma = pipelines
+            .gateup_mma_k16
+            .as_ref()
+            .expect("staged-MMA K16 GateUp pipeline");
+        let (records, _) = synthetic_slot_backings_count(device, EXPERT_CAPACITY);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("56-expert anonymous Tier-2 table");
+        let buffers = Buffers::new_with_expert_capacity(device, EXPERT_CAPACITY);
+        let histograms: [(usize, &[(usize, usize)]); 3] =
+            [(14, &ROUND0_K14), (13, &ROUND1_K13), (14, &ROUND2_K14)];
+        let one_hot_work_lists: [Vec<Buffer>; 3] = std::array::from_fn(|index| {
+            terminal_histogram_sparse_work_lists(
+                device,
+                histograms[index].1,
+                histograms[index].0,
+                1,
+            )
+        });
+        let three_bit_work_lists: [Vec<Buffer>; 3] = std::array::from_fn(|index| {
+            terminal_histogram_sparse_work_lists(
+                device,
+                histograms[index].1,
+                histograms[index].0,
+                3,
+            )
+        });
+        assert_eq!(histograms.map(|(_, ranges)| ranges.len()), [30, 30, 29]);
+        assert_eq!(
+            histograms.map(|(_, ranges)| ranges.iter().map(|range| range.1).sum::<usize>()),
+            [245, 298, 358]
+        );
+        let one_hot_cold_assignments =
+            histograms.map(|(_, ranges)| ranges.iter().map(|range| range.1).sum::<usize>());
+        let three_bit_cold_assignments =
+            one_hot_cold_assignments.map(|assignments| assignments * 3);
+        assert_eq!(one_hot_cold_assignments, [245, 298, 358]);
+        assert_eq!(three_bit_cold_assignments, [735, 894, 1_074]);
+        assert!(histograms.iter().all(|(_, ranges)| ranges
+            .iter()
+            .all(|&(hot, cold)| hot + cold <= EXPERT_CAPACITY)));
+        assert_eq!(
+            histograms
+                .iter()
+                .map(|(k, ranges)| k * S50_ROUTES * ranges.len())
+                .sum::<usize>(),
+            9_728,
+        );
+
+        for _ in 0..2 {
+            for work_lists in [&one_hot_work_lists, &three_bit_work_lists] {
+                for index in 0..histograms.len() {
+                    let (k, ranges) = histograms[index];
+                    let established_warmup = time_terminal_cold_histogram(
+                        &kernel.queue,
+                        &pipelines.gateup,
+                        false,
+                        &table,
+                        &buffers,
+                        &work_lists[index],
+                        ranges,
+                        k,
+                    );
+                    let staged_warmup = time_terminal_cold_histogram(
+                        &kernel.queue,
+                        mma,
+                        true,
+                        &table,
+                        &buffers,
+                        &work_lists[index],
+                        ranges,
+                        k,
+                    );
+                    assert_eq!(established_warmup.swapins, 0, "H63 warmup swapped");
+                    assert_eq!(established_warmup.swapouts, 0, "H63 warmup swapped");
+                    assert_eq!(staged_warmup.swapins, 0, "H63 warmup swapped");
+                    assert_eq!(staged_warmup.swapouts, 0, "H63 warmup swapped");
+                }
+            }
+        }
+
+        let mut one_hot_established: [Vec<Timing>; 3] =
+            std::array::from_fn(|_| Vec::with_capacity(9));
+        let mut one_hot_staged: [Vec<Timing>; 3] = std::array::from_fn(|_| Vec::with_capacity(9));
+        let mut three_bit_established: [Vec<Timing>; 3] =
+            std::array::from_fn(|_| Vec::with_capacity(9));
+        let mut three_bit_staged: [Vec<Timing>; 3] = std::array::from_fn(|_| Vec::with_capacity(9));
+        for sample in 0..9 {
+            let order = if sample % 2 == 0 {
+                [0usize, 1, 2]
+            } else {
+                [2usize, 1, 0]
+            };
+            for index in order {
+                let (k, ranges) = histograms[index];
+                if sample % 2 == 0 {
+                    one_hot_established[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        &pipelines.gateup,
+                        false,
+                        &table,
+                        &buffers,
+                        &one_hot_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                    one_hot_staged[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        mma,
+                        true,
+                        &table,
+                        &buffers,
+                        &one_hot_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                    three_bit_established[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        &pipelines.gateup,
+                        false,
+                        &table,
+                        &buffers,
+                        &three_bit_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                    three_bit_staged[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        mma,
+                        true,
+                        &table,
+                        &buffers,
+                        &three_bit_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                } else {
+                    three_bit_staged[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        mma,
+                        true,
+                        &table,
+                        &buffers,
+                        &three_bit_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                    three_bit_established[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        &pipelines.gateup,
+                        false,
+                        &table,
+                        &buffers,
+                        &three_bit_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                    one_hot_staged[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        mma,
+                        true,
+                        &table,
+                        &buffers,
+                        &one_hot_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                    one_hot_established[index].push(time_terminal_cold_histogram(
+                        &kernel.queue,
+                        &pipelines.gateup,
+                        false,
+                        &table,
+                        &buffers,
+                        &one_hot_work_lists[index],
+                        ranges,
+                        k,
+                    ));
+                }
+            }
+        }
+
+        let median_gpu = |samples: &[Timing]| {
+            let mut ordered = samples.to_vec();
+            ordered.sort_unstable_by_key(|timing| timing.gpu_us);
+            ordered[ordered.len() / 2]
+        };
+        let one_hot_established_medians: [Timing; 3] =
+            std::array::from_fn(|index| median_gpu(&one_hot_established[index]));
+        let one_hot_staged_medians: [Timing; 3] =
+            std::array::from_fn(|index| median_gpu(&one_hot_staged[index]));
+        let three_bit_established_medians: [Timing; 3] =
+            std::array::from_fn(|index| median_gpu(&three_bit_established[index]));
+        let three_bit_staged_medians: [Timing; 3] =
+            std::array::from_fn(|index| median_gpu(&three_bit_staged[index]));
+        let median_paired_delta = |established: &[Timing], staged: &[Timing]| {
+            assert_eq!(established.len(), staged.len());
+            let mut deltas = established
+                .iter()
+                .zip(staged)
+                .map(|(established, staged)| established.gpu_us as i128 - staged.gpu_us as i128)
+                .collect::<Vec<_>>();
+            deltas.sort_unstable();
+            deltas[deltas.len() / 2]
+        };
+        let one_hot_savings: [i128; 3] = std::array::from_fn(|index| {
+            median_paired_delta(&one_hot_established[index], &one_hot_staged[index])
+        });
+        let three_bit_savings: [i128; 3] = std::array::from_fn(|index| {
+            median_paired_delta(&three_bit_established[index], &three_bit_staged[index])
+        });
+        let median_paired_request_delta =
+            |established: &[Vec<Timing>; 3], staged: &[Vec<Timing>; 3]| {
+                let mut deltas = (0..9)
+                    .map(|sample| {
+                        (0..3)
+                            .map(|round| {
+                                established[round][sample].gpu_us as i128
+                                    - staged[round][sample].gpu_us as i128
+                            })
+                            .sum::<i128>()
+                    })
+                    .collect::<Vec<_>>();
+                deltas.sort_unstable();
+                deltas[deltas.len() / 2]
+            };
+        let one_hot_projected_saving_us =
+            median_paired_request_delta(&one_hot_established, &one_hot_staged);
+        let three_bit_projected_saving_us =
+            median_paired_request_delta(&three_bit_established, &three_bit_staged);
+        assert!(
+            one_hot_established
+                .iter()
+                .chain(&one_hot_staged)
+                .chain(&three_bit_established)
+                .chain(&three_bit_staged)
+                .flat_map(|samples| samples.iter())
+                .all(|timing| timing.swapins == 0 && timing.swapouts == 0),
+            "H63 histogram timing gate observed swap-in or swap-out",
+        );
+        for index in 0..3 {
+            let cold_experts = histograms[index]
+                .1
+                .iter()
+                .map(|range| range.1)
+                .sum::<usize>();
+            assert!(
+                one_hot_savings[index] >= 0,
+                "H63 one-hot round {index} regressed: established_median={}us staged_median={}us paired_delta_median={}us",
+                one_hot_established_medians[index].gpu_us,
+                one_hot_staged_medians[index].gpu_us,
+                one_hot_savings[index],
+            );
+            assert!(
+                three_bit_savings[index] >= 0,
+                "H63 three-bit round {index} regressed: established_median={}us staged_median={}us paired_delta_median={}us",
+                three_bit_established_medians[index].gpu_us,
+                three_bit_staged_medians[index].gpu_us,
+                three_bit_savings[index],
+            );
+            eprintln!(
+                "[spec50-h63-terminal-cold] round={index} K={} layers={} cold_experts={cold_experts} mask=synthetic-one-hot cold_assignments={} established_gpu_us={} staged_gpu_us={} saving_us={} repeated_weights=1",
+                histograms[index].0,
+                histograms[index].1.len(),
+                one_hot_cold_assignments[index],
+                one_hot_established_medians[index].gpu_us,
+                one_hot_staged_medians[index].gpu_us,
+                one_hot_savings[index],
+            );
+            eprintln!(
+                "[spec50-h63-terminal-cold] round={index} K={} layers={} cold_experts={cold_experts} mask=synthetic-three-bit cold_assignments={} established_gpu_us={} staged_gpu_us={} saving_us={} repeated_weights=1",
+                histograms[index].0,
+                histograms[index].1.len(),
+                three_bit_cold_assignments[index],
+                three_bit_established_medians[index].gpu_us,
+                three_bit_staged_medians[index].gpu_us,
+                three_bit_savings[index],
+            );
+        }
+        eprintln!(
+            "[spec50-h63-terminal-cold] one_hot_projected_saving_us={one_hot_projected_saving_us} three_bit_projected_saving_us={three_bit_projected_saving_us} formula=K14_round0+K13_round1+K14_round2 dispatches=89 cold_experts=901 one_hot_cold_assignments=901 three_bit_cold_assignments=2703 production_all_union_top8_assignments=9728 masks=synthetic Mini2_full_run_authoritative=1 SIMD={} max_threads={} static_tmem={} repeated_weights=1",
+            mma.thread_execution_width(),
+            mma.max_total_threads_per_threadgroup(),
+            mma.static_threadgroup_memory_length(),
+        );
+        for sample in 0..9 {
+            eprintln!(
+                "[spec50-h63-terminal-cold] sample={sample} mask=synthetic-one-hot r0_established_gpu_us={} r0_staged_gpu_us={} r1_established_gpu_us={} r1_staged_gpu_us={} r2_established_gpu_us={} r2_staged_gpu_us={} swapins={} swapouts={}",
+                one_hot_established[0][sample].gpu_us,
+                one_hot_staged[0][sample].gpu_us,
+                one_hot_established[1][sample].gpu_us,
+                one_hot_staged[1][sample].gpu_us,
+                one_hot_established[2][sample].gpu_us,
+                one_hot_staged[2][sample].gpu_us,
+                one_hot_established[0][sample]
+                    .swapins
+                    .saturating_add(one_hot_staged[0][sample].swapins)
+                    .saturating_add(one_hot_established[1][sample].swapins)
+                    .saturating_add(one_hot_staged[1][sample].swapins)
+                    .saturating_add(one_hot_established[2][sample].swapins)
+                    .saturating_add(one_hot_staged[2][sample].swapins),
+                one_hot_established[0][sample]
+                    .swapouts
+                    .saturating_add(one_hot_staged[0][sample].swapouts)
+                    .saturating_add(one_hot_established[1][sample].swapouts)
+                    .saturating_add(one_hot_staged[1][sample].swapouts)
+                    .saturating_add(one_hot_established[2][sample].swapouts)
+                    .saturating_add(one_hot_staged[2][sample].swapouts),
+            );
+            eprintln!(
+                "[spec50-h63-terminal-cold] sample={sample} mask=synthetic-three-bit r0_established_gpu_us={} r0_staged_gpu_us={} r1_established_gpu_us={} r1_staged_gpu_us={} r2_established_gpu_us={} r2_staged_gpu_us={} swapins={} swapouts={}",
+                three_bit_established[0][sample].gpu_us,
+                three_bit_staged[0][sample].gpu_us,
+                three_bit_established[1][sample].gpu_us,
+                three_bit_staged[1][sample].gpu_us,
+                three_bit_established[2][sample].gpu_us,
+                three_bit_staged[2][sample].gpu_us,
+                three_bit_established[0][sample]
+                    .swapins
+                    .saturating_add(three_bit_staged[0][sample].swapins)
+                    .saturating_add(three_bit_established[1][sample].swapins)
+                    .saturating_add(three_bit_staged[1][sample].swapins)
+                    .saturating_add(three_bit_established[2][sample].swapins)
+                    .saturating_add(three_bit_staged[2][sample].swapins),
+                three_bit_established[0][sample]
+                    .swapouts
+                    .saturating_add(three_bit_staged[0][sample].swapouts)
+                    .saturating_add(three_bit_established[1][sample].swapouts)
+                    .saturating_add(three_bit_staged[1][sample].swapouts)
+                    .saturating_add(three_bit_established[2][sample].swapouts)
+                    .saturating_add(three_bit_staged[2][sample].swapouts),
+            );
+        }
+        assert!(
+            three_bit_projected_saving_us >= 6_000,
+            "H63 continuation requires >=6000us/request on the synthetic three-bit mask; measured {three_bit_projected_saving_us}us",
+        );
     }
 
     /// Warm, real-Metal comparison shaped like one complete 30-layer target
@@ -6343,7 +7248,7 @@ mod tests {
         );
         eprintln!(
             "[spec50-argbuf] immediate arg-cold resource_declaration={}: wall_us={} gpu_us={} \
-             kernel_us={} pageins={} faults={} decompressions={} swapins={}",
+             kernel_us={} pageins={} faults={} decompressions={} swapins={} swapouts={}",
             resource_declaration.label(),
             arg_cold.wall_us,
             arg_cold.gpu_us,
@@ -6352,6 +7257,7 @@ mod tests {
             arg_cold.faults,
             arg_cold.decompressions,
             arg_cold.swapins,
+            arg_cold.swapouts,
         );
 
         let copied_slab = new_buffer(&device, ACTIVE_EXPERTS * S50_SLOT_STRIDE);
@@ -6518,7 +7424,7 @@ mod tests {
         ] {
             eprintln!(
                 "[spec50-argbuf] {label}: wall_us={} gpu_us={} kernel_us={} \
-                 pageins={} faults={} decompressions={} swapins={}",
+                 pageins={} faults={} decompressions={} swapins={} swapouts={}",
                 timing.wall_us,
                 timing.gpu_us,
                 timing.kernel_us,
@@ -6526,6 +7432,7 @@ mod tests {
                 timing.faults,
                 timing.decompressions,
                 timing.swapins,
+                timing.swapouts,
             );
         }
         for (variant, samples) in [

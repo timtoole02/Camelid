@@ -886,6 +886,33 @@ pub(crate) fn gemma4_hybrid_async_two_wave_collapse_enabled() -> bool {
     })
 }
 
+const GEMMA4_TERMINAL_COLD_MMA_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_TERMINAL_COLD_MMA";
+
+/// H63 is deliberately strict and default-off. It is not a global kernel
+/// selector: admission below further requires the H55 terminal-cold schedule.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_terminal_cold_mma_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_terminal_cold_mma_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gemma4_terminal_cold_mma_from(std::env::var(GEMMA4_TERMINAL_COLD_MMA_ENV).ok().as_deref())
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_terminal_cold_mma_conflicts(requested: bool, global_mma: bool) -> bool {
+    requested && global_mma
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_terminal_cold_mma_admitted(requested: bool, h55_round: bool, global_mma: bool) -> bool {
+    requested && h55_round && !global_mma
+}
+
 /// The argument-buffer GateUp and Down kernels carry exact accumulator layouts
 /// through the widened speculative ceiling. Keep this separate from the env
 /// switch so width admission is directly testable and cannot silently drift
@@ -28904,11 +28931,36 @@ impl Gemma4GhostCommonMetal {
         work_base: usize,
         work_count: usize,
     ) -> bool {
+        self.encode_moe_record_gateup_range_with_policy(
+            encoder,
+            slot_binding,
+            active_slots,
+            layer_idx,
+            k_tokens,
+            work_base,
+            work_count,
+            spec50_moe_argbuf::Gemma4MoeGateupRangePolicy::ExistingEnv,
+        )
+        .is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_moe_record_gateup_range_with_policy(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        slot_binding: &Gemma4Q4ExpertSlotBinding,
+        active_slots: &[usize],
+        layer_idx: usize,
+        k_tokens: usize,
+        work_base: usize,
+        work_count: usize,
+        policy: spec50_moe_argbuf::Gemma4MoeGateupRangePolicy,
+    ) -> Option<spec50_moe_argbuf::Gemma4MoeGateupRangeDispatch> {
         let Some(table) = slot_binding.record_table() else {
             eprintln!(
                 "[metal chained single-down] layer {layer_idx} compact record table unavailable"
             );
-            return false;
+            return None;
         };
         if !gemma4_hybrid_hot_cold_single_down_admits_k(k_tokens)
             || work_count == 0
@@ -28926,15 +28978,15 @@ impl Gemma4GhostCommonMetal {
                 "[metal chained single-down] layer {layer_idx} invalid GateUp range base={work_base} count={work_count} slots={} K={k_tokens}",
                 table.slot_count(),
             );
-            return false;
+            return None;
         }
         if table.declare_active_slots(encoder, active_slots) != Some(active_slots.len()) {
             eprintln!(
                 "[metal chained single-down] layer {layer_idx} GateUp range resource declaration failed"
             );
-            return false;
+            return None;
         }
-        if !table.encode_chained_gateup_k8_range(
+        let dispatch = table.encode_chained_gateup_k8_range_with_policy(
             encoder,
             &self.resident_scratch.expert_input_scales_batch,
             &self.resident_scratch.expert_input_quants_batch,
@@ -28944,19 +28996,21 @@ impl Gemma4GhostCommonMetal {
             work_base,
             work_count,
             k_tokens,
-        ) {
+            policy,
+        );
+        let Some(dispatch) = dispatch else {
             eprintln!(
                 "[metal chained single-down] layer {layer_idx} ranged GateUp pipeline unavailable"
             );
-            return false;
-        }
+            return None;
+        };
         encoder.memory_barrier_with_resources(&[
             &self.resident_scratch.gpu_moe_scales,
             &self.resident_scratch.gpu_moe_quants,
             &self.resident_scratch.gpu_work_list,
             &self.resident_scratch.gpu_candidate_routes[layer_idx],
         ]);
-        true
+        Some(dispatch)
     }
 
     fn encode_moe_topk_gateup_down(
@@ -29671,6 +29725,19 @@ impl Gemma4GhostCommonMetal {
             * GEMMA4_OVERFLOW_BANK_SLOTS
             * GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u64;
 
+        let terminal_cold_mma_requested = gemma4_terminal_cold_mma_enabled();
+        // Preserve H58's established lazy env capture when H63 is off. H63
+        // only needs to inspect the global selector to reject the combination.
+        let global_mma_requested =
+            terminal_cold_mma_requested && spec50_moe_argbuf::argbuf_gateup_mma_k16_enabled();
+        if gemma4_terminal_cold_mma_conflicts(terminal_cold_mma_requested, global_mma_requested) {
+            eprintln!(
+                "[metal chained round] rejected: {GEMMA4_TERMINAL_COLD_MMA_ENV}=1 cannot be combined with CAMELID_GEMMA4_MOE_MMA_K16=1"
+            );
+            self.last_chained_ledger = ledger;
+            return false;
+        }
+
         if let Some(dir) = std::env::var_os("CAMELID_GEMMA4_DUMP_DIR") {
             let _ = std::fs::write(std::path::PathBuf::from(dir).join("metal_hidden.txt"), b"");
         }
@@ -29949,6 +30016,11 @@ impl Gemma4GhostCommonMetal {
         let hot_cold_three_wave_round = hot_cold_three_wave_candidate && !retained_cold_bank_round;
         let hot_cold_async_two_wave_round =
             hot_cold_three_wave_round && gemma4_hybrid_async_two_wave_collapse_enabled();
+        let terminal_cold_mma_round = gemma4_terminal_cold_mma_admitted(
+            terminal_cold_mma_requested,
+            hot_cold_async_two_wave_round,
+            global_mma_requested,
+        );
         let retained_cold_direct_bank_round = retained_cold_bank_round
             && retained_cold_direct_bank_fill
             && retained_cold_direct_filler.is_some()
@@ -31588,7 +31660,7 @@ impl Gemma4GhostCommonMetal {
                                         .map_or((0, hot_count), |plan| plan.hot_gateup);
                                     let hot_end = hot_gateup.0.checked_add(hot_gateup.1)?;
                                     let hot_slots = (hot_gateup.0..hot_end).collect::<Vec<_>>();
-                                    let hot_ok = self.encode_moe_topk_only(
+                                    let topk_ok = self.encode_moe_topk_only(
                                         kernel,
                                         hot_enc,
                                         &down_exps_scale,
@@ -31598,19 +31670,27 @@ impl Gemma4GhostCommonMetal {
                                         unique,
                                         k_tokens,
                                         logits_off,
-                                    ) && self.encode_moe_record_gateup_range(
-                                        hot_enc,
-                                        &hot_binding,
-                                        &hot_slots,
-                                        layer_idx,
-                                        k_tokens,
-                                        hot_gateup.0,
-                                        hot_gateup.1,
                                     );
+                                    let hot_dispatch = topk_ok
+                                        .then(|| {
+                                            self.encode_moe_record_gateup_range_with_policy(
+                                                hot_enc,
+                                                &hot_binding,
+                                                &hot_slots,
+                                                layer_idx,
+                                                k_tokens,
+                                                hot_gateup.0,
+                                                hot_gateup.1,
+                                                if terminal_cold_mma_round {
+                                                    spec50_moe_argbuf::Gemma4MoeGateupRangePolicy::ForceEstablished
+                                                } else {
+                                                    spec50_moe_argbuf::Gemma4MoeGateupRangePolicy::ExistingEnv
+                                                },
+                                            )
+                                        })
+                                        .flatten();
                                     hot_enc.end_encoding();
-                                    if !hot_ok {
-                                        return None;
-                                    }
+                                    let hot_dispatch = hot_dispatch?;
 
                                     let ready_cb =
                                         if hot_cold_async_two_wave_round || ready_wave.is_empty() {
@@ -31701,6 +31781,7 @@ impl Gemma4GhostCommonMetal {
                                         hot_binding,
                                         ready_binding,
                                         full_binding,
+                                        hot_dispatch,
                                     ))
                                 },
                             );
@@ -31714,6 +31795,7 @@ impl Gemma4GhostCommonMetal {
                                 hot_binding,
                                 ready_binding,
                                 full_binding,
+                                hot_dispatch,
                             )) = encoded
                             {
                                 let mut ready_binding = ready_binding;
@@ -31798,6 +31880,7 @@ impl Gemma4GhostCommonMetal {
                                 // If terminal encoding fails, still join/reap the owned I/O,
                                 // retire the hot command, and fall through to exact fallback.
                                 let mut terminal_encode_ms = 0.0f64;
+                                let mut terminal_dispatch = None;
                                 let async_terminal_encoded = if hot_cold_async_two_wave_round
                                     && ready_exact
                                 {
@@ -31817,7 +31900,17 @@ impl Gemma4GhostCommonMetal {
                                         let terminal_slots = (plan.terminal_gateup.0..terminal_end)
                                             .collect::<Vec<_>>();
                                         let all_slots = (0..unique).collect::<Vec<_>>();
-                                        let ok = self.encode_moe_record_gateup_range(
+                                        let terminal_policy = if terminal_cold_mma_round
+                                            && matches!(k_tokens, 13 | 14)
+                                        {
+                                            spec50_moe_argbuf::Gemma4MoeGateupRangePolicy::PreferMmaK16
+                                        } else if terminal_cold_mma_round {
+                                            spec50_moe_argbuf::Gemma4MoeGateupRangePolicy::ForceEstablished
+                                        } else {
+                                            spec50_moe_argbuf::Gemma4MoeGateupRangePolicy::ExistingEnv
+                                        };
+                                        let gateup_dispatch =
+                                            self.encode_moe_record_gateup_range_with_policy(
                                             enc,
                                             &full_binding,
                                             &terminal_slots,
@@ -31825,20 +31918,30 @@ impl Gemma4GhostCommonMetal {
                                             k_tokens,
                                             plan.terminal_gateup.0,
                                             plan.terminal_gateup.1,
-                                        ) && self.encode_moe_down(
-                                            kernel,
-                                            enc,
-                                            &full_binding,
-                                            Some(&all_slots),
-                                            layer_idx,
-                                            k_tokens,
-                                            &self.resident_scratch.gpu_moe_acc,
-                                            0,
-                                            None,
-                                        ) && self
-                                            .encode_layer_tail(kernel, enc, layer_idx, k_tokens);
+                                            terminal_policy,
+                                        );
+                                        let ok = gateup_dispatch.is_some()
+                                            && self.encode_moe_down(
+                                                kernel,
+                                                enc,
+                                                &full_binding,
+                                                Some(&all_slots),
+                                                layer_idx,
+                                                k_tokens,
+                                                &self.resident_scratch.gpu_moe_acc,
+                                                0,
+                                                None,
+                                            )
+                                            && self.encode_layer_tail(
+                                                kernel, enc, layer_idx, k_tokens,
+                                            );
                                         enc.end_encoding();
-                                        ok.then_some(cb)
+                                        if ok {
+                                            terminal_dispatch = gateup_dispatch;
+                                            Some(cb)
+                                        } else {
+                                            None
+                                        }
                                     });
                                     terminal_encode_ms =
                                         terminal_encode_started.elapsed().as_secs_f64() * 1000.0;
@@ -31943,6 +32046,22 @@ impl Gemma4GhostCommonMetal {
                                                 demand_wave.len(),
                                                 unique,
                                             );
+                                            if terminal_cold_mma_round {
+                                                if let Some(terminal_dispatch) = terminal_dispatch {
+                                                    let terminal_experts = ready_wave
+                                                        .len()
+                                                        .saturating_add(demand_wave.len());
+                                                    let terminal_mma_experts = usize::from(
+                                                        terminal_dispatch
+                                                            == spec50_moe_argbuf::Gemma4MoeGateupRangeDispatch::MmaK16,
+                                                    ) * terminal_experts;
+                                                    eprintln!(
+                                                        "[metal chained terminal-cold-mma] layer={layer_idx} hot_gateup={} terminal_gateup={} terminal_experts={terminal_experts} terminal_mma_experts={terminal_mma_experts} committed=1",
+                                                        hot_dispatch.label(),
+                                                        terminal_dispatch.label(),
+                                                    );
+                                                }
+                                            }
                                         } else {
                                             eprintln!(
                                                 "[metal chained three-wave] layer={layer_idx} hot={} ready={} demand={} active={} route_passes=1 down_passes=1 merge_passes=0 plan={plan_ms:.2}ms launch={launch_ms:.2}ms demand_join={demand_ms:.2}ms",
@@ -47042,6 +47161,33 @@ mod tests {
                 !super::gemma4_hybrid_async_two_wave_collapse_from(Some(value)),
                 "unexpected H55 admission for {value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn terminal_cold_mma_is_strict_h55_only_and_rejects_global_h58() {
+        assert!(!super::gemma4_terminal_cold_mma_from(None));
+        assert!(super::gemma4_terminal_cold_mma_from(Some("1")));
+        for value in ["", "0", "true", " 1", "yes", "2"] {
+            assert!(
+                !super::gemma4_terminal_cold_mma_from(Some(value)),
+                "unexpected H63 admission for {value:?}",
+            );
+        }
+
+        for requested in [false, true] {
+            for h55_round in [false, true] {
+                for global_h58 in [false, true] {
+                    assert_eq!(
+                        super::gemma4_terminal_cold_mma_conflicts(requested, global_h58),
+                        requested && global_h58,
+                    );
+                    assert_eq!(
+                        super::gemma4_terminal_cold_mma_admitted(requested, h55_round, global_h58,),
+                        requested && h55_round && !global_h58,
+                    );
+                }
+            }
         }
     }
 

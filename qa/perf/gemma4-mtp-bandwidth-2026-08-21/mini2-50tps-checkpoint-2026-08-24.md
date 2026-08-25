@@ -410,6 +410,28 @@ us/request saving. That is below the required 5,000 us continuation gate, so
 H62 is a **NO-GO** and no Mini2 run was performed. The default-off source and
 `H62-mtp-bf16-lattice-loads` profile remain in the branch for reproducibility.
 
+## Exact terminal-cold MMA closure (H63)
+
+H63 tested whether H58's staged-MMA GateUp compute win could be confined to
+H55's terminal cold work without changing the two-command-buffer overlap. The
+experiment is strict default-off behind
+`CAMELID_GEMMA4_GHOST_METAL_TERMINAL_COLD_MMA=1`, is admitted only under H55,
+and refuses the global H58 switch. Hot GateUp and the K7 terminal tail remain
+on the established kernel; only terminal K13/K14 prefers MMA, with an
+established-kernel fallback in the same command buffer when the MMA pipeline
+is unavailable. It adds no command buffer, submission, or barrier.
+
+The four focused selector, refusal, resource-disjointness, and K13/K14 raw-bit
+parity gates passed. The ignored timing gate then exercised the exact
+89-dispatch / 901-cold-expert production histogram with interleaved paired
+samples and zero swap-in/out checks. Its first one-hot round failed the
+fail-fast non-regression gate: the established median was 10,649 us, the MMA
+median was 16,010 us, and the paired median delta was -5,551 us. The sparse
+terminal shape therefore reverses the dense H58 microbenchmark win.
+
+H63 is a **NO-GO** and no Mini2 run or profile was produced. The default-off
+source and exact timing gate remain in the branch as the closure evidence.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -481,6 +503,10 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
   ignored exact 44-draft timing median 55,186 us control versus 52,099 us
   candidate, saving 3,087 us/request against the required 5,000 us gate over
   218,767,360 eliminated rounds and 528 attention dispatches; no Mini2 run;
+- H63 focused selector/refusal/resource-disjoint/raw-bit gates: 4/4; ignored
+  exact production-histogram timing failed the first one-hot round with
+  10,649 us established versus 16,010 us terminal-cold MMA and a -5,551 us
+  paired median delta; fail-fast no-go with no Mini2 run or profile;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 
