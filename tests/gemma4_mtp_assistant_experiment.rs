@@ -26,6 +26,8 @@
 //! CAMELID_GEMMA4_MTP_ASSISTANT_PATH=/exact/path/to/model.safetensors
 //! ```
 
+mod support;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -71,10 +73,8 @@ const HYBRID_HOT_PROFILE_V5_SLOTS: [u16; 30] = [
 ];
 const HYBRID_HOT_PROFILE_V5_ENCODED: &str =
     "39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37";
-const DEFAULT_TARGET_RUNTIME_PATH: &str =
-    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf";
-const DEFAULT_TARGET_CGHOST_PATH: &str =
-    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost";
+const DEFAULT_TARGET_RUNTIME_PATH: &str = "gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf";
+const DEFAULT_TARGET_CGHOST_PATH: &str = "gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost";
 const DEFAULT_TARGET_SOURCE_PATH: &str = "/Volumes/Untitled/models/gemma-4-26B_q4_0-it.gguf";
 const DEFAULT_TARGET_CACHE_MIB: usize = 0;
 const DEFAULT_SEEDED_NGRAM_TEXT: &str = "<|channel>thought\n<channel|>";
@@ -90,7 +90,7 @@ const NATIVE_RECURRENCE_TEST_NAME: &str =
 const NATIVE_RECURRENCE_ORACLE_SHA256: &str =
     "08cf02bedfec09074eeebaa24b1ffaaa5362badd412b523de6a0d52952e94109";
 const NATIVE_RECURRENCE_GENERATION_RECEIPT_SHA256: &str =
-    "573864f252b29b63932a440d9224733e086ae4de42b10caf457da975c623053d";
+    "ec2493eefd1e5b6a0620ece7ad062bbcb333f0fdcf73865773c376280a3ca597";
 const NATIVE_STAGE_ORACLE_SHA256: &str =
     "f18ed0a4ae9538ed5b41e74c39f9242e9b7a842a7c2d3cc5d7abf9765c4b983e";
 // These run-log identities are enforced by the admitted native test. Requiring
@@ -623,7 +623,7 @@ fn target_runtime_config_from_environment() -> Result<TargetRuntimeConfig, Strin
     let path = |name: &str, default: &str| -> Result<PathBuf, String> {
         let path = std::env::var_os(name)
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(default));
+            .unwrap_or_else(|| PathBuf::from(support::model_root()).join(default));
         if !path.is_absolute() {
             return Err(format!("{name} must be an absolute path"));
         }
@@ -1333,9 +1333,9 @@ impl NativeAdmissionReceipt {
             || self.receipt_modified_unix_ms == 0
             || self.parent_validated_unix_ms == 0
             || !self.admission_test_executable_path.is_absolute()
-            || !self
-                .admission_test_executable_path
-                .starts_with("/Users/timtoole/")
+            || !support::is_canonical_path_within_operator_home(
+                &self.admission_test_executable_path,
+            )
             || !is_sha256_hex(&self.admission_test_executable_sha256)
         {
             return Err("native admission receipt identity is incomplete".into());
@@ -5006,7 +5006,7 @@ fn load_native_admission_receipt(
         return Err(format!("{NATIVE_ADMISSION_EVIDENCE_ENV} must be absolute"));
     }
     let canonical = canonical_internal_timed_file(&path, "native admission receipt")?;
-    if !canonical.starts_with("/Users/timtoole/") {
+    if !support::is_canonical_path_within_operator_home(&canonical) {
         return Err(format!(
             "native admission receipt escaped its producer's internal path policy: {}",
             canonical.display()
@@ -5069,7 +5069,7 @@ fn load_native_admission_receipt(
         &admission_test_executable_path,
         "native admission test executable",
     )?;
-    if !admission_test_executable_path.starts_with("/Users/timtoole/") {
+    if !support::is_canonical_path_within_operator_home(&admission_test_executable_path) {
         return Err(format!(
             "native admission test executable escaped its internal path policy: {}",
             admission_test_executable_path.display()

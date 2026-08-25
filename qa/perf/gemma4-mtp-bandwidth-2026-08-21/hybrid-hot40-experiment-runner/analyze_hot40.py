@@ -41,7 +41,16 @@ MAX_HOST_WIRED_BYTES = 8 * 1024**3
 
 REQUEST_SHA256 = "b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939"
 EXPECTED_IDS_SHA256 = "45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975"
-PAGER_BASELINE_RECEIPT = "/Users/timtoole/Documents/Camelid-hot48-receipts/run-hot40-49757102-v4"
+_operator_home = os.environ.get("CAMELID_OPERATOR_HOME") or os.environ.get("HOME")
+if not _operator_home:
+    raise RuntimeError("set CAMELID_OPERATOR_HOME or HOME")
+_receipt_root = os.environ.get("CAMELID_RECEIPT_ROOT") or str(
+    Path(_operator_home) / "Documents" / "Camelid-hot48-receipts"
+)
+PAGER_BASELINE_RECEIPT = os.environ.get(
+    "CAMELID_HOT40_PAGER_BASELINE_RECEIPT",
+    str(Path(_receipt_root) / "run-hot40-49757102-v4"),
+)
 PAGER_BASELINE_INTENT_SHA256 = "3697a2e3c25c051de1d46d8ac3f008b87a55bfc89b4eaff2bbacd472f4f7689e"
 PAGER_BASELINE_WATCHDOG_SHA256 = "6165548cdfecb5f5e5ae9caf3dea33ad97040f5544be0c1f69ba9fa92b5c2965"
 PAGER_BASELINE_RESPONSE_SHA256 = "0eb42179050e4354dad2b597d10c742b6088c56e86078a5ae60646b6c1b43cbe"

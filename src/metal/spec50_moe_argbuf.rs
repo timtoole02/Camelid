@@ -7830,9 +7830,7 @@ mod tests {
         }
         let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
-            });
+            .unwrap_or_else(|| crate::test_support::model_path("gemma-4-26B_q4_0-it.cghost"));
         if !cghost_path.is_file() {
             eprintln!(
                 "SKIP argbuf mincore gate: {} not found",
@@ -7880,9 +7878,7 @@ mod tests {
         }
         let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
-            });
+            .unwrap_or_else(|| crate::test_support::model_path("gemma-4-26B_q4_0-it.cghost"));
         if !cghost_path.is_file() {
             eprintln!("SKIP argbuf MoE gate: {} not found", cghost_path.display());
             return;

@@ -2,12 +2,12 @@ schema_version=1
 source_commit=9ae8dc11ca11270f9069db76814009aca158f080
 binary=/Volumes/Untitled/cargo-targets/global/release/camelid
 974bbdb3237e12857c4423bef3908e91280b6c1238c42799612294834b0ce3f0  /Volumes/Untitled/cargo-targets/global/release/camelid
-66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d  /Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf
-b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757  /Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost
-c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801  /Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
-b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939  /Users/timtoole/Documents/Camelid/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/request-48.json
-45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975  /Users/timtoole/Documents/Camelid/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/expected-48-token-ids.json
-1673e0dde6029de23f654db9b2cc8d15455184653b828f13299aa2280f4e8857  /Users/timtoole/Documents/Camelid/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/gate_50tps.py
+66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d  $CAMELID_MODEL_ROOT/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf
+b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757  $CAMELID_MODEL_ROOT/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost
+c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801  $CAMELID_MODEL_ROOT/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
+b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939  $CAMELID_REPO_ROOT/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/request-48.json
+45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975  $CAMELID_REPO_ROOT/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/expected-48-token-ids.json
+1673e0dde6029de23f654db9b2cc8d15455184653b828f13299aa2280f4e8857  $CAMELID_REPO_ROOT/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/gate_50tps.py
 ba97e1472b4212effdc6bdca48ffd0784724bbedc01c772b64e700152508f9cb  ./run_50tps_gate.zsh
 kern.boottime: { sec = 1787450897, usec = 962984 } Sat Aug 22 19:08:17 2026
 vm.swapusage: total = 2048.00M  used = 586.50M  free = 1461.50M  (encrypted)

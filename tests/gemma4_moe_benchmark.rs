@@ -2,6 +2,8 @@
 //! Experiment A: Command-buffer chaining (1, 2, 5, 10 layers/sync)
 //! Experiment B: Metal-slot capacity (16, 24, 32 slots/layer)
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
@@ -61,8 +63,8 @@ fn get_system_memory_metrics() -> (f64, f64, f64, f64) {
 
 #[test]
 fn test_experiment_b_metal_slot_capacity() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -146,8 +148,8 @@ fn test_experiment_b_metal_slot_capacity() {
 
 #[test]
 fn test_experiment_a_command_buffer_chaining() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -235,8 +237,8 @@ fn test_experiment_a_command_buffer_chaining() {
 
 #[test]
 fn test_cache_maintenance_granularity_and_metal_attention() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

@@ -5,6 +5,8 @@
 //!
 //! Requires the local 26B GGUF + cghost pair.
 
+mod support;
+
 use std::path::PathBuf;
 
 use camelid::api::{gemma4_chat_prompt_for_tests, ChatMessage};
@@ -55,8 +57,8 @@ fn metal_top_is_near_cpu(logits: &[f32], metal_top: u32, cpu_top: u32, max_gap: 
 }
 
 fn model_paths() -> Option<(PathBuf, PathBuf)> {
-    let model = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
     if model.is_file() && cghost.is_file() {
         Some((model, cghost))
     } else {

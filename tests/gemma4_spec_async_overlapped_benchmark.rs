@@ -2,13 +2,15 @@
 //!
 //! Overlaps Round N+1 prefetch concurrently with Round N GPU verifier execution.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
 #[test]
 fn test_genuine_gemma4_async_overlapped_spec_generation_k8() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

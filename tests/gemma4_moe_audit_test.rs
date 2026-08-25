@@ -1,12 +1,14 @@
 //! Target Audit: Prove whether step_chunk performs genuine multi-vector MoE execution or sequential execution at K=5
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
 #[test]
 fn test_real_gemma4_moe_layer_audit_k5() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

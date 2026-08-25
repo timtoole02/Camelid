@@ -1,3 +1,5 @@
+mod support;
+
 use camelid::gguf::read_metadata;
 use camelid::ghost::{write_cghost_moe, GhostFile};
 use camelid::model::{Gemma4Binding, LlamaModelConfig};
@@ -6,8 +8,8 @@ use std::path::PathBuf;
 
 #[test]
 fn test_force_repack_cghost_with_sha256_provenance() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() {
         eprintln!("Model not found: {:?}", model_path);

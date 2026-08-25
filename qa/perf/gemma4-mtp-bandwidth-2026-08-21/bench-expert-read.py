@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Replicate the engine's expert-record read pattern: random 3,345,408 B preads."""
 import os, sys, time, random, threading, fcntl
-PATH="/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost"
+operator_home = os.environ.get("CAMELID_OPERATOR_HOME") or os.environ.get("HOME")
+if not operator_home:
+    raise RuntimeError("set CAMELID_OPERATOR_HOME or HOME")
+model_root = os.environ.get("CAMELID_MODEL_ROOT") or os.path.join(operator_home, "models")
+PATH = os.environ.get("CAMELID_GEMMA4_CGHOST") or os.path.join(
+    model_root, "gemma4-mtp-pair", "gemma-4-26B_q4_0-it.v3.cghost"
+)
 REC=3_345_408
 F_NOCACHE=48
 size=os.path.getsize(PATH)

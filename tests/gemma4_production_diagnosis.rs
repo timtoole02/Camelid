@@ -1,5 +1,7 @@
 //! Systematic Production-Path Diagnosis for Gemma 4 (Phases 1-6)
 
+mod support;
+
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -35,8 +37,8 @@ fn test_phase1_to_phase6_production_diagnosis() {
     println!("PHASE 1: PROVE WHAT MODEL THE GUI / SERVER IS RUNNING");
     println!("================================================================================");
 
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     assert!(
         model_path.exists(),

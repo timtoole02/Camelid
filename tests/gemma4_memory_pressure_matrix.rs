@@ -1,6 +1,8 @@
 //! Genuine Gemma 4 26B-A4B Memory Pressure & Cache Budget Matrix Benchmark
 //! Comparing 32, 48, 64, 80, and 96 slots/layer holding model, prompt, and K=5 verifier constant.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, process::Command, time::Instant};
 
@@ -131,8 +133,8 @@ struct BudgetResult {
 
 #[test]
 fn test_genuine_gemma4_memory_pressure_matrix() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

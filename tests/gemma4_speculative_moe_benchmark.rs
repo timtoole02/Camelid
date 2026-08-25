@@ -6,6 +6,8 @@
 //! - Decisive metric: unique expert weight bytes / accepted output token
 //! - Real verification latency and effective generation speed (tok/s)
 
+mod support;
+
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use camelid::{
@@ -15,8 +17,8 @@ use camelid::{
 
 #[test]
 fn benchmark_speculative_moe_batch_k() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

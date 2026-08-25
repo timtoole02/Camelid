@@ -28,7 +28,7 @@ The deployed Mini2 executable and the local release artifact both have SHA-256:
 `5376959c68cc2f49974510ce585a268b4c65454cb24d1759211aa6da2df0374c`
 
 The prior Mini2 executable is preserved as
-`/Users/timtoole/bin/camelid-bench-pre-h36-direct-c2caa383d5fd`.
+`$CAMELID_OPERATOR_BIN/camelid-bench-pre-h36-direct-c2caa383d5fd`.
 
 ## What moved the result
 
@@ -453,7 +453,7 @@ payload identity. The existing H55 parser and two-command plan gates passed.
 actually succeeds; raw environment eligibility cannot claim activation.
 
 The guarded release executable is
-`/Users/timtoole/bin/camelid-h64-b60fe01705e6`, SHA-256
+`$CAMELID_OPERATOR_BIN/camelid-h64-b60fe01705e6`, SHA-256
 `b60fe01705e6745c7d4d46ddbeea110befa5cfde01730e0934ff8dcb406721f6`.
 After Mini2 was restarted, the clean-host sequence discarded one H55 warmup
 and one H64 warmup, then measured H55/H64/H64/H55 with the same immutable
@@ -559,24 +559,24 @@ Profiles and executable for this checkpoint:
 - `H64-async-two-wave-chunked-read`
 - `H65-wide-down-mma-terms` (source/timing closure only; no profile)
 - `H66-mtp-q4-head-row-pack` (source/timing closure only; no profile)
-- Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
+- Mini2 executable: `$CAMELID_OPERATOR_BIN/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
-- H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
+- H54 Mini2 executable: `$CAMELID_OPERATOR_BIN/camelid-h54-f7f96177a700`
 - H54 SHA-256: `f7f96177a700332aa1486ed0100cc475bffa72d3881ee1d06872972c3e28194f`
 - H55/H56 strict-memory executable:
-  `/Users/timtoole/bin/camelid-h56-0c269ac41c12`
+  `$CAMELID_OPERATOR_BIN/camelid-h56-0c269ac41c12`
 - H55/H56 SHA-256:
   `0c269ac41c126388581675fef21c1f6e7f9417ae4485608bf5b358fe59e03ba3`
-- H57 Mini2 executable: `/Users/timtoole/bin/camelid-h57-5cfecb36b41f`
+- H57 Mini2 executable: `$CAMELID_OPERATOR_BIN/camelid-h57-5cfecb36b41f`
 - H57 SHA-256:
   `5cfecb36b41fd380f8a411a82e92527a00dfca2173376924701d8de844eb7fd7`
-- H58 Mini2 executable: `/Users/timtoole/bin/camelid-h58-67412568314c`
+- H58 Mini2 executable: `$CAMELID_OPERATOR_BIN/camelid-h58-67412568314c`
 - H58 SHA-256:
   `67412568314ca1e9c9e2ef2076f490c6fbd51b4dd0d46c98841886fd507fbff7`
-- H59 measured Mini2 executable: `/Users/timtoole/bin/camelid-h59-7184d5bfa123`
+- H59 measured Mini2 executable: `$CAMELID_OPERATOR_BIN/camelid-h59-7184d5bfa123`
 - H59 measured binary SHA-256:
   `7184d5bfa12301a02f82eaba4321ce8e4966b5292edf411611936c903d1c02be`
-- H64 measured Mini2 executable: `/Users/timtoole/bin/camelid-h64-b60fe01705e6`
+- H64 measured Mini2 executable: `$CAMELID_OPERATOR_BIN/camelid-h64-b60fe01705e6`
 - H64 SHA-256:
   `b60fe01705e6745c7d4d46ddbeea110befa5cfde01730e0934ff8dcb406721f6`
 

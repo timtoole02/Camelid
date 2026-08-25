@@ -33,7 +33,23 @@ use crate::{wire_mmap::GgufWireMmap, BackendError, Result};
 /// Exact staged artifact used by the isolated experiment. Loading is still
 /// explicit; no production path opens this file automatically.
 pub const OFFICIAL_STAGED_ASSISTANT_PATH: &str =
-    "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors";
+    "gemma4-26b-a4b-mtp-qat-assistant/model.safetensors";
+
+fn official_staged_assistant_path() -> PathBuf {
+    let model_root = std::env::var_os("CAMELID_MODEL_ROOT")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("models")
+        });
+    model_root.join(OFFICIAL_STAGED_ASSISTANT_PATH)
+}
 
 const EXPECTED_FILE_BYTES: u64 = 839_427_840;
 const EXPECTED_HEADER_BYTES: usize = 5_360;
@@ -2520,7 +2536,7 @@ impl Gemma4MtpAssistantMetal {
     /// Load the exact staged official artifact. The established BF16 path
     /// retains its hard pin; full-Q4 releases the source after packing.
     pub fn load_staged_official() -> Result<Self> {
-        Self::load(Path::new(OFFICIAL_STAGED_ASSISTANT_PATH))
+        Self::load(&official_staged_assistant_path())
     }
 
     /// Load an exact byte-identical copy of the official artifact. Shape,
@@ -5917,7 +5933,7 @@ mod tests {
     const EXPECTED_STEP4_STAGE_ORACLE_SHA256: &str =
         "c37376fcee30cf3ae682068bf27fb98467d2aaf98d3419075444ed8d3f206c90";
     const EXPECTED_RECURRENCE_GENERATION_RECEIPT_SHA256: &str =
-        "573864f252b29b63932a440d9224733e086ae4de42b10caf457da975c623053d";
+        "ec2493eefd1e5b6a0620ece7ad062bbcb333f0fdcf73865773c376280a3ca597";
     const EXPECTED_RECURRENCE_RUN1_LOG_SHA256: &str =
         "654d0c1fa5221056efb9bc4cc02a7f9c5c1c79044124fd23e1d94b076a05a7a5";
     const EXPECTED_RECURRENCE_RUN2_LOG_SHA256: &str =
@@ -6943,10 +6959,10 @@ mod tests {
         }
 
         fn run(full_q4: bool) -> BenchResult {
-            let path = Path::new(OFFICIAL_STAGED_ASSISTANT_PATH);
+            let path = official_staged_assistant_path();
             assert!(path.is_file(), "missing official assistant at {path:?}");
             let load_started = Instant::now();
-            let mut assistant = Gemma4MtpAssistantMetal::load_with_full_q4(path, full_q4)
+            let mut assistant = Gemma4MtpAssistantMetal::load_with_full_q4(&path, full_q4)
                 .expect("load official assistant");
             let load_wall_us = load_started.elapsed().as_micros();
             assert_eq!(assistant.full_q4_enabled(), full_q4);
@@ -7058,9 +7074,9 @@ mod tests {
                 .collect()
         }
 
-        let path = Path::new(OFFICIAL_STAGED_ASSISTANT_PATH);
+        let path = official_staged_assistant_path();
         assert!(path.is_file(), "missing official assistant at {path:?}");
-        let mut assistant = Gemma4MtpAssistantMetal::load_with_full_q4(path, true)
+        let mut assistant = Gemma4MtpAssistantMetal::load_with_full_q4(&path, true)
             .expect("load official full-Q4 assistant");
 
         let recurrent_bytes = TARGET_HIDDEN * std::mem::size_of::<f32>();
@@ -10183,8 +10199,10 @@ mod tests {
         let canonical_parent = parent
             .canonicalize()
             .expect("native admission evidence parent must already exist");
+        let operator_home = crate::test_support::canonical_operator_home()
+            .expect("HOME or USERPROFILE must name a canonical non-root directory");
         assert!(
-            canonical_parent.starts_with("/Users/timtoole/"),
+            canonical_parent.starts_with(&operator_home),
             "native admission evidence must be emitted to the internal volume, got {}",
             canonical_parent.display()
         );

@@ -8,9 +8,11 @@ readonly script_dir=${0:A:h}
 readonly repo_root=${script_dir:h}
 readonly source_commit=$(/usr/bin/git -C "$repo_root" rev-parse HEAD)
 readonly port=${CAMELID_GEMMA4_WEBUI_PORT:-8181}
-readonly model=${CAMELID_GEMMA4_WEBUI_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
-readonly cghost=${CAMELID_GEMMA4_WEBUI_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
-readonly assistant=${CAMELID_GEMMA4_WEBUI_ASSISTANT:-/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
+readonly operator_home=${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}
+readonly model_root=${CAMELID_MODEL_ROOT:-$operator_home/models}
+readonly model=${CAMELID_GEMMA4_WEBUI_MODEL:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
+readonly cghost=${CAMELID_GEMMA4_WEBUI_CGHOST:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
+readonly assistant=${CAMELID_GEMMA4_WEBUI_ASSISTANT:-$model_root/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
 readonly profile=39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37
 
 typeset binary=${CAMELID_GEMMA4_WEBUI_BINARY:-}
@@ -62,7 +64,7 @@ trap cleanup EXIT INT TERM HUP
 
 print "Starting the exact Gemma 4 MTP WebUI on http://127.0.0.1:$port ..."
 /usr/bin/env -i \
-  HOME="${HOME:?}" \
+  HOME="$operator_home" \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   TMPDIR=/tmp \
   CAMELID_GHOST_ALLOW_LEGACY_SPARSE=0 \

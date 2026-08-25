@@ -4,8 +4,10 @@ set -euo pipefail
 # Benchmark Harness for Gemma 4 26B-A4B on 16GB Apple Silicon
 # Outputs structured JSON metrics matching Phase 22 schema.
 
-MODEL_PATH="${1:-/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf}"
-CGHOST_PATH="${2:-/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost}"
+operator_home="${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}"
+model_root="${CAMELID_MODEL_ROOT:-${operator_home}/models}"
+MODEL_PATH="${1:-${CAMELID_GEMMA4_MODEL:-${model_root}/gemma-4-26B_q4_0-it.gguf}}"
+CGHOST_PATH="${2:-${CAMELID_GEMMA4_CGHOST:-${model_root}/gemma-4-26B_q4_0-it.cghost}}"
 PROMPT="${3:-Write a Rust implementation of a concurrent lock-free queue.}"
 MAX_TOKENS="${4:-64}"
 CACHE_MIB="${5:-8192}"
