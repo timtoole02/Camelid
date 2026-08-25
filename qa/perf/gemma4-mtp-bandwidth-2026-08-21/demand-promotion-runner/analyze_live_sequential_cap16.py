@@ -18,6 +18,7 @@ from typing import Any
 
 PROBE_PREFIX = "[metal live-sequential-predict probe] "
 STAGE_PREFIX = "[gemma4 live-sequential stage] "
+PROMPT_RANKED_HANDOFF_PREFIX = "[gemma4 prompt-ranked hot handoff] "
 EXPECTED_ROUNDS = ((104, 14), (118, 13), (131, 14), (145, 7))
 TARGET_LAYERS = tuple(range(1, 30))
 CAPS = (4, 8, 16)
@@ -121,6 +122,13 @@ STAGE_FIELDS = {
     "shared_demand_pool",
     "consumer_waits",
     "late_model_publish",
+    "routing_authority",
+}
+PROMPT_RANKED_HANDOFF_FIELDS = {
+    "schema", "requested", "admitted", "effective", "fill_ok", "read_failures",
+    "source", "ranking", "layers", "selected_records", "capacity_total",
+    "occupied_total", "selected_masks", "resident_masks", "output_mutation",
+    "io_mutation", "slot_policy_mutation", "table_mutation", "route_mutation",
     "routing_authority",
 }
 
@@ -258,6 +266,79 @@ def _parse_fields(payload: str, label: str) -> dict[str, str]:
             raise ReceiptError(f"{label} has a malformed or duplicate field")
         fields[key] = value
     return fields
+
+
+def _parse_handoff_masks(raw: str, label: str) -> list[int]:
+    records = raw.split("/")
+    if len(records) != 30:
+        raise ReceiptError(f"{label} does not contain exactly 30 layers")
+    masks: list[int] = []
+    for layer, record in enumerate(records):
+        match = re.fullmatch(rf"L{layer}:([0-9a-f]{{32}})", record)
+        if match is None:
+            raise ReceiptError(f"{label} L{layer} is noncanonical")
+        masks.append(int(match.group(1), 16))
+    return masks
+
+
+def validate_prompt_ranked_handoff(log: str, environment: dict[str, str]) -> bool:
+    lines = [
+        line for line in log.splitlines() if line.startswith(PROMPT_RANKED_HANDOFF_PREFIX)
+    ]
+    requested = environment.get(PROMPT_RANKED_HOT_HANDOFF_SELECTOR) == "1"
+    if not requested:
+        if lines:
+            raise ReceiptError("unselected prompt-ranked handoff receipt is present")
+        return False
+    if len(lines) != 1:
+        raise ReceiptError(f"prompt-ranked profile requires exactly one handoff receipt, got {len(lines)}")
+    fields = _parse_fields(
+        lines[0][len(PROMPT_RANKED_HANDOFF_PREFIX):], "prompt-ranked handoff"
+    )
+    _expect_fields(fields, PROMPT_RANKED_HANDOFF_FIELDS, "prompt-ranked handoff")
+    exact = {
+        "schema": "1",
+        "requested": "1",
+        "admitted": "1",
+        "effective": "1",
+        "fill_ok": "1",
+        "read_failures": "0",
+        "source": "current-prompt-exact-route-union",
+        "ranking": "decay-score-desc-expert-id-asc",
+        "layers": "30",
+        "selected_records": "1408",
+        "capacity_total": "1408",
+        "occupied_total": "1408",
+        "output_mutation": "0",
+        "io_mutation": "1",
+        "slot_policy_mutation": "1",
+        "table_mutation": "1",
+        "route_mutation": "0",
+        "routing_authority": "exact-router",
+    }
+    for key, expected in exact.items():
+        if fields[key] != expected:
+            raise ReceiptError(
+                f"prompt-ranked handoff requires {key}={expected}, got {fields[key]!r}"
+            )
+    capacities = [
+        _parse_uint(item, "prompt-ranked H49 capacity")
+        for item in environment[
+            "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER"
+        ].split(",")
+    ]
+    selected = _parse_handoff_masks(fields["selected_masks"], "selected_masks")
+    resident = _parse_handoff_masks(fields["resident_masks"], "resident_masks")
+    if len(capacities) != 30 or sum(capacities) != 1_408:
+        raise ReceiptError("prompt-ranked handoff capacity vector is not exact H49")
+    for layer, (selected_mask, resident_mask, capacity) in enumerate(
+        zip(selected, resident, capacities)
+    ):
+        if selected_mask != resident_mask:
+            raise ReceiptError(f"prompt-ranked L{layer} selected/resident identities differ")
+        if selected_mask.bit_count() != capacity:
+            raise ReceiptError(f"prompt-ranked L{layer} identity count differs from capacity")
+    return True
 
 
 def _parse_uint(raw: str, label: str, *, maximum: int | None = None) -> int:
@@ -1264,6 +1345,7 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     validate_health(run_dir, environment)
     validate_response(run_dir)
     log = _read_text(run_dir / "server.log", "server log")
+    prompt_ranked_handoff_effective = validate_prompt_ranked_handoff(log, environment)
     probes, stages = parse_observations(log)
     stage_caps = {stage["cap"] for stage in stages}
     if len(stage_caps) != 1:
@@ -1402,6 +1484,7 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "observation_only": stage_cap == 8,
             "projected_savings_are_measured": False,
             "throughput_promotion_allowed": False,
+            "prompt_ranked_hot_handoff_effective": prompt_ranked_handoff_effective,
         },
         "safety": safety,
         "rounds": rounds,

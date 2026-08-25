@@ -220,6 +220,45 @@ def stage_line(round_seq: int, start_pos: int, k_tokens: int, stage_cap: int = 8
     return ANALYZER.STAGE_PREFIX + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
+def prompt_ranked_handoff_line() -> str:
+    capacities = [
+        int(value)
+        for value in ANALYZER._parse_profile(ANALYZER.PROFILE_FILE)[
+            "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER"
+        ].split(",")
+    ]
+    masks = "/".join(
+        f"L{layer}:{((1 << capacity) - 1):032x}"
+        for layer, capacity in enumerate(capacities)
+    )
+    fields = {
+        "schema": "1",
+        "requested": "1",
+        "admitted": "1",
+        "effective": "1",
+        "fill_ok": "1",
+        "read_failures": "0",
+        "source": "current-prompt-exact-route-union",
+        "ranking": "decay-score-desc-expert-id-asc",
+        "layers": "30",
+        "selected_records": "1408",
+        "capacity_total": "1408",
+        "occupied_total": "1408",
+        "selected_masks": masks,
+        "resident_masks": masks,
+        "output_mutation": "0",
+        "io_mutation": "1",
+        "slot_policy_mutation": "1",
+        "table_mutation": "1",
+        "route_mutation": "0",
+        "routing_authority": "exact-router",
+    }
+    assert set(fields) == ANALYZER.PROMPT_RANKED_HANDOFF_FIELDS
+    return ANALYZER.PROMPT_RANKED_HANDOFF_PREFIX + " ".join(
+        f"{key}={value}" for key, value in fields.items()
+    )
+
+
 def response() -> dict[str, object]:
     expected_ids = json.loads(ANALYZER.EXPECTED_TOKEN_FILE.read_text(encoding="utf-8"))
     return {
@@ -428,14 +467,23 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
             values = manifest_values()
             values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
             write_manifest(run_dir / "env.txt", values)
+            with (run_dir / "server.log").open("a", encoding="utf-8") as handle:
+                handle.write(prompt_ranked_handoff_line() + "\n")
             result = ANALYZER.analyze(run_dir)
-        self.assertEqual(result["integrity"]["stage_cap"], 8)
+        self.assertTrue(result["integrity"]["prompt_ranked_hot_handoff_effective"])
 
         with fixture() as run_dir:
             values = manifest_values()
             values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "true"
             write_manifest(run_dir / "env.txt", values)
             with self.assertRaisesRegex(ANALYZER.ReceiptError, "must be exactly 1"):
+                ANALYZER.analyze(run_dir)
+
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            with self.assertRaisesRegex(ANALYZER.ReceiptError, "exactly one handoff"):
                 ANALYZER.analyze(run_dir)
 
     def test_probe_rejects_unknown_missing_and_duplicate_fields(self) -> None:

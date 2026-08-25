@@ -4000,11 +4000,15 @@ struct GhostMetalExpertRuntime {
     /// eligible to drive exact previous-cold staging.
     latest_routed_experts_from_successful_decode: bool,
     /// Exact routed identities observed since the latest telemetry interval
-    /// boundary (or runtime construction for epoch zero). This is never read by
-    /// routing, eviction, prefetch, or admission policy.
+    /// boundary (or runtime construction for epoch zero). The default lane is
+    /// observation-only; H71 may read a request-local reset interval once at
+    /// the prefill handoff, never during target routing.
     routed_expert_interval_union: Vec<[u64; 2]>,
     routed_expert_interval_epoch: u64,
     expert_decay_scores: Vec<Vec<f32>>,
+    /// Request-local H71 admission, latched before prompt position zero. A
+    /// malformed selector or non-H49 geometry cannot reset baseline history.
+    prompt_ranked_handoff_armed: bool,
     /// Canonical experts consumed through a hybrid mixed table and eligible
     /// for promotion only after that layer's command reaches terminal status.
     pending_hybrid_promotions: Vec<Vec<usize>>,
@@ -7710,6 +7714,7 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_union: vec![[0; 2]; layer_count],
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
+            prompt_ranked_handoff_armed: false,
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
             hybrid_decode_promotion_enabled: true,
             hybrid_hot_admission: None,
@@ -8037,6 +8042,7 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_union: vec![[0; 2]; layer_count],
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
+            prompt_ranked_handoff_armed: false,
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
             hybrid_decode_promotion_enabled,
             hybrid_hot_admission,
@@ -8357,6 +8363,37 @@ impl GhostMetalExpertRuntime {
         idx.into_iter().take(top_n).map(|(e, _)| e).collect()
     }
 
+    fn prompt_ranked_hot_handoff_shape_admitted(&self) -> bool {
+        let capacities = self
+            .layers
+            .iter()
+            .map(|layer| layer.slots.writable_slot_count())
+            .collect::<Vec<_>>();
+        self.layers.len() == GHOST_METAL_HYBRID_PROFILE_LAYERS
+            && self
+                .layers
+                .iter()
+                .all(|layer| layer.slots.is_hybrid_mapped())
+            && !self.hybrid_decode_promotion_enabled
+            && ghost_metal_hybrid_demand_promotion_enabled()
+            && ghost_metal_hybrid_demand_promotion_fill_enabled()
+            && ghost_metal_hybrid_hot_cold_overlap_enabled()
+            && std::env::var(GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV)
+                .is_ok_and(|value| value == "0")
+            && ghost_metal_live_sequential_mini2_hot_profile_admitted(&capacities)
+    }
+
+    fn prompt_ranked_hot_handoff_matches(&self, desired: &[Vec<usize>]) -> bool {
+        desired.len() == self.layers.len()
+            && self.layers.iter().zip(desired).all(|(layer, experts)| {
+                experts.len() == layer.slots.writable_slot_count()
+                    && layer.directory.entries.iter().flatten().count() == experts.len()
+                    && experts
+                        .iter()
+                        .all(|&expert| layer.directory.lookup_resident_slot(expert).is_some())
+            })
+    }
+
     /// Seed the bounded hot tier once at the prefill-to-decode boundary from
     /// the final prompt chunk's exact routed union. That union is the strongest
     /// available next-token locality signal and preserves the decode hit rate
@@ -8392,18 +8429,9 @@ impl GhostMetalExpertRuntime {
             .map(|layer| layer.slots.writable_slot_count())
             .collect::<Vec<_>>();
         let prompt_ranked_admitted = prompt_ranked_requested
-            && self.layers.len() == GHOST_METAL_HYBRID_PROFILE_LAYERS
-            && self
-                .layers
-                .iter()
-                .all(|layer| layer.slots.is_hybrid_mapped())
-            && !self.hybrid_decode_promotion_enabled
-            && ghost_metal_hybrid_demand_promotion_enabled()
-            && ghost_metal_hybrid_demand_promotion_fill_enabled()
-            && ghost_metal_hybrid_hot_cold_overlap_enabled()
-            && std::env::var(GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV)
-                .is_ok_and(|value| value == "0")
-            && ghost_metal_live_sequential_mini2_hot_profile_admitted(&capacities);
+            && self.prompt_ranked_handoff_armed
+            && self.prompt_ranked_hot_handoff_shape_admitted();
+        self.prompt_ranked_handoff_armed = false;
         let prompt_ranked_routes = prompt_ranked_admitted
             .then(|| {
                 prompt_ranked_hot_handoff_routes(
@@ -8413,8 +8441,13 @@ impl GhostMetalExpertRuntime {
                 )
             })
             .flatten();
-        let prompt_ranked_effective = prompt_ranked_routes.is_some();
+        let desired_prompt_ranked = prompt_ranked_routes.clone();
         let routes = prompt_ranked_routes.unwrap_or(baseline_routes);
+        let read_failures_before = self
+            .layers
+            .iter()
+            .map(|layer| layer.stats.direct_read_failures)
+            .sum::<u64>();
         let counters = WaveFillCounters::default();
         let started = std::time::Instant::now();
         let ok = fill_chained_hybrid_hot_layers(
@@ -8424,6 +8457,27 @@ impl GhostMetalExpertRuntime {
             &counters,
             self.chained_round_seq,
         );
+        let read_failures = self
+            .layers
+            .iter()
+            .map(|layer| layer.stats.direct_read_failures)
+            .sum::<u64>()
+            .saturating_sub(read_failures_before);
+        let prompt_ranked_effective = ok
+            && read_failures == 0
+            && desired_prompt_ranked
+                .as_deref()
+                .is_some_and(|desired| self.prompt_ranked_hot_handoff_matches(desired));
+        let installed_routes = self
+            .layers
+            .iter()
+            .map(|layer| {
+                (0..128)
+                    .filter(|&expert| layer.directory.lookup_resident_slot(expert).is_some())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let occupied_total = installed_routes.iter().map(Vec::len).sum::<usize>();
         // This is the terminal promotion belonging to the prompt interval,
         // merely delayed to the explicit handoff barrier. Prompt ranking only
         // bounds and reorders identities from that already-recorded union; it
@@ -8445,14 +8499,40 @@ impl GhostMetalExpertRuntime {
         );
 
         if prompt_ranked_requested {
+            let selected_masks = routes
+                .iter()
+                .enumerate()
+                .map(|(layer, experts)| {
+                    format!(
+                        "L{layer}:{}",
+                        sparse_expert_mask_hex(experts).unwrap_or_else(|| "invalid".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            let resident_masks = installed_routes
+                .iter()
+                .enumerate()
+                .map(|(layer, experts)| {
+                    format!(
+                        "L{layer}:{}",
+                        sparse_expert_mask_hex(experts).unwrap_or_else(|| "invalid".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("/");
             eprintln!(
-                "[gemma4 prompt-ranked hot handoff] schema=1 requested=1 admitted={} effective={} fill_ok={} source=current-prompt-exact-route-union ranking=decay-score-desc-expert-id-asc layers={} selected_records={} capacity_total={} output_mutation=0 route_mutation=0 routing_authority=exact-router",
+                "[gemma4 prompt-ranked hot handoff] schema=1 requested=1 admitted={} effective={} fill_ok={} read_failures={} source=current-prompt-exact-route-union ranking=decay-score-desc-expert-id-asc layers={} selected_records={} capacity_total={} occupied_total={} selected_masks={} resident_masks={} output_mutation=0 io_mutation=1 slot_policy_mutation=1 table_mutation=1 route_mutation=0 routing_authority=exact-router",
                 u8::from(prompt_ranked_admitted),
                 u8::from(prompt_ranked_effective),
                 u8::from(ok),
+                read_failures,
                 routes.len(),
                 routes.iter().map(Vec::len).sum::<usize>(),
                 capacities.iter().sum::<usize>(),
+                occupied_total,
+                selected_masks,
+                resident_masks,
             );
         }
 
@@ -17357,7 +17437,10 @@ impl Gemma4Runtime {
             if let Some(common) = runtime.common.as_mut() {
                 common.reset_sequence();
             }
-            if ghost_metal_prompt_ranked_hot_handoff_enabled() {
+            runtime.prompt_ranked_handoff_armed = ghost_metal_prompt_ranked_hot_handoff_enabled()
+                && plan == GhostPrefillPlan::HybridChunk
+                && runtime.prompt_ranked_hot_handoff_shape_admitted();
+            if runtime.prompt_ranked_handoff_armed {
                 for union in &mut runtime.routed_expert_interval_union {
                     union.fill(0);
                 }

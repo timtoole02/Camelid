@@ -142,7 +142,7 @@ class ExactResidencyTraceTest(unittest.TestCase):
         with self.assertRaises(ANALYZER.TraceError):
             ANALYZER.solve_profile(traces, 1_200_000)
 
-    def test_underfilled_residency_is_valid_but_aggregate_is_bound(self):
+    def test_underfilled_residency_is_rejected_for_profile_solving(self):
         valid = trace_line(41, 104, 14)
         underfilled = valid.replace(
             "resident_total=1408",
@@ -157,11 +157,8 @@ class ExactResidencyTraceTest(unittest.TestCase):
             f"resident_masks=L0:{mask(range(59))}",
             1,
         )
-        parsed = ANALYZER.parse_trace_line(underfilled)
-        self.assertEqual(len(parsed["residents"][0]), 59)
-        forged_total = underfilled.replace("resident_total=1407", "resident_total=1408", 1)
         with self.assertRaises(ANALYZER.TraceError):
-            ANALYZER.parse_trace_line(forged_total)
+            ANALYZER.parse_trace_line(underfilled)
 
     def test_solver_rejects_nonpositive_or_sub_wave_control_wall(self):
         traces = self.traces()

@@ -143,14 +143,16 @@ def parse_trace_line(line):
         require(8 <= len(routes[layer]) <= min(EXPERTS, 8 * k_tokens),
                 f"L{layer} route width is outside the exact K-dependent domain")
         require(len(routes[layer]) == route_sizes[layer], f"L{layer} route size disagrees")
-        require(len(residents[layer]) == resident_sizes[layer] <= capacities[layer],
-                f"L{layer} resident occupancy exceeds or disagrees with capacity")
+        require(len(residents[layer]) == resident_sizes[layer] == capacities[layer],
+                f"L{layer} resident occupancy is not the complete H49 capacity")
         require(cold[layer] == routes[layer] - residents[layer],
                 f"L{layer} cold mask is not route minus residency")
         require(len(cold[layer]) == cold_sizes[layer], f"L{layer} cold size disagrees")
 
     exact_unique = sum(route_sizes)
     resident_total = sum(resident_sizes)
+    require(resident_total == sum(EXPECTED_CAPACITIES) == 1_408,
+            "resident occupancy is not the complete 1,408-slot H49 profile")
     require(parse_uint(fields["resident_total"], "resident_total") == resident_total,
             "resident occupancy aggregate disagrees")
     resident_hits = sum(len(routes[layer] & residents[layer]) for layer in range(LAYERS))
@@ -333,9 +335,6 @@ def reconcile_h69_rounds(traces, probes, stages):
                     f"trace round {index} L{layer} cold identities disagree with H69")
             require(trace["wave_load_us"][layer] == observed["wall_us"],
                     f"trace round {index} L{layer} wave wall disagrees with H69")
-        expected_cold = stage["exact_cold"]
-        require(trace["cold_records"] == expected_cold,
-                f"trace round {index} cold identities disagree with H69 stage accounting")
         # H69 formats the raw 30-layer sum once, while this trace sums 30
         # individually rounded microsecond values. Their only legal drift is
         # bounded decimal rounding, never a layer-shifted accounting change.
