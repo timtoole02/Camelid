@@ -2564,11 +2564,8 @@ fn prompt_ranked_hot_handoff_routes(
             if ranked.len() < capacity {
                 return None;
             }
-            ranked.sort_unstable_by(|&a, &b| {
-                scores[b]
-                    .total_cmp(&scores[a])
-                    .then_with(|| a.cmp(&b))
-            });
+            ranked
+                .sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b)));
             ranked.truncate(capacity);
             Some(ranked)
         })
@@ -2712,7 +2709,11 @@ fn format_exact_residency_trace(
         route_sizes.push(exact_routes[layer_idx].len().to_string());
         resident_sizes.push(resident.len().to_string());
         cold_sizes.push(cold.len().to_string());
-        wave_load_ms.push(format!("{}.{:03}", layer_wave_us / 1_000, layer_wave_us % 1_000));
+        wave_load_ms.push(format!(
+            "{}.{:03}",
+            layer_wave_us / 1_000,
+            layer_wave_us % 1_000
+        ));
     }
     let exact_unique_records = usize::try_from(ledger_unique_sum).map_err(|_| "unique-domain")?;
     if resident_hits.checked_add(cold_records) != Some(exact_unique_records) {
@@ -8392,7 +8393,10 @@ impl GhostMetalExpertRuntime {
             .collect::<Vec<_>>();
         let prompt_ranked_admitted = prompt_ranked_requested
             && self.layers.len() == GHOST_METAL_HYBRID_PROFILE_LAYERS
-            && self.layers.iter().all(|layer| layer.slots.is_hybrid_mapped())
+            && self
+                .layers
+                .iter()
+                .all(|layer| layer.slots.is_hybrid_mapped())
             && !self.hybrid_decode_promotion_enabled
             && ghost_metal_hybrid_demand_promotion_enabled()
             && ghost_metal_hybrid_demand_promotion_fill_enabled()
@@ -9728,8 +9732,7 @@ impl GhostMetalExpertRuntime {
         } else {
             &empty_unions
         };
-        let mut observation_wave_load_ms =
-            [0.0f64; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS];
+        let mut observation_wave_load_ms = [0.0f64; GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS];
         let mut ok = {
             let Some(common) = self.common.as_mut() else {
                 return false;
@@ -19328,9 +19331,7 @@ impl Gemma4Runtime {
                         // rows, but it cannot feed any result back into this
                         // already-complete verifier or its target state.
                         if exact_residency_trace_requested {
-                            self.emit_exact_residency_trace(
-                                assistant_router_probe_truth.as_ref(),
-                            );
+                            self.emit_exact_residency_trace(assistant_router_probe_truth.as_ref());
                         }
                         if let Some(source) = assistant_router_probe_source {
                             self.emit_mtp_assistant_router_probe(
@@ -20308,10 +20309,7 @@ impl Gemma4Runtime {
     /// exact tied head has fixed acceptance and next logits. It formats frozen
     /// route/residency truth and cannot mutate the verifier or its I/O path.
     #[cfg(target_os = "macos")]
-    fn emit_exact_residency_trace(
-        &self,
-        truth: Option<&Gemma4MtpAssistantRouterProbeTruth>,
-    ) {
+    fn emit_exact_residency_trace(&self, truth: Option<&Gemma4MtpAssistantRouterProbeTruth>) {
         let Some(truth) = truth else {
             eprintln!(
                 "[gemma4 exact-residency trace] schema=1 requested=1 admitted=0 truth_valid=0 reason=chained-truth-unavailable throughput_eligible=0"
@@ -29621,15 +29619,10 @@ mod mtp_target_seam_tests {
         assert!(receipt.contains(
             "capacity_total=1408 resident_total=1408 exact_unique_records=240 resident_hits=0 cold_records=240"
         ));
-        assert!(receipt.contains(
-            "route_masks=L0:ff000000000000000000000000000000/"
-        ));
-        assert!(receipt.contains(
-            "cold_masks=L0:ff000000000000000000000000000000/"
-        ));
-        assert!(receipt.ends_with(
-            "route_mutation=0 routing_authority=exact-router throughput_eligible=0"
-        ));
+        assert!(receipt.contains("route_masks=L0:ff000000000000000000000000000000/"));
+        assert!(receipt.contains("cold_masks=L0:ff000000000000000000000000000000/"));
+        assert!(receipt
+            .ends_with("route_mutation=0 routing_authority=exact-router throughput_eligible=0"));
 
         let mut duplicate = routes.clone();
         duplicate[3][7] = 126;
