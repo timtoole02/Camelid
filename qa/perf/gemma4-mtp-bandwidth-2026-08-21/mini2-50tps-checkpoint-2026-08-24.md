@@ -481,6 +481,30 @@ H64 is a **NO-GO**. Adaptive authoritative-read fanout is not the missing
 latency recovery on this Mini2 lane; the default-off source remains for
 reproducibility.
 
+## Exact wide-Down integer-MMA probe (H65)
+
+H65 tests whether one 256-thread Metal threadgroup can reuse each Q4 expert
+block across the verifier's full candidate union. Eight SIMDgroups compact up
+to 16 live candidates into one or two matrix tiles, write exact signed-16-bit
+Q4xQ8 dot terms into threadgroup memory, and then replay the established
+floating-point scale, route-weight, lane-accumulation, and reduction order
+without alteration. The admission contract is deliberately limited to the
+production GateUp Q8 range `[-127, 127]`; arbitrary `char(-128)` input would
+permit a 32,768 dot and is not admitted.
+
+The raw-bit Metal gate passed on Mini2 for K13, K14, and K16, including
+one- and two-tile masks, Q4/Q8 extrema, adversarial finite half scales,
+signed-zero routes, invalid sentinels, and untouched output guards. The
+production-shaped ignored timing gate then failed its first round decisively.
+For 30 K14 layers and a 1,106-expert union, the established Down path took
+28,540 us while H65 took 278,369 us, a 249,823 us regression. Mini2 remained
+at zero swap before and after the run.
+
+H65 is a **NO-GO**. The compacted matrix work and threadgroup-memory pressure
+cost roughly 10x more than the established sparse Down kernel on M4. It was
+stopped before production selector wiring, a full verifier build, or an ABBA
+run. The exact kernel and fail-fast timing gate remain as closure evidence.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -501,6 +525,7 @@ Profiles and executable for this checkpoint:
 - `H60-mtp-bf16-producer-fusion`
 - `H62-mtp-bf16-lattice-loads`
 - `H64-async-two-wave-chunked-read`
+- `H65-wide-down-mma-terms` (source/timing closure only; no profile)
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -565,6 +590,10 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
   payload-identity, and H55 command-plan gates passed; post-restart Mini2
   warmups plus H55/H64/H64/H55 measured 32.2237 tok/s control versus 32.0718
   tok/s candidate, with 48/48 parity and zero swap throughout; no-go;
+- H65 production-range i16 contract and K13/K14/K16 raw-bit Metal gates:
+  pass; ignored 30-layer K14 production-histogram timing failed round 0 at
+  278,369 us versus 28,540 us established, a 249,823 us regression; Mini2
+  remained at zero swap and no full verifier run was attempted;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

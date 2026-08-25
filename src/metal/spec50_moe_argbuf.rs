@@ -976,6 +976,223 @@ kernel void spec50_moe_argbuf_down_union_batch_k(
     }
 }
 
+// H65 exact wide-Down probe. One eight-SIMDgroup threadgroup owns eight output
+// rows as two sequential four-row phases. It visits every unique expert once
+// per phase, compacts the routed candidates into one or two 8-wide tiles, and
+// reuses that expert's Q4 block through exact half-input/f32-accumulate MMA.
+// Only the integral Q4xQ8 dots are changed; a final pass replays the established
+// candidate/lane/jj order, scale parenthesization, simd_sum, and output indexing
+// verbatim. Production GateUp clamps Q8 to [-127,127], so the largest admitted
+// 32-term dot is 32,512 and `short` is lossless. Arbitrary char(-128) input is
+// deliberately outside this kernel's admission contract.
+static inline uint s50_moe_nth_active_candidate(ulong mask, uint rank) {
+    for (uint bit = 0; bit < 16u; ++bit) {
+        if ((mask & (1ULL << bit)) == 0ULL) continue;
+        if (rank == 0u) return bit;
+        --rank;
+    }
+    return 16u;
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void spec50_moe_argbuf_down_union_batch_k16_mma_terms_rows4(
+    device const float* act_scales [[buffer(0)]],
+    device const char* act_quants [[buffer(1)]],
+    device Gemma4ExpertPointerTable& expert_table [[buffer(2)]],
+    device const Gemma4CandidateRouteEntry* candidate_routes [[buffer(3)]],
+    device const Gemma4UniqueExpertWork* work_list [[buffer(4)]],
+    device float* output_moe_acc [[buffer(5)]],
+    constant uint& k_candidates [[buffer(6)]],
+    constant uint& num_unique_experts [[buffer(7)]],
+    threadgroup short* exact_terms [[threadgroup(0)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (k_candidates == 0u || k_candidates > 16u || num_unique_experts > 128u) return;
+
+    const uint term_count =
+        k_candidates * G4Q4_ROUTES * G4Q4_DOWN_BLOCKS * S50_DOWN_ROWS;
+    // 4,096 B candidate staging + 2,048 B weight staging. Dynamic exact-term
+    // storage adds 18,304 B at K13 or 19,712 B at K14.
+    threadgroup half x_stage[8u * 8u * 32u];
+    threadgroup half weight_stage[8u * S50_DOWN_ROWS * 32u];
+    const short2 coord = s50_moe_mma_frag_coord(ushort(lane));
+    const uint candidate_column = uint(coord.y);
+    const uint local_row0 = uint(coord.x);
+    const uint x_stage_base = sg * 8u * 32u;
+    const uint weight_stage_base = sg * S50_DOWN_ROWS * 32u;
+
+    #pragma unroll
+    for (uint phase = 0; phase < 2u; ++phase) {
+        const uint row0 = group * 8u + phase * S50_DOWN_ROWS;
+        for (uint index = thread_index; index < term_count; index += 256u) {
+            exact_terms[index] = short(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Flattening (unique expert, Down block) balances the producer across
+        // all eight SIMDgroups without introducing cross-group barriers.
+        const uint producer_items = num_unique_experts * G4Q4_DOWN_BLOCKS;
+        for (uint ub = sg; ub < producer_items; ub += 8u) {
+            const uint u = ub / G4Q4_DOWN_BLOCKS;
+            const uint b = ub - u * G4Q4_DOWN_BLOCKS;
+            const Gemma4UniqueExpertWork work = work_list[u];
+            const ulong valid_mask = work.candidate_mask
+                & ((1ULL << k_candidates) - 1ULL);
+            if (valid_mask == 0ULL) continue;
+
+            const uint expert_id = work.expert_weight_offset / G4Q4_SLOT_STRIDE;
+            device const uchar* weights = expert_table.records[expert_id];
+            const uint q = lane & 15u;
+            const uint row_pair = lane >> 4u;
+            #pragma unroll
+            for (uint pair = 0; pair < 2u; ++pair) {
+                const uint r = row_pair + pair * 2u;
+                device const uchar* block = weights + G4Q4_GATE_UP_BYTES
+                    + ulong(row0 + r) * G4Q4_DOWN_ROW_BYTES
+                    + ulong(b) * G4Q4_WIRE;
+                const uchar packed = block[2u + q];
+                const uint stage_row = weight_stage_base + r * 32u;
+                weight_stage[stage_row + q] =
+                    half(float(int(packed & 0x0fu) - 8));
+                weight_stage[stage_row + 16u + q] =
+                    half(float(int(packed >> 4) - 8));
+            }
+
+            const uint active_count = popcount(valid_mask);
+            const uint tiles = (active_count + 7u) / 8u;
+            for (uint tile = 0; tile < tiles; ++tile) {
+                const uint packed_candidate = lane / 4u;
+                const uint t = s50_moe_nth_active_candidate(
+                    valid_mask, tile * 8u + packed_candidate);
+                const uint chunk = lane & 3u;
+                const uint dst = x_stage_base + packed_candidate * 32u + chunk * 8u;
+                if (t < k_candidates) {
+                    device const char* src = act_quants
+                        + ulong(u) * ulong(k_candidates) * G4Q4_FF
+                        + ulong(t) * G4Q4_FF + ulong(b) * 32ul
+                        + ulong(chunk) * 8ul;
+                    #pragma unroll
+                    for (uint j = 0; j < 8u; ++j) {
+                        x_stage[dst + j] = half(float(src[j]));
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint j = 0; j < 8u; ++j) {
+                        x_stage[dst + j] = half(0.0h);
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                simdgroup_float8x8 dot =
+                    make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                #pragma unroll
+                for (uint kk = 0; kk < 32u; kk += 8u) {
+                    simdgroup_half8x8 x_frag;
+                    simdgroup_half8x8 weight_frag;
+                    x_frag.thread_elements()[0] =
+                        x_stage[x_stage_base + candidate_column * 32u + kk + local_row0];
+                    x_frag.thread_elements()[1] =
+                        x_stage[x_stage_base + candidate_column * 32u + kk + local_row0 + 1u];
+                    weight_frag.thread_elements()[0] = local_row0 < S50_DOWN_ROWS
+                        ? weight_stage[weight_stage_base + local_row0 * 32u
+                            + kk + candidate_column]
+                        : half(0.0h);
+                    weight_frag.thread_elements()[1] = local_row0 + 1u < S50_DOWN_ROWS
+                        ? weight_stage[weight_stage_base + (local_row0 + 1u) * 32u
+                            + kk + candidate_column]
+                        : half(0.0h);
+                    simdgroup_barrier(mem_flags::mem_none);
+                    simdgroup_multiply_accumulate(dot, x_frag, weight_frag, dot);
+                }
+
+                const uint candidate = s50_moe_nth_active_candidate(
+                    valid_mask, tile * 8u + candidate_column);
+                if (candidate < k_candidates) {
+                    const short dot0 = short(dot.thread_elements()[0]);
+                    const short dot1 = short(dot.thread_elements()[1]);
+                    #pragma unroll
+                    for (uint slot = 0; slot < G4Q4_ROUTES; ++slot) {
+                        const Gemma4CandidateRouteEntry route =
+                            candidate_routes[candidate * G4Q4_ROUTES + slot];
+                        if (route.weight == 0.0f || route.unique_expert_idx != u) continue;
+                        if (local_row0 < S50_DOWN_ROWS) {
+                            const uint index = (((candidate * G4Q4_ROUTES + slot)
+                                * G4Q4_DOWN_BLOCKS + b) * S50_DOWN_ROWS) + local_row0;
+                            exact_terms[index] = dot0;
+                        }
+                        if (local_row0 + 1u < S50_DOWN_ROWS) {
+                            const uint index = (((candidate * G4Q4_ROUTES + slot)
+                                * G4Q4_DOWN_BLOCKS + b) * S50_DOWN_ROWS)
+                                + local_row0 + 1u;
+                            exact_terms[index] = dot1;
+                        }
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Replay the established arithmetic program exactly. Eight
+        // SIMDgroups cover the candidate dimension in strides of eight.
+        for (uint t = sg; t < k_candidates; t += 8u) {
+            float lane_total[S50_DOWN_ROWS];
+            #pragma unroll
+            for (uint r = 0; r < S50_DOWN_ROWS; ++r) {
+                lane_total[r] = 0.0f;
+            }
+
+            #pragma unroll
+            for (uint jj = 0; jj < S50_DOWN_TERMS; ++jj) {
+                const uint flat = lane + jj * 32u;
+                if (flat >= G4Q4_ROUTES * G4Q4_DOWN_BLOCKS) continue;
+                const uint slot = flat / G4Q4_DOWN_BLOCKS;
+                const uint b = flat - slot * G4Q4_DOWN_BLOCKS;
+                const Gemma4CandidateRouteEntry route =
+                    candidate_routes[t * G4Q4_ROUTES + slot];
+                if (route.weight == 0.0f || route.unique_expert_idx >= 128u) continue;
+                const uint u = route.unique_expert_idx;
+                const Gemma4UniqueExpertWork work = work_list[u];
+                const uint expert_id = work.expert_weight_offset / G4Q4_SLOT_STRIDE;
+                device const uchar* weights = expert_table.records[expert_id];
+                device const uchar* down_rows = weights + G4Q4_GATE_UP_BYTES
+                    + ulong(row0) * G4Q4_DOWN_ROW_BYTES;
+
+                const ulong act_scale_base =
+                    ulong(u) * ulong(k_candidates) * G4Q4_DOWN_BLOCKS
+                    + ulong(t) * G4Q4_DOWN_BLOCKS + ulong(b);
+                const float act_scale = act_scales[act_scale_base];
+
+                #pragma unroll
+                for (uint r = 0; r < S50_DOWN_ROWS; ++r) {
+                    device const uchar* block = down_rows
+                        + ulong(r) * G4Q4_DOWN_ROW_BYTES + ulong(b) * G4Q4_WIRE;
+                    const float weight_scale =
+                        float(*reinterpret_cast<device const half*>(block));
+                    const uint index = (((t * G4Q4_ROUTES + slot)
+                        * G4Q4_DOWN_BLOCKS + b) * S50_DOWN_ROWS) + r;
+                    const int isum = int(exact_terms[index]);
+                    const float term_scale = (weight_scale * act_scale) * route.weight;
+                    lane_total[r] += float(isum) * term_scale;
+                }
+            }
+
+            #pragma unroll
+            for (uint r = 0; r < S50_DOWN_ROWS; ++r) {
+                const float total = simd_sum(lane_total[r]);
+                if (lane == 0) {
+                    output_moe_acc[ulong(t) * G4Q4_HIDDEN + ulong(row0 + r)] = total;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // Exact row-reuse probe. Eight output rows share each route lookup and
 // activation block load instead of four; every row retains the same lane term
 // order and simd_sum reduction as the current kernel.
@@ -1530,6 +1747,9 @@ pub(crate) struct Spec50MoeArgbufKernels {
     /// Exact four-candidate tiled K<=8 twin.
     gateup_k8_tile4: Option<ComputePipelineState>,
     pub(crate) down: ComputePipelineState,
+    /// H65 exact wide-only union-reuse Down probe. Its 25 KiB immutable term
+    /// replay is independently optional and remains default-off.
+    down_mma_terms_k16: Option<ComputePipelineState>,
     /// Exact eight-row reuse probe retained independently from production.
     down_rows8: Option<ComputePipelineState>,
     /// Exact four-candidate threadgroup probe retained independently.
@@ -1747,6 +1967,29 @@ pub(crate) fn spec50_moe_argbuf_kernels(
                     .map_err(|err| eprintln!("[metal] argbuf pipeline {name} failed: {err}"))
                     .ok()
             };
+            let down_mma_terms_k16 = make_pipeline(
+                "spec50_moe_argbuf_down_union_batch_k16_mma_terms_rows4",
+            )
+            .and_then(|pipeline| {
+                let simd_width = pipeline.thread_execution_width();
+                let max_threads = pipeline.max_total_threads_per_threadgroup();
+                let static_tmem = pipeline.static_threadgroup_memory_length();
+                let max_dynamic_tmem = 16 * 8 * 22 * 4 * std::mem::size_of::<i16>() as u64;
+                let total_tmem = static_tmem + max_dynamic_tmem;
+                if simd_width != 32
+                    || max_threads < 256
+                    || total_tmem > 28 * 1024
+                    || total_tmem > device.max_threadgroup_memory_length()
+                {
+                    eprintln!(
+                        "[metal] H65 Down MMA-terms ineligible: SIMD={simd_width} max_threads={max_threads} static_tmem={static_tmem} max_dynamic_tmem={max_dynamic_tmem} total_tmem={total_tmem} device_tmem={}",
+                        device.max_threadgroup_memory_length(),
+                    );
+                    None
+                } else {
+                    Some(pipeline)
+                }
+            });
             let down_rows8 = make_pipeline("spec50_moe_argbuf_down_union_batch_k_rows8");
             let down_tg4 = make_pipeline("spec50_moe_argbuf_down_union_batch_k_tg4");
             let head_gateup_split = make_pipeline("gemma4_q4_expert_argbuf_gate_up_split")?;
@@ -1764,6 +2007,7 @@ pub(crate) fn spec50_moe_argbuf_kernels(
                 gateup_k8_candidate,
                 gateup_k8_tile4,
                 down,
+                down_mma_terms_k16,
                 down_rows8,
                 down_tg4,
                 head_gateup_split,
@@ -3038,6 +3282,46 @@ fn encode_argbuf_down(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_argbuf_down_mma_terms_k16(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    act_scales: &Buffer,
+    act_quants: &Buffer,
+    expert_table: &Buffer,
+    candidate_routes: &Buffer,
+    work_list: &Buffer,
+    output_moe_acc: &Buffer,
+    num_unique_experts: u32,
+    k_candidates: u32,
+) {
+    debug_assert!(matches!(k_candidates, 13 | 14 | 16));
+    debug_assert!((1..=128).contains(&num_unique_experts));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(act_scales), 0);
+    encoder.set_buffer(1, Some(act_quants), 0);
+    encoder.set_buffer(2, Some(expert_table), 0);
+    encoder.set_buffer(3, Some(candidate_routes), 0);
+    encoder.set_buffer(4, Some(work_list), 0);
+    encoder.set_buffer(5, Some(output_moe_acc), 0);
+    encoder.set_bytes(6, 4, &k_candidates as *const u32 as *const _);
+    encoder.set_bytes(7, 4, &num_unique_experts as *const u32 as *const _);
+    let term_bytes = u64::from(k_candidates) * 8 * 22 * 4 * 2;
+    encoder.set_threadgroup_memory_length(0, term_bytes);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (S50_HIDDEN / 8) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_argbuf_down_rows8(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
@@ -3524,6 +3808,24 @@ mod tests {
             .map(|index| quant_cycle[(index * 7 + index / S50_HIDDEN * 3) % quant_cycle.len()])
             .collect::<Vec<_>>();
         write_bytes(&buffers.input_quants, &quants);
+    }
+
+    fn write_adversarial_down_activations(buffers: &Buffers) {
+        // These are exactly representable f16-derived scales and the complete
+        // production GateUp Q8 range. `-128` is intentionally excluded: H65's
+        // i16 intermediate is admitted only for GateUp's [-127,127] clamp.
+        let scale_bits = [
+            0x0000u16, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3555, 0x3c00, 0x7bff,
+        ];
+        let scales = (0..buffers.arg_scales.length() as usize / 4)
+            .map(|index| super::super::f16_bits_to_f32(scale_bits[index % scale_bits.len()]))
+            .collect::<Vec<_>>();
+        write_bytes(&buffers.arg_scales, &scales);
+        let quant_cycle = [-127i8, 127, -126, 126, -64, 64, -8, 7, -1, 0, 1, 31, -32];
+        let quants = (0..buffers.arg_quants.length() as usize)
+            .map(|index| quant_cycle[(index * 7 + index / S50_FF) % quant_cycle.len()])
+            .collect::<Vec<_>>();
+        write_bytes(&buffers.arg_quants, &quants);
     }
 
     const SYNTHETIC_EXPERTS: usize = S50_ROUTES;
@@ -4602,6 +4904,114 @@ mod tests {
                     &read_bytes(&buffers.arg_down, buffers.arg_down.length() as usize),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gemma4_moe_h65_i16_contract_is_gateup_clamp_bounded() {
+        const ADMITTED_MAX: i32 = 32 * 8 * 127;
+        const UNADMITTED_CHAR_MIN_DOT: i32 = 32 * (-8) * (-128);
+        assert_eq!(ADMITTED_MAX, 32_512);
+        assert!(ADMITTED_MAX <= i16::MAX as i32);
+        assert_eq!(UNADMITTED_CHAR_MIN_DOT, 32_768);
+        assert!(UNADMITTED_CHAR_MIN_DOT > i16::MAX as i32);
+        assert!(
+            SPEC50_MOE_ARGBUF_SHADER.contains("clamp(int(round(act_val * inverse)), -127, 127)")
+        );
+        assert!(SPEC50_MOE_ARGBUF_SHADER.contains("Arbitrary char(-128) input is"));
+        assert!(SPEC50_MOE_ARGBUF_SHADER.contains("outside this kernel's admission contract"));
+    }
+
+    /// H65's matrix phase may change only the integral Q4xQ8 dot producer.
+    /// This gate pins the complete established floating replay and untouched
+    /// output suffix for every intended wide verifier width.
+    #[test]
+    fn gemma4_moe_h65_down_mma_terms_k13_k14_k16_is_raw_bit_exact() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP H65 Down MMA-terms parity: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP H65 Down MMA-terms parity: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let candidate = pipelines
+            .down_mma_terms_k16
+            .as_ref()
+            .expect("H65 Down MMA-terms pipeline");
+        assert_eq!(candidate.thread_execution_width(), 32);
+        assert!(candidate.max_total_threads_per_threadgroup() >= 256);
+        assert!(candidate.static_threadgroup_memory_length() + 16 * 8 * 22 * 4 * 2 <= 28 * 1024);
+
+        let (records, _) = synthetic_slot_backings_count(device, ACTIVE_EXPERTS);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("30-expert anonymous Tier-2 table");
+        let buffers = Buffers::new(device);
+        write_adversarial_down_activations(&buffers);
+
+        for (k, expert_count) in [13usize, 14, 16]
+            .into_iter()
+            .flat_map(|k| [(k, ACTIVE_EXPERTS), (k, S50_ROUTES)])
+        {
+            let mut routing = build_routing_for_expert_count(k, expert_count);
+            assert_eq!(routing.active_experts.len(), expert_count);
+            // Preserve two established no-op route forms in the parity gate.
+            // The compact producer may do extra integer work for their stale
+            // mask bits, but replay must still skip both exactly.
+            routing.routes[(k - 1) * S50_ROUTES + (S50_ROUTES - 1)] = Gemma4CandidateRouteEntry {
+                unique_expert_idx: u32::MAX,
+                weight: 1.0,
+            };
+            routing.routes[(k - 1) * S50_ROUTES + (S50_ROUTES - 2)].weight = -0.0;
+            buffers.upload(&routing);
+            fill_zero(&buffers.copy_down);
+            fill_zero(&buffers.arg_down);
+
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(encoder, &routing.active_experts),
+                Some(routing.active_experts.len())
+            );
+            encode_argbuf_down(
+                encoder,
+                &pipelines.down,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                table.argument_buffer(),
+                &buffers.routes,
+                &buffers.work,
+                &buffers.copy_down,
+                k as u32,
+            );
+            encode_argbuf_down_mma_terms_k16(
+                encoder,
+                candidate,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                table.argument_buffer(),
+                &buffers.routes,
+                &buffers.work,
+                &buffers.arg_down,
+                routing.active_experts.len() as u32,
+                k as u32,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed,
+                "H65 K={k} U={expert_count} command failed: {}",
+                command_buffer_error_details(cb),
+            );
+            assert_raw_eq(
+                &format!("H65 K={k} U={expert_count} Down output + guard"),
+                &read_bytes(&buffers.copy_down, buffers.copy_down.length() as usize),
+                &read_bytes(&buffers.arg_down, buffers.arg_down.length() as usize),
+            );
         }
     }
 
@@ -6075,6 +6485,113 @@ mod tests {
         }
     }
 
+    struct H65DownLayerFixture {
+        work: Buffer,
+        routes: Buffer,
+        unique: u32,
+    }
+
+    fn h65_down_histogram_fixtures(
+        device: &Device,
+        k: usize,
+        unique_counts: &[usize],
+    ) -> Vec<H65DownLayerFixture> {
+        unique_counts
+            .iter()
+            .map(|&unique| {
+                let routing = build_routing_for_expert_count(k, unique);
+                assert_eq!(
+                    routing.active_experts.len(),
+                    unique,
+                    "H65 synthetic union does not cover U={unique} at K={k}"
+                );
+                let work = new_buffer(
+                    device,
+                    EXPERTS * std::mem::size_of::<Gemma4UniqueExpertWork>(),
+                );
+                let routes = new_buffer(
+                    device,
+                    WIDE_MAX_K * S50_ROUTES * std::mem::size_of::<Gemma4CandidateRouteEntry>(),
+                );
+                write_bytes(&work, &routing.work);
+                write_bytes(&routes, &routing.routes);
+                H65DownLayerFixture {
+                    work,
+                    routes,
+                    unique: unique as u32,
+                }
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn time_h65_down_histogram(
+        queue: &metal::CommandQueue,
+        pipeline: &ComputePipelineState,
+        candidate: bool,
+        table: &Gemma4MoeSlotArgTable,
+        buffers: &Buffers,
+        layers: &[H65DownLayerFixture],
+        k: usize,
+    ) -> Timing {
+        fill_zero(&buffers.arg_down);
+        let before = vm_counters();
+        let started = std::time::Instant::now();
+        let cb = queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        assert_eq!(table.declare_all_records(encoder), table.slot_count());
+        for layer in layers {
+            if candidate {
+                encode_argbuf_down_mma_terms_k16(
+                    encoder,
+                    pipeline,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    table.argument_buffer(),
+                    &layer.routes,
+                    &layer.work,
+                    &buffers.arg_down,
+                    layer.unique,
+                    k as u32,
+                );
+            } else {
+                encode_argbuf_down(
+                    encoder,
+                    pipeline,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    table.argument_buffer(),
+                    &layer.routes,
+                    &layer.work,
+                    &buffers.arg_down,
+                    k as u32,
+                );
+            }
+        }
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let wall_us = started.elapsed().as_micros();
+        assert_eq!(
+            cb.status(),
+            MTLCommandBufferStatus::Completed,
+            "H65 histogram command failed: {}",
+            command_buffer_error_details(cb),
+        );
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
+        let after = vm_counters();
+        Timing {
+            wall_us,
+            gpu_us,
+            kernel_us,
+            pageins: vm_delta(after, before, |stats| stats.pageins),
+            faults: vm_delta(after, before, |stats| stats.faults),
+            decompressions: vm_delta(after, before, |stats| stats.decompressions),
+            swapins: vm_delta(after, before, |stats| stats.swapins),
+            swapouts: vm_delta(after, before, |stats| stats.swapouts),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn time_argbuf_round(
         queue: &metal::CommandQueue,
@@ -6416,6 +6933,188 @@ mod tests {
                 mma14[sample].swapouts,
             );
         }
+    }
+
+    /// H65's isolated continuation gate. The first two union histograms are
+    /// the exact H64 B1 totals. Round 2 preserves the prior per-layer shape
+    /// while scaling it to the current B1 total U=1,177; masks and records are
+    /// synthetic/repeated-weight, so the full Mini2 request remains authority.
+    #[test]
+    #[ignore = "real-Metal H65 Down production-histogram microbenchmark"]
+    fn spec50_h65_down_production_histogram_interleaved_timing() {
+        const EXPERT_CAPACITY: usize = 56;
+        const ROUND0_K14: [usize; 30] = [
+            45, 55, 39, 38, 33, 34, 32, 34, 35, 36, 40, 36, 36, 38, 35, 33, 25, 28, 26, 34, 29, 34,
+            34, 38, 41, 49, 45, 39, 42, 43,
+        ];
+        const ROUND1_K13: [usize; 30] = [
+            46, 46, 35, 35, 44, 41, 39, 35, 35, 43, 43, 44, 41, 44, 42, 34, 27, 29, 30, 33, 22, 27,
+            30, 36, 31, 43, 34, 38, 32, 36,
+        ];
+        const ROUND2_K14: [usize; 29] = [
+            55, 56, 42, 37, 44, 40, 42, 45, 43, 43, 34, 39, 39, 42, 39, 35, 39, 35, 35, 34, 34, 37,
+            43, 44, 39, 40, 41, 40, 41,
+        ];
+
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP H65 Down histogram: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP H65 Down histogram: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let candidate = pipelines
+            .down_mma_terms_k16
+            .as_ref()
+            .expect("H65 Down MMA-terms pipeline");
+        let (records, _) = synthetic_slot_backings_count(device, EXPERT_CAPACITY);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("56-expert anonymous Tier-2 table");
+        let buffers = Buffers::new_with_expert_capacity(device, EXPERT_CAPACITY);
+        write_adversarial_down_activations(&buffers);
+
+        let histograms: [(usize, &[usize]); 3] =
+            [(14, &ROUND0_K14), (13, &ROUND1_K13), (14, &ROUND2_K14)];
+        assert_eq!(histograms.map(|(_, counts)| counts.len()), [30, 30, 29]);
+        assert_eq!(
+            histograms.map(|(_, counts)| counts.iter().sum::<usize>()),
+            [1_106, 1_095, 1_177]
+        );
+        let fixtures = histograms
+            .iter()
+            .map(|&(k, counts)| h65_down_histogram_fixtures(device, k, counts))
+            .collect::<Vec<_>>();
+
+        for _ in 0..2 {
+            for index in 0..3 {
+                let k = histograms[index].0;
+                for (pipeline, is_candidate) in [(&pipelines.down, false), (candidate, true)] {
+                    let timing = time_h65_down_histogram(
+                        &kernel.queue,
+                        pipeline,
+                        is_candidate,
+                        &table,
+                        &buffers,
+                        &fixtures[index],
+                        k,
+                    );
+                    assert_eq!(timing.swapins, 0, "H65 warmup swapped in");
+                    assert_eq!(timing.swapouts, 0, "H65 warmup swapped out");
+                }
+            }
+        }
+
+        let mut established: [Vec<Timing>; 3] = std::array::from_fn(|_| Vec::with_capacity(9));
+        let mut h65: [Vec<Timing>; 3] = std::array::from_fn(|_| Vec::with_capacity(9));
+        for sample in 0..9 {
+            let round_order = if sample % 2 == 0 {
+                [0usize, 1, 2]
+            } else {
+                [2usize, 1, 0]
+            };
+            for index in round_order {
+                let k = histograms[index].0;
+                let measure = |pipeline: &ComputePipelineState, is_candidate: bool| {
+                    time_h65_down_histogram(
+                        &kernel.queue,
+                        pipeline,
+                        is_candidate,
+                        &table,
+                        &buffers,
+                        &fixtures[index],
+                        k,
+                    )
+                };
+                if sample % 2 == 0 {
+                    established[index].push(measure(&pipelines.down, false));
+                    h65[index].push(measure(candidate, true));
+                } else {
+                    h65[index].push(measure(candidate, true));
+                    established[index].push(measure(&pipelines.down, false));
+                }
+            }
+        }
+
+        assert!(
+            established
+                .iter()
+                .chain(&h65)
+                .flat_map(|samples| samples.iter())
+                .all(|timing| timing.swapins == 0 && timing.swapouts == 0),
+            "H65 histogram timing observed swap-in or swap-out",
+        );
+        let median = |samples: &[Timing]| {
+            let mut ordered = samples.to_vec();
+            ordered.sort_unstable_by_key(|timing| timing.gpu_us);
+            ordered[ordered.len() / 2]
+        };
+        let paired_round_saving: [i128; 3] = std::array::from_fn(|index| {
+            let mut deltas = established[index]
+                .iter()
+                .zip(&h65[index])
+                .map(|(a, b)| a.gpu_us as i128 - b.gpu_us as i128)
+                .collect::<Vec<_>>();
+            deltas.sort_unstable();
+            deltas[deltas.len() / 2]
+        });
+        let request_samples = (0..9)
+            .map(|sample| {
+                (0..3)
+                    .map(|round| {
+                        established[round][sample].gpu_us as i128
+                            - h65[round][sample].gpu_us as i128
+                    })
+                    .sum::<i128>()
+            })
+            .collect::<Vec<_>>();
+        let mut request_deltas = request_samples.clone();
+        request_deltas.sort_unstable();
+        let request_saving = request_deltas[request_deltas.len() / 2];
+
+        for index in 0..3 {
+            let control = median(&established[index]);
+            let candidate_median = median(&h65[index]);
+            eprintln!(
+                "[spec50-h65-down] round={index} K={} layers={} union={} established_gpu_us={} h65_gpu_us={} paired_saving_us={} masks=synthetic repeated_weights=1",
+                histograms[index].0,
+                histograms[index].1.len(),
+                histograms[index].1.iter().sum::<usize>(),
+                control.gpu_us,
+                candidate_median.gpu_us,
+                paired_round_saving[index],
+            );
+            assert!(
+                paired_round_saving[index] >= 0,
+                "H65 round {index} regressed by {}us",
+                -paired_round_saving[index]
+            );
+        }
+        eprintln!(
+            "[spec50-h65-down] projected_request_saving_us={request_saving} formula=K14+K13+K14 dispatches=89 unions=1106,1095,1177 SIMD={} max_threads={} static_tmem={} K14_dynamic_tmem={} masks=synthetic repeated_weights=1 Mini2_full_run_authoritative=1",
+            candidate.thread_execution_width(),
+            candidate.max_total_threads_per_threadgroup(),
+            candidate.static_threadgroup_memory_length(),
+            14 * 8 * 22 * 4 * 2,
+        );
+        for sample in 0..9 {
+            eprintln!(
+                "[spec50-h65-down] sample={sample} r0_established={} r0_h65={} r1_established={} r1_h65={} r2_established={} r2_h65={} request_saving_us={}",
+                established[0][sample].gpu_us,
+                h65[0][sample].gpu_us,
+                established[1][sample].gpu_us,
+                h65[1][sample].gpu_us,
+                established[2][sample].gpu_us,
+                h65[2][sample].gpu_us,
+                request_samples[sample],
+            );
+        }
+        assert!(
+            request_saving >= 20_000,
+            "H65 continuation requires >=20,000us/request isolated Down saving; measured {request_saving}us",
+        );
     }
 
     /// H63 continuation gate using the exact admitted-layer hot/cold counts
