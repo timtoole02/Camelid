@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "e4bf87d7",
+    "source_head": "67c597720",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -328,7 +328,7 @@
         "family": "ornith",
         "quantization": "Q4_K_M",
         "gguf_filename": "ornith-1.0-9b-Q4_K_M.gguf",
-        "sha256": "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f"
+        "sha256": "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106"
       },
       "contract": {
         "id": "ornith_1_0_9b_q4_k_m",
@@ -346,7 +346,7 @@
         "parity_audited": "cuda_5_prompt_pass_cross_backend_tolerance_attributed_near_ties_vs_llamacpp_acd79d6",
         "performance_measured": "cuda_device_decode_loop_18_8_toks_median_measured",
         "frontend_load_path_verified": "not_promoted",
-        "frontend_readiness_gate": "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0) and CAMELID_QWEN35_CUDA=1",
+        "frontend_readiness_gate": "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf; certified sha256 2711bf1e... on CUDA or 5720d1f6... on Apple Metal) is loaded_now=true, generation_ready=true, matching active_model_id, and served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
         "tested_context": "short_serve_smoke_plus_agent_eval_read_list_write",
         "chat_template_renderer": "ornith-chatml-native",
         "chat_template_shape_pack": "not_promoted",
@@ -369,8 +369,8 @@
         "latest_checked_bucket": "agent_eval_read_list_write",
         "latest_checked_result": "pass",
         "latest_checked_output": "camelid.agent_eval/v1 PASS (full 3-case battery)",
-        "evidence": "qwen35 (Ornith-1.0-9B) Q4_K_M fully GPU-resident (CAMELID_QWEN35_CUDA=1): 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle PASSES under the cross-backend tolerance policy — 2/5 token-identical at n=64 and every flip probed and attributed to soft positions with <=0.33-nat top-2 gaps where the oracle's own CPU-vs-CUDA backends also flip (qa/ornith/constrained-vram/RECEIPT_ITEM2_qwen35_parity_cuda.json, probes + oracle/camelid internal-variance controls committed alongside). The full read_file/list_dir/write_file agent battery passes on this exact file with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json); tool_capable earned ONLY by that receipt. Decode throughput 18.8 tok/s median via the device-side decode loop (qa/ornith/constrained-vram profile CSVs). NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
-        "next_step": "preserve the CUDA parity + agent capability for this exact row; NOTE a macOS resident Metal lane now accepts qwen35 K-quant files by default (opt-out CAMELID_QWEN35_METAL=0) and would serve THESE bytes on Apple Silicon with no receipt covering them — the only Metal K-quant parity evidence is qa/ornith/G-PARITY-qwen35-kquant-metal-macos.md, taken on a DIFFERENT artifact (sha256 5720d1f6, the HuggingFace imatrix quant, not this row's 2711bf1e); a Metal receipt on these exact bytes, context-pack coverage, the frontend picker load path, and a normalized full-support bundle remain before any broader claim"
+        "evidence": "qwen35 (Ornith-1.0-9B) Q4_K_M has two byte-pinned platform receipts under this filename. The in-house requant (sha256 2711bf1e...) is fully CUDA-resident and passes 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle under the cross-backend tolerance policy; its full read_file/list_dir/write_file agent battery is qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json. The public HuggingFace imatrix quant (sha256 5720d1f6...) runs on the resident Apple Metal qwen35 K-quant lane and passes the same full three-case agent battery after command-buffer completion was made fail-closed; receipt qa/agent-eval/ornith-1.0-9b-Q4_K_M-1786773670-PASS.json. Tool capability is admitted only for one of those two exact digests. CUDA decode throughput was 18.8 tok/s median via the device-side decode loop. NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
+        "next_step": "preserve both byte-pinned platform receipts; add bounded-context coverage, frontend picker load evidence, repeated current-head bundles, and a normalized full-support bundle before broadening the claim"
       }
     },
     {
