@@ -95,13 +95,22 @@ measured GPU stages totaled 701.8 ms and direct-stage I/O totaled 512.3 ms;
   around 44.6 tok/s. H21's K8 recurrence projects only about 244–259 reusable
   H40 records, enough for roughly 40.7–42.4 tok/s under ideal scaling, not 50.
 
-The next technically sound experiment is a default-off retained cold bank:
-about six records per layer (~577 MiB), exact hot + retained + fresh indexed
-tables, and terminal-safe identity publication. The existing shared 24-record
-stage cannot simply be reused: every layer overwrites it, so only the final
-layer survives a round. A retained bank is a moderate 250–400-line feature and
-is expected around 36–40 tok/s in practice. It is not implemented in this
-checkpoint because it is not a credible route to 50 by itself.
+A default-off retained cold bank was implemented after the promoted H40
+checkpoint: six records per layer (576.56 MiB), exact hot + retained + fresh
+indexed tables, and two-phase identity publication after a queue-order terminal
+barrier. H43 stayed exact and at zero swap but regressed to 33.53 and 33.42
+tok/s. It avoided 229 of H40's 580 reads in the later comparison, but the
+remaining small read batches fell from about 3.5 to 2.1 GiB/s and 278 serialized
+stage-to-bank blits copied another 886.9 MiB on the Metal queue.
+
+H44 adaptively split sparse fresh records across the eight-reader pool, capped
+at four positioned reads per record. It remained exact at 34.33 tok/s with zero
+swap and recovered about 38 ms versus H43 candidate 2, but did not beat H40.
+The next bounded experiment is direct-to-bank replacement fill: invalidate an
+unused bank destination before I/O, read its exact fresh record there while the
+hot command runs, bind that bank slot for the cold command, and publish its
+identity only after terminal success. That removes the blits without adding
+memory or changing the H40 default.
 
 Practical 50 tok/s on this exact 16 GiB lane needs both near-complete cold
 availability including first-use records and additional target-compute margin,

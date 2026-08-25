@@ -1089,6 +1089,20 @@ pub struct GhostFile {
     uncached: Option<std::sync::Mutex<UncachedReader>>,
 }
 
+fn routed_expert_positioned_chunk_bytes(expected_len: usize, requested_chunks: usize) -> usize {
+    const CHUNK_ALIGNMENT: usize = 16 * 1024;
+    let chunks = requested_chunks.max(1).min(expected_len.max(1));
+    if chunks == 1 || expected_len <= 1 {
+        return expected_len.max(1);
+    }
+    let balanced = expected_len.div_ceil(chunks);
+    if expected_len >= CHUNK_ALIGNMENT {
+        balanced.div_ceil(CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT
+    } else {
+        balanced
+    }
+}
+
 impl GhostFile {
     /// Retained file-backed payload mapping for non-faulting load-probe
     /// residency snapshots. Strict no-page-cache mode intentionally has none.
@@ -1797,6 +1811,23 @@ impl GhostFile {
         expert_idx: usize,
         destination: &mut [u8],
     ) -> Result<()> {
+        self.read_moe_expert_into_chunks(layer_idx, expert_idx, destination, 1)
+    }
+
+    /// Read one routed-expert record through several independent positioned
+    /// reads, then run the existing sampled payload-identity validation once
+    /// over the completed record. The ordinary reader above deliberately
+    /// requests one chunk and therefore preserves its established one-pread
+    /// behavior. The retained-cold research lane uses this only when too few
+    /// remaining records would otherwise leave the bounded Ghost read pool
+    /// under-filled.
+    pub(crate) fn read_moe_expert_into_chunks(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+        destination: &mut [u8],
+        requested_chunks: usize,
+    ) -> Result<()> {
         let (group, start, expected_len) = self.checked_moe_expert_span(layer_idx, expert_idx)?;
         if destination.len() != expected_len {
             return Err(invalid(format!(
@@ -1805,7 +1836,36 @@ impl GhostFile {
                 destination.len()
             )));
         }
-        self.read_positioned_span_into(start, expected_len as u64, destination)?;
+
+        let chunks = requested_chunks.max(1).min(expected_len.max(1));
+        if chunks == 1 || expected_len <= 1 {
+            self.read_positioned_span_into(start, expected_len as u64, destination)?;
+        } else {
+            use rayon::prelude::*;
+
+            // Keep all interior boundaries on a 16 KiB page when the record
+            // is large enough. The final chunk is intentionally exact rather
+            // than padded: callers own only the validated payload bytes.
+            let chunk_bytes = routed_expert_positioned_chunk_bytes(expected_len, chunks);
+            let outcomes = destination
+                .par_chunks_mut(chunk_bytes.max(1))
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let chunk_offset = chunk_idx.checked_mul(chunk_bytes).ok_or_else(|| {
+                        invalid("routed-expert positioned-read chunk offset overflow".to_string())
+                    })?;
+                    let source = start.checked_add(chunk_offset as u64).ok_or_else(|| {
+                        invalid("routed-expert positioned-read source offset overflow".to_string())
+                    })?;
+                    self.read_positioned_span_into(source, chunk.len() as u64, chunk)
+                })
+                .collect::<Vec<_>>();
+            // Do not short-circuit sibling reads: every task submitted to the
+            // pool joins before a partial record can be reported as failed.
+            for outcome in outcomes {
+                outcome?;
+            }
+        }
         let (_, access) = self.moe_group_access(layer_idx, expert_idx)?;
         self.validate_moe_expert_payload_identity(group, access, start, destination)
     }
@@ -2595,6 +2655,50 @@ mod tests {
     }
 
     #[test]
+    fn chunked_direct_moe_expert_read_matches_the_single_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.cghost");
+        write_tiny_moe_cghost(&path);
+        let ghost = GhostFile::open(&path).unwrap();
+
+        for expert_idx in 0..2 {
+            let len = ghost.moe_expert_byte_len(0, expert_idx).unwrap();
+            let mut expected = vec![0xa5; len];
+            ghost
+                .read_moe_expert_into(0, expert_idx, &mut expected)
+                .unwrap();
+            for chunks in [2, 3, 8] {
+                let mut actual = vec![0x5a; len];
+                ghost
+                    .read_moe_expert_into_chunks(0, expert_idx, &mut actual, chunks)
+                    .unwrap();
+                assert_eq!(actual, expected, "expert={expert_idx} chunks={chunks}");
+            }
+        }
+    }
+
+    #[test]
+    fn production_expert_chunk_plan_is_aligned_gapless_and_exact() {
+        const RECORD_BYTES: usize = 3_345_408;
+        const ALIGNMENT: usize = 16 * 1024;
+        let chunk_bytes = routed_expert_positioned_chunk_bytes(RECORD_BYTES, 4);
+        assert_eq!(chunk_bytes % ALIGNMENT, 0);
+
+        let ranges = (0..RECORD_BYTES)
+            .step_by(chunk_bytes)
+            .map(|start| start..(start + chunk_bytes).min(RECORD_BYTES))
+            .collect::<Vec<_>>();
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, RECORD_BYTES);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+            assert_eq!(pair[1].start % ALIGNMENT, 0);
+        }
+        assert!(ranges.iter().all(|range| range.start < range.end));
+    }
+
+    #[test]
     fn direct_moe_expert_read_rejects_wrong_destination_lengths_before_io() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.cghost");
@@ -2747,6 +2851,17 @@ mod tests {
                 assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof)
             }
             other => panic!("expected positioned-read I/O error, got {other}"),
+        }
+
+        destination.fill(0xa5);
+        let err = ghost
+            .read_moe_expert_into_chunks(0, 1, &mut destination, 4)
+            .unwrap_err();
+        match err {
+            BackendError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof)
+            }
+            other => panic!("expected chunked positioned-read I/O error, got {other}"),
         }
     }
 
@@ -2982,6 +3097,12 @@ mod tests {
         corrupt.sync_all().unwrap();
         drop(corrupt);
         let ghost = GhostFile::open(&out_path).unwrap();
+        let len = ghost.moe_expert_byte_len(0, 0).unwrap();
+        let mut destination = vec![0u8; len];
+        let err = ghost
+            .read_moe_expert_into_chunks(0, 0, &mut destination, 4)
+            .unwrap_err();
+        assert!(err.to_string().contains("payload identity mismatch"));
         let err = ghost.read_moe_expert(0, 0).unwrap_err();
         assert!(err.to_string().contains("payload identity mismatch"));
     }

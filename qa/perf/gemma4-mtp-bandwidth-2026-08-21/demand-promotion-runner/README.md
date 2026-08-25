@@ -85,6 +85,8 @@ construction; check `exact_prefix_len == 48` instead.
 | `H40-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100` | **Promoted Mini2 profile:** 34.69, 35.28, 35.08 tok/s exact; zero swap |
 | `H41-hot-cold-overlap-schedule14-13-14-direct-stage-hot2200` | 2,200-slot capacity check; exact but no faster, 34.77–34.93 tok/s |
 | `H42-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-rebalanced` | Same-memory rebalancing closure; exact at 34.82 tok/s, no-go |
+| `H43-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6` | Six retained cold records/layer; exact at 33.53 and 33.42 tok/s, zero swap, no-go |
+| `H44-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6-chunked-read` | H43 plus adaptive capped-four positioned-read splitting; exact at 34.33 tok/s, zero swap, no-go |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 
