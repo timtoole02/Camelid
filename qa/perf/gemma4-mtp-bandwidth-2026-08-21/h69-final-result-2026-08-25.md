@@ -7,8 +7,8 @@ observed anywhere in this Mini2 effort remains **36.84 tok/s** from H49's
 2,100-slot live-hidden sequential staging run. That run produced the frozen
 48/48 token sequence and observed zero swap, but it is a historical peak rather
 than a promotion result: the later physical-footprint treaty rejects the
-2,100-slot lane, and the repeatable promoted H40 checkpoint was 35.02 tok/s mean
-with a 35.28 tok/s peak. See
+2,100-slot lane, and the repeatable historical H40 checkpoint was 35.02 tok/s
+mean with a 35.28 tok/s peak. See
 [`mini2-50tps-checkpoint-2026-08-24.md`](mini2-50tps-checkpoint-2026-08-24.md)
 for the original receipts and decomposition.
 
