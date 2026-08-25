@@ -29767,17 +29767,17 @@ mod mtp_target_seam_tests {
         let counts = [65u16; 30];
         assert_eq!(
             format_exact_residency_trace(
-            42,
-            118,
-            14,
-            true,
-            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
-            &routes,
-            hot.as_slice(),
-            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
-            &[0.0; 30],
-            &counts,
-            1_950,
+                42,
+                118,
+                14,
+                true,
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                &routes,
+                hot.as_slice(),
+                &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+                &[0.0; 30],
+                &counts,
+                1_950,
             ),
             Err("resident-capacity")
         );
