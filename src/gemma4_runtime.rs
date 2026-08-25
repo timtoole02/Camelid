@@ -2160,7 +2160,7 @@ const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
 /// promoted by the current API/WebUI evidence bundle. Changing any runtime
 /// shape or named scheduling selector requires a new identifier and evidence.
 pub const GEMMA4_MINI2_WEBUI_PROFILE_ID: &str =
-    "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v2";
+    "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1";
 
 /// Exact expert payload paired with the prepared target above. The profile
 /// receipt is minted only after hashing the complete bytes through the same
@@ -14694,7 +14694,7 @@ fn mtp_scheduled_verify_width(
 }
 
 const MTP_ADAPTIVE_BASE_VERIFY_K: usize = 10;
-const MTP_ADAPTIVE_MIN_VERIFY_K: usize = 2;
+const MTP_ADAPTIVE_MIN_VERIFY_K: usize = 4;
 
 fn mtp_initial_verify_width(adaptive: bool, max_verify_k: usize) -> usize {
     if adaptive {
@@ -31341,10 +31341,10 @@ mod mtp_target_seam_tests {
         assert_eq!(mtp_next_verify_width(true, 12, 11, 10, 10), 12);
         assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 4), 6);
         assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 3), 5);
-        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 0), 2);
-        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 1), 3);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 0), 4);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 1), 4);
         assert_eq!(mtp_next_verify_width(true, 12, 12, 11, 10), 12);
-        assert_eq!(mtp_next_verify_width(true, 3, 3, 2, 0), 2);
+        assert_eq!(mtp_next_verify_width(true, 3, 3, 2, 0), 3);
     }
 
     #[test]

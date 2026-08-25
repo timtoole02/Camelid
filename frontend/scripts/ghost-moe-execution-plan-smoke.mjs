@@ -10,7 +10,7 @@ import {
 
 assert.equal(
   GEMMA4_MINI2_WEBUI_PROFILE_ID,
-  'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v2',
+  'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1',
   'the frontend receipt must stay pinned to the exact promoted Mini2 runtime profile',
 )
 
