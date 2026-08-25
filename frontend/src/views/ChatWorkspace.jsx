@@ -505,9 +505,9 @@ export default function ChatWorkspace({
   }
 
   /* Send-time budget check: the response limit is an upper bound the backend
-     clamps to the context's remaining room, so an overshoot is a non-blocking
-     notice. A prompt that fills the live window is rejected because speculative
-     verification needs an open position. Prompt size is a client estimate. */
+     clamps to the constructed context's remaining room, so an overshoot is a
+     non-blocking notice. A prompt that fills that allocation is rejected because
+     speculative verification needs an open position. Prompt size is a client estimate. */
   const estimatedPromptTokens = useMemo(() => {
     const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
     const text = `${history} ${composer}`
@@ -545,7 +545,7 @@ export default function ChatWorkspace({
     canChat ? 'Enter sends. Shift+Enter starts a new line.' : sendDisabledReason,
     ghostBudgetCapped
       ? ghostMetalContextCapacity
-        ? `Replies from this model are capped at ${effectiveMaxTokens.toLocaleString()} tokens to fit the live Metal context.`
+        ? `Replies from this model are capped at ${effectiveMaxTokens.toLocaleString()} tokens to fit the constructed Metal context.`
         : `Replies from this model are capped at ${effectiveMaxTokens.toLocaleString()} tokens on the Ghost serving lane.`
       : '',
     'Camelid runs the loaded model locally. Verify important output.',

@@ -507,7 +507,7 @@ const {
   assert.equal(applyGemma4ChatTokenFloor(3, 'gemma4_decoder'), 8, 'Gemma 4 chat should raise only undersized budgets to the visible-output floor')
   assert.equal(applyGemma4ChatTokenFloor(2048, 'gemma4_decoder'), 2048, 'Gemma 4 chat should preserve a configured budget already above the floor')
   assert.equal(applyGemma4ChatTokenFloor(3, 'llama_bpe_decoder'), 3, 'the Gemma 4 floor must not widen another model family\'s configured budget')
-  assert.equal(applyGemma4GhostChatTokenCap(8192, 'ghost_moe'), GEMMA4_GHOST_WEBUI_MAX_TOKENS, 'Ghost-MoE should retain its conservative fallback cap when live capacity is unavailable')
+  assert.equal(applyGemma4GhostChatTokenCap(8192, 'ghost_moe'), GEMMA4_GHOST_WEBUI_MAX_TOKENS, 'Ghost-MoE should retain its conservative fallback cap when constructed capacity is unavailable')
   assert.equal(applyGemma4GhostChatTokenCap(256, 'ghost_moe'), 256, 'Ghost-MoE should preserve a smaller user-selected budget')
   assert.equal(
     applyGemma4GhostChatTokenCap(512, 'ghost_moe', { contextCapacity: 1024, promptTokens: 900 }),
@@ -517,7 +517,7 @@ const {
   assert.equal(
     applyGemma4GhostChatTokenCap(512, 'ghost_moe', { contextCapacity: 256 }),
     256,
-    'a live Metal capacity below the fallback ceiling must still bound a reply before a prompt estimate exists',
+    'a constructed Metal capacity below the fallback ceiling must still bound a reply before a prompt estimate exists',
   )
   assert.equal(
     applyGemma4GhostChatTokenCap(512, 'ghost_moe', { contextCapacity: '1024', promptTokens: 900 }),
@@ -623,9 +623,9 @@ assert.match(rlcSource, /Memory estimate not available/, 'missing memory data re
 assert.match(rlcSource, /estimated/, 'the future readout contract keeps the estimated label in source')
 assert.doesNotMatch(rlcSource, /navigator\.deviceMemory|performance\.memory/, 'no client-side memory guessing')
 assert.match(chatWorkspaceSource, /validateSendBudget/, 'the composer must validate prompt+max_tokens against the real context rule at send time')
-assert.match(chatWorkspaceSource, /const ghostMetalContextCapacity = gemma4GhostRuntimeContextCapacity\([\s\S]*gemma4_ghost_common_metal_context_capacity/, 'the composer must validate the live Ghost Metal allocation before using it')
-assert.match(chatWorkspaceSource, /effectiveChatContextLength\([\s\S]*ghostMetalContextCapacity/, 'the composer must prefer the live Ghost Metal allocation over training-context metadata')
-assert.match(dashboardHookSource, /contextCapacity:\s*runtime\?\.gemma4_ghost_common_metal_context_capacity,[\s\S]*promptTokens:\s*promptTokenEstimate/, 'the request budget must include live Ghost context headroom before sending')
+assert.match(chatWorkspaceSource, /const ghostMetalContextCapacity = gemma4GhostRuntimeContextCapacity\([\s\S]*gemma4_ghost_common_metal_context_capacity/, 'the composer must validate the constructed Ghost Metal allocation before using it')
+assert.match(chatWorkspaceSource, /effectiveChatContextLength\([\s\S]*ghostMetalContextCapacity/, 'the composer must prefer the constructed Ghost Metal allocation over training-context metadata')
+assert.match(dashboardHookSource, /contextCapacity:\s*runtime\?\.gemma4_ghost_common_metal_context_capacity,[\s\S]*promptTokens:\s*promptTokenEstimate/, 'the request budget must include constructed Ghost context headroom before sending')
 
 /* ---- Display pacing honesty bounds (Phase 8B) ---- */
 const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../src/lib/streamPacing.js')

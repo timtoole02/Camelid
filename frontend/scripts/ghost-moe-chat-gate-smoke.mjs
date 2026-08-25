@@ -304,7 +304,7 @@ assert.match(
 assert.match(
   executionPlanSource,
   /gemma4_ghost_common_metal_context_capacity:\s*optionalPositiveInteger\(health\?\.gemma4_ghost_common_metal_context_capacity\)/,
-  'the live Metal context capacity must survive the health projection used by send budgeting',
+  'the constructed Metal context capacity must survive the health projection used by send budgeting',
 )
 assert.match(
   executionPlanSource,

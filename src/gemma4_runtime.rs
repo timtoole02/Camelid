@@ -32705,7 +32705,9 @@ mod scalar_prefill_head_tests {
 
 #[cfg(test)]
 mod ghost_hybrid_prefill_plan_tests {
-    use super::{select_ghost_prefill_plan, GhostPrefillPlan};
+    use super::{
+        ghost_prefill_requires_hybrid_finish, select_ghost_prefill_plan, GhostPrefillPlan,
+    };
 
     #[test]
     fn multi_token_common_prefill_defaults_to_hybrid_but_has_a_scalar_kill_switch() {

@@ -3453,6 +3453,20 @@ fn gemma4_ghost_execution_health(
     })
 }
 
+/// Health publishes the allocation that request admission enforces, even when
+/// the live GPU switch currently pins generation to CPU/storage. Keeping this
+/// separate from the live execution booleans lets clients budget consistently
+/// without allowing a dormant Metal lane to satisfy the verified-runtime gate.
+fn gemma4_ghost_constructed_context_capacity(
+    lane: Option<Gemma4ServeLane>,
+    capacity: Option<usize>,
+) -> Option<u32> {
+    (lane == Some(Gemma4ServeLane::GhostMoe))
+        .then_some(capacity)
+        .flatten()
+        .and_then(|capacity| capacity.try_into().ok())
+}
+
 async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     let active_id_lock = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
@@ -3545,14 +3559,12 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     let mtp_assistant_health = gemma4_runtime
         .as_deref()
         .and_then(Gemma4ServeRuntime::mtp_assistant_health);
-    let ghost_common_metal_context_capacity = ghost_execution
-        .filter(|health| health.common_metal_active)
-        .and_then(|_| {
-            gemma4_runtime
-                .as_deref()
-                .and_then(Gemma4ServeRuntime::ghost_metal_context_capacity)
-        })
-        .and_then(|capacity| capacity.try_into().ok());
+    let ghost_common_metal_context_capacity = gemma4_ghost_constructed_context_capacity(
+        gemma4_serve_lane,
+        gemma4_runtime
+            .as_deref()
+            .and_then(Gemma4ServeRuntime::ghost_metal_context_capacity),
+    );
     let ghost_exact_expert_policy_active = (gemma4_serve_lane == Some(Gemma4ServeLane::GhostMoe)
         && metal_owned_components.experts)
         .then(|| {
@@ -4125,6 +4137,51 @@ mod gemma4_serve_lane_health_tests {
             Gemma4GhostExecutionMode::CpuStorage,
             "deterministic mode disables every accelerator component",
         );
+    }
+
+    #[test]
+    fn ghost_health_keeps_constructed_context_visible_when_dispatch_is_inactive() {
+        let execution = gemma4_ghost_execution_health(
+            Some(Gemma4ServeLane::GhostMoe),
+            true,
+            crate::gemma4_runtime::Gemma4GhostMetalComponents {
+                common: true,
+                experts: true,
+                head: true,
+            },
+            crate::gemma4_runtime::Gemma4GhostCudaComponents::default(),
+            false,
+            false,
+        )
+        .expect("loaded Ghost runtime has health state");
+        assert!(!execution.common_metal_active, "the live GPU switch is off");
+        assert_eq!(
+            gemma4_ghost_constructed_context_capacity(
+                Some(Gemma4ServeLane::GhostMoe),
+                Some(1_024),
+            ),
+            Some(1_024),
+        );
+        assert_eq!(
+            gemma4_ghost_constructed_context_capacity(
+                Some(Gemma4ServeLane::Local),
+                Some(1_024),
+            ),
+            None,
+            "a neighboring Gemma 4 lane must not inherit Ghost capacity",
+        );
+        if usize::BITS > u32::BITS {
+            let too_large = usize::try_from(u64::from(u32::MAX) + 1)
+                .expect("wider usize holds one more than u32::MAX");
+            assert_eq!(
+                gemma4_ghost_constructed_context_capacity(
+                    Some(Gemma4ServeLane::GhostMoe),
+                    Some(too_large),
+                ),
+                None,
+                "health must fail closed when the runtime capacity does not fit the wire field",
+            );
+        }
     }
 
     #[test]
@@ -10365,7 +10422,7 @@ fn gemma4_context_bounded_max_tokens(
             StatusCode::BAD_REQUEST,
             "context_length_exceeded",
             format!(
-                "the rendered Gemma 4 prompt is {prompt_tokens} tokens, filling or exceeding the live Metal context capacity of {capacity}; shorten the conversation or start a new chat"
+                "the rendered Gemma 4 prompt is {prompt_tokens} tokens, filling or exceeding the constructed Metal context capacity of {capacity}; shorten the conversation or start a new chat"
             ),
             Some(parameter),
         )
@@ -10495,10 +10552,9 @@ impl Gemma4ServeRuntime {
         }
     }
 
-    /// Capacity is a serving constraint only while the common Metal lane is
-    /// eligible for this request. A live GPU opt-out or deterministic-mode
-    /// switch selects CPU/storage, whose context must not inherit a dormant
-    /// Metal allocation limit.
+    /// Load-time plan evidence may cite capacity only while the common Metal
+    /// lane is active. Request admission independently retains the constructed
+    /// allocation as its conservative ceiling across live GPU transitions.
     fn active_ghost_metal_context_capacity(&self) -> Option<usize> {
         self.ghost_metal_acceleration_active()
             .then(|| self.ghost_metal_context_capacity())
@@ -11231,7 +11287,7 @@ mod gemma4_hybrid_response_tests {
     use super::*;
 
     #[test]
-    fn live_metal_context_clamps_reply_instead_of_silently_falling_back_to_cpu() {
+    fn constructed_metal_context_clamps_reply_across_live_dispatch_changes() {
         assert_eq!(
             gemma4_max_tokens_for_runtime_context(900, 512, Some(1_024)),
             Ok(124)
