@@ -1,0 +1,129 @@
+{
+  "schema": "camelid.evidence_bundle_manifest/v1",
+  "bundle": "gemma4-26b-a4b-m4-metal-webui-20260825",
+  "generated_utc": "2026-08-25T22:50:33Z",
+  "qualification_harness_head": "138b0f538be0da162f973ab7f69c16b794f160cd",
+  "runtime_head": "138b0f538be0da162f973ab7f69c16b794f160cd",
+  "runtime_version": "v0.6.1-357-g138b0f538",
+  "checkout_state_before_final_runs": "runtime implementation was committed; public support documentation and this evidence manifest were the only pending tracked changes",
+  "host": {
+    "model_identifier": "Mac16,10",
+    "cpu": "Apple M4",
+    "memory_bytes": 17179869184,
+    "logical_cpus": 10,
+    "operating_system": "macOS 26.5.2",
+    "architecture": "arm64",
+    "backend": "gemma4_ghost_moe_metal_runtime",
+    "hostname_redacted": true
+  },
+  "model": {
+    "row_id": "gemma4_26b_a4b_qat_q4_0",
+    "runtime_id": "26B_dequant_it_hf",
+    "filename": "gemma-4-26B_q4_0-it.hot.gguf",
+    "size_bytes": 14439361440,
+    "prepared_target_sha256": "66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d",
+    "cghost_size_bytes": 12899030749,
+    "cghost_sha256": "b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757",
+    "mtp_assistant_size_bytes": 839427840
+  },
+  "runtime_profile": {
+    "id": "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1",
+    "anonymous_hot_slots": 1408,
+    "context_capacity": 1024,
+    "mtp_draft_ceiling": 15,
+    "adaptive_width": true,
+    "watchdog_active": false
+  },
+  "health_gate": {
+    "passed": true,
+    "loaded_now": true,
+    "generation_ready": true,
+    "backend": "gemma4-runtime",
+    "serve_lane": "ghost_moe",
+    "ghost_backend": "metal",
+    "execution_mode": "full_common_metal",
+    "common_metal_active": true,
+    "experts_metal_active": true,
+    "head_metal_active": true,
+    "common_gpu_active": true,
+    "experts_gpu_active": true,
+    "head_gpu_active": true,
+    "exact_expert_policy_active": true,
+    "mtp_assistant_loaded": true,
+    "mtp_full_q4_active": true
+  },
+  "execution_plan_gate": {
+    "passed": true,
+    "operating_system": "macos",
+    "architecture": "aarch64",
+    "cpu_model": "Apple M4",
+    "model_family": "gemma4",
+    "quant_type": "Q4_0",
+    "support_level": "supported_exact_row_smoke",
+    "selected_backend": "gemma4_ghost_moe_metal_runtime",
+    "prefill_path": "gemma4_ghost_moe_metal_prefill",
+    "decode_path": "gemma4_ghost_moe_metal_speculative_decode"
+  },
+  "correctness_gate": {
+    "passed": true,
+    "request_fixture": "qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-experiment-runner/request-48.json",
+    "expected_token_ids_fixture": "qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-experiment-runner/expected-48-token-ids.json",
+    "expected_generated_ids": 48,
+    "matching_generated_ids": 48,
+    "receipt_schema": 2,
+    "receipt_scope": "single_completed_measured_request",
+    "receipt_rounds": 5,
+    "receipt_forwarded_tokens": 48,
+    "receipt_accepted_drafts": 43,
+    "receipt_proposed_drafts": 44,
+    "route_lookups": 16344,
+    "route_hits": 12458,
+    "route_misses": 3886,
+    "promotion_loads": 3575,
+    "promotion_bytes": 11959833600,
+    "capacity_overflow_events": 0,
+    "victim_hits": 0
+  },
+  "api_sse_webui_gate": {
+    "passed": true,
+    "fresh_reply_support_claim": "verified",
+    "fresh_reply_experimental_lane": false,
+    "fresh_reply_unverified_badge_present": false,
+    "historical_reply_metadata_is_immutable": true,
+    "webui_prompt_tokens": 260,
+    "webui_generated_tokens": 8,
+    "webui_decode_tokens_per_second_rounded": 38.0,
+    "webui_developer_diagnostics_tokens_per_second": 37.6,
+    "webui_sample_is_short_and_not_a_throughput_claim": true
+  },
+  "performance_observations": {
+    "units": "generated tokens per second after the first token unless otherwise stated",
+    "frozen_structured_fixture": {
+      "post_first_tokens": 47,
+      "post_first_elapsed_ms": 1254.705,
+      "tokens_per_second": 37.459,
+      "time_to_first_content_ms": 6650,
+      "end_to_end_tokens_per_second": 6.075
+    },
+    "strict_receipt_same_fixture": {
+      "metric": "receipt round-wall decode rate",
+      "round_wall_ms": 1577.366,
+      "tokens_per_second": 30.4305
+    },
+    "ordinary_prose_repeats": {
+      "post_first_tokens_each": 127,
+      "tokens_per_second": [
+        17.614,
+        17.922
+      ]
+    },
+    "interpretation": "The previously observed approximately 36 tok/s result is reproducible only for the frozen structured fixture. Longer ordinary prose settles into lower MTP acceptance and remains in the high teens. No 36 or 50 tok/s general-chat claim is made."
+  },
+  "support_decision": "supported_exact_row_smoke",
+  "safety_qualified": false,
+  "claim_boundary": "exact prepared target and complete cghost digests; one Mac16,10 Apple M4 host running macOS 26.5.x arm64; exact 1,408-slot, 1,024-position full-common Metal Ghost-MoE plus full-Q4 MTP profile; no portable performance level or SLA, 50 tok/s claim, other Apple hardware, CPU or hybrid/partial Metal execution, neighboring artifact or quant, context ladder, broader Gemma/MoE support, broader MTP support, multimodal support, safety qualification, or production-readiness claim",
+  "artifacts": [
+    "manifest.json",
+    "SHA256SUMS"
+  ]
+}
