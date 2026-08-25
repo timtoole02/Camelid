@@ -85,7 +85,8 @@ class ExactResidencyTraceTest(unittest.TestCase):
         self.assertEqual(result["profile_resident_occurrences"], 960)
         self.assertEqual(result["projected_residual_cold_occurrences"], 0)
         self.assertEqual(result["projected_wave_saved_ms"], 120.0)
-        self.assertFalse(result["linear_ceiling_at_least_300ms_saved"])
+        self.assertFalse(result["linear_projection_at_least_300ms_saved"])
+        self.assertFalse(result["physical_demand_identity_bound"])
         self.assertEqual(len(result["profile"]), 30)
 
     def test_solver_prefers_recurrent_weighted_identities_over_low_ids(self):

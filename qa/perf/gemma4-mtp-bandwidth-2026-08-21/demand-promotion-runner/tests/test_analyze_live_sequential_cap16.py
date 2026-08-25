@@ -220,30 +220,34 @@ def stage_line(round_seq: int, start_pos: int, k_tokens: int, stage_cap: int = 8
     return ANALYZER.STAGE_PREFIX + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
-def prompt_ranked_handoff_line() -> str:
+def prompt_ranked_handoff_line(*, effective: bool = True) -> str:
     capacities = [
         int(value)
         for value in ANALYZER._parse_profile(ANALYZER.PROFILE_FILE)[
             "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER"
         ].split(",")
     ]
+    selected_capacities = (
+        capacities if effective else [capacity - 1 for capacity in capacities]
+    )
     masks = "/".join(
         f"L{layer}:{((1 << capacity) - 1):032x}"
-        for layer, capacity in enumerate(capacities)
+        for layer, capacity in enumerate(selected_capacities)
     )
+    selected_records = sum(selected_capacities)
     fields = {
         "schema": "1",
         "requested": "1",
         "admitted": "1",
-        "effective": "1",
+        "effective": "1" if effective else "0",
         "fill_ok": "1",
         "read_failures": "0",
         "source": "current-prompt-exact-route-union",
         "ranking": "decay-score-desc-expert-id-asc",
         "layers": "30",
-        "selected_records": "1408",
+        "selected_records": str(selected_records),
         "capacity_total": "1408",
-        "occupied_total": "1408",
+        "occupied_total": str(selected_records),
         "selected_masks": masks,
         "resident_masks": masks,
         "output_mutation": "0",
@@ -483,7 +487,59 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
             values = manifest_values()
             values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
             write_manifest(run_dir / "env.txt", values)
-            with self.assertRaisesRegex(ANALYZER.ReceiptError, "exactly one handoff"):
+            with self.assertRaisesRegex(
+                ANALYZER.ReceiptError, "exactly one effective handoff"
+            ):
+                ANALYZER.analyze(run_dir)
+
+    def test_prompt_ranked_handoff_binds_pre_ready_startup_separately(self) -> None:
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            original = (run_dir / "server.log").read_text(encoding="utf-8")
+            (run_dir / "server.log").write_text(
+                prompt_ranked_handoff_line(effective=False)
+                + "\nCamelid is ready\n"
+                + prompt_ranked_handoff_line()
+                + "\n"
+                + original,
+                encoding="utf-8",
+            )
+            result = ANALYZER.analyze(run_dir)
+        self.assertTrue(result["integrity"]["prompt_ranked_hot_handoff_effective"])
+
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            with (run_dir / "server.log").open("a", encoding="utf-8") as handle:
+                handle.write("Camelid is ready\n")
+                handle.write(prompt_ranked_handoff_line(effective=False) + "\n")
+                handle.write(prompt_ranked_handoff_line() + "\n")
+            with self.assertRaisesRegex(ANALYZER.ReceiptError, "not strictly pre-ready"):
+                ANALYZER.analyze(run_dir)
+
+    def test_prompt_ranked_startup_totals_must_reconcile(self) -> None:
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            startup = prompt_ranked_handoff_line(effective=False).replace(
+                "selected_records=1378", "selected_records=1377", 1
+            )
+            original = (run_dir / "server.log").read_text(encoding="utf-8")
+            (run_dir / "server.log").write_text(
+                startup
+                + "\nCamelid is ready\n"
+                + prompt_ranked_handoff_line()
+                + "\n"
+                + original,
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ANALYZER.ReceiptError, "startup selected total does not reconcile"
+            ):
                 ANALYZER.analyze(run_dir)
 
     def test_probe_rejects_unknown_missing_and_duplicate_fields(self) -> None:

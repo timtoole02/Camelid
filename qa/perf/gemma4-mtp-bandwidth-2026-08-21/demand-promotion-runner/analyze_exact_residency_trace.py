@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate exact decode-route traces and solve the fixed 1,408-slot profile."""
+"""Validate exact decode-route traces and solve a 1,408-slot coverage heuristic."""
 
 import hashlib
 import json
@@ -295,9 +295,13 @@ def solve_profile(traces, measured_decode_wall_us):
     return {
         "schema_version": 1,
         "valid": True,
-        "profile_kind": "offline-exact-route-weighted-residency-ceiling",
+        "profile_kind": "offline-exact-route-weighted-residency-heuristic",
         "fixture_specialized": True,
         "throughput_promotion_allowed": False,
+        "physical_demand_identity_bound": False,
+        "projection_basis": (
+            "route-minus-start-residency-count-weighted-by-direct-demand-wave-wall"
+        ),
         "capacity_total": sum(EXPECTED_CAPACITIES),
         "capacities": list(EXPECTED_CAPACITIES),
         "route_occurrences": route_occurrences,
@@ -309,11 +313,13 @@ def solve_profile(traces, measured_decode_wall_us):
         "projected_wave_saved_ms": round(float(projected_saved / 1_000), 3),
         "measured_decode_wall_ms": round(measured_decode_wall_us / 1_000, 3),
         "required_saved_for_50_tok_s_ms": round(required_saved / 1_000, 3),
-        "optimistic_decode_wall_floor_ms": round(projected_decode_ms, 3),
-        "optimistic_decode_tok_s_ceiling": round(48_000 / projected_decode_ms, 6),
-        "linear_ceiling_at_least_300ms_saved": projected_saved >= 300_000,
-        "linear_ceiling_covers_required_50_tok_s_saving": projected_saved >= required_saved,
-        "linear_ceiling_allows_at_least_50_tok_s": projected_decode_wall <= 960_000,
+        "linear_route_coverage_projected_decode_wall_ms": round(projected_decode_ms, 3),
+        "linear_route_coverage_projected_tok_s": round(48_000 / projected_decode_ms, 6),
+        "linear_projection_at_least_300ms_saved": projected_saved >= 300_000,
+        "linear_projection_covers_required_50_tok_s_saving": (
+            projected_saved >= required_saved
+        ),
+        "linear_projection_allows_at_least_50_tok_s": projected_decode_wall <= 960_000,
         "profile_sha256": digest,
         "profile": profile_lines,
     }

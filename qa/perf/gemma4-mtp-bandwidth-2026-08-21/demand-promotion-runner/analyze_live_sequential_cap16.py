@@ -291,20 +291,122 @@ def _parse_handoff_masks(raw: str, label: str) -> list[int]:
 def validate_prompt_ranked_handoff(
     log: str, environment: dict[str, str]
 ) -> list[int] | None:
-    lines = [
-        line for line in log.splitlines() if line.startswith(PROMPT_RANKED_HANDOFF_PREFIX)
-    ]
+    log_lines = log.splitlines()
+    receipts: list[tuple[int, dict[str, str]]] = []
+    for index, line in enumerate(log_lines):
+        if not line.startswith(PROMPT_RANKED_HANDOFF_PREFIX):
+            continue
+        fields = _parse_fields(
+            line[len(PROMPT_RANKED_HANDOFF_PREFIX):], "prompt-ranked handoff"
+        )
+        _expect_fields(fields, PROMPT_RANKED_HANDOFF_FIELDS, "prompt-ranked handoff")
+        if fields["effective"] not in ("0", "1"):
+            raise ReceiptError("prompt-ranked handoff effective must be exactly 0 or 1")
+        receipts.append((index, fields))
     requested = environment.get(PROMPT_RANKED_HOT_HANDOFF_SELECTOR) == "1"
     if not requested:
-        if lines:
+        if receipts:
             raise ReceiptError("unselected prompt-ranked handoff receipt is present")
         return None
-    if len(lines) != 1:
-        raise ReceiptError(f"prompt-ranked profile requires exactly one handoff receipt, got {len(lines)}")
-    fields = _parse_fields(
-        lines[0][len(PROMPT_RANKED_HANDOFF_PREFIX):], "prompt-ranked handoff"
-    )
-    _expect_fields(fields, PROMPT_RANKED_HANDOFF_FIELDS, "prompt-ranked handoff")
+    effective = [item for item in receipts if item[1]["effective"] == "1"]
+    inactive = [item for item in receipts if item[1]["effective"] == "0"]
+    if len(effective) != 1:
+        raise ReceiptError(
+            "prompt-ranked profile requires exactly one effective handoff receipt, "
+            f"got {len(effective)}"
+        )
+    ready_indices = [
+        index for index, line in enumerate(log_lines) if "Camelid is ready" in line
+    ]
+    if inactive:
+        if len(inactive) != 1 or len(ready_indices) != 1:
+            raise ReceiptError(
+                "prompt-ranked startup handoff requires exactly one inactive receipt "
+                "and one readiness boundary"
+            )
+        if not inactive[0][0] < ready_indices[0] < effective[0][0]:
+            raise ReceiptError(
+                "prompt-ranked inactive startup receipt is not strictly pre-ready"
+            )
+    elif ready_indices and (
+        len(ready_indices) != 1 or effective[0][0] <= ready_indices[0]
+    ):
+        raise ReceiptError("prompt-ranked effective receipt is not strictly post-ready")
+
+    capacities = [
+        _parse_uint(item, "prompt-ranked H49 capacity")
+        for item in environment[
+            "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER"
+        ].split(",")
+    ]
+    if len(capacities) != 30 or sum(capacities) != 1_408:
+        raise ReceiptError("prompt-ranked handoff capacity vector is not exact H49")
+
+    if inactive:
+        startup = inactive[0][1]
+        startup_exact = {
+            "schema": "1",
+            "requested": "1",
+            "admitted": "1",
+            "effective": "0",
+            "fill_ok": "1",
+            "read_failures": "0",
+            "source": "current-prompt-exact-route-union",
+            "ranking": "decay-score-desc-expert-id-asc",
+            "layers": "30",
+            "capacity_total": "1408",
+            "output_mutation": "0",
+            "io_mutation": "1",
+            "slot_policy_mutation": "1",
+            "table_mutation": "1",
+            "route_mutation": "0",
+            "routing_authority": "exact-router",
+        }
+        for key, expected in startup_exact.items():
+            if startup[key] != expected:
+                raise ReceiptError(
+                    f"prompt-ranked startup handoff requires {key}={expected}, "
+                    f"got {startup[key]!r}"
+                )
+        startup_selected = _parse_handoff_masks(
+            startup["selected_masks"], "startup selected_masks"
+        )
+        startup_resident = _parse_handoff_masks(
+            startup["resident_masks"], "startup resident_masks"
+        )
+        selected_records = _parse_uint(
+            startup["selected_records"],
+            "prompt-ranked startup selected_records",
+            maximum=1_408,
+        )
+        occupied_total = _parse_uint(
+            startup["occupied_total"],
+            "prompt-ranked startup occupied_total",
+            maximum=1_408,
+        )
+        if selected_records != sum(popcount(mask) for mask in startup_selected):
+            raise ReceiptError("prompt-ranked startup selected total does not reconcile")
+        if occupied_total != sum(popcount(mask) for mask in startup_resident):
+            raise ReceiptError("prompt-ranked startup occupied total does not reconcile")
+        for layer, (selected_mask, resident_mask, capacity) in enumerate(
+            zip(startup_selected, startup_resident, capacities)
+        ):
+            if popcount(selected_mask) > capacity or popcount(resident_mask) > capacity:
+                raise ReceiptError(
+                    f"prompt-ranked startup L{layer} exceeds fixed capacity"
+                )
+            if resident_mask & ~selected_mask:
+                raise ReceiptError(
+                    f"prompt-ranked startup L{layer} installed an unselected identity"
+                )
+        if (
+            selected_records == 1_408
+            and occupied_total == 1_408
+            and startup_selected == startup_resident
+        ):
+            raise ReceiptError("prompt-ranked startup falsely reports effective=0")
+
+    fields = effective[0][1]
     exact = {
         "schema": "1",
         "requested": "1",
@@ -330,16 +432,8 @@ def validate_prompt_ranked_handoff(
             raise ReceiptError(
                 f"prompt-ranked handoff requires {key}={expected}, got {fields[key]!r}"
             )
-    capacities = [
-        _parse_uint(item, "prompt-ranked H49 capacity")
-        for item in environment[
-            "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER"
-        ].split(",")
-    ]
     selected = _parse_handoff_masks(fields["selected_masks"], "selected_masks")
     resident = _parse_handoff_masks(fields["resident_masks"], "resident_masks")
-    if len(capacities) != 30 or sum(capacities) != 1_408:
-        raise ReceiptError("prompt-ranked handoff capacity vector is not exact H49")
     for layer, (selected_mask, resident_mask, capacity) in enumerate(
         zip(selected, resident, capacities)
     ):
