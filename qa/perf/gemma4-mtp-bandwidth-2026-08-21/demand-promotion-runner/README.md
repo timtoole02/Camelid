@@ -105,6 +105,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H58-moe-mma-k16` | Strict default-off K13/K14 staged-MMA GateUp: 3/3 raw gates and isolated timing projected 30.588 ms/request saved with zero swap; exact Mini2 ABBA cut GateUp by 10.0 ms/round and GPU time by 9.65 ms/round, but mean throughput regressed 1.25%, so retain as a compute building block and do not promote the profile |
 | `H59-mtp-device-chain-k4-warmup` | Default-off exact K4 + step-3-capture load warm: the warm graph fell to 85 us, but the first real K4 was 27,947 us versus 26,479 us for H58; exact, zero swap, immediate no-go with no ABBA |
 | `H60-mtp-bf16-producer-fusion` | Default-off assistant BF16 producer fusion: exact targeted tests passed, but the ignored exact 44-proposal microbenchmark saved only 2,427 us/request (8,102 us control versus 5,675 us fused), below the 5,000 us gate; no-go with no Mini2 run, source and profile retained for reproducibility |
+| `H61-wide-qkv-staged` (source-history audit; no profile) | Exact wide-QKV SG4/TB8 activation staging duplicated the already-falsified runtime-width staged family in `9b28d3f9`; the tiled candidates, including SG4/TB8, measured 0.438--0.964x on M4, so H61 stopped before a build or Mini2 run |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 

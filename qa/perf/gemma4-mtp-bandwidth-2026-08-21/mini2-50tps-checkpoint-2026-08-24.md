@@ -373,6 +373,27 @@ required 5,000 us continuation gate, so H60 is a **NO-GO** and no Mini2 run was
 performed. The default-off source and `H60-mtp-bf16-producer-fusion` profile
 remain in the branch for reproducibility.
 
+## Exact wide-QKV activation-staging source-history closure (H61)
+
+H61 considered sharing each local fused-QKV activation tile across four
+SIMDgroups at SG4/TB8 while retaining the runtime-width floating-point program.
+The production local shape is Q/K/V = 4096/2048/2048 rows with 88 Q4 blocks
+per row. Before a build, the source-history audit found that commit `9b28d3f9`
+had already tested this scheduling family against the exact runtime-width
+oracle, including SG4/TB8.
+
+All candidates in that prior audit were raw-bit exact. On the 724.8 MB
+distinct-weight 30-layer M4 sweep, however, the best result was the unstaged
+SG4/TB0 shape at 37.912 ms versus the 38.196 ms oracle (1.007x, within noise),
+while the tiled candidates ranged from 0.438x to 0.964x. The older fixed-K8
+staged QKV result is not a counterexample: that arithmetic family is not
+partition-safe against the runtime-width/K1 oracle used by the current
+K14/K13/K14/K7 verifier schedule.
+
+H61 is therefore a source-history **NO-GO**. No H61 profile was created, no
+source candidate was retained, and no build, focused test, benchmark, binary,
+or Mini2 run was performed.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -437,6 +458,8 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - H60 targeted raw-u32 producer parity and dispatch/traffic accounting: pass;
   ignored exact 44-proposal timing median 8,102 us control versus 5,675 us
   fused, saving 2,427 us/request against the required 5,000 us gate;
+- H61 source-history audit: commit `9b28d3f9` already covered the exact
+  runtime-width staged family, including SG4/TB8; no new execution occurred;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 
