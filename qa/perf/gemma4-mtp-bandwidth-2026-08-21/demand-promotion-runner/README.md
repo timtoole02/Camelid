@@ -92,6 +92,11 @@ construction; check `exact_prefix_len == 48` instead.
 | `H47-live-hidden-sequential-stage-cap8` | Exact one-reader private cap-eight stage; 34.69–36.51 tok/s, modest gain, scalar predictor too costly |
 | `H48-live-hidden-sequential-fast-predict` | H47 plus batched Accelerate SGEMM predictor; exact at 36.22 tok/s, one-reader readiness limited |
 | `H49-live-hidden-sequential-fast-predict-dual-reader` | H48 plus a second private reader under the same cap; exact at 36.84 tok/s, zero swap; current research best |
+| `H50-live-hidden-dual-previous-cold96` | H49 plus capped previous-round staging; exact at 34.74 tok/s, zero swap, no-go |
+| `H51-live-hidden-fast-dual-k16x3` | Three K16 verifier passes; exact at 34.08 tok/s, zero swap, no-go |
+| `H52-k16-7-step3-rejection-rank-probe` | Diagnostic width/rank profile retained for reproducibility; superseded by the narrower H53 rejection probe |
+| `H53-k16-draft10-rank-probe` | Diagnostic K16 run; exact at 34.06 tok/s, but the decisive target token ranked 20th at draft index 10, closing the width-only shortcut |
+| `H54-three-wave-live-ready-gateup` | Exact three-wave hot/ready/demand GateUp overlap; 36.25 tok/s, zero swap, no-go because 82 extra GPU submissions erased the hidden I/O gain |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 

@@ -11,14 +11,15 @@
 //! - absent or previously failed keys are read synchronously by demand.
 //!
 //! The module has no model, Metal, Ghost, or file-format dependency. Callers
-//! supply an immutable, thread-safe loader closure. A process-global permit
-//! bounds live predictive stages to one, including the interval after a stage
-//! owner is dropped while its final blocking read is still returning.
+//! supply an immutable, thread-safe loader closure. Process-global lane
+//! permits bound live fixed and rolling stages to one of each, including the
+//! interval after a stage owner is dropped while its final blocking read is
+//! still returning.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Exact identity of one independently loadable expert record.
@@ -161,6 +162,7 @@ impl std::error::Error for PredictiveStageStartError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PredictiveRecordTakeError {
     Cancelled,
+    DemandInFlight(PredictiveRecordKey),
     AlreadyTaken(PredictiveRecordKey),
     LoadFailed {
         key: PredictiveRecordKey,
@@ -172,6 +174,11 @@ impl fmt::Display for PredictiveRecordTakeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => write!(f, "predictive record stage was cancelled"),
+            Self::DemandInFlight(key) => write!(
+                f,
+                "predictive record ({}, {}) already has an authoritative demand owner",
+                key.layer, key.expert
+            ),
             Self::AlreadyTaken(key) => write!(
                 f,
                 "predictive record ({}, {}) was already taken",
@@ -202,22 +209,29 @@ pub(crate) struct PredictiveStageSnapshot {
     pub(crate) coordinator_done: bool,
 }
 
-static PREDICTIVE_STAGE_ACTIVE: AtomicBool = AtomicBool::new(false);
+const FIXED_STAGE_PERMIT: u8 = 1 << 0;
+const ROLLING_STAGE_PERMIT: u8 = 1 << 1;
+static PREDICTIVE_STAGE_ACTIVE: AtomicU8 = AtomicU8::new(0);
 
-struct GlobalStagePermit;
+struct GlobalStagePermit {
+    lane: u8,
+}
 
 impl GlobalStagePermit {
-    fn try_acquire() -> Option<Self> {
+    fn try_acquire(lane: u8) -> Option<Self> {
+        debug_assert!(lane == FIXED_STAGE_PERMIT || lane == ROLLING_STAGE_PERMIT);
         PREDICTIVE_STAGE_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active & lane == 0).then_some(active | lane)
+            })
             .ok()
-            .map(|_| Self)
+            .map(|_| Self { lane })
     }
 }
 
 impl Drop for GlobalStagePermit {
     fn drop(&mut self) {
-        PREDICTIVE_STAGE_ACTIVE.store(false, Ordering::Release);
+        PREDICTIVE_STAGE_ACTIVE.fetch_and(!self.lane, Ordering::AcqRel);
     }
 }
 
@@ -275,7 +289,7 @@ impl PredictiveRecordStage {
             return Err(PredictiveStageStartError::NoCandidates);
         }
 
-        let permit = GlobalStagePermit::try_acquire()
+        let permit = GlobalStagePermit::try_acquire(FIXED_STAGE_PERMIT)
             .ok_or(PredictiveStageStartError::StageAlreadyActive)?;
         let entries = ordered_keys
             .iter()
@@ -446,9 +460,65 @@ impl PredictiveRecordStage {
         }
     }
 
+    /// Take a completed predictive record or atomically claim immediate
+    /// authoritative fallback without waiting for speculative I/O.
+    ///
+    /// A queued, reading, or failed candidate moves to `DemandOwned` before
+    /// this method returns [`PredictiveRecordClaim::Demand`]. If a speculative
+    /// read was already running, its private result is discarded when the
+    /// coordinator observes that the entry is no longer `Reading`. A second
+    /// caller can therefore never receive another demand claim for the same
+    /// key. The demand owner must publish completion with
+    /// [`Self::finish_demand`].
+    ///
+    /// This method never invokes the loader or waits on a condition variable.
+    pub(crate) fn try_claim_ready_or_demand(
+        &self,
+        key: PredictiveRecordKey,
+    ) -> Result<PredictiveRecordClaim, PredictiveRecordTakeError> {
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            return Err(PredictiveRecordTakeError::Cancelled);
+        }
+        let Some(entry) = self.inner.entries.get(&key) else {
+            return Ok(PredictiveRecordClaim::Demand);
+        };
+
+        let mut state = entry.lock();
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            return Err(PredictiveRecordTakeError::Cancelled);
+        }
+        match &*state {
+            PredictiveRecordState::Queued
+            | PredictiveRecordState::Reading
+            | PredictiveRecordState::Failed(_) => {
+                *state = PredictiveRecordState::DemandOwned;
+                entry.changed.notify_all();
+                Ok(PredictiveRecordClaim::Demand)
+            }
+            PredictiveRecordState::Ready(_) => {
+                let ready = std::mem::replace(&mut *state, PredictiveRecordState::Taken);
+                entry.changed.notify_all();
+                let PredictiveRecordState::Ready(bytes) = ready else {
+                    unreachable!("state was matched as Ready")
+                };
+                Ok(PredictiveRecordClaim::Staged(PredictiveRecord {
+                    key,
+                    source: PredictiveRecordSource::Staged,
+                    bytes,
+                }))
+            }
+            PredictiveRecordState::DemandOwned => {
+                Err(PredictiveRecordTakeError::DemandInFlight(key))
+            }
+            PredictiveRecordState::Taken => Err(PredictiveRecordTakeError::AlreadyTaken(key)),
+        }
+    }
+
     /// Publish completion of a demand claim made by
-    /// [`Self::claim_ready_or_demand`]. Keys outside the predictive set need no
-    /// publication. A failed batch can be retried by a later exact consumer.
+    /// [`Self::claim_ready_or_demand`] or
+    /// [`Self::try_claim_ready_or_demand`]. Keys outside the predictive set
+    /// need no publication. A failed batch can be retried by a later exact
+    /// consumer.
     pub(crate) fn finish_demand(&self, key: PredictiveRecordKey, succeeded: bool) {
         let Some(entry) = self.inner.entries.get(&key) else {
             return;
@@ -734,8 +804,9 @@ struct RollingPredictiveInner {
     work_available: Condvar,
     // Retain the process-global stage permit in shared ownership so a blocked
     // loader cannot be followed by an unbounded succession of new workers.
-    // The permit is released only after both the public owner and worker drop
-    // their final `Arc`, including the late-read cancellation interval.
+    // The rolling-lane permit is released only after both the public owner and
+    // every worker drop their final `Arc`, including the late-read
+    // cancellation interval. A fixed pre-assistant stage has its own bit.
     _permit: GlobalStagePermit,
 }
 
@@ -786,7 +857,7 @@ impl RollingPredictiveRecordStage {
             });
         }
 
-        let permit = GlobalStagePermit::try_acquire()
+        let permit = GlobalStagePermit::try_acquire(ROLLING_STAGE_PERMIT)
             .ok_or(RollingPredictiveStageStartError::StageAlreadyActive)?;
 
         let inner = Arc::new(RollingPredictiveInner {
@@ -1051,8 +1122,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    // The production permit is intentionally process-global, so these tests
-    // must not contend with one another when the Rust test harness is parallel.
+    // The production lane permits are intentionally process-global, so these
+    // tests must not contend with one another when the Rust harness is parallel.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     struct TestGuard {
@@ -1065,7 +1136,7 @@ mod tests {
             // later in each test. Wait for any just-cancelled coordinator to
             // release the process-global permit before another test begins.
             let deadline = Instant::now() + Duration::from_secs(2);
-            while PREDICTIVE_STAGE_ACTIVE.load(Ordering::Acquire) {
+            while PREDICTIVE_STAGE_ACTIVE.load(Ordering::Acquire) != 0 {
                 assert!(
                     Instant::now() < deadline,
                     "test left a predictive stage coordinator stalled"
@@ -1253,6 +1324,135 @@ mod tests {
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stage.status(second), Some(PredictiveRecordStatus::Taken));
+    }
+
+    #[test]
+    fn try_claim_is_nonblocking_for_reading_and_cancel_preserves_demand_ownership() {
+        let _serial = test_guard();
+        let wanted = key(3, 12);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let loader: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            assert_eq!(loaded_key, wanted);
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(bytes(12))
+        });
+        let stage = PredictiveRecordStage::start([wanted], 1, loader).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let claim_started = Instant::now();
+        assert_eq!(
+            stage.try_claim_ready_or_demand(wanted),
+            Ok(PredictiveRecordClaim::Demand)
+        );
+        assert!(
+            claim_started.elapsed() < Duration::from_millis(100),
+            "try-claim waited for a stalled speculative loader"
+        );
+        assert_eq!(
+            stage.status(wanted),
+            Some(PredictiveRecordStatus::DemandOwned)
+        );
+        assert_eq!(
+            stage.try_claim_ready_or_demand(wanted),
+            Err(PredictiveRecordTakeError::DemandInFlight(wanted))
+        );
+
+        stage.cancel();
+        assert_eq!(
+            stage.status(wanted),
+            Some(PredictiveRecordStatus::DemandOwned)
+        );
+        stage.finish_demand(wanted, true);
+        assert_eq!(stage.status(wanted), Some(PredictiveRecordStatus::Taken));
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !stage.snapshot().coordinator_done {
+            assert!(
+                Instant::now() < deadline,
+                "speculative coordinator did not discard its late private result"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(stage.status(wanted), Some(PredictiveRecordStatus::Taken));
+    }
+
+    #[test]
+    fn try_claim_owns_queued_fallback_and_takes_ready_bytes() {
+        let _serial = test_guard();
+        let first = key(4, 1);
+        let second = key(4, 2);
+        let second_speculative_calls = Arc::new(AtomicUsize::new(0));
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let release_first_rx = Mutex::new(release_first_rx);
+        let second_calls_for_loader = Arc::clone(&second_speculative_calls);
+        let loader: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            if loaded_key == first {
+                first_started_tx.send(()).unwrap();
+                release_first_rx.lock().unwrap().recv().unwrap();
+                Ok(bytes(1))
+            } else {
+                assert_eq!(loaded_key, second);
+                second_calls_for_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(bytes(2))
+            }
+        });
+        let stage = PredictiveRecordStage::start([first, second], 2, loader).unwrap();
+        first_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(stage.status(second), Some(PredictiveRecordStatus::Queued));
+
+        assert_eq!(
+            stage.try_claim_ready_or_demand(second),
+            Ok(PredictiveRecordClaim::Demand)
+        );
+        stage.finish_demand(second, true);
+        release_first_tx.send(()).unwrap();
+        wait_for_status(&stage, first, PredictiveRecordStatus::Ready);
+
+        let first_record = match stage.try_claim_ready_or_demand(first).unwrap() {
+            PredictiveRecordClaim::Staged(record) => record,
+            PredictiveRecordClaim::Demand => panic!("ready record fell through to demand"),
+        };
+        assert_eq!(first_record.source, PredictiveRecordSource::Staged);
+        assert_eq!(&*first_record.bytes, &[1; 4]);
+        assert_eq!(second_speculative_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(stage.snapshot().taken, 2);
+    }
+
+    #[test]
+    fn try_claim_retries_failed_and_leaves_absent_keys_untracked() {
+        let _serial = test_guard();
+        let failed = key(5, 7);
+        let absent = key(6, 8);
+        let loader: PredictiveRecordLoader = Arc::new(|_| Err("staged failure".into()));
+        let stage = PredictiveRecordStage::start([failed], 1, loader).unwrap();
+        wait_for_status(&stage, failed, PredictiveRecordStatus::Failed);
+
+        assert_eq!(
+            stage.try_claim_ready_or_demand(failed),
+            Ok(PredictiveRecordClaim::Demand)
+        );
+        stage.finish_demand(failed, false);
+        assert_eq!(stage.status(failed), Some(PredictiveRecordStatus::Failed));
+        assert_eq!(
+            stage.try_claim_ready_or_demand(failed),
+            Ok(PredictiveRecordClaim::Demand)
+        );
+        stage.finish_demand(failed, true);
+        assert_eq!(stage.status(failed), Some(PredictiveRecordStatus::Taken));
+
+        assert_eq!(
+            stage.try_claim_ready_or_demand(absent),
+            Ok(PredictiveRecordClaim::Demand)
+        );
+        stage.finish_demand(absent, true);
+        assert_eq!(stage.status(absent), None);
     }
 
     #[test]
@@ -1457,6 +1657,63 @@ mod tests {
         release_tx.send(()).unwrap();
         let stage_two = start_until_permit_released(vec![key(1, 1)], loader_two);
         assert_eq!(stage_two.candidate_keys(), &[key(1, 1)]);
+    }
+
+    #[test]
+    fn fixed_and_rolling_permit_lanes_coexist_and_release_independently() {
+        let _serial = test_guard();
+        let fixed_key = key(20, 1);
+        let (fixed_started_tx, fixed_started_rx) = mpsc::channel();
+        let (release_fixed_tx, release_fixed_rx) = mpsc::channel();
+        let release_fixed_rx = Mutex::new(release_fixed_rx);
+        let fixed_loader_one: PredictiveRecordLoader = Arc::new(move |_| {
+            fixed_started_tx.send(()).unwrap();
+            release_fixed_rx.lock().unwrap().recv().unwrap();
+            Ok(bytes(1))
+        });
+        let fixed_one = PredictiveRecordStage::start([fixed_key], 1, fixed_loader_one).unwrap();
+        fixed_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let rolling_loader: PredictiveRecordLoader = Arc::new(|key| Ok(bytes(key.expert as u8)));
+        let rolling_one =
+            RollingPredictiveRecordStage::start(2, Arc::clone(&rolling_loader)).unwrap();
+        let fixed_loader_two: PredictiveRecordLoader = Arc::new(|_| Ok(bytes(2)));
+        assert!(matches!(
+            PredictiveRecordStage::start([key(21, 2)], 1, Arc::clone(&fixed_loader_two)),
+            Err(PredictiveStageStartError::StageAlreadyActive)
+        ));
+        assert!(matches!(
+            RollingPredictiveRecordStage::start(2, Arc::clone(&rolling_loader)),
+            Err(RollingPredictiveStageStartError::StageAlreadyActive)
+        ));
+
+        drop(fixed_one);
+        assert!(matches!(
+            PredictiveRecordStage::start([key(21, 2)], 1, Arc::clone(&fixed_loader_two)),
+            Err(PredictiveStageStartError::StageAlreadyActive)
+        ));
+        release_fixed_tx.send(()).unwrap();
+        let fixed_two =
+            start_until_permit_released(vec![key(21, 2)], Arc::clone(&fixed_loader_two));
+
+        // Releasing the fixed bit must not release the still-owned rolling bit.
+        assert!(matches!(
+            RollingPredictiveRecordStage::start(2, Arc::clone(&rolling_loader)),
+            Err(RollingPredictiveStageStartError::StageAlreadyActive)
+        ));
+        stop_rolling(&rolling_one);
+        drop(rolling_one);
+
+        let rolling_two = RollingPredictiveRecordStage::start(2, rolling_loader).unwrap();
+        // Releasing the rolling bit must not release the still-owned fixed bit.
+        assert!(matches!(
+            PredictiveRecordStage::start([key(22, 3)], 1, fixed_loader_two),
+            Err(PredictiveStageStartError::StageAlreadyActive)
+        ));
+        stop_rolling(&rolling_two);
+        drop(fixed_two);
     }
 
     #[test]

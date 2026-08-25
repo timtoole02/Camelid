@@ -1979,6 +1979,10 @@ const GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL";
 const GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_SINGLE_DOWN";
+/// H54 exact three-wave GateUp schedule. Already-ready live-sequential cold
+/// records use a separate bounded Metal slab while authoritative direct reads
+/// write the disjoint demand slab. The full-union Down remains single.
+const GHOST_METAL_THREE_WAVE_GATEUP_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_THREE_WAVE_GATEUP";
 const GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH";
 const GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS: usize = 2_100;
@@ -1989,8 +1993,8 @@ const GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE: [usize; 30] = [
 /// Default-off exact I/O A/B for the compact cold stage. When the host expert
 /// cache is deliberately disabled, read each selected record directly into
 /// its final Metal stage slot instead of allocating an intermediate record and
-/// copying it a second time. Previous-cold staging remains a separate source
-/// and therefore makes this lane ineligible.
+/// copying it a second time. H50 can admit a separately bounded previous-cold
+/// source, but only through its own exact literal opt-in below.
 const GHOST_METAL_DIRECT_STAGE_READ_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DIRECT_STAGE_READ";
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
 const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 512;
@@ -2001,6 +2005,12 @@ const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 512;
 const GHOST_METAL_PREVIOUS_COLD_STAGE_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE";
 const GHOST_METAL_PREVIOUS_COLD_STAGE_RECORDS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE_RECORDS";
+/// H50 exact compatibility gate. When both previous-cold staging and the
+/// direct-to-stage lane are enabled, only already-ready matching private bytes
+/// may substitute for one exact direct read. Every other state is claimed by
+/// authoritative demand without waiting.
+const GHOST_METAL_PREVIOUS_COLD_STAGE_DIRECT_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE_DIRECT";
 const GHOST_METAL_PREVIOUS_COLD_STAGE_DEFAULT_RECORDS: usize = 96;
 const GHOST_METAL_PREVIOUS_COLD_STAGE_MAX_RECORDS: usize = 96;
 /// Darwin-only stronger page-in experiment. It is deliberately subordinate to
@@ -3510,6 +3520,9 @@ struct GhostMetalExpertRuntime {
     /// the prior layer's queue-order retirement barrier; allocating it only
     /// for the exact parent opt-in keeps default residency fixed.
     hybrid_cold_stage: Option<crate::metal::Gemma4Q4ExpertSlots>,
+    /// H54's disjoint cap-eight ready-record slab. Separate Metal resources
+    /// make live-ready GPU reads and authoritative CPU writes non-aliasing.
+    hybrid_ready_stage: Option<crate::metal::Gemma4Q4ExpertSlots>,
     /// K and outcome of the latest completed chained attempt. Telemetry only;
     /// route prediction remains keyed exclusively by `last_chained_sig`.
     last_chained_k: Option<usize>,
@@ -3680,6 +3693,7 @@ fn previous_cold_stage_candidates(
 struct PreviousColdRoundStage {
     expected_start_pos: usize,
     planned_k: usize,
+    direct_compatible: bool,
     records: crate::predictive_record_stage::PredictiveRecordStage,
     staged_hits: std::sync::atomic::AtomicUsize,
     demand_claims: std::sync::atomic::AtomicUsize,
@@ -3717,6 +3731,35 @@ impl PreviousColdRoundStage {
         claim
     }
 
+    /// H50 direct-to-stage consumer. This ownership claim never waits for a
+    /// speculative read: already-ready bytes are taken, while queued, failed,
+    /// or in-flight candidates transfer to the authoritative direct batch.
+    fn try_claim(
+        &self,
+        key: crate::predictive_record_stage::PredictiveRecordKey,
+    ) -> std::result::Result<
+        crate::predictive_record_stage::PredictiveRecordClaim,
+        crate::predictive_record_stage::PredictiveRecordTakeError,
+    > {
+        use std::sync::atomic::Ordering::Relaxed;
+        let started = std::time::Instant::now();
+        let claim = self.records.try_claim_ready_or_demand(key);
+        self.claim_wait_us.fetch_add(
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Relaxed,
+        );
+        match &claim {
+            Ok(crate::predictive_record_stage::PredictiveRecordClaim::Staged(_)) => {
+                self.staged_hits.fetch_add(1, Relaxed);
+            }
+            Ok(crate::predictive_record_stage::PredictiveRecordClaim::Demand) => {
+                self.demand_claims.fetch_add(1, Relaxed);
+            }
+            Err(_) => {}
+        }
+        claim
+    }
+
     fn finish_demand(
         &self,
         key: crate::predictive_record_stage::PredictiveRecordKey,
@@ -3729,10 +3772,16 @@ impl PreviousColdRoundStage {
         use std::sync::atomic::Ordering::Relaxed;
         let snapshot = self.records.snapshot();
         eprintln!(
-            "[gemma4 previous-cold stage] start_pos={} K={} ok={} candidates={} staged_hits={} demand_claims={} claim_wait={:.3}ms queued={} reading={} ready={} failed={} demand_owned={} taken={} coordinator_done={}",
+            "[gemma4 previous-cold stage] start_pos={} K={} ok={} direct_compatible={} claim_policy={} candidates={} staged_hits={} demand_claims={} claim_wait={:.3}ms queued={} reading={} ready={} failed={} demand_owned={} taken={} coordinator_done={}",
             self.expected_start_pos,
             self.planned_k,
             usize::from(ok),
+            u8::from(self.direct_compatible),
+            if self.direct_compatible {
+                "nonblocking-ready-or-direct"
+            } else {
+                "blocking-share-inflight"
+            },
             snapshot.total,
             self.staged_hits.load(Relaxed),
             self.demand_claims.load(Relaxed),
@@ -3769,6 +3818,7 @@ struct LiveSequentialRoundStage {
     seal_calls: std::sync::atomic::AtomicUsize,
     exact_cold_records: std::sync::atomic::AtomicUsize,
     ready_hits: std::sync::atomic::AtomicUsize,
+    previous_ready_hits: std::sync::atomic::AtomicUsize,
     fallback_records: std::sync::atomic::AtomicUsize,
     ready_unused: std::sync::atomic::AtomicUsize,
     ready_malformed: std::sync::atomic::AtomicUsize,
@@ -3804,7 +3854,7 @@ impl LiveSequentialRoundStage {
                 .saturating_add(snapshot.reads_failed),
         );
         eprintln!(
-            "[gemma4 live-sequential stage] schema=1 round_seq={} start_pos={} K={} ok={} cap={} workers={} workers_started={} workers_done={} predict_impl={} launches={} candidates={} reads_started={} reads_succeeded={} reads_failed={} reads_in_flight={} speculative_read_ms={:.3} seals={} exact_cold={} ready_hits={} fallback={} ready_unused={} ready_malformed={} ready_copy_ms={:.3} ready_returned={} worker_unused_ready={} late_discarded={} worker_done={} cancelled={} snapshot_terminal=0 shared_demand_pool=0 consumer_waits=0 late_model_publish=0 routing_authority=exact-router",
+            "[gemma4 live-sequential stage] schema=1 round_seq={} start_pos={} K={} ok={} cap={} workers={} workers_started={} workers_done={} predict_impl={} launches={} candidates={} reads_started={} reads_succeeded={} reads_failed={} reads_in_flight={} speculative_read_ms={:.3} seals={} exact_cold={} ready_hits={} previous_ready_hits={} direct_fallback={} ready_unused={} ready_malformed={} ready_copy_ms={:.3} ready_returned={} worker_unused_ready={} late_discarded={} worker_done={} cancelled={} snapshot_terminal=0 shared_demand_pool=0 consumer_waits=0 late_model_publish=0 routing_authority=exact-router",
             self.round_seq,
             self.start_pos,
             self.k_tokens,
@@ -3828,6 +3878,7 @@ impl LiveSequentialRoundStage {
             self.seal_calls.load(Relaxed),
             self.exact_cold_records.load(Relaxed),
             self.ready_hits.load(Relaxed),
+            self.previous_ready_hits.load(Relaxed),
             self.fallback_records.load(Relaxed),
             self.ready_unused.load(Relaxed),
             self.ready_malformed.load(Relaxed),
@@ -4049,6 +4100,23 @@ fn ghost_metal_hybrid_hot_cold_overlap_enabled() -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn ghost_metal_three_wave_gateup_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_three_wave_gateup_requested() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ghost_metal_three_wave_gateup_from(
+            std::env::var(GHOST_METAL_THREE_WAVE_GATEUP_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_direct_stage_read_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
@@ -4173,8 +4241,28 @@ const fn ghost_metal_direct_stage_read_admitted(
     enabled: bool,
     cache_budget_bytes: usize,
     previous_cold_stage_present: bool,
+    previous_cold_stage_direct: bool,
 ) -> bool {
-    enabled && cache_budget_bytes == 0 && !previous_cold_stage_present
+    enabled
+        && cache_budget_bytes == 0
+        && (!previous_cold_stage_present || previous_cold_stage_direct)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_previous_cold_stage_direct_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_previous_cold_stage_direct_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ghost_metal_previous_cold_stage_direct_from(
+            std::env::var(GHOST_METAL_PREVIOUS_COLD_STAGE_DIRECT_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 fn parse_ghost_metal_previous_cold_stage_records(
@@ -4279,8 +4367,9 @@ mod previous_cold_stage_policy_tests {
 mod direct_stage_read_policy_tests {
     use super::{
         compact_stage_direct_read_jobs, ghost_metal_direct_stage_read_admitted,
-        ghost_metal_direct_stage_read_from, retained_cold_direct_read_jobs, CompactStageReadJob,
-        RetainedColdDirectReadJob, RetainedColdDirectReadTarget,
+        ghost_metal_direct_stage_read_from, ghost_metal_previous_cold_stage_direct_from,
+        retained_cold_direct_read_jobs, CompactStageReadJob, RetainedColdDirectReadJob,
+        RetainedColdDirectReadTarget,
     };
     use crate::metal::Gemma4RetainedColdPlacement;
 
@@ -4292,14 +4381,30 @@ mod direct_stage_read_policy_tests {
         assert!(!ghost_metal_direct_stage_read_from(Some("true")));
         assert!(!ghost_metal_direct_stage_read_from(Some(" 1")));
         assert!(!ghost_metal_direct_stage_read_from(Some("1\n")));
+
+        assert!(!ghost_metal_previous_cold_stage_direct_from(None));
+        assert!(ghost_metal_previous_cold_stage_direct_from(Some("1")));
+        for value in ["", "0", "true", "TRUE", "yes", "2", " 1", "1 "] {
+            assert!(!ghost_metal_previous_cold_stage_direct_from(Some(value)));
+        }
     }
 
     #[test]
-    fn admission_requires_zero_cache_and_no_previous_stage() {
-        assert!(!ghost_metal_direct_stage_read_admitted(false, 0, false));
-        assert!(ghost_metal_direct_stage_read_admitted(true, 0, false));
-        assert!(!ghost_metal_direct_stage_read_admitted(true, 1, false));
-        assert!(!ghost_metal_direct_stage_read_admitted(true, 0, true));
+    fn admission_requires_zero_cache_and_explicit_previous_stage_compatibility() {
+        assert!(!ghost_metal_direct_stage_read_admitted(
+            false, 0, false, false
+        ));
+        assert!(ghost_metal_direct_stage_read_admitted(
+            true, 0, false, false
+        ));
+        assert!(!ghost_metal_direct_stage_read_admitted(
+            true, 1, false, false
+        ));
+        assert!(!ghost_metal_direct_stage_read_admitted(
+            true, 0, true, false
+        ));
+        assert!(ghost_metal_direct_stage_read_admitted(true, 0, true, true));
+        assert!(!ghost_metal_direct_stage_read_admitted(true, 1, true, true));
     }
 
     #[test]
@@ -5265,6 +5370,39 @@ struct CompactStageReadJob {
     expert: usize,
 }
 
+/// H54's authoritative second phase. The exact router-owned cold union is
+/// partitioned once; live-ready records have already been copied to their
+/// disjoint slab, while these jobs retain the compact demand destinations.
+#[cfg(target_os = "macos")]
+struct CompactThreeWaveDemandPlan {
+    layer_idx: usize,
+    cold_experts: Vec<usize>,
+    ready_records: Vec<(usize, Box<[u8]>)>,
+    ready_count: usize,
+    experts: Vec<usize>,
+    jobs: Vec<CompactStageReadJob>,
+    unused_ready: usize,
+    receiver: Option<std::sync::mpsc::Receiver<CompactThreeWaveDemandBatch>>,
+}
+
+#[cfg(target_os = "macos")]
+struct CompactThreeWaveDemandBatch {
+    outcomes: Vec<(CompactStageReadJob, std::result::Result<(), String>)>,
+    read_us: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CompactThreeWaveDemandPlan {
+    fn drop(&mut self) {
+        // A pre-commit Metal refusal may abandon H54 and reuse the demand slab
+        // through the established exact path. Drain the owned batch first so
+        // no detached writer can outlive its plan or race that fallback.
+        if let Some(receiver) = self.receiver.take() {
+            let _ = receiver.recv();
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetainedColdDirectReadTarget {
@@ -5360,6 +5498,329 @@ fn compact_stage_direct_read_jobs(
     Some(jobs)
 }
 
+/// Seal the live-sequential generation without waiting, copy only exact
+/// already-ready records into H54's separate ready slab, and retain the
+/// remaining exact identities for the authoritative demand phase. The output
+/// order is stable within the router's cold union, producing compact
+/// `[ready | demand]` subranges without prediction ever becoming authority.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn plan_compact_three_wave_direct_from_live(
+    ready_slot_count: usize,
+    demand_slot_count: usize,
+    cache: &GhostMoeExpertCache,
+    layer_idx: usize,
+    experts: &[usize],
+    live_stage: &LiveSequentialRoundStage,
+) -> Option<(Vec<usize>, CompactThreeWaveDemandPlan)> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    compact_stage_direct_read_jobs(experts, crate::metal::GEMMA4_OVERFLOW_BANK_SLOTS)?;
+    if layer_idx >= cache.layer_budgets.len()
+        || cache.budget_bytes != 0
+        || ready_slot_count != GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP
+    {
+        return None;
+    }
+    let record_bytes = crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES;
+
+    live_stage.seal_calls.fetch_add(1, Relaxed);
+    live_stage
+        .exact_cold_records
+        .fetch_add(experts.len(), Relaxed);
+    let mut ready_by_expert = std::collections::HashMap::<usize, Box<[u8]>>::new();
+    for record in live_stage.records.seal_layer(layer_idx) {
+        let valid = record.key.layer == layer_idx
+            && record.key.expert < 128
+            && record.source == crate::predictive_record_stage::PredictiveRecordSource::Staged
+            && record.bytes.len() == record_bytes
+            && !ready_by_expert.contains_key(&record.key.expert);
+        if valid {
+            ready_by_expert.insert(record.key.expert, record.bytes);
+        } else {
+            live_stage.ready_malformed.fetch_add(1, Relaxed);
+        }
+    }
+
+    let mut ready_records = Vec::with_capacity(ready_by_expert.len().min(experts.len()));
+    let mut demand_experts = Vec::with_capacity(experts.len());
+    for &expert in experts {
+        if let Some(bytes) = ready_by_expert.remove(&expert) {
+            ready_records.push((expert, bytes));
+        } else {
+            demand_experts.push(expert);
+        }
+    }
+    if ready_records.len() > ready_slot_count {
+        return None;
+    }
+
+    let mut demand_jobs = demand_experts
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(slot, expert)| CompactStageReadJob { slot, expert })
+        .collect::<Vec<_>>();
+    if demand_jobs.len() > demand_slot_count {
+        return None;
+    }
+    // Physical I/O stays monotonic in the layer even though compact logical
+    // order remains router-stable through every job's destination slot.
+    demand_jobs.sort_unstable_by_key(|job| job.expert);
+
+    let ready_experts = ready_records
+        .iter()
+        .map(|(expert, _)| *expert)
+        .collect::<Vec<_>>();
+    Some((
+        ready_experts,
+        CompactThreeWaveDemandPlan {
+            layer_idx,
+            cold_experts: experts.to_vec(),
+            ready_count: ready_records.len(),
+            ready_records,
+            experts: demand_experts,
+            jobs: demand_jobs,
+            unused_ready: ready_by_expert.len(),
+            receiver: None,
+        },
+    ))
+}
+
+/// After Metal commits the static-hot GateUp command, launch authoritative
+/// demand I/O first and then copy ready Boxes. Thus demand reads overlap both
+/// ready-copy and ready GateUp, while every CPU destination remains disjoint
+/// from every committed GPU resource.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn launch_compact_three_wave_direct(
+    ready_slots: &metal::Buffer,
+    ready_slot_count: usize,
+    demand_slots: &metal::Buffer,
+    demand_slot_count: usize,
+    cache: &GhostMoeExpertCache,
+    layer_idx: usize,
+    cold_experts: &[usize],
+    plan: &mut CompactThreeWaveDemandPlan,
+    ready_slot_table: &mut [u32; 128],
+    counters: &WaveFillCounters,
+    live_stage: &LiveSequentialRoundStage,
+    chunked_read_enabled: bool,
+) -> bool {
+    use rayon::prelude::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    ready_slot_table.fill(u32::MAX);
+    if plan.layer_idx != layer_idx
+        || plan.cold_experts != cold_experts
+        || plan.receiver.is_some()
+        || plan.ready_records.len() > ready_slot_count
+        || plan.experts.len() > demand_slot_count
+        || plan.jobs.len() != plan.experts.len()
+        || layer_idx >= cache.layer_budgets.len()
+        || cache.budget_bytes != 0
+    {
+        return false;
+    }
+    let record_bytes = crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES;
+    let stride = crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE;
+    let Some(required_ready_bytes) = ready_slot_count.checked_mul(stride) else {
+        return false;
+    };
+    let Some(required_demand_bytes) = demand_slot_count.checked_mul(stride) else {
+        return false;
+    };
+    let ready_base = ready_slots.contents().cast::<u8>();
+    let demand_base = demand_slots.contents().cast::<u8>();
+    if ready_base.is_null()
+        || demand_base.is_null()
+        || record_bytes > stride
+        || usize::try_from(ready_slots.length())
+            .map_or(true, |length| length < required_ready_bytes)
+        || usize::try_from(demand_slots.length())
+            .map_or(true, |length| length < required_demand_bytes)
+    {
+        return false;
+    }
+
+    if !plan.jobs.is_empty() {
+        let Some(pool) = cache.read_pool.as_ref() else {
+            return false;
+        };
+        let chunks_per_record = ghost_metal_retained_cold_chunks_per_record(
+            chunked_read_enabled,
+            plan.jobs.len(),
+            pool.current_num_threads(),
+        );
+        if chunks_per_record > 1 {
+            counters
+                .chunked_read_records
+                .fetch_add(plan.jobs.len(), Relaxed);
+            counters
+                .chunked_read_preads
+                .fetch_add(plan.jobs.len().saturating_mul(chunks_per_record), Relaxed);
+            counters
+                .chunked_read_max_chunks
+                .fetch_max(chunks_per_record, Relaxed);
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let file = Arc::clone(&cache.file);
+        let demand_base = demand_base as usize;
+        let demand_jobs = plan.jobs.clone();
+        pool.spawn_fifo(move || {
+            let read_one = |job: &CompactStageReadJob| {
+                // SAFETY: the plan proved a bijection over the complete demand
+                // prefix. Plan Drop joins this owned task before slab reuse.
+                let destination = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (demand_base + job.slot * stride) as *mut u8,
+                        record_bytes,
+                    )
+                };
+                (
+                    *job,
+                    file.read_moe_expert_into_chunks(
+                        layer_idx,
+                        job.expert,
+                        destination,
+                        chunks_per_record,
+                    )
+                    .map_err(|error| error.to_string()),
+                )
+            };
+            let read_started = std::time::Instant::now();
+            let outcomes = demand_jobs.par_iter().map(read_one).collect::<Vec<_>>();
+            let read_us = read_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            let _ = sender.send(CompactThreeWaveDemandBatch { outcomes, read_us });
+        });
+        plan.receiver = Some(receiver);
+    }
+
+    let ready_count = plan.ready_records.len();
+    let copy_started = std::time::Instant::now();
+    let ready_base = ready_base as usize;
+    for (ready_slot, (expert, bytes)) in plan.ready_records.drain(..).enumerate() {
+        // SAFETY: geometry is complete, ready slots are a unique compact
+        // prefix, and each private source is one validated exact record.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (ready_base + ready_slot * stride) as *mut u8,
+                record_bytes,
+            );
+        }
+        ready_slot_table[expert] = ready_slot as u32;
+    }
+    let ready_copy_us = copy_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    if ready_count > 0 {
+        counters.copy_us.fetch_add(ready_copy_us, Relaxed);
+        live_stage.ready_copy_us.fetch_add(ready_copy_us, Relaxed);
+    }
+    true
+}
+
+/// Complete H54's authoritative demand phase directly into its disjoint Metal
+/// slab. The batch was launched before ready-copy/table work; this callback is
+/// the mandatory join and publication barrier before final command commit.
+#[cfg(target_os = "macos")]
+fn fill_compact_three_wave_demand_from_file(
+    cache: &GhostMoeExpertCache,
+    layer_idx: usize,
+    experts: &[usize],
+    mut plan: CompactThreeWaveDemandPlan,
+    updated_slots: &mut [u32; 128],
+    counters: &WaveFillCounters,
+    live_stage: &LiveSequentialRoundStage,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    updated_slots.fill(u32::MAX);
+    if plan.layer_idx != layer_idx
+        || plan.experts != experts
+        || layer_idx >= cache.layer_budgets.len()
+        || cache.budget_bytes != 0
+    {
+        return false;
+    }
+    let read_us = if experts.is_empty() {
+        if plan.receiver.is_some() {
+            return false;
+        }
+        0
+    } else {
+        let Some(receiver) = plan.receiver.take() else {
+            return false;
+        };
+        let Ok(batch) = receiver.recv() else {
+            return false;
+        };
+        if batch.outcomes.len() != experts.len() {
+            return false;
+        }
+        let mut seen = [false; 128];
+        let mut seen_slots = vec![false; experts.len()];
+        let mut failed = false;
+        for (job, outcome) in batch.outcomes {
+            if job.expert >= seen.len()
+                || seen[job.expert]
+                || job.slot >= seen_slots.len()
+                || seen_slots[job.slot]
+                || experts[job.slot] != job.expert
+            {
+                return false;
+            }
+            seen[job.expert] = true;
+            seen_slots[job.slot] = true;
+            if let Err(error) = outcome {
+                failed = true;
+                eprintln!(
+                    "[gemma4-ghost-metal] layer {layer_idx} three-wave demand slot {} expert {} read failed: {error}",
+                    job.slot, job.expert,
+                );
+            }
+        }
+        if failed {
+            return false;
+        }
+        batch.read_us
+    };
+
+    let record_bytes = crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES;
+    let read_bytes = experts.len().saturating_mul(record_bytes);
+    counters.demand_loads.fetch_add(experts.len(), Relaxed);
+    counters
+        .nvme_bytes
+        .fetch_add(read_bytes.min(u64::MAX as usize) as u64, Relaxed);
+    counters.nvme_us.fetch_add(read_us, Relaxed);
+    {
+        let mut state = cache.state.lock().expect("ghost MoE cache poisoned");
+        for &expert in &plan.cold_experts {
+            let key = (layer_idx, expert);
+            state.touch_layer(layer_idx);
+            state.misses = state.misses.saturating_add(1);
+            if state.seen_keys.insert(key) {
+                state.compulsory_misses = state.compulsory_misses.saturating_add(1);
+            } else {
+                state.capacity_misses = state.capacity_misses.saturating_add(1);
+            }
+        }
+        state.bytes_read = state
+            .bytes_read
+            .saturating_add(read_bytes.min(u64::MAX as usize) as u64);
+    }
+    live_stage.ready_hits.fetch_add(plan.ready_count, Relaxed);
+    live_stage
+        .fallback_records
+        .fetch_add(plan.experts.len(), Relaxed);
+    live_stage
+        .ready_unused
+        .fetch_add(plan.unused_ready, Relaxed);
+    for (slot, &expert) in experts.iter().enumerate() {
+        updated_slots[expert] = slot as u32;
+    }
+    true
+}
+
 /// Read one exact cold wave directly into its final shared Metal stage slots.
 /// The caller has already committed only the disjoint hot command; the cold
 /// command remains uncommitted until this function returns true and its slot
@@ -5375,6 +5836,7 @@ fn fill_compact_wave_direct_from_file(
     experts: &[usize],
     updated_slots: &mut [u32; 128],
     counters: &WaveFillCounters,
+    previous_cold_stage: Option<&PreviousColdRoundStage>,
     live_sequential_stage: Option<&LiveSequentialRoundStage>,
     chunked_read_enabled: bool,
 ) -> bool {
@@ -5416,22 +5878,25 @@ fn fill_compact_wave_direct_from_file(
         }
     }
 
-    // Seal never waits for a speculative loader. Only completely published,
-    // private owned records are returned; queued/in-flight/failed/absent keys
-    // fall straight through to the exact direct reader below. The exact cold
-    // wave still owns both record selection and compact-slot destination.
-    let mut ready_by_expert = std::collections::HashMap::<usize, Box<[u8]>>::new();
+    // Neither speculative source may delay exact demand. Seal the live stage
+    // first, then atomically take only already-ready previous-round bytes for
+    // exact jobs the live source did not satisfy. Every queued, failed, or
+    // in-flight previous candidate transfers ownership to the authoritative
+    // direct batch below; an already-owned key fails closed rather than
+    // issuing a second authoritative read.
+    let exact_job_count = jobs.len();
+    let mut live_ready_by_expert = std::collections::HashMap::<usize, Box<[u8]>>::new();
     if let Some(stage) = live_sequential_stage {
         stage.seal_calls.fetch_add(1, Relaxed);
-        stage.exact_cold_records.fetch_add(jobs.len(), Relaxed);
+        stage.exact_cold_records.fetch_add(exact_job_count, Relaxed);
         for record in stage.records.seal_layer(layer_idx) {
             let valid = record.key.layer == layer_idx
                 && record.key.expert < 128
                 && record.source == crate::predictive_record_stage::PredictiveRecordSource::Staged
                 && record.bytes.len() == record_bytes
-                && !ready_by_expert.contains_key(&record.key.expert);
+                && !live_ready_by_expert.contains_key(&record.key.expert);
             if valid {
-                ready_by_expert.insert(record.key.expert, record.bytes);
+                live_ready_by_expert.insert(record.key.expert, record.bytes);
             } else {
                 stage.ready_malformed.fetch_add(1, Relaxed);
             }
@@ -5440,17 +5905,80 @@ fn fill_compact_wave_direct_from_file(
 
     let mut ready_jobs = Vec::new();
     let mut demand_jobs = Vec::new();
+    let mut previous_demand_keys = Vec::new();
+    let mut live_ready_hits = 0usize;
+    let mut previous_ready_hits = 0usize;
     for job in jobs {
-        if let Some(bytes) = ready_by_expert.remove(&job.expert) {
+        if let Some(bytes) = live_ready_by_expert.remove(&job.expert) {
+            live_ready_hits = live_ready_hits.saturating_add(1);
             ready_jobs.push((job, bytes));
-        } else {
-            demand_jobs.push(job);
+            continue;
+        }
+
+        let key = crate::predictive_record_stage::PredictiveRecordKey::new(layer_idx, job.expert);
+        let previous_claim = previous_cold_stage
+            .filter(|stage| stage.direct_compatible && stage.records.status(key).is_some())
+            .map(|stage| stage.try_claim(key));
+        match previous_claim {
+            Some(Ok(crate::predictive_record_stage::PredictiveRecordClaim::Staged(record)))
+                if record.key == key
+                    && record.source
+                        == crate::predictive_record_stage::PredictiveRecordSource::Staged
+                    && record.bytes.len() == record_bytes =>
+            {
+                previous_ready_hits = previous_ready_hits.saturating_add(1);
+                ready_jobs.push((job, record.bytes));
+            }
+            Some(Ok(crate::predictive_record_stage::PredictiveRecordClaim::Staged(record))) => {
+                eprintln!(
+                    "[gemma4 previous-cold stage] refused malformed direct record layer={layer_idx} expert={} got_layer={} got_expert={} bytes={}",
+                    job.expert,
+                    record.key.layer,
+                    record.key.expert,
+                    record.bytes.len(),
+                );
+                demand_jobs.push(job);
+            }
+            Some(Ok(crate::predictive_record_stage::PredictiveRecordClaim::Demand)) => {
+                previous_demand_keys.push(key);
+                demand_jobs.push(job);
+            }
+            Some(Err(
+                crate::predictive_record_stage::PredictiveRecordTakeError::DemandInFlight(_)
+                | crate::predictive_record_stage::PredictiveRecordTakeError::AlreadyTaken(_),
+            )) => {
+                if let Some(stage) = previous_cold_stage {
+                    for claimed in previous_demand_keys.drain(..) {
+                        stage.finish_demand(claimed, false);
+                    }
+                }
+                eprintln!(
+                    "[gemma4 previous-cold stage] refused duplicate authoritative owner layer={layer_idx} expert={}",
+                    job.expert,
+                );
+                return false;
+            }
+            Some(Err(error)) => {
+                if ghost_metal_timing_enabled() {
+                    eprintln!(
+                        "[gemma4 previous-cold stage] nonblocking direct fallback layer={layer_idx} expert={}: {error}",
+                        job.expert,
+                    );
+                }
+                demand_jobs.push(job);
+            }
+            None => demand_jobs.push(job),
         }
     }
     if let Some(stage) = live_sequential_stage {
-        stage.ready_hits.fetch_add(ready_jobs.len(), Relaxed);
+        stage.ready_hits.fetch_add(live_ready_hits, Relaxed);
+        stage
+            .previous_ready_hits
+            .fetch_add(previous_ready_hits, Relaxed);
         stage.fallback_records.fetch_add(demand_jobs.len(), Relaxed);
-        stage.ready_unused.fetch_add(ready_by_expert.len(), Relaxed);
+        stage
+            .ready_unused
+            .fetch_add(live_ready_by_expert.len(), Relaxed);
     }
 
     let base_raw = base as usize;
@@ -5523,13 +6051,22 @@ fn fill_compact_wave_direct_from_file(
     let read_us = read_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
     let mut failed = false;
+    let mut demand_succeeded = [false; 128];
     for (job, outcome) in outcomes {
-        if let Err(error) = outcome {
-            failed = true;
-            eprintln!(
-                "[gemma4-ghost-metal] layer {layer_idx} direct cold-stage slot {} expert {} read failed: {error}",
-                job.slot, job.expert,
-            );
+        match outcome {
+            Ok(()) => demand_succeeded[job.expert] = true,
+            Err(error) => {
+                failed = true;
+                eprintln!(
+                    "[gemma4-ghost-metal] layer {layer_idx} direct cold-stage slot {} expert {} read failed: {error}",
+                    job.slot, job.expert,
+                );
+            }
+        }
+    }
+    if let Some(stage) = previous_cold_stage {
+        for key in previous_demand_keys {
+            stage.finish_demand(key, demand_succeeded[key.expert]);
         }
     }
     if failed {
@@ -5802,6 +6339,7 @@ fn fill_compact_wave_into_slots(
         ghost_metal_direct_stage_read_enabled(),
         cache.budget_bytes,
         previous_cold_stage.is_some(),
+        ghost_metal_previous_cold_stage_direct_enabled(),
     ) {
         return fill_compact_wave_direct_from_file(
             slots,
@@ -5811,6 +6349,7 @@ fn fill_compact_wave_into_slots(
             experts,
             updated_slots,
             counters,
+            previous_cold_stage,
             live_sequential_stage,
             chunked_direct_read,
         );
@@ -6423,6 +6962,7 @@ impl GhostMetalExpertRuntime {
             pending_mapped_rdadvise_round: None,
             overflow_bank,
             hybrid_cold_stage: None,
+            hybrid_ready_stage: None,
             last_chained_k: None,
             last_chained_succeeded: false,
             last_chained_sig: None,
@@ -6689,6 +7229,21 @@ impl GhostMetalExpertRuntime {
         } else {
             None
         };
+        let hybrid_ready_stage = if hybrid_cold_stage.is_some()
+            && ghost_metal_three_wave_gateup_requested()
+        {
+            Some(
+                crate::metal::Gemma4Q4ExpertSlots::new(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP)
+                    .ok_or_else(|| {
+                        BackendError::UnsupportedModelArchitecture(format!(
+                            "{GHOST_METAL_THREE_WAVE_GATEUP_ENV}=1 could not allocate its {}-record ready staging slab",
+                            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
         if hybrid_cold_stage.is_some() {
             eprintln!(
                 "[gemma4-ghost-metal] exact hot/cold overlap armed: stage_records={} stage_bytes={:.1}MiB decode=1 prefill_k8={} prefill_publish=0 fallback=current-exact",
@@ -6696,6 +7251,16 @@ impl GhostMetalExpertRuntime {
                 (GHOST_METAL_OVERFLOW_SLOTS * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as f64
                     / (1024.0 * 1024.0),
                 u8::from(crate::metal::gemma4_hybrid_hot_cold_prefill_enabled()),
+            );
+        }
+        if hybrid_ready_stage.is_some() {
+            eprintln!(
+                "[gemma4-ghost-metal] exact three-wave GateUp armed: ready_records={} ready_bytes={:.1}MiB demand_records={} routing_authority=exact-router down_passes=1",
+                GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP,
+                (GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP
+                    * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as f64
+                    / (1024.0 * 1024.0),
+                GHOST_METAL_OVERFLOW_SLOTS,
             );
         }
         Ok(Self {
@@ -6719,6 +7284,7 @@ impl GhostMetalExpertRuntime {
             pending_mapped_rdadvise_round: None,
             overflow_bank: Vec::new(),
             hybrid_cold_stage,
+            hybrid_ready_stage,
             last_chained_k: None,
             last_chained_succeeded: false,
             last_chained_sig: None,
@@ -6763,6 +7329,7 @@ impl GhostMetalExpertRuntime {
             ghost_metal_direct_stage_read_enabled(),
             host_cache_budget_bytes,
             !previous_cold_stage_absent,
+            ghost_metal_previous_cold_stage_direct_enabled(),
         );
         let admitted = ghost_metal_retained_cold_bank_admitted(
             requested,
@@ -6886,6 +7453,7 @@ impl GhostMetalExpertRuntime {
                 Some(PreviousColdRoundStage {
                     expected_start_pos: next_target_start_pos,
                     planned_k,
+                    direct_compatible: ghost_metal_previous_cold_stage_direct_enabled(),
                     records,
                     staged_hits: std::sync::atomic::AtomicUsize::new(0),
                     demand_claims: std::sync::atomic::AtomicUsize::new(0),
@@ -7555,6 +8123,7 @@ impl GhostMetalExpertRuntime {
                     ghost_metal_direct_stage_read_enabled(),
                     cache.budget_bytes,
                     previous_cold_stage.is_some(),
+                    ghost_metal_previous_cold_stage_direct_enabled(),
                 )
             });
         let live_sequential_h40_shape = live_sequential_predictor.is_some()
@@ -7626,6 +8195,7 @@ impl GhostMetalExpertRuntime {
                         seal_calls: std::sync::atomic::AtomicUsize::new(0),
                         exact_cold_records: std::sync::atomic::AtomicUsize::new(0),
                         ready_hits: std::sync::atomic::AtomicUsize::new(0),
+                        previous_ready_hits: std::sync::atomic::AtomicUsize::new(0),
                         fallback_records: std::sync::atomic::AtomicUsize::new(0),
                         ready_unused: std::sync::atomic::AtomicUsize::new(0),
                         ready_malformed: std::sync::atomic::AtomicUsize::new(0),
@@ -7656,6 +8226,14 @@ impl GhostMetalExpertRuntime {
                     && common.retained_cold_slot_count()
                         == self.layers.len() * crate::metal::GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER
             });
+
+        let three_wave_gateup_active = ghost_metal_three_wave_gateup_requested()
+            && !self.prefill_round
+            && live_sequential_h40_shape
+            && live_sequential_stage.is_some()
+            && previous_cold_stage.is_none()
+            && !retained_cold_direct_bank_fill_active
+            && self.hybrid_ready_stage.is_some();
 
         if allow_predicted && !hot_cold_overlap_freeze_hot {
             if let Some(cache) = ghost_cache {
@@ -7723,8 +8301,25 @@ impl GhostMetalExpertRuntime {
             None
         };
         let cold_stage_buf_for_fill = cold_stage_buf.clone();
+        let ready_stage_slot_count = if three_wave_gateup_active {
+            self.hybrid_ready_stage
+                .as_ref()
+                .map_or(0, crate::metal::Gemma4Q4ExpertSlots::slot_count)
+        } else {
+            0
+        };
+        let ready_stage_buf = if three_wave_gateup_active {
+            self.hybrid_ready_stage
+                .as_ref()
+                .and_then(crate::metal::Gemma4Q4ExpertSlots::monolithic_slab_buffer)
+                .cloned()
+        } else {
+            None
+        };
+        let ready_stage_buf_for_fill = ready_stage_buf.clone();
         let live_sequential_stage_for_fill = live_sequential_stage.clone();
         let layers_ref = &mut self.layers;
+        let mut three_wave_pending: Option<CompactThreeWaveDemandPlan> = None;
         let mut slot_filler = ghost_cache.map(|cache| {
             |layer_idx: usize,
              router_logits: &[f32],
@@ -7733,7 +8328,109 @@ impl GhostMetalExpertRuntime {
              updated_slots: &mut [u32; 128],
              union_out: &mut Vec<usize>| -> bool {
                 let layer = &mut layers_ref[layer_idx];
+                if phase == crate::metal::Gemma4Q4SlotFillPhase::StageColdReady {
+                    let Some(experts) = wave else {
+                        return false;
+                    };
+                    let Some(live_stage) = live_sequential_stage_for_fill.as_deref() else {
+                        return false;
+                    };
+                    if !three_wave_gateup_active || three_wave_pending.is_some() {
+                        return false;
+                    }
+                    let Some((ready_experts, pending)) =
+                        plan_compact_three_wave_direct_from_live(
+                            ready_stage_slot_count,
+                            cold_stage_slot_count,
+                            cache,
+                            layer_idx,
+                            experts,
+                            live_stage,
+                        )
+                    else {
+                        return false;
+                    };
+                    updated_slots.fill(u32::MAX);
+                    union_out.clear();
+                    union_out.extend_from_slice(&ready_experts);
+                    three_wave_pending = Some(pending);
+                    return true;
+                }
+                if phase == crate::metal::Gemma4Q4SlotFillPhase::StageColdLaunch {
+                    let Some(ready_stage) = ready_stage_buf_for_fill.as_ref() else {
+                        return false;
+                    };
+                    let Some(demand_stage) = cold_stage_buf_for_fill.as_ref() else {
+                        return false;
+                    };
+                    let Some(experts) = wave else {
+                        return false;
+                    };
+                    let Some(live_stage) = live_sequential_stage_for_fill.as_deref() else {
+                        return false;
+                    };
+                    let Some(pending) = three_wave_pending.as_mut() else {
+                        return false;
+                    };
+                    if !launch_compact_three_wave_direct(
+                        ready_stage,
+                        ready_stage_slot_count,
+                        demand_stage,
+                        cold_stage_slot_count,
+                        cache,
+                        layer_idx,
+                        experts,
+                        pending,
+                        updated_slots,
+                        &fill_counters,
+                        live_stage,
+                        retained_cold_chunked_read_active,
+                    ) {
+                        return false;
+                    }
+                    return true;
+                }
+                if phase == crate::metal::Gemma4Q4SlotFillPhase::StageColdDemand {
+                    let Some(experts) = wave else {
+                        return false;
+                    };
+                    let Some(pending) = three_wave_pending.take() else {
+                        return false;
+                    };
+                    let misses = pending.cold_experts.len();
+                    let lookups = union_out.len();
+                    let Some(live_stage) = live_sequential_stage_for_fill.as_deref() else {
+                        return false;
+                    };
+                    let filled = fill_compact_three_wave_demand_from_file(
+                        cache,
+                        layer_idx,
+                        experts,
+                        pending,
+                        updated_slots,
+                        &fill_counters,
+                        live_stage,
+                    );
+                    if filled {
+                        let hits = lookups.saturating_sub(misses);
+                        fill_counters
+                            .plan_hits
+                            .fetch_add(hits as u64, std::sync::atomic::Ordering::Relaxed);
+                        fill_counters
+                            .plan_misses
+                            .fetch_add(misses as u64, std::sync::atomic::Ordering::Relaxed);
+                        layer.stats.route_lookups =
+                            layer.stats.route_lookups.saturating_add(lookups as u64);
+                        layer.stats.hits = layer.stats.hits.saturating_add(hits as u64);
+                        layer.stats.misses = layer.stats.misses.saturating_add(misses as u64);
+                    }
+                    return filled;
+                }
                 if phase == crate::metal::Gemma4Q4SlotFillPhase::StageCold {
+                    // A pre-commit H54 encode/materialization refusal returns
+                    // to the established full cold fill. Drop its unconsumed
+                    // demand receipt before re-reading the exact union.
+                    let abandoned_three_wave = three_wave_pending.take().is_some();
                     let Some(stage) = cold_stage_buf_for_fill.as_ref() else {
                         return false;
                     };
@@ -7749,7 +8446,9 @@ impl GhostMetalExpertRuntime {
                         updated_slots,
                         &fill_counters,
                         previous_cold_stage,
-                        live_sequential_stage_for_fill.as_deref(),
+                        (!abandoned_three_wave)
+                            .then_some(live_sequential_stage_for_fill.as_deref())
+                            .flatten(),
                         retained_cold_chunked_read_active,
                     );
                     if staged {
@@ -7786,6 +8485,12 @@ impl GhostMetalExpertRuntime {
                         &fill_counters,
                         round_seq,
                     );
+                }
+                if phase == crate::metal::Gemma4Q4SlotFillPhase::Demand {
+                    // Any H54 plan that did not reach its explicit demand join
+                    // belongs to an abandoned pre-commit attempt. Drain/drop
+                    // it before the established exact path can touch a slab.
+                    three_wave_pending.take();
                 }
                 let n_tokens = k_tokens.min(crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
                 let n_slots = if layer.slots.is_hybrid_mapped() {
@@ -8151,6 +8856,8 @@ impl GhostMetalExpertRuntime {
                 retained_cold_direct_bank_fill_active,
                 cold_stage_buf.as_ref(),
                 cold_stage_slot_count,
+                ready_stage_buf.as_ref(),
+                ready_stage_slot_count,
                 (hot_cold_overlap_active || live_sequential_predictor.is_some())
                     .then_some(hot_at_start.as_slice()),
                 live_sequential_predictor.take(),
@@ -12779,18 +13486,30 @@ struct MtpAssistantTargetRank {
     selected_minus_target_margin: f32,
 }
 
+fn mtp_verifier_target_token_at(
+    proposed_drafts: &[u32],
+    accepted_drafts: usize,
+    verifier_next_logits: &[f32],
+    draft_index: usize,
+) -> Option<u32> {
+    match accepted_drafts.cmp(&draft_index) {
+        std::cmp::Ordering::Less => None,
+        std::cmp::Ordering::Equal => mtp_argmax(verifier_next_logits).ok(),
+        std::cmp::Ordering::Greater => proposed_drafts.get(draft_index).copied(),
+    }
+}
+
 fn mtp_step3_verifier_target_token(
     proposed_drafts: &[u32],
     accepted_drafts: usize,
     verifier_next_logits: &[f32],
 ) -> Option<u32> {
-    match accepted_drafts.cmp(&MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX) {
-        std::cmp::Ordering::Less => None,
-        std::cmp::Ordering::Equal => mtp_argmax(verifier_next_logits).ok(),
-        std::cmp::Ordering::Greater => proposed_drafts
-            .get(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX)
-            .copied(),
-    }
+    mtp_verifier_target_token_at(
+        proposed_drafts,
+        accepted_drafts,
+        verifier_next_logits,
+        MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX,
+    )
 }
 
 fn mtp_assistant_target_rank(
@@ -12824,8 +13543,9 @@ fn mtp_assistant_target_rank(
     })
 }
 
-fn trace_mtp_step3_assistant_logits(
+fn trace_mtp_assistant_logits(
     round_index: usize,
+    draft_index: usize,
     proposed_drafts: &[u32],
     accepted_drafts: usize,
     verifier_next_logits: &[f32],
@@ -12834,34 +13554,37 @@ fn trace_mtp_step3_assistant_logits(
     let Some(assistant_logits) = assistant_logits else {
         return;
     };
-    let Some(&selected_token) = proposed_drafts.get(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX) else {
+    let Some(&selected_token) = proposed_drafts.get(draft_index) else {
         eprintln!(
-            "[gemma4-mtp step3-logit-trace] round={round_index} draft_index={MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX} accepted_drafts={accepted_drafts} unavailable=missing_assistant_draft"
+            "[gemma4-mtp logit-trace] round={round_index} draft_index={draft_index} accepted_drafts={accepted_drafts} unavailable=missing_assistant_draft"
         );
         return;
     };
-    let Some(target_token) =
-        mtp_step3_verifier_target_token(proposed_drafts, accepted_drafts, verifier_next_logits)
-    else {
-        let reason = if accepted_drafts < MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX {
-            "verifier_mismatch_before_step3"
+    let Some(target_token) = mtp_verifier_target_token_at(
+        proposed_drafts,
+        accepted_drafts,
+        verifier_next_logits,
+        draft_index,
+    ) else {
+        let reason = if accepted_drafts < draft_index {
+            "verifier_mismatch_before_trace_index"
         } else {
             "invalid_verifier_logits"
         };
         eprintln!(
-            "[gemma4-mtp step3-logit-trace] round={round_index} draft_index={MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX} accepted_drafts={accepted_drafts} selected_token={selected_token} unavailable={reason}"
+            "[gemma4-mtp logit-trace] round={round_index} draft_index={draft_index} accepted_drafts={accepted_drafts} selected_token={selected_token} unavailable={reason}"
         );
         return;
     };
     let Some(rank) = mtp_assistant_target_rank(assistant_logits, selected_token, target_token)
     else {
         eprintln!(
-            "[gemma4-mtp step3-logit-trace] round={round_index} draft_index={MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX} accepted_drafts={accepted_drafts} selected_token={selected_token} target_token={target_token} unavailable=invalid_assistant_logits"
+            "[gemma4-mtp logit-trace] round={round_index} draft_index={draft_index} accepted_drafts={accepted_drafts} selected_token={selected_token} target_token={target_token} unavailable=invalid_assistant_logits"
         );
         return;
     };
     eprintln!(
-        "[gemma4-mtp step3-logit-trace] round={round_index} draft_index={MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX} accepted_drafts={accepted_drafts} selected_token={selected_token} target_token={target_token} target_rank={} selected_logit={:.8} target_logit={:.8} selected_minus_target_margin={:.8}",
+        "[gemma4-mtp logit-trace] round={round_index} draft_index={draft_index} accepted_drafts={accepted_drafts} selected_token={selected_token} target_token={target_token} target_rank={} selected_logit={:.8} target_logit={:.8} selected_minus_target_margin={:.8}",
         rank.target_rank,
         rank.selected_logit,
         rank.target_logit,
@@ -16786,9 +17509,20 @@ impl Gemma4Runtime {
                 assistant_gpu_us =
                     assistant_gpu_us.saturating_add(mtp_us_saturating(proposal.timing.gpu_us));
             }
-            let step3_assistant_logits = proposals
-                .get_mut(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX)
-                .and_then(|proposal| proposal.step3_assistant_logits.take());
+            let assistant_logit_capture =
+                proposals
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(draft_index, proposal)| {
+                        proposal
+                            .step3_assistant_logits
+                            .take()
+                            .map(|logits| (draft_index, logits))
+                    });
+            let step3_assistant_logits = assistant_logit_capture
+                .as_ref()
+                .filter(|(draft_index, _)| *draft_index == MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX)
+                .map(|(_, logits)| logits.as_slice());
 
             let boundary_alternate = if boundary_arbitration_enabled
                 && !boundary_arbitration_attempted
@@ -16810,9 +17544,7 @@ impl Gemma4Runtime {
                 let prefix_is_control_only = prefix_pieces
                     .as_deref()
                     .is_some_and(mtp_prefix_pieces_are_control_only);
-                let top2 = step3_assistant_logits
-                    .as_deref()
-                    .and_then(mtp_assistant_top2);
+                let top2 = step3_assistant_logits.and_then(mtp_assistant_top2);
                 let selected_matches_top1 = top2.is_some_and(|top2| {
                     proposals
                         .get(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX)
@@ -16989,13 +17721,16 @@ impl Gemma4Runtime {
                     generation_started,
                 );
             }
-            trace_mtp_step3_assistant_logits(
-                output.rounds.len(),
-                &proposed_drafts,
-                verified.accepted_drafts,
-                &verified.next_logits,
-                step3_assistant_logits.as_deref(),
-            );
+            if let Some((draft_index, assistant_logits)) = assistant_logit_capture.as_ref() {
+                trace_mtp_assistant_logits(
+                    output.rounds.len(),
+                    *draft_index,
+                    &proposed_drafts,
+                    verified.accepted_drafts,
+                    &verified.next_logits,
+                    Some(assistant_logits),
+                );
+            }
             let plan = match mtp_commit_plan(
                 anchor,
                 &proposed_drafts,
@@ -26835,6 +27570,18 @@ mod mtp_target_seam_tests {
             assert!(
                 !ghost_metal_live_sequential_stage_from(Some(value)),
                 "unexpected live sequential stage admission for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn three_wave_gateup_is_exact_positive_and_default_off() {
+        assert!(!ghost_metal_three_wave_gateup_from(None));
+        assert!(ghost_metal_three_wave_gateup_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !ghost_metal_three_wave_gateup_from(Some(value)),
+                "unexpected three-wave admission for {value:?}"
             );
         }
     }

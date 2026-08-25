@@ -61,6 +61,7 @@ const FULL_KV_HEADS: usize = 2;
 const MTP_CHAIN_MAX_DRAFTS: usize = 16;
 const MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX: usize = 3;
 const MTP_STEP3_LOGIT_TRACE_ENV: &str = "CAMELID_GEMMA4_MTP_STEP3_LOGIT_TRACE";
+const MTP_LOGIT_TRACE_DRAFT_INDEX_ENV: &str = "CAMELID_GEMMA4_MTP_LOGIT_TRACE_DRAFT_INDEX";
 // Official Gemma 4 proportional RoPE keeps the normal split-half geometry for
 // the entire 512-wide head, but gives only the first quarter of dimensions a
 // non-zero angle: 512 * 0.25 / 2 = 64 active pairs.  In particular, pair d is
@@ -1226,6 +1227,26 @@ fn mtp_step3_logit_capture_enabled(explicit_capture: bool) -> bool {
     mtp_step3_logit_capture_enabled_values(trace_value.as_deref(), explicit_capture)
 }
 
+fn mtp_logit_trace_draft_index_value(value: Option<&str>) -> Option<usize> {
+    value
+        .map(str::trim)?
+        .parse::<usize>()
+        .ok()
+        .filter(|&index| index < MTP_CHAIN_MAX_DRAFTS)
+}
+
+fn mtp_logit_capture_draft_index(explicit_step3_capture: bool) -> Option<usize> {
+    if mtp_step3_logit_capture_enabled(explicit_step3_capture) {
+        Some(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX)
+    } else {
+        mtp_logit_trace_draft_index_value(
+            std::env::var(MTP_LOGIT_TRACE_DRAFT_INDEX_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+}
+
 fn full_q4_requested_from_environment() -> Result<bool> {
     const NAME: &str = "CAMELID_GEMMA4_MTP_FULL_Q4";
     match std::env::var(NAME) {
@@ -1802,7 +1823,8 @@ pub struct Gemma4MtpProposal {
     pub recurrent_hidden: Vec<f32>,
     pub timing: Gemma4MtpProposalTiming,
     pub ledger: Gemma4MtpProposalLedger,
-    /// Default-off diagnostic snapshot attached only to zero-based draft 3.
+    /// Default-off one-shot diagnostic snapshot. Boundary arbitration attaches
+    /// it to draft 3; the indexed trace can attach it to another draft.
     pub(crate) step3_assistant_logits: Option<Vec<f32>>,
     #[cfg(test)]
     stage_snapshots: Vec<MtpStageSnapshot>,
@@ -2963,8 +2985,9 @@ impl Gemma4MtpAssistantMetal {
         )
     }
 
-    /// Device-fed chain with an optional one-shot step-3 logit snapshot. The
-    /// trace environment is still honored independently of the per-call flag.
+    /// Device-fed chain with an optional one-shot logit snapshot. Boundary
+    /// arbitration still owns explicit step-3 capture; the default-off indexed
+    /// trace environment can select another draft on ordinary rounds.
     pub(crate) fn propose_chain_device_resident_with_step3_logit_capture(
         &mut self,
         anchor_token: u32,
@@ -3040,9 +3063,10 @@ impl Gemma4MtpAssistantMetal {
             ));
         }
         let attention_scores = shared_buffer(&kernel.device, score_bytes);
-        let step3_logits_snapshot = (draft_limit > MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX
-            && mtp_step3_logit_capture_enabled(capture_step3_logits))
-        .then(|| shared_buffer(&kernel.device, VOCAB * std::mem::size_of::<f32>()));
+        let logit_capture_index = mtp_logit_capture_draft_index(capture_step3_logits)
+            .filter(|&index| index < draft_limit);
+        let logits_snapshot = logit_capture_index
+            .map(|_| shared_buffer(&kernel.device, VOCAB * std::mem::size_of::<f32>()));
 
         write_buffer_f32(&self.scratch.recurrent_hidden, initial_recurrent_hidden);
         unsafe {
@@ -3206,8 +3230,8 @@ impl Gemma4MtpAssistantMetal {
                 (step * std::mem::size_of::<u32>()) as u64,
                 VOCAB,
             );
-            if step == MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX {
-                if let Some(snapshot) = step3_logits_snapshot.as_ref() {
+            if logit_capture_index == Some(step) {
+                if let Some(snapshot) = logits_snapshot.as_ref() {
                     encode_copy_f32_to_offset(
                         encoder,
                         &self.pipelines.copy_f32,
@@ -3238,7 +3262,7 @@ impl Gemma4MtpAssistantMetal {
         read_buffer_f32(&self.scratch.chain_recurrent_hidden, &mut recurrent_rows);
         let token_ptr = self.scratch.output_token.contents().cast::<u32>();
         let tokens = unsafe { std::slice::from_raw_parts(token_ptr, draft_limit) }.to_vec();
-        let mut step3_assistant_logits = step3_logits_snapshot.as_ref().map(|snapshot| {
+        let mut captured_assistant_logits = logits_snapshot.as_ref().map(|snapshot| {
             let mut logits = vec![0.0f32; VOCAB];
             read_buffer_f32(snapshot, &mut logits);
             logits
@@ -3253,7 +3277,7 @@ impl Gemma4MtpAssistantMetal {
             )
             .and_then(|bytes| {
                 bytes.checked_add(
-                    step3_logits_snapshot
+                    logits_snapshot
                         .as_ref()
                         .map_or(0, |snapshot| snapshot.length()),
                 )
@@ -3308,8 +3332,8 @@ impl Gemma4MtpAssistantMetal {
                 } else {
                     Gemma4MtpProposalLedger::default()
                 },
-                step3_assistant_logits: if step == MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX {
-                    step3_assistant_logits.take()
+                step3_assistant_logits: if logit_capture_index == Some(step) {
+                    captured_assistant_logits.take()
                 } else {
                     None
                 },
@@ -5017,6 +5041,17 @@ mod tests {
         assert!(mtp_step3_logit_capture_enabled_values(None, true));
         assert!(mtp_step3_logit_capture_enabled_values(Some("false"), true));
         assert!(mtp_step3_logit_capture_enabled_values(Some("true"), true));
+    }
+
+    #[test]
+    fn indexed_logit_trace_accepts_only_a_bounded_zero_based_draft_index() {
+        assert_eq!(mtp_logit_trace_draft_index_value(None), None);
+        assert_eq!(mtp_logit_trace_draft_index_value(Some("")), None);
+        assert_eq!(mtp_logit_trace_draft_index_value(Some(" 10 ")), Some(10));
+        assert_eq!(mtp_logit_trace_draft_index_value(Some("15")), Some(15));
+        assert_eq!(mtp_logit_trace_draft_index_value(Some("16")), None);
+        assert_eq!(mtp_logit_trace_draft_index_value(Some("-1")), None);
+        assert_eq!(mtp_logit_trace_draft_index_value(Some("nope")), None);
     }
 
     #[test]

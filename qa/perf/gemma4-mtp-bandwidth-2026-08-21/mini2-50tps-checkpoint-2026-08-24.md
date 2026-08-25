@@ -164,14 +164,34 @@ work totaled 678.4 ms and remaining demand waves totaled 346.4 ms. Therefore
 cap-eight set can recover at most 57 additional true hits, so adding more
 workers alone cannot close the gap.
 
-The next bounded experiment is complementary pre-assistant reuse: explicitly
-stage a capped subset of the previous successful target round's exact cold
-identities during assistant work, consume only already-ready matching bytes in
-the direct-to-stage path, and retain H49 live-hidden staging for next-layer
-first-use coverage. Exact demand must remain nonblocking and authoritative;
-the two speculative sources need independent hard caps and lifecycle permits.
-This is materially different from H43–H45 retained banks: no record persists
-across rounds, no Metal bank is allocated, and no replacement blit is queued.
+## Post-H49 bounded experiments (H50–H54)
+
+A same-state H49 control after H50 measured 35.81 tok/s. H50 added a capped
+96-record previous-round source, remained 48/48 exact with zero swap, and fell
+to 34.74 tok/s. H51 changed the verifier to three K16 passes and remained exact
+at 34.08 tok/s. H53 then traced the decisive K16 rejection: the required target
+token was rank 20 at draft index 10, with a 21.57-logit deficit. That closes a
+simple wider-verifier or short-rescore shortcut for this fixture.
+
+H54 split each sparse layer into exact hot, already-ready, and authoritative
+demand prefixes. Demand reads started after the hot commit while ready records
+ran GateUp, and a final command ran the demand GateUp plus the single Down/tail.
+The run remained 48/48 exact at 36.25 tok/s with zero swap and no fallback or
+error. It hid about 34 ms of record loading, but 82 additional GPU command
+submissions raised slot wait by 26.4 ms and GPU time by 3.9 ms; verifier wall
+improved only 2.73 ms versus the same-state H49 control. H54 is therefore an
+exact architectural proof, not a throughput promotion.
+
+The next bounded revision will keep the immediate hot GateUp command, preserve
+the concurrent demand-read/ready-copy host staging, then fuse ready and demand
+GateUp into one terminal command with the sole Down and tail. At the observed
+layer mix that removes all 82 extra submissions and returns the sparse verifier
+to the H49 command count. This cleanup alone is not projected to reach 40 tok/s;
+it creates the lower-overhead exact base needed for the next compute change.
+
+H50 tested the earlier complementary pre-assistant reuse hypothesis described
+at the H49 checkpoint. Its exact regression closes that path at a 96-record
+cap; it is not the next promotion candidate.
 
 Profiles and executable for this checkpoint:
 
@@ -179,8 +199,15 @@ Profiles and executable for this checkpoint:
 - `H47-live-hidden-sequential-stage-cap8`
 - `H48-live-hidden-sequential-fast-predict`
 - `H49-live-hidden-sequential-fast-predict-dual-reader`
+- `H50-live-hidden-dual-previous-cold96`
+- `H51-live-hidden-fast-dual-k16x3`
+- `H52-k16-7-step3-rejection-rank-probe`
+- `H53-k16-draft10-rank-probe`
+- `H54-three-wave-live-ready-gateup`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
+- H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
+- H54 SHA-256: `f7f96177a700332aa1486ed0100cc475bffa72d3881ee1d06872972c3e28194f`
 
 ## Validation and provenance
 

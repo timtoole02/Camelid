@@ -852,6 +852,18 @@ fn gemma4_hybrid_hot_cold_single_down_enabled() -> bool {
     })
 }
 
+/// `CAMELID_GEMMA4_GHOST_METAL_THREE_WAVE_GATEUP=1`: split the exact cold
+/// GateUp range into already-ready and authoritative-demand prefixes backed by
+/// separate Metal buffers. Default off while H54 is validated on Mini2.
+#[cfg(target_os = "macos")]
+fn gemma4_hybrid_three_wave_gateup_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_THREE_WAVE_GATEUP")
+            .is_ok_and(|value| value == "1")
+    })
+}
+
 /// The argument-buffer GateUp and Down kernels carry exact accumulator layouts
 /// through the widened speculative ceiling. Keep this separate from the env
 /// switch so width admission is directly testable and cannot silently drift
@@ -14031,6 +14043,126 @@ impl Gemma4Q4HybridExpertSource {
         Some((table, lease))
     }
 
+    /// Build H54's three immutable table prefixes from one hot-directory
+    /// snapshot. The ready command cannot reference `demand_slab`, making its
+    /// GPU reads and concurrent host writes disjoint Metal resources.
+    fn materialize_hot_ready_demand_stage_tables(
+        self: &std::sync::Arc<Self>,
+        hot_experts: &[usize],
+        ready_experts: &[usize],
+        ready_slab: &Buffer,
+        demand_experts: &[usize],
+        demand_slab: &Buffer,
+    ) -> Option<(
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        std::sync::Arc<Gemma4Q4HybridBindingLease>,
+    )> {
+        let hot_count = hot_experts.len();
+        let ready_count = hot_count.checked_add(ready_experts.len())?;
+        let unique = ready_count.checked_add(demand_experts.len())?;
+        if hot_experts.is_empty()
+            || ready_experts.len().checked_add(demand_experts.len())? == 0
+            || unique > 128
+            || std::ptr::eq::<metal::BufferRef>(&**ready_slab, &**demand_slab)
+        {
+            return None;
+        }
+        let mut seen = [false; 128];
+        for &expert in hot_experts
+            .iter()
+            .chain(ready_experts)
+            .chain(demand_experts)
+        {
+            if expert >= 128 || seen[expert] {
+                return None;
+            }
+            seen[expert] = true;
+        }
+
+        loop {
+            let state = self.lease_state.load(std::sync::atomic::Ordering::Acquire);
+            if state < 0 || state == isize::MAX {
+                return None;
+            }
+            if self
+                .lease_state
+                .compare_exchange_weak(
+                    state,
+                    state + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let lease = std::sync::Arc::new(Gemma4Q4HybridBindingLease {
+            source: std::sync::Arc::clone(self),
+        });
+        let published = self.hot_slot_ids.read().ok()?;
+        let mut hot_records = Vec::with_capacity(hot_count);
+        let mut hot_offsets = Vec::with_capacity(hot_count);
+        for &expert in hot_experts {
+            let physical_slot = published
+                .iter()
+                .position(|published_expert| *published_expert == Some(expert))?;
+            hot_records.push(self.hot_records.get(physical_slot)?.clone());
+            hot_offsets.push(0usize);
+        }
+        drop(published);
+
+        let mut ready_records = hot_records.clone();
+        let mut ready_offsets = hot_offsets.clone();
+        for slot in 0..ready_experts.len() {
+            ready_records.push(ready_slab.clone());
+            ready_offsets.push(slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
+        }
+        let mut full_records = ready_records.clone();
+        let mut full_offsets = ready_offsets.clone();
+        for slot in 0..demand_experts.len() {
+            full_records.push(demand_slab.clone());
+            full_offsets.push(slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
+        }
+
+        let kernel = metal_linear_kernel()?;
+        let hot_slots = (0..hot_count).collect::<Vec<_>>();
+        let ready_slots = (0..ready_count).collect::<Vec<_>>();
+        let full_slots = (0..unique).collect::<Vec<_>>();
+        let hot_table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+            &kernel.device,
+            hot_count,
+            &hot_slots,
+            &hot_records,
+            &hot_offsets,
+            0,
+            None,
+        )?;
+        let ready_table =
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+                &kernel.device,
+                ready_count,
+                &ready_slots,
+                &ready_records,
+                &ready_offsets,
+                0,
+                None,
+            )?;
+        let full_table =
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+                &kernel.device,
+                unique,
+                &full_slots,
+                &full_records,
+                &full_offsets,
+                0,
+                None,
+            )?;
+        Some((hot_table, ready_table, full_table, lease))
+    }
+
     /// Build separate retained-bank tables from one hot-directory snapshot.
     /// The hot command can address only `[hot | retained hits]`; the cold
     /// command owns the full `[hot | retained hits | fresh]` table. Keeping
@@ -14453,6 +14585,43 @@ impl Gemma4Q4ExpertSlotBinding {
                 .map(|(table, lease)| Self::HybridMappedTable {
                     table: std::sync::Arc::new(table),
                     _lease: lease,
+                }),
+            _ => None,
+        }
+    }
+
+    fn materialize_hot_ready_demand_stage_tables(
+        &self,
+        hot_experts: &[usize],
+        ready_experts: &[usize],
+        ready_slab: &Buffer,
+        demand_experts: &[usize],
+        demand_slab: &Buffer,
+    ) -> Option<(Self, Self, Self)> {
+        match self {
+            Self::HybridMappedSource(source) => source
+                .materialize_hot_ready_demand_stage_tables(
+                    hot_experts,
+                    ready_experts,
+                    ready_slab,
+                    demand_experts,
+                    demand_slab,
+                )
+                .map(|(hot_table, ready_table, full_table, lease)| {
+                    (
+                        Self::HybridMappedTable {
+                            table: std::sync::Arc::new(hot_table),
+                            _lease: std::sync::Arc::clone(&lease),
+                        },
+                        Self::HybridMappedTable {
+                            table: std::sync::Arc::new(ready_table),
+                            _lease: std::sync::Arc::clone(&lease),
+                        },
+                        Self::HybridMappedTable {
+                            table: std::sync::Arc::new(full_table),
+                            _lease: lease,
+                        },
+                    )
                 }),
             _ => None,
         }
@@ -24593,8 +24762,8 @@ fn same_expert_set(a: &[usize], b: &[usize]) -> bool {
 }
 
 /// Host callback phase for exact record publication. `Demand` preserves the
-/// established route/fill behavior. The two cold-stage phases are reachable
-/// only under the explicit hot/cold overlap admission.
+/// established route/fill behavior. The staged-cold phases are reachable only
+/// under an explicit hot/cold overlap admission.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gemma4Q4SlotFillPhase {
@@ -24602,6 +24771,14 @@ pub(crate) enum Gemma4Q4SlotFillPhase {
     /// Observe exact route truth and publish the canonical identity table, but
     /// defer cold bytes to the guarded split-wave schedule.
     RouteOnly,
+    /// Nonblocking exact reconciliation. Retain already-ready private records
+    /// and return their stable cold-subset identities without copying bytes.
+    StageColdReady,
+    /// After static-hot commit, launch authoritative demand reads and copy the
+    /// retained ready records into their physically disjoint Metal slab.
+    StageColdLaunch,
+    /// Join the complete authoritative demand batch before final commit.
+    StageColdDemand,
     StageCold,
     PublishCold,
 }
@@ -24872,6 +25049,75 @@ fn hot_cold_compact_slot_table(hot: &[usize], cold: &[usize]) -> Option<[u32; 12
     let mut seen = [false; 128];
     let mut table = [u32::MAX; 128];
     for (slot, expert) in hot.iter().chain(cold).copied().enumerate() {
+        if expert >= 128 || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        table[expert] = slot as u32;
+    }
+    Some(table)
+}
+
+/// Validate H54's nonblocking ready receipt against the exact router-owned
+/// cold union and derive its stable complement. Both output sides preserve
+/// their relative order in `cold`.
+#[cfg(any(target_os = "macos", test))]
+fn partition_exact_cold_by_ready(
+    cold: &[usize],
+    ready: &[usize],
+    ready_capacity: usize,
+    demand_capacity: usize,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    if cold.is_empty() || ready.len() > ready_capacity {
+        return None;
+    }
+    let mut cold_seen = [false; 128];
+    for &expert in cold {
+        if expert >= 128 || cold_seen[expert] {
+            return None;
+        }
+        cold_seen[expert] = true;
+    }
+    let mut ready_mask = [false; 128];
+    for &expert in ready {
+        if expert >= 128 || !cold_seen[expert] || ready_mask[expert] {
+            return None;
+        }
+        ready_mask[expert] = true;
+    }
+    let mut stable_ready = Vec::with_capacity(ready.len());
+    let mut demand = Vec::with_capacity(cold.len().saturating_sub(ready.len()));
+    for &expert in cold {
+        if ready_mask[expert] {
+            stable_ready.push(expert);
+        } else {
+            demand.push(expert);
+        }
+    }
+    if stable_ready != ready || demand.len() > demand_capacity {
+        return None;
+    }
+    Some((stable_ready, demand))
+}
+
+/// Build the one authoritative compact mapping consumed by H54's single
+/// top-k pass and single Down pass.
+#[cfg(any(target_os = "macos", test))]
+fn hot_ready_demand_compact_slot_table(
+    hot: &[usize],
+    ready: &[usize],
+    demand: &[usize],
+) -> Option<[u32; 128]> {
+    let unique = hot
+        .len()
+        .checked_add(ready.len())?
+        .checked_add(demand.len())?;
+    if hot.is_empty() || ready.len().checked_add(demand.len())? == 0 || unique > 128 {
+        return None;
+    }
+    let mut seen = [false; 128];
+    let mut table = [u32::MAX; 128];
+    for (slot, expert) in hot.iter().chain(ready).chain(demand).copied().enumerate() {
         if expert >= 128 || seen[expert] {
             return None;
         }
@@ -29072,6 +29318,8 @@ impl Gemma4GhostCommonMetal {
         retained_cold_direct_bank_fill: bool,
         cold_stage_slab: Option<&Buffer>,
         cold_stage_slot_count: usize,
+        ready_stage_slab: Option<&Buffer>,
+        ready_stage_slot_count: usize,
         hot_residency_at_start: Option<&[[bool; 128]]>,
         mut live_sequential_predictor: Option<
             &mut dyn FnMut(usize, &[f32], usize) -> Option<Vec<usize>>,
@@ -29466,6 +29714,21 @@ impl Gemma4GhostCommonMetal {
             && !hot_cold_mapped_wave
             && gemma4_hybrid_hot_cold_single_down_admits_k(k_tokens)
             && gemma4_hybrid_hot_cold_single_down_enabled();
+        let hot_cold_three_wave_candidate = hot_cold_single_down
+            && is_decode_round
+            && !hot_cold_overlap_publish
+            && live_sequential_h40_shape
+            && gemma4_hybrid_three_wave_gateup_enabled()
+            && ready_stage_slot_count == 8
+            && ready_stage_slab.is_some_and(|slab| {
+                slab.length() as usize
+                    >= ready_stage_slot_count.saturating_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+            })
+            && ready_stage_slab
+                .zip(cold_stage_slab)
+                .is_some_and(|(ready, demand)| {
+                    !std::ptr::eq::<metal::BufferRef>(&**ready, &**demand)
+                });
         let retained_cold_bank_round = hot_cold_single_down
             && is_decode_round
             && !hot_cold_overlap_publish
@@ -29473,6 +29736,7 @@ impl Gemma4GhostCommonMetal {
                 .retained_cold_layers
                 .as_ref()
                 .is_some_and(|layers| layers.len() == n_layers);
+        let hot_cold_three_wave_round = hot_cold_three_wave_candidate && !retained_cold_bank_round;
         let retained_cold_direct_bank_round = retained_cold_bank_round
             && retained_cold_direct_bank_fill
             && retained_cold_direct_filler.is_some()
@@ -31008,556 +31272,748 @@ impl Gemma4GhostCommonMetal {
 
                 if let Some((hot_wave, cold_wave)) = hot_cold_partition {
                     let stage_slab = cold_stage_slab.expect("hot/cold admission checked");
-                    let split_tables = hot_cold_split_slot_tables(&hot_wave, &cold_wave);
-                    let retained_plan = retained_cold_plan.as_ref();
-                    let fresh_wave =
-                        retained_plan.map_or(cold_wave.as_slice(), |plan| plan.fresh.as_slice());
-                    let ready_count =
-                        retained_plan.map_or(hot_wave.len(), Gemma4RetainedColdPlan::ready_count);
-                    let compact_table = if let Some(plan) = retained_plan {
-                        retained_cold_compact_slot_table(plan)
-                    } else if hot_cold_single_down {
-                        hot_cold_compact_slot_table(&hot_wave, &cold_wave)
-                    } else {
-                        None
-                    };
-                    let hot_ready = if hot_cold_single_down {
-                        compact_table.as_ref().is_some_and(|table| {
-                            wave_slots_ready(table, &union, union.len()).is_none()
-                        })
-                    } else {
-                        split_tables.as_ref().is_some_and(|(hot_table, _)| {
-                            wave_slots_ready(hot_table, &hot_wave, 128).is_none()
-                        })
-                    };
-                    let mut encode_pair = |mapped_wave: bool, direct_bank: bool| {
-                        if !hot_ready {
-                            return None;
-                        }
-                        let (hot_table, legacy_expected_cold_table) =
-                            *split_tables.as_ref().expect("checked");
-                        let expected_cold_table = if retained_plan.is_some() {
-                            compact_stage_slot_table(fresh_wave)?
-                        } else {
-                            legacy_expected_cold_table
-                        };
-                        let single_down = hot_cold_single_down && !mapped_wave;
-                        if direct_bank && (!single_down || retained_plan.is_none()) {
-                            return None;
-                        }
-                        let hot_and_full_binding = if single_down {
-                            if let Some(plan) = retained_plan {
-                                let bank_slots =
-                                    &self.retained_cold_layers.as_ref()?.get(layer_idx)?.slots;
-                                slot_binding.materialize_hot_retained_fresh_tables(
-                                    &hot_wave,
-                                    &plan.retained,
-                                    bank_slots,
-                                    fresh_wave,
-                                    stage_slab,
-                                    &plan.blits,
-                                    direct_bank,
+                    if hot_cold_three_wave_round {
+                        let ready_slab = ready_stage_slab.expect("three-wave admission checked");
+                        let plan_started = std::time::Instant::now();
+                        let mut ready_wave = union.clone();
+                        let mut plan_table = [u32::MAX; 128];
+                        let planned = filler(
+                            layer_idx,
+                            &[],
+                            Some(cold_wave.as_slice()),
+                            Gemma4Q4SlotFillPhase::StageColdReady,
+                            &mut plan_table,
+                            &mut ready_wave,
+                        );
+                        let plan_ms = plan_started.elapsed().as_secs_f64() * 1000.0;
+                        account_wave_load!(layer_idx, plan_ms);
+                        let ready_demand = planned
+                            .then(|| {
+                                partition_exact_cold_by_ready(
+                                    &cold_wave,
+                                    &ready_wave,
+                                    ready_stage_slot_count,
+                                    cold_stage_slot_count,
                                 )
-                            } else {
-                                slot_binding
-                                    .materialize_hot_cold_stage_table(
-                                        &hot_wave, &cold_wave, stage_slab,
-                                    )
-                                    .map(|binding| (binding.clone(), binding))
-                            }
-                        } else {
-                            slot_binding
-                                .materialize_for_active_slots(&hot_wave)
-                                .map(|binding| (binding, slot_binding.clone()))
-                        };
-                        hot_and_full_binding.and_then(|(hot_binding, full_binding)| {
-                            if single_down {
-                                let expected_hot_records = if retained_plan.is_some() {
-                                    ready_count
-                                } else {
-                                    unique
-                                };
-                                if hot_binding.record_table().is_none_or(|table| {
-                                    table.slot_count() != expected_hot_records
-                                        || table.bound_record_count() != expected_hot_records
-                                }) || full_binding.record_table().is_none_or(|table| {
-                                    table.slot_count() != unique
-                                        || table.bound_record_count() != unique
-                                }) {
-                                    return None;
-                                }
-                            } else if hot_binding.bound_tier_record_counts()
-                                != Some((hot_wave.len(), 0))
-                            {
-                                return None;
-                            }
-                            let published_table = if single_down {
-                                compact_table.as_ref()?
-                            } else {
-                                &hot_table
-                            };
-                            unsafe {
-                                let dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
-                                std::ptr::copy_nonoverlapping(published_table.as_ptr(), dest, 128);
-                            }
+                            })
+                            .flatten();
 
+                        if let Some((ready_wave, demand_wave)) = ready_demand {
+                            let compact_table = hot_ready_demand_compact_slot_table(
+                                &hot_wave,
+                                &ready_wave,
+                                &demand_wave,
+                            );
+                            let bindings = slot_binding.materialize_hot_ready_demand_stage_tables(
+                                &hot_wave,
+                                &ready_wave,
+                                ready_slab,
+                                &demand_wave,
+                                stage_slab,
+                            );
                             let encode_started = std::time::Instant::now();
-                            let hot_cb = kernel.queue.new_command_buffer().to_owned();
-                            let hot_enc = hot_cb.new_compute_command_encoder();
-                            let hot_ok = if single_down {
-                                let hot_slots: Vec<usize> = (0..ready_count).collect();
-                                self.encode_moe_topk_only(
-                                    kernel,
-                                    hot_enc,
-                                    &down_exps_scale,
-                                    &expert_to_slot_table,
-                                    layer_idx,
-                                    unique,
-                                    unique,
-                                    k_tokens,
-                                    logits_off,
-                                ) && self.encode_moe_record_gateup_range(
-                                    hot_enc,
-                                    &hot_binding,
-                                    &hot_slots,
-                                    layer_idx,
-                                    k_tokens,
-                                    0,
-                                    ready_count,
-                                )
-                            } else {
-                                self.encode_moe_topk_gateup_down(
-                                    kernel,
-                                    hot_enc,
-                                    &down_exps_scale,
-                                    &expert_to_slot_table,
-                                    &hot_binding,
-                                    Some(&hot_wave),
-                                    layer_idx,
-                                    128,
-                                    128,
-                                    k_tokens,
-                                    &self.resident_scratch.gpu_moe_acc,
-                                    0,
-                                    logits_off,
-                                    None,
-                                ) && self.encode_moe_down(
-                                    kernel,
-                                    hot_enc,
-                                    &hot_binding,
-                                    Some(&hot_wave),
-                                    layer_idx,
-                                    k_tokens,
-                                    &self.resident_scratch.gpu_moe_acc,
-                                    0,
-                                    None,
-                                )
-                            };
-                            hot_enc.end_encoding();
-                            if !hot_ok {
-                                return None;
-                            }
-
-                            let cold_table_buffer = self
-                                .resident_scratch
-                                .wave1_slot_tables
-                                .get(layer_idx)?
-                                .clone();
-                            let cold_binding = if single_down {
-                                full_binding
-                            } else if mapped_wave {
-                                if hot_wave.len().checked_add(cold_wave.len()) != Some(unique) {
-                                    return None;
-                                }
-                                let mut identity_table = [u32::MAX; 128];
-                                for &expert in &cold_wave {
-                                    if expert >= identity_table.len()
-                                        || identity_table[expert] != u32::MAX
+                            let encoded = compact_table.zip(bindings).and_then(
+                                |(compact_table, (hot_binding, ready_binding, full_binding))| {
+                                    let hot_count = hot_wave.len();
+                                    let ready_end = hot_count.checked_add(ready_wave.len())?;
+                                    if ready_end.checked_add(demand_wave.len()) != Some(unique)
+                                        || hot_binding.record_table().is_none_or(|table| {
+                                            table.slot_count() != hot_count
+                                                || table.bound_record_count() != hot_count
+                                        })
+                                        || ready_binding.record_table().is_none_or(|table| {
+                                            table.slot_count() != ready_end
+                                                || table.bound_record_count() != ready_end
+                                        })
+                                        || full_binding.record_table().is_none_or(|table| {
+                                            table.slot_count() != unique
+                                                || table.bound_record_count() != unique
+                                        })
                                     {
                                         return None;
                                     }
-                                    identity_table[expert] = expert as u32;
-                                }
-                                if wave_slots_ready(&identity_table, &cold_wave, 128).is_some() {
-                                    return None;
-                                }
-                                let binding =
-                                    slot_binding.materialize_for_active_slots(&cold_wave)?;
-                                if binding.bound_tier_record_counts() != Some((0, cold_wave.len()))
-                                {
-                                    return None;
-                                }
+
+                                    let hot_cb = kernel.queue.new_command_buffer().to_owned();
+                                    let hot_enc = hot_cb.new_compute_command_encoder();
+                                    let hot_slots = (0..hot_count).collect::<Vec<_>>();
+                                    let hot_ok = self.encode_moe_topk_only(
+                                        kernel,
+                                        hot_enc,
+                                        &down_exps_scale,
+                                        &expert_to_slot_table,
+                                        layer_idx,
+                                        unique,
+                                        unique,
+                                        k_tokens,
+                                        logits_off,
+                                    ) && self.encode_moe_record_gateup_range(
+                                        hot_enc,
+                                        &hot_binding,
+                                        &hot_slots,
+                                        layer_idx,
+                                        k_tokens,
+                                        0,
+                                        hot_count,
+                                    );
+                                    hot_enc.end_encoding();
+                                    if !hot_ok {
+                                        return None;
+                                    }
+
+                                    let ready_cb = if ready_wave.is_empty() {
+                                        None
+                                    } else {
+                                        let cb = kernel.queue.new_command_buffer().to_owned();
+                                        let enc = cb.new_compute_command_encoder();
+                                        let ready_slots =
+                                            (hot_count..ready_end).collect::<Vec<_>>();
+                                        let all_slots = (0..unique).collect::<Vec<_>>();
+                                        let mut ok = self.encode_moe_record_gateup_range(
+                                            enc,
+                                            &ready_binding,
+                                            &ready_slots,
+                                            layer_idx,
+                                            k_tokens,
+                                            hot_count,
+                                            ready_wave.len(),
+                                        );
+                                        if demand_wave.is_empty() {
+                                            ok =
+                                                ok && self.encode_moe_down(
+                                                    kernel,
+                                                    enc,
+                                                    &full_binding,
+                                                    Some(&all_slots),
+                                                    layer_idx,
+                                                    k_tokens,
+                                                    &self.resident_scratch.gpu_moe_acc,
+                                                    0,
+                                                    None,
+                                                ) && self.encode_layer_tail(
+                                                    kernel, enc, layer_idx, k_tokens,
+                                                );
+                                        }
+                                        enc.end_encoding();
+                                        if !ok {
+                                            return None;
+                                        }
+                                        Some(cb)
+                                    };
+
+                                    let demand_cb = if demand_wave.is_empty() {
+                                        None
+                                    } else {
+                                        let cb = kernel.queue.new_command_buffer().to_owned();
+                                        let enc = cb.new_compute_command_encoder();
+                                        let demand_slots = (ready_end..unique).collect::<Vec<_>>();
+                                        let all_slots = (0..unique).collect::<Vec<_>>();
+                                        let ok = self.encode_moe_record_gateup_range(
+                                            enc,
+                                            &full_binding,
+                                            &demand_slots,
+                                            layer_idx,
+                                            k_tokens,
+                                            ready_end,
+                                            demand_wave.len(),
+                                        ) && self.encode_moe_down(
+                                            kernel,
+                                            enc,
+                                            &full_binding,
+                                            Some(&all_slots),
+                                            layer_idx,
+                                            k_tokens,
+                                            &self.resident_scratch.gpu_moe_acc,
+                                            0,
+                                            None,
+                                        ) && self
+                                            .encode_layer_tail(kernel, enc, layer_idx, k_tokens);
+                                        enc.end_encoding();
+                                        if !ok {
+                                            return None;
+                                        }
+                                        Some(cb)
+                                    };
+                                    Some((
+                                        compact_table,
+                                        hot_cb,
+                                        ready_cb,
+                                        demand_cb,
+                                        hot_binding,
+                                        ready_binding,
+                                        full_binding,
+                                    ))
+                                },
+                            );
+                            ledger.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+
+                            if let Some((
+                                compact_table,
+                                hot_cb,
+                                ready_cb,
+                                demand_cb,
+                                hot_binding,
+                                ready_binding,
+                                full_binding,
+                            )) = encoded
+                            {
                                 unsafe {
-                                    let dest = cold_table_buffer.contents() as *mut u32;
+                                    let dest =
+                                        moe_layer.expert_to_slot_table.contents() as *mut u32;
                                     std::ptr::copy_nonoverlapping(
-                                        identity_table.as_ptr(),
+                                        compact_table.as_ptr(),
                                         dest,
                                         128,
                                     );
                                 }
-                                binding
+                                stamp.start(GPU_STAGE_GATEUP);
+                                stamp.push_current(&hot_cb);
+                                hot_cb.commit();
+                                mapped_binding_guards
+                                    .push(Gemma4Q4MappedBindingGuard::new(&hot_cb, hot_binding));
+
+                                let launch_started = std::time::Instant::now();
+                                let mut ready_table = [u32::MAX; 128];
+                                let mut launch_union = union.clone();
+                                let launched = filler(
+                                    layer_idx,
+                                    &[],
+                                    Some(cold_wave.as_slice()),
+                                    Gemma4Q4SlotFillPhase::StageColdLaunch,
+                                    &mut ready_table,
+                                    &mut launch_union,
+                                );
+                                let launch_ms = launch_started.elapsed().as_secs_f64() * 1000.0;
+                                account_wave_load!(layer_idx, launch_ms);
+                                let expected_ready_table = if ready_wave.is_empty() {
+                                    Some([u32::MAX; 128])
+                                } else {
+                                    compact_stage_slot_table(&ready_wave)
+                                };
+                                let ready_exact = launched
+                                    && expected_ready_table == Some(ready_table)
+                                    && (ready_wave.is_empty()
+                                        || wave_slots_ready(
+                                            &ready_table,
+                                            &ready_wave,
+                                            ready_wave.len(),
+                                        )
+                                        .is_none());
+
+                                let mut ready_committed = false;
+                                if ready_exact {
+                                    if let Some(ready_cb) = ready_cb.as_ref() {
+                                        stamp.start(GPU_STAGE_GATEUP);
+                                        stamp.push_current(ready_cb);
+                                        ready_cb.commit();
+                                        ready_committed = true;
+                                        mapped_binding_guards.push(
+                                            Gemma4Q4MappedBindingGuard::new(
+                                                ready_cb,
+                                                ready_binding,
+                                            ),
+                                        );
+                                        if demand_wave.is_empty() {
+                                            mapped_binding_guards.push(
+                                                Gemma4Q4MappedBindingGuard::new(
+                                                    ready_cb,
+                                                    full_binding.clone(),
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        drop(ready_binding);
+                                    }
+                                } else {
+                                    drop(ready_binding);
+                                }
+
+                                let demand_started = std::time::Instant::now();
+                                let mut demand_table = [u32::MAX; 128];
+                                let mut demand_union = union.clone();
+                                let demand_joined = ready_exact
+                                    && filler(
+                                        layer_idx,
+                                        &[],
+                                        Some(demand_wave.as_slice()),
+                                        Gemma4Q4SlotFillPhase::StageColdDemand,
+                                        &mut demand_table,
+                                        &mut demand_union,
+                                    );
+                                let demand_ms = demand_started.elapsed().as_secs_f64() * 1000.0;
+                                account_wave_load!(layer_idx, demand_ms);
+                                let expected_demand_table = if demand_wave.is_empty() {
+                                    Some([u32::MAX; 128])
+                                } else {
+                                    compact_stage_slot_table(&demand_wave)
+                                };
+                                let demand_exact = demand_joined
+                                    && expected_demand_table == Some(demand_table)
+                                    && (demand_wave.is_empty()
+                                        || wave_slots_ready(
+                                            &demand_table,
+                                            &demand_wave,
+                                            demand_wave.len(),
+                                        )
+                                        .is_none());
+
+                                if demand_exact {
+                                    let terminal_cb = if let Some(demand_cb) = demand_cb {
+                                        stamp.start(GPU_STAGE_GATEUP);
+                                        stamp.push_current(&demand_cb);
+                                        demand_cb.commit();
+                                        mapped_binding_guards.push(
+                                            Gemma4Q4MappedBindingGuard::new(
+                                                &demand_cb,
+                                                full_binding,
+                                            ),
+                                        );
+                                        demand_cb
+                                    } else if let Some(ready_cb) = ready_cb {
+                                        // D=0: this command owns the one Down
+                                        // and already retains both prefix tables.
+                                        drop(full_binding);
+                                        ready_cb
+                                    } else {
+                                        // Exact cold is non-empty, so R=D=0 is
+                                        // impossible after partition validation.
+                                        self.last_chained_ledger = ledger;
+                                        return false;
+                                    };
+                                    last_committed_cb = Some(terminal_cb);
+                                    cb_closed = true;
+                                    layer_committed = true;
+                                    ledger.overlap_layers = ledger.overlap_layers.saturating_add(1);
+                                    let command_count = 1usize
+                                        + usize::from(!ready_wave.is_empty())
+                                        + usize::from(!demand_wave.is_empty());
+                                    ledger.expert_waves_sum = ledger
+                                        .expert_waves_sum
+                                        .saturating_add(command_count.saturating_sub(1) as u32);
+                                    ledger.expert_waves_max =
+                                        ledger.expert_waves_max.max(command_count as u32);
+                                    ledger.hot_bound_records = ledger
+                                        .hot_bound_records
+                                        .saturating_add(unique.min(u32::MAX as usize) as u32);
+                                    if let Some(value) =
+                                        ledger.hot_bound_per_layer.get_mut(layer_idx)
+                                    {
+                                        *value = value
+                                            .saturating_add(unique.min(u16::MAX as usize) as u16);
+                                    }
+                                    if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING").is_ok_and(
+                                        |value| value == "1" || value.eq_ignore_ascii_case("true"),
+                                    ) {
+                                        eprintln!(
+                                            "[metal chained three-wave] layer={layer_idx} hot={} ready={} demand={} active={} route_passes=1 down_passes=1 merge_passes=0 plan={plan_ms:.2}ms launch={launch_ms:.2}ms demand_join={demand_ms:.2}ms",
+                                            hot_wave.len(),
+                                            ready_wave.len(),
+                                            demand_wave.len(),
+                                            unique,
+                                        );
+                                    }
+                                    encode_clock = std::time::Instant::now();
+                                } else {
+                                    // No Down/tail was committed. Retire every
+                                    // GateUp-only prefix, join any owned I/O via
+                                    // the callback/plan guard, release the shared
+                                    // hot lease, then let the established exact
+                                    // two-wave path refill and overwrite scratch.
+                                    let barrier = if ready_committed {
+                                        ready_cb.as_ref().expect("committed").to_owned()
+                                    } else {
+                                        hot_cb.to_owned()
+                                    };
+                                    barrier.wait_until_completed();
+                                    if barrier.status() != metal::MTLCommandBufferStatus::Completed
+                                    {
+                                        self.last_chained_ledger = ledger;
+                                        return false;
+                                    }
+                                    drop(demand_cb);
+                                    drop(full_binding);
+                                    mapped_binding_guards.clear();
+                                    if let Err(error) = stamp.harvest_completed() {
+                                        eprintln!(
+                                            "[metal chained round] layer {layer_idx} three-wave fallback retirement failed: {error}"
+                                        );
+                                        self.last_chained_ledger = ledger;
+                                        return false;
+                                    }
+                                    ledger.overlap_fallbacks =
+                                        ledger.overlap_fallbacks.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+                    if !layer_committed {
+                        let split_tables = hot_cold_split_slot_tables(&hot_wave, &cold_wave);
+                        let retained_plan = retained_cold_plan.as_ref();
+                        let fresh_wave = retained_plan
+                            .map_or(cold_wave.as_slice(), |plan| plan.fresh.as_slice());
+                        let ready_count = retained_plan
+                            .map_or(hot_wave.len(), Gemma4RetainedColdPlan::ready_count);
+                        let compact_table = if let Some(plan) = retained_plan {
+                            retained_cold_compact_slot_table(plan)
+                        } else if hot_cold_single_down {
+                            hot_cold_compact_slot_table(&hot_wave, &cold_wave)
+                        } else {
+                            None
+                        };
+                        let hot_ready = if hot_cold_single_down {
+                            compact_table.as_ref().is_some_and(|table| {
+                                wave_slots_ready(table, &union, union.len()).is_none()
+                            })
+                        } else {
+                            split_tables.as_ref().is_some_and(|(hot_table, _)| {
+                                wave_slots_ready(hot_table, &hot_wave, 128).is_none()
+                            })
+                        };
+                        let mut encode_pair = |mapped_wave: bool, direct_bank: bool| {
+                            if !hot_ready {
+                                return None;
+                            }
+                            let (hot_table, legacy_expected_cold_table) =
+                                *split_tables.as_ref().expect("checked");
+                            let expected_cold_table = if retained_plan.is_some() {
+                                compact_stage_slot_table(fresh_wave)?
                             } else {
-                                Gemma4Q4ExpertSlotBinding::Monolithic(stage_slab.clone())
+                                legacy_expected_cold_table
                             };
-                            let cold_active_slots = mapped_wave.then_some(cold_wave.as_slice());
-                            let cold_slot_count = if mapped_wave { 128 } else { cold_wave.len() };
-                            let cold_cb = kernel.queue.new_command_buffer().to_owned();
-                            let cold_enc = cold_cb.new_compute_command_encoder();
-                            let cold_ok = if single_down {
-                                let cold_slots: Vec<usize> = (ready_count..unique).collect();
-                                let all_slots: Vec<usize> = (0..unique).collect();
-                                (cold_slots.is_empty()
-                                    || self.encode_moe_record_gateup_range(
-                                        cold_enc,
-                                        &cold_binding,
-                                        &cold_slots,
+                            let single_down = hot_cold_single_down && !mapped_wave;
+                            if direct_bank && (!single_down || retained_plan.is_none()) {
+                                return None;
+                            }
+                            let hot_and_full_binding = if single_down {
+                                if let Some(plan) = retained_plan {
+                                    let bank_slots =
+                                        &self.retained_cold_layers.as_ref()?.get(layer_idx)?.slots;
+                                    slot_binding.materialize_hot_retained_fresh_tables(
+                                        &hot_wave,
+                                        &plan.retained,
+                                        bank_slots,
+                                        fresh_wave,
+                                        stage_slab,
+                                        &plan.blits,
+                                        direct_bank,
+                                    )
+                                } else {
+                                    slot_binding
+                                        .materialize_hot_cold_stage_table(
+                                            &hot_wave, &cold_wave, stage_slab,
+                                        )
+                                        .map(|binding| (binding.clone(), binding))
+                                }
+                            } else {
+                                slot_binding
+                                    .materialize_for_active_slots(&hot_wave)
+                                    .map(|binding| (binding, slot_binding.clone()))
+                            };
+                            hot_and_full_binding.and_then(|(hot_binding, full_binding)| {
+                                if single_down {
+                                    let expected_hot_records = if retained_plan.is_some() {
+                                        ready_count
+                                    } else {
+                                        unique
+                                    };
+                                    if hot_binding.record_table().is_none_or(|table| {
+                                        table.slot_count() != expected_hot_records
+                                            || table.bound_record_count() != expected_hot_records
+                                    }) || full_binding.record_table().is_none_or(|table| {
+                                        table.slot_count() != unique
+                                            || table.bound_record_count() != unique
+                                    }) {
+                                        return None;
+                                    }
+                                } else if hot_binding.bound_tier_record_counts()
+                                    != Some((hot_wave.len(), 0))
+                                {
+                                    return None;
+                                }
+                                let published_table = if single_down {
+                                    compact_table.as_ref()?
+                                } else {
+                                    &hot_table
+                                };
+                                unsafe {
+                                    let dest =
+                                        moe_layer.expert_to_slot_table.contents() as *mut u32;
+                                    std::ptr::copy_nonoverlapping(
+                                        published_table.as_ptr(),
+                                        dest,
+                                        128,
+                                    );
+                                }
+
+                                let encode_started = std::time::Instant::now();
+                                let hot_cb = kernel.queue.new_command_buffer().to_owned();
+                                let hot_enc = hot_cb.new_compute_command_encoder();
+                                let hot_ok = if single_down {
+                                    let hot_slots: Vec<usize> = (0..ready_count).collect();
+                                    self.encode_moe_topk_only(
+                                        kernel,
+                                        hot_enc,
+                                        &down_exps_scale,
+                                        &expert_to_slot_table,
+                                        layer_idx,
+                                        unique,
+                                        unique,
+                                        k_tokens,
+                                        logits_off,
+                                    ) && self.encode_moe_record_gateup_range(
+                                        hot_enc,
+                                        &hot_binding,
+                                        &hot_slots,
                                         layer_idx,
                                         k_tokens,
+                                        0,
                                         ready_count,
-                                        fresh_wave.len(),
-                                    ))
-                                    && self.encode_moe_down(
+                                    )
+                                } else {
+                                    self.encode_moe_topk_gateup_down(
                                         kernel,
-                                        cold_enc,
-                                        &cold_binding,
-                                        Some(&all_slots),
+                                        hot_enc,
+                                        &down_exps_scale,
+                                        &expert_to_slot_table,
+                                        &hot_binding,
+                                        Some(&hot_wave),
+                                        layer_idx,
+                                        128,
+                                        128,
+                                        k_tokens,
+                                        &self.resident_scratch.gpu_moe_acc,
+                                        0,
+                                        logits_off,
+                                        None,
+                                    ) && self.encode_moe_down(
+                                        kernel,
+                                        hot_enc,
+                                        &hot_binding,
+                                        Some(&hot_wave),
                                         layer_idx,
                                         k_tokens,
                                         &self.resident_scratch.gpu_moe_acc,
                                         0,
                                         None,
                                     )
-                            } else {
-                                self.encode_moe_topk_gateup_down(
-                                    kernel,
-                                    cold_enc,
-                                    &down_exps_scale,
-                                    &cold_table_buffer,
-                                    &cold_binding,
-                                    cold_active_slots,
-                                    layer_idx,
-                                    cold_slot_count,
-                                    cold_slot_count,
-                                    k_tokens,
-                                    &self.resident_scratch.gpu_moe_acc_wave,
-                                    0,
-                                    logits_off,
-                                    None,
-                                ) && self.encode_moe_down(
-                                    kernel,
-                                    cold_enc,
-                                    &cold_binding,
-                                    cold_active_slots,
-                                    layer_idx,
-                                    k_tokens,
-                                    &self.resident_scratch.gpu_moe_acc_wave,
-                                    0,
-                                    None,
-                                )
-                            };
-                            if cold_ok && !single_down {
-                                let n_el = (k_tokens * GEMMA4_Q4_EXPERT_HIDDEN) as u32;
-                                cold_enc.set_compute_pipeline_state(&kernel.residual_add_pipeline);
-                                cold_enc.set_buffer(0, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                                cold_enc.set_buffer(
-                                    1,
-                                    Some(&self.resident_scratch.gpu_moe_acc_wave),
-                                    0,
-                                );
-                                cold_enc.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                                cold_enc.set_bytes(3, 4, &n_el as *const u32 as *const _);
-                                dispatch_1d(
-                                    cold_enc,
-                                    &kernel.residual_add_pipeline,
-                                    k_tokens * GEMMA4_Q4_EXPERT_HIDDEN,
-                                );
-                                cold_enc.memory_barrier_with_resources(&[&self
-                                    .resident_scratch
-                                    .gpu_moe_acc]);
-                            }
-                            let cold_ok = cold_ok
-                                && self.encode_layer_tail(kernel, cold_enc, layer_idx, k_tokens);
-                            cold_enc.end_encoding();
-                            if !cold_ok {
-                                return None;
-                            }
-                            if let Some(plan) = retained_plan.filter(|_| !direct_bank) {
-                                let bank_slots =
-                                    &self.retained_cold_layers.as_ref()?.get(layer_idx)?.slots;
-                                if !encode_retained_cold_blits(
-                                    &cold_cb,
-                                    stage_slab,
-                                    fresh_wave.len(),
-                                    bank_slots,
-                                    &plan.blits,
-                                ) {
+                                };
+                                hot_enc.end_encoding();
+                                if !hot_ok {
                                     return None;
                                 }
-                            }
-                            ledger.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
-                            Some((
-                                hot_cb,
-                                cold_cb,
-                                hot_binding,
-                                cold_binding,
-                                cold_table_buffer,
-                                expected_cold_table,
-                                mapped_wave,
-                                single_down,
-                                direct_bank,
-                            ))
-                        })
-                    };
-                    // The direct mapped experiment must remain a pre-commit
-                    // optimization only. Any resource, receipt, or encode
-                    // refusal drops its uncommitted pair and retries the
-                    // established exact staged schedule unchanged.
-                    let encoded = if retained_cold_direct_bank_round && retained_plan.is_some() {
-                        match encode_pair(false, true) {
-                            Some(pair) => Some(pair),
-                            None => encode_pair(false, false),
-                        }
-                    } else if hot_cold_mapped_wave {
-                        match encode_pair(true, false) {
-                            Some(pair) => Some(pair),
-                            None => encode_pair(false, false),
-                        }
-                    } else {
-                        encode_pair(false, false)
-                    };
-                    drop(encode_pair);
 
-                    if let Some((
-                        hot_cb,
-                        cold_cb,
-                        hot_binding,
-                        cold_binding,
-                        cold_table_buffer,
-                        expected_cold_table,
-                        mapped_wave,
-                        single_down,
-                        direct_bank,
-                    )) = encoded
-                    {
-                        if mapped_wave {
-                            debug_assert!(!hot_cold_overlap_publish);
-                            debug_assert_eq!(hot_wave.len() + cold_wave.len(), unique);
-                            // Both sparse tables and both command streams were
-                            // proven before the first commit. Queue order makes
-                            // cold accumulation observe the completed hot
-                            // accumulator, while two independent guards retain
-                            // the anonymous-hot and mapped-cold table leases.
-                            stamp.start(GPU_STAGE_GATEUP);
-                            stamp.push_current(&hot_cb);
-                            hot_cb.commit();
-                            mapped_binding_guards
-                                .push(Gemma4Q4MappedBindingGuard::new(&hot_cb, hot_binding));
-                            stamp.start(GPU_STAGE_GATEUP);
-                            stamp.push_current(&cold_cb);
-                            cold_cb.commit();
-                            mapped_binding_guards
-                                .push(Gemma4Q4MappedBindingGuard::new(&cold_cb, cold_binding));
-                            last_committed_cb = Some(cold_cb);
-                            cb_closed = true;
-                            layer_committed = true;
-                            ledger.overlap_layers = ledger.overlap_layers.saturating_add(1);
-                            ledger.expert_waves_sum = ledger.expert_waves_sum.saturating_add(1);
-                            ledger.expert_waves_max = ledger.expert_waves_max.max(2);
-                            ledger.hot_bound_records = ledger
-                                .hot_bound_records
-                                .saturating_add(hot_wave.len().min(u32::MAX as usize) as u32);
-                            ledger.mapped_bound_records = ledger
-                                .mapped_bound_records
-                                .saturating_add(cold_wave.len().min(u32::MAX as usize) as u32);
-                            if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
-                                *value = value
-                                    .saturating_add(hot_wave.len().min(u16::MAX as usize) as u16);
-                            }
-                            if let Some(value) = ledger.mapped_bound_per_layer.get_mut(layer_idx) {
-                                *value = value
-                                    .saturating_add(cold_wave.len().min(u16::MAX as usize) as u16);
-                            }
-                            if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
-                                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                            {
-                                eprintln!(
-                                    "[metal chained hot-cold mapped] layer={layer_idx} hot={} mapped={} active={} min_cold={hot_cold_overlap_min_cold} publish=0 hidden_candidate=1",
-                                    hot_wave.len(),
-                                    cold_wave.len(),
-                                    hot_wave.len() + cold_wave.len(),
-                                );
-                            }
-                            encode_clock = std::time::Instant::now();
-                        } else {
-                            // Both command streams are now fully encoded. Publish
-                            // the hot table, commit only that command, then fill
-                            // the disjoint cold slab while the GPU consumes hot
-                            // records. Cold remains uncommitted until all record
-                            // bytes and its separate table validate.
-                            stamp.start(GPU_STAGE_GATEUP);
-                            stamp.push_current(&hot_cb);
-                            hot_cb.commit();
-                            let stage_started = std::time::Instant::now();
-                            let mut cold_table = [0xFFFFFFFFu32; 128];
-                            // H45 invalidates every destination identity before
-                            // the first positioned read can modify bank bytes.
-                            // A failed or partial fill deliberately leaves those
-                            // identities absent; rolling them back could expose
-                            // a torn record to a later round.
-                            let direct_retained_publish = if direct_bank {
-                                retained_plan.and_then(|plan| {
-                                    prepare_retained_cold_publish(
-                                        &mut self.retained_cold_layers,
-                                        layer_idx,
-                                        plan,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
-                            let direct_prepare_ready =
-                                !direct_bank || direct_retained_publish.is_some();
-                            let staged = if !direct_prepare_ready {
-                                false
-                            } else if fresh_wave.is_empty() {
-                                true
-                            } else if direct_bank {
-                                let bank_slots = self
-                                    .retained_cold_layers
-                                    .as_ref()
-                                    .and_then(|layers| layers.get(layer_idx))
-                                    .map(|bank| &bank.slots);
-                                match (
-                                    retained_cold_direct_filler.as_deref_mut(),
-                                    retained_plan,
-                                    bank_slots,
-                                ) {
-                                    (Some(fill), Some(plan), Some(bank_slots)) => fill(
-                                        layer_idx,
-                                        fresh_wave,
-                                        stage_slab,
-                                        cold_stage_slot_count,
-                                        bank_slots,
-                                        &plan.blits,
-                                        &mut cold_table,
-                                    ),
-                                    _ => false,
-                                }
-                            } else {
-                                filler(
-                                    layer_idx,
-                                    &[],
-                                    Some(fresh_wave),
-                                    Gemma4Q4SlotFillPhase::StageCold,
-                                    &mut cold_table,
-                                    &mut union,
-                                )
-                            };
-                            let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-                            account_wave_load!(layer_idx, stage_ms);
-                            let table_exact = staged
-                                && cold_table == expected_cold_table
-                                && wave_slots_ready(&cold_table, fresh_wave, fresh_wave.len())
-                                    .is_none();
-                            let retained_publish = if direct_bank {
-                                direct_retained_publish
-                            } else if table_exact {
-                                retained_plan.and_then(|plan| {
-                                    prepare_retained_cold_publish(
-                                        &mut self.retained_cold_layers,
-                                        layer_idx,
-                                        plan,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
-                            let retained_publish_ready =
-                                retained_plan.is_none() || retained_publish.is_some();
-                            if table_exact && retained_publish_ready {
-                                unsafe {
-                                    let dest = cold_table_buffer.contents() as *mut u32;
-                                    std::ptr::copy_nonoverlapping(cold_table.as_ptr(), dest, 128);
-                                }
-                                mapped_binding_guards
-                                    .push(Gemma4Q4MappedBindingGuard::new(&hot_cb, hot_binding));
-                                let cpu_probe_job = if cpu_cold_probe_round {
-                                    prepare_cpu_cold_probe_job(
-                                        router_slice,
-                                        k_tokens,
-                                        &down_exps_scale,
-                                        &cold_wave,
-                                        &self.resident_scratch.expert_input_scales_batch,
-                                        &self.resident_scratch.expert_input_quants_batch,
-                                    )
-                                } else {
-                                    None
-                                };
-                                if cpu_cold_probe_round && cpu_probe_job.is_none() {
-                                    if let Some(accounting) = cpu_cold_probe.as_mut() {
-                                        accounting.record_refusal();
+                                let cold_table_buffer = self
+                                    .resident_scratch
+                                    .wave1_slot_tables
+                                    .get(layer_idx)?
+                                    .clone();
+                                let cold_binding = if single_down {
+                                    full_binding
+                                } else if mapped_wave {
+                                    if hot_wave.len().checked_add(cold_wave.len()) != Some(unique) {
+                                        return None;
                                     }
-                                }
-                                let mut cpu_probe_valid = false;
-                                if let Some(job) = cpu_probe_job.as_ref() {
-                                    let hot_inflight_before = matches!(
-                                        hot_cb.status(),
-                                        metal::MTLCommandBufferStatus::Enqueued
-                                            | metal::MTLCommandBufferStatus::Committed
-                                            | metal::MTLCommandBufferStatus::Scheduled
-                                    );
-                                    let cold_inflight_before = matches!(
-                                        cold_cb.status(),
-                                        metal::MTLCommandBufferStatus::Enqueued
-                                            | metal::MTLCommandBufferStatus::Committed
-                                            | metal::MTLCommandBufferStatus::Scheduled
-                                    );
-                                    // The CPU exclusively reads the completed
-                                    // cold stage while the already-committed
-                                    // hot command reads disjoint hot records.
-                                    // Cold remains uncommitted until this
-                                    // observation returns, so the probe cannot
-                                    // race a Metal reader of the stage. It
-                                    // deliberately delays cold commit in this
-                                    // calibration profile without changing any
-                                    // bytes consumed by the model command.
-                                    let receipt = run_cpu_cold_probe_job(job, stage_slab);
-                                    cpu_probe_valid = receipt.valid;
-                                    if let Some(accounting) = cpu_cold_probe.as_mut() {
-                                        accounting.record_work(
-                                            receipt,
-                                            hot_inflight_before,
-                                            cold_inflight_before,
-                                            hot_cb.status()
-                                                == metal::MTLCommandBufferStatus::Completed,
-                                            cold_cb.status()
-                                                == metal::MTLCommandBufferStatus::Completed,
+                                    let mut identity_table = [u32::MAX; 128];
+                                    for &expert in &cold_wave {
+                                        if expert >= identity_table.len()
+                                            || identity_table[expert] != u32::MAX
+                                        {
+                                            return None;
+                                        }
+                                        identity_table[expert] = expert as u32;
+                                    }
+                                    if wave_slots_ready(&identity_table, &cold_wave, 128).is_some()
+                                    {
+                                        return None;
+                                    }
+                                    let binding =
+                                        slot_binding.materialize_for_active_slots(&cold_wave)?;
+                                    if binding.bound_tier_record_counts()
+                                        != Some((0, cold_wave.len()))
+                                    {
+                                        return None;
+                                    }
+                                    unsafe {
+                                        let dest = cold_table_buffer.contents() as *mut u32;
+                                        std::ptr::copy_nonoverlapping(
+                                            identity_table.as_ptr(),
+                                            dest,
+                                            128,
                                         );
                                     }
+                                    binding
+                                } else {
+                                    Gemma4Q4ExpertSlotBinding::Monolithic(stage_slab.clone())
+                                };
+                                let cold_active_slots = mapped_wave.then_some(cold_wave.as_slice());
+                                let cold_slot_count =
+                                    if mapped_wave { 128 } else { cold_wave.len() };
+                                let cold_cb = kernel.queue.new_command_buffer().to_owned();
+                                let cold_enc = cold_cb.new_compute_command_encoder();
+                                let cold_ok = if single_down {
+                                    let cold_slots: Vec<usize> = (ready_count..unique).collect();
+                                    let all_slots: Vec<usize> = (0..unique).collect();
+                                    (cold_slots.is_empty()
+                                        || self.encode_moe_record_gateup_range(
+                                            cold_enc,
+                                            &cold_binding,
+                                            &cold_slots,
+                                            layer_idx,
+                                            k_tokens,
+                                            ready_count,
+                                            fresh_wave.len(),
+                                        ))
+                                        && self.encode_moe_down(
+                                            kernel,
+                                            cold_enc,
+                                            &cold_binding,
+                                            Some(&all_slots),
+                                            layer_idx,
+                                            k_tokens,
+                                            &self.resident_scratch.gpu_moe_acc,
+                                            0,
+                                            None,
+                                        )
+                                } else {
+                                    self.encode_moe_topk_gateup_down(
+                                        kernel,
+                                        cold_enc,
+                                        &down_exps_scale,
+                                        &cold_table_buffer,
+                                        &cold_binding,
+                                        cold_active_slots,
+                                        layer_idx,
+                                        cold_slot_count,
+                                        cold_slot_count,
+                                        k_tokens,
+                                        &self.resident_scratch.gpu_moe_acc_wave,
+                                        0,
+                                        logits_off,
+                                        None,
+                                    ) && self.encode_moe_down(
+                                        kernel,
+                                        cold_enc,
+                                        &cold_binding,
+                                        cold_active_slots,
+                                        layer_idx,
+                                        k_tokens,
+                                        &self.resident_scratch.gpu_moe_acc_wave,
+                                        0,
+                                        None,
+                                    )
+                                };
+                                if cold_ok && !single_down {
+                                    let n_el = (k_tokens * GEMMA4_Q4_EXPERT_HIDDEN) as u32;
+                                    cold_enc
+                                        .set_compute_pipeline_state(&kernel.residual_add_pipeline);
+                                    cold_enc.set_buffer(
+                                        0,
+                                        Some(&self.resident_scratch.gpu_moe_acc),
+                                        0,
+                                    );
+                                    cold_enc.set_buffer(
+                                        1,
+                                        Some(&self.resident_scratch.gpu_moe_acc_wave),
+                                        0,
+                                    );
+                                    cold_enc.set_buffer(
+                                        2,
+                                        Some(&self.resident_scratch.gpu_moe_acc),
+                                        0,
+                                    );
+                                    cold_enc.set_bytes(3, 4, &n_el as *const u32 as *const _);
+                                    dispatch_1d(
+                                        cold_enc,
+                                        &kernel.residual_add_pipeline,
+                                        k_tokens * GEMMA4_Q4_EXPERT_HIDDEN,
+                                    );
+                                    cold_enc.memory_barrier_with_resources(&[&self
+                                        .resident_scratch
+                                        .gpu_moe_acc]);
                                 }
-                                let cpu_probe_gpu_sample = cpu_probe_valid
-                                    .then(|| (layer_idx, hot_cb.to_owned(), cold_cb.to_owned()));
+                                let cold_ok = cold_ok
+                                    && self
+                                        .encode_layer_tail(kernel, cold_enc, layer_idx, k_tokens);
+                                cold_enc.end_encoding();
+                                if !cold_ok {
+                                    return None;
+                                }
+                                if let Some(plan) = retained_plan.filter(|_| !direct_bank) {
+                                    let bank_slots =
+                                        &self.retained_cold_layers.as_ref()?.get(layer_idx)?.slots;
+                                    if !encode_retained_cold_blits(
+                                        &cold_cb,
+                                        stage_slab,
+                                        fresh_wave.len(),
+                                        bank_slots,
+                                        &plan.blits,
+                                    ) {
+                                        return None;
+                                    }
+                                }
+                                ledger.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+                                Some((
+                                    hot_cb,
+                                    cold_cb,
+                                    hot_binding,
+                                    cold_binding,
+                                    cold_table_buffer,
+                                    expected_cold_table,
+                                    mapped_wave,
+                                    single_down,
+                                    direct_bank,
+                                ))
+                            })
+                        };
+                        // The direct mapped experiment must remain a pre-commit
+                        // optimization only. Any resource, receipt, or encode
+                        // refusal drops its uncommitted pair and retries the
+                        // established exact staged schedule unchanged.
+                        let encoded = if retained_cold_direct_bank_round && retained_plan.is_some()
+                        {
+                            match encode_pair(false, true) {
+                                Some(pair) => Some(pair),
+                                None => encode_pair(false, false),
+                            }
+                        } else if hot_cold_mapped_wave {
+                            match encode_pair(true, false) {
+                                Some(pair) => Some(pair),
+                                None => encode_pair(false, false),
+                            }
+                        } else {
+                            encode_pair(false, false)
+                        };
+                        drop(encode_pair);
+
+                        if let Some((
+                            hot_cb,
+                            cold_cb,
+                            hot_binding,
+                            cold_binding,
+                            cold_table_buffer,
+                            expected_cold_table,
+                            mapped_wave,
+                            single_down,
+                            direct_bank,
+                        )) = encoded
+                        {
+                            if mapped_wave {
+                                debug_assert!(!hot_cold_overlap_publish);
+                                debug_assert_eq!(hot_wave.len() + cold_wave.len(), unique);
+                                // Both sparse tables and both command streams were
+                                // proven before the first commit. Queue order makes
+                                // cold accumulation observe the completed hot
+                                // accumulator, while two independent guards retain
+                                // the anonymous-hot and mapped-cold table leases.
+                                stamp.start(GPU_STAGE_GATEUP);
+                                stamp.push_current(&hot_cb);
+                                hot_cb.commit();
+                                mapped_binding_guards
+                                    .push(Gemma4Q4MappedBindingGuard::new(&hot_cb, hot_binding));
                                 stamp.start(GPU_STAGE_GATEUP);
                                 stamp.push_current(&cold_cb);
                                 cold_cb.commit();
-                                if let Some(pending) = retained_publish {
-                                    debug_assert!(pending_retained_cold_publish.is_none());
-                                    pending_retained_cold_publish = Some(pending);
-                                }
-                                if single_down {
-                                    // The composite table owns both the hot
-                                    // lease and all cold stage views. Retain a
-                                    // clone specifically through the command
-                                    // that performs the full-union Down.
-                                    mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(
-                                        &cold_cb,
-                                        cold_binding,
-                                    ));
-                                }
-                                if let Some(sample) = cpu_probe_gpu_sample {
-                                    debug_assert!(pending_cpu_cold_probe_gpu_sample.is_none());
-                                    pending_cpu_cold_probe_gpu_sample = Some(sample);
-                                }
+                                mapped_binding_guards
+                                    .push(Gemma4Q4MappedBindingGuard::new(&cold_cb, cold_binding));
                                 last_committed_cb = Some(cold_cb);
                                 cb_closed = true;
                                 layer_committed = true;
@@ -31566,68 +32022,287 @@ impl Gemma4GhostCommonMetal {
                                 ledger.expert_waves_max = ledger.expert_waves_max.max(2);
                                 ledger.hot_bound_records = ledger
                                     .hot_bound_records
-                                    .saturating_add(unique.min(u32::MAX as usize) as u32);
+                                    .saturating_add(hot_wave.len().min(u32::MAX as usize) as u32);
+                                ledger.mapped_bound_records = ledger
+                                    .mapped_bound_records
+                                    .saturating_add(cold_wave.len().min(u32::MAX as usize) as u32);
                                 if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
-                                    *value =
-                                        value.saturating_add(unique.min(u16::MAX as usize) as u16);
+                                    *value = value.saturating_add(
+                                        hot_wave.len().min(u16::MAX as usize) as u16,
+                                    );
                                 }
-                                if let Some(plan) = retained_plan {
-                                    let hits = plan.retained.len();
-                                    let fresh = plan.fresh.len();
-                                    let blits = if direct_bank { 0 } else { plan.blits.len() };
-                                    let direct_fills =
-                                        if direct_bank { plan.blits.len() } else { 0 };
-                                    ledger.retained_cold_hits = ledger
-                                        .retained_cold_hits
-                                        .saturating_add(hits.min(u32::MAX as usize) as u32);
-                                    ledger.retained_cold_fresh = ledger
-                                        .retained_cold_fresh
-                                        .saturating_add(fresh.min(u32::MAX as usize) as u32);
-                                    ledger.retained_cold_blits = ledger
-                                        .retained_cold_blits
-                                        .saturating_add(blits.min(u32::MAX as usize) as u32);
-                                    ledger.retained_cold_direct_fills = ledger
-                                        .retained_cold_direct_fills
-                                        .saturating_add(direct_fills.min(u32::MAX as usize) as u32);
-                                    if let Some(value) =
-                                        ledger.retained_cold_hits_per_layer.get_mut(layer_idx)
-                                    {
-                                        *value = value
-                                            .saturating_add(hits.min(u16::MAX as usize) as u16);
-                                    }
-                                    if let Some(value) =
-                                        ledger.retained_cold_fresh_per_layer.get_mut(layer_idx)
-                                    {
-                                        *value = value
-                                            .saturating_add(fresh.min(u16::MAX as usize) as u16);
-                                    }
-                                    if let Some(value) =
-                                        ledger.retained_cold_blits_per_layer.get_mut(layer_idx)
-                                    {
-                                        *value = value
-                                            .saturating_add(blits.min(u16::MAX as usize) as u16);
-                                    }
-                                    if let Some(value) = ledger
-                                        .retained_cold_direct_fills_per_layer
-                                        .get_mut(layer_idx)
-                                    {
-                                        *value = value.saturating_add(
-                                            direct_fills.min(u16::MAX as usize) as u16,
-                                        );
-                                    }
-                                }
-                                if hot_cold_overlap_publish {
-                                    pending_staged_promotion =
-                                        Some((layer_idx, cold_wave.clone(), union.clone()));
-                                } else {
-                                    debug_assert!(pending_staged_promotion.is_none());
+                                if let Some(value) =
+                                    ledger.mapped_bound_per_layer.get_mut(layer_idx)
+                                {
+                                    *value = value.saturating_add(
+                                        cold_wave.len().min(u16::MAX as usize) as u16,
+                                    );
                                 }
                                 if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
                                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                                 {
+                                    eprintln!(
+                                    "[metal chained hot-cold mapped] layer={layer_idx} hot={} mapped={} active={} min_cold={hot_cold_overlap_min_cold} publish=0 hidden_candidate=1",
+                                    hot_wave.len(),
+                                    cold_wave.len(),
+                                    hot_wave.len() + cold_wave.len(),
+                                );
+                                }
+                                encode_clock = std::time::Instant::now();
+                            } else {
+                                // Both command streams are now fully encoded. Publish
+                                // the hot table, commit only that command, then fill
+                                // the disjoint cold slab while the GPU consumes hot
+                                // records. Cold remains uncommitted until all record
+                                // bytes and its separate table validate.
+                                stamp.start(GPU_STAGE_GATEUP);
+                                stamp.push_current(&hot_cb);
+                                hot_cb.commit();
+                                let stage_started = std::time::Instant::now();
+                                let mut cold_table = [0xFFFFFFFFu32; 128];
+                                // H45 invalidates every destination identity before
+                                // the first positioned read can modify bank bytes.
+                                // A failed or partial fill deliberately leaves those
+                                // identities absent; rolling them back could expose
+                                // a torn record to a later round.
+                                let direct_retained_publish = if direct_bank {
+                                    retained_plan.and_then(|plan| {
+                                        prepare_retained_cold_publish(
+                                            &mut self.retained_cold_layers,
+                                            layer_idx,
+                                            plan,
+                                        )
+                                    })
+                                } else {
+                                    None
+                                };
+                                let direct_prepare_ready =
+                                    !direct_bank || direct_retained_publish.is_some();
+                                let staged = if !direct_prepare_ready {
+                                    false
+                                } else if fresh_wave.is_empty() {
+                                    true
+                                } else if direct_bank {
+                                    let bank_slots = self
+                                        .retained_cold_layers
+                                        .as_ref()
+                                        .and_then(|layers| layers.get(layer_idx))
+                                        .map(|bank| &bank.slots);
+                                    match (
+                                        retained_cold_direct_filler.as_deref_mut(),
+                                        retained_plan,
+                                        bank_slots,
+                                    ) {
+                                        (Some(fill), Some(plan), Some(bank_slots)) => fill(
+                                            layer_idx,
+                                            fresh_wave,
+                                            stage_slab,
+                                            cold_stage_slot_count,
+                                            bank_slots,
+                                            &plan.blits,
+                                            &mut cold_table,
+                                        ),
+                                        _ => false,
+                                    }
+                                } else {
+                                    filler(
+                                        layer_idx,
+                                        &[],
+                                        Some(fresh_wave),
+                                        Gemma4Q4SlotFillPhase::StageCold,
+                                        &mut cold_table,
+                                        &mut union,
+                                    )
+                                };
+                                let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+                                account_wave_load!(layer_idx, stage_ms);
+                                let table_exact = staged
+                                    && cold_table == expected_cold_table
+                                    && wave_slots_ready(&cold_table, fresh_wave, fresh_wave.len())
+                                        .is_none();
+                                let retained_publish = if direct_bank {
+                                    direct_retained_publish
+                                } else if table_exact {
+                                    retained_plan.and_then(|plan| {
+                                        prepare_retained_cold_publish(
+                                            &mut self.retained_cold_layers,
+                                            layer_idx,
+                                            plan,
+                                        )
+                                    })
+                                } else {
+                                    None
+                                };
+                                let retained_publish_ready =
+                                    retained_plan.is_none() || retained_publish.is_some();
+                                if table_exact && retained_publish_ready {
+                                    unsafe {
+                                        let dest = cold_table_buffer.contents() as *mut u32;
+                                        std::ptr::copy_nonoverlapping(
+                                            cold_table.as_ptr(),
+                                            dest,
+                                            128,
+                                        );
+                                    }
+                                    mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(
+                                        &hot_cb,
+                                        hot_binding,
+                                    ));
+                                    let cpu_probe_job = if cpu_cold_probe_round {
+                                        prepare_cpu_cold_probe_job(
+                                            router_slice,
+                                            k_tokens,
+                                            &down_exps_scale,
+                                            &cold_wave,
+                                            &self.resident_scratch.expert_input_scales_batch,
+                                            &self.resident_scratch.expert_input_quants_batch,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    if cpu_cold_probe_round && cpu_probe_job.is_none() {
+                                        if let Some(accounting) = cpu_cold_probe.as_mut() {
+                                            accounting.record_refusal();
+                                        }
+                                    }
+                                    let mut cpu_probe_valid = false;
+                                    if let Some(job) = cpu_probe_job.as_ref() {
+                                        let hot_inflight_before = matches!(
+                                            hot_cb.status(),
+                                            metal::MTLCommandBufferStatus::Enqueued
+                                                | metal::MTLCommandBufferStatus::Committed
+                                                | metal::MTLCommandBufferStatus::Scheduled
+                                        );
+                                        let cold_inflight_before = matches!(
+                                            cold_cb.status(),
+                                            metal::MTLCommandBufferStatus::Enqueued
+                                                | metal::MTLCommandBufferStatus::Committed
+                                                | metal::MTLCommandBufferStatus::Scheduled
+                                        );
+                                        // The CPU exclusively reads the completed
+                                        // cold stage while the already-committed
+                                        // hot command reads disjoint hot records.
+                                        // Cold remains uncommitted until this
+                                        // observation returns, so the probe cannot
+                                        // race a Metal reader of the stage. It
+                                        // deliberately delays cold commit in this
+                                        // calibration profile without changing any
+                                        // bytes consumed by the model command.
+                                        let receipt = run_cpu_cold_probe_job(job, stage_slab);
+                                        cpu_probe_valid = receipt.valid;
+                                        if let Some(accounting) = cpu_cold_probe.as_mut() {
+                                            accounting.record_work(
+                                                receipt,
+                                                hot_inflight_before,
+                                                cold_inflight_before,
+                                                hot_cb.status()
+                                                    == metal::MTLCommandBufferStatus::Completed,
+                                                cold_cb.status()
+                                                    == metal::MTLCommandBufferStatus::Completed,
+                                            );
+                                        }
+                                    }
+                                    let cpu_probe_gpu_sample = cpu_probe_valid.then(|| {
+                                        (layer_idx, hot_cb.to_owned(), cold_cb.to_owned())
+                                    });
+                                    stamp.start(GPU_STAGE_GATEUP);
+                                    stamp.push_current(&cold_cb);
+                                    cold_cb.commit();
+                                    if let Some(pending) = retained_publish {
+                                        debug_assert!(pending_retained_cold_publish.is_none());
+                                        pending_retained_cold_publish = Some(pending);
+                                    }
                                     if single_down {
-                                        if let Some(plan) = retained_plan {
-                                            eprintln!(
+                                        // The composite table owns both the hot
+                                        // lease and all cold stage views. Retain a
+                                        // clone specifically through the command
+                                        // that performs the full-union Down.
+                                        mapped_binding_guards.push(
+                                            Gemma4Q4MappedBindingGuard::new(&cold_cb, cold_binding),
+                                        );
+                                    }
+                                    if let Some(sample) = cpu_probe_gpu_sample {
+                                        debug_assert!(pending_cpu_cold_probe_gpu_sample.is_none());
+                                        pending_cpu_cold_probe_gpu_sample = Some(sample);
+                                    }
+                                    last_committed_cb = Some(cold_cb);
+                                    cb_closed = true;
+                                    layer_committed = true;
+                                    ledger.overlap_layers = ledger.overlap_layers.saturating_add(1);
+                                    ledger.expert_waves_sum =
+                                        ledger.expert_waves_sum.saturating_add(1);
+                                    ledger.expert_waves_max = ledger.expert_waves_max.max(2);
+                                    ledger.hot_bound_records = ledger
+                                        .hot_bound_records
+                                        .saturating_add(unique.min(u32::MAX as usize) as u32);
+                                    if let Some(value) =
+                                        ledger.hot_bound_per_layer.get_mut(layer_idx)
+                                    {
+                                        *value = value
+                                            .saturating_add(unique.min(u16::MAX as usize) as u16);
+                                    }
+                                    if let Some(plan) = retained_plan {
+                                        let hits = plan.retained.len();
+                                        let fresh = plan.fresh.len();
+                                        let blits = if direct_bank { 0 } else { plan.blits.len() };
+                                        let direct_fills =
+                                            if direct_bank { plan.blits.len() } else { 0 };
+                                        ledger.retained_cold_hits = ledger
+                                            .retained_cold_hits
+                                            .saturating_add(hits.min(u32::MAX as usize) as u32);
+                                        ledger.retained_cold_fresh = ledger
+                                            .retained_cold_fresh
+                                            .saturating_add(fresh.min(u32::MAX as usize) as u32);
+                                        ledger.retained_cold_blits = ledger
+                                            .retained_cold_blits
+                                            .saturating_add(blits.min(u32::MAX as usize) as u32);
+                                        ledger.retained_cold_direct_fills =
+                                            ledger.retained_cold_direct_fills.saturating_add(
+                                                direct_fills.min(u32::MAX as usize) as u32,
+                                            );
+                                        if let Some(value) =
+                                            ledger.retained_cold_hits_per_layer.get_mut(layer_idx)
+                                        {
+                                            *value = value
+                                                .saturating_add(hits.min(u16::MAX as usize) as u16);
+                                        }
+                                        if let Some(value) =
+                                            ledger.retained_cold_fresh_per_layer.get_mut(layer_idx)
+                                        {
+                                            *value =
+                                                value.saturating_add(
+                                                    fresh.min(u16::MAX as usize) as u16
+                                                );
+                                        }
+                                        if let Some(value) =
+                                            ledger.retained_cold_blits_per_layer.get_mut(layer_idx)
+                                        {
+                                            *value =
+                                                value.saturating_add(
+                                                    blits.min(u16::MAX as usize) as u16
+                                                );
+                                        }
+                                        if let Some(value) = ledger
+                                            .retained_cold_direct_fills_per_layer
+                                            .get_mut(layer_idx)
+                                        {
+                                            *value = value.saturating_add(
+                                                direct_fills.min(u16::MAX as usize) as u16,
+                                            );
+                                        }
+                                    }
+                                    if hot_cold_overlap_publish {
+                                        pending_staged_promotion =
+                                            Some((layer_idx, cold_wave.clone(), union.clone()));
+                                    } else {
+                                        debug_assert!(pending_staged_promotion.is_none());
+                                    }
+                                    if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
+                                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                    {
+                                        if single_down {
+                                            if let Some(plan) = retained_plan {
+                                                eprintln!(
                                                 "[metal chained retained] layer={layer_idx} hot={} retained_hits={} fresh={} blits={} direct_fills={} bank_occupied={} active={} route_passes=1 down_passes=1 merge_passes=0 publish=terminal stage={stage_ms:.2}ms",
                                                 plan.hot.len(),
                                                 plan.retained.len(),
@@ -31637,84 +32312,86 @@ impl Gemma4GhostCommonMetal {
                                                 plan.next_slot_ids.iter().flatten().count(),
                                                 unique,
                                             );
-                                        } else {
-                                            eprintln!(
+                                            } else {
+                                                eprintln!(
                                                 "[metal chained hot-cold single-down] layer={layer_idx} hot={} cold={} active={} route_passes=1 down_passes=1 merge_passes=0 publish={} stage={stage_ms:.2}ms",
                                                 hot_wave.len(),
                                                 cold_wave.len(),
                                                 unique,
                                                 u8::from(hot_cold_overlap_publish),
                                             );
-                                        }
-                                    } else {
-                                        eprintln!(
+                                            }
+                                        } else {
+                                            eprintln!(
                                             "[metal chained hot-cold] layer={layer_idx} hot={} cold={} min_cold={hot_cold_overlap_min_cold} publish={} stage={stage_ms:.2}ms hidden_candidate=1",
                                             hot_wave.len(),
                                             cold_wave.len(),
                                             u8::from(hot_cold_overlap_publish),
                                         );
+                                        }
                                     }
-                                }
-                                encode_clock = std::time::Instant::now();
-                            } else {
-                                // Only hot was committed. Wait for its terminal
-                                // state and release its mixed-table lease before
-                                // restoring the established full-union fill. That
-                                // path overwrites gpu_moe_acc, so the abandoned hot
-                                // result cannot leak into the token.
-                                hot_cb.wait_until_completed();
-                                if hot_cb.status() != metal::MTLCommandBufferStatus::Completed {
-                                    self.last_chained_ledger = ledger;
-                                    return false;
-                                }
-                                // The cold command was never committed. Drop
-                                // its encoded references and composite-table
-                                // lease before the demand fallback mutates any
-                                // hot record or reuses the stage slab.
-                                drop(cold_cb);
-                                drop(cold_binding);
-                                drop(hot_binding);
-                                if let Err(error) = stamp.harvest_completed() {
-                                    eprintln!(
+                                    encode_clock = std::time::Instant::now();
+                                } else {
+                                    // Only hot was committed. Wait for its terminal
+                                    // state and release its mixed-table lease before
+                                    // restoring the established full-union fill. That
+                                    // path overwrites gpu_moe_acc, so the abandoned hot
+                                    // result cannot leak into the token.
+                                    hot_cb.wait_until_completed();
+                                    if hot_cb.status() != metal::MTLCommandBufferStatus::Completed {
+                                        self.last_chained_ledger = ledger;
+                                        return false;
+                                    }
+                                    // The cold command was never committed. Drop
+                                    // its encoded references and composite-table
+                                    // lease before the demand fallback mutates any
+                                    // hot record or reuses the stage slab.
+                                    drop(cold_cb);
+                                    drop(cold_binding);
+                                    drop(hot_binding);
+                                    if let Err(error) = stamp.harvest_completed() {
+                                        eprintln!(
                                         "[metal chained round] layer {layer_idx} hot/cold fallback retirement failed: {error}"
                                     );
-                                    self.last_chained_ledger = ledger;
-                                    return false;
+                                        self.last_chained_ledger = ledger;
+                                        return false;
+                                    }
+                                    let t_exact = std::time::Instant::now();
+                                    if !filler(
+                                        layer_idx,
+                                        router_slice,
+                                        None,
+                                        Gemma4Q4SlotFillPhase::Demand,
+                                        &mut updated_slots,
+                                        &mut union,
+                                    ) {
+                                        self.last_chained_ledger = ledger;
+                                        return false;
+                                    }
+                                    ledger.slot_filler_ms +=
+                                        t_exact.elapsed().as_secs_f64() * 1000.0;
+                                    ledger.overlap_fallbacks =
+                                        ledger.overlap_fallbacks.saturating_add(1);
                                 }
-                                let t_exact = std::time::Instant::now();
-                                if !filler(
-                                    layer_idx,
-                                    router_slice,
-                                    None,
-                                    Gemma4Q4SlotFillPhase::Demand,
-                                    &mut updated_slots,
-                                    &mut union,
-                                ) {
-                                    self.last_chained_ledger = ledger;
-                                    return false;
-                                }
-                                ledger.slot_filler_ms += t_exact.elapsed().as_secs_f64() * 1000.0;
-                                ledger.overlap_fallbacks =
-                                    ledger.overlap_fallbacks.saturating_add(1);
                             }
+                        } else {
+                            // Encoding/materialization failed before any hot commit.
+                            // The full-union path is still untouched and exact.
+                            let t_exact = std::time::Instant::now();
+                            if !filler(
+                                layer_idx,
+                                router_slice,
+                                None,
+                                Gemma4Q4SlotFillPhase::Demand,
+                                &mut updated_slots,
+                                &mut union,
+                            ) {
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            }
+                            ledger.slot_filler_ms += t_exact.elapsed().as_secs_f64() * 1000.0;
+                            ledger.overlap_fallbacks = ledger.overlap_fallbacks.saturating_add(1);
                         }
-                    } else {
-                        // Encoding/materialization failed before any hot commit.
-                        // The full-union path is still untouched and exact.
-                        let t_exact = std::time::Instant::now();
-                        if !filler(
-                            layer_idx,
-                            router_slice,
-                            None,
-                            Gemma4Q4SlotFillPhase::Demand,
-                            &mut updated_slots,
-                            &mut union,
-                        ) {
-                            self.last_chained_ledger = ledger;
-                            return false;
-                        }
-                        ledger.slot_filler_ms += t_exact.elapsed().as_secs_f64() * 1000.0;
-                        ledger.overlap_fallbacks = ledger.overlap_fallbacks.saturating_add(1);
                     }
                 }
 
@@ -45976,6 +46653,42 @@ mod tests {
         assert!(!super::gemma4_hybrid_hot_cold_single_down_admits_k(
             super::GEMMA4_MAX_WIDENED_SPEC_CHUNK + 1
         ));
+    }
+
+    #[test]
+    fn three_wave_partition_is_stable_exact_and_bounded() {
+        let cold = [11, 4, 90, 3, 27];
+        assert_eq!(
+            super::partition_exact_cold_by_ready(&cold, &[4, 3], 8, 24),
+            Some((vec![4, 3], vec![11, 90, 27]))
+        );
+        assert_eq!(
+            super::partition_exact_cold_by_ready(&cold, &[], 8, 24),
+            Some((vec![], cold.to_vec()))
+        );
+        assert_eq!(
+            super::partition_exact_cold_by_ready(&cold, &cold, 8, 24),
+            Some((cold.to_vec(), vec![]))
+        );
+        assert!(super::partition_exact_cold_by_ready(&cold, &[3, 4], 8, 24).is_none());
+        assert!(super::partition_exact_cold_by_ready(&cold, &[4, 4], 8, 24).is_none());
+        assert!(super::partition_exact_cold_by_ready(&cold, &[12], 8, 24).is_none());
+        assert!(super::partition_exact_cold_by_ready(&[1, 1], &[1], 8, 24).is_none());
+        assert!(super::partition_exact_cold_by_ready(&cold, &[4, 3], 1, 24).is_none());
+        assert!(super::partition_exact_cold_by_ready(&cold, &[4, 3], 8, 2).is_none());
+    }
+
+    #[test]
+    fn three_wave_compact_table_has_disjoint_contiguous_prefixes() {
+        let table = super::hot_ready_demand_compact_slot_table(&[7, 2], &[11, 4], &[90, 3, 27])
+            .expect("valid exact partition");
+        for (slot, expert) in [7, 2, 11, 4, 90, 3, 27].into_iter().enumerate() {
+            assert_eq!(table[expert], slot as u32);
+        }
+        assert!(super::hot_ready_demand_compact_slot_table(&[], &[1], &[2]).is_none());
+        assert!(super::hot_ready_demand_compact_slot_table(&[1], &[], &[]).is_none());
+        assert!(super::hot_ready_demand_compact_slot_table(&[1], &[1], &[2]).is_none());
+        assert!(super::hot_ready_demand_compact_slot_table(&[128], &[1], &[]).is_none());
     }
 
     #[cfg(target_os = "macos")]
