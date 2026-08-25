@@ -88,6 +88,10 @@ construction; check `exact_prefix_len == 48` instead.
 | `H43-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6` | Six retained cold records/layer; exact at 33.53 and 33.42 tok/s, zero swap, no-go |
 | `H44-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6-chunked-read` | H43 plus adaptive capped-four positioned-read splitting; exact at 34.33 tok/s, zero swap, no-go |
 | `H45-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6-direct-bank` | H44 plus record-granular direct-to-bank fills and zero blits; exact at 33.01 tok/s, zero swap, no-go |
+| `H46-live-hidden-sequential-probe` | Observation-only live next-layer predictor; exact, cap-eight truth hits 318, weighted recall 54.91% |
+| `H47-live-hidden-sequential-stage-cap8` | Exact one-reader private cap-eight stage; 34.69–36.51 tok/s, modest gain, scalar predictor too costly |
+| `H48-live-hidden-sequential-fast-predict` | H47 plus batched Accelerate SGEMM predictor; exact at 36.22 tok/s, one-reader readiness limited |
+| `H49-live-hidden-sequential-fast-predict-dual-reader` | H48 plus a second private reader under the same cap; exact at 36.84 tok/s, zero swap; current research best |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 

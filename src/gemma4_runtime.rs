@@ -980,6 +980,126 @@ pub(crate) fn rms_norm(x: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> 
     }
 }
 
+/// H48's advisory router projection. Rows are flattened row-major and the
+/// router matrix keeps Camelid's existing expert-major `[E, H]` layout. The
+/// helper is deliberately shape-bounded and returns `None` on every malformed
+/// or non-finite input; exact inference never depends on this result.
+#[cfg(target_os = "macos")]
+fn gemma4_live_batched_router_logits(
+    flat_hidden_rows: &[f32],
+    rows: usize,
+    hidden: usize,
+    experts: usize,
+    gate_input_scale: &[f32],
+    gate_inp: &[f32],
+    eps: f32,
+) -> Option<Vec<f32>> {
+    const MAX_ROWS: usize = 16;
+    if rows == 0
+        || rows > MAX_ROWS
+        || hidden == 0
+        || experts == 0
+        || !eps.is_finite()
+        || eps < 0.0
+        || flat_hidden_rows.len() != rows.checked_mul(hidden)?
+        || gate_input_scale.len() != hidden
+        || gate_inp.len() != experts.checked_mul(hidden)?
+    {
+        return None;
+    }
+    let rows_i32 = i32::try_from(rows).ok()?;
+    let hidden_i32 = i32::try_from(hidden).ok()?;
+    let experts_i32 = i32::try_from(experts).ok()?;
+    let hidden_scale = 1.0f32 / (hidden as f32).sqrt();
+    let mut scaled = vec![0.0f32; flat_hidden_rows.len()];
+    for (source, destination) in flat_hidden_rows
+        .chunks_exact(hidden)
+        .zip(scaled.chunks_exact_mut(hidden))
+    {
+        let mean_square = source.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+        let rms_inv = (mean_square + eps).powf(-0.5);
+        if !rms_inv.is_finite() {
+            return None;
+        }
+        for ((out, &value), &scale) in destination.iter_mut().zip(source).zip(gate_input_scale) {
+            *out = ((value * rms_inv) * hidden_scale) * scale;
+            if !out.is_finite() {
+                return None;
+            }
+        }
+    }
+
+    let mut logits = vec![0.0f32; rows.checked_mul(experts)?];
+    // SAFETY: every matrix extent and leading dimension was validated above.
+    // Accelerate reads A=[rows,H] and the transposed expert-major B=[E,H],
+    // then writes the complete row-major C=[rows,E] allocation.
+    unsafe {
+        crate::inference::cblas_sgemm(
+            101, // CblasRowMajor
+            111, // CblasNoTrans
+            112, // CblasTrans
+            rows_i32,
+            experts_i32,
+            hidden_i32,
+            1.0,
+            scaled.as_ptr(),
+            hidden_i32,
+            gate_inp.as_ptr(),
+            hidden_i32,
+            0.0,
+            logits.as_mut_ptr(),
+            experts_i32,
+        );
+    }
+    logits
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(logits)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_live_ranked_router_candidates_from_logits(
+    logits: &[f32],
+    rows: usize,
+    experts: usize,
+    top_k: usize,
+) -> Option<Vec<usize>> {
+    if rows == 0
+        || rows > 16
+        || experts == 0
+        || logits.len() != rows.checked_mul(experts)?
+        || logits.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    let mut confidence = vec![f32::NEG_INFINITY; experts];
+    for row in logits.chunks_exact(experts) {
+        let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let weights = row
+            .iter()
+            .map(|&value| (value - max_logit).exp())
+            .collect::<Vec<_>>();
+        let denominator = weights.iter().sum::<f32>();
+        if !denominator.is_finite() || denominator <= 0.0 {
+            return None;
+        }
+        let mut ranked = (0..experts).collect::<Vec<_>>();
+        ranked.sort_unstable_by(|&a, &b| weights[b].total_cmp(&weights[a]).then_with(|| a.cmp(&b)));
+        ranked.truncate(top_k.min(experts));
+        for expert in ranked {
+            confidence[expert] = confidence[expert].max(weights[expert] / denominator);
+        }
+    }
+    let mut selected = confidence
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, score)| score.is_finite())
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Some(selected.into_iter().map(|(expert, _)| expert).collect())
+}
+
 fn mtp_final_normalized_hidden(
     hidden_rows: &[Vec<f32>],
     selected_row: usize,
@@ -1897,6 +2017,29 @@ const GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS: usize = 64;
 const GHOST_METAL_SPARSE_PREDICT_PROBE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_SPARSE_PREDICT_PROBE";
 const GHOST_METAL_SPARSE_PREDICT_CAP: usize = 48;
+/// Observation-only sequential predictor probe. After layer L's exact
+/// attention/router barrier, the Metal lane exposes the completed post-attention
+/// hidden rows to the existing CPU router predictor for layer L+1. The ranked
+/// result is compared with L+1's later exact union, but never drives a read,
+/// slot, table, command buffer, route, or fallback decision.
+const GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE";
+/// Exact H40-only consumer for the live sequential signal. Private bounded
+/// readers may prepare next-layer cold records, but exact demand never waits
+/// for them and remains the only authority for slots and routing.
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE";
+/// H48 expansion of the exact H47 lane: a second private reader under the same
+/// cap-eight candidate set. This remains subordinate to the stage opt-in and
+/// literal `1` so a stale profile cannot silently widen I/O or memory.
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER";
+/// Replace the per-row advisory router matvecs with one Accelerate SGEMM per
+/// layer. The signal remains advisory and exact StageCold demand is unchanged.
+const GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT";
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP: usize = 8;
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS: usize = 2;
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER: &str =
     "[gemma4-ghost-metal] mapped-cold readahead policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool";
@@ -1954,6 +2097,74 @@ fn ghost_metal_sparse_predict_probe_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var(GHOST_METAL_SPARSE_PREDICT_PROBE_ENV).is_ok_and(|value| value == "1")
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_predict_probe_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_live_sequential_predict_probe_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        ghost_metal_live_sequential_predict_probe_from(
+            std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_stage_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_live_sequential_stage_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        ghost_metal_live_sequential_stage_from(
+            std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_stage_dual_reader_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_live_sequential_stage_dual_reader_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        ghost_metal_live_sequential_stage_dual_reader_from(
+            std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_fast_predict_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_live_sequential_fast_predict_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        ghost_metal_live_sequential_fast_predict_from(
+            std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV)
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -3541,6 +3752,95 @@ impl PreviousColdRoundStage {
     }
 }
 
+/// One verifier-round-owned rolling live-hidden stage. Its worker writes only
+/// private owned byte buffers. Exact `StageCold` seals a target layer without
+/// waiting, consumes fully ready records by identity, and sends every other
+/// exact record through the established direct demand reader.
+#[cfg(target_os = "macos")]
+struct LiveSequentialRoundStage {
+    round_seq: u32,
+    start_pos: usize,
+    k_tokens: usize,
+    cap: usize,
+    workers: usize,
+    fast_predict: bool,
+    records: crate::predictive_record_stage::RollingPredictiveRecordStage,
+    speculative_read_us: Arc<std::sync::atomic::AtomicU64>,
+    seal_calls: std::sync::atomic::AtomicUsize,
+    exact_cold_records: std::sync::atomic::AtomicUsize,
+    ready_hits: std::sync::atomic::AtomicUsize,
+    fallback_records: std::sync::atomic::AtomicUsize,
+    ready_unused: std::sync::atomic::AtomicUsize,
+    ready_malformed: std::sync::atomic::AtomicUsize,
+    ready_copy_us: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(target_os = "macos")]
+impl LiveSequentialRoundStage {
+    fn launch(&self, target_layer: usize, candidates: &[usize]) -> bool {
+        let keys = candidates.iter().copied().map(|expert| {
+            crate::predictive_record_stage::PredictiveRecordKey::new(target_layer, expert)
+        });
+        match self.records.launch(target_layer, keys) {
+            Ok(_) => true,
+            Err(error) => {
+                if ghost_metal_timing_enabled() {
+                    eprintln!(
+                        "[gemma4 live-sequential stage] launch refused round_seq={} start_pos={} K={} target_layer={target_layer}: {error}",
+                        self.round_seq, self.start_pos, self.k_tokens,
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn log_receipt(&self, ok: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let snapshot = self.records.snapshot();
+        let reads_in_flight = snapshot.reads_started.saturating_sub(
+            snapshot
+                .reads_succeeded
+                .saturating_add(snapshot.reads_failed),
+        );
+        eprintln!(
+            "[gemma4 live-sequential stage] schema=1 round_seq={} start_pos={} K={} ok={} cap={} workers={} workers_started={} workers_done={} predict_impl={} launches={} candidates={} reads_started={} reads_succeeded={} reads_failed={} reads_in_flight={} speculative_read_ms={:.3} seals={} exact_cold={} ready_hits={} fallback={} ready_unused={} ready_malformed={} ready_copy_ms={:.3} ready_returned={} worker_unused_ready={} late_discarded={} worker_done={} cancelled={} snapshot_terminal=0 shared_demand_pool=0 consumer_waits=0 late_model_publish=0 routing_authority=exact-router",
+            self.round_seq,
+            self.start_pos,
+            self.k_tokens,
+            u8::from(ok),
+            self.cap,
+            self.workers,
+            snapshot.workers_started,
+            snapshot.workers_done,
+            if self.fast_predict {
+                "accelerate-sgemm"
+            } else {
+                "scalar-row-matvec"
+            },
+            snapshot.launches,
+            snapshot.candidates,
+            snapshot.reads_started,
+            snapshot.reads_succeeded,
+            snapshot.reads_failed,
+            reads_in_flight,
+            self.speculative_read_us.load(Relaxed) as f64 / 1_000.0,
+            self.seal_calls.load(Relaxed),
+            self.exact_cold_records.load(Relaxed),
+            self.ready_hits.load(Relaxed),
+            self.fallback_records.load(Relaxed),
+            self.ready_unused.load(Relaxed),
+            self.ready_malformed.load(Relaxed),
+            self.ready_copy_us.load(Relaxed) as f64 / 1_000.0,
+            snapshot.ready_returned,
+            snapshot.unused_ready,
+            snapshot.late_discarded,
+            u8::from(snapshot.worker_done),
+            u8::from(snapshot.cancelled),
+        );
+    }
+}
+
 /// Build the pre-assistant advisory set without consulting future tokens. Each
 /// layer starts with its previous exact cold union, then fills from its decayed
 /// routed history. A round-robin merge prevents an early layer from consuming
@@ -5075,6 +5375,7 @@ fn fill_compact_wave_direct_from_file(
     experts: &[usize],
     updated_slots: &mut [u32; 128],
     counters: &WaveFillCounters,
+    live_sequential_stage: Option<&LiveSequentialRoundStage>,
     chunked_read_enabled: bool,
 ) -> bool {
     use rayon::prelude::*;
@@ -5115,22 +5416,85 @@ fn fill_compact_wave_direct_from_file(
         }
     }
 
+    // Seal never waits for a speculative loader. Only completely published,
+    // private owned records are returned; queued/in-flight/failed/absent keys
+    // fall straight through to the exact direct reader below. The exact cold
+    // wave still owns both record selection and compact-slot destination.
+    let mut ready_by_expert = std::collections::HashMap::<usize, Box<[u8]>>::new();
+    if let Some(stage) = live_sequential_stage {
+        stage.seal_calls.fetch_add(1, Relaxed);
+        stage.exact_cold_records.fetch_add(jobs.len(), Relaxed);
+        for record in stage.records.seal_layer(layer_idx) {
+            let valid = record.key.layer == layer_idx
+                && record.key.expert < 128
+                && record.source == crate::predictive_record_stage::PredictiveRecordSource::Staged
+                && record.bytes.len() == record_bytes
+                && !ready_by_expert.contains_key(&record.key.expert);
+            if valid {
+                ready_by_expert.insert(record.key.expert, record.bytes);
+            } else {
+                stage.ready_malformed.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    let mut ready_jobs = Vec::new();
+    let mut demand_jobs = Vec::new();
+    for job in jobs {
+        if let Some(bytes) = ready_by_expert.remove(&job.expert) {
+            ready_jobs.push((job, bytes));
+        } else {
+            demand_jobs.push(job);
+        }
+    }
+    if let Some(stage) = live_sequential_stage {
+        stage.ready_hits.fetch_add(ready_jobs.len(), Relaxed);
+        stage.fallback_records.fetch_add(demand_jobs.len(), Relaxed);
+        stage.ready_unused.fetch_add(ready_by_expert.len(), Relaxed);
+    }
+
+    let base_raw = base as usize;
+    let copy_started = std::time::Instant::now();
+    for (job, bytes) in &ready_jobs {
+        // SAFETY: the geometry checks above prove a complete fixed-stride
+        // destination, compact jobs have unique slots, and ready bytes have
+        // the exact validated record length. Cold Metal remains uncommitted.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (base_raw + job.slot * stride) as *mut u8,
+                record_bytes,
+            );
+        }
+    }
+    let ready_copy_us = copy_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    if !ready_jobs.is_empty() {
+        counters.copy_us.fetch_add(ready_copy_us, Relaxed);
+        if let Some(stage) = live_sequential_stage {
+            stage.ready_copy_us.fetch_add(ready_copy_us, Relaxed);
+        }
+    }
+
     let read_threads = cache
         .read_pool
         .as_ref()
         .map_or(1, |pool| pool.current_num_threads());
-    let chunks_per_record =
-        ghost_metal_retained_cold_chunks_per_record(chunked_read_enabled, jobs.len(), read_threads);
+    let chunks_per_record = ghost_metal_retained_cold_chunks_per_record(
+        chunked_read_enabled,
+        demand_jobs.len(),
+        read_threads,
+    );
     if chunks_per_record > 1 {
-        counters.chunked_read_records.fetch_add(jobs.len(), Relaxed);
+        counters
+            .chunked_read_records
+            .fetch_add(demand_jobs.len(), Relaxed);
         counters
             .chunked_read_preads
-            .fetch_add(jobs.len().saturating_mul(chunks_per_record), Relaxed);
+            .fetch_add(demand_jobs.len().saturating_mul(chunks_per_record), Relaxed);
         counters
             .chunked_read_max_chunks
             .fetch_max(chunks_per_record, Relaxed);
     }
-    let base_raw = base as usize;
     let read_one = |job: &CompactStageReadJob| {
         // SAFETY: admission proves the complete fixed-stride stage allocation,
         // jobs contain unique compact slots, and every slice is exactly one
@@ -5151,10 +5515,10 @@ fn fill_compact_wave_direct_from_file(
     };
     let read_started = std::time::Instant::now();
     let outcomes = match cache.read_pool.as_ref() {
-        Some(pool) if jobs.len() > 1 || chunks_per_record > 1 => {
-            pool.install(|| jobs.par_iter().map(read_one).collect::<Vec<_>>())
+        Some(pool) if demand_jobs.len() > 1 || chunks_per_record > 1 => {
+            pool.install(|| demand_jobs.par_iter().map(read_one).collect::<Vec<_>>())
         }
-        _ => jobs.iter().map(read_one).collect::<Vec<_>>(),
+        _ => demand_jobs.iter().map(read_one).collect::<Vec<_>>(),
     };
     let read_us = read_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
@@ -5172,8 +5536,8 @@ fn fill_compact_wave_direct_from_file(
         return false;
     }
 
-    let read_bytes = jobs.len().saturating_mul(record_bytes);
-    counters.demand_loads.fetch_add(jobs.len(), Relaxed);
+    let read_bytes = demand_jobs.len().saturating_mul(record_bytes);
+    counters.demand_loads.fetch_add(demand_jobs.len(), Relaxed);
     counters
         .nvme_bytes
         .fetch_add(read_bytes.min(u64::MAX as usize) as u64, Relaxed);
@@ -5415,6 +5779,7 @@ fn fill_compact_wave_into_slots(
     updated_slots: &mut [u32; 128],
     counters: &WaveFillCounters,
     previous_cold_stage: Option<&PreviousColdRoundStage>,
+    live_sequential_stage: Option<&LiveSequentialRoundStage>,
     chunked_direct_read: bool,
 ) -> bool {
     let nvme_us = &counters.nvme_us;
@@ -5446,6 +5811,7 @@ fn fill_compact_wave_into_slots(
             experts,
             updated_slots,
             counters,
+            live_sequential_stage,
             chunked_direct_read,
         );
     }
@@ -6878,6 +7244,10 @@ impl GhostMetalExpertRuntime {
         hidden_rows: &[Vec<f32>],
         sparse_probe_approx_routes: Option<&[Vec<usize>]>,
         sparse_probe_predict_us: Option<u64>,
+        mut live_sequential_predictor: Option<
+            &mut dyn FnMut(usize, &[f32], usize) -> Option<Vec<usize>>,
+        >,
+        live_sequential_stage_requested: bool,
         theta_local: f32,
         theta_global: f32,
         rope_factors: Option<&[f32]>,
@@ -7175,6 +7545,103 @@ impl GhostMetalExpertRuntime {
         let hot_cold_overlap_freeze_hot = hot_cold_overlap_active
             && (self.prefill_round
                 || !crate::metal::gemma4_hybrid_hot_cold_overlap_publish_enabled());
+        let retained_cold_direct_bank_fill_requested =
+            !self.prefill_round && ghost_metal_retained_cold_direct_bank_fill_enabled();
+        let direct_stage_read_active = (live_sequential_predictor.is_some()
+            || retained_cold_direct_bank_fill_requested)
+            && !self.prefill_round
+            && ghost_cache.is_some_and(|cache| {
+                ghost_metal_direct_stage_read_admitted(
+                    ghost_metal_direct_stage_read_enabled(),
+                    cache.budget_bytes,
+                    previous_cold_stage.is_some(),
+                )
+            });
+        let live_sequential_h40_shape = live_sequential_predictor.is_some()
+            && direct_stage_read_active
+            && hot_cold_overlap_active
+            && !ghost_metal_hybrid_demand_promotion_prefetch_enabled()
+            && self.layers.len() == GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE.len()
+            && self
+                .layers
+                .iter()
+                .zip(GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE)
+                .all(|(layer, expected)| layer.slots.writable_slot_count() == expected);
+        let live_sequential_stage_cap = GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP;
+        let live_sequential_stage_workers = if live_sequential_stage_requested
+            && ghost_metal_live_sequential_stage_dual_reader_enabled()
+        {
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS
+        } else {
+            1
+        };
+        let live_sequential_fast_predict =
+            live_sequential_stage_requested && ghost_metal_live_sequential_fast_predict_enabled();
+        let live_sequential_stage = if live_sequential_stage_requested && live_sequential_h40_shape
+        {
+            ghost_cache.and_then(|cache| {
+                let file = Arc::clone(&cache.file);
+                let speculative_read_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let loader_read_us = Arc::clone(&speculative_read_us);
+                let loader: crate::predictive_record_stage::PredictiveRecordLoader =
+                    Arc::new(move |key| {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let started = std::time::Instant::now();
+                        let mut bytes =
+                            vec![0u8; crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES]
+                                .into_boxed_slice();
+                        let loaded = file
+                            .read_moe_expert_into(key.layer, key.expert, &mut bytes)
+                            .map_err(|error| error.to_string())
+                            .and_then(|()| {
+                                (bytes.len() == crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES)
+                                    .then_some(bytes)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "live predictive record ({}, {}) returned wrong byte length",
+                                            key.layer, key.expert,
+                                        )
+                                    })
+                            });
+                        loader_read_us.fetch_add(
+                            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                            Relaxed,
+                        );
+                        loaded
+                    });
+                match crate::predictive_record_stage::RollingPredictiveRecordStage::start_with_workers(
+                    live_sequential_stage_cap,
+                    live_sequential_stage_workers,
+                    loader,
+                ) {
+                    Ok(records) => Some(Arc::new(LiveSequentialRoundStage {
+                        round_seq,
+                        start_pos,
+                        k_tokens,
+                        cap: live_sequential_stage_cap,
+                        workers: live_sequential_stage_workers,
+                        fast_predict: live_sequential_fast_predict,
+                        records,
+                        speculative_read_us,
+                        seal_calls: std::sync::atomic::AtomicUsize::new(0),
+                        exact_cold_records: std::sync::atomic::AtomicUsize::new(0),
+                        ready_hits: std::sync::atomic::AtomicUsize::new(0),
+                        fallback_records: std::sync::atomic::AtomicUsize::new(0),
+                        ready_unused: std::sync::atomic::AtomicUsize::new(0),
+                        ready_malformed: std::sync::atomic::AtomicUsize::new(0),
+                        ready_copy_us: std::sync::atomic::AtomicU64::new(0),
+                    })),
+                    Err(error) => {
+                        eprintln!(
+                            "[gemma4 live-sequential stage] start refused round_seq={round_seq} start_pos={start_pos} K={k_tokens} cap={live_sequential_stage_cap} workers={live_sequential_stage_workers}: {error}"
+                        );
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
         let retained_cold_chunked_read_active = !self.prefill_round
             && ghost_metal_retained_cold_chunked_read_enabled()
             && self.common.as_ref().is_some_and(|common| {
@@ -7182,14 +7649,8 @@ impl GhostMetalExpertRuntime {
                     == self.layers.len() * crate::metal::GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER
             });
         let retained_cold_direct_bank_fill_active = !self.prefill_round
-            && ghost_metal_retained_cold_direct_bank_fill_enabled()
-            && ghost_cache.is_some_and(|cache| {
-                ghost_metal_direct_stage_read_admitted(
-                    ghost_metal_direct_stage_read_enabled(),
-                    cache.budget_bytes,
-                    previous_cold_stage.is_some(),
-                )
-            })
+            && retained_cold_direct_bank_fill_requested
+            && direct_stage_read_active
             && self.common.as_ref().is_some_and(|common| {
                 common.retained_cold_record_granular()
                     && common.retained_cold_slot_count()
@@ -7241,6 +7702,7 @@ impl GhostMetalExpertRuntime {
                                 &mut updated_slots,
                                 &fill_counters,
                                 None,
+                                None,
                                 false,
                             );
                         }
@@ -7261,6 +7723,7 @@ impl GhostMetalExpertRuntime {
             None
         };
         let cold_stage_buf_for_fill = cold_stage_buf.clone();
+        let live_sequential_stage_for_fill = live_sequential_stage.clone();
         let layers_ref = &mut self.layers;
         let mut slot_filler = ghost_cache.map(|cache| {
             |layer_idx: usize,
@@ -7286,6 +7749,7 @@ impl GhostMetalExpertRuntime {
                         updated_slots,
                         &fill_counters,
                         previous_cold_stage,
+                        live_sequential_stage_for_fill.as_deref(),
                         retained_cold_chunked_read_active,
                     );
                     if staged {
@@ -7608,9 +8072,13 @@ impl GhostMetalExpertRuntime {
                     updated_slots,
                     fill_counters_for_pong,
                     None,
+                    None,
                     false,
                 );
             }
+        });
+        let mut live_sequential_stage_launcher = live_sequential_stage.clone().map(|stage| {
+            move |target_layer: usize, candidates: &[usize]| stage.launch(target_layer, candidates)
         });
 
         let slot_filler_fn: Option<
@@ -7645,7 +8113,11 @@ impl GhostMetalExpertRuntime {
                 Some(f) => Some(f),
                 None => None,
             };
-
+        let live_sequential_stage_launcher_fn: Option<&mut dyn FnMut(usize, &[usize]) -> bool> =
+            match live_sequential_stage_launcher.as_mut() {
+                Some(f) => Some(f),
+                None => None,
+            };
         let wave1_refs: Vec<&metal::Buffer> = wave1_gpu.iter().collect();
         let slot_mapping_slices: Vec<&[u32; 128]> = slot_mappings.iter().collect();
         let empty_unions = vec![Vec::new(); n_layers];
@@ -7679,7 +8151,11 @@ impl GhostMetalExpertRuntime {
                 retained_cold_direct_bank_fill_active,
                 cold_stage_buf.as_ref(),
                 cold_stage_slot_count,
-                hot_cold_overlap_active.then_some(hot_at_start.as_slice()),
+                (hot_cold_overlap_active || live_sequential_predictor.is_some())
+                    .then_some(hot_at_start.as_slice()),
+                live_sequential_predictor.take(),
+                live_sequential_stage_launcher_fn,
+                live_sequential_h40_shape,
                 pong_slab_for_gpu.as_ref(),
                 gpu_unions,
                 fill_pong_fn,
@@ -7693,6 +8169,10 @@ impl GhostMetalExpertRuntime {
         // accounted itself through the ordinary filler and has no retained
         // per-layer receipt here.
         drop(slot_filler);
+        drop(live_sequential_stage_launcher);
+        if let Some(stage) = live_sequential_stage.as_ref() {
+            stage.log_receipt(ok);
+        }
         if ok && retained_cold_direct_bank_fill_active {
             if let Some(common) = self.common.as_ref() {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -7761,6 +8241,8 @@ impl GhostMetalExpertRuntime {
                 hidden_rows,
                 None,
                 None,
+                None,
+                false,
                 theta_local,
                 theta_global,
                 rope_factors,
@@ -16770,6 +17252,43 @@ impl Gemma4Runtime {
                     } else {
                         (None, None)
                     };
+                // Default-off live-hidden signal. Metal invokes this after
+                // layer L's completed attention/router barrier with the exact
+                // post-attention slab_b rows. Probe mode only compares the
+                // ranking with L+1's later exact union; stage mode may prepare
+                // private bytes, while that exact union remains authoritative.
+                let live_sequential_probe = ghost_metal_live_sequential_predict_probe_enabled();
+                let live_sequential_stage = ghost_metal_live_sequential_stage_enabled();
+                let live_sequential_signal = live_sequential_probe || live_sequential_stage;
+                let live_sequential_fast_predict =
+                    live_sequential_signal && ghost_metal_live_sequential_fast_predict_enabled();
+                let mut live_sequential_predictor = |next_layer_idx: usize,
+                                                     flat_hidden_rows: &[f32],
+                                                     observed_k: usize|
+                 -> Option<Vec<usize>> {
+                    let expected = observed_k.checked_mul(hidden)?;
+                    if observed_k == 0 || flat_hidden_rows.len() != expected {
+                        return None;
+                    }
+                    let ranked = if live_sequential_fast_predict {
+                        self.predict_next_layer_routes_top_k_ranked_batched(
+                            next_layer_idx,
+                            flat_hidden_rows,
+                            observed_k,
+                            8,
+                        )
+                    } else {
+                        let approx_rows = flat_hidden_rows
+                            .chunks_exact(hidden)
+                            .map(|row| row.to_vec())
+                            .collect::<Vec<_>>();
+                        self.predict_next_layer_routes_top_k_ranked(next_layer_idx, &approx_rows, 8)
+                    };
+                    (!ranked.is_empty()).then_some(ranked)
+                };
+                let live_sequential_predictor_fn: Option<
+                    &mut dyn FnMut(usize, &[f32], usize) -> Option<Vec<usize>>,
+                > = live_sequential_signal.then_some(&mut live_sequential_predictor);
                 if let Ok(mut guard) = self.metal_q4_experts.lock() {
                     if let Some(lane) = guard.as_mut() {
                         chained_fallback_forbidden = lane.cpu_fallback_forbidden();
@@ -16778,6 +17297,8 @@ impl Gemma4Runtime {
                             &hs,
                             sparse_probe_routes.as_deref(),
                             sparse_probe_predict_us,
+                            live_sequential_predictor_fn,
+                            live_sequential_stage,
                             theta_local,
                             theta_global,
                             rope_factors,
@@ -16990,6 +17511,8 @@ impl Gemma4Runtime {
                             &hs,
                             None,
                             None,
+                            None,
+                            false,
                             theta_local,
                             theta_global,
                             rope_factors,
@@ -17672,10 +18195,10 @@ impl Gemma4Runtime {
             .collect()
     }
 
-    /// Probe-only sibling that preserves a deterministic confidence order for
-    /// global staging-cap analysis. The production predictor above retains its
-    /// established canonical-ID order. Here, each selected expert receives its
-    /// maximum normalized router probability across candidate rows; descending
+    /// Ranked advisory sibling used by the live probe and bounded rolling
+    /// stage. The production predictor above retains its established
+    /// canonical-ID order. Here, each selected expert receives its maximum
+    /// normalized router probability across candidate rows; descending
     /// confidence and then canonical ID break ties.
     #[cfg(target_os = "macos")]
     fn predict_next_layer_routes_top_k_ranked(
@@ -17729,6 +18252,43 @@ impl Gemma4Runtime {
             .collect::<Vec<_>>();
         selected.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         selected.into_iter().map(|(expert, _)| expert).collect()
+    }
+
+    /// One Accelerate projection for all live-hidden rows. Unlike the shipping
+    /// scalar-row helper, this advisory-only path may use BLAS reduction order;
+    /// exact router output is still recomputed later by Metal and controls all
+    /// slots, fallbacks, and model output.
+    #[cfg(target_os = "macos")]
+    fn predict_next_layer_routes_top_k_ranked_batched(
+        &self,
+        next_li: usize,
+        flat_hidden_rows: &[f32],
+        rows: usize,
+        top_k: usize,
+    ) -> Vec<usize> {
+        let Some(lw) = self.layers.get(next_li) else {
+            return Vec::new();
+        };
+        let Some(moe) = lw.moe.as_ref() else {
+            return Vec::new();
+        };
+        let hidden = self.config.embedding_length as usize;
+        if moe.n_expert != 128 {
+            return Vec::new();
+        }
+        gemma4_live_batched_router_logits(
+            flat_hidden_rows,
+            rows,
+            hidden,
+            moe.n_expert,
+            &moe.gate_inp_scale,
+            &moe.gate_inp,
+            self.config.rms_norm_epsilon,
+        )
+        .and_then(|logits| {
+            gemma4_live_ranked_router_candidates_from_logits(&logits, rows, moe.n_expert, top_k)
+        })
+        .unwrap_or_default()
     }
 
     /// Layer-major sibling of [`Self::moe_layer_ffn`] for Ghost prompt chunks.
@@ -26254,6 +26814,183 @@ impl Gemma4CudaResident {
 #[cfg(test)]
 mod mtp_target_seam_tests {
     use super::*;
+
+    #[test]
+    fn live_sequential_predict_probe_is_exact_positive_and_default_off() {
+        assert!(!ghost_metal_live_sequential_predict_probe_from(None));
+        assert!(ghost_metal_live_sequential_predict_probe_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !ghost_metal_live_sequential_predict_probe_from(Some(value)),
+                "unexpected live sequential probe admission for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_sequential_stage_is_exact_positive_and_default_off() {
+        assert!(!ghost_metal_live_sequential_stage_from(None));
+        assert!(ghost_metal_live_sequential_stage_from(Some("1")));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !ghost_metal_live_sequential_stage_from(Some(value)),
+                "unexpected live sequential stage admission for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_sequential_stage_dual_reader_is_exact_positive_and_default_off() {
+        assert!(!ghost_metal_live_sequential_stage_dual_reader_from(None));
+        assert!(ghost_metal_live_sequential_stage_dual_reader_from(Some(
+            "1"
+        )));
+        for value in ["", "0", "true", "TRUE", "yes", "2", " 1", "1 "] {
+            assert!(
+                !ghost_metal_live_sequential_stage_dual_reader_from(Some(value)),
+                "unexpected truthy value: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_sequential_fast_predict_is_exact_positive_and_default_off() {
+        assert!(!ghost_metal_live_sequential_fast_predict_from(None));
+        assert!(ghost_metal_live_sequential_fast_predict_from(Some("1")));
+        for value in ["", "0", "true", "TRUE", "yes", "2", " 1", "1 "] {
+            assert!(
+                !ghost_metal_live_sequential_fast_predict_from(Some(value)),
+                "unexpected truthy value: {value:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_sequential_batched_router_refuses_bad_shape_and_nonfinite_input() {
+        let scale = vec![1.0f32; 4];
+        let gate = vec![0.25f32; 12];
+        assert!(gemma4_live_batched_router_logits(&[], 0, 4, 3, &scale, &gate, 1e-6).is_none());
+        assert!(
+            gemma4_live_batched_router_logits(&[1.0; 7], 2, 4, 3, &scale, &gate, 1e-6).is_none()
+        );
+        let mut nonfinite = vec![1.0f32; 8];
+        nonfinite[3] = f32::NAN;
+        assert!(
+            gemma4_live_batched_router_logits(&nonfinite, 2, 4, 3, &scale, &gate, 1e-6,).is_none()
+        );
+        assert!(
+            gemma4_live_ranked_router_candidates_from_logits(&[0.0, f32::INFINITY], 1, 2, 1,)
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_sequential_batched_router_matches_well_separated_scalar_ranking() {
+        let rows = 14usize;
+        let hidden = 32usize;
+        let experts = 16usize;
+        let top_k = 8usize;
+        let flat = (0..rows * hidden)
+            .map(|index| 0.75 + ((index * 17 + 3) % 29) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let scale = (0..hidden)
+            .map(|index| 0.9 + (index % 5) as f32 * 0.03)
+            .collect::<Vec<_>>();
+        let gate = (0..experts)
+            .flat_map(|expert| {
+                (0..hidden)
+                    .map(move |column| (expert + 1) as f32 * 0.02 + (column % 3) as f32 * 0.0001)
+            })
+            .collect::<Vec<_>>();
+        let batched =
+            gemma4_live_batched_router_logits(&flat, 14, hidden, experts, &scale, &gate, 1e-6)
+                .unwrap();
+        let hidden_scale = 1.0f32 / (hidden as f32).sqrt();
+        let scalar = flat
+            .chunks_exact(hidden)
+            .flat_map(|row| {
+                let mut normalized = rms_norm(row, None, 1e-6);
+                for (value, &input_scale) in normalized.iter_mut().zip(&scale) {
+                    *value = (*value * hidden_scale) * input_scale;
+                }
+                f32_matvec(&gate, hidden, experts, &normalized)
+            })
+            .collect::<Vec<_>>();
+        for (&expected, &actual) in scalar.iter().zip(&batched) {
+            let tolerance = 1e-4f32.max(expected.abs() * 2e-5);
+            assert!((expected - actual).abs() <= tolerance);
+        }
+        assert_eq!(
+            gemma4_live_ranked_router_candidates_from_logits(&batched, rows, experts, top_k,),
+            gemma4_live_ranked_router_candidates_from_logits(&scalar, rows, experts, top_k,)
+        );
+    }
+
+    #[test]
+    fn live_sequential_ranked_router_ties_and_multirow_confidence_are_stable() {
+        assert_eq!(
+            gemma4_live_ranked_router_candidates_from_logits(&[0.0; 24], 2, 12, 4),
+            Some(vec![0, 1, 2, 3])
+        );
+        let logits = [5.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 1.0];
+        assert_eq!(
+            gemma4_live_ranked_router_candidates_from_logits(&logits, 2, 4, 1),
+            Some(vec![2, 0])
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "production-shape Accelerate advisory benchmark"]
+    fn live_sequential_batched_router_production_shape_benchmark() {
+        use std::hint::black_box;
+        let hidden = 2_816usize;
+        let experts = 128usize;
+        let scale = vec![1.0f32; hidden];
+        let gate = (0..experts * hidden)
+            .map(|index| ((index * 13 + 7) % 257) as f32 * 0.0001)
+            .collect::<Vec<_>>();
+        let mut batched_us = 0u128;
+        let mut scalar_us = 0u128;
+        for rows in [14usize, 13, 14, 7] {
+            let flat = (0..rows * hidden)
+                .map(|index| 0.5 + ((index * 11 + 5) % 31) as f32 * 0.01)
+                .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            for _ in 0..29 {
+                black_box(
+                    gemma4_live_batched_router_logits(
+                        &flat, rows, hidden, experts, &scale, &gate, 1e-6,
+                    )
+                    .unwrap(),
+                );
+            }
+            batched_us += started.elapsed().as_micros();
+
+            let started = std::time::Instant::now();
+            for _ in 0..29 {
+                for row in flat.chunks_exact(hidden) {
+                    let mut normalized = rms_norm(row, None, 1e-6);
+                    let hidden_scale = 1.0f32 / (hidden as f32).sqrt();
+                    for value in &mut normalized {
+                        *value *= hidden_scale;
+                    }
+                    black_box(f32_matvec(&gate, hidden, experts, &normalized));
+                }
+            }
+            scalar_us += started.elapsed().as_micros();
+        }
+        eprintln!(
+            "[live sequential predictor bench] scalar_ms={:.3} batched_ms={:.3} speedup={:.3}",
+            scalar_us as f64 / 1_000.0,
+            batched_us as f64 / 1_000.0,
+            scalar_us as f64 / batched_us.max(1) as f64,
+        );
+        assert!(batched_us <= 20_000, "batched predictor exceeded 20ms");
+        assert!(scalar_us >= batched_us.saturating_mul(4));
+    }
 
     #[test]
     fn sparse_candidates_preserve_priority_deduplicate_and_cap() {

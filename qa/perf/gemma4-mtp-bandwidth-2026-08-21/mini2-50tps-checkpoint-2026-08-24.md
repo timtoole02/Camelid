@@ -127,6 +127,61 @@ for example compressed/global retention plus assistant-informed future-route
 prefetch and an exact kernel improvement. Static capacity alone is closed:
 2,200 did not win and 2,400 swapped.
 
+## Live-hidden sequential staging (H46–H49)
+
+H46 added an observation-only next-layer route predictor at the exact
+post-attention barrier. It never changed I/O, slots, tables, routing, or model
+output. Across the frozen four verifier rounds, cap-eight predicted 318 of the
+later exact cold records (54.91% read-wall-weighted recall) while preserving
+48/48 exact output and zero swap. The original scalar predictor cost about
+101.4 ms, so it was useful as a quality proof but too expensive to promote.
+
+H47 turned that signal into a bounded, one-worker record stage. Every staged
+record stays in private owned bytes until exact `StageCold` requests the same
+layer/expert identity; sealing never waits, and queued, late, failed, or absent
+records fall through to the established eight-reader direct-to-stage path.
+Three exact zero-swap runs measured 36.51, 34.69, and 35.41 tok/s (35.54 mean,
+35.41 median). The best receipt had 261 ready hits and reduced exact demand
+reads from 580 to 319, but the scalar predictor still cost 102.5 ms. This was a
+real but modest gain over H40, not a stable promotion.
+
+H48 replaced the per-row predictor matvecs with one Apple Accelerate SGEMM per
+layer. The production-shape release microbenchmark measured 8.455 ms versus
+77.892 ms for the scalar reference (9.21x faster), and focused shape,
+non-finite, tie-order, ranking-parity, and literal-opt-in tests passed. On the
+real Mini2 request, the first-run Accelerate warmup brought total predictor
+time to 26.36 ms. Candidate quality stayed exactly 318 cap-eight truth hits,
+but one serial reader delivered only 214 in time; the run remained 48/48 exact
+at 36.22 tok/s with zero swap.
+
+H49 enabled a second private reader without widening the cap-eight candidate
+set. It remained exact with zero swap and reached **36.84 tok/s**. The stage
+issued 544 of 612 candidates and delivered 261 useful ready hits, leaving 319
+authoritative fallback reads. Four-round wall time was 1,302.99 ms:
+220.34 ms assistant and 1,082.10 ms verifier. Inside the verifier, measured GPU
+work totaled 678.4 ms and remaining demand waves totaled 346.4 ms. Therefore
+40 tok/s now needs 102.99 ms removed. Perfect readiness of the current
+cap-eight set can recover at most 57 additional true hits, so adding more
+workers alone cannot close the gap.
+
+The next bounded experiment is complementary pre-assistant reuse: explicitly
+stage a capped subset of the previous successful target round's exact cold
+identities during assistant work, consume only already-ready matching bytes in
+the direct-to-stage path, and retain H49 live-hidden staging for next-layer
+first-use coverage. Exact demand must remain nonblocking and authoritative;
+the two speculative sources need independent hard caps and lifecycle permits.
+This is materially different from H43–H45 retained banks: no record persists
+across rounds, no Metal bank is allocated, and no replacement blit is queued.
+
+Profiles and executable for this checkpoint:
+
+- `H46-live-hidden-sequential-probe`
+- `H47-live-hidden-sequential-stage-cap8`
+- `H48-live-hidden-sequential-fast-predict`
+- `H49-live-hidden-sequential-fast-predict-dual-reader`
+- Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
+- SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
+
 ## Validation and provenance
 
 Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
@@ -138,6 +193,10 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - retained planning, two-phase publication, legacy blits, record-resource
   isolation, and separate hot/full binding gates: 7/7;
 - existing previous-cold-stage tests: 2/2;
+- live sequential parser, probe accounting, Accelerate shape/ranking/parity,
+  and production-shape latency tests: 10 passing plus one ignored benchmark;
+- predictive record staging lifecycle, concurrency, cancellation, and global
+  permit tests: 20/20;
 - K9–K12 specialized/general GateUp raw-bit parity (H31 research lane);
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

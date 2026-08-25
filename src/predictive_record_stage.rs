@@ -606,6 +606,444 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
     }
 }
 
+/// Failure to create a persistent rolling predictive-record worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RollingPredictiveStageStartError {
+    ZeroCapacity,
+    InvalidWorkerCount {
+        requested: usize,
+        max_allowed: usize,
+    },
+    StageAlreadyActive,
+    WorkerSpawn(String),
+}
+
+impl fmt::Display for RollingPredictiveStageStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroCapacity => write!(
+                f,
+                "rolling predictive record stage capacity must be non-zero"
+            ),
+            Self::InvalidWorkerCount {
+                requested,
+                max_allowed,
+            } => write!(
+                f,
+                "rolling predictive record worker count {requested} is outside 1..={max_allowed}"
+            ),
+            Self::StageAlreadyActive => {
+                write!(f, "another predictive record stage is still active")
+            }
+            Self::WorkerSpawn(message) => {
+                write!(
+                    f,
+                    "failed to spawn rolling predictive record worker: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RollingPredictiveStageStartError {}
+
+/// Failure to replace the rolling worker's current generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RollingPredictiveLaunchError {
+    Cancelled,
+    LayerMismatch {
+        target_layer: usize,
+        key: PredictiveRecordKey,
+    },
+    GenerationExhausted,
+}
+
+impl fmt::Display for RollingPredictiveLaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "rolling predictive record stage was cancelled"),
+            Self::LayerMismatch { target_layer, key } => write!(
+                f,
+                "rolling predictive target layer {target_layer} does not match candidate layer {}",
+                key.layer
+            ),
+            Self::GenerationExhausted => {
+                write!(f, "rolling predictive generation counter was exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RollingPredictiveLaunchError {}
+
+/// Lifetime telemetry for one rolling stage.
+///
+/// `reads_succeeded` and `reads_failed` describe loader outcomes, including
+/// outcomes that arrive after their generation became stale. A successful
+/// stale result also increments `late_discarded`. `unused_ready` counts
+/// already-published buffers discarded by replacement or cancellation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RollingPredictiveStageSnapshot {
+    pub(crate) launches: u64,
+    pub(crate) candidates: u64,
+    pub(crate) reads_started: u64,
+    pub(crate) reads_succeeded: u64,
+    pub(crate) reads_failed: u64,
+    pub(crate) ready_returned: u64,
+    pub(crate) unused_ready: u64,
+    pub(crate) late_discarded: u64,
+    pub(crate) workers_started: u64,
+    pub(crate) workers_done: u64,
+    /// Compatibility summary: true only after every started worker exits.
+    pub(crate) worker_done: bool,
+    pub(crate) cancelled: bool,
+}
+
+#[derive(Debug)]
+enum RollingPredictiveEntryState {
+    Queued,
+    Reading,
+    Ready(Box<[u8]>),
+    Failed,
+}
+
+#[derive(Debug)]
+struct RollingPredictiveEntry {
+    key: PredictiveRecordKey,
+    state: RollingPredictiveEntryState,
+}
+
+#[derive(Debug)]
+struct RollingPredictiveGeneration {
+    id: u64,
+    target_layer: usize,
+    entries: Vec<RollingPredictiveEntry>,
+}
+
+#[derive(Debug)]
+struct RollingPredictiveShared {
+    next_generation: u64,
+    active: Option<RollingPredictiveGeneration>,
+    telemetry: RollingPredictiveStageSnapshot,
+}
+
+struct RollingPredictiveInner {
+    max_records: usize,
+    loader: PredictiveRecordLoader,
+    shared: Mutex<RollingPredictiveShared>,
+    work_available: Condvar,
+    // Retain the process-global stage permit in shared ownership so a blocked
+    // loader cannot be followed by an unbounded succession of new workers.
+    // The permit is released only after both the public owner and worker drop
+    // their final `Arc`, including the late-read cancellation interval.
+    _permit: GlobalStagePermit,
+}
+
+/// A persistent, bounded, generation-aware predictive record stage.
+///
+/// One to four workers share the generation queue. Each worker calls the
+/// supplied loader serially, so [`Self::start`] preserves the original
+/// one-worker behavior while [`Self::start_with_workers`] permits bounded
+/// parallel reads. Each [`Self::launch`] replaces the previous generation
+/// without waiting for old reads. Loader output remains in a worker-private
+/// `Box<[u8]>` until that worker can prove that the same generation is still
+/// active; otherwise the box is dropped without publication.
+///
+/// [`Self::seal_layer`] never invokes the loader, waits on a condition
+/// variable, or joins the worker. It only takes the short-lived metadata mutex,
+/// removes the matching generation, and transfers buffers that were already
+/// fully published. Queued, reading, failed, absent, and stale records remain
+/// authoritative demand work for the caller.
+pub(crate) struct RollingPredictiveRecordStage {
+    inner: Arc<RollingPredictiveInner>,
+}
+
+impl RollingPredictiveRecordStage {
+    /// Start one private serial worker that can serve many rolling launches.
+    pub(crate) fn start(
+        max_records: usize,
+        loader: PredictiveRecordLoader,
+    ) -> Result<Self, RollingPredictiveStageStartError> {
+        Self::start_with_workers(max_records, 1, loader)
+    }
+
+    /// Start a bounded set of persistent workers sharing one generation
+    /// queue. The worker count must fit both the record cap and the fixed
+    /// four-worker safety ceiling.
+    pub(crate) fn start_with_workers(
+        max_records: usize,
+        worker_count: usize,
+        loader: PredictiveRecordLoader,
+    ) -> Result<Self, RollingPredictiveStageStartError> {
+        if max_records == 0 {
+            return Err(RollingPredictiveStageStartError::ZeroCapacity);
+        }
+        let max_workers = max_records.min(4);
+        if !(1..=max_workers).contains(&worker_count) {
+            return Err(RollingPredictiveStageStartError::InvalidWorkerCount {
+                requested: worker_count,
+                max_allowed: max_workers,
+            });
+        }
+
+        let permit = GlobalStagePermit::try_acquire()
+            .ok_or(RollingPredictiveStageStartError::StageAlreadyActive)?;
+
+        let inner = Arc::new(RollingPredictiveInner {
+            max_records,
+            loader,
+            shared: Mutex::new(RollingPredictiveShared {
+                next_generation: 1,
+                active: None,
+                telemetry: RollingPredictiveStageSnapshot::default(),
+            }),
+            work_available: Condvar::new(),
+            _permit: permit,
+        });
+
+        for worker_index in 0..worker_count {
+            let worker_inner = Arc::clone(&inner);
+            let spawn_result = std::thread::Builder::new()
+                .name(format!(
+                    "camelid-rolling-predictive-record-stage-{worker_index}"
+                ))
+                .spawn(move || run_rolling_predictive_worker(worker_inner));
+            match spawn_result {
+                Ok(handle) => {
+                    // Detach deliberately: cancellation must never join a
+                    // worker whose loader is stalled in an OS read.
+                    drop(handle);
+                    lock_rolling_shared(&inner).telemetry.workers_started += 1;
+                }
+                Err(error) => {
+                    // Fail closed. Already-started workers see cancellation,
+                    // discard any private result, and retain the global permit
+                    // until every stalled loader has actually returned.
+                    lock_rolling_shared(&inner).telemetry.cancelled = true;
+                    inner.work_available.notify_all();
+                    return Err(RollingPredictiveStageStartError::WorkerSpawn(
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(Self { inner })
+    }
+
+    /// Replace pending work with an ordered, unique, hard-capped generation.
+    ///
+    /// All admitted keys must carry `target_layer`; a mismatch rejects the
+    /// launch before it can replace current work. Empty launches are valid and
+    /// still invalidate the previous generation.
+    pub(crate) fn launch<I>(
+        &self,
+        target_layer: usize,
+        candidates: I,
+    ) -> Result<u64, RollingPredictiveLaunchError>
+    where
+        I: IntoIterator<Item = PredictiveRecordKey>,
+    {
+        let mut seen = BTreeSet::new();
+        let mut entries = Vec::with_capacity(self.inner.max_records);
+        for key in candidates {
+            if key.layer != target_layer {
+                return Err(RollingPredictiveLaunchError::LayerMismatch { target_layer, key });
+            }
+            if seen.insert(key) {
+                entries.push(RollingPredictiveEntry {
+                    key,
+                    state: RollingPredictiveEntryState::Queued,
+                });
+                if entries.len() == self.inner.max_records {
+                    break;
+                }
+            }
+        }
+
+        let candidate_count = entries.len() as u64;
+        let mut shared = lock_rolling_shared(&self.inner);
+        if shared.telemetry.cancelled {
+            return Err(RollingPredictiveLaunchError::Cancelled);
+        }
+        let generation = shared.next_generation;
+        shared.next_generation = generation
+            .checked_add(1)
+            .ok_or(RollingPredictiveLaunchError::GenerationExhausted)?;
+
+        if let Some(stale) = shared.active.take() {
+            shared.telemetry.unused_ready += rolling_ready_count(&stale);
+        }
+        shared.active = Some(RollingPredictiveGeneration {
+            id: generation,
+            target_layer,
+            entries,
+        });
+        shared.telemetry.launches += 1;
+        shared.telemetry.candidates += candidate_count;
+        drop(shared);
+        self.inner.work_available.notify_all();
+        Ok(generation)
+    }
+
+    /// Seal one exact target layer and take only buffers already fully ready.
+    ///
+    /// This operation never waits for an outstanding read. Removing the
+    /// generation before returning is the publication barrier: an in-flight
+    /// result for this generation will subsequently fail the identity check
+    /// in the worker and be discarded. Calling with a layer other than the
+    /// active target leaves the active generation untouched and returns empty.
+    pub(crate) fn seal_layer(&self, target_layer: usize) -> Vec<PredictiveRecord> {
+        let mut shared = lock_rolling_shared(&self.inner);
+        let Some(active) = shared.active.as_ref() else {
+            return Vec::new();
+        };
+        if active.target_layer != target_layer {
+            return Vec::new();
+        }
+        let active = shared
+            .active
+            .take()
+            .expect("matching rolling generation must still be active");
+        let mut ready = Vec::with_capacity(active.entries.len());
+        for entry in active.entries {
+            if let RollingPredictiveEntryState::Ready(bytes) = entry.state {
+                debug_assert_eq!(entry.key.layer, target_layer);
+                ready.push(PredictiveRecord {
+                    key: entry.key,
+                    source: PredictiveRecordSource::Staged,
+                    bytes,
+                });
+            }
+        }
+        shared.telemetry.ready_returned += ready.len() as u64;
+        ready
+    }
+
+    /// Cancel queued work and invalidate any generation without joining the
+    /// worker. A loader call already in progress is allowed to return into its
+    /// private buffer, which the worker then discards.
+    pub(crate) fn cancel(&self) {
+        let mut shared = lock_rolling_shared(&self.inner);
+        if shared.telemetry.cancelled {
+            return;
+        }
+        shared.telemetry.cancelled = true;
+        if let Some(stale) = shared.active.take() {
+            shared.telemetry.unused_ready += rolling_ready_count(&stale);
+        }
+        drop(shared);
+        self.inner.work_available.notify_all();
+    }
+
+    pub(crate) fn snapshot(&self) -> RollingPredictiveStageSnapshot {
+        lock_rolling_shared(&self.inner).telemetry
+    }
+}
+
+impl Drop for RollingPredictiveRecordStage {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn lock_rolling_shared(inner: &RollingPredictiveInner) -> MutexGuard<'_, RollingPredictiveShared> {
+    inner
+        .shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn rolling_ready_count(generation: &RollingPredictiveGeneration) -> u64 {
+    generation
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.state, RollingPredictiveEntryState::Ready(_)))
+        .count() as u64
+}
+
+fn run_rolling_predictive_worker(inner: Arc<RollingPredictiveInner>) {
+    set_rolling_predictive_worker_utility_qos();
+    loop {
+        let (generation, target_layer, key) = {
+            let mut shared = lock_rolling_shared(&inner);
+            loop {
+                if shared.telemetry.cancelled {
+                    shared.telemetry.workers_done += 1;
+                    shared.telemetry.worker_done =
+                        shared.telemetry.workers_done == shared.telemetry.workers_started;
+                    return;
+                }
+
+                let next = shared.active.as_mut().and_then(|active| {
+                    active
+                        .entries
+                        .iter_mut()
+                        .find(|entry| matches!(entry.state, RollingPredictiveEntryState::Queued))
+                        .map(|entry| {
+                            entry.state = RollingPredictiveEntryState::Reading;
+                            (active.id, active.target_layer, entry.key)
+                        })
+                });
+                if let Some(next) = next {
+                    shared.telemetry.reads_started += 1;
+                    break next;
+                }
+                shared = inner
+                    .work_available
+                    .wait(shared)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+
+        // The worker owns this result privately. No reference to its bytes is
+        // installed in shared state until the generation identity is checked.
+        let loaded = invoke_loader(&inner.loader, key);
+        let mut shared = lock_rolling_shared(&inner);
+        match &loaded {
+            Ok(_) => shared.telemetry.reads_succeeded += 1,
+            Err(_) => shared.telemetry.reads_failed += 1,
+        }
+
+        let publish_entry = if shared.telemetry.cancelled {
+            None
+        } else {
+            shared.active.as_mut().and_then(|active| {
+                if active.id != generation || active.target_layer != target_layer {
+                    return None;
+                }
+                active.entries.iter_mut().find(|entry| {
+                    entry.key == key && matches!(entry.state, RollingPredictiveEntryState::Reading)
+                })
+            })
+        };
+        if let Some(entry) = publish_entry {
+            entry.state = match loaded {
+                Ok(bytes) => RollingPredictiveEntryState::Ready(bytes),
+                Err(_) => RollingPredictiveEntryState::Failed,
+            };
+        } else if loaded.is_ok() {
+            shared.telemetry.late_discarded += 1;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_rolling_predictive_worker_utility_qos() {
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+
+    // Best effort only: failure keeps the worker correct and merely leaves the
+    // platform's inherited scheduling policy in place.
+    const QOS_CLASS_UTILITY: u32 = 0x11;
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_rolling_predictive_worker_utility_qos() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,5 +1494,439 @@ mod tests {
             snapshot.total
         );
         release_tx.send(()).unwrap();
+    }
+
+    fn wait_for_rolling_snapshot(
+        stage: &RollingPredictiveRecordStage,
+        predicate: impl Fn(RollingPredictiveStageSnapshot) -> bool,
+    ) -> RollingPredictiveStageSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = stage.snapshot();
+            if predicate(snapshot) {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for rolling snapshot; last={snapshot:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn stop_rolling(stage: &RollingPredictiveRecordStage) {
+        stage.cancel();
+        wait_for_rolling_snapshot(stage, |snapshot| snapshot.worker_done);
+    }
+
+    #[test]
+    fn rolling_worker_count_is_validated_before_taking_the_global_permit() {
+        let _serial = test_guard();
+        let loader: PredictiveRecordLoader = Arc::new(|_| Ok(bytes(1)));
+
+        assert!(matches!(
+            RollingPredictiveRecordStage::start_with_workers(0, 1, Arc::clone(&loader)),
+            Err(RollingPredictiveStageStartError::ZeroCapacity)
+        ));
+        assert!(matches!(
+            RollingPredictiveRecordStage::start_with_workers(4, 0, Arc::clone(&loader)),
+            Err(RollingPredictiveStageStartError::InvalidWorkerCount {
+                requested: 0,
+                max_allowed: 4,
+            })
+        ));
+        assert!(matches!(
+            RollingPredictiveRecordStage::start_with_workers(2, 3, Arc::clone(&loader)),
+            Err(RollingPredictiveStageStartError::InvalidWorkerCount {
+                requested: 3,
+                max_allowed: 2,
+            })
+        ));
+        assert!(matches!(
+            RollingPredictiveRecordStage::start_with_workers(8, 5, Arc::clone(&loader)),
+            Err(RollingPredictiveStageStartError::InvalidWorkerCount {
+                requested: 5,
+                max_allowed: 4,
+            })
+        ));
+
+        // Invalid attempts must not consume the process-global permit, and
+        // the legacy constructor must remain exactly one-worker behavior.
+        let stage = RollingPredictiveRecordStage::start(4, loader).unwrap();
+        assert_eq!(stage.snapshot().workers_started, 1);
+        stop_rolling(&stage);
+        let snapshot = stage.snapshot();
+        assert_eq!(snapshot.workers_done, 1);
+        assert!(snapshot.worker_done);
+    }
+
+    #[test]
+    fn rolling_two_workers_are_concurrent_and_seal_discards_both_late_results() {
+        let _serial = test_guard();
+        let first = key(13, 1);
+        let second = key(13, 2);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let release_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let in_flight_for_loader = Arc::clone(&in_flight);
+        let max_in_flight_for_loader = Arc::clone(&max_in_flight);
+        let release_gate_for_loader = Arc::clone(&release_gate);
+        let loader: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            let concurrent = in_flight_for_loader.fetch_add(1, Ordering::SeqCst) + 1;
+            max_in_flight_for_loader.fetch_max(concurrent, Ordering::SeqCst);
+            started_tx.send(loaded_key).unwrap();
+
+            let (released, changed) = &*release_gate_for_loader;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            in_flight_for_loader.fetch_sub(1, Ordering::SeqCst);
+            Ok(bytes(loaded_key.expert as u8))
+        });
+
+        let stage = RollingPredictiveRecordStage::start_with_workers(2, 2, loader).unwrap();
+        assert_eq!(stage.snapshot().workers_started, 2);
+        stage.launch(13, [first, second]).unwrap();
+
+        let mut started = BTreeSet::new();
+        started.insert(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        started.insert(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(started, BTreeSet::from([first, second]));
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+
+        let seal_started = Instant::now();
+        let ready = stage.seal_layer(13);
+        assert!(
+            seal_started.elapsed() < Duration::from_millis(100),
+            "seal waited for concurrently stalled predictive loaders"
+        );
+        assert!(ready.is_empty());
+
+        let (released, changed) = &*release_gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| snapshot.late_discarded == 2);
+        assert_eq!(snapshot.reads_started, 2);
+        assert_eq!(snapshot.reads_succeeded, 2);
+        assert_eq!(snapshot.ready_returned, 0);
+
+        stop_rolling(&stage);
+        let snapshot = stage.snapshot();
+        assert_eq!(snapshot.workers_started, 2);
+        assert_eq!(snapshot.workers_done, 2);
+        assert!(snapshot.worker_done);
+    }
+
+    #[test]
+    fn rolling_launch_preserves_first_unique_order_under_hard_cap() {
+        let _serial = test_guard();
+        let loaded = Arc::new(Mutex::new(Vec::new()));
+        let loaded_for_worker = Arc::clone(&loaded);
+        let loader: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            loaded_for_worker.lock().unwrap().push(loaded_key);
+            Ok(bytes(loaded_key.expert as u8))
+        });
+        let stage = RollingPredictiveRecordStage::start(3, loader).unwrap();
+        let generation = stage
+            .launch(6, [key(6, 4), key(6, 1), key(6, 4), key(6, 9), key(6, 2)])
+            .unwrap();
+        assert_eq!(generation, 1);
+        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| snapshot.reads_succeeded == 3);
+        assert_eq!(snapshot.launches, 1);
+        assert_eq!(snapshot.candidates, 3);
+        assert_eq!(snapshot.reads_started, 3);
+        assert_eq!(
+            *loaded.lock().unwrap(),
+            vec![key(6, 4), key(6, 1), key(6, 9)]
+        );
+
+        let ready = stage.seal_layer(6);
+        assert_eq!(
+            ready.iter().map(|record| record.key).collect::<Vec<_>>(),
+            vec![key(6, 4), key(6, 1), key(6, 9)]
+        );
+        stop_rolling(&stage);
+    }
+
+    #[test]
+    fn rolling_seal_is_nonblocking_during_a_stalled_private_read() {
+        let _serial = test_guard();
+        let wanted = key(7, 3);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let loader: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            assert_eq!(loaded_key, wanted);
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(bytes(3))
+        });
+        let stage = RollingPredictiveRecordStage::start(8, loader).unwrap();
+        stage.launch(7, [wanted]).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        std::thread::scope(|scope| {
+            let (sealed_tx, sealed_rx) = mpsc::channel();
+            let stage_ref = &stage;
+            scope.spawn(move || sealed_tx.send(stage_ref.seal_layer(7)).unwrap());
+            let sealed = sealed_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("seal waited for the stalled predictive loader");
+            assert!(sealed.is_empty());
+            release_tx.send(()).unwrap();
+        });
+
+        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| snapshot.late_discarded == 1);
+        assert_eq!(snapshot.reads_succeeded, 1);
+        assert_eq!(snapshot.ready_returned, 0);
+        stop_rolling(&stage);
+    }
+
+    #[test]
+    fn rolling_new_generation_replaces_stale_work_and_drops_late_bytes() {
+        let _serial = test_guard();
+        let old = key(2, 1);
+        let new = key(3, 5);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_old_tx, release_old_rx) = mpsc::channel();
+        let release_old_rx = Mutex::new(release_old_rx);
+        let loader: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            started_tx.send(loaded_key).unwrap();
+            if loaded_key == old {
+                release_old_rx.lock().unwrap().recv().unwrap();
+            }
+            Ok(bytes(loaded_key.expert as u8))
+        });
+        let stage = RollingPredictiveRecordStage::start(8, loader).unwrap();
+        assert_eq!(stage.launch(2, [old]).unwrap(), 1);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            old
+        );
+
+        // Replacement is a metadata operation and cannot wait for `old`.
+        assert_eq!(stage.launch(3, [new]).unwrap(), 2);
+        assert_eq!(stage.snapshot().launches, 2);
+        release_old_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            new
+        );
+        let snapshot = wait_for_rolling_snapshot(&stage, |snapshot| snapshot.reads_succeeded == 2);
+        assert_eq!(snapshot.late_discarded, 1);
+
+        let ready = stage.seal_layer(3);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].key, new);
+        assert_eq!(&*ready[0].bytes, &[5; 4]);
+        assert!(stage.seal_layer(2).is_empty());
+        stop_rolling(&stage);
+    }
+
+    #[test]
+    fn rolling_ready_records_keep_layer_identity_and_unused_ready_is_discarded() {
+        let _serial = test_guard();
+        let loader: PredictiveRecordLoader =
+            Arc::new(move |loaded_key| Ok(bytes(loaded_key.expert as u8)));
+        let stage = RollingPredictiveRecordStage::start(2, loader).unwrap();
+
+        assert_eq!(
+            stage.launch(8, [key(9, 1)]),
+            Err(RollingPredictiveLaunchError::LayerMismatch {
+                target_layer: 8,
+                key: key(9, 1),
+            })
+        );
+        assert_eq!(stage.snapshot().launches, 0);
+
+        stage.launch(8, [key(8, 2), key(8, 7)]).unwrap();
+        wait_for_rolling_snapshot(&stage, |snapshot| snapshot.reads_succeeded == 2);
+        assert!(stage.seal_layer(7).is_empty());
+        let ready = stage.seal_layer(8);
+        assert_eq!(ready.len(), 2);
+        assert!(ready.iter().all(|record| {
+            record.key.layer == 8 && record.source == PredictiveRecordSource::Staged
+        }));
+        assert_eq!(&*ready[0].bytes, &[2; 4]);
+        assert_eq!(&*ready[1].bytes, &[7; 4]);
+        assert_eq!(stage.snapshot().ready_returned, 2);
+
+        stage.launch(10, [key(10, 4)]).unwrap();
+        wait_for_rolling_snapshot(&stage, |snapshot| snapshot.reads_succeeded == 3);
+        stage.launch(11, []).unwrap();
+        let snapshot = stage.snapshot();
+        assert_eq!(snapshot.unused_ready, 1);
+        assert_eq!(snapshot.launches, 3);
+        assert_eq!(snapshot.candidates, 3);
+        stop_rolling(&stage);
+    }
+
+    #[test]
+    fn rolling_global_permit_survives_owner_drop_until_stalled_read_finishes() {
+        let _serial = test_guard();
+        let wanted = key(11, 3);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let loader_one: PredictiveRecordLoader = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(bytes(3))
+        });
+        let stage_one = RollingPredictiveRecordStage::start(8, loader_one).unwrap();
+        stage_one.launch(11, [wanted]).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let loader_two: PredictiveRecordLoader = Arc::new(|key| Ok(bytes(key.expert as u8)));
+        assert!(matches!(
+            RollingPredictiveRecordStage::start(8, Arc::clone(&loader_two)),
+            Err(RollingPredictiveStageStartError::StageAlreadyActive)
+        ));
+        drop(stage_one);
+        assert!(matches!(
+            RollingPredictiveRecordStage::start(8, Arc::clone(&loader_two)),
+            Err(RollingPredictiveStageStartError::StageAlreadyActive)
+        ));
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stage_two = loop {
+            match RollingPredictiveRecordStage::start(8, Arc::clone(&loader_two)) {
+                Ok(stage) => break stage,
+                Err(RollingPredictiveStageStartError::StageAlreadyActive) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "rolling global stage permit was not released"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("unexpected rolling stage start failure: {error}"),
+            }
+        };
+        stage_two.launch(12, [key(12, 4)]).unwrap();
+        wait_for_rolling_snapshot(&stage_two, |snapshot| snapshot.reads_succeeded == 1);
+        stop_rolling(&stage_two);
+    }
+
+    #[test]
+    fn rolling_multiworker_permit_survives_until_every_stalled_read_finishes() {
+        let _serial = test_guard();
+        let first = key(14, 1);
+        let second = key(14, 2);
+        let released_keys = Arc::new((Mutex::new(BTreeSet::new()), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let released_keys_for_loader = Arc::clone(&released_keys);
+        let loader_one: PredictiveRecordLoader = Arc::new(move |loaded_key| {
+            started_tx.send(loaded_key).unwrap();
+            let (released, changed) = &*released_keys_for_loader;
+            let mut released = released.lock().unwrap();
+            while !released.contains(&loaded_key) {
+                released = changed.wait(released).unwrap();
+            }
+            finished_tx.send(loaded_key).unwrap();
+            Ok(bytes(loaded_key.expert as u8))
+        });
+        let stage_one = RollingPredictiveRecordStage::start_with_workers(2, 2, loader_one).unwrap();
+        stage_one.launch(14, [first, second]).unwrap();
+
+        let mut started = BTreeSet::new();
+        started.insert(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        started.insert(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(started, BTreeSet::from([first, second]));
+
+        let loader_two: PredictiveRecordLoader = Arc::new(|key| Ok(bytes(key.expert as u8)));
+        assert!(matches!(
+            RollingPredictiveRecordStage::start(2, Arc::clone(&loader_two)),
+            Err(RollingPredictiveStageStartError::StageAlreadyActive)
+        ));
+        drop(stage_one);
+        assert!(matches!(
+            RollingPredictiveRecordStage::start(2, Arc::clone(&loader_two)),
+            Err(RollingPredictiveStageStartError::StageAlreadyActive)
+        ));
+
+        let (released, changed) = &*released_keys;
+        released.lock().unwrap().insert(first);
+        changed.notify_all();
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            first
+        );
+        // One completed worker cannot release the permit while its sibling is
+        // still blocked in a loader call.
+        assert!(matches!(
+            RollingPredictiveRecordStage::start(2, Arc::clone(&loader_two)),
+            Err(RollingPredictiveStageStartError::StageAlreadyActive)
+        ));
+
+        released.lock().unwrap().insert(second);
+        changed.notify_all();
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            second
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stage_two = loop {
+            match RollingPredictiveRecordStage::start(2, Arc::clone(&loader_two)) {
+                Ok(stage) => break stage,
+                Err(RollingPredictiveStageStartError::StageAlreadyActive) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "multiworker global stage permit was not released"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("unexpected rolling stage start failure: {error}"),
+            }
+        };
+        stage_two.launch(15, [key(15, 3)]).unwrap();
+        wait_for_rolling_snapshot(&stage_two, |snapshot| snapshot.reads_succeeded == 1);
+        stop_rolling(&stage_two);
+    }
+
+    #[test]
+    fn rolling_drop_cancels_without_joining_a_stalled_read() {
+        let _serial = test_guard();
+        let wanted = key(12, 6);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let loader: PredictiveRecordLoader = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(bytes(6))
+        });
+        let stage = RollingPredictiveRecordStage::start(8, loader).unwrap();
+        let inner = Arc::clone(&stage.inner);
+        stage.launch(12, [wanted]).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(stage);
+            dropped_tx.send(()).unwrap();
+        });
+        dropped_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("drop joined the stalled rolling worker");
+        assert!(lock_rolling_shared(&inner).telemetry.cancelled);
+        assert!(!lock_rolling_shared(&inner).telemetry.worker_done);
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = lock_rolling_shared(&inner).telemetry;
+            if snapshot.worker_done {
+                assert_eq!(snapshot.late_discarded, 1);
+                assert_eq!(snapshot.reads_succeeded, 1);
+                break;
+            }
+            assert!(Instant::now() < deadline, "rolling worker did not cancel");
+            std::thread::yield_now();
+        }
     }
 }

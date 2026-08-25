@@ -24676,6 +24676,125 @@ fn exact_cold_mask_from_union(union: &[usize], hot_at_start: &[bool; 128]) -> Op
     Some(cold)
 }
 
+/// Pure observation receipt for one sequential live-hidden prediction. Ranked
+/// candidates are filtered against immutable start-of-round residency before
+/// the global cap is applied. The later exact routed union remains the sole
+/// truth source; invalid or duplicate identities fail only this observation.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LiveSequentialProbeTally {
+    hits: u32,
+    actual_cold: u32,
+    predicted_cold: u32,
+}
+
+/// Validate one deterministic ranked list and return its bounded cold prefix.
+/// Immutable start-of-round residency is filtered before `cap`, so a hot
+/// candidate never consumes speculative payload capacity. The helper owns no
+/// execution state and cannot alter the later exact route union.
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_cold_candidates(
+    ranked: &[usize],
+    hot_at_start: &[bool; 128],
+    cap: usize,
+) -> Option<Vec<usize>> {
+    if cap == 0 {
+        return None;
+    }
+    let mut seen = [false; 128];
+    let mut cold = Vec::with_capacity(cap.min(128));
+    for &expert in ranked {
+        if expert >= seen.len() || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        if !hot_at_start[expert] && cold.len() < cap.min(128) {
+            cold.push(expert);
+        }
+    }
+    Some(cold)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_tally(
+    ranked: &[usize],
+    actual_union: &[usize],
+    hot_at_start: &[bool; 128],
+    cap: usize,
+) -> Option<LiveSequentialProbeTally> {
+    if cap == 0 {
+        return None;
+    }
+    let cold_candidates = live_sequential_cold_candidates(ranked, hot_at_start, cap)?;
+    let mut predicted = [false; 128];
+    for &expert in &cold_candidates {
+        predicted[expert] = true;
+    }
+
+    let mut actual_seen = [false; 128];
+    let mut actual_cold = 0u32;
+    let mut hits = 0u32;
+    for &expert in actual_union {
+        if expert >= 128 || actual_seen[expert] {
+            return None;
+        }
+        actual_seen[expert] = true;
+        if !hot_at_start[expert] {
+            actual_cold += 1;
+            hits += u32::from(predicted[expert]);
+        }
+    }
+    Some(LiveSequentialProbeTally {
+        hits,
+        actual_cold,
+        predicted_cold: cold_candidates.len().min(u32::MAX as usize) as u32,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct LiveSequentialProbeSummary {
+    compared_layers: u32,
+    hits: u32,
+    actual_cold: u32,
+    predicted_cold: u32,
+    read_wall_ms: f64,
+    projected_saved_ms: f64,
+}
+
+/// Record-linear projection only: for each layer, price the predicted fraction
+/// of exact cold demand against that layer's measured synchronous wave-load
+/// wall. This is a ceiling estimate, not a staging result; the probe performs
+/// no I/O and therefore cannot observe readiness or contention directly.
+#[cfg(any(target_os = "macos", test))]
+fn summarize_live_sequential_probe(
+    tallies: &[Option<LiveSequentialProbeTally>],
+    read_wall_ms: &[f64],
+) -> Option<LiveSequentialProbeSummary> {
+    if tallies.len() != read_wall_ms.len() {
+        return None;
+    }
+    let mut summary = LiveSequentialProbeSummary::default();
+    for (tally, &wall_ms) in tallies.iter().zip(read_wall_ms) {
+        let Some(tally) = tally else {
+            continue;
+        };
+        if !wall_ms.is_finite() || wall_ms < 0.0 {
+            return None;
+        }
+        summary.compared_layers = summary.compared_layers.saturating_add(1);
+        summary.hits = summary.hits.saturating_add(tally.hits);
+        summary.actual_cold = summary.actual_cold.saturating_add(tally.actual_cold);
+        summary.predicted_cold = summary.predicted_cold.saturating_add(tally.predicted_cold);
+        summary.read_wall_ms += wall_ms;
+        if tally.actual_cold != 0 {
+            summary.projected_saved_ms +=
+                wall_ms * f64::from(tally.hits) / f64::from(tally.actual_cold);
+        }
+    }
+    Some(summary)
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn cold_recurrence_tally(previous: &[bool; 128], current: &[bool; 128]) -> ColdRecurrenceTally {
     let mut tally = ColdRecurrenceTally::default();
@@ -25625,10 +25744,11 @@ mod hot_cold_overlap_plan_tests {
         gemma4_hybrid_cpu_cold_probe_from, gemma4_hybrid_cpu_cold_probe_round_admitted,
         gemma4_hybrid_hot_cold_overlap_publish_from, gemma4_hybrid_hot_cold_prefill_from,
         gemma4_hybrid_hot_cold_publication_allowed, gemma4_hybrid_hot_cold_round_kind_admitted,
-        hot_cold_compact_slot_table, hot_cold_split_slot_tables, partition_exact_union_by_hot,
-        plan_retained_cold_layer, retained_cold_compact_slot_table, ColdRecurrenceTally,
+        hot_cold_compact_slot_table, hot_cold_split_slot_tables, live_sequential_cold_candidates,
+        live_sequential_probe_tally, partition_exact_union_by_hot, plan_retained_cold_layer,
+        retained_cold_compact_slot_table, summarize_live_sequential_probe, ColdRecurrenceTally,
         CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
-        Gemma4RetainedColdPlacement,
+        Gemma4RetainedColdPlacement, LiveSequentialProbeTally,
     };
 
     fn expert_mask(experts: &[usize]) -> [bool; 128] {
@@ -25637,6 +25757,87 @@ mod hot_cold_overlap_plan_tests {
             mask[expert] = true;
         }
         mask
+    }
+
+    #[test]
+    fn live_sequential_probe_filters_hot_before_cap_and_never_changes_inputs() {
+        let ranked = vec![2, 5, 7, 9, 11];
+        let actual = vec![2, 5, 9, 13];
+        let ranked_before = ranked.clone();
+        let actual_before = actual.clone();
+        let hot = expert_mask(&[2]);
+
+        assert_eq!(
+            live_sequential_cold_candidates(&ranked, &hot, 2),
+            Some(vec![5, 7])
+        );
+
+        assert_eq!(
+            live_sequential_probe_tally(&ranked, &actual, &hot, 2),
+            Some(LiveSequentialProbeTally {
+                hits: 1,
+                actual_cold: 3,
+                predicted_cold: 2,
+            })
+        );
+        assert_eq!(
+            live_sequential_probe_tally(&ranked, &actual, &hot, 4),
+            Some(LiveSequentialProbeTally {
+                hits: 2,
+                actual_cold: 3,
+                predicted_cold: 4,
+            })
+        );
+        assert_eq!(ranked, ranked_before);
+        assert_eq!(actual, actual_before);
+        assert!(live_sequential_probe_tally(&ranked, &actual, &hot, 0).is_none());
+        assert!(live_sequential_probe_tally(&[5, 5], &actual, &hot, 4).is_none());
+        assert!(live_sequential_probe_tally(&ranked, &[5, 5], &hot, 4).is_none());
+        assert!(live_sequential_probe_tally(&[128], &actual, &hot, 4).is_none());
+    }
+
+    #[test]
+    fn live_sequential_probe_projects_per_layer_read_wall_only() {
+        let tallies = [
+            Some(LiveSequentialProbeTally {
+                hits: 2,
+                actual_cold: 3,
+                predicted_cold: 4,
+            }),
+            Some(LiveSequentialProbeTally {
+                hits: 1,
+                actual_cold: 1,
+                predicted_cold: 2,
+            }),
+            None,
+        ];
+        let summary = summarize_live_sequential_probe(&tallies, &[30.0, 10.0, 99.0]).unwrap();
+        assert_eq!(summary.compared_layers, 2);
+        assert_eq!(summary.hits, 3);
+        assert_eq!(summary.actual_cold, 4);
+        assert_eq!(summary.predicted_cold, 6);
+        assert!((summary.read_wall_ms - 40.0).abs() < 1.0e-9);
+        assert!((summary.projected_saved_ms - 30.0).abs() < 1.0e-9);
+        assert!(summarize_live_sequential_probe(&tallies, &[1.0]).is_none());
+        assert!(summarize_live_sequential_probe(&[tallies[0]], &[f64::NAN]).is_none());
+    }
+
+    #[test]
+    fn live_sequential_probe_reconciles_exactly_29_future_layers() {
+        let sample = LiveSequentialProbeTally {
+            hits: 1,
+            actual_cold: 2,
+            predicted_cold: 4,
+        };
+        let mut tallies = vec![Some(sample); 30];
+        tallies[0] = None;
+        let summary = summarize_live_sequential_probe(&tallies, &[1.0; 30]).unwrap();
+        assert_eq!(summary.compared_layers, 29);
+        assert_eq!(summary.hits, 29);
+        assert_eq!(summary.actual_cold, 58);
+        assert_eq!(summary.predicted_cold, 116);
+        assert!((summary.read_wall_ms - 29.0).abs() < 1.0e-9);
+        assert!((summary.projected_saved_ms - 14.5).abs() < 1.0e-9);
     }
 
     fn fill_q4_matrix(wire: &mut [u8], rows: usize, blocks: usize, seed: usize) {
@@ -28872,6 +29073,11 @@ impl Gemma4GhostCommonMetal {
         cold_stage_slab: Option<&Buffer>,
         cold_stage_slot_count: usize,
         hot_residency_at_start: Option<&[[bool; 128]]>,
+        mut live_sequential_predictor: Option<
+            &mut dyn FnMut(usize, &[f32], usize) -> Option<Vec<usize>>,
+        >,
+        mut live_sequential_stage_launcher: Option<&mut dyn FnMut(usize, &[usize]) -> bool>,
+        live_sequential_h40_shape: bool,
         pong_slab: Option<&Buffer>,
         predicted_unions: &[Vec<usize>],
         mut fill_pong_wave: Option<&mut dyn FnMut(usize, &[usize], &mut [u32; 128])>,
@@ -29382,6 +29588,70 @@ impl Gemma4GhostCommonMetal {
         // queue-order terminal barrier. At most the immediately preceding
         // layer can be pending because every layer has a private bank slab.
         let mut pending_retained_cold_publish: Option<Gemma4PendingRetainedColdPublish> = None;
+        let live_sequential_probe_requested = live_sequential_predictor.is_some();
+        let live_sequential_probe_admitted = live_sequential_probe_requested
+            && live_sequential_h40_shape
+            && record_demand
+            && file_mapped_demand
+            && is_decode_round
+            && hot_cold_overlap_round
+            && hot_cold_single_down
+            && !hot_cold_overlap_publish
+            && !retained_cold_bank_round
+            && !unified_single_cb
+            && slot_filler.is_some()
+            && hot_residency_at_start.is_some_and(|hot| hot.len() >= n_layers);
+        let live_sequential_stage_requested = live_sequential_stage_launcher.is_some();
+        let live_sequential_stage_admitted =
+            live_sequential_stage_requested && live_sequential_probe_admitted;
+        if live_sequential_probe_requested && !live_sequential_probe_admitted {
+            eprintln!(
+                "[metal live-sequential-predict probe] schema=1 admitted=0 start_pos={start_pos} K={k_tokens} h40_shape={} record_demand={} file_mapped={} decode={} hot_cold_overlap={} single_down={} publish={} retained_bank={} unified={} filler={} hot_snapshot={} output_mutation=0 io_mutation=0 slot_mutation=0",
+                u8::from(live_sequential_h40_shape),
+                u8::from(record_demand),
+                u8::from(file_mapped_demand),
+                u8::from(is_decode_round),
+                u8::from(hot_cold_overlap_round),
+                u8::from(hot_cold_single_down),
+                u8::from(hot_cold_overlap_publish),
+                u8::from(retained_cold_bank_round),
+                u8::from(unified_single_cb),
+                u8::from(slot_filler.is_some()),
+                u8::from(hot_residency_at_start.is_some_and(|hot| hot.len() >= n_layers)),
+            );
+            live_sequential_predictor = None;
+        }
+        if live_sequential_stage_requested && !live_sequential_stage_admitted {
+            live_sequential_stage_launcher = None;
+        }
+        let mut live_sequential_ranked =
+            live_sequential_probe_admitted.then(|| vec![None::<Vec<usize>>; n_layers]);
+        let mut live_sequential_failed =
+            live_sequential_probe_admitted.then(|| vec![false; n_layers]);
+        let mut live_sequential_cap4 = live_sequential_probe_admitted
+            .then(|| vec![None::<LiveSequentialProbeTally>; n_layers]);
+        let mut live_sequential_cap8 = live_sequential_probe_admitted
+            .then(|| vec![None::<LiveSequentialProbeTally>; n_layers]);
+        let mut live_sequential_read_wall_ms =
+            live_sequential_probe_admitted.then(|| vec![0.0f64; n_layers]);
+        let mut live_sequential_predict_us = 0u64;
+        let mut live_sequential_attempts = 0u32;
+        let mut live_sequential_failures = 0u32;
+        let mut live_sequential_stage_launch_attempts = 0u32;
+        let mut live_sequential_stage_launches = 0u32;
+        let mut live_sequential_stage_launch_failures = 0u32;
+        let mut live_sequential_stage_candidates = 0u32;
+        macro_rules! account_wave_load {
+            ($layer_idx:expr, $elapsed_ms:expr) => {{
+                let elapsed_ms = $elapsed_ms;
+                ledger.wave_load_ms += elapsed_ms;
+                if let Some(per_layer) = live_sequential_read_wall_ms.as_mut() {
+                    if let Some(value) = per_layer.get_mut($layer_idx) {
+                        *value += elapsed_ms;
+                    }
+                }
+            }};
+        }
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let norms = &self.norms[layer_idx];
@@ -30242,7 +30512,7 @@ impl Gemma4GhostCommonMetal {
                             &mut spec_ping,
                             &mut spec_discard,
                         );
-                        ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                        account_wave_load!(layer_idx, t_load.elapsed().as_secs_f64() * 1000.0);
                         spec_filled = true;
                     }
                 }
@@ -30259,6 +30529,44 @@ impl Gemma4GhostCommonMetal {
                     );
                     self.last_chained_ledger = ledger;
                     return false;
+                }
+                // Live-hidden sequential signal. At this barrier slab_b is the
+                // exact post-attention residual for layer L. The queued shared
+                // command only reads it and the expert/tail writer has not
+                // been committed, so this host read cannot race a mutation.
+                // The callback only ranks L+1 identities. A separately gated
+                // launcher may later prepare private bytes after this layer's
+                // exact StageCold work and expert/tail commit.
+                if layer_idx + 1 < n_layers {
+                    if let Some(predictor) = live_sequential_predictor.as_deref_mut() {
+                        live_sequential_attempts = live_sequential_attempts.saturating_add(1);
+                        let next_layer_idx = layer_idx + 1;
+                        let flat_hidden = unsafe {
+                            std::slice::from_raw_parts(
+                                self.slab_b.contents() as *const f32,
+                                k_tokens * hidden,
+                            )
+                        };
+                        let predict_started = std::time::Instant::now();
+                        let ranked = predictor(next_layer_idx, flat_hidden, k_tokens);
+                        live_sequential_predict_us = live_sequential_predict_us.saturating_add(
+                            predict_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                        );
+                        match ranked {
+                            Some(ranked) if !ranked.is_empty() => {
+                                if let Some(predictions) = live_sequential_ranked.as_mut() {
+                                    predictions[next_layer_idx] = Some(ranked);
+                                }
+                            }
+                            _ => {
+                                live_sequential_failures =
+                                    live_sequential_failures.saturating_add(1);
+                                if let Some(failed) = live_sequential_failed.as_mut() {
+                                    failed[next_layer_idx] = true;
+                                }
+                            }
+                        }
+                    }
                 }
                 // The router command buffer is later on the singleton queue
                 // than the previous layer's expert/tail buffer. Its completed
@@ -30533,6 +30841,39 @@ impl Gemma4GhostCommonMetal {
                         );
                     self.last_chained_ledger = ledger;
                     return false;
+                }
+                if live_sequential_probe_admitted && layer_idx > 0 {
+                    let prediction_failed = live_sequential_failed
+                        .as_ref()
+                        .and_then(|failed| failed.get(layer_idx))
+                        .copied()
+                        .unwrap_or(true);
+                    if !prediction_failed {
+                        let ranked = live_sequential_ranked
+                            .as_ref()
+                            .and_then(|predictions| predictions.get(layer_idx))
+                            .and_then(Option::as_deref);
+                        let hot = hot_residency_at_start.and_then(|hot| hot.get(layer_idx));
+                        let tallies = ranked.zip(hot).and_then(|(ranked, hot)| {
+                            Some((
+                                live_sequential_probe_tally(ranked, &union, hot, 4)?,
+                                live_sequential_probe_tally(ranked, &union, hot, 8)?,
+                            ))
+                        });
+                        if let Some((cap4, cap8)) = tallies {
+                            if let Some(per_layer) = live_sequential_cap4.as_mut() {
+                                per_layer[layer_idx] = Some(cap4);
+                            }
+                            if let Some(per_layer) = live_sequential_cap8.as_mut() {
+                                per_layer[layer_idx] = Some(cap8);
+                            }
+                        } else {
+                            live_sequential_failures = live_sequential_failures.saturating_add(1);
+                            if let Some(failed) = live_sequential_failed.as_mut() {
+                                failed[layer_idx] = true;
+                            }
+                        }
+                    }
                 }
                 if file_mapped_demand
                     && union.iter().any(|&expert| {
@@ -31113,7 +31454,7 @@ impl Gemma4GhostCommonMetal {
                                 )
                             };
                             let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
-                            ledger.wave_load_ms += stage_ms;
+                            account_wave_load!(layer_idx, stage_ms);
                             let table_exact = staged
                                 && cold_table == expected_cold_table
                                 && wave_slots_ready(&cold_table, fresh_wave, fresh_wave.len())
@@ -31447,7 +31788,7 @@ impl Gemma4GhostCommonMetal {
                             &mut updated_slots,
                             &mut union,
                         );
-                        ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                        account_wave_load!(layer_idx, t_load.elapsed().as_secs_f64() * 1000.0);
                     }
                     mask_slot_table_to_wave(&mut updated_slots, wave0);
                     let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
@@ -31467,7 +31808,7 @@ impl Gemma4GhostCommonMetal {
                     if let Some(fill_pong) = fill_pong_wave.as_mut() {
                         let t_load = std::time::Instant::now();
                         fill_pong(layer_idx, wave1.as_slice(), &mut pong_table);
-                        ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                        account_wave_load!(layer_idx, t_load.elapsed().as_secs_f64() * 1000.0);
                     }
                     mask_slot_table_to_wave(&mut pong_table, wave1);
                     let pong_slots = wave1.len().max(1);
@@ -31553,7 +31894,7 @@ impl Gemma4GhostCommonMetal {
                                 &mut updated_slots,
                                 &mut union,
                             );
-                            ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                            account_wave_load!(layer_idx, t_load.elapsed().as_secs_f64() * 1000.0);
                         } else if spec_filled && same_expert_set(&spec_w0, wave) {
                             updated_slots = spec_ping;
                         }
@@ -32167,6 +32508,45 @@ impl Gemma4GhostCommonMetal {
                 cb_closed = true;
                 encode_clock = std::time::Instant::now();
             }
+
+            // Start only after this layer's exact StageCold reconciliation and
+            // expert/tail commit. The private reader therefore cannot sit in
+            // front of current exact demand. Its target is L+1, and the next
+            // layer's exact router remains the sole consumer authority.
+            if live_sequential_stage_admitted && layer_idx + 1 < n_layers {
+                live_sequential_stage_launch_attempts =
+                    live_sequential_stage_launch_attempts.saturating_add(1);
+                let next_layer_idx = layer_idx + 1;
+                let cold_candidates = live_sequential_ranked
+                    .as_ref()
+                    .and_then(|ranked| ranked.get(next_layer_idx))
+                    .and_then(Option::as_deref)
+                    .zip(hot_residency_at_start.and_then(|hot| hot.get(next_layer_idx)))
+                    .and_then(|(ranked, hot)| live_sequential_cold_candidates(ranked, hot, 8));
+                match cold_candidates {
+                    Some(candidates) => {
+                        live_sequential_stage_candidates = live_sequential_stage_candidates
+                            .saturating_add(candidates.len().min(u32::MAX as usize) as u32);
+                        // An empty launch is still meaningful: it replaces any
+                        // stale generation so no obsolete private read can
+                        // continue merely because every prediction was hot.
+                        let launched = live_sequential_stage_launcher
+                            .as_deref_mut()
+                            .is_some_and(|launcher| launcher(next_layer_idx, &candidates));
+                        if launched {
+                            live_sequential_stage_launches =
+                                live_sequential_stage_launches.saturating_add(1);
+                        } else {
+                            live_sequential_stage_launch_failures =
+                                live_sequential_stage_launch_failures.saturating_add(1);
+                        }
+                    }
+                    None => {
+                        live_sequential_stage_launch_failures =
+                            live_sequential_stage_launch_failures.saturating_add(1);
+                    }
+                }
+            }
         }
 
         let final_cb: metal::CommandBuffer = if cb_closed {
@@ -32558,6 +32938,109 @@ impl Gemma4GhostCommonMetal {
         } else if cold_recurrence_probe_round {
             eprintln!(
                 "[metal chained cold-recurrence] sample=skipped reason=incomplete-exact-layer-sample observed_layers={cold_recurrence_observed_layers} expected_layers={n_layers} policy_mutation=0 start_pos={start_pos} K={k_tokens}"
+            );
+        }
+        if live_sequential_probe_admitted {
+            let cap4 = live_sequential_cap4
+                .as_deref()
+                .zip(live_sequential_read_wall_ms.as_deref())
+                .and_then(|(tallies, wall)| summarize_live_sequential_probe(tallies, wall));
+            let cap8 = live_sequential_cap8
+                .as_deref()
+                .zip(live_sequential_read_wall_ms.as_deref())
+                .and_then(|(tallies, wall)| summarize_live_sequential_probe(tallies, wall));
+            let truth_valid = cap4.zip(cap8).is_some_and(|(cap4, cap8)| {
+                live_sequential_failures == 0
+                    && cap4.compared_layers == live_sequential_attempts
+                    && cap8.compared_layers == live_sequential_attempts
+                    && live_sequential_attempts == n_layers.saturating_sub(1) as u32
+            });
+            let cap4 = cap4.unwrap_or_default();
+            let cap8 = cap8.unwrap_or_default();
+            let ratio = |numerator: u32, denominator: u32| {
+                (denominator != 0)
+                    .then(|| format!("{:.6}", f64::from(numerator) / f64::from(denominator)))
+                    .unwrap_or_else(|| "na".to_owned())
+            };
+            let weighted_recall = |summary: LiveSequentialProbeSummary| {
+                (summary.read_wall_ms > 0.0)
+                    .then(|| format!("{:.6}", summary.projected_saved_ms / summary.read_wall_ms))
+                    .unwrap_or_else(|| "na".to_owned())
+            };
+            let cap8_candidates = live_sequential_ranked
+                .as_deref()
+                .zip(hot_residency_at_start)
+                .map(|(ranked, hot)| {
+                    ranked
+                        .iter()
+                        .zip(hot)
+                        .enumerate()
+                        .skip(1)
+                        .filter_map(|(layer_idx, (ranked, hot))| {
+                            ranked.as_ref().map(|ranked| {
+                                let ids = ranked
+                                    .iter()
+                                    .copied()
+                                    .filter(|&expert| expert < 128 && !hot[expert])
+                                    .take(8)
+                                    .map(|expert| expert.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!("L{layer_idx}:{ids}")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .unwrap_or_default();
+            let cap8_layers = live_sequential_cap8
+                .as_deref()
+                .zip(live_sequential_read_wall_ms.as_deref())
+                .map(|(tallies, wall)| {
+                    tallies
+                        .iter()
+                        .zip(wall)
+                        .enumerate()
+                        .skip(1)
+                        .filter_map(|(layer_idx, (tally, wall_ms))| {
+                            tally.map(|tally| {
+                                format!(
+                                    "L{layer_idx}:{}/{}/{}@{wall_ms:.3}",
+                                    tally.hits, tally.actual_cold, tally.predicted_cold,
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "[metal live-sequential-predict probe] schema=1 admitted=1 profile=H40-direct-stage-single-down-publish0 start_pos={start_pos} K={k_tokens} source=post-attention-slab-b target=next-layer-exact-union first_target_layer=1 eligible_layers={} attempted_layers={live_sequential_attempts} failures={live_sequential_failures} truth_valid={} predict_us={live_sequential_predict_us} predictor_top_k_per_row=8 cap4_hits={} cap4_actual_cold={} cap4_predicted_cold={} cap4_recall={} cap4_precision={} cap4_read_wall_ms={:.3} cap4_projected_saved_ms={:.3} cap4_read_wall_weighted_recall={} cap8_hits={} cap8_actual_cold={} cap8_predicted_cold={} cap8_recall={} cap8_precision={} cap8_read_wall_ms={:.3} cap8_projected_saved_ms={:.3} cap8_read_wall_weighted_recall={} total_wave_load_ms={:.3} projection=record-linear-per-layer-wave-load-ceiling stage_admitted={} stage_launch_attempts={live_sequential_stage_launch_attempts} stage_launches={live_sequential_stage_launches} stage_launch_failures={live_sequential_stage_launch_failures} stage_candidates={live_sequential_stage_candidates} readiness_measured={} contention_measured={} output_mutation=0 io_mutation={} slot_policy_mutation=0 routing_authority=exact-router cap8_candidates={} cap8_layers={}",
+                n_layers.saturating_sub(1),
+                u8::from(truth_valid),
+                cap4.hits,
+                cap4.actual_cold,
+                cap4.predicted_cold,
+                ratio(cap4.hits, cap4.actual_cold),
+                ratio(cap4.hits, cap4.predicted_cold),
+                cap4.read_wall_ms,
+                cap4.projected_saved_ms,
+                weighted_recall(cap4),
+                cap8.hits,
+                cap8.actual_cold,
+                cap8.predicted_cold,
+                ratio(cap8.hits, cap8.actual_cold),
+                ratio(cap8.hits, cap8.predicted_cold),
+                cap8.read_wall_ms,
+                cap8.projected_saved_ms,
+                weighted_recall(cap8),
+                ledger.wave_load_ms,
+                u8::from(live_sequential_stage_admitted),
+                u8::from(live_sequential_stage_admitted),
+                u8::from(live_sequential_stage_admitted),
+                u8::from(live_sequential_stage_admitted),
+                cap8_candidates,
+                cap8_layers,
             );
         }
         self.last_chained_ledger = ledger;
