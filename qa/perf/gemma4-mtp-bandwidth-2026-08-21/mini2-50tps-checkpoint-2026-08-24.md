@@ -265,6 +265,61 @@ both below the hard ceilings. Private-queue target-free warming is therefore
 closed; the cold cost belongs to the chain-specific workload rather than the
 queue object alone.
 
+## Exact wide GateUp MMA closure (H58)
+
+H58 is a strict default-off compute experiment derived from the frozen H49
+KV192 control. `CAMELID_GEMMA4_MOE_MMA_K16=1` selects the optional staged-MMA
+GateUp only for the production K13 and K14 verifier widths; K7, K8, K9--K12,
+K15, and K16 retain their established kernels. The measured binary SHA-256 was
+`67412568314ca1e9c9e2ef2076f490c6fbd51b4dd0d46c98841886fd507fbff7`.
+
+The three focused H58 gates passed 3/3: strict parser/selection, adversarial
+K13/K14/K16 raw-byte parity against the current K16 GateUp, and split-range
+raw-byte parity proving full-union output coordinates. The ignored
+30-layer-equivalent timing gate then measured nine interleaved samples after
+discarded warmups:
+
+| width | control median | staged-MMA median | saving |
+|---|---:|---:|---:|
+| K13 | 62.332 ms | 54.662 ms | 7.670 ms |
+| K14 | 66.335 ms | 54.876 ms | 11.459 ms |
+
+For the `14,13,14,7` request schedule, where K7 remains unchanged, this
+projects to `2 * 11.459 + 7.670 = 30.588 ms/request` saved. Every isolated
+sample reported zero swap.
+
+Two Mini2 post-build warmups were discarded before the measured ABBA. The
+first, `mini2-h58-postbuild-warmup1-h49`, produced 48/48 exact tokens, zero
+swap, and memory below both ceilings, but its runner receipt was refused solely
+because post-exit telemetry raced process teardown; it is not counted as a
+measurement. The subsequent measured sequence was:
+
+| run | lane | tok/s | GateUp ms/round | GPU ms/round |
+|---|---|---:|---:|---:|
+| A1 | H49 control | 31.68 | 97.7 | 176.1 |
+| B1 | H58 | 31.67 | 87.4 | 165.8 |
+| B2 | H58 | 31.40 | 87.4 | 165.8 |
+| A2 | H49 control | 32.19 | 97.1 | 174.8 |
+
+All four A/B runs were 48/48 exact with zero swap and remained below the child
+and wired-memory ceilings. Peak A/B child footprint was 7,122,615,176 bytes;
+peak host-wired memory was 8,241,315,840 bytes. The H49 controls averaged
+31.935 tok/s and H58 averaged 31.535 tok/s, a 1.25% throughput regression.
+Nevertheless, mean GateUp fell from 97.4 to 87.4 ms/round, saving 10.0
+ms/round or 40.0 ms/request, and aggregate GPU time fell from 175.45 to 165.8
+ms/round, saving 9.65 ms/round or 38.6 ms/request.
+
+Verdict: the exact compute win is retained as a default-off building block,
+but H58 is a throughput-promotion **NO-GO** because exposed I/O and slot-state
+variability dominated the end-to-end ABBA. Evidence is local under:
+
+- `demand-promotion-runner/runs/mini2-h58-postbuild-warmup1-h49`;
+- `demand-promotion-runner/runs/mini2-h58-postbuild-warmup2-h58`;
+- `demand-promotion-runner/runs/mini2-h58-abba-a1-h49`;
+- `demand-promotion-runner/runs/mini2-h58-abba-b1-h58`;
+- `demand-promotion-runner/runs/mini2-h58-abba-b2-h58`;
+- `demand-promotion-runner/runs/mini2-h58-abba-a2-h49`.
+
 Profiles and executable for this checkpoint:
 
 - `H46-live-hidden-sequential-probe`
@@ -280,6 +335,7 @@ Profiles and executable for this checkpoint:
 - `H55-async-two-wave-collapse`
 - `H56-mtp-assistant-router-probe`
 - `H57-mtp-private-queue-warmup`
+- `H58-moe-mma-k16`
 - Mini2 executable: `/Users/timtoole/bin/camelid-h48-fast-b5b770ef`
 - SHA-256: `b5b770ef64f5ecb19d42eef6a489b9fad6bcd4897fdd5091dece3453f52a5f4c`
 - H54 Mini2 executable: `/Users/timtoole/bin/camelid-h54-f7f96177a700`
@@ -291,6 +347,9 @@ Profiles and executable for this checkpoint:
 - H57 Mini2 executable: `/Users/timtoole/bin/camelid-h57-5cfecb36b41f`
 - H57 SHA-256:
   `5cfecb36b41fd380f8a411a82e92527a00dfca2173376924701d8de844eb7fd7`
+- H58 Mini2 executable: `/Users/timtoole/bin/camelid-h58-67412568314c`
+- H58 SHA-256:
+  `67412568314ca1e9c9e2ef2076f490c6fbd51b4dd0d46c98841886fd507fbff7`
 
 ## Validation and provenance
 
@@ -312,6 +371,8 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - H55 parser/plan/raw-bit terminal parity: 3/3;
 - H56 parser/source/tally/global-budget accounting: 4/4;
 - H57 parser/subordinate-warmup configuration: 3/3;
+- H58 strict selector and raw K13/K14/K16 plus split-range parity: 3/3,
+  with the ignored nine-sample K13/K14 timing gate run separately;
 - watchdog process-accounting and runner boundary suite: 31/31;
 - `cargo fmt --check`, `git diff --check`, and guarded release build.
 

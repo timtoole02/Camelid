@@ -102,6 +102,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H55-async-two-wave-collapse` | H54 submission recovery: exact two-command hot/terminal path; strict-memory ABBA mean 31.45 tok/s versus H49 31.74, no-go |
 | `H56-mtp-assistant-router-probe` | Read-only assistant-hidden router projection; global-96 residual-cold recall 4.63% and 31.61 ms projected savings, so predictive host staging is closed |
 | `H57-mtp-private-queue-warmup` | Target-free assistant warmup on the measured chain's private queue; exact strict-memory ABBA mean 31.34 tok/s versus H49 31.38, and the ~23 ms first-chain setup remained, no-go |
+| `H58-moe-mma-k16` | Strict default-off K13/K14 staged-MMA GateUp: 3/3 raw gates and isolated timing projected 30.588 ms/request saved with zero swap; exact Mini2 ABBA cut GateUp by 10.0 ms/round and GPU time by 9.65 ms/round, but mean throughput regressed 1.25%, so retain as a compute building block and do not promote the profile |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 

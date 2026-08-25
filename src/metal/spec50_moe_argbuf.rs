@@ -168,6 +168,285 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k(
     }
 }
 
+// Strict K<=16 staged 8x8-MMA probe. One 128-thread group owns the same
+// (unique expert, 32-row block) tile as the scalar kernel; its four
+// SIMDgroups split those rows eight ways apiece while every SIMDgroup computes
+// two canonical eight-candidate tiles. Q4 and Q8 integers are converted to
+// half only for the matrix instruction. Their products and every 32-term
+// integer dot are exactly representable in the float accumulator. Weight and
+// input scales remain outside the MMA and are applied once per 32-value block,
+// in the same ascending gb order and parenthesization as the scalar kernel.
+static inline short2 s50_moe_mma_frag_coord(ushort lane) {
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    return short2(fn, fm);
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k16_mma8x8(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device Gemma4ExpertPointerTable& expert_table [[buffer(2)]],
+    device const Gemma4UniqueExpertWork* work_list [[buffer(3)]],
+    device float* output_scales [[buffer(4)]],
+    device char* output_quants [[buffer(5)]],
+    constant uint& num_unique_experts [[buffer(6)]],
+    constant uint& k_candidates [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint b = group % G4Q4_DOWN_BLOCKS;
+    const uint u = group / G4Q4_DOWN_BLOCKS;
+    if (u >= num_unique_experts) return;
+    if (k_candidates == 0u || k_candidates > 16u) return;
+
+    const Gemma4UniqueExpertWork work = work_list[u];
+    const ulong mask = work.candidate_mask;
+    if (mask == 0ULL) return;
+
+    const uint expert_id = work.expert_weight_offset / G4Q4_SLOT_STRIDE;
+    device const uchar* weights = expert_table.records[expert_id];
+
+    // 1,024 B of candidate inputs, two 2-KiB weight tiles, 128 B of
+    // f16 scales, 2 KiB of post-GeLU values, and 64 B of quantization
+    // reciprocals: 7,360 B total static threadgroup storage.
+    threadgroup half x_stage[16 * 32];
+    threadgroup half gate_stage[32 * 32];
+    threadgroup half up_stage[32 * 32];
+    threadgroup half gate_scales[32];
+    threadgroup half up_scales[32];
+    threadgroup float act_stage[16 * 32];
+    threadgroup float quant_inverse[16];
+
+    const short2 coord = s50_moe_mma_frag_coord(ushort(lane));
+    const uint candidate_column = uint(coord.y);
+    const uint candidate0 = candidate_column;
+    const uint candidate1 = 8u + candidate_column;
+    const uint local_row0 = uint(coord.x);
+    const uint row_base = b * 32u + sg * 8u;
+    const bool active0 = candidate0 < k_candidates
+        && (mask & (1ULL << candidate0)) != 0ULL;
+    const bool active1 = candidate1 < k_candidates
+        && (mask & (1ULL << candidate1)) != 0ULL;
+
+    float gate_acc00 = 0.0f;
+    float gate_acc01 = 0.0f;
+    float up_acc00 = 0.0f;
+    float up_acc01 = 0.0f;
+    float gate_acc10 = 0.0f;
+    float gate_acc11 = 0.0f;
+    float up_acc10 = 0.0f;
+    float up_acc11 = 0.0f;
+
+    for (uint gb = 0; gb < G4Q4_GU_BLOCKS; ++gb) {
+        // No SIMDgroup may overwrite the shared tile until all four groups
+        // have consumed the preceding gb.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // SIMDgroups zero and one stage one canonical eight-candidate input
+        // tile apiece. Inactive candidates are literal zero rows, avoiding
+        // divergent matrix geometry.
+        if (sg < 2u) {
+            const uint t = sg * 8u + lane / 4u;
+            const uint chunk = lane % 4u;
+            const uint dst = t * 32u + chunk * 8u;
+            if (t < k_candidates && (mask & (1ULL << t)) != 0ULL) {
+                device const char* src = input_quants
+                    + ulong(t) * G4Q4_HIDDEN + ulong(gb) * 32ul
+                    + ulong(chunk) * 8ul;
+                #pragma unroll
+                for (uint j = 0; j < 8u; ++j) {
+                    x_stage[dst + j] = half(float(src[j]));
+                }
+            } else {
+                #pragma unroll
+                for (uint j = 0; j < 8u; ++j) {
+                    x_stage[dst + j] = half(0.0h);
+                }
+            }
+        }
+
+        // Each SIMDgroup expands its own 8x32 Q4 tile. Every packed byte is
+        // read once and placed in natural [output row][K] order. Both
+        // candidate tiles reuse this same staged weight tile and scales.
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j) {
+            const uint packed_index = lane * 4u + j;
+            const uint local_row = packed_index / 16u;
+            const uint q = packed_index - local_row * 16u;
+            const uint row = row_base + local_row;
+            device const uchar* gate_block = weights
+                + ulong(row) * G4Q4_GU_ROW_BYTES + ulong(gb) * G4Q4_WIRE;
+            device const uchar* up_block = weights
+                + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES
+                + ulong(gb) * G4Q4_WIRE;
+            const uchar gate_packed = gate_block[2u + q];
+            const uchar up_packed = up_block[2u + q];
+            const uint row_offset = (sg * 8u + local_row) * 32u;
+            gate_stage[row_offset + q] = half(float(int(gate_packed & 0x0fu) - 8));
+            gate_stage[row_offset + 16u + q] = half(float(int(gate_packed >> 4) - 8));
+            up_stage[row_offset + q] = half(float(int(up_packed & 0x0fu) - 8));
+            up_stage[row_offset + 16u + q] = half(float(int(up_packed >> 4) - 8));
+        }
+        if (lane < 8u) {
+            const uint row = row_base + lane;
+            device const uchar* gate_block = weights
+                + ulong(row) * G4Q4_GU_ROW_BYTES + ulong(gb) * G4Q4_WIRE;
+            device const uchar* up_block = weights
+                + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES
+                + ulong(gb) * G4Q4_WIRE;
+            gate_scales[sg * 8u + lane] =
+                *reinterpret_cast<device const half*>(gate_block);
+            up_scales[sg * 8u + lane] =
+                *reinterpret_cast<device const half*>(up_block);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 gate_dot0 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 up_dot0 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 gate_dot1 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 up_dot1 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        #pragma unroll
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 x_frag0;
+            simdgroup_half8x8 x_frag1;
+            simdgroup_half8x8 gate_frag;
+            simdgroup_half8x8 up_frag;
+            simdgroup_barrier(mem_flags::mem_none);
+            x_frag0.thread_elements()[0] =
+                x_stage[candidate0 * 32u + kk + local_row0];
+            x_frag0.thread_elements()[1] =
+                x_stage[candidate0 * 32u + kk + local_row0 + 1u];
+            x_frag1.thread_elements()[0] =
+                x_stage[candidate1 * 32u + kk + local_row0];
+            x_frag1.thread_elements()[1] =
+                x_stage[candidate1 * 32u + kk + local_row0 + 1u];
+            simdgroup_barrier(mem_flags::mem_none);
+            // Fragment B's K coordinate is the lane-local matrix column for
+            // both tiles. The global candidate offset belongs only to the two
+            // input fragments and to final output indexing.
+            const uint weight_offset =
+                (sg * 8u + local_row0) * 32u + kk + candidate_column;
+            gate_frag.thread_elements()[0] = gate_stage[weight_offset];
+            gate_frag.thread_elements()[1] = gate_stage[weight_offset + 32u];
+            up_frag.thread_elements()[0] = up_stage[weight_offset];
+            up_frag.thread_elements()[1] = up_stage[weight_offset + 32u];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(gate_dot0, x_frag0, gate_frag, gate_dot0);
+            simdgroup_multiply_accumulate(up_dot0, x_frag0, up_frag, up_dot0);
+            simdgroup_multiply_accumulate(gate_dot1, x_frag1, gate_frag, gate_dot1);
+            simdgroup_multiply_accumulate(up_dot1, x_frag1, up_frag, up_dot1);
+        }
+
+        const uint scale_row = sg * 8u + local_row0;
+        if (active0) {
+            const float in_scale =
+                input_scales[ulong(candidate0) * G4Q4_GU_BLOCKS + gb];
+            gate_acc00 += (gate_dot0.thread_elements()[0]
+                * float(gate_scales[scale_row])) * in_scale;
+            gate_acc01 += (gate_dot0.thread_elements()[1]
+                * float(gate_scales[scale_row + 1u])) * in_scale;
+            up_acc00 += (up_dot0.thread_elements()[0]
+                * float(up_scales[scale_row])) * in_scale;
+            up_acc01 += (up_dot0.thread_elements()[1]
+                * float(up_scales[scale_row + 1u])) * in_scale;
+        }
+        if (active1) {
+            const float in_scale =
+                input_scales[ulong(candidate1) * G4Q4_GU_BLOCKS + gb];
+            gate_acc10 += (gate_dot1.thread_elements()[0]
+                * float(gate_scales[scale_row])) * in_scale;
+            gate_acc11 += (gate_dot1.thread_elements()[1]
+                * float(gate_scales[scale_row + 1u])) * in_scale;
+            up_acc10 += (up_dot1.thread_elements()[0]
+                * float(up_scales[scale_row])) * in_scale;
+            up_acc11 += (up_dot1.thread_elements()[1]
+                * float(up_scales[scale_row + 1u])) * in_scale;
+        }
+    }
+
+    float act00 = 0.0f;
+    float act01 = 0.0f;
+    float act10 = 0.0f;
+    float act11 = 0.0f;
+    if (active0) {
+        const float inner0 = 0.7978845608f
+            * (gate_acc00 + 0.044715f * gate_acc00 * gate_acc00 * gate_acc00);
+        const float gelu0 = 0.5f * gate_acc00
+            * (1.0f + tanh(clamp(inner0, -15.0f, 15.0f)));
+        act00 = gelu0 * up_acc00;
+        const float inner1 = 0.7978845608f
+            * (gate_acc01 + 0.044715f * gate_acc01 * gate_acc01 * gate_acc01);
+        const float gelu1 = 0.5f * gate_acc01
+            * (1.0f + tanh(clamp(inner1, -15.0f, 15.0f)));
+        act01 = gelu1 * up_acc01;
+    }
+    if (active1) {
+        const float inner0 = 0.7978845608f
+            * (gate_acc10 + 0.044715f * gate_acc10 * gate_acc10 * gate_acc10);
+        const float gelu0 = 0.5f * gate_acc10
+            * (1.0f + tanh(clamp(inner0, -15.0f, 15.0f)));
+        act10 = gelu0 * up_acc10;
+        const float inner1 = 0.7978845608f
+            * (gate_acc11 + 0.044715f * gate_acc11 * gate_acc11 * gate_acc11);
+        const float gelu1 = 0.5f * gate_acc11
+            * (1.0f + tanh(clamp(inner1, -15.0f, 15.0f)));
+        act11 = gelu1 * up_acc11;
+    }
+    const uint act_offset0 = candidate0 * 32u + sg * 8u + local_row0;
+    const uint act_offset1 = candidate1 * 32u + sg * 8u + local_row0;
+    act_stage[act_offset0] = act00;
+    act_stage[act_offset0 + 1u] = act01;
+    act_stage[act_offset1] = act10;
+    act_stage[act_offset1 + 1u] = act11;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // SIMDgroup zero assigns one lane per canonical candidate and scans its
+    // 32-row block. max is association-independent for finite fabs values.
+    if (sg == 0u && lane < 16u) {
+        const uint t = lane;
+        float max_abs = 0.0f;
+        #pragma unroll
+        for (uint r = 0; r < 32u; ++r) {
+            max_abs = max(max_abs, fabs(act_stage[t * 32u + r]));
+        }
+        const float unrounded = max_abs / 127.0f;
+        const float stored_scale = float(half(unrounded));
+        quant_inverse[t] = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+        if (t < k_candidates && (mask & (1ULL << t)) != 0ULL) {
+            const ulong scale_idx = ulong(u) * ulong(k_candidates) * G4Q4_DOWN_BLOCKS
+                + ulong(t) * G4Q4_DOWN_BLOCKS + ulong(b);
+            output_scales[scale_idx] = stored_scale;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (active0) {
+        const float inverse = quant_inverse[candidate0];
+        const ulong quant_idx = ulong(u) * ulong(k_candidates) * G4Q4_FF
+            + ulong(candidate0) * G4Q4_FF + ulong(row_base + local_row0);
+        output_quants[quant_idx] =
+            char(clamp(int(round(act00 * inverse)), -127, 127));
+        output_quants[quant_idx + 1ul] =
+            char(clamp(int(round(act01 * inverse)), -127, 127));
+    }
+    if (active1) {
+        const float inverse = quant_inverse[candidate1];
+        const ulong quant_idx = ulong(u) * ulong(k_candidates) * G4Q4_FF
+            + ulong(candidate1) * G4Q4_FF + ulong(row_base + local_row0);
+        output_quants[quant_idx] =
+            char(clamp(int(round(act10 * inverse)), -127, 127));
+        output_quants[quant_idx + 1ul] =
+            char(clamp(int(round(act11 * inverse)), -127, 127));
+    }
+}
+
 // Exact K<=12 register-narrow twin of the general K=16 kernel. This keeps only
 // the 24 floating-point accumulators that K=9..12 can address while preserving
 // every load, integer fold, floating-point expression, and output index above.
@@ -1235,6 +1514,10 @@ kernel void gemma4_q4_expert_argbuf_down_reduce_turbo(
 
 pub(crate) struct Spec50MoeArgbufKernels {
     pub(crate) gateup: ComputePipelineState,
+    /// Exact staged SIMDgroup-MMA K<=16 probe. It remains independently
+    /// optional and default-off so unsupported Metal devices retain the
+    /// established scalar paths.
+    gateup_mma_k16: Option<ComputePipelineState>,
     /// Register-narrow K<=12 twin. It is optional and default-off so a Metal
     /// compiler or GPU that rejects it retains the proven K=16 pipeline.
     gateup_k12: Option<ComputePipelineState>,
@@ -1263,6 +1546,7 @@ pub(crate) struct Spec50MoeArgbufKernels {
 
 static SPEC50_MOE_ARGBUF_KERNELS: OnceLock<Option<Spec50MoeArgbufKernels>> = OnceLock::new();
 const ARGBUF_GATEUP_K12_ENV: &str = "CAMELID_GEMMA4_ARGBUF_GATEUP_K12";
+const ARGBUF_GATEUP_MMA_K16_ENV: &str = "CAMELID_GEMMA4_MOE_MMA_K16";
 
 fn argbuf_gateup_k12_enabled_from(value: Option<&str>) -> bool {
     value == Some("1")
@@ -1274,6 +1558,22 @@ fn argbuf_gateup_k12_enabled() -> bool {
         let value = std::env::var(ARGBUF_GATEUP_K12_ENV).ok();
         argbuf_gateup_k12_enabled_from(value.as_deref())
     })
+}
+
+fn argbuf_gateup_mma_k16_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn argbuf_gateup_mma_k16_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var(ARGBUF_GATEUP_MMA_K16_ENV).ok();
+        argbuf_gateup_mma_k16_enabled_from(value.as_deref())
+    })
+}
+
+fn argbuf_gateup_mma_k16_selected(k_candidates: usize, enabled: bool) -> bool {
+    enabled && matches!(k_candidates, 13 | 14)
 }
 
 pub(crate) fn spec50_moe_argbuf_kernels(
@@ -1302,6 +1602,31 @@ pub(crate) fn spec50_moe_argbuf_kernels(
                 .new_compute_pipeline_state_with_function(&gateup_function)
                 .map_err(|err| eprintln!("[metal] argbuf GateUp pipeline failed: {err}"))
                 .ok()?;
+            let gateup_mma_k16 = library
+                .get_function(
+                    "spec50_moe_argbuf_gateup_geglu_quant_batch_k16_mma8x8",
+                    None,
+                )
+                .and_then(|function| device.new_compute_pipeline_state_with_function(&function))
+                .map_err(|err| {
+                    eprintln!(
+                        "[metal] argbuf staged-MMA K16 GateUp unavailable; experiment disabled: {err}"
+                    )
+                })
+                .ok()
+                .and_then(|pipeline| {
+                    let simd_width = pipeline.thread_execution_width();
+                    let max_threads = pipeline.max_total_threads_per_threadgroup();
+                    let static_tmem = pipeline.static_threadgroup_memory_length();
+                    if simd_width != 32 || max_threads < 128 || static_tmem > 8 * 1024 {
+                        eprintln!(
+                            "[metal] argbuf staged-MMA K16 GateUp ineligible: SIMD={simd_width} max_threads={max_threads} static_tmem={static_tmem}"
+                        );
+                        None
+                    } else {
+                        Some(pipeline)
+                    }
+                });
             let gateup_k12 = library
                 .get_function(
                     "spec50_moe_argbuf_gateup_geglu_quant_batch_k12",
@@ -1375,6 +1700,7 @@ pub(crate) fn spec50_moe_argbuf_kernels(
             let head_down_turbo = make_pipeline("gemma4_q4_expert_argbuf_down_reduce_turbo")?;
             Some(Spec50MoeArgbufKernels {
                 gateup,
+                gateup_mma_k16,
                 gateup_k12,
                 gateup_k8,
                 gateup_k8_candidate,
@@ -1971,6 +2297,28 @@ impl Gemma4MoeSlotArgTable {
         let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
             return false;
         };
+        if argbuf_gateup_mma_k16_selected(k_candidates, argbuf_gateup_mma_k16_enabled()) {
+            let Some(gateup) = pipelines.gateup_mma_k16.as_ref() else {
+                eprintln!(
+                    "[metal] requested {ARGBUF_GATEUP_MMA_K16_ENV}=1 for K={k_candidates}, but the staged-MMA K16 GateUp PSO is unavailable or ineligible"
+                );
+                return false;
+            };
+            encode_argbuf_gateup_mma_k16_range(
+                encoder,
+                gateup,
+                input_scales,
+                input_quants,
+                &self.table,
+                work_list,
+                output_scales,
+                output_quants,
+                work_base,
+                work_count as u32,
+                k_candidates as u32,
+            );
+            return true;
+        }
         let gateup = if k_candidates <= 8 {
             pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
         } else if (9..=12).contains(&k_candidates) && argbuf_gateup_k12_enabled() {
@@ -2442,6 +2790,46 @@ fn encode_argbuf_gateup_range(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_argbuf_gateup_mma_k16_range(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    expert_table: &Buffer,
+    work_list: &Buffer,
+    output_scales: &Buffer,
+    output_quants: &Buffer,
+    work_base: usize,
+    work_count: u32,
+    k_candidates: u32,
+) {
+    debug_assert!((1..=16).contains(&k_candidates));
+    let layout = gateup_range_layout(work_base, work_count as usize, k_candidates as usize)
+        .expect("validated staged-MMA GateUp work range");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(1, Some(input_quants), 0);
+    encoder.set_buffer(2, Some(expert_table), 0);
+    encoder.set_buffer(3, Some(work_list), layout.work_offset as u64);
+    encoder.set_buffer(4, Some(output_scales), layout.output_scales_offset as u64);
+    encoder.set_buffer(5, Some(output_quants), layout.output_quants_offset as u64);
+    encoder.set_bytes(6, 4, &work_count as *const u32 as *const _);
+    encoder.set_bytes(7, 4, &k_candidates as *const u32 as *const _);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: u64::from(work_count) * (S50_FF as u64 / 32),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_argbuf_gateup_candidate(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
@@ -2634,11 +3022,13 @@ mod tests {
 
     const EXPERTS: usize = 128;
     const ACTIVE_EXPERTS: usize = 30;
+    const WIDE_BENCH_EXPERTS: usize = 38;
     // The copied-slab oracle used by this module is deliberately the shipping
     // K<=8 SPEC50 path. K=9..16 is covered by `spec50_widen`'s independent
     // parity tests; asking this oracle for K>8 trips its admission guard before
     // the argument-buffer result can be compared.
     const MAX_K: usize = 8;
+    const WIDE_MAX_K: usize = 16;
 
     struct Rng(u64);
 
@@ -2693,6 +3083,25 @@ mod tests {
         assert!(!argbuf_gateup_k12_enabled_from(Some("0")));
         assert!(!argbuf_gateup_k12_enabled_from(Some("true")));
         assert!(argbuf_gateup_k12_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn gateup_mma_k16_experiment_gate_and_selector_are_strict() {
+        assert!(!argbuf_gateup_mma_k16_enabled_from(None));
+        assert!(!argbuf_gateup_mma_k16_enabled_from(Some("")));
+        assert!(!argbuf_gateup_mma_k16_enabled_from(Some("0")));
+        assert!(!argbuf_gateup_mma_k16_enabled_from(Some("true")));
+        assert!(!argbuf_gateup_mma_k16_enabled_from(Some(" 1")));
+        assert!(argbuf_gateup_mma_k16_enabled_from(Some("1")));
+
+        for k in 1..=WIDE_MAX_K {
+            assert_eq!(
+                argbuf_gateup_mma_k16_selected(k, true),
+                matches!(k, 13 | 14),
+                "only production K13/K14 may select staged MMA"
+            );
+            assert!(!argbuf_gateup_mma_k16_selected(k, false));
+        }
     }
 
     #[test]
@@ -2799,25 +3208,33 @@ mod tests {
         active_experts: Vec<usize>,
     }
 
-    fn route_fixture() -> ([[u32; S50_ROUTES]; MAX_K], [[f32; S50_ROUTES]; MAX_K]) {
-        let mut experts = [[0u32; S50_ROUTES]; MAX_K];
-        let mut weights = [[0.0f32; S50_ROUTES]; MAX_K];
-        for token in 0..MAX_K {
+    fn route_fixture(
+        expert_count: usize,
+    ) -> (
+        [[u32; S50_ROUTES]; WIDE_MAX_K],
+        [[f32; S50_ROUTES]; WIDE_MAX_K],
+    ) {
+        assert!((1..=EXPERTS).contains(&expert_count));
+        let mut experts = [[0u32; S50_ROUTES]; WIDE_MAX_K];
+        let mut weights = [[0.0f32; S50_ROUTES]; WIDE_MAX_K];
+        for token in 0..WIDE_MAX_K {
             for rank in 0..S50_ROUTES {
-                experts[token][rank] = ((token * 4 + rank * 3) % ACTIVE_EXPERTS) as u32;
+                experts[token][rank] = ((token * 4 + rank * 3) % expert_count) as u32;
                 weights[token][rank] = 0.05 + rank as f32 * 0.01 + token as f32 * 0.001;
             }
         }
         (experts, weights)
     }
 
-    fn build_routing(k: usize) -> Routing {
-        let (experts, weights) = route_fixture();
+    fn build_routing_for_expert_count(k: usize, expert_count: usize) -> Routing {
+        assert!((1..=WIDE_MAX_K).contains(&k));
+        assert!((1..=EXPERTS).contains(&expert_count));
+        let (experts, weights) = route_fixture(expert_count);
         let mut active_map = [u32::MAX; EXPERTS];
         let mut work = vec![Gemma4UniqueExpertWork::default(); EXPERTS];
         let mut active_experts = Vec::new();
 
-        for expert_id in 0..ACTIVE_EXPERTS {
+        for expert_id in 0..expert_count {
             let mut mask = 0u64;
             for token in 0..k {
                 for rank in 0..S50_ROUTES {
@@ -2839,7 +3256,7 @@ mod tests {
             active_experts.push(expert_id);
         }
 
-        let mut routes = vec![Gemma4CandidateRouteEntry::default(); MAX_K * S50_ROUTES];
+        let mut routes = vec![Gemma4CandidateRouteEntry::default(); WIDE_MAX_K * S50_ROUTES];
         for token in 0..k {
             for rank in 0..S50_ROUTES {
                 let expert_id = experts[token][rank] as usize;
@@ -2858,6 +3275,10 @@ mod tests {
         }
     }
 
+    fn build_routing(k: usize) -> Routing {
+        build_routing_for_expert_count(k, ACTIVE_EXPERTS)
+    }
+
     struct Buffers {
         input_scales: Buffer,
         input_quants: Buffer,
@@ -2874,21 +3295,21 @@ mod tests {
     impl Buffers {
         fn new(device: &Device) -> Self {
             let mut rng = Rng::new(0xa26b_5001);
-            let input_scales = new_buffer(device, MAX_K * S50_GU_BLOCKS * 4);
-            let scales: Vec<f32> = (0..MAX_K * S50_GU_BLOCKS)
+            let input_scales = new_buffer(device, WIDE_MAX_K * S50_GU_BLOCKS * 4);
+            let scales: Vec<f32> = (0..WIDE_MAX_K * S50_GU_BLOCKS)
                 .map(|_| 0.0005 + rng.next_f32() * 0.01)
                 .collect();
             write_bytes(&input_scales, &scales);
 
-            let input_quants = new_buffer(device, MAX_K * S50_HIDDEN);
-            let quants: Vec<i8> = (0..MAX_K * S50_HIDDEN)
+            let input_quants = new_buffer(device, WIDE_MAX_K * S50_HIDDEN);
+            let quants: Vec<i8> = (0..WIDE_MAX_K * S50_HIDDEN)
                 .map(|_| ((rng.next_u32() % 255) as i32 - 127) as i8)
                 .collect();
             write_bytes(&input_quants, &quants);
 
-            let scale_len = ACTIVE_EXPERTS * MAX_K * S50_DOWN_BLOCKS * 4;
-            let quant_len = ACTIVE_EXPERTS * MAX_K * S50_FF;
-            let down_len = MAX_K * S50_HIDDEN * 4;
+            let scale_len = WIDE_BENCH_EXPERTS * WIDE_MAX_K * S50_DOWN_BLOCKS * 4;
+            let quant_len = WIDE_BENCH_EXPERTS * WIDE_MAX_K * S50_FF;
+            let down_len = WIDE_MAX_K * S50_HIDDEN * 4;
             Self {
                 input_scales,
                 input_quants,
@@ -2898,7 +3319,7 @@ mod tests {
                 ),
                 routes: new_buffer(
                     device,
-                    MAX_K * S50_ROUTES * std::mem::size_of::<Gemma4CandidateRouteEntry>(),
+                    WIDE_MAX_K * S50_ROUTES * std::mem::size_of::<Gemma4CandidateRouteEntry>(),
                 ),
                 copy_scales: new_buffer(device, scale_len),
                 copy_quants: new_buffer(device, quant_len),
@@ -2926,6 +3347,31 @@ mod tests {
                 fill_zero(output);
             }
         }
+    }
+
+    fn write_adversarial_wide_gateup_inputs(buffers: &Buffers) {
+        let scale_cycle = [
+            0.0f32,
+            -0.0f32,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            0.000_5f32,
+            0.003_906_25f32,
+            0.01f32,
+            0.031_25f32,
+        ];
+        let scales = (0..WIDE_MAX_K * S50_GU_BLOCKS)
+            .map(|index| scale_cycle[(index * 5 + index / S50_GU_BLOCKS) % scale_cycle.len()])
+            .collect::<Vec<_>>();
+        write_bytes(&buffers.input_scales, &scales);
+
+        let quant_cycle = [
+            -127i8, 127i8, -126i8, 126i8, -64i8, 64i8, -1i8, 0i8, 1i8, 31i8, -32i8,
+        ];
+        let quants = (0..WIDE_MAX_K * S50_HIDDEN)
+            .map(|index| quant_cycle[(index * 7 + index / S50_HIDDEN * 3) % quant_cycle.len()])
+            .collect::<Vec<_>>();
+        write_bytes(&buffers.input_quants, &quants);
     }
 
     const SYNTHETIC_EXPERTS: usize = S50_ROUTES;
@@ -3621,6 +4067,222 @@ mod tests {
                 &format!("K12 K={k} GateUp quants"),
                 &read_bytes(&reference_quants, quant_bytes),
                 &read_bytes(&narrow_quants, quant_bytes),
+            );
+        }
+    }
+
+    /// Raw-byte proof that the two staged matrix tiles preserve the general
+    /// K16 GateUp arithmetic at both production widths and the full-width
+    /// boundary. The routing masks are sparse and the Q4 fixture cycles all
+    /// packed nibble values; inputs pin signed zero, f32 subnormals, and both
+    /// admitted Q8 extrema.
+    #[test]
+    fn gemma4_moe_mma_k16_gateup_k13_k14_k16_adversarial_raw_bit_parity() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP staged-MMA K16 GateUp parity: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP staged-MMA K16 GateUp parity: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let mma = pipelines
+            .gateup_mma_k16
+            .as_ref()
+            .expect("staged-MMA K16 GateUp pipeline");
+        assert_eq!(mma.thread_execution_width(), 32);
+        assert!(mma.max_total_threads_per_threadgroup() >= 128);
+        assert!(mma.static_threadgroup_memory_length() <= 8 * 1024);
+
+        let (records, _) = synthetic_slot_backings_count(device, ACTIVE_EXPERTS);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("30-expert anonymous Tier-2 table");
+        let buffers = Buffers::new(device);
+        write_adversarial_wide_gateup_inputs(&buffers);
+
+        for k in [13usize, 14, 16] {
+            let routing = build_routing(k);
+            let unique = routing.active_experts.len();
+            buffers.upload(&routing);
+            buffers.zero_outputs();
+
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(encoder, &routing.active_experts),
+                Some(unique)
+            );
+            encode_argbuf_gateup(
+                encoder,
+                &pipelines.gateup,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.copy_scales,
+                &buffers.copy_quants,
+                unique as u32,
+                k as u32,
+            );
+            encode_argbuf_gateup_mma_k16_range(
+                encoder,
+                mma,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                0,
+                unique as u32,
+                k as u32,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed,
+                "staged-MMA GateUp K={k} command failed: {}",
+                command_buffer_error_details(cb)
+            );
+
+            let scale_bytes = unique * k * S50_DOWN_BLOCKS * 4;
+            let quant_bytes = unique * k * S50_FF;
+            assert_raw_eq(
+                &format!("staged-MMA K={k} GateUp scales"),
+                &read_bytes(&buffers.copy_scales, scale_bytes),
+                &read_bytes(&buffers.arg_scales, scale_bytes),
+            );
+            assert_raw_eq(
+                &format!("staged-MMA K={k} GateUp quants"),
+                &read_bytes(&buffers.copy_quants, quant_bytes),
+                &read_bytes(&buffers.arg_quants, quant_bytes),
+            );
+        }
+    }
+
+    /// Prove that two independently submitted MMA ranges bind their work and
+    /// output buffers at full-union coordinates rather than overwriting the
+    /// prefix. This is the production hot/cold ranged seam.
+    #[test]
+    fn gemma4_moe_mma_k16_split_range_is_raw_bit_exact() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP staged-MMA split-range parity: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP staged-MMA split-range parity: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let mma = pipelines
+            .gateup_mma_k16
+            .as_ref()
+            .expect("staged-MMA K16 GateUp pipeline");
+        let (records, _) = synthetic_slot_backings_count(device, ACTIVE_EXPERTS);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("30-expert anonymous Tier-2 table");
+        let buffers = Buffers::new(device);
+        write_adversarial_wide_gateup_inputs(&buffers);
+
+        for k in [13usize, 14, 16] {
+            let routing = build_routing(k);
+            let unique = routing.active_experts.len();
+            let split = unique / 2;
+            assert!(split > 0 && split < unique);
+            buffers.upload(&routing);
+            buffers.zero_outputs();
+
+            let oracle = kernel.queue.new_command_buffer();
+            let oracle_enc = oracle.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(oracle_enc, &routing.active_experts),
+                Some(unique)
+            );
+            encode_argbuf_gateup(
+                oracle_enc,
+                &pipelines.gateup,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.copy_scales,
+                &buffers.copy_quants,
+                unique as u32,
+                k as u32,
+            );
+            oracle_enc.end_encoding();
+            oracle.commit();
+
+            let prefix = kernel.queue.new_command_buffer();
+            let prefix_enc = prefix.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(prefix_enc, &routing.active_experts[..split]),
+                Some(split)
+            );
+            encode_argbuf_gateup_mma_k16_range(
+                prefix_enc,
+                mma,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                0,
+                split as u32,
+                k as u32,
+            );
+            prefix_enc.end_encoding();
+
+            let suffix = kernel.queue.new_command_buffer();
+            let suffix_enc = suffix.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(suffix_enc, &routing.active_experts[split..]),
+                Some(unique - split)
+            );
+            encode_argbuf_gateup_mma_k16_range(
+                suffix_enc,
+                mma,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                split,
+                (unique - split) as u32,
+                k as u32,
+            );
+            suffix_enc.end_encoding();
+
+            prefix.commit();
+            suffix.commit();
+            suffix.wait_until_completed();
+            assert_eq!(oracle.status(), MTLCommandBufferStatus::Completed);
+            assert_eq!(prefix.status(), MTLCommandBufferStatus::Completed);
+            assert_eq!(
+                suffix.status(),
+                MTLCommandBufferStatus::Completed,
+                "staged-MMA split-range K={k} command failed: {}",
+                command_buffer_error_details(suffix)
+            );
+
+            let scale_bytes = unique * k * S50_DOWN_BLOCKS * 4;
+            let quant_bytes = unique * k * S50_FF;
+            assert_raw_eq(
+                &format!("staged-MMA split-range K={k} GateUp scales"),
+                &read_bytes(&buffers.copy_scales, scale_bytes),
+                &read_bytes(&buffers.arg_scales, scale_bytes),
+            );
+            assert_raw_eq(
+                &format!("staged-MMA split-range K={k} GateUp quants"),
+                &read_bytes(&buffers.copy_quants, quant_bytes),
+                &read_bytes(&buffers.arg_quants, quant_bytes),
             );
         }
     }
@@ -4804,6 +5466,19 @@ mod tests {
                     routing.active_experts.len() as u32,
                     k as u32,
                 ),
+                16 => encode_argbuf_gateup_mma_k16_range(
+                    encoder,
+                    pipeline,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    table.argument_buffer(),
+                    &buffers.work,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    0,
+                    routing.active_experts.len() as u32,
+                    k as u32,
+                ),
                 _ => panic!("unsupported GateUp candidate tile {candidate_tile}"),
             }
         }
@@ -5088,6 +5763,204 @@ mod tests {
             faults: vm_delta(after, before, |stats| stats.faults),
             decompressions: vm_delta(after, before, |stats| stats.decompressions),
             swapins: vm_delta(after, before, |stats| stats.swapins),
+        }
+    }
+
+    /// Warm 30-layer-equivalent timing gate for the two H58 production widths.
+    /// Two warmups per PSO/width are discarded, then nine samples alternate
+    /// and reverse order. The projected request saving reflects schedule
+    /// 14,13,14; its K7 tail remains on the established K8 kernel.
+    #[test]
+    #[ignore = "real-Metal staged-MMA K13/K14 GateUp microbenchmark"]
+    fn spec50_moe_mma_k16_gateup_30_layer_microbenchmark() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP staged-MMA K16 GateUp benchmark: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP staged-MMA K16 GateUp benchmark: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let mma = pipelines
+            .gateup_mma_k16
+            .as_ref()
+            .expect("staged-MMA K16 GateUp pipeline");
+        let (records, _) = synthetic_slot_backings_count(device, WIDE_BENCH_EXPERTS);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("38-expert anonymous Tier-2 table");
+        let buffers = Buffers::new(device);
+        let routing13 = build_routing_for_expert_count(13, WIDE_BENCH_EXPERTS);
+        let routing14 = build_routing_for_expert_count(14, WIDE_BENCH_EXPERTS);
+        assert_eq!(routing13.active_experts.len(), WIDE_BENCH_EXPERTS);
+        assert_eq!(routing14.active_experts.len(), WIDE_BENCH_EXPERTS);
+
+        for _ in 0..2 {
+            for (k, routing) in [(13, &routing13), (14, &routing14)] {
+                let _ = time_gateup_layers(
+                    &kernel.queue,
+                    &pipelines.gateup,
+                    0,
+                    &table,
+                    &buffers,
+                    routing,
+                    k,
+                    30,
+                );
+                let _ =
+                    time_gateup_layers(&kernel.queue, mma, 16, &table, &buffers, routing, k, 30);
+            }
+        }
+
+        let mut current13 = Vec::with_capacity(9);
+        let mut mma13 = Vec::with_capacity(9);
+        let mut current14 = Vec::with_capacity(9);
+        let mut mma14 = Vec::with_capacity(9);
+        for sample in 0..9 {
+            if sample % 2 == 0 {
+                current13.push(time_gateup_layers(
+                    &kernel.queue,
+                    &pipelines.gateup,
+                    0,
+                    &table,
+                    &buffers,
+                    &routing13,
+                    13,
+                    30,
+                ));
+                mma13.push(time_gateup_layers(
+                    &kernel.queue,
+                    mma,
+                    16,
+                    &table,
+                    &buffers,
+                    &routing13,
+                    13,
+                    30,
+                ));
+                current14.push(time_gateup_layers(
+                    &kernel.queue,
+                    &pipelines.gateup,
+                    0,
+                    &table,
+                    &buffers,
+                    &routing14,
+                    14,
+                    30,
+                ));
+                mma14.push(time_gateup_layers(
+                    &kernel.queue,
+                    mma,
+                    16,
+                    &table,
+                    &buffers,
+                    &routing14,
+                    14,
+                    30,
+                ));
+            } else {
+                mma14.push(time_gateup_layers(
+                    &kernel.queue,
+                    mma,
+                    16,
+                    &table,
+                    &buffers,
+                    &routing14,
+                    14,
+                    30,
+                ));
+                current14.push(time_gateup_layers(
+                    &kernel.queue,
+                    &pipelines.gateup,
+                    0,
+                    &table,
+                    &buffers,
+                    &routing14,
+                    14,
+                    30,
+                ));
+                mma13.push(time_gateup_layers(
+                    &kernel.queue,
+                    mma,
+                    16,
+                    &table,
+                    &buffers,
+                    &routing13,
+                    13,
+                    30,
+                ));
+                current13.push(time_gateup_layers(
+                    &kernel.queue,
+                    &pipelines.gateup,
+                    0,
+                    &table,
+                    &buffers,
+                    &routing13,
+                    13,
+                    30,
+                ));
+            }
+        }
+
+        let median_gpu = |samples: &[Timing]| {
+            let mut ordered = samples.to_vec();
+            ordered.sort_unstable_by_key(|timing| timing.gpu_us);
+            ordered[ordered.len() / 2]
+        };
+        let current13_median = median_gpu(&current13);
+        let mma13_median = median_gpu(&mma13);
+        let current14_median = median_gpu(&current14);
+        let mma14_median = median_gpu(&mma14);
+        let saving13 = current13_median.gpu_us as i128 - mma13_median.gpu_us as i128;
+        let saving14 = current14_median.gpu_us as i128 - mma14_median.gpu_us as i128;
+        let projected_request_saving_us = 2 * saving14 + saving13;
+        assert!(
+            current13
+                .iter()
+                .chain(&mma13)
+                .chain(&current14)
+                .chain(&mma14)
+                .all(|timing| timing.swapins == 0),
+            "staged-MMA timing gate observed swap-in"
+        );
+
+        eprintln!(
+            "[spec50-mma-k16-gateup] K=13 U={} layers=30 current_gpu_us={} mma_gpu_us={} saving_us={} speedup={:.4}",
+            routing13.active_experts.len(),
+            current13_median.gpu_us,
+            mma13_median.gpu_us,
+            saving13,
+            current13_median.gpu_us as f64 / mma13_median.gpu_us as f64,
+        );
+        eprintln!(
+            "[spec50-mma-k16-gateup] K=14 U={} layers=30 current_gpu_us={} mma_gpu_us={} saving_us={} speedup={:.4}",
+            routing14.active_experts.len(),
+            current14_median.gpu_us,
+            mma14_median.gpu_us,
+            saving14,
+            current14_median.gpu_us as f64 / mma14_median.gpu_us as f64,
+        );
+        eprintln!(
+            "[spec50-mma-k16-gateup] projected_request_saving_us={} formula=2*K14+K13 SIMD={} max_threads={} static_tmem={}",
+            projected_request_saving_us,
+            mma.thread_execution_width(),
+            mma.max_total_threads_per_threadgroup(),
+            mma.static_threadgroup_memory_length(),
+        );
+        for sample in 0..9 {
+            eprintln!(
+                "[spec50-mma-k16-gateup] sample={} K13_current_gpu_us={} K13_mma_gpu_us={} K14_current_gpu_us={} K14_mma_gpu_us={} K13_current_swapins={} K13_mma_swapins={} K14_current_swapins={} K14_mma_swapins={}",
+                sample,
+                current13[sample].gpu_us,
+                mma13[sample].gpu_us,
+                current14[sample].gpu_us,
+                mma14[sample].gpu_us,
+                current13[sample].swapins,
+                mma13[sample].swapins,
+                current14[sample].swapins,
+                mma14[sample].swapins,
+            );
         }
     }
 
