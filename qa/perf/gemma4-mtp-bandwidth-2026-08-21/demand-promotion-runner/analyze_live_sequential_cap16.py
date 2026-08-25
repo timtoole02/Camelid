@@ -300,6 +300,8 @@ def validate_prompt_ranked_handoff(
             line[len(PROMPT_RANKED_HANDOFF_PREFIX):], "prompt-ranked handoff"
         )
         _expect_fields(fields, PROMPT_RANKED_HANDOFF_FIELDS, "prompt-ranked handoff")
+        if fields["schema"] not in ("1", "2"):
+            raise ReceiptError("prompt-ranked handoff schema must be exactly 1 or 2")
         if fields["effective"] not in ("0", "1"):
             raise ReceiptError("prompt-ranked handoff effective must be exactly 0 or 1")
         receipts.append((index, fields))
@@ -315,22 +317,26 @@ def validate_prompt_ranked_handoff(
             "prompt-ranked profile requires exactly one effective handoff receipt, "
             f"got {len(effective)}"
         )
+    if any(fields["schema"] != effective[0][1]["schema"] for _, fields in receipts):
+        raise ReceiptError("prompt-ranked handoff schemas differ within one run")
     ready_indices = [
         index for index, line in enumerate(log_lines) if "Camelid is ready" in line
     ]
+    if len(ready_indices) != 1:
+        raise ReceiptError(
+            "prompt-ranked profile requires exactly one readiness boundary"
+        )
+    ready_index = ready_indices[0]
     if inactive:
-        if len(inactive) != 1 or len(ready_indices) != 1:
+        if len(inactive) != 1:
             raise ReceiptError(
-                "prompt-ranked startup handoff requires exactly one inactive receipt "
-                "and one readiness boundary"
+                "prompt-ranked startup handoff requires exactly one inactive receipt"
             )
-        if not inactive[0][0] < ready_indices[0] < effective[0][0]:
+        if not inactive[0][0] < ready_index < effective[0][0]:
             raise ReceiptError(
                 "prompt-ranked inactive startup receipt is not strictly pre-ready"
             )
-    elif ready_indices and (
-        len(ready_indices) != 1 or effective[0][0] <= ready_indices[0]
-    ):
+    elif effective[0][0] <= ready_index:
         raise ReceiptError("prompt-ranked effective receipt is not strictly post-ready")
 
     capacities = [
@@ -344,15 +350,27 @@ def validate_prompt_ranked_handoff(
 
     if inactive:
         startup = inactive[0][1]
+        # Schema 1 is retained for legacy receipt compatibility; its fallback
+        # was mislabeled as admitted. Schema 2 makes that route-construction
+        # refusal explicit and is required for new runs.
+        if startup["schema"] == "1":
+            startup_admission = {
+                "admitted": "1",
+                "source": "current-prompt-exact-route-union",
+                "ranking": "decay-score-desc-expert-id-asc",
+            }
+        else:
+            startup_admission = {
+                "admitted": "0",
+                "source": "baseline-interval-union-or-latest-route",
+                "ranking": "expert-id-asc-or-route-order",
+            }
         startup_exact = {
-            "schema": "1",
+            "schema": startup["schema"],
             "requested": "1",
-            "admitted": "1",
             "effective": "0",
             "fill_ok": "1",
             "read_failures": "0",
-            "source": "current-prompt-exact-route-union",
-            "ranking": "decay-score-desc-expert-id-asc",
             "layers": "30",
             "capacity_total": "1408",
             "output_mutation": "0",
@@ -361,6 +379,7 @@ def validate_prompt_ranked_handoff(
             "table_mutation": "1",
             "route_mutation": "0",
             "routing_authority": "exact-router",
+            **startup_admission,
         }
         for key, expected in startup_exact.items():
             if startup[key] != expected:
@@ -408,7 +427,7 @@ def validate_prompt_ranked_handoff(
 
     fields = effective[0][1]
     exact = {
-        "schema": "1",
+        "schema": fields["schema"],
         "requested": "1",
         "admitted": "1",
         "effective": "1",
@@ -922,7 +941,6 @@ def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
         raise ReceiptError(f"{profile_label} environment is not KV_INIT=192")
     exact_metadata = {
         "manifest_format": "base64-v1",
-        "HOME": "/Users/timtoole",
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "TMPDIR": "/tmp",
         "cache_mib": "0",
@@ -933,6 +951,8 @@ def validate_environment(run_dir: Path, safety_mode: str) -> dict[str, str]:
     for key, expected_value in exact_metadata.items():
         if observed[key] != expected_value:
             raise ReceiptError(f"environment metadata requires {key}={expected_value!r}")
+    if not Path(observed["HOME"]).is_absolute() or "\n" in observed["HOME"]:
+        raise ReceiptError("environment HOME is not an absolute single line")
     if not observed["binary"].startswith("/") or "\n" in observed["binary"]:
         raise ReceiptError("environment binary path is not an absolute single line")
     expected_supervision = (

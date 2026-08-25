@@ -37,7 +37,7 @@ def manifest_values(stage_cap: int = 8) -> dict[str, str]:
     assert stage_cap in (8, 16)
     expected_text = ANALYZER.EXPECTED_TOKEN_FILE.read_bytes()
     values = {
-        "HOME": "/Users/timtoole",
+        "HOME": "/Users/benchmark",
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "TMPDIR": "/tmp",
     }
@@ -48,11 +48,11 @@ def manifest_values(stage_cap: int = 8) -> dict[str, str]:
         key, value = raw.split("=", 1)
         values[key] = value.replace(
             "__ASSISTANT__",
-            "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors",
+            "/opt/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors",
         )
     values.update(
         {
-            "binary": "/Users/timtoole/camelid-h69-bin/camelid",
+            "binary": "/opt/camelid/bin/camelid",
             "cache_mib": "0",
             "request": str(ANALYZER.REQUEST_FILE),
             "request_sha256": hashlib.sha256(ANALYZER.REQUEST_FILE.read_bytes()).hexdigest(),
@@ -220,7 +220,9 @@ def stage_line(round_seq: int, start_pos: int, k_tokens: int, stage_cap: int = 8
     return ANALYZER.STAGE_PREFIX + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
-def prompt_ranked_handoff_line(*, effective: bool = True) -> str:
+def prompt_ranked_handoff_line(
+    *, effective: bool = True, schema: str = "1"
+) -> str:
     capacities = [
         int(value)
         for value in ANALYZER._parse_profile(ANALYZER.PROFILE_FILE)[
@@ -235,15 +237,24 @@ def prompt_ranked_handoff_line(*, effective: bool = True) -> str:
         for layer, capacity in enumerate(selected_capacities)
     )
     selected_records = sum(selected_capacities)
+    corrected_refusal = schema == "2" and not effective
     fields = {
-        "schema": "1",
+        "schema": schema,
         "requested": "1",
-        "admitted": "1",
+        "admitted": "0" if corrected_refusal else "1",
         "effective": "1" if effective else "0",
         "fill_ok": "1",
         "read_failures": "0",
-        "source": "current-prompt-exact-route-union",
-        "ranking": "decay-score-desc-expert-id-asc",
+        "source": (
+            "baseline-interval-union-or-latest-route"
+            if corrected_refusal
+            else "current-prompt-exact-route-union"
+        ),
+        "ranking": (
+            "expert-id-asc-or-route-order"
+            if corrected_refusal
+            else "decay-score-desc-expert-id-asc"
+        ),
         "layers": "30",
         "selected_records": str(selected_records),
         "capacity_total": "1408",
@@ -472,9 +483,21 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
             values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
             write_manifest(run_dir / "env.txt", values)
             with (run_dir / "server.log").open("a", encoding="utf-8") as handle:
+                handle.write("Camelid is ready\n")
                 handle.write(prompt_ranked_handoff_line() + "\n")
             result = ANALYZER.analyze(run_dir)
         self.assertTrue(result["integrity"]["prompt_ranked_hot_handoff_effective"])
+
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            with (run_dir / "server.log").open("a", encoding="utf-8") as handle:
+                handle.write(prompt_ranked_handoff_line() + "\n")
+            with self.assertRaisesRegex(
+                ANALYZER.ReceiptError, "exactly one readiness boundary"
+            ):
+                ANALYZER.analyze(run_dir)
 
         with fixture() as run_dir:
             values = manifest_values()
@@ -539,6 +562,41 @@ class LiveSequentialCap16AnalyzerTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 ANALYZER.ReceiptError, "startup selected total does not reconcile"
+            ):
+                ANALYZER.analyze(run_dir)
+
+    def test_prompt_ranked_schema2_startup_is_an_explicit_refusal(self) -> None:
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            original = (run_dir / "server.log").read_text(encoding="utf-8")
+            (run_dir / "server.log").write_text(
+                prompt_ranked_handoff_line(effective=False, schema="2")
+                + "\nCamelid is ready\n"
+                + prompt_ranked_handoff_line(schema="2")
+                + "\n"
+                + original,
+                encoding="utf-8",
+            )
+            result = ANALYZER.analyze(run_dir)
+        self.assertTrue(result["integrity"]["prompt_ranked_hot_handoff_effective"])
+
+        with fixture() as run_dir:
+            values = manifest_values()
+            values[ANALYZER.PROMPT_RANKED_HOT_HANDOFF_SELECTOR] = "1"
+            write_manifest(run_dir / "env.txt", values)
+            original = (run_dir / "server.log").read_text(encoding="utf-8")
+            (run_dir / "server.log").write_text(
+                prompt_ranked_handoff_line(effective=False, schema="1")
+                + "\nCamelid is ready\n"
+                + prompt_ranked_handoff_line(schema="2")
+                + "\n"
+                + original,
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ANALYZER.ReceiptError, "schemas differ within one run"
             ):
                 ANALYZER.analyze(run_dir)
 

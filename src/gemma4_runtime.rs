@@ -2243,7 +2243,7 @@ const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_ENV: &str =
 const GHOST_METAL_EXACT_RESIDENCY_TRACE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_EXACT_RESIDENCY_TRACE";
 /// Default-off H71 policy: select the fixed Mini2 hot footprint from exact
-/// prompt-only route recency/frequency at the existing prefill handoff.
+/// prompt-only route recency/chunk-presence scores at the prefill handoff.
 const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF";
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP: usize = 8;
@@ -8461,11 +8461,11 @@ impl GhostMetalExpertRuntime {
             .iter()
             .map(|layer| layer.slots.writable_slot_count())
             .collect::<Vec<_>>();
-        let prompt_ranked_admitted = prompt_ranked_requested
+        let prompt_ranked_shape_admitted = prompt_ranked_requested
             && self.prompt_ranked_handoff_armed
             && self.prompt_ranked_hot_handoff_shape_admitted();
         self.prompt_ranked_handoff_armed = false;
-        let prompt_ranked_routes = prompt_ranked_admitted
+        let prompt_ranked_routes = prompt_ranked_shape_admitted
             .then(|| {
                 prompt_ranked_hot_handoff_routes(
                     &self.prompt_ranked_route_union,
@@ -8474,6 +8474,7 @@ impl GhostMetalExpertRuntime {
                 )
             })
             .flatten();
+        let prompt_ranked_admitted = prompt_ranked_routes.is_some();
         let desired_prompt_ranked = prompt_ranked_routes.clone();
         let routes = prompt_ranked_routes.unwrap_or(baseline_routes);
         let read_failures_before = self
@@ -8532,6 +8533,17 @@ impl GhostMetalExpertRuntime {
         );
 
         if prompt_ranked_requested {
+            let (receipt_source, receipt_ranking) = if prompt_ranked_admitted {
+                (
+                    "current-prompt-exact-route-union",
+                    "decay-score-desc-expert-id-asc",
+                )
+            } else {
+                (
+                    "baseline-interval-union-or-latest-route",
+                    "expert-id-asc-or-route-order",
+                )
+            };
             let selected_masks = routes
                 .iter()
                 .enumerate()
@@ -8555,11 +8567,13 @@ impl GhostMetalExpertRuntime {
                 .collect::<Vec<_>>()
                 .join("/");
             eprintln!(
-                "[gemma4 prompt-ranked hot handoff] schema=1 requested=1 admitted={} effective={} fill_ok={} read_failures={} source=current-prompt-exact-route-union ranking=decay-score-desc-expert-id-asc layers={} selected_records={} capacity_total={} occupied_total={} selected_masks={} resident_masks={} output_mutation=0 io_mutation=1 slot_policy_mutation=1 table_mutation=1 route_mutation=0 routing_authority=exact-router",
+                "[gemma4 prompt-ranked hot handoff] schema=2 requested=1 admitted={} effective={} fill_ok={} read_failures={} source={} ranking={} layers={} selected_records={} capacity_total={} occupied_total={} selected_masks={} resident_masks={} output_mutation=0 io_mutation=1 slot_policy_mutation=1 table_mutation=1 route_mutation=0 routing_authority=exact-router",
                 u8::from(prompt_ranked_admitted),
                 u8::from(prompt_ranked_effective),
                 u8::from(ok),
                 read_failures,
+                receipt_source,
+                receipt_ranking,
                 routes.len(),
                 routes.iter().map(Vec::len).sum::<usize>(),
                 capacities.iter().sum::<usize>(),
