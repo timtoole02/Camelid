@@ -91,7 +91,7 @@ function MessageMetaFooter({ message }) {
       {/* "TTFT" is the term of art; under a reply it just needs to say what it
           measures. The abbreviation stays in the tooltip for anyone comparing. */}
       {ttft && <span className="cxturn__meta-item" title="Time to first content (TTFT), measured in this browser">first token {ttft}</span>}
-      {rate && <span className="cxturn__meta-item" title="End-to-end output rate, measured in this browser">{rate}</span>}
+      {rate && <span className="cxturn__meta-item" title="Decode output rate after the first token, measured in this browser">{rate}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
       {sentAt && <time className="cxturn__meta-item" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>}
       <span className="cxturn__meta-item cxturn__meta-note">client-measured</span>

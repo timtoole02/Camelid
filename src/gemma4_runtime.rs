@@ -2175,7 +2175,6 @@ pub struct Gemma4CghostArtifactReceipt {
     pub sha256: String,
 }
 
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn gemma4_mini2_cghost_artifact_admitted(receipt: &Gemma4CghostArtifactReceipt) -> bool {
     receipt.logical_bytes == crate::ghost_install::GEMMA4_26B_GHOST_CGHOST_BYTES
         && receipt
@@ -7674,7 +7673,7 @@ fn ghost_metal_stats_enabled() -> bool {
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GhostMetalSequenceMode {
     Idle,
@@ -7685,7 +7684,7 @@ enum GhostMetalSequenceMode {
     Metal,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gemma4MtpRequestAdmission {
     CpuPinned,
@@ -7694,7 +7693,7 @@ enum Gemma4MtpRequestAdmission {
     RefuseTargetState,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn classify_mtp_request_lane(
     mode: Option<GhostMetalSequenceMode>,
     gpu_enabled: bool,
@@ -7743,6 +7742,10 @@ fn select_ghost_prefill_plan(
         _ if chunk_eligible && prompt_len > 1 => GhostPrefillPlan::CpuChunk,
         _ => GhostPrefillPlan::ScalarCpu,
     }
+}
+
+fn ghost_prefill_requires_hybrid_finish(plan: GhostPrefillPlan) -> bool {
+    plan == GhostPrefillPlan::HybridChunk
 }
 
 /// A generation request owns the persistent common-core KV state. Resetting it
@@ -23229,7 +23232,7 @@ impl Gemma4Runtime {
                 let mut rows = self.step_chunk_with_head(tokens, start_pos, kc, vc, false, None)?;
                 logits = rows.pop().expect("non-empty prefill chunk has logits");
             }
-            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
+            if ghost_prefill_requires_hybrid_finish(plan) {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
             }
             #[cfg(target_os = "macos")]
@@ -23410,7 +23413,7 @@ impl Gemma4Runtime {
             if should_cancel() {
                 return Ok(None);
             }
-            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
+            if ghost_prefill_requires_hybrid_finish(plan) {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
                 // Import is synchronous but can copy a large context. Observe a
                 // disconnect that arrived during it before starting decode; the
@@ -32722,6 +32725,13 @@ mod ghost_hybrid_prefill_plan_tests {
             select_ghost_prefill_plan(true, true, 1, 8, Some(4096)),
             GhostPrefillPlan::ScalarMetal
         );
+        assert!(ghost_prefill_requires_hybrid_finish(
+            GhostPrefillPlan::HybridChunk
+        ));
+        assert!(
+            !ghost_prefill_requires_hybrid_finish(GhostPrefillPlan::ScalarMetal),
+            "one-token Metal prefill already owns KV and must not be reset through the CPU handoff"
+        );
         assert_eq!(
             select_ghost_prefill_plan(true, true, 4000, 4127, Some(4096)),
             GhostPrefillPlan::CpuChunk
@@ -32879,6 +32889,7 @@ mod ghost_moe_wire_tests {
         (dir, path)
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn cghost_full_artifact_receipt_detects_unsampled_padding_changes() {
         let (_dir, path) = cache_fixture(1, 1);

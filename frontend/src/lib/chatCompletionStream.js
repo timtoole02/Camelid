@@ -87,11 +87,11 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
     const parsed = readChatCompletionJsonPayload(payload, { estimateTokenCount })
     const elapsedMs = performance.now() - responseStartedAt
     if (parsed.content) onDelta(parsed.content, parsed.content, { completionTokens: parsed.completionTokens, elapsedMs, firstByteMs: 0, firstEventMs: null, firstContentMs: elapsedMs })
-    return { ...parsed, camelid: payload?.camelid || null, camelidReceipt: payload?.camelid_receipt || null, firstByteMs: 0, firstEventMs: null, firstContentMs: parsed.content ? elapsedMs : null }
+    return { ...parsed, camelid: payload?.camelid || null, camelidReceipt: payload?.camelid_receipt || null, elapsedMs, firstByteMs: 0, firstEventMs: null, firstContentMs: parsed.content ? elapsedMs : null }
   }
 
   const reader = response.body?.getReader()
-  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null, camelid: null, camelidReceipt: null }
+  if (!reader) return { content: '', finishReason: null, completionTokens: 0, elapsedMs: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null, camelid: null, camelidReceipt: null }
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
@@ -186,5 +186,5 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
   buffer += decoder.decode()
   if (buffer.trim()) consumeEvent(buffer.replace(/\r\n/g, '\n'))
   // Receipts only attach to non-streaming responses (the JSON fallback above).
-  return { content, finishReason, completionTokens, firstContentMs, firstByteMs, firstEventMs, usage, camelid, camelidReceipt: null }
+  return { content, finishReason, completionTokens, elapsedMs: performance.now() - streamStartedAt, firstContentMs, firstByteMs, firstEventMs, usage, camelid, camelidReceipt: null }
 }

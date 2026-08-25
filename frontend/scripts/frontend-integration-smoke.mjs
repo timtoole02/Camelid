@@ -491,7 +491,7 @@ try {
   assert.match(streamingMarkup, /message-code-card is-generating/, 'open streaming code should render as the real ForgeLocal-derived code card, not fallback prose')
   assert.match(streamingMarkup, /Generation details \(client-measured telemetry\)/, 'the meta footer should render during streaming as the live tok/s readout')
   assert.match(streamingMarkup, /13 tok\/s/, 'the streaming footer should show the live-patched output rate')
-  assert.match(streamingMarkup, /End-to-end output rate, measured in this browser/, 'the browser output-rate hover must not imply decode-only timing')
+  assert.match(streamingMarkup, /Decode output rate after the first token, measured in this browser/, 'the browser output-rate hover must identify the post-first-token decode interval')
   assert.match(streamingMarkup, /tokens est\.[\s\S]*in 24[\s\S]*out 7/, 'the streaming footer should show live input and output token counts')
   assert.doesNotMatch(streamingMarkup, /cxturn__meta--reserve/, 'the invisible footer placeholder must not render; the live footer holds the layout slot itself')
 
