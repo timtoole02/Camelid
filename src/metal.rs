@@ -50875,6 +50875,625 @@ kernel void sample_active_expert_records(
             }
         }
     }
+
+    /// Production-shaped Gemma 4 26B attention-read A/B. Unlike the Llama
+    /// depth probe above, both arms use the same split-three topology
+    /// (scores -> shared softmax -> context); only the persistent K/V format
+    /// changes. Cache construction and Q8 quantization complete before any
+    /// measured command buffer.
+    ///
+    /// `depth` is the final filled length, distinct from both the dynamically
+    /// grown KV capacity and the fixed session/score stride. K=16 therefore
+    /// verifies candidates at causal lengths `depth - 15 ..= depth`, matching
+    /// a chained round whose base position is `depth - 16`.
+    ///
+    /// Run (under the repository build lock):
+    /// cargo test --release --lib gemma4_q8_attention_read_depth_probe -- --ignored --nocapture --test-threads=1
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "production-sized Metal microbenchmark; allocates paired f32/Q8 KV caches"]
+    fn gemma4_q8_attention_read_depth_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+
+        #[derive(Clone, Copy)]
+        enum BenchScope {
+            Full30,
+            Local25,
+            Global5,
+        }
+
+        struct BenchLayer {
+            global: bool,
+            head_dim: usize,
+            sliding_window: usize,
+            kv_capacity: usize,
+            f32_k: Buffer,
+            f32_v: Buffer,
+            q8_k: Buffer,
+            q8_v: Buffer,
+        }
+
+        fn scope_name(scope: BenchScope) -> &'static str {
+            match scope {
+                BenchScope::Full30 => "full30",
+                BenchScope::Local25 => "local25",
+                BenchScope::Global5 => "global5",
+            }
+        }
+
+        fn scope_includes(scope: BenchScope, global: bool) -> bool {
+            match scope {
+                BenchScope::Full30 => true,
+                BenchScope::Local25 => !global,
+                BenchScope::Global5 => global,
+            }
+        }
+
+        fn fill_nonzero_pattern(buffer: &Buffer, elements: usize, step: u32, seed: u32) {
+            // A cheap recurrence avoids hundreds of millions of integer divisions in
+            // the 4096-position setup while still giving every layer deterministic,
+            // finite, non-constant K/V. The range is approximately [-0.25, 0.25].
+            let values = unsafe {
+                std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), elements)
+            };
+            let mut code = seed % 509;
+            for value in values {
+                code += step;
+                if code >= 509 {
+                    code -= 509;
+                }
+                *value = (code as f32 - 254.0) * 0.000_976_562_5;
+            }
+        }
+
+        let kernel = metal_linear_kernel().expect("Metal Gemma Q8 benchmark pipelines");
+        assert!(kernel.gemma4_attention_decode_scores_q8_pipeline.is_some());
+        assert!(kernel.gemma4_attention_decode_context_q8_pipeline.is_some());
+        assert!(kernel
+            .gemma4_attention_decode_scores_batch_k_q8_pipeline
+            .is_some());
+        assert!(kernel
+            .gemma4_attention_decode_context_batch_k_q8_pipeline
+            .is_some());
+        let device = &kernel.device;
+        let opts = MTLResourceOptions::StorageModeShared;
+        let n_heads = GEMMA4_GHOST_26B_HEADS;
+        const SESSION_MAX_POSITIONS: usize = 4_096;
+        let scopes = [BenchScope::Full30, BenchScope::Local25, BenchScope::Global5];
+
+        for &depth in &[192usize, 1_024, 4_096] {
+            assert!(depth <= SESSION_MAX_POSITIONS);
+            // Production starts at 256 rows and grows geometrically as the
+            // session fills: 192 -> 256, 1024 -> 1024, 4096 -> 4096.
+            let kv_capacity = depth
+                .max(256)
+                .next_power_of_two()
+                .min(SESSION_MAX_POSITIONS);
+            // Retain only the paired primary/mirror buffers. Position-major
+            // staging is allocated, initialized, scattered, and dropped one
+            // layer at a time so the 4096 case stays comfortably below 3 GiB.
+            let mut layers = Vec::with_capacity(GEMMA4_GHOST_26B_LAYERS);
+            for layer_index in 0..GEMMA4_GHOST_26B_LAYERS {
+                let global = GEMMA4_GHOST_26B_GLOBAL_LAYERS.contains(&layer_index);
+                let (head_dim, n_kv_heads, sliding_window) = if global {
+                    (
+                        GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM,
+                        GEMMA4_GHOST_26B_GLOBAL_KV_HEADS,
+                        0usize,
+                    )
+                } else {
+                    (
+                        GEMMA4_GHOST_26B_LOCAL_HEAD_DIM,
+                        GEMMA4_GHOST_26B_LOCAL_KV_HEADS,
+                        GEMMA4_GHOST_26B_SLIDING_WINDOW,
+                    )
+                };
+                let group = n_heads / n_kv_heads;
+                assert_eq!(group, if global { 8 } else { 2 });
+                let kv_dim = n_kv_heads * head_dim;
+                let staging_elements = depth * kv_dim;
+                let q8_row_bytes = gemma4_ghost_q8_row_bytes(head_dim).unwrap();
+                let f32_cache_bytes = n_kv_heads * kv_capacity * head_dim * 4;
+                let q8_cache_bytes = n_kv_heads * kv_capacity * q8_row_bytes;
+
+                let staging_k = device.new_buffer((staging_elements * 4) as u64, opts);
+                let staging_v = device.new_buffer((staging_elements * 4) as u64, opts);
+                fill_nonzero_pattern(
+                    &staging_k,
+                    staging_elements,
+                    37,
+                    11 + layer_index as u32 * 17,
+                );
+                fill_nonzero_pattern(
+                    &staging_v,
+                    staging_elements,
+                    53,
+                    29 + layer_index as u32 * 23,
+                );
+
+                let f32_k = device.new_buffer(f32_cache_bytes as u64, opts);
+                let f32_v = device.new_buffer(f32_cache_bytes as u64, opts);
+                let q8_k = device.new_buffer(q8_cache_bytes as u64, opts);
+                let q8_v = device.new_buffer(q8_cache_bytes as u64, opts);
+
+                let head_dim_u32 = head_dim as u32;
+                let kv_capacity_u32 = kv_capacity as u32;
+                let base_position_u32 = 0u32;
+                let kv_dim_u32 = kv_dim as u32;
+                let no_f16_mirror = 0u32;
+                let command = kernel.queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&kernel.kv_scatter_batch_pipeline);
+                encoder.set_buffer(0, Some(&staging_k), 0);
+                encoder.set_buffer(1, Some(&staging_v), 0);
+                encoder.set_buffer(2, Some(&f32_k), 0);
+                encoder.set_buffer(3, Some(&f32_v), 0);
+                encoder.set_bytes(4, 4, &head_dim_u32 as *const u32 as *const _);
+                encoder.set_bytes(5, 4, &kv_capacity_u32 as *const u32 as *const _);
+                encoder.set_bytes(6, 4, &base_position_u32 as *const u32 as *const _);
+                encoder.set_bytes(7, 4, &kv_dim_u32 as *const u32 as *const _);
+                // These resources are inert because write_kv16 is zero, but
+                // binding the real destinations matches the production scatter.
+                encoder.set_buffer(8, Some(&f32_k), 0);
+                encoder.set_buffer(9, Some(&f32_v), 0);
+                encoder.set_bytes(10, 4, &no_f16_mirror as *const u32 as *const _);
+                let scatter_width = kernel
+                    .kv_scatter_batch_pipeline
+                    .thread_execution_width()
+                    .max(1);
+                encoder.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: (kv_dim as u64).div_ceil(scatter_width),
+                        height: depth as u64,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: scatter_width,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                assert!(encode_gemma4_q8_mirror_scatter_batch(
+                    encoder,
+                    kernel,
+                    &staging_k,
+                    &staging_v,
+                    &q8_k,
+                    &q8_v,
+                    head_dim,
+                    n_kv_heads,
+                    kv_capacity,
+                    0,
+                    depth,
+                ));
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(
+                    command.status(),
+                    metal::MTLCommandBufferStatus::Completed,
+                    "Gemma Q8 benchmark cache setup failed at layer {layer_index}: {}",
+                    command_buffer_error_details(command)
+                );
+
+                layers.push(BenchLayer {
+                    global,
+                    head_dim,
+                    sliding_window,
+                    kv_capacity,
+                    f32_k,
+                    f32_v,
+                    q8_k,
+                    q8_v,
+                });
+                // staging_k/staging_v drop here, before the next layer's
+                // position-major source is allocated.
+            }
+            assert_eq!(layers.len(), 30);
+            assert_eq!(layers.iter().filter(|layer| !layer.global).count(), 25);
+            assert_eq!(layers.iter().filter(|layer| layer.global).count(), 5);
+
+            for &k_tokens in &[1usize, 16] {
+                let local_query_elements = k_tokens * n_heads * GEMMA4_GHOST_26B_LOCAL_HEAD_DIM;
+                let global_query_elements = k_tokens * n_heads * GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM;
+                let local_query = device.new_buffer((local_query_elements * 4) as u64, opts);
+                let global_query = device.new_buffer((global_query_elements * 4) as u64, opts);
+                fill_nonzero_pattern(&local_query, local_query_elements, 31, 71 + k_tokens as u32);
+                fill_nonzero_pattern(
+                    &global_query,
+                    global_query_elements,
+                    43,
+                    97 + k_tokens as u32,
+                );
+
+                let scores = device.new_buffer(
+                    (k_tokens * n_heads * SESSION_MAX_POSITIONS * 4) as u64,
+                    opts,
+                );
+                let denom = device.new_buffer((k_tokens * n_heads * 4) as u64, opts);
+                let local_output = device.new_buffer((local_query_elements * 4) as u64, opts);
+                let global_output = device.new_buffer((global_query_elements * 4) as u64, opts);
+                let attention_blocks = device.new_buffer(8, opts);
+                let local_scalar = device.new_buffer(48, opts);
+                let global_scalar = device.new_buffer(48, opts);
+                let base_position = depth - k_tokens;
+
+                for (scalar, head_dim, n_kv_heads, sliding_window) in [
+                    (
+                        &local_scalar,
+                        GEMMA4_GHOST_26B_LOCAL_HEAD_DIM,
+                        GEMMA4_GHOST_26B_LOCAL_KV_HEADS,
+                        GEMMA4_GHOST_26B_SLIDING_WINDOW,
+                    ),
+                    (
+                        &global_scalar,
+                        GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM,
+                        GEMMA4_GHOST_26B_GLOBAL_KV_HEADS,
+                        0usize,
+                    ),
+                ] {
+                    let scalar_position_count = if k_tokens == 1 {
+                        depth.min(if sliding_window == 0 {
+                            depth
+                        } else {
+                            sliding_window
+                        })
+                    } else {
+                        base_position
+                    };
+                    let window_start = if k_tokens == 1 {
+                        depth - scalar_position_count
+                    } else {
+                        0
+                    };
+                    unsafe {
+                        let p = scalar.contents().cast::<u8>();
+                        *p.cast::<u32>() = n_heads as u32;
+                        *p.add(4).cast::<u32>() = head_dim as u32;
+                        *p.add(8).cast::<u32>() = scalar_position_count as u32;
+                        *p.add(12).cast::<u32>() = (n_heads / n_kv_heads) as u32;
+                        // Gemma's q_norm already folds query_pre_attn_scalar.
+                        *p.add(16).cast::<f32>() = 1.0;
+                        *p.add(20).cast::<u32>() = head_dim as u32;
+                        *p.add(24).cast::<u32>() = (kv_capacity * head_dim) as u32;
+                        *p.add(28).cast::<u32>() = (window_start * head_dim) as u32;
+                        *p.add(40).cast::<u32>() = sliding_window as u32;
+                        *p.add(44).cast::<u32>() = SESSION_MAX_POSITIONS as u32;
+                    }
+                }
+
+                let poison_buffer = |buffer: &Buffer, elements: usize| {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), elements)
+                    }
+                    .fill(f32::NAN);
+                };
+                let fingerprint_buffer = |buffer: &Buffer,
+                                          elements: usize,
+                                          output_name: &str|
+                 -> f64 {
+                    let values = unsafe {
+                        std::slice::from_raw_parts(buffer.contents().cast::<f32>(), elements)
+                    };
+                    let mut fingerprint = 0.0f64;
+                    let mut magnitude = 0.0f64;
+                    for (index, &value) in values.iter().enumerate() {
+                        assert!(
+                                value.is_finite(),
+                                "non-finite {output_name} output at element {index} depth={depth} K={k_tokens}"
+                            );
+                        let value = value as f64;
+                        // A periodic weight avoids a plain sum's easy cancellation
+                        // while keeping the fingerprint exactly reproducible.
+                        fingerprint += value * ((index % 251) + 1) as f64;
+                        magnitude += value.abs();
+                    }
+                    assert!(
+                        magnitude > 1.0e-9,
+                        "zero {output_name} output depth={depth} K={k_tokens}"
+                    );
+                    assert!(
+                        fingerprint.is_finite() && fingerprint.abs() > 1.0e-12,
+                        "invalid {output_name} fingerprint depth={depth} K={k_tokens}"
+                    );
+                    fingerprint
+                };
+                let snapshot_buffer = |buffer: &Buffer, elements: usize| -> Vec<f32> {
+                    unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), elements) }
+                        .to_vec()
+                };
+                let assert_q8_close = |geometry: &str, reference: &[f32], actual: &[f32]| {
+                    assert_eq!(reference.len(), actual.len());
+                    let mut max_abs_error = 0.0f64;
+                    let mut error_sq = 0.0f64;
+                    let mut reference_sq = 0.0f64;
+                    for (&want, &got) in reference.iter().zip(actual) {
+                        assert!(want.is_finite() && got.is_finite());
+                        let error = (got - want) as f64;
+                        max_abs_error = max_abs_error.max(error.abs());
+                        error_sq += error * error;
+                        reference_sq += (want as f64) * (want as f64);
+                    }
+                    let normalized_rmse =
+                        (error_sq / reference_sq.max(reference.len() as f64 * 1.0e-20)).sqrt();
+                    assert!(
+                            max_abs_error <= 2.0e-2 && normalized_rmse <= 8.0e-2,
+                            "f32/Q8 {geometry} sanity mismatch depth={depth} K={k_tokens}: max_abs_error={max_abs_error:.6e} normalized_rmse={normalized_rmse:.6e}"
+                        );
+                };
+
+                let run_arm = |scope: BenchScope,
+                               q8: bool,
+                               validate_output: bool|
+                 -> (u128, u64, Option<f64>) {
+                    if validate_output {
+                        match scope {
+                            BenchScope::Local25 => {
+                                poison_buffer(&local_output, local_query_elements)
+                            }
+                            BenchScope::Global5 => {
+                                poison_buffer(&global_output, global_query_elements)
+                            }
+                            BenchScope::Full30 => {
+                                poison_buffer(&local_output, local_query_elements);
+                                poison_buffer(&global_output, global_query_elements);
+                            }
+                        }
+                    }
+                    let command = kernel.queue.new_command_buffer();
+                    let encoder = command.new_compute_command_encoder();
+                    let mut aggregate_encoded_kv_payload_bytes = 0u64;
+
+                    for layer in &layers {
+                        if !scope_includes(scope, layer.global) {
+                            continue;
+                        }
+                        let query = if layer.global {
+                            &global_query
+                        } else {
+                            &local_query
+                        };
+                        let output = if layer.global {
+                            &global_output
+                        } else {
+                            &local_output
+                        };
+                        let scalar = if layer.global {
+                            &global_scalar
+                        } else {
+                            &local_scalar
+                        };
+                        let (keys, values) = if q8 {
+                            (&layer.q8_k, &layer.q8_v)
+                        } else {
+                            (&layer.f32_k, &layer.f32_v)
+                        };
+                        assert_eq!(layer.kv_capacity, kv_capacity);
+
+                        let causal_rows = if k_tokens == 1 {
+                            if layer.sliding_window == 0 {
+                                depth
+                            } else {
+                                depth.min(layer.sliding_window)
+                            }
+                        } else {
+                            (0..k_tokens)
+                                .map(|candidate| {
+                                    let filled = base_position + candidate + 1;
+                                    if layer.sliding_window == 0 {
+                                        filled
+                                    } else {
+                                        filled.min(layer.sliding_window)
+                                    }
+                                })
+                                .sum::<usize>()
+                        };
+                        let row_bytes = if q8 {
+                            gemma4_ghost_q8_row_bytes(layer.head_dim).unwrap()
+                        } else {
+                            layer.head_dim * 4
+                        };
+                        // Aggregate algorithmic encoded payload over all selected
+                        // layers/query heads, counting each GQA cache row once per
+                        // consuming head. This is neither unique resident cache size
+                        // nor a measurement of physical DRAM IO.
+                        aggregate_encoded_kv_payload_bytes = aggregate_encoded_kv_payload_bytes
+                            .saturating_add(
+                                2u64.saturating_mul(n_heads as u64)
+                                    .saturating_mul(causal_rows as u64)
+                                    .saturating_mul(row_bytes as u64),
+                            );
+
+                        if k_tokens == 1 {
+                            let position_count = if layer.sliding_window == 0 {
+                                depth
+                            } else {
+                                depth.min(layer.sliding_window)
+                            };
+                            if q8 {
+                                assert!(encode_gemma4_attention_split3_q8(
+                                    encoder,
+                                    kernel,
+                                    query,
+                                    keys,
+                                    values,
+                                    &scores,
+                                    &denom,
+                                    output,
+                                    scalar,
+                                    n_heads,
+                                    layer.head_dim,
+                                    position_count,
+                                    layer.kv_capacity,
+                                    0,
+                                    0,
+                                ));
+                            } else {
+                                encode_attention_split3(
+                                    encoder,
+                                    kernel,
+                                    query,
+                                    keys,
+                                    values,
+                                    &scores,
+                                    &denom,
+                                    output,
+                                    scalar,
+                                    &attention_blocks,
+                                    n_heads,
+                                    layer.head_dim,
+                                    position_count,
+                                    0,
+                                    0,
+                                );
+                            }
+                        } else if q8 {
+                            assert!(encode_gemma4_attention_split3_batch_k_q8(
+                                encoder,
+                                kernel,
+                                query,
+                                keys,
+                                values,
+                                &scores,
+                                &denom,
+                                output,
+                                scalar,
+                                n_heads,
+                                layer.head_dim,
+                                depth,
+                                k_tokens,
+                                layer.sliding_window as u32,
+                                SESSION_MAX_POSITIONS as u32,
+                                layer.kv_capacity,
+                            ));
+                        } else {
+                            assert!(encode_attention_split3_batch_k(
+                                encoder,
+                                kernel,
+                                query,
+                                keys,
+                                values,
+                                &scores,
+                                &denom,
+                                output,
+                                scalar,
+                                n_heads,
+                                layer.head_dim,
+                                depth,
+                                k_tokens,
+                                layer.sliding_window as u32,
+                                SESSION_MAX_POSITIONS as u32,
+                            ));
+                        }
+                    }
+
+                    encoder.end_encoding();
+                    command.commit();
+                    command.wait_until_completed();
+                    assert_eq!(
+                        command.status(),
+                        metal::MTLCommandBufferStatus::Completed,
+                        "Gemma Q8 attention benchmark failed scope={} depth={depth} K={k_tokens} arm={}: {}",
+                        scope_name(scope),
+                        if q8 { "q8" } else { "f32" },
+                        command_buffer_error_details(command)
+                    );
+                    let gpu_us = command_buffer_gpu_times_us(command).0;
+                    assert!(
+                        gpu_us > 0,
+                        "zero Metal timestamp scope={} depth={depth} K={k_tokens}",
+                        scope_name(scope)
+                    );
+
+                    // Validation calls provide the CPU-visible sink. Measured
+                    // calls deliberately leave output GPU-owned so CPU coherence
+                    // traffic cannot perturb the next command buffer.
+                    let fingerprint = validate_output.then(|| match scope {
+                        BenchScope::Local25 => {
+                            fingerprint_buffer(&local_output, local_query_elements, "local")
+                        }
+                        BenchScope::Global5 => {
+                            fingerprint_buffer(&global_output, global_query_elements, "global")
+                        }
+                        BenchScope::Full30 => {
+                            fingerprint_buffer(&local_output, local_query_elements, "local")
+                                + fingerprint_buffer(
+                                    &global_output,
+                                    global_query_elements,
+                                    "global",
+                                )
+                        }
+                    });
+                    assert!(fingerprint.is_none_or(f64::is_finite));
+                    (gpu_us, aggregate_encoded_kv_payload_bytes, fingerprint)
+                };
+
+                for &scope in &scopes {
+                    // Validate each arm outside measurement: poison every selected
+                    // output element, require full overwrite/finite output, and
+                    // retain a deterministic weighted fingerprint.
+                    let (_, _, Some(f32_fingerprint)) = run_arm(scope, false, true) else {
+                        unreachable!()
+                    };
+                    let f32_sanity = matches!(scope, BenchScope::Full30).then(|| {
+                        (
+                            snapshot_buffer(&local_output, local_query_elements),
+                            snapshot_buffer(&global_output, global_query_elements),
+                        )
+                    });
+                    let (_, _, Some(q8_fingerprint)) = run_arm(scope, true, true) else {
+                        unreachable!()
+                    };
+                    if let Some((f32_local, f32_global)) = f32_sanity {
+                        let q8_local = snapshot_buffer(&local_output, local_query_elements);
+                        let q8_global = snapshot_buffer(&global_output, global_query_elements);
+                        assert_q8_close("local-hd256-group2", &f32_local, &q8_local);
+                        assert_q8_close("global-hd512-group8", &f32_global, &q8_global);
+                    }
+
+                    // One GPU-only warmup per arm restores production-like ownership
+                    // after CPU validation. From here through all measured rounds,
+                    // no CPU reads or writes any output buffer.
+                    let _ = run_arm(scope, false, false);
+                    let _ = run_arm(scope, true, false);
+                    for round in 0..9usize {
+                        let order = if round.is_multiple_of(2) {
+                            [false, true]
+                        } else {
+                            [true, false]
+                        };
+                        for q8 in order {
+                            let (gpu_us, aggregate_encoded_kv_payload_bytes, fingerprint) =
+                                run_arm(scope, q8, false);
+                            assert!(fingerprint.is_none());
+                            let aggregate_encoded_kv_payload_gib_s =
+                                aggregate_encoded_kv_payload_bytes as f64
+                                    / (1024.0 * 1024.0 * 1024.0)
+                                    / (gpu_us as f64 / 1_000_000.0);
+                            let validated_fingerprint =
+                                if q8 { q8_fingerprint } else { f32_fingerprint };
+                            println!(
+                                "{{\"schema\":\"camelid.gemma4_q8_attention_read/v2\",\"scope\":\"{}\",\"depth\":{},\"kv_capacity\":{},\"max_positions\":{},\"k\":{},\"round\":{},\"arm\":\"{}\",\"gpu_us\":{},\"aggregate_encoded_kv_payload_bytes\":{},\"aggregate_encoded_kv_payload_gib_s\":{:.6},\"validated_output_fingerprint\":{:.9e}}}",
+                                scope_name(scope),
+                                depth,
+                                kv_capacity,
+                                SESSION_MAX_POSITIONS,
+                                k_tokens,
+                                round + 1,
+                                if q8 { "q8" } else { "f32" },
+                                gpu_us,
+                                aggregate_encoded_kv_payload_bytes,
+                                aggregate_encoded_kv_payload_gib_s,
+                                validated_fingerprint,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     use super::*;
 
     #[cfg(target_os = "macos")]
