@@ -3007,7 +3007,7 @@ impl RunnableModel {
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
         stream_tokens_observable: bool,
-        is_cancelled: &dyn Fn() -> bool,
+        _is_cancelled: &dyn Fn() -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
@@ -3033,7 +3033,7 @@ impl RunnableModel {
                         max_new,
                         stop,
                         sampling,
-                        is_cancelled,
+                        _is_cancelled,
                         tracked_on_token,
                     )
                 },
