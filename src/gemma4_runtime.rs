@@ -31026,6 +31026,91 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn hybrid_telemetry_mini2_wide_round_requires_truthful_hot_mapped_partition() {
+        let make_snapshot = |all_hot: bool| {
+            let mut snapshot = exact_hybrid_snapshot(101, Some(10), 0, 0);
+            set_profiled_hybrid_hot_capacity(
+                &mut snapshot,
+                &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+            );
+            let mut hot_total = 0u32;
+            let mut mapped_total = 0u32;
+            for (layer, &capacity) in GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+                .iter()
+                .enumerate()
+            {
+                let hot = if all_hot { 64 } else { capacity.min(50) } as u16;
+                let mapped = 64u16.saturating_sub(hot);
+                snapshot.last_chained_unique_per_layer[layer] = 64;
+                snapshot.last_chained_hot_bound_per_layer[layer] = hot;
+                snapshot.last_chained_mapped_bound_per_layer[layer] = mapped;
+                hot_total = hot_total.saturating_add(u32::from(hot));
+                mapped_total = mapped_total.saturating_add(u32::from(mapped));
+            }
+            snapshot.last_chained_unique_experts_sum = 64 * HYBRID_TELEMETRY_LAYERS as u32;
+            snapshot.last_chained_unique_experts_max = 64;
+            snapshot.last_chained_hot_bound_records = hot_total;
+            snapshot.last_chained_mapped_bound_records = mapped_total;
+            snapshot.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+                route_lookups: 2_400,
+                hits: 1_800,
+                misses: 600,
+                ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+            };
+            snapshot.cumulative_chained_demand_loads = 14;
+            snapshot.cumulative_chained_demand_read_bytes =
+                14 * HYBRID_TELEMETRY_RECORD_BYTES;
+            snapshot
+        };
+        let round = Gemma4HybridRoundInput {
+            round_index: 0,
+            prefix_tokens_before: 34,
+            bootstrap: false,
+            remaining_budget_before: 128,
+            requested_k: 10,
+            proposed_k: 9,
+            verifier_k: 10,
+            budget_truncated: false,
+            accepted_drafts: 5,
+            useful_accepted_drafts: 5,
+            committed_tokens: vec![10, 11, 12, 13, 14, 15],
+            assistant_wall_us: 20_000,
+            assistant_gpu_us: 15_000,
+            verifier_wall_us: 70_000,
+            verifier_gpu_us: 50_000,
+            total_wall_us: 100_000,
+        };
+
+        let mut before = exact_hybrid_snapshot(100, None, 0, 0);
+        set_profiled_hybrid_hot_capacity(
+            &mut before,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        );
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact Mini2 baseline");
+        let partitioned = make_snapshot(false);
+        collector.capture_round(round.clone(), Some(partitioned.clone()));
+        assert!(
+            collector.finish(Some(partitioned), 6, 0).is_some(),
+            "a K10 composite table remains receiptable when hot and mapped records are separated"
+        );
+
+        let mut before = exact_hybrid_snapshot(100, None, 0, 0);
+        set_profiled_hybrid_hot_capacity(
+            &mut before,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        );
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact Mini2 baseline");
+        let all_hot = make_snapshot(true);
+        collector.capture_round(round, Some(all_hot.clone()));
+        assert!(
+            collector.finish(Some(all_hot), 6, 0).is_none(),
+            "misclassifying a 64-record union as all-hot must still fail the per-layer capacity gate"
+        );
+    }
+
+    #[test]
     fn hybrid_telemetry_schema_v2_whitelists_exact_uniform_hot48_only() {
         let mut uniform_hot48 = exact_hybrid_snapshot(10, None, 0, 0);
         set_uniform_hybrid_hot_capacity(&mut uniform_hot48, HYBRID_TELEMETRY_HOT48_PER_LAYER);

@@ -24953,6 +24953,40 @@ impl ChainedRoundHostLedger {
             + self.cpu_cold_probe_prepare_ms
             + self.cpu_cold_probe_compute_ms
     }
+
+    /// Record the exact resource-tier partition bound for one routed layer.
+    /// The composite single-Down table contains both persistent anonymous-hot
+    /// records and staged mapped-cold records; keeping those counts separate is
+    /// required for the strict hybrid receipt to prove the hot capacity rather
+    /// than misclassifying the full active union as anonymous-hot.
+    fn record_hybrid_bound_partition(
+        &mut self,
+        layer_idx: usize,
+        hot_records: usize,
+        mapped_records: usize,
+    ) -> bool {
+        let (Ok(hot_layer), Ok(mapped_layer), Ok(hot_total), Ok(mapped_total)) = (
+            u16::try_from(hot_records),
+            u16::try_from(mapped_records),
+            u32::try_from(hot_records),
+            u32::try_from(mapped_records),
+        ) else {
+            return false;
+        };
+        let (Some(hot_per_layer), Some(mapped_per_layer)) = (
+            self.hot_bound_per_layer.get_mut(layer_idx),
+            self.mapped_bound_per_layer.get_mut(layer_idx),
+        ) else {
+            return false;
+        };
+        self.hot_bound_records = self.hot_bound_records.saturating_add(hot_total);
+        self.mapped_bound_records = self
+            .mapped_bound_records
+            .saturating_add(mapped_total);
+        *hot_per_layer = hot_per_layer.saturating_add(hot_layer);
+        *mapped_per_layer = mapped_per_layer.saturating_add(mapped_layer);
+        true
+    }
 }
 
 fn same_expert_set(a: &[usize], b: &[usize]) -> bool {
@@ -26801,7 +26835,8 @@ mod hot_cold_overlap_plan_tests {
         live_sequential_receipt_wall_us, partition_exact_union_by_hot, plan_retained_cold_layer,
         retained_cold_compact_slot_table, summarize_live_sequential_probe,
         validate_live_sequential_probe_receipt, ColdRecurrenceTally, CpuColdProbeAccounting,
-        CpuColdProbeRoute, Gemma4RetainedColdHit, Gemma4RetainedColdPlacement,
+        ChainedRoundHostLedger, CpuColdProbeRoute, Gemma4RetainedColdHit,
+        Gemma4RetainedColdPlacement,
         LiveSequentialProbeSummary, LiveSequentialProbeTally, LIVE_SEQUENTIAL_PROBE_CAP16,
         LIVE_SEQUENTIAL_PROBE_CAP8,
     };
@@ -27530,6 +27565,20 @@ mod hot_cold_overlap_plan_tests {
             assert_eq!(hot_table[expert], u32::MAX);
             assert_eq!(cold_table[expert], slot as u32);
         }
+    }
+
+    #[test]
+    fn composite_single_down_receipts_hot_and_mapped_records_separately() {
+        let mut ledger = ChainedRoundHostLedger::default();
+        assert!(ledger.record_hybrid_bound_partition(0, 50, 14));
+        assert!(ledger.record_hybrid_bound_partition(1, 39, 25));
+        assert_eq!(ledger.hot_bound_records, 89);
+        assert_eq!(ledger.mapped_bound_records, 39);
+        assert_eq!(ledger.hot_bound_per_layer[0], 50);
+        assert_eq!(ledger.mapped_bound_per_layer[0], 14);
+        assert_eq!(ledger.hot_bound_per_layer[1], 39);
+        assert_eq!(ledger.mapped_bound_per_layer[1], 25);
+        assert!(!ledger.record_hybrid_bound_partition(30, 1, 1));
     }
 
     #[test]
@@ -33396,23 +33445,12 @@ impl Gemma4GhostCommonMetal {
                                 ledger.overlap_layers = ledger.overlap_layers.saturating_add(1);
                                 ledger.expert_waves_sum = ledger.expert_waves_sum.saturating_add(1);
                                 ledger.expert_waves_max = ledger.expert_waves_max.max(2);
-                                ledger.hot_bound_records = ledger
-                                    .hot_bound_records
-                                    .saturating_add(hot_wave.len().min(u32::MAX as usize) as u32);
-                                ledger.mapped_bound_records = ledger
-                                    .mapped_bound_records
-                                    .saturating_add(cold_wave.len().min(u32::MAX as usize) as u32);
-                                if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
-                                    *value = value.saturating_add(
-                                        hot_wave.len().min(u16::MAX as usize) as u16,
-                                    );
-                                }
-                                if let Some(value) =
-                                    ledger.mapped_bound_per_layer.get_mut(layer_idx)
-                                {
-                                    *value = value.saturating_add(
-                                        cold_wave.len().min(u16::MAX as usize) as u16,
-                                    );
+                                if !ledger.record_hybrid_bound_partition(
+                                    layer_idx,
+                                    hot_wave.len(),
+                                    cold_wave.len(),
+                                ) {
+                                    return None;
                                 }
                                 if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
                                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -33608,14 +33646,13 @@ impl Gemma4GhostCommonMetal {
                                     ledger.expert_waves_sum =
                                         ledger.expert_waves_sum.saturating_add(1);
                                     ledger.expert_waves_max = ledger.expert_waves_max.max(2);
-                                    ledger.hot_bound_records = ledger
-                                        .hot_bound_records
-                                        .saturating_add(unique.min(u32::MAX as usize) as u32);
-                                    if let Some(value) =
-                                        ledger.hot_bound_per_layer.get_mut(layer_idx)
-                                    {
-                                        *value = value
-                                            .saturating_add(unique.min(u16::MAX as usize) as u16);
+                                    debug_assert_eq!(hot_wave.len() + cold_wave.len(), unique);
+                                    if !ledger.record_hybrid_bound_partition(
+                                        layer_idx,
+                                        hot_wave.len(),
+                                        cold_wave.len(),
+                                    ) {
+                                        return None;
                                     }
                                     if let Some(plan) = retained_plan {
                                         let hits = plan.retained.len();
