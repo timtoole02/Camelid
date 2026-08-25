@@ -2601,7 +2601,7 @@ fn exact_residency_route_truth_valid(
     let max_union = k_tokens.saturating_mul(8).min(128);
     (1..=16).contains(&k_tokens)
         && exact_routes.len() == 30
-        && ledger_unique_per_layer.len() >= 30
+        && ledger_unique_per_layer.len() == 30
         && exact_routes.iter().enumerate().all(|(layer, route)| {
             (8..=max_union).contains(&route.len())
                 && sparse_expert_mask_hex(route).is_some()
@@ -2633,9 +2633,9 @@ fn format_exact_residency_trace(
         || stage_cap != GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP
         || exact_routes.len() != LAYERS
         || hot_at_start.len() != LAYERS
-        || capacities.len() != LAYERS
+        || !ghost_metal_live_sequential_mini2_hot_profile_admitted(capacities)
         || wave_load_ms_per_layer.len() != LAYERS
-        || ledger_unique_per_layer.len() < LAYERS
+        || ledger_unique_per_layer.len() != LAYERS
         || !exact_residency_route_truth_valid(
             exact_routes,
             k_tokens,
