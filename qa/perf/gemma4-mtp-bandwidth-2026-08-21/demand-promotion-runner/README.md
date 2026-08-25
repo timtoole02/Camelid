@@ -87,6 +87,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H42-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-rebalanced` | Same-memory rebalancing closure; exact at 34.82 tok/s, no-go |
 | `H43-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6` | Six retained cold records/layer; exact at 33.53 and 33.42 tok/s, zero swap, no-go |
 | `H44-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6-chunked-read` | H43 plus adaptive capped-four positioned-read splitting; exact at 34.33 tok/s, zero swap, no-go |
+| `H45-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6-direct-bank` | H44 plus record-granular direct-to-bank fills and zero blits; exact at 33.01 tok/s, zero swap, no-go |
 | `A-explicit56` | historical anonymous 56-slot profile; old measurements predate the ordering fix and are invalid |
 | `C-mono88` | historical anonymous monolithic profile; old measurements predate the ordering fix and are invalid |
 

@@ -1850,6 +1850,13 @@ const GHOST_METAL_RETAINED_COLD_BANK_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_RET
 /// bank is successfully armed.
 const GHOST_METAL_RETAINED_COLD_CHUNKED_READ_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_CHUNKED_READ";
+/// Exact decode-only H45 opt-in. Fresh retained-bank replacements are read
+/// directly into record-granular bank resources, while overflow remains in
+/// its original compact-stage slot. This removes the post-Down bank blits
+/// without letting the committed hot command reference any destination that
+/// the CPU can still mutate.
+const GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL";
 const GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_SINGLE_DOWN";
 const GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV: &str =
@@ -3756,12 +3763,29 @@ fn ghost_metal_retained_cold_chunked_read_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_retained_cold_direct_bank_fill_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
 #[cfg(target_os = "macos")]
 fn ghost_metal_retained_cold_chunked_read_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         ghost_metal_retained_cold_chunked_read_from(
             std::env::var(GHOST_METAL_RETAINED_COLD_CHUNKED_READ_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_retained_cold_direct_bank_fill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ghost_metal_retained_cold_direct_bank_fill_from(
+            std::env::var(GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL_ENV)
                 .ok()
                 .as_deref(),
         )
@@ -3779,6 +3803,30 @@ fn ghost_metal_retained_cold_chunks_per_record(
     } else {
         read_threads.div_ceil(record_jobs).min(4)
     }
+}
+
+/// Assign only enough per-record positioned reads to occupy the read pool.
+/// Unlike the older uniform fanout, this never turns three records into nine
+/// tasks for an eight-thread pool. The total is exactly `min(threads, 4*jobs)`
+/// whenever chunking is enabled and there is idle read capacity.
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_retained_cold_direct_chunk_counts(
+    enabled: bool,
+    record_jobs: usize,
+    read_threads: usize,
+) -> Vec<usize> {
+    if record_jobs == 0 {
+        return Vec::new();
+    }
+    if !enabled || read_threads <= record_jobs {
+        return vec![1; record_jobs];
+    }
+    let target_tasks = read_threads.min(record_jobs.saturating_mul(4));
+    let base = target_tasks / record_jobs;
+    let remainder = target_tasks % record_jobs;
+    (0..record_jobs)
+        .map(|job| base + usize::from(job < remainder))
+        .collect()
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3931,8 +3979,10 @@ mod previous_cold_stage_policy_tests {
 mod direct_stage_read_policy_tests {
     use super::{
         compact_stage_direct_read_jobs, ghost_metal_direct_stage_read_admitted,
-        ghost_metal_direct_stage_read_from, CompactStageReadJob,
+        ghost_metal_direct_stage_read_from, retained_cold_direct_read_jobs, CompactStageReadJob,
+        RetainedColdDirectReadJob, RetainedColdDirectReadTarget,
     };
+    use crate::metal::Gemma4RetainedColdPlacement;
 
     #[test]
     fn environment_requires_the_exact_canonical_one() {
@@ -3967,6 +4017,83 @@ mod direct_stage_read_policy_tests {
         assert_eq!(compact_stage_direct_read_jobs(&[1, 2, 3], 2), None);
         assert_eq!(compact_stage_direct_read_jobs(&[128], 1), None);
     }
+
+    #[test]
+    fn retained_io_order_preserves_logical_and_physical_targets() {
+        let placements = [
+            Gemma4RetainedColdPlacement {
+                expert: 9,
+                fresh_slot: 0,
+                bank_slot: 5,
+            },
+            Gemma4RetainedColdPlacement {
+                expert: 7,
+                fresh_slot: 2,
+                bank_slot: 1,
+            },
+        ];
+        assert_eq!(
+            retained_cold_direct_read_jobs(&[9, 2, 7], &placements, 6, 3),
+            Some(vec![
+                RetainedColdDirectReadJob {
+                    logical_fresh_slot: 1,
+                    expert: 2,
+                    target: RetainedColdDirectReadTarget::Stage(1),
+                },
+                RetainedColdDirectReadJob {
+                    logical_fresh_slot: 2,
+                    expert: 7,
+                    target: RetainedColdDirectReadTarget::Bank(1),
+                },
+                RetainedColdDirectReadJob {
+                    logical_fresh_slot: 0,
+                    expert: 9,
+                    target: RetainedColdDirectReadTarget::Bank(5),
+                },
+            ])
+        );
+
+        let bad = |placement| retained_cold_direct_read_jobs(&[9, 2, 7], &[placement], 6, 3);
+        assert!(bad(Gemma4RetainedColdPlacement {
+            expert: 2,
+            fresh_slot: 0,
+            bank_slot: 0,
+        })
+        .is_none());
+        assert!(bad(Gemma4RetainedColdPlacement {
+            expert: 9,
+            fresh_slot: 3,
+            bank_slot: 0,
+        })
+        .is_none());
+        assert!(bad(Gemma4RetainedColdPlacement {
+            expert: 9,
+            fresh_slot: 0,
+            bank_slot: 6,
+        })
+        .is_none());
+        assert!(retained_cold_direct_read_jobs(
+            &[9, 2, 7],
+            &[
+                Gemma4RetainedColdPlacement {
+                    expert: 9,
+                    fresh_slot: 0,
+                    bank_slot: 1,
+                },
+                Gemma4RetainedColdPlacement {
+                    expert: 7,
+                    fresh_slot: 2,
+                    bank_slot: 1,
+                },
+            ],
+            6,
+            3,
+        )
+        .is_none());
+        assert!(retained_cold_direct_read_jobs(&[], &[], 6, 3).is_none());
+        assert!(retained_cold_direct_read_jobs(&[9, 9], &[], 6, 3).is_none());
+        assert!(retained_cold_direct_read_jobs(&[9, 2, 7], &[], 6, 2).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -3974,7 +4101,9 @@ mod retained_cold_bank_policy_tests {
     use super::{
         ghost_metal_retained_cold_bank_admitted, ghost_metal_retained_cold_bank_from,
         ghost_metal_retained_cold_chunked_read_from, ghost_metal_retained_cold_chunks_per_record,
-        GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE, GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS,
+        ghost_metal_retained_cold_direct_bank_fill_from,
+        ghost_metal_retained_cold_direct_chunk_counts, GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE,
+        GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS,
     };
 
     fn admitted(profile: &[usize]) -> bool {
@@ -3989,9 +4118,14 @@ mod retained_cold_bank_policy_tests {
         assert!(ghost_metal_retained_cold_bank_from(Some("1")));
         assert!(!ghost_metal_retained_cold_chunked_read_from(None));
         assert!(ghost_metal_retained_cold_chunked_read_from(Some("1")));
+        assert!(!ghost_metal_retained_cold_direct_bank_fill_from(None));
+        assert!(ghost_metal_retained_cold_direct_bank_fill_from(Some("1")));
         for value in ["", "0", "true", " 1", "1\n"] {
             assert!(!ghost_metal_retained_cold_bank_from(Some(value)));
             assert!(!ghost_metal_retained_cold_chunked_read_from(Some(value)));
+            assert!(!ghost_metal_retained_cold_direct_bank_fill_from(Some(
+                value
+            )));
         }
     }
 
@@ -4011,6 +4145,35 @@ mod retained_cold_bank_policy_tests {
         assert_eq!(ghost_metal_retained_cold_chunks_per_record(true, 7, 8), 2);
         assert_eq!(ghost_metal_retained_cold_chunks_per_record(true, 8, 8), 1);
         assert_eq!(ghost_metal_retained_cold_chunks_per_record(true, 9, 8), 1);
+
+        assert_eq!(
+            ghost_metal_retained_cold_direct_chunk_counts(false, 3, 8),
+            vec![1, 1, 1]
+        );
+        assert_eq!(
+            ghost_metal_retained_cold_direct_chunk_counts(true, 1, 8),
+            vec![4]
+        );
+        assert_eq!(
+            ghost_metal_retained_cold_direct_chunk_counts(true, 2, 8),
+            vec![4, 4]
+        );
+        assert_eq!(
+            ghost_metal_retained_cold_direct_chunk_counts(true, 3, 8),
+            vec![3, 3, 2]
+        );
+        assert_eq!(
+            ghost_metal_retained_cold_direct_chunk_counts(true, 5, 8),
+            vec![2, 2, 2, 1, 1]
+        );
+        assert_eq!(
+            ghost_metal_retained_cold_direct_chunk_counts(true, 7, 8),
+            vec![2, 1, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            ghost_metal_retained_cold_direct_chunk_counts(true, 8, 8),
+            vec![1; 8]
+        );
     }
 
     #[test]
@@ -4802,6 +4965,76 @@ struct CompactStageReadJob {
     expert: usize,
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedColdDirectReadTarget {
+    Bank(usize),
+    Stage(usize),
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetainedColdDirectReadJob {
+    logical_fresh_slot: usize,
+    expert: usize,
+    target: RetainedColdDirectReadTarget,
+}
+
+/// Preserve route order as the logical work-table order while sorting physical
+/// reads monotonically by expert record. A placement names the record-granular
+/// bank destination for one fresh expert; every unplaced expert stays at its
+/// original (possibly holey) fresh slot in the shared overflow stage.
+#[cfg(any(target_os = "macos", test))]
+fn retained_cold_direct_read_jobs(
+    experts: &[usize],
+    placements: &[crate::metal::Gemma4RetainedColdPlacement],
+    bank_slot_count: usize,
+    stage_slot_count: usize,
+) -> Option<Vec<RetainedColdDirectReadJob>> {
+    if experts.is_empty() || experts.len() > stage_slot_count || experts.len() > 128 {
+        return None;
+    }
+    let mut expert_seen = [false; 128];
+    for &expert in experts {
+        if expert >= expert_seen.len() || expert_seen[expert] {
+            return None;
+        }
+        expert_seen[expert] = true;
+    }
+    let mut placement_by_fresh = vec![None; experts.len()];
+    let mut bank_seen = vec![false; bank_slot_count];
+    for placement in placements {
+        if placement.expert >= 128
+            || placement.fresh_slot >= experts.len()
+            || experts[placement.fresh_slot] != placement.expert
+            || placement.bank_slot >= bank_slot_count
+            || placement_by_fresh[placement.fresh_slot].is_some()
+            || bank_seen[placement.bank_slot]
+        {
+            return None;
+        }
+        placement_by_fresh[placement.fresh_slot] = Some(placement.bank_slot);
+        bank_seen[placement.bank_slot] = true;
+    }
+    let mut jobs = Vec::with_capacity(experts.len());
+    for (logical_fresh_slot, (&expert, bank_slot)) in experts
+        .iter()
+        .zip(placement_by_fresh.into_iter())
+        .enumerate()
+    {
+        jobs.push(RetainedColdDirectReadJob {
+            logical_fresh_slot,
+            expert,
+            target: bank_slot.map_or(
+                RetainedColdDirectReadTarget::Stage(logical_fresh_slot),
+                RetainedColdDirectReadTarget::Bank,
+            ),
+        });
+    }
+    jobs.sort_unstable_by_key(|job| job.expert);
+    Some(jobs)
+}
+
 /// Keep positioned reads monotonic in the `.cghost` layer while retaining the
 /// exact compact slot assigned by route-union order. I/O order is not model
 /// accumulation order: the slot table remains authoritative after every read
@@ -4885,7 +5118,7 @@ fn fill_compact_wave_direct_from_file(
     let read_threads = cache
         .read_pool
         .as_ref()
-        .map_or(1, rayon::ThreadPool::current_num_threads);
+        .map_or(1, |pool| pool.current_num_threads());
     let chunks_per_record =
         ghost_metal_retained_cold_chunks_per_record(chunked_read_enabled, jobs.len(), read_threads);
     if chunks_per_record > 1 {
@@ -4953,6 +5186,202 @@ fn fill_compact_wave_direct_from_file(
     }
     for (slot, &expert) in experts.iter().enumerate() {
         updated_slots[expert] = slot as u32;
+    }
+    true
+}
+
+/// Fill one retained-cold wave into its final resources in a single read-pool
+/// batch. Bank placements target distinct record-granular Metal buffers;
+/// unplaced overflow targets its original fresh-slot offset in the shared
+/// stage. The hot command's paired binding excludes every one of these
+/// resources, and the cold command remains uncommitted until this function has
+/// joined all reads and published the exact logical table.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn fill_retained_cold_direct_from_file(
+    stage: &metal::Buffer,
+    stage_slot_count: usize,
+    bank: &crate::metal::Gemma4Q4ExpertSlots,
+    cache: &GhostMoeExpertCache,
+    layer_idx: usize,
+    experts: &[usize],
+    placements: &[crate::metal::Gemma4RetainedColdPlacement],
+    updated_slots: &mut [u32; 128],
+    counters: &WaveFillCounters,
+    chunked_read_enabled: bool,
+) -> bool {
+    use rayon::prelude::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    updated_slots.fill(u32::MAX);
+    if layer_idx >= cache.layer_budgets.len()
+        || cache.budget_bytes != 0
+        || !bank.is_record_granular()
+    {
+        return false;
+    }
+    let Some(jobs) = retained_cold_direct_read_jobs(
+        experts,
+        placements,
+        bank.writable_slot_count(),
+        stage_slot_count,
+    ) else {
+        return false;
+    };
+    let record_bytes = crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES;
+    let stride = crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE;
+    let Some(required_stage_bytes) = stage_slot_count.checked_mul(stride) else {
+        return false;
+    };
+    let stage_base = stage.contents().cast::<u8>();
+    if stage_base.is_null()
+        || record_bytes > stride
+        || usize::try_from(stage.length()).map_or(true, |length| length < required_stage_bytes)
+    {
+        return false;
+    }
+
+    #[derive(Clone, Copy)]
+    struct ResolvedJob {
+        job: RetainedColdDirectReadJob,
+        destination: usize,
+    }
+    let mut resolved = Vec::with_capacity(jobs.len());
+    let mut destination_addresses = std::collections::HashSet::with_capacity(jobs.len());
+    for job in jobs {
+        let destination = match job.target {
+            RetainedColdDirectReadTarget::Bank(bank_slot) => {
+                // SAFETY: the pure planner proves unique in-range bank slots;
+                // record-granular admission makes every slot a distinct Metal
+                // resource, and no GPU binding that references a destination
+                // is committed while this callback runs.
+                let Some(bytes) = (unsafe { bank.slot_bytes_mut_raw(bank_slot) }) else {
+                    return false;
+                };
+                if bytes.len() != record_bytes {
+                    return false;
+                }
+                bytes.as_mut_ptr() as usize
+            }
+            RetainedColdDirectReadTarget::Stage(stage_slot) => {
+                if stage_slot >= stage_slot_count {
+                    return false;
+                }
+                // SAFETY: stage geometry and slot bounds were checked above.
+                unsafe { stage_base.add(stage_slot * stride) as usize }
+            }
+        };
+        if destination == 0 || !destination_addresses.insert(destination) {
+            return false;
+        }
+        resolved.push(ResolvedJob { job, destination });
+    }
+
+    // Preserve the zero-budget cache's observable request accounting even
+    // though all exact bytes go directly to their final Metal resources.
+    {
+        let mut state = cache.state.lock().expect("ghost MoE cache poisoned");
+        for &expert in experts {
+            let key = (layer_idx, expert);
+            state.touch_layer(layer_idx);
+            state.misses = state.misses.saturating_add(1);
+            if state.seen_keys.insert(key) {
+                state.compulsory_misses = state.compulsory_misses.saturating_add(1);
+            } else {
+                state.capacity_misses = state.capacity_misses.saturating_add(1);
+            }
+        }
+    }
+
+    let read_threads = cache
+        .read_pool
+        .as_ref()
+        .map_or(1, |pool| pool.current_num_threads());
+    let chunk_counts = ghost_metal_retained_cold_direct_chunk_counts(
+        chunked_read_enabled,
+        resolved.len(),
+        read_threads,
+    );
+    let max_chunks = chunk_counts.iter().copied().max().unwrap_or(1);
+    if max_chunks > 1 {
+        let split_records = chunk_counts.iter().filter(|&&chunks| chunks > 1).count();
+        let split_preads = chunk_counts
+            .iter()
+            .copied()
+            .filter(|&chunks| chunks > 1)
+            .sum();
+        counters
+            .chunked_read_records
+            .fetch_add(split_records, Relaxed);
+        counters
+            .chunked_read_preads
+            .fetch_add(split_preads, Relaxed);
+        counters
+            .chunked_read_max_chunks
+            .fetch_max(max_chunks, Relaxed);
+    }
+    let read_one = |(resolved, &chunks): (&ResolvedJob, &usize)| {
+        // SAFETY: every destination is a unique complete record, all addresses
+        // stay alive through this joined batch, and no cold Metal command is
+        // committed until the callback reports success.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(resolved.destination as *mut u8, record_bytes)
+        };
+        (
+            resolved.job,
+            cache.file.read_moe_expert_into_chunks(
+                layer_idx,
+                resolved.job.expert,
+                destination,
+                chunks,
+            ),
+        )
+    };
+    let read_started = std::time::Instant::now();
+    let outcomes = match cache.read_pool.as_ref() {
+        Some(pool) if resolved.len() > 1 || max_chunks > 1 => pool.install(|| {
+            resolved
+                .par_iter()
+                .zip(chunk_counts.par_iter())
+                .map(read_one)
+                .collect::<Vec<_>>()
+        }),
+        _ => resolved
+            .iter()
+            .zip(chunk_counts.iter())
+            .map(read_one)
+            .collect::<Vec<_>>(),
+    };
+    let read_us = read_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+
+    let mut failed = false;
+    for (job, outcome) in outcomes {
+        if let Err(error) = outcome {
+            failed = true;
+            eprintln!(
+                "[gemma4-ghost-metal] layer {layer_idx} direct retained-cold expert {} logical_slot={} target={:?} read failed: {error}",
+                job.expert, job.logical_fresh_slot, job.target,
+            );
+        }
+    }
+    if failed {
+        return false;
+    }
+
+    let read_bytes = resolved.len().saturating_mul(record_bytes);
+    counters.demand_loads.fetch_add(resolved.len(), Relaxed);
+    counters
+        .nvme_bytes
+        .fetch_add(read_bytes.min(u64::MAX as usize) as u64, Relaxed);
+    counters.nvme_us.fetch_add(read_us, Relaxed);
+    {
+        let mut state = cache.state.lock().expect("ghost MoE cache poisoned");
+        state.bytes_read = state
+            .bytes_read
+            .saturating_add(read_bytes.min(u64::MAX as usize) as u64);
+    }
+    for job in resolved {
+        updated_slots[job.job.expert] = job.job.logical_fresh_slot as u32;
     }
     true
 }
@@ -5982,11 +6411,16 @@ impl GhostMetalExpertRuntime {
             direct_stage_admitted,
             previous_cold_stage_absent,
         );
-        let allocated = admitted.then(|| common.arm_retained_cold_bank()).flatten();
+        let direct_bank_fill_requested = ghost_metal_retained_cold_direct_bank_fill_enabled();
+        let allocated = admitted
+            .then(|| common.arm_retained_cold_bank(direct_bank_fill_requested))
+            .flatten();
         let effective = allocated.is_some();
         let chunked_read = effective && ghost_metal_retained_cold_chunked_read_enabled();
+        let direct_bank_fill =
+            effective && direct_bank_fill_requested && common.retained_cold_record_granular();
         eprintln!(
-            "[gemma4 retained-cold bank] requested=1 effective={} records_per_layer={} layers={} hot_slots={} payload_bytes={} stride_bytes={} allocated_bytes={} direct_stage={} chunked_read={} publish_after_terminal=1 replacement=preserve-hit-then-route-order fallback=H40",
+            "[gemma4 retained-cold bank] requested=1 effective={} records_per_layer={} layers={} hot_slots={} payload_bytes={} stride_bytes={} allocated_bytes={} direct_stage={} chunked_read={} direct_bank_fill={} bank_layout={} publish_after_terminal=1 replacement=preserve-hit-then-route-order fallback=H40",
             u8::from(effective),
             crate::metal::GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER,
             layer_count,
@@ -5996,6 +6430,8 @@ impl GhostMetalExpertRuntime {
             allocated.unwrap_or(0),
             u8::from(direct_stage_admitted),
             u8::from(chunked_read),
+            u8::from(direct_bank_fill),
+            if direct_bank_fill { "record-granular" } else { "monolithic" },
         );
         effective
     }
@@ -6745,6 +7181,20 @@ impl GhostMetalExpertRuntime {
                 common.retained_cold_slot_count()
                     == self.layers.len() * crate::metal::GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER
             });
+        let retained_cold_direct_bank_fill_active = !self.prefill_round
+            && ghost_metal_retained_cold_direct_bank_fill_enabled()
+            && ghost_cache.is_some_and(|cache| {
+                ghost_metal_direct_stage_read_admitted(
+                    ghost_metal_direct_stage_read_enabled(),
+                    cache.budget_bytes,
+                    previous_cold_stage.is_some(),
+                )
+            })
+            && self.common.as_ref().is_some_and(|common| {
+                common.retained_cold_record_granular()
+                    && common.retained_cold_slot_count()
+                        == self.layers.len() * crate::metal::GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER
+            });
 
         if allow_predicted && !hot_cold_overlap_freeze_hot {
             if let Some(cache) = ghost_cache {
@@ -7111,6 +7561,34 @@ impl GhostMetalExpertRuntime {
             }
         });
 
+        let mut retained_direct_filler = retained_cold_direct_bank_fill_active
+            .then(|| {
+                ghost_cache.map(|cache| {
+                    |layer_idx: usize,
+                     experts: &[usize],
+                     stage: &metal::Buffer,
+                     stage_slot_count: usize,
+                     bank: &crate::metal::Gemma4Q4ExpertSlots,
+                     placements: &[crate::metal::Gemma4RetainedColdPlacement],
+                     updated_slots: &mut [u32; 128]|
+                     -> bool {
+                        fill_retained_cold_direct_from_file(
+                            stage,
+                            stage_slot_count,
+                            bank,
+                            cache,
+                            layer_idx,
+                            experts,
+                            placements,
+                            updated_slots,
+                            &fill_counters,
+                            retained_cold_chunked_read_active,
+                        )
+                    }
+                })
+            })
+            .flatten();
+
         let pong_slab_for_gpu = pong_slab_buf.clone();
         let wave1_bufs_for_fill = &wave1_bufs;
         let fill_counters_for_pong = &fill_counters;
@@ -7145,6 +7623,20 @@ impl GhostMetalExpertRuntime {
                 &mut Vec<usize>,
             ) -> bool,
         > = match slot_filler.as_mut() {
+            Some(f) => Some(f),
+            None => None,
+        };
+        let retained_direct_fill_fn: Option<
+            &mut dyn FnMut(
+                usize,
+                &[usize],
+                &metal::Buffer,
+                usize,
+                &crate::metal::Gemma4Q4ExpertSlots,
+                &[crate::metal::Gemma4RetainedColdPlacement],
+                &mut [u32; 128],
+            ) -> bool,
+        > = match retained_direct_filler.as_mut() {
             Some(f) => Some(f),
             None => None,
         };
@@ -7183,6 +7675,8 @@ impl GhostMetalExpertRuntime {
                 &num_slots_per_layer,
                 out_rows,
                 slot_filler_fn,
+                retained_direct_fill_fn,
+                retained_cold_direct_bank_fill_active,
                 cold_stage_buf.as_ref(),
                 cold_stage_slot_count,
                 hot_cold_overlap_active.then_some(hot_at_start.as_slice()),
@@ -7193,6 +7687,33 @@ impl GhostMetalExpertRuntime {
                 !self.prefill_round,
             )
         };
+        // The direct retained callback bypasses the ordinary `StageCold`
+        // closure, so fold its exact plan accounting only after Metal confirms
+        // a successful cold commit. Any layer that fell back to Demand already
+        // accounted itself through the ordinary filler and has no retained
+        // per-layer receipt here.
+        drop(slot_filler);
+        if ok && retained_cold_direct_bank_fill_active {
+            if let Some(common) = self.common.as_ref() {
+                use std::sync::atomic::Ordering::Relaxed;
+                let ledger = common.last_chained_ledger();
+                for (layer_idx, layer) in self.layers.iter_mut().enumerate().take(30) {
+                    let retained_hits = usize::from(ledger.retained_cold_hits_per_layer[layer_idx]);
+                    let fresh = usize::from(ledger.retained_cold_fresh_per_layer[layer_idx]);
+                    if retained_hits + fresh == 0 {
+                        continue;
+                    }
+                    let lookups = usize::from(ledger.unique_per_layer[layer_idx]);
+                    let hits = lookups.saturating_sub(fresh);
+                    fill_counters.plan_hits.fetch_add(hits as u64, Relaxed);
+                    fill_counters.plan_misses.fetch_add(fresh as u64, Relaxed);
+                    layer.stats.route_lookups =
+                        layer.stats.route_lookups.saturating_add(lookups as u64);
+                    layer.stats.hits = layer.stats.hits.saturating_add(hits as u64);
+                    layer.stats.misses = layer.stats.misses.saturating_add(fresh as u64);
+                }
+            }
+        }
         if hybrid_terminal_promotion_allowed(
             ok,
             hybrid_mapped_backing,
@@ -7663,14 +8184,18 @@ impl GhostMetalExpertRuntime {
                 );
                 if led.retained_cold_active {
                     eprintln!(
-                        "[metal chained retained ledger] active=1 hits={} fresh={} blits={} avoided_bytes={} fresh_bytes={} chunked_records={} chunked_preads={} max_chunks_per_record={}",
+                        "[metal chained retained ledger] active=1 hits={} fresh={} blits={} direct_bank_fills={} avoided_bytes={} fresh_bytes={} eliminated_copy_traffic_bytes={} chunked_records={} chunked_preads={} max_chunks_per_record={}",
                         led.retained_cold_hits,
                         led.retained_cold_fresh,
                         led.retained_cold_blits,
+                        led.retained_cold_direct_fills,
                         u64::from(led.retained_cold_hits)
                             .saturating_mul(crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES as u64),
                         u64::from(led.retained_cold_fresh)
                             .saturating_mul(crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES as u64),
+                        u64::from(led.retained_cold_direct_fills)
+                            .saturating_mul(crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES as u64)
+                            .saturating_mul(2),
                         led.chunked_read_records,
                         led.chunked_read_preads,
                         led.chunked_read_max_chunks,

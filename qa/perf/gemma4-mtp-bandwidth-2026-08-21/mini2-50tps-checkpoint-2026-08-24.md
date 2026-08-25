@@ -76,6 +76,9 @@ Every number below is from a receipt with `exact_match_expected: true` and a
 | H40 H38 + 2,100 hot slots | 4 | **34.69, 35.28, 35.08** | promoted Mini2 profile |
 | H41 2,200 hot slots | 4 | 34.77, 34.93 | more memory, no gain |
 | H42 rebalanced 2,100 slots | 4 | 34.82 | fewer reads, no gain |
+| H43 retained cold bank | 4 | 33.53, 33.42 | fewer reads, serialized blits, no-go |
+| H44 retained bank + chunked reads | 4 | 34.33 | recovered read parallelism, no-go |
+| H45 direct-to-bank, zero blits | 4 | 33.01 | removed copies, exposed no critical-path gain |
 
 ## Post-H40 ceiling
 
@@ -84,9 +87,9 @@ was 226.90 ms and the target verifier was 1,133.00 ms. Inside the target,
 measured GPU stages totaled 701.8 ms and direct-stage I/O totaled 512.3 ms;
 81.1 ms overlapped.
 
-- 40 tok/s requires 1,200 ms, so it needs another 160.46 ms removed. A true
-  retained cold cache could plausibly do this if it avoids roughly 182–216 of
-  H40's 580 reads.
+- 40 tok/s requires 1,200 ms, so it needs another 160.46 ms removed. H43–H45
+  closed retained-I/O microtuning as that source: avoiding 229 reads and then
+  removing every replacement blit still failed to beat H40.
 - 50 tok/s requires 960 ms, so it needs 400.46 ms removed. With assistant and
   GPU work unchanged, the stage-free arithmetic roof is only about 51.65
   tok/s, leaving 30.74 ms of total margin. Roughly 93% of exposed stage time
@@ -106,11 +109,17 @@ stage-to-bank blits copied another 886.9 MiB on the Metal queue.
 H44 adaptively split sparse fresh records across the eight-reader pool, capped
 at four positioned reads per record. It remained exact at 34.33 tok/s with zero
 swap and recovered about 38 ms versus H43 candidate 2, but did not beat H40.
-The next bounded experiment is direct-to-bank replacement fill: invalidate an
-unused bank destination before I/O, read its exact fresh record there while the
-hot command runs, bind that bank slot for the cold command, and publish its
-identity only after terminal success. That removes the blits without adding
-memory or changing the H40 default.
+
+H45 completed the direct-to-bank experiment. It replaced the monolithic bank
+with six distinct record resources per layer, gave the committed hot command a
+ready-only table, invalidated replacement identities before positioned reads,
+and committed the full cold table only after every exact read joined. It stayed
+48/48 exact and at zero swap, converted all 278 replacement blits to direct
+fills, and removed about 1.73 GiB of duplicate unified-memory read/write
+traffic. Throughput nevertheless fell to 33.01 tok/s. Its three later rounds
+were essentially flat against H44; a 54 ms first-round regression accounted for
+nearly the entire loss. The retained copies were therefore not on the exposed
+critical path, and further bank/chunk/read tuning is closed.
 
 Practical 50 tok/s on this exact 16 GiB lane needs both near-complete cold
 availability including first-use records and additional target-compute margin,
@@ -125,6 +134,9 @@ Focused gates passed under `cam-lock.sh` with `CARGO_BUILD_JOBS=2`:
 - verifier schedule parser/sequence/tail: 3/3;
 - existing adaptive-width tests: 3/3;
 - direct-stage parser/admission/I/O-order tests: 3/3;
+- retained-bank environment/chunk policy and direct target mapping: 7/7;
+- retained planning, two-phase publication, legacy blits, record-resource
+  isolation, and separate hot/full binding gates: 7/7;
 - existing previous-cold-stage tests: 2/2;
 - K9–K12 specialized/general GateUp raw-bit parity (H31 research lane);
 - `cargo fmt --check`, `git diff --check`, and guarded release build.

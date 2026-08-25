@@ -14031,35 +14031,37 @@ impl Gemma4Q4HybridExpertSource {
         Some((table, lease))
     }
 
-    /// Build the retained-bank variant of the compact hot/cold table. Work
-    /// slots are `[hot | retained hits | fresh stage]`; every source is an
-    /// anonymous Metal buffer and the shared hybrid lease freezes hot records
-    /// through both command buffers.
-    fn materialize_hot_retained_stage_table(
+    /// Build separate retained-bank tables from one hot-directory snapshot.
+    /// The hot command can address only `[hot | retained hits]`; the cold
+    /// command owns the full `[hot | retained hits | fresh]` table. Keeping
+    /// fresh bank destinations out of the hot argument table makes H45's CPU
+    /// writes disjoint at the Metal-resource level, not merely by byte range.
+    fn materialize_hot_retained_fresh_tables(
         self: &std::sync::Arc<Self>,
         hot_experts: &[usize],
         retained: &[Gemma4RetainedColdHit],
-        retained_slab: &Buffer,
+        retained_slots: &Gemma4Q4ExpertSlots,
         fresh_experts: &[usize],
         stage_slab: &Buffer,
+        placements: &[Gemma4RetainedColdPlacement],
+        direct_fresh_to_bank: bool,
     ) -> Option<(
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
         spec50_moe_argbuf::Gemma4MoeSlotArgTable,
         std::sync::Arc<Gemma4Q4HybridBindingLease>,
     )> {
-        let unique = hot_experts
-            .len()
-            .checked_add(retained.len())?
-            .checked_add(fresh_experts.len())?;
+        let ready = hot_experts.len().checked_add(retained.len())?;
+        let unique = ready.checked_add(fresh_experts.len())?;
         if hot_experts.is_empty()
             || retained.len().checked_add(fresh_experts.len())? == 0
             || unique > 128
-            || usize::try_from(retained_slab.length()).ok()?
-                < GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?
+            || retained_slots.anonymous_slot_count() != GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER
+            || (direct_fresh_to_bank && !retained_slots.is_record_granular())
         {
             return None;
         }
         let mut seen = [false; 128];
-        let mut retained_slots = [false; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER];
+        let mut retained_slot_mask = [false; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER];
         for &expert in hot_experts {
             if expert >= 128 || seen[expert] {
                 return None;
@@ -14069,19 +14071,35 @@ impl Gemma4Q4HybridExpertSource {
         for hit in retained {
             if hit.expert >= 128
                 || seen[hit.expert]
-                || hit.bank_slot >= retained_slots.len()
-                || retained_slots[hit.bank_slot]
+                || hit.bank_slot >= retained_slot_mask.len()
+                || retained_slot_mask[hit.bank_slot]
             {
                 return None;
             }
             seen[hit.expert] = true;
-            retained_slots[hit.bank_slot] = true;
+            retained_slot_mask[hit.bank_slot] = true;
         }
         for &expert in fresh_experts {
             if expert >= 128 || seen[expert] {
                 return None;
             }
             seen[expert] = true;
+        }
+        let mut placed_fresh = vec![None; fresh_experts.len()];
+        let mut placed_bank = [false; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER];
+        for placement in placements {
+            if placement.expert >= 128
+                || placement.fresh_slot >= fresh_experts.len()
+                || fresh_experts[placement.fresh_slot] != placement.expert
+                || placement.bank_slot >= placed_bank.len()
+                || retained_slot_mask[placement.bank_slot]
+                || placed_fresh[placement.fresh_slot].is_some()
+                || placed_bank[placement.bank_slot]
+            {
+                return None;
+            }
+            placed_fresh[placement.fresh_slot] = Some(placement.bank_slot);
+            placed_bank[placement.bank_slot] = true;
         }
 
         loop {
@@ -14106,36 +14124,61 @@ impl Gemma4Q4HybridExpertSource {
             source: std::sync::Arc::clone(self),
         });
         let published = self.hot_slot_ids.read().ok()?;
-        let mut records = Vec::with_capacity(unique);
-        let mut offsets = Vec::with_capacity(unique);
+        let mut hot_records = Vec::with_capacity(ready);
+        let mut hot_offsets = Vec::with_capacity(ready);
         for &expert in hot_experts {
             let physical_slot = published
                 .iter()
                 .position(|published_expert| *published_expert == Some(expert))?;
-            records.push(self.hot_records.get(physical_slot)?.clone());
-            offsets.push(0usize);
+            hot_records.push(self.hot_records.get(physical_slot)?.clone());
+            hot_offsets.push(0usize);
         }
         for hit in retained {
-            records.push(retained_slab.clone());
-            offsets.push(hit.bank_slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
+            let (record, offset) = retained_slots.anonymous_record_view(hit.bank_slot)?;
+            hot_records.push(record);
+            hot_offsets.push(offset);
         }
-        for stage_slot in 0..fresh_experts.len() {
-            records.push(stage_slab.clone());
-            offsets.push(stage_slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
+        let mut full_records = hot_records.clone();
+        let mut full_offsets = hot_offsets.clone();
+        for fresh_slot in 0..fresh_experts.len() {
+            if direct_fresh_to_bank {
+                if let Some(bank_slot) = placed_fresh[fresh_slot] {
+                    let (record, offset) = retained_slots.anonymous_record_view(bank_slot)?;
+                    if offset != 0 {
+                        return None;
+                    }
+                    full_records.push(record);
+                    full_offsets.push(offset);
+                    continue;
+                }
+            }
+            full_records.push(stage_slab.clone());
+            full_offsets.push(fresh_slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?);
         }
         drop(published);
-        let record_slots: Vec<usize> = (0..unique).collect();
         let kernel = metal_linear_kernel()?;
-        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+        let hot_record_slots: Vec<usize> = (0..ready).collect();
+        let hot_table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
             &kernel.device,
-            unique,
-            &record_slots,
-            &records,
-            &offsets,
+            ready,
+            &hot_record_slots,
+            &hot_records,
+            &hot_offsets,
             0,
             None,
         )?;
-        Some((table, lease))
+        let full_record_slots: Vec<usize> = (0..unique).collect();
+        let full_table =
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_indexed_slot_buffer_offsets(
+                &kernel.device,
+                unique,
+                &full_record_slots,
+                &full_records,
+                &full_offsets,
+                0,
+                None,
+            )?;
+        Some((hot_table, full_table, lease))
     }
 }
 
@@ -14415,26 +14458,38 @@ impl Gemma4Q4ExpertSlotBinding {
         }
     }
 
-    fn materialize_hot_retained_stage_table(
+    fn materialize_hot_retained_fresh_tables(
         &self,
         hot_experts: &[usize],
         retained: &[Gemma4RetainedColdHit],
-        retained_slab: &Buffer,
+        retained_slots: &Gemma4Q4ExpertSlots,
         fresh_experts: &[usize],
         stage_slab: &Buffer,
-    ) -> Option<Self> {
+        placements: &[Gemma4RetainedColdPlacement],
+        direct_fresh_to_bank: bool,
+    ) -> Option<(Self, Self)> {
         match self {
             Self::HybridMappedSource(source) => source
-                .materialize_hot_retained_stage_table(
+                .materialize_hot_retained_fresh_tables(
                     hot_experts,
                     retained,
-                    retained_slab,
+                    retained_slots,
                     fresh_experts,
                     stage_slab,
+                    placements,
+                    direct_fresh_to_bank,
                 )
-                .map(|(table, lease)| Self::HybridMappedTable {
-                    table: std::sync::Arc::new(table),
-                    _lease: lease,
+                .map(|(hot_table, full_table, lease)| {
+                    (
+                        Self::HybridMappedTable {
+                            table: std::sync::Arc::new(hot_table),
+                            _lease: std::sync::Arc::clone(&lease),
+                        },
+                        Self::HybridMappedTable {
+                            table: std::sync::Arc::new(full_table),
+                            _lease: lease,
+                        },
+                    )
                 }),
             _ => None,
         }
@@ -14772,6 +14827,26 @@ impl Gemma4Q4ExpertSlots {
         }
     }
 
+    /// Resolve one anonymous record as a retained Metal buffer plus byte
+    /// offset. Monolithic H43 banks repeat one slab at fixed-stride offsets;
+    /// record-granular H45 banks return distinct resources at offset zero.
+    fn anonymous_record_view(&self, slot: usize) -> Option<(Buffer, usize)> {
+        if slot >= self.anonymous_slot_count() {
+            return None;
+        }
+        match &self.backing {
+            Gemma4Q4ExpertSlotBacking::Monolithic { slab, .. } => Some((
+                slab.clone(),
+                slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?,
+            )),
+            Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => {
+                Some((records.get(slot)?.clone(), 0))
+            }
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. }
+            | Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. } => None,
+        }
+    }
+
     fn record_table(&self) -> Option<&spec50_moe_argbuf::Gemma4MoeSlotArgTable> {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => None,
@@ -14834,6 +14909,13 @@ impl Gemma4Q4ExpertSlots {
         Some(unsafe { std::slice::from_raw_parts_mut(pointer, GEMMA4_Q4_EXPERT_RECORD_BYTES) })
     }
 
+    /// Expose one complete writable record without taking `&mut self` so a
+    /// caller can fill proven-disjoint record resources in parallel.
+    ///
+    /// # Safety
+    /// The caller must ensure that no live mutable slice or committed GPU
+    /// command can access this physical slot, and that concurrent calls use
+    /// distinct slots/resources for the full lifetime of every returned slice.
     pub(crate) unsafe fn slot_bytes_mut_raw(&self, slot: usize) -> Option<&mut [u8]> {
         if slot >= self.writable_slot_count() || !self.hot_refill_available() {
             return None;
@@ -24301,9 +24383,10 @@ pub(crate) struct Gemma4GhostCommonMetal {
     /// Diagnostic-only previous successful decode cold sets. These masks are
     /// never consulted by routing, fill, binding, or publication policy.
     cold_recurrence_previous: Option<Vec<[bool; 128]>>,
-    /// Default-off six-record-per-layer cold bank. Bytes are copied from the
-    /// exact shared stage only after a layer's Down/tail reads complete, and
-    /// identities are published only at the next queue-order terminal barrier.
+    /// Default-off six-record-per-layer cold bank. H43 copies bytes from the
+    /// exact shared stage after Down/tail; H45 may fill distinct record-granular
+    /// destinations directly before committing the cold command. Both publish
+    /// identities only at the next queue-order terminal barrier.
     retained_cold_layers: Option<Vec<Gemma4RetainedColdLayer>>,
     pub(crate) last_chained_ledger: ChainedRoundHostLedger,
 }
@@ -24378,16 +24461,19 @@ pub struct ChainedRoundHostLedger {
     pub hot_bound_per_layer: [u16; 30],
     pub mapped_bound_per_layer: [u16; 30],
     /// Exact retained-cold-bank activity for the latest chained round.
-    /// `fresh` counts records still read into the shared stage; `hits` are
-    /// stage reads avoided; `blits` are newly retained records published only
-    /// after terminal success.
+    /// `fresh` counts newly read records; `hits` are reads avoided; `blits` are
+    /// H43 stage-to-bank copies and `direct_fills` are H45 reads whose final
+    /// destination is a retained-bank record. Both publication modes remain
+    /// terminal-only.
     pub retained_cold_active: bool,
     pub retained_cold_hits: u32,
     pub retained_cold_fresh: u32,
     pub retained_cold_blits: u32,
+    pub retained_cold_direct_fills: u32,
     pub retained_cold_hits_per_layer: [u16; 30],
     pub retained_cold_fresh_per_layer: [u16; 30],
     pub retained_cold_blits_per_layer: [u16; 30],
+    pub retained_cold_direct_fills_per_layer: [u16; 30],
     /// Observation-only previous-cold recurrence receipt. Hits are
     /// `previous_cold ∩ current_cold`; current is the recall denominator and
     /// previous is the precision denominator. The arrays preserve the same
@@ -24685,10 +24771,10 @@ struct Gemma4RetainedColdHit {
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Gemma4RetainedColdBlit {
-    expert: usize,
-    stage_slot: usize,
-    bank_slot: usize,
+pub(crate) struct Gemma4RetainedColdPlacement {
+    pub(crate) expert: usize,
+    pub(crate) fresh_slot: usize,
+    pub(crate) bank_slot: usize,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -24698,7 +24784,7 @@ struct Gemma4RetainedColdPlan {
     retained: Vec<Gemma4RetainedColdHit>,
     fresh: Vec<usize>,
     next_slot_ids: [Option<usize>; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER],
-    blits: Vec<Gemma4RetainedColdBlit>,
+    blits: Vec<Gemma4RetainedColdPlacement>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -24757,18 +24843,18 @@ fn prepare_retained_cold_publish(
         hit_slots[hit.bank_slot] = true;
     }
     let mut destination_slots = [false; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER];
-    for blit in &plan.blits {
-        if blit.expert >= 128
-            || blit.stage_slot >= plan.fresh.len()
-            || plan.fresh[blit.stage_slot] != blit.expert
-            || blit.bank_slot >= destination_slots.len()
-            || hit_slots[blit.bank_slot]
-            || destination_slots[blit.bank_slot]
-            || plan.next_slot_ids[blit.bank_slot] != Some(blit.expert)
+    for placement in &plan.blits {
+        if placement.expert >= 128
+            || placement.fresh_slot >= plan.fresh.len()
+            || plan.fresh[placement.fresh_slot] != placement.expert
+            || placement.bank_slot >= destination_slots.len()
+            || hit_slots[placement.bank_slot]
+            || destination_slots[placement.bank_slot]
+            || plan.next_slot_ids[placement.bank_slot] != Some(placement.expert)
         {
             return None;
         }
-        destination_slots[blit.bank_slot] = true;
+        destination_slots[placement.bank_slot] = true;
     }
     // From this point until terminal publication, no identity may name a
     // destination whose bytes the committed blit can replace.
@@ -24867,15 +24953,15 @@ fn plan_retained_cold_layer(
         next_slot_ids[hit.bank_slot] = Some(hit.expert);
     }
     let mut blits = Vec::new();
-    for (stage_slot, &expert) in fresh.iter().enumerate() {
+    for (fresh_slot, &expert) in fresh.iter().enumerate() {
         let Some(bank_slot) = occupied.iter().position(|&used| !used) else {
             break;
         };
         occupied[bank_slot] = true;
         next_slot_ids[bank_slot] = Some(expert);
-        blits.push(Gemma4RetainedColdBlit {
+        blits.push(Gemma4RetainedColdPlacement {
             expert,
-            stage_slot,
+            fresh_slot,
             bank_slot,
         });
     }
@@ -24935,8 +25021,8 @@ fn encode_retained_cold_blits(
     command_buffer: &metal::CommandBufferRef,
     stage_slab: &Buffer,
     stage_slot_count: usize,
-    retained_slab: &Buffer,
-    blits: &[Gemma4RetainedColdBlit],
+    retained_slots: &Gemma4Q4ExpertSlots,
+    blits: &[Gemma4RetainedColdPlacement],
 ) -> bool {
     if blits.is_empty() {
         return true;
@@ -24945,59 +25031,58 @@ fn encode_retained_cold_blits(
         Ok(length) => length,
         Err(_) => return false,
     };
-    let retained_len = match usize::try_from(retained_slab.length()) {
-        Ok(length) => length,
-        Err(_) => return false,
-    };
     let Some(required_stage) = stage_slot_count.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE) else {
         return false;
     };
-    let Some(required_retained) =
-        GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
-    else {
-        return false;
-    };
-    if stage_len < required_stage || retained_len < required_retained {
+    if stage_len < required_stage
+        || retained_slots.anonymous_slot_count() != GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER
+    {
         return false;
     }
     let mut sources = vec![false; stage_slot_count];
     let mut destinations = [false; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER];
-    for blit in blits {
-        if blit.expert >= 128
-            || blit.stage_slot >= stage_slot_count
-            || blit.bank_slot >= destinations.len()
-            || sources[blit.stage_slot]
-            || destinations[blit.bank_slot]
+    let mut resolved_destinations = Vec::with_capacity(blits.len());
+    for placement in blits {
+        if placement.expert >= 128
+            || placement.fresh_slot >= stage_slot_count
+            || placement.bank_slot >= destinations.len()
+            || sources[placement.fresh_slot]
+            || destinations[placement.bank_slot]
         {
             return false;
         }
-        let Some(source_end) = blit
-            .stage_slot
+        let Some(source_end) = placement
+            .fresh_slot
             .checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
             .and_then(|offset| offset.checked_add(GEMMA4_Q4_EXPERT_RECORD_BYTES))
         else {
             return false;
         };
-        let Some(destination_end) = blit
-            .bank_slot
-            .checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
-            .and_then(|offset| offset.checked_add(GEMMA4_Q4_EXPERT_RECORD_BYTES))
+        let Some((destination, destination_offset)) =
+            retained_slots.anonymous_record_view(placement.bank_slot)
         else {
             return false;
         };
-        if source_end > stage_len || destination_end > retained_len {
+        let Some(destination_end) = destination_offset.checked_add(GEMMA4_Q4_EXPERT_RECORD_BYTES)
+        else {
+            return false;
+        };
+        if source_end > stage_len
+            || usize::try_from(destination.length()).map_or(true, |length| destination_end > length)
+        {
             return false;
         }
-        sources[blit.stage_slot] = true;
-        destinations[blit.bank_slot] = true;
+        sources[placement.fresh_slot] = true;
+        destinations[placement.bank_slot] = true;
+        resolved_destinations.push((destination, destination_offset));
     }
     let encoder = command_buffer.new_blit_command_encoder();
-    for blit in blits {
+    for (placement, (destination, destination_offset)) in blits.iter().zip(&resolved_destinations) {
         encoder.copy_from_buffer(
             stage_slab,
-            (blit.stage_slot * GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u64,
-            retained_slab,
-            (blit.bank_slot * GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u64,
+            (placement.fresh_slot * GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u64,
+            destination,
+            *destination_offset as u64,
             GEMMA4_Q4_EXPERT_RECORD_BYTES as u64,
         );
     }
@@ -25542,7 +25627,8 @@ mod hot_cold_overlap_plan_tests {
         gemma4_hybrid_hot_cold_publication_allowed, gemma4_hybrid_hot_cold_round_kind_admitted,
         hot_cold_compact_slot_table, hot_cold_split_slot_tables, partition_exact_union_by_hot,
         plan_retained_cold_layer, retained_cold_compact_slot_table, ColdRecurrenceTally,
-        CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdBlit, Gemma4RetainedColdHit,
+        CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
+        Gemma4RetainedColdPlacement,
     };
 
     fn expert_mask(experts: &[usize]) -> [bool; 128] {
@@ -25938,14 +26024,14 @@ mod hot_cold_overlap_plan_tests {
         assert_eq!(
             plan.blits,
             vec![
-                Gemma4RetainedColdBlit {
+                Gemma4RetainedColdPlacement {
                     expert: 9,
-                    stage_slot: 0,
+                    fresh_slot: 0,
                     bank_slot: 0,
                 },
-                Gemma4RetainedColdBlit {
+                Gemma4RetainedColdPlacement {
                     expert: 11,
-                    stage_slot: 1,
+                    fresh_slot: 1,
                     bank_slot: 2,
                 },
             ]
@@ -27049,7 +27135,7 @@ impl Gemma4GhostCommonMetal {
     /// Allocate the complete retained-cold bank atomically. A partial
     /// allocation is never installed, so any refusal leaves the established
     /// H40 schedule and memory footprint untouched.
-    pub(crate) fn arm_retained_cold_bank(&mut self) -> Option<usize> {
+    pub(crate) fn arm_retained_cold_bank(&mut self, record_granular: bool) -> Option<usize> {
         if self.retained_cold_layers.is_some()
             || !self.strict_26b
             || !self.moe_configured()
@@ -27060,7 +27146,11 @@ impl Gemma4GhostCommonMetal {
         let mut layers = Vec::with_capacity(self.layers.len());
         for _ in 0..self.layers.len() {
             layers.push(Gemma4RetainedColdLayer {
-                slots: Gemma4Q4ExpertSlots::new(GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER)?,
+                slots: if record_granular {
+                    Gemma4Q4ExpertSlots::new_record_granular(GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER)?
+                } else {
+                    Gemma4Q4ExpertSlots::new(GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER)?
+                },
                 slot_ids: [None; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER],
             });
         }
@@ -27069,6 +27159,12 @@ impl Gemma4GhostCommonMetal {
         )?;
         self.retained_cold_layers = Some(layers);
         Some(bytes)
+    }
+
+    pub(crate) fn retained_cold_record_granular(&self) -> bool {
+        self.retained_cold_layers.as_ref().is_some_and(|layers| {
+            !layers.is_empty() && layers.iter().all(|layer| layer.slots.is_record_granular())
+        })
     }
 
     pub(crate) fn retained_cold_slot_count(&self) -> usize {
@@ -28761,6 +28857,18 @@ impl Gemma4GhostCommonMetal {
                 &mut Vec<usize>,
             ) -> bool,
         >,
+        mut retained_cold_direct_filler: Option<
+            &mut dyn FnMut(
+                usize,
+                &[usize],
+                &Buffer,
+                usize,
+                &Gemma4Q4ExpertSlots,
+                &[Gemma4RetainedColdPlacement],
+                &mut [u32; 128],
+            ) -> bool,
+        >,
+        retained_cold_direct_bank_fill: bool,
         cold_stage_slab: Option<&Buffer>,
         cold_stage_slot_count: usize,
         hot_residency_at_start: Option<&[[bool; 128]]>,
@@ -29159,6 +29267,10 @@ impl Gemma4GhostCommonMetal {
                 .retained_cold_layers
                 .as_ref()
                 .is_some_and(|layers| layers.len() == n_layers);
+        let retained_cold_direct_bank_round = retained_cold_bank_round
+            && retained_cold_direct_bank_fill
+            && retained_cold_direct_filler.is_some()
+            && self.retained_cold_record_granular();
         ledger.retained_cold_active = retained_cold_bank_round;
         let cpu_cold_probe_requested = gemma4_hybrid_cpu_cold_probe_enabled();
         let cpu_cold_probe_round = !hot_cold_single_down
@@ -30497,7 +30609,6 @@ impl Gemma4GhostCommonMetal {
                                 .as_ref()
                                 .and_then(|layers| layers.get(layer_idx))
                                 .and_then(|bank| {
-                                    let slab = bank.slots.monolithic_slab_buffer()?.clone();
                                     plan_retained_cold_layer(
                                         &union,
                                         hot,
@@ -30505,7 +30616,6 @@ impl Gemma4GhostCommonMetal {
                                         cold_stage_slot_count,
                                         hot_cold_overlap_min_cold,
                                     )
-                                    .map(|plan| (plan, slab))
                                 })
                         })
                 } else {
@@ -30513,7 +30623,7 @@ impl Gemma4GhostCommonMetal {
                 };
                 let hot_cold_partition = retained_cold_plan
                     .as_ref()
-                    .map(|(plan, _)| {
+                    .map(|plan| {
                         let mut cold = plan.retained_experts();
                         cold.extend(plan.fresh.iter().copied());
                         (plan.hot.clone(), cold)
@@ -30558,8 +30668,7 @@ impl Gemma4GhostCommonMetal {
                 if let Some((hot_wave, cold_wave)) = hot_cold_partition {
                     let stage_slab = cold_stage_slab.expect("hot/cold admission checked");
                     let split_tables = hot_cold_split_slot_tables(&hot_wave, &cold_wave);
-                    let retained_plan = retained_cold_plan.as_ref().map(|(plan, _)| plan);
-                    let retained_slab = retained_cold_plan.as_ref().map(|(_, slab)| slab);
+                    let retained_plan = retained_cold_plan.as_ref();
                     let fresh_wave =
                         retained_plan.map_or(cold_wave.as_slice(), |plan| plan.fresh.as_slice());
                     let ready_count =
@@ -30580,7 +30689,7 @@ impl Gemma4GhostCommonMetal {
                             wave_slots_ready(hot_table, &hot_wave, 128).is_none()
                         })
                     };
-                    let mut encode_pair = |mapped_wave: bool| {
+                    let mut encode_pair = |mapped_wave: bool, direct_bank: bool| {
                         if !hot_ready {
                             return None;
                         }
@@ -30592,26 +30701,45 @@ impl Gemma4GhostCommonMetal {
                             legacy_expected_cold_table
                         };
                         let single_down = hot_cold_single_down && !mapped_wave;
-                        let hot_binding = if single_down {
-                            if let (Some(plan), Some(bank_slab)) = (retained_plan, retained_slab) {
-                                slot_binding.materialize_hot_retained_stage_table(
+                        if direct_bank && (!single_down || retained_plan.is_none()) {
+                            return None;
+                        }
+                        let hot_and_full_binding = if single_down {
+                            if let Some(plan) = retained_plan {
+                                let bank_slots =
+                                    &self.retained_cold_layers.as_ref()?.get(layer_idx)?.slots;
+                                slot_binding.materialize_hot_retained_fresh_tables(
                                     &hot_wave,
                                     &plan.retained,
-                                    bank_slab,
+                                    bank_slots,
                                     fresh_wave,
                                     stage_slab,
+                                    &plan.blits,
+                                    direct_bank,
                                 )
                             } else {
-                                slot_binding.materialize_hot_cold_stage_table(
-                                    &hot_wave, &cold_wave, stage_slab,
-                                )
+                                slot_binding
+                                    .materialize_hot_cold_stage_table(
+                                        &hot_wave, &cold_wave, stage_slab,
+                                    )
+                                    .map(|binding| (binding.clone(), binding))
                             }
                         } else {
-                            slot_binding.materialize_for_active_slots(&hot_wave)
+                            slot_binding
+                                .materialize_for_active_slots(&hot_wave)
+                                .map(|binding| (binding, slot_binding.clone()))
                         };
-                        hot_binding.and_then(|hot_binding| {
+                        hot_and_full_binding.and_then(|(hot_binding, full_binding)| {
                             if single_down {
+                                let expected_hot_records = if retained_plan.is_some() {
+                                    ready_count
+                                } else {
+                                    unique
+                                };
                                 if hot_binding.record_table().is_none_or(|table| {
+                                    table.slot_count() != expected_hot_records
+                                        || table.bound_record_count() != expected_hot_records
+                                }) || full_binding.record_table().is_none_or(|table| {
                                     table.slot_count() != unique
                                         || table.bound_record_count() != unique
                                 }) {
@@ -30695,7 +30823,7 @@ impl Gemma4GhostCommonMetal {
                                 .get(layer_idx)?
                                 .clone();
                             let cold_binding = if single_down {
-                                hot_binding.clone()
+                                full_binding
                             } else if mapped_wave {
                                 if hot_wave.len().checked_add(cold_wave.len()) != Some(unique) {
                                     return None;
@@ -30812,12 +30940,14 @@ impl Gemma4GhostCommonMetal {
                             if !cold_ok {
                                 return None;
                             }
-                            if let (Some(plan), Some(bank_slab)) = (retained_plan, retained_slab) {
+                            if let Some(plan) = retained_plan.filter(|_| !direct_bank) {
+                                let bank_slots =
+                                    &self.retained_cold_layers.as_ref()?.get(layer_idx)?.slots;
                                 if !encode_retained_cold_blits(
                                     &cold_cb,
                                     stage_slab,
                                     fresh_wave.len(),
-                                    bank_slab,
+                                    bank_slots,
                                     &plan.blits,
                                 ) {
                                     return None;
@@ -30833,6 +30963,7 @@ impl Gemma4GhostCommonMetal {
                                 expected_cold_table,
                                 mapped_wave,
                                 single_down,
+                                direct_bank,
                             ))
                         })
                     };
@@ -30840,13 +30971,18 @@ impl Gemma4GhostCommonMetal {
                     // optimization only. Any resource, receipt, or encode
                     // refusal drops its uncommitted pair and retries the
                     // established exact staged schedule unchanged.
-                    let encoded = if hot_cold_mapped_wave {
-                        match encode_pair(true) {
+                    let encoded = if retained_cold_direct_bank_round && retained_plan.is_some() {
+                        match encode_pair(false, true) {
                             Some(pair) => Some(pair),
-                            None => encode_pair(false),
+                            None => encode_pair(false, false),
+                        }
+                    } else if hot_cold_mapped_wave {
+                        match encode_pair(true, false) {
+                            Some(pair) => Some(pair),
+                            None => encode_pair(false, false),
                         }
                     } else {
-                        encode_pair(false)
+                        encode_pair(false, false)
                     };
                     drop(encode_pair);
 
@@ -30859,6 +30995,7 @@ impl Gemma4GhostCommonMetal {
                         expected_cold_table,
                         mapped_wave,
                         single_down,
+                        direct_bank,
                     )) = encoded
                     {
                         if mapped_wave {
@@ -30921,22 +31058,69 @@ impl Gemma4GhostCommonMetal {
                             hot_cb.commit();
                             let stage_started = std::time::Instant::now();
                             let mut cold_table = [0xFFFFFFFFu32; 128];
-                            let staged = fresh_wave.is_empty()
-                                || filler(
+                            // H45 invalidates every destination identity before
+                            // the first positioned read can modify bank bytes.
+                            // A failed or partial fill deliberately leaves those
+                            // identities absent; rolling them back could expose
+                            // a torn record to a later round.
+                            let direct_retained_publish = if direct_bank {
+                                retained_plan.and_then(|plan| {
+                                    prepare_retained_cold_publish(
+                                        &mut self.retained_cold_layers,
+                                        layer_idx,
+                                        plan,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            let direct_prepare_ready =
+                                !direct_bank || direct_retained_publish.is_some();
+                            let staged = if !direct_prepare_ready {
+                                false
+                            } else if fresh_wave.is_empty() {
+                                true
+                            } else if direct_bank {
+                                let bank_slots = self
+                                    .retained_cold_layers
+                                    .as_ref()
+                                    .and_then(|layers| layers.get(layer_idx))
+                                    .map(|bank| &bank.slots);
+                                match (
+                                    retained_cold_direct_filler.as_deref_mut(),
+                                    retained_plan,
+                                    bank_slots,
+                                ) {
+                                    (Some(fill), Some(plan), Some(bank_slots)) => fill(
+                                        layer_idx,
+                                        fresh_wave,
+                                        stage_slab,
+                                        cold_stage_slot_count,
+                                        bank_slots,
+                                        &plan.blits,
+                                        &mut cold_table,
+                                    ),
+                                    _ => false,
+                                }
+                            } else {
+                                filler(
                                     layer_idx,
                                     &[],
                                     Some(fresh_wave),
                                     Gemma4Q4SlotFillPhase::StageCold,
                                     &mut cold_table,
                                     &mut union,
-                                );
+                                )
+                            };
                             let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
                             ledger.wave_load_ms += stage_ms;
                             let table_exact = staged
                                 && cold_table == expected_cold_table
                                 && wave_slots_ready(&cold_table, fresh_wave, fresh_wave.len())
                                     .is_none();
-                            let retained_publish = if table_exact {
+                            let retained_publish = if direct_bank {
+                                direct_retained_publish
+                            } else if table_exact {
                                 retained_plan.and_then(|plan| {
                                     prepare_retained_cold_publish(
                                         &mut self.retained_cold_layers,
@@ -31049,7 +31233,9 @@ impl Gemma4GhostCommonMetal {
                                 if let Some(plan) = retained_plan {
                                     let hits = plan.retained.len();
                                     let fresh = plan.fresh.len();
-                                    let blits = plan.blits.len();
+                                    let blits = if direct_bank { 0 } else { plan.blits.len() };
+                                    let direct_fills =
+                                        if direct_bank { plan.blits.len() } else { 0 };
                                     ledger.retained_cold_hits = ledger
                                         .retained_cold_hits
                                         .saturating_add(hits.min(u32::MAX as usize) as u32);
@@ -31059,6 +31245,9 @@ impl Gemma4GhostCommonMetal {
                                     ledger.retained_cold_blits = ledger
                                         .retained_cold_blits
                                         .saturating_add(blits.min(u32::MAX as usize) as u32);
+                                    ledger.retained_cold_direct_fills = ledger
+                                        .retained_cold_direct_fills
+                                        .saturating_add(direct_fills.min(u32::MAX as usize) as u32);
                                     if let Some(value) =
                                         ledger.retained_cold_hits_per_layer.get_mut(layer_idx)
                                     {
@@ -31077,6 +31266,14 @@ impl Gemma4GhostCommonMetal {
                                         *value = value
                                             .saturating_add(blits.min(u16::MAX as usize) as u16);
                                     }
+                                    if let Some(value) = ledger
+                                        .retained_cold_direct_fills_per_layer
+                                        .get_mut(layer_idx)
+                                    {
+                                        *value = value.saturating_add(
+                                            direct_fills.min(u16::MAX as usize) as u16,
+                                        );
+                                    }
                                 }
                                 if hot_cold_overlap_publish {
                                     pending_staged_promotion =
@@ -31090,11 +31287,12 @@ impl Gemma4GhostCommonMetal {
                                     if single_down {
                                         if let Some(plan) = retained_plan {
                                             eprintln!(
-                                                "[metal chained retained] layer={layer_idx} hot={} retained_hits={} fresh={} blits={} bank_occupied={} active={} route_passes=1 down_passes=1 merge_passes=0 publish=terminal stage={stage_ms:.2}ms",
+                                                "[metal chained retained] layer={layer_idx} hot={} retained_hits={} fresh={} blits={} direct_fills={} bank_occupied={} active={} route_passes=1 down_passes=1 merge_passes=0 publish=terminal stage={stage_ms:.2}ms",
                                                 plan.hot.len(),
                                                 plan.retained.len(),
                                                 plan.fresh.len(),
-                                                plan.blits.len(),
+                                                if direct_bank { 0 } else { plan.blits.len() },
+                                                if direct_bank { plan.blits.len() } else { 0 },
                                                 plan.next_slot_ids.iter().flatten().count(),
                                                 unique,
                                             );
@@ -48476,6 +48674,14 @@ kernel void sample_active_expert_records(
         );
         assert!(slots.record_buffer(PHYSICAL_SLOTS - 1).is_some());
         assert!(slots.record_buffer(PHYSICAL_SLOTS).is_none());
+        let (record0, offset0) = slots.anonymous_record_view(0).expect("record zero view");
+        let (record1, offset1) = slots.anonymous_record_view(1).expect("record one view");
+        assert_eq!(offset0, 0);
+        assert_eq!(offset1, 0);
+        assert_eq!(record0.length() as usize, GEMMA4_Q4_EXPERT_SLOT_STRIDE);
+        assert_eq!(record1.length() as usize, GEMMA4_Q4_EXPERT_SLOT_STRIDE);
+        assert_ne!(record0.contents(), record1.contents());
+        assert!(slots.anonymous_record_view(PHYSICAL_SLOTS).is_none());
         assert!(slots.slot_bytes_mut(PHYSICAL_SLOTS - 1).is_some());
         assert!(slots.slot_bytes_mut(PHYSICAL_SLOTS).is_none());
         let (locked, failed) = slots.pin_working_set();
@@ -48495,8 +48701,8 @@ kernel void sample_active_expert_records(
         }
         let initial = [Some(40), Some(7), Some(41), Some(3), Some(42), Some(43)];
         let mut layers = Some(vec![Gemma4RetainedColdLayer {
-            slots: Gemma4Q4ExpertSlots::new(GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER)
-                .expect("retained bank"),
+            slots: Gemma4Q4ExpertSlots::new_record_granular(GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER)
+                .expect("record-granular retained bank"),
             slot_ids: initial,
         }]);
         let hot = {
@@ -48533,6 +48739,81 @@ kernel void sample_active_expert_records(
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn metal_retained_direct_hot_table_excludes_fresh_destination_resources() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let span = 128usize
+            .checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+            .expect("mapped hybrid span");
+        let file = tempfile::NamedTempFile::new().expect("hybrid sparse fixture");
+        file.as_file()
+            .set_len(span as u64)
+            .expect("size sparse mapped cold tier");
+        let mmap =
+            crate::wire_mmap::GgufWireMmap::map(file.path()).expect("map sparse hybrid cold tier");
+        let mut hot_slots =
+            Gemma4Q4ExpertSlots::new_hybrid_mapped_record_granular_with_hot_slots(mmap, 0, span, 4)
+                .expect("four-record hot tier");
+        {
+            let mut refill = hot_slots.begin_hybrid_refill().expect("exclusive refill");
+            assert!(refill.publish_hot_slot_ids(&[Some(1), Some(5), None, None]));
+        }
+        let bank = Gemma4Q4ExpertSlots::new_record_granular(GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER)
+            .expect("record-granular retained bank");
+        let kernel = metal_linear_kernel().expect("Metal kernel");
+        let stage = kernel.device.new_buffer(
+            (3 * GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let retained = [
+            Gemma4RetainedColdHit {
+                expert: 7,
+                bank_slot: 1,
+            },
+            Gemma4RetainedColdHit {
+                expert: 3,
+                bank_slot: 3,
+            },
+        ];
+        let fresh = [9, 11, 13];
+        let placements = [
+            Gemma4RetainedColdPlacement {
+                expert: 9,
+                fresh_slot: 0,
+                bank_slot: 0,
+            },
+            Gemma4RetainedColdPlacement {
+                expert: 11,
+                fresh_slot: 1,
+                bank_slot: 2,
+            },
+        ];
+        let source = hot_slots.gpu_binding();
+        let (hot, full) = source
+            .materialize_hot_retained_fresh_tables(
+                &[1, 5],
+                &retained,
+                &bank,
+                &fresh,
+                &stage,
+                &placements,
+                true,
+            )
+            .expect("separate direct retained tables");
+        assert_eq!(hot.record_table().unwrap().slot_count(), 4);
+        assert_eq!(hot.record_table().unwrap().bound_record_count(), 4);
+        assert_eq!(full.record_table().unwrap().slot_count(), 7);
+        assert_eq!(full.record_table().unwrap().bound_record_count(), 7);
+        assert!(hot_slots.begin_hybrid_refill().is_none());
+        drop(hot);
+        assert!(hot_slots.begin_hybrid_refill().is_none());
+        drop(full);
+        assert!(hot_slots.begin_hybrid_refill().is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn metal_retained_cold_blits_are_ordered_payload_only_and_fail_closed() {
         if !detect_metal_device().available {
             return;
@@ -48546,9 +48827,12 @@ kernel void sample_active_expert_records(
         let stage = kernel
             .device
             .new_buffer(stage_bytes as u64, MTLResourceOptions::StorageModeShared);
-        let bank = kernel
-            .device
-            .new_buffer(bank_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let bank = Gemma4Q4ExpertSlots::new(GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER)
+            .expect("monolithic retained bank");
+        let bank_slab = bank
+            .monolithic_slab_buffer()
+            .expect("monolithic bank slab")
+            .clone();
         unsafe {
             std::ptr::write_bytes(seed.contents().cast::<u8>(), 0x31, stage_bytes);
             std::ptr::write_bytes(
@@ -48559,17 +48843,17 @@ kernel void sample_active_expert_records(
                 GEMMA4_Q4_EXPERT_RECORD_BYTES,
             );
             std::ptr::write_bytes(stage.contents().cast::<u8>(), 0xa5, stage_bytes);
-            std::ptr::write_bytes(bank.contents().cast::<u8>(), 0x5c, bank_bytes);
+            std::ptr::write_bytes(bank_slab.contents().cast::<u8>(), 0x5c, bank_bytes);
         }
         let blits = [
-            Gemma4RetainedColdBlit {
+            Gemma4RetainedColdPlacement {
                 expert: 9,
-                stage_slot: 0,
+                fresh_slot: 0,
                 bank_slot: 2,
             },
-            Gemma4RetainedColdBlit {
+            Gemma4RetainedColdPlacement {
                 expert: 11,
-                stage_slot: 1,
+                fresh_slot: 1,
                 bank_slot: 5,
             },
         ];
@@ -48592,7 +48876,10 @@ kernel void sample_active_expert_records(
         assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
 
         let bank_bytes = unsafe {
-            std::slice::from_raw_parts(bank.contents().cast::<u8>(), bank.length() as usize)
+            std::slice::from_raw_parts(
+                bank_slab.contents().cast::<u8>(),
+                bank_slab.length() as usize,
+            )
         };
         for (slot, expected) in [(2usize, 0x31u8), (5usize, 0x72u8)] {
             let base = slot * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
@@ -48609,20 +48896,20 @@ kernel void sample_active_expert_records(
 
         let duplicate_source = [
             blits[0],
-            Gemma4RetainedColdBlit {
+            Gemma4RetainedColdPlacement {
                 bank_slot: 3,
                 ..blits[0]
             },
         ];
         let duplicate_destination = [
             blits[0],
-            Gemma4RetainedColdBlit {
-                stage_slot: 1,
+            Gemma4RetainedColdPlacement {
+                fresh_slot: 1,
                 ..blits[0]
             },
         ];
-        let invalid_source = [Gemma4RetainedColdBlit {
-            stage_slot: 2,
+        let invalid_source = [Gemma4RetainedColdPlacement {
+            fresh_slot: 2,
             ..blits[0]
         }];
         for invalid in [
