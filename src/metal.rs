@@ -16609,13 +16609,34 @@ pub(crate) fn try_gemma4_q4_fused_moe_layer_chunk(
     None
 }
 
-/// Encode the strict single-token Q6_K x Q8_K GEMV used by Gemma 4's tied
-/// head. `scalar` carries `n_superblocks` at byte 0 and `rows` at byte 4.
-/// `weight_offset` permits a file-backed, page-aligned Metal buffer window to
-/// expose a tensor that starts after the beginning of that window.
+/// Selects the reassociated turbo kernel or the strict ordered parity kernel
+/// for one Q6_K projection.
+#[cfg(target_os = "macos")]
+enum Q6kSingleKernel {
+    TurboIfAvailable,
+    Ordered,
+}
+
+#[cfg(target_os = "macos")]
+fn runtime_q6k_single_kernel() -> Q6kSingleKernel {
+    if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
+        .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+    {
+        Q6kSingleKernel::Ordered
+    } else {
+        Q6kSingleKernel::TurboIfAvailable
+    }
+}
+
+/// Encode the single-token Q6_K x Q8_K GEMV used by Gemma 4's tied head.
+/// `kernel_selection` lets strict arithmetic tests bypass the production turbo
+/// default without mutating process-global environment state. `scalar` carries
+/// `n_superblocks` at byte 0 and `rows` at byte 4. `weight_offset` permits a
+/// file-backed, page-aligned Metal buffer window to expose a tensor that starts
+/// after the beginning of that window.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn encode_q6k_ordered_single(
+fn encode_q6k_single(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
     input_scales: &Buffer,
@@ -16629,11 +16650,11 @@ fn encode_q6k_ordered_single(
     input_scales_offset: u64,
     input_quants_offset: u64,
     output_offset: u64,
+    kernel_selection: Q6kSingleKernel,
 ) {
-    let turbo_pipeline = (!std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
-        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false")))
-    .then(|| admitted_32_lane_pipeline(kernel.q6k_linear_turbo_pipeline.as_ref()))
-    .flatten();
+    let turbo_pipeline = matches!(kernel_selection, Q6kSingleKernel::TurboIfAvailable)
+        .then(|| admitted_32_lane_pipeline(kernel.q6k_linear_turbo_pipeline.as_ref()))
+        .flatten();
     encoder
         .set_compute_pipeline_state(turbo_pipeline.unwrap_or(&kernel.q6k_linear_ordered_pipeline));
     encoder.set_buffer(0, Some(input_scales), input_scales_offset);
@@ -16778,7 +16799,7 @@ fn encode_q6k_ordered_batch_at(
 }
 
 /// Encode K candidate Q6_K GEMVs. Prefers a tile-once kernel that matches the
-/// same per-token reduction `encode_q6k_ordered_single` / `forward()` uses
+/// same per-token reduction `encode_q6k_single` / `forward()` uses
 /// (turbo simd_sum when that lane is live, otherwise ordered lane-zero fold).
 /// Falls back to K serial GEMVs in this command buffer if the batch pipeline
 /// is missing or K>8.
@@ -16800,7 +16821,7 @@ fn encode_q6k_ordered_batch(
     softcap: f32,
 ) {
     if k_batch == 1 {
-        encode_q6k_ordered_single(
+        encode_q6k_single(
             encoder,
             kernel,
             input_scales,
@@ -16814,6 +16835,7 @@ fn encode_q6k_ordered_batch(
             0,
             0,
             0,
+            runtime_q6k_single_kernel(),
         );
         return;
     }
@@ -17782,7 +17804,7 @@ impl Gemma4Q6KHead {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         let n_superblocks = state.hidden / 256;
-        encode_q6k_ordered_single(
+        encode_q6k_single(
             encoder,
             kernel,
             &state.q8k_scales,
@@ -17796,6 +17818,7 @@ impl Gemma4Q6KHead {
             0,
             0,
             0,
+            runtime_q6k_single_kernel(),
         );
         encoder.end_encoding();
         cb.commit();
@@ -18153,7 +18176,7 @@ impl Gemma4Q6KHead {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         let n_superblocks = state.hidden / 256;
-        encode_q6k_ordered_single(
+        encode_q6k_single(
             encoder,
             kernel,
             &state.q8k_scales,
@@ -18167,6 +18190,7 @@ impl Gemma4Q6KHead {
             0,
             0,
             0,
+            runtime_q6k_single_kernel(),
         );
 
         encoder.set_compute_pipeline_state(&kernel.argmax_f32_greedy_pipeline);
@@ -21067,6 +21091,7 @@ fn encode_q8_matmul_f32y_batched(
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
     e.set_buffer(6, Some(scalar), 8);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: (rows as u64).div_ceil(2),
@@ -21074,7 +21099,7 @@ fn encode_q8_matmul_f32y_batched(
             depth: 1,
         },
         metal::MTLSize {
-            width: 32,
+            width: 256,
             height: 1,
             depth: 1,
         },
@@ -48470,7 +48495,7 @@ mod tests {
 
             let command_buffer = kernel.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encode_q6k_ordered_single(
+            encode_q6k_single(
                 encoder,
                 kernel,
                 &input_scales,
@@ -48484,6 +48509,7 @@ mod tests {
                 0,
                 0,
                 0,
+                Q6kSingleKernel::Ordered,
             );
             encoder.end_encoding();
             command_buffer.commit();
