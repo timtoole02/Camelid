@@ -82,9 +82,7 @@ fn test_genuine_gemma4_pipelined_spec_generation_k8() {
         let mut draft_logits = cur_logits.clone();
         let mut draft_kc = kc.clone();
         let mut draft_vc = vc.clone();
-        let mut draft_pos = cur_pos;
-
-        for _ in 0..k {
+        for draft_pos in (cur_pos..).take(k) {
             let tok = draft_logits
                 .iter()
                 .enumerate()
@@ -95,7 +93,6 @@ fn test_genuine_gemma4_pipelined_spec_generation_k8() {
             draft_logits = runtime
                 .step(tok, draft_pos, &mut draft_kc, &mut draft_vc)
                 .expect("draft step");
-            draft_pos += 1;
         }
 
         // 2. Prefetch Top-14 candidates for the chunk

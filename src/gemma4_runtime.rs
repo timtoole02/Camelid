@@ -2075,23 +2075,23 @@ const GHOST_METAL_DECODE_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DECOD
 /// which is the point of this switch. Refusal (a live table lease or a union
 /// wider than the hot budget) simply retains the mapped fallback, so the switch
 /// is a performance opt-in and never a correctness dependency.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_HYBRID_DEMAND_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION";
 /// Exact decode-only A/B: execute the already-resident routed experts while
 /// the host fills newly-routed records into one reusable cold staging slab.
 /// The cold wave is committed only after its complete records and directory
 /// are published; unset keeps the established demand-promotion schedule.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_HYBRID_HOT_COLD_OVERLAP_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP";
 /// Exact opt-in for the six-record-per-layer retained cold bank. It is armed
 /// only on the frozen H40 shape; every other configuration keeps the existing
 /// direct-stage schedule unchanged.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_RETAINED_COLD_BANK_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_BANK";
 /// Exact opt-in for restoring read-pool queue depth after retained hits leave
 /// only a few fresh records in a layer. It has no effect unless the retained
 /// bank is successfully armed.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_RETAINED_COLD_CHUNKED_READ_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_CHUNKED_READ";
 /// Exact decode-only H45 opt-in. Fresh retained-bank replacements are read
@@ -2099,25 +2099,25 @@ const GHOST_METAL_RETAINED_COLD_CHUNKED_READ_ENV: &str =
 /// its original compact-stage slot. This removes the post-Down bank blits
 /// without letting the committed hot command reference any destination that
 /// the CPU can still mutate.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL";
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_SINGLE_DOWN";
 /// H54 exact three-wave GateUp schedule. Already-ready live-sequential cold
 /// records use a separate bounded Metal slab while authoritative direct reads
 /// write the disjoint demand slab. The full-union Down remains single.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_THREE_WAVE_GATEUP_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_THREE_WAVE_GATEUP";
 /// Exact H55-only opt-in for restoring read-pool queue depth when live-stage
 /// hits leave fewer authoritative demand records than read workers. It changes
 /// only the positioned-read fanout inside `StageColdLaunch`; the established
 /// fallback, slot policy, byte count, and command schedule remain unchanged.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ";
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH";
 #[cfg(any(target_os = "macos", test))]
@@ -2321,7 +2321,7 @@ fn ghost_metal_live_sequential_hot_profile_admitted(profile: &[usize]) -> bool {
 /// its final Metal stage slot instead of allocating an intermediate record and
 /// copying it a second time. H50 can admit a separately bounded previous-cold
 /// source, but only through its own exact literal opt-in below.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_DIRECT_STAGE_READ_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DIRECT_STAGE_READ";
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
@@ -2330,16 +2330,16 @@ const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 512;
 /// decode's exact cold routes while the MTP assistant runs. The current
 /// router remains authoritative; staged bytes are only an alternate source
 /// for its exact `StageCold` identities.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE";
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_RECORDS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE_RECORDS";
 /// H50 exact compatibility gate. When both previous-cold staging and the
 /// direct-to-stage lane are enabled, only already-ready matching private bytes
 /// may substitute for one exact direct read. Every other state is claimed by
 /// authoritative demand without waiting.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_DIRECT_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE_DIRECT";
 #[cfg(any(target_os = "macos", test))]
@@ -2358,17 +2358,17 @@ const GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS: usize = 64;
 /// assistant proposals against exact start residency and post-router unions.
 /// Neither receipt changes a slot, table, command buffer, token, or fallback
 /// decision.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_SPARSE_PREDICT_PROBE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_SPARSE_PREDICT_PROBE";
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_SPARSE_PREDICT_CAP: usize = 48;
 /// Observation-only sequential predictor probe. After layer L's exact
 /// attention/router barrier, the Metal lane exposes the completed post-attention
 /// hidden rows to the existing CPU router predictor for layer L+1. The ranked
 /// result is compared with L+1's later exact union, but never drives a read,
 /// slot, table, command buffer, route, or fallback decision.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE";
 /// H56 observation-only replay of the official assistant's post-projection
@@ -2376,40 +2376,40 @@ const GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV: &str =
 /// verification, but projection and comparison run only after the exact target
 /// head has fixed the verifier output. No candidate from this probe is ever
 /// passed to a stage, slot filler, route table, or execution admission path.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_ENV: &str = "CAMELID_GEMMA4_MTP_ASSISTANT_ROUTER_PROBE";
 /// Exact H40-only consumer for the live sequential signal. Private bounded
 /// readers may prepare next-layer cold records, but exact demand never waits
 /// for them and remains the only authority for slots and routing.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE";
 /// H48 expansion of the exact H47 lane: a second private reader under the same
 /// cap-eight candidate set. This remains subordinate to the stage opt-in and
 /// literal `1` so a stale profile cannot silently widen I/O or memory.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER";
 /// Replace the per-row advisory router matvecs with one Accelerate SGEMM per
 /// layer. The signal remains advisory and exact StageCold demand is unchanged.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT";
 /// H70 widens only the private rolling prediction payload. The exact router,
 /// static hot profile, compact Metal stage, and demand reader remain unchanged.
 /// Admission is deliberately stricter than the parent stage selector below.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16";
 /// Observation-only exact route/residency trace for offline placement work.
 /// This is not inherited by H49/H69: a dedicated literal-1 selector is
 /// required so ordinary throughput receipts do not pay formatting/log I/O.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_EXACT_RESIDENCY_TRACE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_EXACT_RESIDENCY_TRACE";
 /// Default-off H71 policy: select the fixed Mini2 hot footprint from exact
 /// prompt-only route recency/chunk-presence scores at the prefill handoff.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF";
 /// Default-off H71 subordinate policy: when the prompt route union does not
@@ -2526,7 +2526,7 @@ fn ghost_metal_demand_load_only_from_env() -> bool {
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn ghost_metal_sparse_predict_probe_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -15111,7 +15111,7 @@ const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS: usize = 30;
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN: usize = 2_816;
 #[cfg(any(target_os = "macos", test))]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS: usize = 128;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_TOP_K: usize = 8;
 
 /// Request-local H56 source. The official assistant already applied its

@@ -13581,7 +13581,7 @@ pub(crate) const GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER: usize = 6;
 /// This is a physical-record budget, not a limit on routed canonical expert
 /// IDs: every one of the 128 experts remains addressable through the mapped
 /// fallback.
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) const GEMMA4_Q4_HYBRID_HOT_SLOTS: usize = 32;
 /// Global overflow experts reused across layers. 20 resident + 24 overflow covers
 /// measured K=8 unique max of 42.

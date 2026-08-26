@@ -365,10 +365,9 @@ fn capital_france_greedy_matches_oracle() {
     let mut kc = vec![Vec::new(); 30];
     let mut vc = vec![Vec::new(); 30];
     let mut metal_tops = Vec::new();
-    let mut last_logits = Vec::new();
     let mut first_mismatch: Option<(usize, u32, u32, u32)> = None;
     for (pos, &tok) in ORACLE_PROMPT_TOKENS.iter().enumerate() {
-        last_logits = runtime
+        let last_logits = runtime
             .step(tok, pos, &mut kc, &mut vc)
             .expect("metal step");
         let top = argmax(&last_logits);

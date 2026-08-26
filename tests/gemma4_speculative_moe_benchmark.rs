@@ -113,11 +113,9 @@ fn benchmark_speculative_moe_batch_k() {
         let mut temp_kc = kc.clone();
         let mut temp_vc = vc.clone();
         let mut cand_tok = cur_tok;
-        let mut cand_pos = cur_pos;
-
         let mut round_layer_experts: Vec<HashSet<usize>> = vec![HashSet::new(); 30];
 
-        for _ in 0..k {
+        for cand_pos in (cur_pos..).take(k) {
             let (out, prof) = runtime
                 .step_range_profiled(cand_tok, cand_pos, None, &mut temp_kc, &mut temp_vc)
                 .expect("step");
@@ -141,7 +139,6 @@ fn benchmark_speculative_moe_batch_k() {
                 }
             }
             cand_tok = next_id;
-            cand_pos += 1;
         }
 
         let total_unique_experts: usize = round_layer_experts.iter().map(|s| s.len()).sum();
