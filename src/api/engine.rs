@@ -17,7 +17,7 @@
 //! and queued jobs from dropped handlers return immediately when they run.
 
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -80,6 +80,10 @@ pub(crate) struct EngineHandle {
     active_completed_units: Arc<AtomicU64>,
     next_task_id: Arc<AtomicU64>,
     continuous_batch_slots: usize,
+    /// Monotonic low-memory admission mode. Once enabled, retained
+    /// cooperative sessions and exclusive jobs are drained one at a time so
+    /// only one task can own populated KV state.
+    single_kv_owner_mode: Arc<AtomicBool>,
     /// Cooperative slots the worker currently holds. Published by the worker
     /// itself, which already computes it for `CooperativeStepContext`.
     occupied_slots: Arc<AtomicUsize>,
@@ -146,6 +150,13 @@ fn epoch_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn run_exclusive_job(job: ExclusiveJob, exclusive_active: &AtomicUsize, depth: &AtomicUsize) {
+    exclusive_active.store(1, Ordering::Relaxed);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+    exclusive_active.store(0, Ordering::Relaxed);
+    depth.fetch_sub(1, Ordering::SeqCst);
+}
+
 impl EngineHandle {
     /// Spawn the engine worker thread and return the posting handle.
     pub(crate) fn spawn() -> Self {
@@ -162,28 +173,54 @@ impl EngineHandle {
         let active_completed_units = Arc::new(AtomicU64::new(0));
         let occupied_slots = Arc::new(AtomicUsize::new(0));
         let exclusive_active = Arc::new(AtomicUsize::new(0));
+        let single_kv_owner_mode = Arc::new(AtomicBool::new(false));
         let worker_occupied = Arc::clone(&occupied_slots);
         let worker_exclusive = Arc::clone(&exclusive_active);
+        let worker_single_kv_owner = Arc::clone(&single_kv_owner_mode);
         std::thread::Builder::new()
             .name("camelid-engine".to_string())
             .spawn(move || {
                 let mut batch = ContinuousBatch::<CooperativeJob>::new(continuous_batch_slots);
-                // At most ONE task is ever held outside the channel: a
-                // cooperative job that arrived with every slot busy. Draining
+                // At most ONE task is ever held outside the channel: work that
+                // cannot run against the KV owners currently retained by the
+                // batch. Draining
                 // the channel into an unbounded local queue instead would make
                 // `try_send` never report `Full`, and the typed `QueueFull` ->
                 // 503 backpressure would silently stop existing for as long as
                 // any stream was running.
-                let mut pending: Option<CooperativeJob> = None;
+                let mut pending: Option<EngineTask> = None;
                 let mut disconnected = false;
                 loop {
-                    // A held-back stream takes the first freed slot, ahead of
-                    // anything still in the channel.
-                    if let Some(job) = pending.take() {
-                        if batch.has_free_slot() {
-                            batch.admit(job);
-                        } else {
-                            pending = Some(job);
+                    // Held-back work takes the first safe opening, ahead of
+                    // anything still in the channel. In low-memory mode an
+                    // exclusive job must also wait for retained cooperative KV
+                    // to drain: serialized compute alone does not release that
+                    // memory between token steps.
+                    if let Some(task) = pending.take() {
+                        let single_owner = worker_single_kv_owner.load(Ordering::Acquire);
+                        match task {
+                            EngineTask::Exclusive(job) if !single_owner || batch.is_empty() => {
+                                run_exclusive_job(
+                                    job,
+                                    worker_exclusive.as_ref(),
+                                    worker_depth.as_ref(),
+                                );
+                            }
+                            EngineTask::Exclusive(job) => {
+                                pending = Some(EngineTask::Exclusive(job));
+                            }
+                            EngineTask::Cooperative(job)
+                                if if single_owner {
+                                    batch.is_empty()
+                                } else {
+                                    batch.has_free_slot()
+                                } =>
+                            {
+                                batch.admit(job);
+                            }
+                            EngineTask::Cooperative(job) => {
+                                pending = Some(EngineTask::Cooperative(job));
+                            }
                         }
                     }
                     // Admit until a stream arrives with no slot for it. Every
@@ -207,23 +244,31 @@ impl EngineHandle {
                                 Err(_) => break,
                             }
                         };
+                        let single_owner = worker_single_kv_owner.load(Ordering::Acquire);
                         match task {
-                            // Exclusive work runs as soon as it is picked up.
-                            // Making it wait for `batch.is_empty()` lets
-                            // overlapping streams starve model load/unload,
-                            // non-streaming completions, the parity probe and
-                            // resident-cache resets indefinitely.
+                            // Normally exclusive work runs as soon as it is
+                            // picked up, avoiding starvation behind overlapping
+                            // streams. Low-memory mode deliberately trades that
+                            // concurrency for a single populated KV owner.
+                            EngineTask::Exclusive(job) if !single_owner || batch.is_empty() => {
+                                run_exclusive_job(
+                                    job,
+                                    worker_exclusive.as_ref(),
+                                    worker_depth.as_ref(),
+                                );
+                            }
                             EngineTask::Exclusive(job) => {
-                                worker_exclusive.store(1, Ordering::Relaxed);
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                                worker_exclusive.store(0, Ordering::Relaxed);
-                                worker_depth.fetch_sub(1, Ordering::SeqCst);
+                                pending = Some(EngineTask::Exclusive(job));
                             }
                             EngineTask::Cooperative(job) => {
-                                if batch.has_free_slot() {
+                                if if single_owner {
+                                    batch.is_empty()
+                                } else {
+                                    batch.has_free_slot()
+                                } {
                                     batch.admit(job);
                                 } else {
-                                    pending = Some(job);
+                                    pending = Some(EngineTask::Cooperative(job));
                                 }
                             }
                         }
@@ -260,6 +305,7 @@ impl EngineHandle {
             active_completed_units,
             next_task_id: Arc::new(AtomicU64::new(1)),
             continuous_batch_slots,
+            single_kv_owner_mode,
             occupied_slots,
             exclusive_active,
         }
@@ -275,6 +321,18 @@ impl EngineHandle {
         self.continuous_batch_slots
     }
 
+    /// Permanently serialize KV-owning engine work for this process. The
+    /// transition is intentionally one-way: callers may have already prepared
+    /// sessions under the stricter mode, so widening again without a global
+    /// drain would make the aggregate-memory guarantee racy.
+    pub(crate) fn enable_single_kv_owner_mode(&self) {
+        self.single_kv_owner_mode.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn single_kv_owner_mode(&self) -> bool {
+        self.single_kv_owner_mode.load(Ordering::Acquire)
+    }
+
     /// Streaming slots this engine will actually admit right now.
     ///
     /// Not the same as [`continuous_batch_slots`](Self::continuous_batch_slots):
@@ -282,9 +340,10 @@ impl EngineHandle {
     /// engine is NOT driving decode, because that engine is a process-global slot
     /// keyed by model id. On such a deployment every stream runs exclusive, so
     /// advertising two slots would invite a client to dispatch against capacity
-    /// that does not exist.
+    /// that does not exist. Low-memory mode keeps the cooperative task shape but
+    /// admits only one such owner, so it reports one slot here as well.
     pub(crate) fn total_slots(&self) -> usize {
-        if crate::inference::resident_decode_cuda_active() {
+        if crate::inference::resident_decode_cuda_active() || self.single_kv_owner_mode() {
             1
         } else {
             self.continuous_batch_slots
@@ -544,6 +603,139 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         assert_eq!(*order.lock().unwrap(), vec!['a', 'b', 'a', 'b', 'a', 'b']);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_does_not_starve_a_short_stream() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        // Queue both streams before scheduling starts. `p` models one long
+        // prompt exposing four prefill chunks; `s` models a short request that
+        // can produce its first token immediately.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let order = Arc::clone(&order);
+            let mut chunks = 0usize;
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    chunks += 1;
+                    order.lock().unwrap().push('p');
+                    if chunks == 4 {
+                        StepOutcome::Complete
+                    } else {
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+        {
+            let order = Arc::clone(&order);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    order.lock().unwrap().push('s');
+                    StepOutcome::Complete
+                })))
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!['p', 's', 'p', 'p', 'p'],
+            "the short stream must run after one prefill chunk, not after the long prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_kv_owner_mode_drains_tasks_without_retained_overlap() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        // Hold the worker until every relevant task is queued. The mode switch
+        // must affect already-accepted work, not only jobs posted afterward.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let order = Arc::clone(&order);
+            let mut steps = 0usize;
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    order.lock().unwrap().push('a');
+                    steps += 1;
+                    if steps == 2 {
+                        StepOutcome::Complete
+                    } else {
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+        {
+            let order = Arc::clone(&order);
+            engine
+                .post(EngineTask::Exclusive(Box::new(move || {
+                    order.lock().unwrap().push('x');
+                })))
+                .unwrap();
+        }
+        {
+            let order = Arc::clone(&order);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    order.lock().unwrap().push('b');
+                    StepOutcome::Complete
+                })))
+                .unwrap();
+        }
+
+        engine.enable_single_kv_owner_mode();
+        assert!(engine.single_kv_owner_mode());
+        assert_eq!(engine.total_slots(), 1);
+        release_tx.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!['a', 'a', 'x', 'b'],
+            "the exclusive and second stream must wait until the retained first session drains"
+        );
     }
 
     #[tokio::test]

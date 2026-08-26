@@ -29,10 +29,10 @@ mod decode_scratch;
 mod diagnostic_config;
 pub mod draft_merge;
 pub(crate) mod gemma4;
-mod kv_cache;
+pub(crate) mod kv_cache;
 mod kv_f16;
 pub mod kv_pool;
-mod metal_resident;
+pub(crate) mod metal_resident;
 mod metal_seam;
 mod q8_block_reader;
 mod q8_runtime;
@@ -123,6 +123,43 @@ use crate::{
     },
     BackendError, Result,
 };
+
+/// Return a conservative upper bound for the host KV-cache cost of one token.
+///
+/// The calculation is built from the same [`LlamaKvCachePlan`] shapes the
+/// runtime allocates, including MLA's compressed-key/no-value storage shape.
+/// It deliberately prices every stored element as f32: the host cache may use
+/// f16, Q8_0, or Q4_0, but f32 is the default and the largest supported host
+/// representation. Adaptive context sizing can therefore avoid depending on
+/// process-wide diagnostic flags while the runtime's allocation guard remains
+/// authoritative.
+pub(crate) fn conservative_host_kv_bytes_per_token(config: &LlamaModelConfig) -> Result<u64> {
+    let plan = LlamaKvCachePlan::from_config(config)?;
+    let stored_value_head_dim = plan.value_shape.get(3).copied().unwrap_or(0);
+    let elements_per_token = plan
+        .layer_count
+        .checked_mul(plan.kv_head_count)
+        .and_then(|value| value.checked_mul(plan.k_head_dim.saturating_add(stored_value_head_dim)))
+        .ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "KV-cache dimensions overflow the host context sizing calculation".to_string(),
+            )
+        })?;
+    let bytes_per_token = u64::try_from(elements_per_token)
+        .ok()
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+        .ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "KV-cache byte cost overflows the host context sizing calculation".to_string(),
+            )
+        })?;
+    if bytes_per_token == 0 {
+        return Err(BackendError::InvalidModelMetadata(
+            "KV-cache dimensions produce a zero byte cost per token".to_string(),
+        ));
+    }
+    Ok(bytes_per_token)
+}
 
 #[cfg(test)]
 use crate::tensor::record_q8_0_file_read;
@@ -2720,6 +2757,24 @@ impl LlamaInferenceSession {
         self.kv_cache.allocated_bytes()
     }
 
+    pub(crate) fn snapshot_prompt_kv_blocks(
+        &self,
+        block_tokens: usize,
+    ) -> Option<Vec<Arc<kv_cache::LlamaKvBlockSnapshot>>> {
+        self.kv_cache
+            .snapshot_prompt_blocks(block_tokens)
+            .map(|blocks| blocks.into_iter().map(Arc::new).collect())
+    }
+
+    pub(crate) fn restore_prompt_kv_blocks(
+        &mut self,
+        blocks: &[Arc<kv_cache::LlamaKvBlockSnapshot>],
+        position: usize,
+    ) -> Result<()> {
+        self.resident_decode = None;
+        self.kv_cache.restore_prompt_blocks(blocks, position)
+    }
+
     /// Positions still available before the context limit.
     pub fn remaining_context(&self) -> usize {
         self.kv_cache
@@ -2743,6 +2798,44 @@ impl LlamaInferenceSession {
     /// ordinary single-request generation keeps it enabled.
     pub fn set_resident_encode_ahead_enabled(&mut self, enabled: bool) {
         self.resident_encode_ahead_enabled = enabled;
+    }
+
+    /// Return the existing CPU-prefill chunk size when a prompt can be split
+    /// across cooperative engine turns without changing its numerical lane.
+    ///
+    /// The ordinary generation path already evaluates this prompt in chunks of
+    /// exactly this size. The cooperative scheduler merely yields between those
+    /// same chunks. Resident GPU prefill, layer-major prefill, single-token
+    /// fallback, and windowed attention stay monolithic until they have their
+    /// own incremental parity receipts.
+    pub(crate) fn cooperative_prefill_chunk_tokens(&self, prefill_count: usize) -> Option<usize> {
+        let chunk_tokens = session_prefill_chunk_tokens(&self.config, prefill_count);
+        if prefill_count <= chunk_tokens
+            || chunk_tokens <= 1
+            || crate::model::arch_has_windowed_attention(&self.config)
+            || prefill_layer_major_enabled(&self.weights)
+        {
+            return None;
+        }
+        let resident_would_prefill = self.kv_cache.position == 0
+            && self.weights.layer_range.is_none()
+            && self.resident_decode_eligible(false).ok()?;
+        (!resident_would_prefill).then_some(chunk_tokens)
+    }
+
+    /// Evaluate one scheduler-owned slice of a CPU chunked prefill. Callers
+    /// must obtain the slice size from [`Self::cooperative_prefill_chunk_tokens`]
+    /// so its boundaries remain identical to the run-to-completion path.
+    pub(crate) fn cooperative_prefill_chunk(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<LlamaForwardTimings> {
+        if token_ids.is_empty() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "cooperative prefill requires a non-empty token slice".to_string(),
+            ));
+        }
+        run_on_prefill_pool(|| self.forward_prefill_chunk_timed_fast(token_ids))
     }
 
     /// Arm the execution-trace rollup: subsequent forward passes fold every layer's output
@@ -3451,8 +3544,16 @@ impl LlamaInferenceSession {
                 .engine
                 .read_kv_layer(engine_layer, position)
                 .map_err(BackendError::RuntimeShapeMismatch)?;
-            self.kv_cache
-                .store_mirrored_layer_kv(layer_idx, position, &keys, &values)?;
+            // CUDA re-seeds by converting host f32 back to f16 bits
+            // (`CudaResidentDecode::seed_layer`), so an exact CPU copy would be
+            // discarded on the way in. Keep the rounding here.
+            self.kv_cache.store_mirrored_layer_kv(
+                layer_idx,
+                position,
+                &keys,
+                &values,
+                crate::inference::kv_cache::KvStoreFidelity::F16Rounded,
+            )?;
         }
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(
@@ -6955,7 +7056,7 @@ fn greedy_sample_rows(logits: &CpuTensor) -> Result<Vec<u32>> {
 
 /// Force every disallowed token's logit to `-inf` (grammar-constrained decoding).
 /// Errors if the mask length does not match the vocab or masks every token.
-fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
+pub(crate) fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
     if allowed.len() != logits.data.len() {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "grammar mask length {} does not match vocabulary size {}",
@@ -13109,25 +13210,29 @@ fn spec_draft_kv_context() -> usize {
         .unwrap_or(512)
 }
 
-/// Clear both resident-engine caches (target + drafter) so the next decode rebuilds them. Used
-/// when the VRAM budget changes (entering/leaving speculative coexistence). No-op without CUDA.
-#[cfg(feature = "cuda")]
+/// Clear process-global resident/model-weight caches so the next decode rebuilds them.
+///
+/// CUDA owns target + drafter engine slots and an async allocation pool. Metal owns a permanent
+/// linear-weight cache whose no-copy entries pin their host `WirePages`. Model unload/replacement
+/// invokes this as an engine-exclusive job, after dropping API registries and prompt sessions.
 pub fn reset_resident_caches() {
-    *resident_cuda_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
-    *resident_cuda_drafter_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
-    // The engines dropped above returned their VRAM to cudarc's stream-ordered async
-    // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
-    // the next model's resident fit decision measures the real free VRAM ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â otherwise a
-    // larger model wrongly falls back to the CPU path (the ~20x-slower symptom this
-    // unload path exists to prevent).
-    crate::cuda::release_async_pool();
+    #[cfg(feature = "cuda")]
+    {
+        *resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *resident_cuda_drafter_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        // The engines dropped above returned their VRAM to cudarc's stream-ordered async
+        // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
+        // the next model's resident fit decision measures the real free VRAM ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â otherwise a
+        // larger model wrongly falls back to the CPU path (the ~20x-slower symptom this
+        // unload path exists to prevent).
+        crate::cuda::release_async_pool();
+    }
+    crate::metal::reset_model_caches();
 }
-#[cfg(not(feature = "cuda"))]
-pub fn reset_resident_caches() {}
 
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.

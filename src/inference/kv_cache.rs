@@ -154,6 +154,24 @@ pub struct LlamaKvCache {
     pub(super) kv_budget_bytes: u64,
 }
 
+/// Immutable, position-normalized CPU KV rows for one prompt token block.
+/// Rows are stored as f32 because the primary Mac cache is exact-F32.
+/// F16 and quantized CPU KV caches keep the legacy typed session snapshot so
+/// block caching never doubles their retained memory or requantizes KV values.
+#[derive(Debug, Clone)]
+pub(crate) struct LlamaKvBlockSnapshot {
+    pub start_position: usize,
+    pub token_count: usize,
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+impl LlamaKvBlockSnapshot {
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        ((self.keys.len() + self.values.len()) * std::mem::size_of::<f32>()) as u64
+    }
+}
+
 impl PartialEq for LlamaKvCache {
     fn eq(&self, other: &Self) -> bool {
         // Cache STATE only. `kv_budget_bytes` is host-derived operational config and
@@ -218,6 +236,30 @@ pub enum KvDtype {
     F16,
     Q8_0,
     Q4_0,
+}
+
+/// Whether a KV write must reproduce the CPU forward's f16 rounding.
+///
+/// The rounding is a deliberate llama.cpp-oracle contract — `KvDtype`'s note above
+/// and `kv_cache_storage_matches_llama_cpp_f16_rounding` both pin it — but it is
+/// load-bearing only for K/V the CPU forward itself computed. A GPU→host mirror
+/// carries no such contract: that data never touched the CPU reference lane, and
+/// rounding it just discards precision the device is still holding, which is what
+/// made an F32-primary Metal session ineligible for the prompt-prefix cache.
+///
+/// Deciding this PER ENGINE rather than globally matters: the CUDA lane converts
+/// host f32 back to f16 bits when it re-seeds (`CudaResidentDecode::seed_layer`),
+/// so an exact CPU copy would be thrown away there — it stays `F16Rounded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvStoreFidelity {
+    /// Round every value through f16, as every CPU-forward write does.
+    F16Rounded,
+    /// Store the f32 values bit-exactly. Only observable in a [`KvDtype::F32`]
+    /// cache, and only correct for device-produced K/V.
+    // Metal constructs this in production. Other hosts keep the shared enum so
+    // recovery and parity tests exercise both fidelity contracts.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    ExactF32,
 }
 
 /// Env gate for f16 storage, read once per cache construction. Requires the
@@ -307,6 +349,115 @@ impl LlamaKvCache {
 
     pub fn can_append(&self) -> bool {
         self.position < self.plan.max_sequence_length
+    }
+
+    pub(crate) fn snapshot_prompt_blocks(
+        &self,
+        block_tokens: usize,
+    ) -> Option<Vec<LlamaKvBlockSnapshot>> {
+        if block_tokens == 0
+            || self.dtype != KvDtype::F32
+            || self.plan.value_shape[3] == 0
+            || !self.history_materialized(self.position)
+        {
+            return None;
+        }
+        let key_rows = self.plan.layer_count * self.plan.kv_head_count;
+        let value_rows = key_rows;
+        let mut blocks = Vec::with_capacity(self.position.div_ceil(block_tokens));
+        for start in (0..self.position).step_by(block_tokens) {
+            let token_count = block_tokens.min(self.position - start);
+            let mut keys = Vec::with_capacity(token_count * self.position_stride());
+            let mut values = Vec::with_capacity(token_count * self.value_position_stride());
+            let mut key_row = vec![0.0; self.plan.k_head_dim];
+            let mut value_row = vec![0.0; self.plan.v_head_dim];
+            for position in start..start + token_count {
+                for row in 0..key_rows {
+                    let layer = row / self.plan.kv_head_count;
+                    let head = row % self.plan.kv_head_count;
+                    self.copy_key_row_into(layer, position, head, &mut key_row);
+                    keys.extend_from_slice(&key_row);
+                }
+                for row in 0..value_rows {
+                    let layer = row / self.plan.kv_head_count;
+                    let head = row % self.plan.kv_head_count;
+                    self.copy_value_row_into(layer, position, head, &mut value_row);
+                    values.extend_from_slice(&value_row);
+                }
+            }
+            blocks.push(LlamaKvBlockSnapshot {
+                start_position: start,
+                token_count,
+                keys,
+                values,
+            });
+        }
+        Some(blocks)
+    }
+
+    pub(crate) fn restore_prompt_blocks(
+        &mut self,
+        blocks: &[std::sync::Arc<LlamaKvBlockSnapshot>],
+        position: usize,
+    ) -> Result<()> {
+        if self.dtype != KvDtype::F32 {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "block prompt cache requires exact-F32 CPU KV storage".to_string(),
+            ));
+        }
+        if position > self.plan.max_sequence_length {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "block prompt cache position {position} exceeds context length {}",
+                self.plan.max_sequence_length
+            )));
+        }
+        self.ensure_position_capacity(position)?;
+        let mut restored_through = 0usize;
+        for block in blocks {
+            if block.start_position != restored_through || restored_through >= position {
+                break;
+            }
+            let rows_to_restore = block.token_count.min(position - restored_through);
+            let key_token_stride = self.position_stride();
+            let value_token_stride = self.value_position_stride();
+            if block.keys.len() != block.token_count * key_token_stride
+                || block.values.len() != block.token_count * value_token_stride
+            {
+                return Err(BackendError::RuntimeShapeMismatch(
+                    "block prompt cache payload shape does not match this model".to_string(),
+                ));
+            }
+            for local_position in 0..rows_to_restore {
+                let position_index = restored_through + local_position;
+                let mut key_offset = local_position * key_token_stride;
+                let mut value_offset = local_position * value_token_stride;
+                for layer in 0..self.plan.layer_count {
+                    for head in 0..self.plan.kv_head_count {
+                        let key_end = key_offset + self.plan.k_head_dim;
+                        let value_end = value_offset + self.plan.v_head_dim;
+                        self.store_kv_head_row_with_fidelity(
+                            layer,
+                            position_index,
+                            head,
+                            &block.keys[key_offset..key_end],
+                            &block.values[value_offset..value_end],
+                            KvStoreFidelity::ExactF32,
+                        );
+                        key_offset = key_end;
+                        value_offset = value_end;
+                    }
+                }
+            }
+            restored_through += rows_to_restore;
+        }
+        if restored_through != position {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "block prompt cache restored {restored_through} of {position} requested tokens"
+            )));
+        }
+        self.position = position;
+        self.materialized_through = position;
+        Ok(())
     }
 
     /// Roll the cache back to an earlier `position`, discarding newer
@@ -598,9 +749,15 @@ impl LlamaKvCache {
     /// slots relative to the session's owned layer range, so a sharded caller translates
     /// before calling (as the CUDA seed path already does in the other direction).
     ///
-    /// Rows go through [`store_kv_head_row`](Self::store_kv_head_row), so the f16 rounding and
-    /// the materialized-through watermark are handled exactly as for a CPU write — the GPU KV
-    /// is f16 already, so the re-rounding is idempotent.
+    /// Rows go through [`store_kv_head_row_with_fidelity`](Self::store_kv_head_row_with_fidelity),
+    /// so the materialized-through watermark is handled exactly as for a CPU write.
+    ///
+    /// `fidelity` is the CALLER'S engine format, and it is load-bearing. The re-rounding is
+    /// idempotent only when the device cache is f16 already (CUDA always, Metal's F16/K-quant
+    /// primary); against Metal's **F32 primary** it would destroy precision the GPU is still
+    /// holding, so that engine passes [`KvStoreFidelity::ExactF32`]. Unlike the CPU forward's
+    /// writers, this path carries no llama.cpp-oracle contract — the data never came from the
+    /// CPU reference lane — so storing it exactly is free of parity consequences.
     ///
     /// Shared by the Metal and CUDA recovery paths so the only backend-specific code left is
     /// the device readback itself.
@@ -610,6 +767,7 @@ impl LlamaKvCache {
         position_count: usize,
         keys: &[f32],
         values: &[f32],
+        fidelity: KvStoreFidelity,
     ) -> Result<()> {
         let k_head_dim = self.plan.k_head_dim;
         let v_head_dim = self.plan.v_head_dim;
@@ -649,12 +807,13 @@ impl LlamaKvCache {
                 } else {
                     &[]
                 };
-                self.store_kv_head_row(
+                self.store_kv_head_row_with_fidelity(
                     layer_idx,
                     p,
                     h,
                     &keys[k_src..k_src + k_head_dim],
                     value_slice,
+                    fidelity,
                 );
             }
         }
@@ -772,10 +931,12 @@ impl LlamaKvCache {
 
     /// THE canonical KV store: one (layer, position, kv_head) row of K and V,
     /// rounded through f16 exactly as the write path always has, into
-    /// whichever dtype backs this cache. Every writer routes through here —
-    /// including the CUDA prefill mirror-back, whose data is f16-exact
-    /// already (re-rounding is idempotent), so the routing is bit-neutral
-    /// and enforces the f16-exactness invariant structurally.
+    /// whichever dtype backs this cache. Every CPU-forward writer routes
+    /// through here, which is what enforces the llama.cpp f16-exactness
+    /// invariant structurally (see `kv_cache_storage_matches_llama_cpp_f16_rounding`).
+    ///
+    /// GPU→host mirrors call [`store_kv_head_row_with_fidelity`](Self::store_kv_head_row_with_fidelity)
+    /// instead, because their data never passed through the CPU reference lane.
     pub(super) fn store_kv_head_row(
         &mut self,
         layer_idx: usize,
@@ -783,6 +944,31 @@ impl LlamaKvCache {
         kv_head: usize,
         key_row: &[f32],
         value_row: &[f32],
+    ) {
+        self.store_kv_head_row_with_fidelity(
+            layer_idx,
+            position,
+            kv_head,
+            key_row,
+            value_row,
+            KvStoreFidelity::F16Rounded,
+        );
+    }
+
+    /// [`store_kv_head_row`](Self::store_kv_head_row) with the f16 rounding made explicit.
+    ///
+    /// `ExactF32` skips the rounding, and only changes anything for a [`KvDtype::F32`]
+    /// cache — an F16 or quantized cache converts on the way in regardless, so the flag
+    /// is a no-op there rather than a silent lie. Reserved for data a GPU produced: the
+    /// CPU forward's own writes must stay rounded to hold the oracle contract.
+    pub(super) fn store_kv_head_row_with_fidelity(
+        &mut self,
+        layer_idx: usize,
+        position: usize,
+        kv_head: usize,
+        key_row: &[f32],
+        value_row: &[f32],
+        fidelity: KvStoreFidelity,
     ) {
         let k_head_dim = self.plan.k_head_dim;
         let v_dim = value_row.len();
@@ -795,15 +981,21 @@ impl LlamaKvCache {
 
         match self.dtype {
             KvDtype::F32 => {
+                let round = |value: f32| match fidelity {
+                    KvStoreFidelity::F16Rounded => {
+                        super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value))
+                    }
+                    KvStoreFidelity::ExactF32 => value,
+                };
                 for (slot, &value) in self.keys[dst..dst + k_head_dim].iter_mut().zip(key_row) {
-                    *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                    *slot = round(value);
                 }
                 if v_dim > 0 {
                     let v_dst = dst / k_head_dim * v_dim; // Adjust offset for value buffer if dims differ
                     for (slot, &value) in
                         self.values[v_dst..v_dst + v_dim].iter_mut().zip(value_row)
                     {
-                        *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                        *slot = round(value);
                     }
                 }
             }
@@ -1031,6 +1223,68 @@ mod tests {
             v_head_dim: head_dim,
             key_shape: shape.clone(),
             value_shape: shape,
+        }
+    }
+
+    #[test]
+    fn prompt_kv_blocks_round_trip_f32_and_both_layouts() {
+        let plan = plan_with(16, 2, 2, 4);
+        for layout in [KvLayout::PositionMajor, KvLayout::HeadMajor] {
+            let mut source =
+                LlamaKvCache::new_with_layout_and_dtype(plan.clone(), layout, KvDtype::F32)
+                    .unwrap();
+            source.ensure_position_capacity(6).unwrap();
+            for position in 0..6 {
+                for layer in 0..plan.layer_count {
+                    for head in 0..plan.kv_head_count {
+                        let base = (position * 100 + layer * 10 + head) as f32;
+                        let keys = [base + 0.1, base + 0.2, base + 0.3, base + 0.4];
+                        let values = [base + 1.1, base + 1.2, base + 1.3, base + 1.4];
+                        source.store_kv_head_row(layer, position, head, &keys, &values);
+                    }
+                }
+            }
+            source.position = 6;
+            let blocks: Vec<_> = source
+                .snapshot_prompt_blocks(4)
+                .unwrap()
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect();
+            assert_eq!(blocks.len(), 2);
+
+            let mut restored =
+                LlamaKvCache::new_with_layout_and_dtype(plan.clone(), layout, KvDtype::F32)
+                    .unwrap();
+            restored.restore_prompt_blocks(&blocks, 5).unwrap();
+            assert_eq!(restored.position, 5);
+            assert_eq!(restored.materialized_through, 5);
+            for position in 0..5 {
+                for layer in 0..plan.layer_count {
+                    for head in 0..plan.kv_head_count {
+                        let mut source_key = [0.0; 4];
+                        let mut source_value = [0.0; 4];
+                        let mut restored_key = [0.0; 4];
+                        let mut restored_value = [0.0; 4];
+                        source.copy_key_row_into(layer, position, head, &mut source_key);
+                        source.copy_value_row_into(layer, position, head, &mut source_value);
+                        restored.copy_key_row_into(layer, position, head, &mut restored_key);
+                        restored.copy_value_row_into(layer, position, head, &mut restored_value);
+                        assert_eq!(restored_key, source_key);
+                        assert_eq!(restored_value, source_value);
+                    }
+                }
+            }
+        }
+
+        for dtype in [KvDtype::F16, KvDtype::Q8_0, KvDtype::Q4_0] {
+            let typed = LlamaKvCache::new_with_layout_and_dtype(
+                plan.clone(),
+                KvLayout::PositionMajor,
+                dtype,
+            )
+            .unwrap();
+            assert!(typed.snapshot_prompt_blocks(4).is_none());
         }
     }
 

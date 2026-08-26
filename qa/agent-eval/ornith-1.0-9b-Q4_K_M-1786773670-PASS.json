@@ -1,0 +1,66 @@
+{
+  "schema": "camelid.agent_eval/v1",
+  "outcome": "PASS",
+  "model_id": "Ornith 1.0 9B",
+  "gguf": "/Volumes/Untitled/models/ornith-qwen35/ornith-1.0-9b-Q4_K_M.gguf",
+  "gguf_bytes": 5629108704,
+  "quantization": "Q4_K_M",
+  "note": "battery complete",
+  "cases": [
+    {
+      "case": "read_and_count",
+      "goal": "Read the file notes.txt and tell me how many lines it has. Use the read_file tool, then give the count.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "read_file(notes.txt, start_line=1, max_lines=all)"
+      ],
+      "tool_results": [
+        {
+          "tool": "read_file",
+          "ok": true,
+          "output": "1 | alpha\n2 | beta\n3 | gamma\n"
+        }
+      ],
+      "final_answer": "The file `notes.txt` has **3 lines**.",
+      "passed": true
+    },
+    {
+      "case": "list_dir_find",
+      "goal": "List the entries of the current directory '.' with the list_dir tool, then tell me the name of the text file you find there.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "list_dir(., offset=0, limit=all)"
+      ],
+      "tool_results": [
+        {
+          "tool": "list_dir",
+          "ok": true,
+          "output": "notes.txt"
+        }
+      ],
+      "final_answer": "The text file in the current directory is **notes.txt**.",
+      "passed": true
+    },
+    {
+      "case": "write_greeting",
+      "goal": "Create a file named greeting.txt whose exact contents are: hello there\nUse the write_file tool ONCE, then reply in words that you created it. Do not call any further tools and do not read the file back.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "write_file(greeting.txt, 11 bytes)"
+      ],
+      "tool_results": [
+        {
+          "tool": "write_file",
+          "ok": true,
+          "output": "wrote 11 bytes to greeting.txt"
+        }
+      ],
+      "final_answer": "I created the file `greeting.txt` with the contents \"hello there\".",
+      "passed": true
+    }
+  ],
+  "host_loadavg_1m": 2.4736328125,
+  "timestamp_unix": 1786773670,
+  "promotion_eligible": true,
+  "receipt_id": "c73ea423db2d7a6558950c2012c005973581eb1e548a2c7ae9b6b5fb437903c1"
+}

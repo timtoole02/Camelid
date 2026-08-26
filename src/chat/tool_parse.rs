@@ -173,21 +173,29 @@ fn repair_invalid_json_escapes(s: &str) -> String {
     let mut chars = s.chars().peekable();
     let mut in_string = false;
     while let Some(character) = chars.next() {
-        if character == '"' {
-            in_string = !in_string;
-            out.push(character);
-            continue;
-        }
         if in_string && character == '\\' {
+            // Consume the escape and its following char TOGETHER. A `\"` must not
+            // fall through to the `"` arm below, or it would flip `in_string` and
+            // desync the tracker — a command like `echo \"\$i.txt\"` then leaves
+            // the later `\$` treated as outside a string and never repaired, so
+            // the whole call stays unparseable. (This was the live failure: Qwen
+            // over-escaping `$` inside a run_shell command killed the turn.)
+            let next = chars.next();
             let valid = matches!(
-                chars.peek(),
+                next,
                 Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')
             );
             if !valid {
                 out.push('\\');
             }
             out.push(character);
+            if let Some(next) = next {
+                out.push(next);
+            }
             continue;
+        }
+        if character == '"' {
+            in_string = !in_string;
         }
         out.push(character);
     }
@@ -628,6 +636,81 @@ fn first_json_array(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_call_parser_corpus_accepts_unambiguous_variants_and_rejects_truncation() {
+        let accepted = [
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+            // A complete JSON object is still unambiguous when a small model
+            // omits only the decorative closing tag.
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+            (
+                "mistral",
+                r#"[TOOL_CALLS] [{"name":"read_file","arguments":{"path":"src/lib.rs"}}]"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+            (
+                "ornith",
+                "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/lib.rs\n</parameter>\n</function>\n</tool_call>",
+                "read_file",
+                "src/lib.rs",
+            ),
+            (
+                "qwen3",
+                r#"read_file({"path":"src/lib.rs"})"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+        ];
+        for (family, text, expected_name, expected_path) in accepted {
+            let calls = parse(text, family);
+            assert_eq!(calls.len(), 1, "family={family}, text={text}");
+            assert_eq!(calls[0].name, expected_name);
+            assert_eq!(calls[0].args["path"], expected_path);
+        }
+
+        for truncated_or_ambiguous in [
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs""#,
+            r#"<tool_call>{"arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+            r#"I might call read_file({"path":"src/lib.rs"}) after checking."#,
+            r#"<tool_call><function=read_file><parameter=path>src/lib.rs"#,
+        ] {
+            assert!(
+                parse(truncated_or_ambiguous, "qwen3").is_empty(),
+                "must not fabricate a call from {truncated_or_ambiguous}"
+            );
+        }
+    }
+
+    /// The live failure that killed a Code turn: Qwen over-escapes `$` inside a
+    /// run_shell command, and the command also contains escaped quotes `\"`. The
+    /// `\"` used to desync the repair's in-string tracker so the later `\$` was
+    /// never doubled, leaving the call unparseable and looping the turn to death.
+    #[test]
+    fn hermes_call_with_escaped_quotes_and_escaped_dollar_is_recovered() {
+        let text = r#"<tool_call>
+{"name": "run_shell", "arguments": {"command": "seq 1 100 | while read -r i; do echo \"\$i.txt\"; done"}}
+</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "the call must be recovered, got {calls:?}");
+        assert_eq!(calls[0].name, "run_shell");
+        let command = calls[0].args["command"].as_str().unwrap();
+        assert!(
+            command.contains("seq 1 100") && command.contains("i.txt"),
+            "command survived repair: {command}"
+        );
+    }
 
     #[test]
     fn parses_llama_json_with_parameters() {

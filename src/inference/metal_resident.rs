@@ -66,7 +66,7 @@ pub(super) const MAX_VERIFY_K: usize = 8;
 /// — see `prepare_for_prompt_prefix_cache_gated`.)
 const LOW_MEMORY_PREFIX_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-pub(super) fn resident_prefix_cache_mirror_enabled() -> bool {
+pub(crate) fn resident_prefix_cache_mirror_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         resident_prefix_cache_policy(
@@ -514,11 +514,11 @@ impl super::LlamaInferenceSession {
     ///
     /// Mirroring back is only safe when the round trip cannot change the K/V:
     /// see [`crate::metal::ResidentDecodeState::kv_roundtrips_through_cpu_exactly`].
-    /// With an F32 or Q8 primary the CPU copy would be rounded and the resumed
+    /// With a quantized primary the CPU copy would be rounded and the resumed
     /// sequence would attend over different K/V than its prefill produced — the
     /// same hazard that makes the streaming path bypass this cache entirely when
-    /// the CUDA resident engine is driving. So this helps Q4_K/Q6_K models (which
-    /// default to an F16 primary) and deliberately does NOT help Q8_0 ones.
+    /// the CUDA resident engine is driving. F16 primaries round-trip through an
+    /// F16/F32 CPU cache; F32 primaries require an F32 CPU cache.
     ///
     /// Opt out with `CAMELID_PREFIX_CACHE_RESIDENT=0`: mirroring takes the CPU KV
     /// for this sequence from zero bytes to full size, and `store_prompt_prefix_cache`
@@ -542,6 +542,18 @@ impl super::LlamaInferenceSession {
     /// caller's request: a refusal just means no cache entry.
     pub fn prepare_for_prompt_prefix_cache(&mut self) -> bool {
         self.prepare_for_prompt_prefix_cache_gated(resident_prefix_cache_mirror_enabled())
+    }
+
+    /// Whether a cached clone came from the exact-F32 Metal lane. Partial hits
+    /// on this lane cannot use batched resident prefill at a nonzero KV position,
+    /// so API cache admission treats them differently from F16/Q4_K resumes.
+    pub(crate) fn uses_f32_metal_resident_kv(&self) -> bool {
+        self.resident_decode.as_ref().is_some_and(|session| {
+            matches!(
+                session.kv_mirror_fidelity(),
+                crate::inference::kv_cache::KvStoreFidelity::ExactF32
+            )
+        })
     }
 
     /// `cache_enabled` is `resident_prefix_cache_mirror_enabled()` in
@@ -583,10 +595,14 @@ impl super::LlamaInferenceSession {
         // Reading [0, position) is safe against the encode-ahead window: a
         // pre-committed future graph writes the NEXT position's row, so it cannot
         // touch the range being mirrored.
+        // An F32 primary is exact only into an F32 CPU cache; an F16 primary is exact
+        // into either. The mirror writes with the matching `KvStoreFidelity`, derived
+        // from the same engine state, so the two answers cannot disagree.
+        let cpu_holds_f32_exactly = matches!(self.kv_cache.dtype, KvDtype::F32);
         if !self
             .resident_decode
             .as_ref()
-            .is_some_and(|state| state.kv_roundtrips_through_cpu_exactly())
+            .is_some_and(|state| state.kv_roundtrips_through_cpu_exactly(cpu_holds_f32_exactly))
         {
             return false;
         }
@@ -625,6 +641,14 @@ impl super::LlamaInferenceSession {
         {
             return Ok(false);
         }
+        // Ask THIS engine how its KV must be written, for the same time-of-check /
+        // time-of-use reason the round-trip gate does: a model switch re-decides the
+        // process-global format while this session keeps the engine it was built with.
+        let fidelity = self
+            .resident_decode
+            .as_ref()
+            .expect("resident session present (checked above)")
+            .kv_mirror_fidelity();
         let dims = DenseLlamaDims::from_config(&self.config)?;
         let range = self
             .weights
@@ -645,7 +669,7 @@ impl super::LlamaInferenceSession {
                 ))
             })?;
             self.kv_cache
-                .store_mirrored_layer_kv(layer_idx, position, &keys, &values)?;
+                .store_mirrored_layer_kv(layer_idx, position, &keys, &values, fidelity)?;
         }
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(

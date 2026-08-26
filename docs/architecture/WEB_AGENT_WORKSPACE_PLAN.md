@@ -125,13 +125,36 @@ Compaction changes which completed turns are always recent; it does not delete t
 
 ## Exact Context Budget
 
-Workspace uses a static total envelope of 4,096 tokens:
+Workspace resolves one adaptive total envelope when a session starts. Camelid
+reads the active GGUF's native context and KV dimensions, samples currently
+available host RAM after the model is loaded, divides 70% of that memory across
+active generation slots and retained prompt-prefix caches for conservative f32 KV,
+and rounds down to a 1,024-token quantum. The result is clamped by Camelid's
+validated agent-context envelope, the model and server limits, a 65,536-token
+operational ceiling, and the optional `CAMELID_AGENT_CONTEXT_MAX_TOKENS`
+operator cap. Native GGUF metadata does not itself widen a supported window;
+the bounded-paging exception below is keyed to exact earned Qwen3 4B rows.
+Unknown telemetry falls back to 8,192 tokens. The selected value stays fixed
+for the session and is inherited by delegated Code workers. The API reports the
+raw memory-derived capacity separately from the 8,192-token minimum operational
+recommendation; under severe pressure the allocator remains authoritative.
 
-- default generation reserve: 512 tokens;
-- maximum generation reserve: 1,024 tokens;
-- default agent steps: 12;
-- maximum agent steps: 32;
-- maximum first goal: 4 KiB.
+Generation allowance and action steps remain separate controls. Code has no
+arbitrary action-step limit, accepts a 64 KiB written task specification, and
+uses context paging by default so durable task/source state does not depend on
+replaying an ever-growing transcript. Read-only Workspace retains its bounded
+step policy.
+
+The logical session envelope and the paging working set are intentionally
+different. With paging enabled, the exact Qwen3 4B Q8_0 Code row exposes a 16K
+logical task envelope while the paging capsule remains bounded to its 8K
+input/output/safety working set. This avoids turning a larger session ceiling
+into an unbounded cold prefill on every step. It does not authorize a 16K model
+prompt; the active request remains inside the exact row's validated envelope.
+Q4_K_M does not inherit this exception. It keeps the legacy 8K operational
+agent envelope needed to fit the paging capsule and reserves, but that value is
+not a context-support promotion: its formal parity ladder remains 512/1,024
+until the intervening 2K near-tie and the longer buckets are qualified.
 
 Before every model step, Camelid renders the real chat template with the actual tool schemas and tokenizer. The required system policy, current user message, and latest native tool call/result pair stay intact. Earlier tool exchanges are reduced to bounded observations. If the request is too large, optional memory is removed first, followed by complete older user/assistant turn pairs. If required content still cannot fit, the turn fails instead of overflowing.
 
@@ -201,7 +224,8 @@ This preview does not claim:
 - production-ready interactive latency;
 - a population-level latency or retrieval-recall SLA;
 - per-request proof of resident GPU execution versus CPU fallback;
-- dynamic selection of the 4,096-token envelope from device capacity;
+- population-level validation of adaptive context sizing under latency and
+  memory pressure;
 - prefix reuse or appendable GPU KV sessions;
 - semantic or embedding-based retrieval;
 - recursive inventory without explicit bounded observation;

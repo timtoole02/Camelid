@@ -244,10 +244,37 @@ fn read_journal(root: &Path) -> Vec<Checkpoint> {
     let Ok(text) = std::fs::read_to_string(root.join(JOURNAL)) else {
         return Vec::new();
     };
+    // The journal lives INSIDE the workspace, so a sandboxed shell command (or
+    // a confused subagent) can write to it. Its `backup` field is later read by
+    // the UNSANDBOXED server — `diff` inlines it into /changes on every poll,
+    // `undo` copies from it — so an absolute path smuggled into the journal was
+    // a read primitive that routed around the kernel sandbox's credential
+    // deny-list. Reject any journal line whose backup resolves to a real file
+    // OUTSIDE this workspace's checkpoint store. A backup that does not resolve
+    // at all (a cleaned-up blob) is kept: the restore copy fails safe, whereas
+    // silently nulling it would turn a restore into a delete.
+    let store = std::fs::canonicalize(root.join(".camelid/checkpoints")).ok();
+    let backup_escapes_store = |path: &Path| -> bool {
+        match (std::fs::canonicalize(path).ok(), store.as_deref()) {
+            (Some(canonical), Some(store)) => !canonical.starts_with(store),
+            // No store dir, or the path resolves but we cannot resolve the
+            // store: treat as an escape and refuse.
+            (Some(_), None) => true,
+            // Unresolvable path: benign (missing blob); the copy will fail safe.
+            (None, _) => false,
+        }
+    };
     text.lines()
         .filter(|line| !line.trim().is_empty())
         // A torn final line from a killed child is skipped, not a hard error.
         .filter_map(|line| serde_json::from_str::<JournalLine>(line).ok())
+        .filter(|entry| {
+            entry
+                .backup
+                .as_deref()
+                .map(Path::new)
+                .is_none_or(|path| !backup_escapes_store(path))
+        })
         .map(|entry| Checkpoint {
             id: entry.id,
             rel: entry.rel,
@@ -361,9 +388,14 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
                 .chars()
                 .map(|c| if c == '/' || c == '\\' { '_' } else { c })
                 .collect();
+            // Sequence the park like `prepare` sequences backups: pid alone
+            // made a second undo of the same file overwrite the first park,
+            // destroying the only copy of the intermediate state.
+            static UNDONE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = UNDONE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = std::fs::copy(
                 &target,
-                dir.join(format!("undone_{}_{flat}", std::process::id())),
+                dir.join(format!("undone_{}_{seq:04}_{flat}", std::process::id())),
             );
         }
     }
@@ -386,18 +418,70 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
         }
         g.pop();
     }
-    // Keep the durable journal in step, or the next sync would resurrect the
-    // entry this call just walked back.
-    forget_journaled(sandbox.root(), &cp.id);
-    match &cp.backup {
+    // RESTORE FIRST, forget after. The old order forgot the journal entry and
+    // THEN attempted the copy, so a failed restore (read-only target, ENOSPC,
+    // a stale TCC denial on an external volume) left the checkpoint erased
+    // from both stores with the target possibly truncated — unrecoverable. A
+    // failure now re-pushes the in-memory entry and leaves the journal intact,
+    // so the user can fix the cause and undo again.
+    // Retryable vs unrecoverable failures diverge below: re-pushing on a
+    // MISSING backup blob wedged undo permanently (every attempt pops, fails
+    // NotFound, re-pushes the same entry at the top of the stack forever).
+    let mut backup_gone = false;
+    let restore_result = match &cp.backup {
         Some(b) => {
-            std::fs::copy(b, &target).map_err(|e| format!("restore failed: {e}"))?;
-            Ok(format!("restored {}", cp.rel))
+            // Re-validate at USE time, not just at journal-load time: the blob
+            // could have been swapped for a symlink out of the store between
+            // the two (the journal is workspace-writable).
+            let in_store = std::fs::canonicalize(sandbox.root().join(DIR))
+                .ok()
+                .zip(std::fs::canonicalize(b).ok())
+                .is_some_and(|(store, blob)| blob.starts_with(store));
+            if !in_store {
+                backup_gone = true;
+                Err(format!(
+                    "restore failed: the backup for {} is missing or points outside the \
+                     checkpoint store; this checkpoint cannot be restored and was dropped",
+                    cp.rel
+                ))
+            } else {
+                std::fs::copy(b, &target)
+                    .map(|_| format!("restored {}", cp.rel))
+                    .map_err(|e| {
+                        backup_gone = e.kind() == std::io::ErrorKind::NotFound;
+                        format!("restore failed: {e}")
+                    })
+            }
         }
         None => {
             // The file did not exist before the agent made it.
             let _ = std::fs::remove_file(&target);
             Ok(format!("removed {} (it was newly created)", cp.rel))
+        }
+    };
+    match restore_result {
+        Ok(message) => {
+            // Keep the durable journal in step, or the next sync would
+            // resurrect the entry this call just walked back.
+            forget_journaled(sandbox.root(), &cp.id);
+            Ok(message)
+        }
+        Err(error) if backup_gone => {
+            // Unrecoverable: drop the entry from the journal too, so undo can
+            // proceed to the next checkpoint instead of wedging on this one.
+            forget_journaled(sandbox.root(), &cp.id);
+            Err(error)
+        }
+        Err(error) => {
+            // Retryable (permissions, disk full): put the entry back so the
+            // user can fix the cause and undo again — but only if a concurrent
+            // sync has not already restored it.
+            if let Ok(mut g) = log().lock() {
+                if g.last().map(|last| last.id.as_str()) != Some(cp.id.as_str()) {
+                    g.push(cp);
+                }
+            }
+            Err(error)
         }
     }
 }
@@ -592,6 +676,100 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
         assert!(undo(&sandbox, false).is_err(), "nothing left to undo");
         clear();
+    }
+
+    /// A failed restore must not destroy the checkpoint. The old order forgot
+    /// the journal entry and truncated the target BEFORE the copy, so an
+    /// unwritable target lost the entry for good. Now the entry survives a
+    /// failure and the file is untouched, so a retry after fixing perms works.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_restore_preserves_the_checkpoint_and_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, "v1").unwrap();
+
+        let pending = prepare(&sandbox, &f, "edit_file");
+        std::fs::write(&f, "v2").unwrap();
+        finish(pending, true);
+
+        // Make the file unwritable so std::fs::copy(backup, target) fails.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let result = undo(&sandbox, true);
+        // Restore permissions before asserting so a failure still cleans up.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "an unwritable target must fail the restore"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "v2",
+            "a failed restore must not truncate the file"
+        );
+        // The checkpoint survived, so a retry (now writable) succeeds.
+        undo(&sandbox, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
+        clear();
+    }
+
+    /// The journal is workspace-writable, so a hostile absolute `backup` path
+    /// would turn the unsandboxed diff/undo reader into a file-exfiltration
+    /// primitive. read_journal must drop any backup that resolves outside the
+    /// checkpoint store, while keeping the rest of the entry.
+    #[test]
+    fn a_journal_backup_pointing_outside_the_store_is_rejected() {
+        let _g = cp_lock();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        clear_for_workspace(sandbox.root());
+
+        // A real secret outside the workspace.
+        let secret = d.path().join("secret_outside.txt");
+        std::fs::write(&secret, "TOP SECRET").unwrap();
+
+        let journal = sandbox.root().join(JOURNAL);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let line = serde_json::json!({
+            "id": "9999-0",
+            "rel": "victim.txt",
+            "backup": secret.to_string_lossy(),
+            "tool": "edit_file",
+            "post_hash": null,
+        });
+        std::fs::write(&journal, format!("{line}\n")).unwrap();
+
+        // The whole line is untrusted and dropped — NOT surfaced with a null
+        // backup, which would make undo "delete victim.txt" (None = never
+        // existed). A benign line alongside it still loads.
+        let benign_backup = sandbox.root().join(".camelid/checkpoints/1234_0000_ok.txt");
+        std::fs::write(&benign_backup, "prior").unwrap();
+        let benign = serde_json::json!({
+            "id": "1234-0",
+            "rel": "ok.txt",
+            "backup": benign_backup.to_string_lossy(),
+            "tool": "edit_file",
+            "post_hash": null,
+        });
+        std::fs::write(&journal, format!("{line}\n{benign}\n")).unwrap();
+
+        let loaded = read_journal(sandbox.root());
+        assert_eq!(
+            loaded.len(),
+            1,
+            "the escaping line is dropped; only the benign one survives"
+        );
+        assert_eq!(loaded[0].rel, "ok.txt");
+        assert!(
+            loaded[0].backup.is_some(),
+            "an in-store backup must be preserved"
+        );
+        clear_for_workspace(sandbox.root());
     }
 
     #[test]

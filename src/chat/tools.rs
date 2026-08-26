@@ -11,7 +11,7 @@
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -206,15 +206,32 @@ impl ToolOutcome {
 
     pub fn clipped(self, max_bytes: usize) -> Self {
         let clip_text = |text: String| {
-            const MARKER: &str = "\n...[truncated for Workspace]";
             if text.len() <= max_bytes {
                 return text;
             }
-            let mut end = max_bytes.saturating_sub(MARKER.len());
+            // ANCHOR THE CUT. A bare "[truncated]" leaves a small model two
+            // moves: reissue the identical call (the repeat guard then ends the
+            // run) or give up — both dead 10-20s decodes. Reporting where the
+            // cut fell, and the exact continuation, turns that into one targeted
+            // read. The notice is composed first so its own length is inside the
+            // budget and a later clip can never remove it.
+            let total = text.len();
+            // Line count is what read_file's continuation cursor speaks in.
+            let marker = |shown_lines: usize| {
+                format!(
+                    "\n…[showing the first {shown_lines} lines of this result ({total} bytes \
+                     total); continue with read_file start_line={} if this was a file]",
+                    shown_lines + 1
+                )
+            };
+            // Reserve generously: the marker's own digits vary.
+            let reserve = marker(total).len();
+            let mut end = max_bytes.saturating_sub(reserve);
             while end > 0 && !text.is_char_boundary(end) {
                 end -= 1;
             }
-            format!("{}{MARKER}", &text[..end])
+            let head = &text[..end];
+            format!("{head}{}", marker(head.lines().count()))
         };
         match self {
             Self::Ok(text) => Self::Ok(clip_text(text)),
@@ -261,6 +278,9 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_RANGED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 4_096;
 const MAX_SEARCH_FILES: usize = 5_000;
+/// Longest single search hit handed back. One minified or generated line can
+/// otherwise eat the whole observation budget and evict every other match.
+const MAX_SEARCH_HIT_BYTES: usize = 500;
 const MAX_SEARCH_DURATION: Duration = Duration::from_secs(2);
 const FULL_SEARCH_HITS: u64 = 100;
 const WORKSPACE_SEARCH_HITS: u64 = 20;
@@ -270,7 +290,73 @@ const WORKSPACE_SEARCH_HITS: u64 = 20;
 /// budget are unknown here. ~4k tokens, i.e. half an 8192-token budget, so a
 /// single runaway command cannot on its own force a context trim.
 const WEB_CODE_OBSERVATION_LIMIT: usize = 16 * 1024;
-const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
+pub(crate) const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
+
+/// Separator between a synthetic line number and the file's own bytes.
+///
+/// Deliberately NOT `": "`, which occurs constantly in Rust, Python, YAML and
+/// JSON — the model could not tell the harness's prefix from the file's own
+/// content, and then echoed the prefix back inside an `edit_file` needle, which
+/// of course never matched.
+pub(crate) const LINE_ANCHOR: &str = " | ";
+
+/// Up to three sibling names similar to the one that was not found, plus the
+/// workspace-root note.
+///
+/// A wrong path guess otherwise costs a bare OS error, a `list_dir` round trip,
+/// and a retry — three decodes for a typo. Bounded: one directory read, no
+/// recursion, silent on any failure.
+fn similar_path_hint(path: &Path) -> String {
+    let Some(parent) = path.parent() else {
+        return String::new();
+    };
+    let Some(leaf) = path.file_name().and_then(|n| n.to_str()) else {
+        return String::new();
+    };
+    let needle = leaf.to_ascii_lowercase();
+    let stem = needle.split('.').next().unwrap_or(&needle).to_string();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return String::new();
+    };
+    let mut similar: Vec<String> = Vec::new();
+    for entry in entries.flatten().take(2_000) {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let lowered = name.to_ascii_lowercase();
+        if lowered == needle {
+            continue;
+        }
+        // Substring either way catches truncated/extended guesses; edit distance
+        // catches the typo shapes substring matching cannot (a dropped or
+        // transposed character, e.g. `confg.toml` -> `config.toml`).
+        let close_enough = (!stem.is_empty() && lowered.contains(&stem))
+            || needle.contains(&lowered)
+            || edit_distance(&needle, &lowered) <= (needle.len() / 4).clamp(1, 3);
+        if close_enough {
+            similar.push(name);
+            if similar.len() == 3 {
+                break;
+            }
+        }
+    }
+    if similar.is_empty() {
+        String::new()
+    } else {
+        format!(" Similar names here: {}.", similar.join(", "))
+    }
+}
+
+/// Error text for a failed read that names the fix when the path is the problem.
+fn read_failure_message(path: &Path, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return format!(
+            "read failed: {error}. Paths are relative to the workspace root.{}",
+            similar_path_hint(path)
+        );
+    }
+    format!("read failed: {error}")
+}
 
 impl Sandbox {
     /// Build a sandbox rooted at `root` (canonicalized). Fails if the root does
@@ -331,9 +417,53 @@ impl Sandbox {
         display_path(&self.root)
     }
 
+    /// Canonicalize a directory that does not exist yet, by canonicalizing its
+    /// nearest EXISTING ancestor and re-appending the missing components.
+    ///
+    /// A plain `canonicalize` of the parent fails outright on a new subdirectory,
+    /// which made `write_file rpncalc/__init__.py` impossible in a fresh
+    /// workspace: every write into a directory the model had not created yet was
+    /// refused, and the only route left was for it to guess `run_shell mkdir -p`.
+    ///
+    /// Canonicalizing is what resolves `..` and symlinks, and it is the ONLY
+    /// reason the `starts_with(&self.root)` check in `resolve` means anything.
+    /// So the missing tail must not contain `..`: it cannot be resolved against a
+    /// real directory, and appending it blindly would walk back out of the
+    /// workspace past the check. Anything that cannot be resolved fails closed.
+    fn canonicalize_possibly_missing_dir(dir: &Path, raw: &str) -> Result<PathBuf, String> {
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        let mut cursor = dir;
+        loop {
+            if let Ok(base) = std::fs::canonicalize(cursor) {
+                let mut resolved = base;
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            // `file_name()` is None for a path ending in `..` or a root, so both
+            // land here and are refused rather than guessed at.
+            let name = cursor.file_name().ok_or_else(|| {
+                format!("cannot access parent of {raw}: no existing ancestor directory")
+            })?;
+            if name == std::ffi::OsStr::new("..") {
+                return Err(format!(
+                    "cannot resolve {raw}: it points through `..` above a directory that does \
+                     not exist yet. Use a path relative to the workspace root."
+                ));
+            }
+            missing.push(name.to_os_string());
+            cursor = cursor.parent().ok_or_else(|| {
+                format!("cannot access parent of {raw}: no existing ancestor directory")
+            })?;
+        }
+    }
+
     /// Resolve a user/model-supplied path against the root and confirm it stays
     /// inside. `must_exist=false` resolves the parent (for write targets that
-    /// don't exist yet). This is the path-escape backstop (constraint 5).
+    /// don't exist yet, including ones whose directory does not exist yet — see
+    /// [`Self::canonicalize_possibly_missing_dir`]). This is the path-escape
+    /// backstop (constraint 5).
     pub fn resolve(&self, raw: &str, must_exist: bool) -> Result<PathBuf, String> {
         if raw.trim().is_empty() {
             return Err("empty path".into());
@@ -355,16 +485,20 @@ impl Sandbox {
             let file = candidate
                 .file_name()
                 .ok_or_else(|| format!("invalid path {raw}"))?;
-            let parent_canon = std::fs::canonicalize(parent)
-                .map_err(|e| format!("cannot access parent of {raw}: {e}"))?;
+            let parent_canon = Self::canonicalize_possibly_missing_dir(parent, raw)?;
             parent_canon.join(file)
         };
         if self.fs_unrestricted || canon == self.root || canon.starts_with(&self.root) {
             Ok(canon)
         } else {
+            // Lead with the correction, not the escape hatch. `--allow-fs` is a CLI
+            // flag; on the Workspace/Code web surfaces there is no way to pass it, so
+            // naming it first told the model to do something it cannot do and left it
+            // repeating the same refused call until the repeat guard ended the turn.
             Err(format!(
-                "path {raw} escapes the sandbox root {} (pass --allow-fs to let the agent \
-                 read/write anywhere on disk)",
+                "path {raw} escapes the workspace root {}. Retry with a path relative to \
+                 that root — `.` for the root itself, `sub/file.txt` beneath it. Do not \
+                 repeat this call unchanged.",
                 self.root.display()
             ))
         }
@@ -465,21 +599,19 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     let mut tools = vec![
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file within the workspace. Use start_line and \
-                          max_lines for bounded excerpts."
-                .into(),
+            description: "Read UTF-8 text. Optional start_line/max_lines select an excerpt; `N | ` prefixes are not file content.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "list_dir".into(),
-            description: "List a page of directory entry names within the workspace. Use this to discover filenames and file extensions.".into(),
+            description: "List directory entry names.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex or glob syntax.".into(),
+            description: "Find a literal substring in file contents; no regex or globs.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
@@ -501,15 +633,15 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "write_file".into(),
-            description: "Create or overwrite a file within the workspace.".into(),
+            description: "Create or overwrite one workspace file.".into(),
             risk: Risk::Write,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
         ToolSpec {
             name: "edit_file".into(),
-            description: "Replace a unique occurrence of `old` with `new` in a file.".into(),
+            description: "Replace exact file text (`N | ` prefixes excluded); replace_all changes every match.".into(),
             risk: Risk::Write,
-            params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
+            params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old","new"]}),
         },
     ];
     if profile == ToolProfile::WorkspaceReadOnly {
@@ -519,13 +651,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     if shell_mode != ShellSandbox::Disabled {
         tools.push(ToolSpec {
             name: "run_shell".into(),
-            description: concat!(
-                "Run a shell command in the workspace and capture its output. Pass a command ",
-                "line, never raw program source: create source with write_file first, then invoke ",
-                "its runtime. Probe a missing runtime before attempting an approval-gated ",
-                "package-manager install."
-            )
-            .into(),
+            description: "Run a workspace shell command. Put source in files; use this for builds, tests, apps, installs, git, or bulk work.".into(),
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
@@ -565,14 +691,15 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
                 name: "spawn_subagent".into(),
                 description: "Spawn a child agent (subagent) for one independent scoped goal, \
                               then call await_subagent once with the returned runtime id. Do not delegate a small \
-                              single-file task; use write_file/edit_file directly. Exec tier — \
+                              single-file task or bulk mechanical work (one run_shell loop beats \
+                              a subagent); use write_file/edit_file directly. Exec tier — \
                               always gated. The child runs UNATTENDED: unless this session is in \
                               confirmed full-auto it can only READ, so delegate investigation \
                               and make edits yourself from its report."
                     .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
-                    "subtask_id":{"type":"string","description":"Optional readable alias. Case, spaces, `_`, and `-` are normalized; the runtime generates an id when omitted."},
+                    "subtask_id":{"type":"string","description":"Optional readable alias; normalized; omit to auto-generate."},
                     "goal":{"type":"string","description":"The scoped goal for the subagent"}
                 },"required":["goal"]}),
             });
@@ -796,6 +923,8 @@ pub enum Action {
         summary: String,
     },
     EditFile {
+        /// Change every occurrence instead of refusing an ambiguous match.
+        replace_all: bool,
         path: PathBuf,
         old: String,
         new: String,
@@ -1046,7 +1175,9 @@ impl Action {
             Action::WriteFile { path, summary, .. } => {
                 format!("write_file → {}\n{summary}", sandbox.rel(path))
             }
-            Action::EditFile { path, old, new } => {
+            Action::EditFile {
+                path, old, new, replace_all: _,
+            } => {
                 // The full replacement, - then +, bounded: unique-replace
                 // needles are short by construction, and an approval that
                 // shows only first lines is approving on faith.
@@ -1105,6 +1236,13 @@ impl Action {
     }
 
     /// Execute the (already approved) action outside an agent turn.
+    ///
+    /// The live agent loop calls `execute_cancellable` directly; this wrapper's only
+    /// non-test caller is the `#[cfg(windows)]` syscap battery, so on a non-Windows
+    /// lib build it is legitimately unreferenced. Kept rather than cfg'd away because
+    /// the tests exercise it on every platform — but CI runs
+    /// `cargo clippy --all-targets -- -D warnings`, where bare dead_code is fatal.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn execute(&self, sandbox: &Sandbox) -> ToolOutcome {
         static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
         self.execute_cancellable(sandbox, &NEVER_CANCELLED)
@@ -1140,13 +1278,18 @@ impl Action {
                 super::checkpoint::finish(pending, !out.is_err());
                 out
             }
-            Action::EditFile { path, old, new } => {
+            Action::EditFile {
+                path,
+                old,
+                new,
+                replace_all,
+            } => {
                 let pending = super::checkpoint::prepare(sandbox, path, "edit_file");
-                let out = edit_file(path, old, new, &sandbox.rel(path));
+                let out = edit_file(path, old, new, &sandbox.rel(path), *replace_all);
                 super::checkpoint::finish(pending, !out.is_err());
                 out
             }
-            Action::RunShell { command } => run_shell(sandbox, command),
+            Action::RunShell { command } => run_shell_cancellable(sandbox, command, cancel),
             Action::HttpFetch { method, url } => http_fetch(sandbox, method, url),
             Action::RunWindowsCommand {
                 workdir,
@@ -1324,17 +1467,186 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
     validate_for(ToolProfile::Full, call, sandbox)
 }
 
+/// Every tool name `validate_for` has an arm for. The repair ladder below
+/// fuzzy-matches against the subset the active profile actually advertises.
+const KNOWN_TOOL_NAMES: &[&str] = &[
+    "await_subagent",
+    "check_subagent_status",
+    "edit_file",
+    "http_fetch",
+    "inspect_system",
+    "list_dir",
+    "mouse_click",
+    "mouse_move",
+    "press_keys",
+    "read_file",
+    "run_shell",
+    "run_windows_command",
+    "screenshot",
+    "search",
+    "spawn_subagent",
+    "type_text",
+    "ui_click",
+    "ui_inspect",
+    "update_plan",
+    "web_search",
+    "write_file",
+];
+
+/// Fold the spelling variants small models actually emit onto the canonical
+/// form: `WriteFile`, `write-file`, `Write File`, `write_file_tool`,
+/// `functions.write_file`, and stray quote/tag fragments all become
+/// `write_file`. Pure string work — no allocation beyond the result.
+fn normalize_tool_name(raw: &str) -> String {
+    // Drop a namespace prefix (`functions.write_file`, `tools:write_file`) and
+    // any leaked XML/quote fragments around the name.
+    let trimmed = raw.trim().trim_matches(|c: char| {
+        c == '"' || c == '\'' || c == '`' || c == '<' || c == '>' || c == '/' || c.is_whitespace()
+    });
+    // Skip EMPTY segments: a trailing separator ("write_file." / "write_file:")
+    // otherwise selects "" and defeats an otherwise-certain repair.
+    let trimmed = trimmed
+        .rsplit(['.', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(trimmed);
+    let mut out = String::with_capacity(trimmed.len() + 4);
+    let mut previous_lower_or_digit = false;
+    for character in trimmed.chars() {
+        if character == '-' || character == ' ' {
+            out.push('_');
+            previous_lower_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() {
+            // CamelCase -> snake_case, but do not inject a leading underscore.
+            if previous_lower_or_digit {
+                out.push('_');
+            }
+            out.push(character.to_ascii_lowercase());
+            previous_lower_or_digit = false;
+            continue;
+        }
+        previous_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+        out.push(character);
+    }
+    // `write_file_tool` / `write_filetool` -> `write_file`.
+    for suffix in ["_tool", "tool"] {
+        if let Some(stripped) = out.strip_suffix(suffix) {
+            if !stripped.is_empty() && KNOWN_TOOL_NAMES.contains(&stripped.trim_end_matches('_')) {
+                out = stripped.trim_end_matches('_').to_string();
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Levenshtein distance, capped — only used against a ~12-entry name list.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut current = vec![0usize; b_chars.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            current[j + 1] = (previous[j] + cost)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b_chars.len()]
+}
+
+/// Repair a near-miss tool name to the canonical one this profile advertises.
+///
+/// A small model that emits `WriteFile` knows exactly what it wants; rejecting
+/// it burns a validation strike plus a full local decode pass to re-emit the
+/// same intent. Normalization is exact-match-safe; the fuzzy step is deliberately
+/// tight (distance <= 2 and <= 1/3 of the name) so `read_file` can never be
+/// "repaired" into `edit_file` — a wrong repair would silently run the wrong tool.
+pub(crate) fn repair_tool_name(raw: &str, profile: ToolProfile) -> Option<&'static str> {
+    let normalized = normalize_tool_name(raw);
+    if normalized.is_empty() {
+        return None;
+    }
+    let candidates = || KNOWN_TOOL_NAMES.iter().filter(|name| profile.allows(name));
+    if let Some(exact) = candidates().find(|name| **name == normalized) {
+        return Some(exact);
+    }
+    let mut best: Option<(usize, &'static str)> = None;
+    for candidate in candidates() {
+        let distance = edit_distance(&normalized, candidate);
+        let ceiling = 2.min(candidate.len() / 3);
+        if distance == 0 || distance > ceiling {
+            continue;
+        }
+        if best.is_none_or(|(d, _)| distance < d) {
+            best = Some((distance, candidate));
+        }
+    }
+    // Ambiguity is a wrong-tool hazard: refuse when two candidates tie.
+    if let Some((distance, winner)) = best {
+        let ties = candidates()
+            .filter(|candidate| edit_distance(&normalized, candidate) == distance)
+            .count();
+        if ties == 1 {
+            return Some(winner);
+        }
+    }
+    None
+}
+
+/// A name that carries no recoverable intent — empty, whitespace, or a fragment
+/// of echoed tool-call JSON lifted out of file contents. These get a terse error
+/// with NO tool catalog: repeating the catalog primes the model to emit more of
+/// the same phantom calls.
+pub(crate) fn tool_name_is_unrecoverable(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if !trimmed.contains(|c: char| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    // Echoed JSON/markup fragments rather than an identifier.
+    trimmed.len() > 48 || trimmed.contains('{') || trimmed.contains('}') || trimmed.contains('\n')
+}
+
 pub fn validate_for(
     profile: ToolProfile,
     call: &ToolCall,
     sandbox: &Sandbox,
 ) -> Result<Action, String> {
-    if !profile.allows(&call.name) {
+    // Repair before rejecting: a spelling variant of a real tool should execute,
+    // not burn a strike and a decode pass. `repaired` is used for dispatch below.
+    let repaired: Option<&'static str> = if profile.allows(&call.name) {
+        None
+    } else {
+        repair_tool_name(&call.name, profile)
+    };
+    if !profile.allows(&call.name) && repaired.is_none() {
+        if tool_name_is_unrecoverable(&call.name) {
+            // Terse and catalog-free on purpose (anti-priming).
+            return Err(
+                "that was not a tool call. Answer in plain text, or emit one call using an \
+                 advertised tool name."
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "tool `{}` is not available in this agent mode",
             call.name
         ));
     }
+    let call = match repaired {
+        Some(canonical) => &ToolCall {
+            name: canonical.to_string(),
+            args: call.args.clone(),
+        },
+        None => call,
+    };
     let args = &call.args;
     let str_arg = |key: &str| -> Result<String, String> {
         args.get(key)
@@ -1408,6 +1720,7 @@ pub fn validate_for(
                 path,
                 old: str_arg("old")?,
                 new: str_arg("new")?,
+                replace_all: lenient_bool(args.get("replace_all")),
             })
         }
         "run_shell" => validate_shell_command(str_arg("command")?),
@@ -1724,6 +2037,19 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<
                     return Ok(parsed);
                 }
             }
+            // Second rung: coerce scalars toward the types the tool's OWN schema
+            // declares ("50" -> 50, "true" -> true) and drop explicit nulls sent
+            // for optional fields. Same argument as the rung above — a
+            // stringified integer is a formatting tic, not a reasoning failure —
+            // and with VALIDATION_REPEAT_LIMIT at 2, two such tics end the run.
+            if let Some(schema) = argument_schema_for(name) {
+                let coerced = coerce_to_schema(args, &schema);
+                if &coerced != args {
+                    if let Ok(parsed) = serde_json::from_value::<T>(coerced) {
+                        return Ok(parsed);
+                    }
+                }
+            }
             // Still wrong: say what was expected. The bare serde message ("invalid
             // type: string ..., expected a sequence") tells the model nothing about
             // the shape it should have sent, so it retries the same malformed call
@@ -1763,11 +2089,131 @@ fn unwrap_json_string_fields(args: &Value) -> Option<Value> {
 
 /// The argument shape a tool advertises, as a compact hint for an error message.
 /// Read from the same schema the model was given, so the two cannot drift.
+/// A boolean argument that tolerates the string and integer spellings a small
+/// model produces. `validate_for` reads a few flags straight off the raw args
+/// rather than through `parse_args`, so schema coercion never sees them.
+fn lenient_bool(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "1"
+            )
+        }
+        Some(Value::Number(number)) => number.as_i64() == Some(1),
+        _ => false,
+    }
+}
+
 fn argument_schema_hint(name: &str) -> Option<String> {
     let spec = specs(true, shell_sandbox::ShellSandbox::Sandboxed)
         .into_iter()
         .find(|spec| spec.name == name)?;
     serde_json::to_string(&spec.params).ok()
+}
+
+/// The tool's declared JSON Schema, for coercion (the hint above renders the
+/// same value for humans).
+fn argument_schema_for(name: &str) -> Option<Value> {
+    specs(true, shell_sandbox::ShellSandbox::Sandboxed)
+        .into_iter()
+        .find(|spec| spec.name == name)
+        .map(|spec| spec.params)
+}
+
+/// Nudge scalars toward the types the schema declares, and drop explicit nulls
+/// sent for fields the schema does not require.
+///
+/// Deliberately conservative: it only rewrites a value when the declared type
+/// says what the value should have been, never invents a field, and never
+/// touches a value that already type-checks. Anything it cannot confidently
+/// convert is left exactly as the model sent it, so the caller still reports the
+/// original error.
+fn coerce_to_schema(value: &Value, schema: &Value) -> Value {
+    let declared = schema.get("type").and_then(Value::as_str);
+    match declared {
+        Some("object") => {
+            let Some(map) = value.as_object() else {
+                return value.clone();
+            };
+            let properties = schema.get("properties").and_then(Value::as_object);
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let mut out = serde_json::Map::new();
+            for (key, child) in map {
+                // An explicit null for an optional field is the model saying
+                // "not applicable"; serde reads it as a type error.
+                if child.is_null() && !required.contains(&key.as_str()) {
+                    continue;
+                }
+                match properties.and_then(|properties| properties.get(key)) {
+                    Some(child_schema) => {
+                        out.insert(key.clone(), coerce_to_schema(child, child_schema));
+                    }
+                    None => {
+                        out.insert(key.clone(), child.clone());
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        Some("array") => {
+            let Some(items) = value.as_array() else {
+                return value.clone();
+            };
+            match schema.get("items") {
+                Some(item_schema) => Value::Array(
+                    items
+                        .iter()
+                        .map(|item| coerce_to_schema(item, item_schema))
+                        .collect(),
+                ),
+                None => value.clone(),
+            }
+        }
+        Some("integer") | Some("number") => match value {
+            Value::String(text) => {
+                let trimmed = text.trim();
+                if let Ok(parsed) = trimmed.parse::<i64>() {
+                    return Value::from(parsed);
+                }
+                if declared == Some("number") {
+                    if let Ok(parsed) = trimmed.parse::<f64>() {
+                        if let Some(number) = serde_json::Number::from_f64(parsed) {
+                            return Value::Number(number);
+                        }
+                    }
+                }
+                value.clone()
+            }
+            Value::Bool(_) => value.clone(),
+            _ => value.clone(),
+        },
+        Some("boolean") => match value {
+            Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "1" => Value::Bool(true),
+                "false" | "no" | "0" => Value::Bool(false),
+                _ => value.clone(),
+            },
+            Value::Number(number) => match number.as_i64() {
+                Some(0) => Value::Bool(false),
+                Some(1) => Value::Bool(true),
+                _ => value.clone(),
+            },
+            _ => value.clone(),
+        },
+        Some("string") => match value {
+            // A bare number where a string is declared (a path like 2024).
+            Value::Number(number) => Value::String(number.to_string()),
+            Value::Bool(flag) => Value::String(flag.to_string()),
+            _ => value.clone(),
+        },
+        _ => value.clone(),
+    }
 }
 
 // --- execution ------------------------------------------------------------
@@ -1784,7 +2230,7 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
         }
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
-            Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+            Err(error) => return ToolOutcome::Err(read_failure_message(path, &error)),
         };
         let start = start_line.unwrap_or(1);
         let limit = max_lines.unwrap_or(200);
@@ -1801,9 +2247,9 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
             }
             let line = match line {
                 Ok(line) => line,
-                Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+                Err(error) => return ToolOutcome::Err(read_failure_message(path, &error)),
             };
-            let rendered = format!("{line_number}: {line}\n");
+            let rendered = format!("{line_number}{LINE_ANCHOR}{line}\n");
             if output.len().saturating_add(rendered.len()) > MAX_READ_BYTES {
                 output.push_str(&format!("...[continue at start_line={line_number}]"));
                 break;
@@ -1829,13 +2275,22 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
         Ok(bytes) => {
             let truncated = bytes.len() > MAX_READ_BYTES;
             let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
-            let mut text = String::from_utf8_lossy(slice).into_owned();
+            let raw = String::from_utf8_lossy(slice);
+            // Number this branch the SAME way as the ranged one. They used to
+            // differ — ranged emitted "N: line", whole-file emitted raw bytes —
+            // so the model's mental model of the file depended on which branch
+            // it happened to hit, and an edit anchored after a whole-file read
+            // had no line numbers to reason with.
+            let mut text = String::with_capacity(raw.len() + raw.lines().count() * 6);
+            for (index, line) in raw.lines().enumerate() {
+                text.push_str(&format!("{}{LINE_ANCHOR}{line}\n", index + 1));
+            }
             if truncated {
                 text.push_str(&format!("\n…[truncated at {MAX_READ_BYTES} bytes]"));
             }
             ToolOutcome::Ok(text)
         }
-        Err(e) => ToolOutcome::Err(format!("read failed: {e}")),
+        Err(e) => ToolOutcome::Err(read_failure_message(path, &e)),
     }
 }
 
@@ -1844,7 +2299,29 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     let mut capped = false;
     let read = match std::fs::read_dir(path) {
         Ok(r) => r,
-        Err(e) => return ToolOutcome::Err(format!("list failed: {e}")),
+        Err(e) => {
+            // Listing a FILE is the one failure here a model can act on, and the
+            // raw errno is the one message it cannot. `Not a directory (os error
+            // 20)` names a POSIX condition, not a next step, and a small model
+            // reads it as "try again": observed looping three times on the same
+            // call in one run, while recovering first-try from every failure in
+            // the same run whose message named the fix. Route it to the tool that
+            // actually reads a file.
+            return ToolOutcome::Err(if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "list failed: {e}. Paths are relative to the workspace root.{}",
+                    similar_path_hint(path)
+                )
+            } else if path.is_file() {
+                format!(
+                    "list_dir failed: {} is a file, not a directory. Use read_file to read it, \
+                     or list_dir on its parent directory to see what is beside it.",
+                    display_path(path)
+                )
+            } else {
+                format!("list failed: {e}")
+            });
+        }
     };
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1917,13 +2394,24 @@ fn search(
     let mut visited = std::collections::HashSet::new();
     let mut files_scanned = 0usize;
     let started = Instant::now();
-    let mut truncated = false;
+    // WHY the search stopped, not just THAT it did. One flag collapsed three
+    // very different situations into "narrow pattern or path" — advice that is
+    // actively wrong for the hit cap (`limit` is a parameter the model can
+    // raise) and silent about a biased partial sample when a budget ran out.
+    let mut stopped_at_hit_cap = false;
+    let mut stopped_at_file_budget = false;
+    let mut stopped_at_time_budget = false;
     while let Some(dir) = stack.pop() {
-        if hits.len() >= limit
-            || (bounded
-                && (files_scanned >= MAX_SEARCH_FILES || started.elapsed() >= MAX_SEARCH_DURATION))
-        {
-            truncated = true;
+        if hits.len() >= limit {
+            stopped_at_hit_cap = true;
+            break;
+        }
+        if bounded && files_scanned >= MAX_SEARCH_FILES {
+            stopped_at_file_budget = true;
+            break;
+        }
+        if bounded && started.elapsed() >= MAX_SEARCH_DURATION {
+            stopped_at_time_budget = true;
             break;
         }
         let Ok(dir) = std::fs::canonicalize(dir) else {
@@ -1936,12 +2424,16 @@ fn search(
             continue;
         };
         for entry in read.flatten() {
-            if hits.len() >= limit
-                || (bounded
-                    && (files_scanned >= MAX_SEARCH_FILES
-                        || started.elapsed() >= MAX_SEARCH_DURATION))
-            {
-                truncated = true;
+            if hits.len() >= limit {
+                stopped_at_hit_cap = true;
+                break;
+            }
+            if bounded && files_scanned >= MAX_SEARCH_FILES {
+                stopped_at_file_budget = true;
+                break;
+            }
+            if bounded && started.elapsed() >= MAX_SEARCH_DURATION {
+                stopped_at_time_budget = true;
                 break;
             }
             let Ok(path) = std::fs::canonicalize(entry.path()) else {
@@ -1972,9 +2464,21 @@ fn search(
             let text = String::from_utf8_lossy(&bytes);
             for (n, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
-                    hits.push(format!("{}:{}: {}", sandbox.rel(&path), n + 1, line.trim()));
+                    // Cap each hit: one minified or generated line can otherwise
+                    // consume the whole observation budget and evict every other
+                    // match, which is the opposite of what a search is for.
+                    let mut rendered = line.trim().to_string();
+                    if rendered.len() > MAX_SEARCH_HIT_BYTES {
+                        let mut end = MAX_SEARCH_HIT_BYTES;
+                        while end > 0 && !rendered.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        rendered.truncate(end);
+                        rendered.push('…');
+                    }
+                    hits.push(format!("{}:{}: {rendered}", sandbox.rel(&path), n + 1));
                     if hits.len() >= limit {
-                        truncated = true;
+                        stopped_at_hit_cap = true;
                         break;
                     }
                 }
@@ -1986,8 +2490,22 @@ fn search(
     } else {
         hits.join("\n")
     };
-    if truncated {
-        output.push_str("\n...[search truncated; narrow pattern or path]");
+    if stopped_at_hit_cap {
+        output.push_str(&format!(
+            "\n…[stopped at the {limit}-hit limit; there may be more matches. Raise `limit` \
+             or search a narrower `path` — do NOT narrow the pattern, \
+             that discards real matches]"
+        ));
+    } else if stopped_at_file_budget {
+        output.push_str(&format!(
+            "\n…[stopped after scanning {MAX_SEARCH_FILES} files; these results are a PARTIAL \
+             sample of the tree, not all matches. Search a specific `path` to cover the rest]"
+        ));
+    } else if stopped_at_time_budget {
+        output.push_str(
+            "\n…[stopped at the search time budget; these results are a PARTIAL sample of the \
+             tree, not all matches. Search a specific `path` to cover the rest]",
+        );
     }
     ToolOutcome::Ok(output)
 }
@@ -2030,35 +2548,365 @@ fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> To
     ToolOutcome::Ok(output)
 }
 
+/// The line and the offending text of an f-string whose quote never closes on
+/// its own line, or `None` when the Python source has no such break.
+///
+/// Deliberately narrow. It looks only for a single-quoted `f'…` / `f"…` opened
+/// and not closed before the newline, which is the ONE construct this failure
+/// takes; a triple-quoted f-string spans lines legally and must not be flagged.
+/// It is a lint, not a parser: false negatives are fine (the syntax check is
+/// still behind it), false positives are not.
+fn python_quote_end(bytes: &[u8], mut cursor: usize, quote: u8, triple: bool) -> Option<usize> {
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            cursor = cursor.saturating_add(2);
+            continue;
+        }
+        if bytes[cursor] == quote
+            && (!triple
+                || bytes
+                    .get(cursor..cursor.saturating_add(3))
+                    .is_some_and(|candidate| candidate == [quote; 3]))
+        {
+            return Some(cursor + if triple { 3 } else { 1 });
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn python_line_has_explicit_continuation(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn python_string_prefix(bytes: &[u8], quote_at: usize) -> &[u8] {
+    let mut start = quote_at;
+    while start > 0 && bytes[start - 1].is_ascii_alphabetic() {
+        start -= 1;
+    }
+    &bytes[start..quote_at]
+}
+
+fn unterminated_fstring_line(source: &str) -> Option<(usize, String)> {
+    let mut triple_quote = None;
+    let mut continued_quote = None;
+    for (index, line) in source.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let bytes = line.as_bytes();
+        let mut cursor = 0usize;
+
+        if let Some(quote) = continued_quote {
+            if let Some(end) = python_quote_end(bytes, 0, quote, false) {
+                continued_quote = None;
+                cursor = end;
+            } else {
+                if !python_line_has_explicit_continuation(bytes) {
+                    continued_quote = None;
+                }
+                continue;
+            }
+        }
+
+        while cursor < bytes.len() {
+            if let Some(quote) = triple_quote {
+                if let Some(end) = python_quote_end(bytes, cursor, quote, true) {
+                    triple_quote = None;
+                    cursor = end;
+                    continue;
+                }
+                break;
+            }
+
+            if bytes[cursor] == b'#' {
+                break;
+            }
+            if !matches!(bytes[cursor], b'\'' | b'"') {
+                cursor += 1;
+                continue;
+            }
+
+            let quote_at = cursor;
+            let quote = bytes[quote_at];
+            let prefix = python_string_prefix(bytes, quote_at);
+            let valid_prefix = prefix
+                .iter()
+                .all(|byte| matches!(byte, b'r' | b'R' | b'b' | b'B' | b'u' | b'U' | b'f' | b'F'));
+            let formatted = valid_prefix && prefix.iter().any(|byte| matches!(byte, b'f' | b'F'));
+            let triple = bytes
+                .get(quote_at..quote_at.saturating_add(3))
+                .is_some_and(|candidate| candidate == [quote; 3]);
+            let content_at = quote_at + if triple { 3 } else { 1 };
+            if let Some(end) = python_quote_end(bytes, content_at, quote, triple) {
+                cursor = end;
+                continue;
+            }
+
+            if triple {
+                triple_quote = Some(quote);
+                break;
+            }
+            if python_line_has_explicit_continuation(bytes) {
+                continued_quote = Some(quote);
+                break;
+            }
+            if formatted {
+                return Some((index + 1, line.trim_start().to_string()));
+            }
+            break;
+        }
+    }
+    None
+}
+
 fn write_file(path: &Path, content: &str, display_path: &str) -> ToolOutcome {
+    // Refuse a broken f-string BEFORE it lands. This exact defect — a literal
+    // newline inside `f'…'` — appeared in all nine observed TaskForge runs, and
+    // survived being corrected once mid-run: the model fixed line 51, later
+    // regenerated the file, and re-emitted it. The kernel already says to spell
+    // breaks as `\n`, and is ignored, so instruction is not the lever here.
+    //
+    // Catching it at authorship costs one rejection with the fix in it; catching
+    // it downstream costs a write, an execute, a syntax failure, a read and an
+    // edit — and leaves a file on disk that does not parse if the turn ends first.
+    if path.extension().is_some_and(|ext| ext == "py") {
+        if let Some((line, text)) = unterminated_fstring_line(content) {
+            return ToolOutcome::Err(format!(
+                "write refused: {display_path} line {line} opens an f-string that never closes on \
+                 that line:\n  {text}\nA single-quoted Python f-string needs an explicit \
+                 continuation to span physical lines. Spell the intended break as \\n inside the \
+                 quotes — print(f'a:\\n  b') — then write the file again."
+            ));
+        }
+    }
+    // Create the containing directory. `path` has already been through
+    // `Workspace::resolve`, which canonicalized every existing ancestor and
+    // refused anything outside the root, so this cannot create a directory the
+    // write itself would not have been allowed to target.
+    //
+    // Without this, laying down any package — `pkg/__init__.py`, `tests/test_x.py`
+    // — burned one failed call per file and then depended on the model guessing
+    // `run_shell mkdir -p`, which is a separate approval on the gated surfaces.
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return ToolOutcome::Err(format!(
+                "write failed: could not create the directory for {display_path}: {e}"
+            ));
+        }
+    }
     match std::fs::write(path, content) {
         Ok(()) => ToolOutcome::Ok(format!("wrote {} bytes to {}", content.len(), display_path)),
         Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
     }
 }
 
-fn edit_file(path: &Path, old: &str, new: &str, display_path: &str) -> ToolOutcome {
+/// Normalize a line for tolerant matching: fold CRLF, strip horizontal
+/// whitespace at both ends, and map the Unicode characters a model most often
+/// substitutes for their ASCII originals.
+fn normalize_match_line(line: &str) -> String {
+    line.trim_end_matches('\r')
+        .trim_matches(|c: char| c == ' ' || c == '\t')
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{201b}' => '\'',
+            '\u{201c}' | '\u{201d}' | '\u{201f}' => '"',
+            '\u{00a0}' | '\u{2007}' | '\u{202f}' => ' ',
+            '\u{2013}' | '\u{2014}' | '\u{2212}' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// Find `old` in `content` tolerantly, returning the byte range of the matched
+/// region and whether tolerance was needed.
+///
+/// The exact `content.matches(old)` that used to be the ONLY strategy fails on
+/// drift a model cannot see it introduced — a re-indented block, CRLF, a smart
+/// quote pasted from prose. Each such miss cost two decodes and then escalated
+/// to a whole-file rewrite, which is the most expensive path in the loop.
+fn locate_edit_region(content: &str, old: &str) -> Option<(std::ops::Range<usize>, bool)> {
+    if let Some(start) = content.find(old) {
+        return Some((start..start + old.len(), false));
+    }
+    // Line-wise tolerant match: compare normalized lines, then map the hit back
+    // to real byte offsets so the splice stays byte-exact outside the region.
+    let needle: Vec<String> = old.lines().map(normalize_match_line).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    // (byte_start, byte_end_exclusive_of_newline, normalized)
+    let mut hay: Vec<(usize, usize, String)> = Vec::new();
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        hay.push((
+            offset,
+            offset + trimmed.len(),
+            normalize_match_line(trimmed),
+        ));
+        offset += line.len();
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    let mut hit: Option<std::ops::Range<usize>> = None;
+    for window_start in 0..=(hay.len() - needle.len()) {
+        let matches = needle
+            .iter()
+            .enumerate()
+            .all(|(i, want)| &hay[window_start + i].2 == want);
+        if matches {
+            if hit.is_some() {
+                return None; // ambiguous under tolerance: refuse rather than guess
+            }
+            hit = Some(hay[window_start].0..hay[window_start + needle.len() - 1].1);
+        }
+    }
+    hit.map(|range| (range, true))
+}
+
+/// The region of `content` around `at`, for handing back as ground truth.
+fn region_excerpt(content: &str, at: usize, budget: usize) -> String {
+    let start = content[..at.min(content.len())]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut end = (start + budget).min(content.len());
+    while end > start && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(last_newline) = content[start..end].rfind('\n') {
+        if last_newline > 0 {
+            end = start + last_newline;
+        }
+    }
+    content[start..end].to_string()
+}
+
+/// Render the changed region with line anchors so the model can see what landed
+/// and anchor its NEXT edit on freshly-rendered text.
+fn changed_region_snippet(updated: &str, at: usize, new_len: usize) -> String {
+    const CONTEXT_LINES: usize = 4;
+    const MAX_SNIPPET_BYTES: usize = 4096;
+    let first_changed = updated[..at.min(updated.len())].lines().count();
+    let last_changed = first_changed
+        + updated[at..(at + new_len).min(updated.len())]
+            .lines()
+            .count();
+    let from = first_changed.saturating_sub(CONTEXT_LINES);
+    let to = last_changed + CONTEXT_LINES;
+    let mut out = String::new();
+    for (index, line) in updated.lines().enumerate() {
+        let number = index + 1;
+        if number <= from || number > to {
+            continue;
+        }
+        if out.len() >= MAX_SNIPPET_BYTES {
+            out.push_str("…\n");
+            break;
+        }
+        out.push_str(&format!("{number}{LINE_ANCHOR}{line}\n"));
+    }
+    out
+}
+
+fn edit_file(
+    path: &Path,
+    old: &str,
+    new: &str,
+    display_path: &str,
+    replace_all: bool,
+) -> ToolOutcome {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) => return ToolOutcome::Err(format!("read failed: {e}")),
+        Err(e) => return ToolOutcome::Err(read_failure_message(path, &e)),
     };
-    let count = content.matches(old).count();
-    if count == 0 {
-        return ToolOutcome::Err("`old` text not found in file".into());
-    }
-    if count > 1 {
+    let exact = content.matches(old).count();
+    if exact > 1 && !replace_all {
         return ToolOutcome::Err(format!(
-            "`old` text is not unique ({count} occurrences); include more context"
+            "`old` text is not unique ({exact} occurrences); include more surrounding context to \
+             pick one, or set replace_all:true to change every occurrence"
         ));
     }
-    let updated = content.replacen(old, new, 1);
+    if exact > 1 {
+        let updated = content.replace(old, new);
+        return match std::fs::write(path, &updated) {
+            Ok(()) => ToolOutcome::Ok(format!(
+                "edited {display_path} ({exact} occurrences replaced)"
+            )),
+            Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
+        };
+    }
+    let Some((range, needed_tolerance)) = locate_edit_region(&content, old) else {
+        // Hand back GROUND TRUTH instead of a bare "not found". The model
+        // reconstructed `old` from an earlier read and got whitespace or a
+        // quote character wrong; without the real bytes its retry is another
+        // guess, and two guesses escalate to a full-file rewrite.
+        let anchor = old
+            .lines()
+            .map(normalize_match_line)
+            .find(|line| !line.is_empty())
+            .and_then(|line| {
+                content
+                    .split_inclusive('\n')
+                    .scan(0usize, |offset, raw| {
+                        let start = *offset;
+                        *offset += raw.len();
+                        Some((start, raw))
+                    })
+                    .find(|(_, raw)| normalize_match_line(raw.trim_end_matches('\n')) == line)
+                    .map(|(start, _)| start)
+            });
+        let excerpt = match anchor {
+            Some(at) => format!(
+                "The closest matching region currently reads:\n{}",
+                region_excerpt(&content, at, 800)
+            ),
+            None => format!(
+                "The file currently begins:\n{}",
+                region_excerpt(&content, 0, 800)
+            ),
+        };
+        return ToolOutcome::Err(format!(
+            "`old` text not found in {display_path}, even allowing for indentation, line endings, \
+             and quote-style differences. Match the text below EXACTLY as shown.\n{excerpt}"
+        ));
+    };
+    let mut updated = String::with_capacity(content.len() + new.len());
+    updated.push_str(&content[..range.start]);
+    updated.push_str(new);
+    updated.push_str(&content[range.end..]);
     match std::fs::write(path, &updated) {
-        Ok(()) => ToolOutcome::Ok(format!("edited {display_path}")),
+        Ok(()) => {
+            let mut message = format!("edited {display_path}");
+            if needed_tolerance {
+                message
+                    .push_str(" (matched allowing for indentation/line-ending/quote differences)");
+            }
+            let snippet = changed_region_snippet(&updated, range.start, new.len());
+            if !snippet.is_empty() {
+                message.push_str(&format!(
+                    "\nThe file now reads (no need to re-read it):\n{snippet}"
+                ));
+            }
+            ToolOutcome::Ok(message)
+        }
         Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
     }
 }
 
-fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
+/// Shell execution whose wait loop also honors the turn's cancel flag: a
+/// user Stop kills the child within one 50ms poll instead of being ignored for
+/// the rest of the shell timeout (120s on the Web Code lane — the old behavior
+/// left Stop dead for the whole window). Cancellation uses the same
+/// direct-child kill as the timeout path; the documented Unix orphan-descendant
+/// tradeoff is unchanged.
+fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutcome {
     // Platform shell with a timeout: `/bin/sh -c <command>` on Unix, `cmd /C
     // <command>` on Windows. The cwd-pin and OS-level confinement are applied by
     // the shell-sandbox layer (Task 1), which fails closed when the configured
@@ -2169,6 +3017,21 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if cancel.load(Ordering::Relaxed) {
+                    // User Stop: same teardown as the timeout arm below, taken
+                    // within one poll instead of at the end of the window.
+                    #[cfg(windows)]
+                    if let Some(ref j) = _job {
+                        j.terminate();
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Do NOT join the readers here — see the note on the timeout
+                    // arm below. Their output is discarded on this path anyway.
+                    drop(out_reader);
+                    drop(err_reader);
+                    return ToolOutcome::Err("command cancelled by user stop".into());
+                }
                 if std::time::Instant::now() >= deadline {
                     // Windows: tear down the whole tree (W2), then the
                     // direct-child backstop. Terminating the job kills every
@@ -2181,16 +3044,24 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
                     }
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Killing the child closes the write ends → the readers hit
-                    // EOF. Join them so neither thread outlives this call.
-                    if let Some(h) = out_reader {
-                        let _ = h.join();
-                    }
-                    if let Some(h) = err_reader {
-                        let _ = h.join();
-                    }
+                    // DETACH the readers instead of joining them. Killing the
+                    // direct child does NOT necessarily close the pipe write
+                    // ends on Unix: a pipe reports EOF only once EVERY writer
+                    // has closed, and `/bin/sh -c` may leave a descendant
+                    // (`sleep`, a `make -j` fan-out) holding the inherited fd.
+                    // Joining then blocked until that orphan exited on its own,
+                    // so BOTH the deadline and a user Stop were silently
+                    // unbounded — measured at a full 30s against a 3s deadline
+                    // on Linux CI. The output is discarded on these paths, so
+                    // the threads have nothing to hand back; they own only their
+                    // own buffer and exit when the pipe finally closes.
+                    drop(out_reader);
+                    drop(err_reader);
+                    // The hint pass below never sees this early return, so the
+                    // guidance rides the message itself.
                     return ToolOutcome::Err(format!(
-                        "command timed out after {}s",
+                        "command timed out after {}s\n[hint: run a smaller unit of work \
+                         rather than repeating the same long command]",
                         sandbox.shell_timeout.as_secs()
                     ));
                 }
@@ -2221,8 +3092,167 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     if status.success() {
         ToolOutcome::Ok(text)
     } else {
+        if let Some(hint) = shell_failure_hint(&stdout, &stderr) {
+            text.push_str(&format!("[hint: {hint}]\n"));
+        }
         ToolOutcome::Err(text)
     }
+}
+
+/// One actionable line appended to a FAILED `run_shell` result, naming the next
+/// action for the most common failure classes.
+///
+/// A bare non-zero exit tells a small model that something went wrong but not
+/// what to do about it, so it typically retries the identical command, burns a
+/// full decode pass (30s+ on a local 4B), and often trips a repeat guard. Each
+/// arm here is a class that costs at least one wasted round trip.
+///
+/// Rules: first match wins, at most ONE hint, and every hint names a concrete
+/// next action rather than restating the error. Ordered most-specific first —
+/// the sandbox arm must precede the generic permission arm, since a Seatbelt
+/// denial also prints "Operation not permitted". Deliberately a plain scan over
+/// a bounded prefix: no regex dependency, and no cost at all on success.
+fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
+    // Bounded scan of the HEAD AND TAIL of each stream. Head-only missed the
+    // classes that matter most for dev work: cargo/npm print the verdict
+    // ("test result: FAILED", the failing assertion) at the END of the log, so
+    // any suite whose chatter exceeded the budget was classified by incidental
+    // words in its head instead.
+    const SLICE_BYTES: usize = 2048;
+    fn char_floor(s: &str, mut index: usize) -> usize {
+        while index > 0 && !s.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+    fn char_ceil(s: &str, mut index: usize) -> usize {
+        while index < s.len() && !s.is_char_boundary(index) {
+            index += 1;
+        }
+        index
+    }
+    let mut combined = String::with_capacity(4 * SLICE_BYTES + 4);
+    for part in [stderr, stdout] {
+        if part.len() <= 2 * SLICE_BYTES {
+            combined.push_str(part);
+        } else {
+            combined.push_str(&part[..char_floor(part, SLICE_BYTES)]);
+            combined.push('\n');
+            combined.push_str(&part[char_ceil(part, part.len() - SLICE_BYTES)..]);
+        }
+        combined.push('\n');
+    }
+    let text = combined.to_ascii_lowercase();
+    let has = |needle: &str| text.contains(needle);
+
+    // --- build/test verdicts FIRST: a failing suite's output can contain any of
+    // the permission/network phrases below inside test names or asserted
+    // strings, and the verdict arms are the more specific classification. ---
+    if has("error[e") || has("could not compile") {
+        return Some(
+            "this is a compile error, not a harness failure. Read the named file at the reported \
+             line, fix the code, then rebuild",
+        );
+    }
+    if has("test result: failed") || has("assertion") && has("failed") {
+        return Some(
+            "a test failed. Read the assertion and the file it names, fix the cause, then re-run \
+             only that test",
+        );
+    }
+    // --- sandbox / permission ---
+    // The Seatbelt denial always prints "operation not permitted"; matching
+    // loose word pairs like sandbox+deny false-fired on test NAMES in suite
+    // output (this repo's own tests contain both words).
+    if has("operation not permitted") {
+        return Some(
+            "the kernel sandbox refused this path or network access. Do NOT retry unchanged — \
+             work inside the workspace root, or use the file tools instead",
+        );
+    }
+    if has("permission denied") {
+        return Some(
+            "permission denied. Check the path is inside the workspace; do not retry the same \
+             command, and do not attempt to change permissions on files you did not create",
+        );
+    }
+    // --- missing interpreters/tools: name the platform-correct alternative ---
+    if has("command not found") || has("no such file or directory") && has("bad interpreter") {
+        if has("python") && !has("python3") {
+            return Some("`python` is not on PATH here; use `python3` instead");
+        }
+        if has("py: command not found") {
+            return Some("the `py` launcher is Windows-only; on this host use `python3`");
+        }
+        if has("pip") && !has("pip3") {
+            return Some("use `python3 -m pip` instead of a bare `pip`");
+        }
+        return Some(
+            "that command is not installed on this host. Probe for an alternative (e.g. \
+             `command -v <tool>`) before assuming an install is needed",
+        );
+    }
+    // --- filesystem ---
+    if has("no such file or directory") {
+        return Some(
+            "a path in the command does not exist. Use list_dir to confirm the real path before \
+             retrying — paths are relative to the workspace root",
+        );
+    }
+    if has("is a directory") {
+        return Some("that path is a directory, not a file. Use list_dir to inspect it");
+    }
+    if has("no space left on device") {
+        return Some(
+            "the disk is full. Do not retry; report this to the user — it is not something the \
+             agent can fix",
+        );
+    }
+    if has("file exists") {
+        return Some(
+            "the target already exists. Read it first, then edit_file rather than recreating it",
+        );
+    }
+    // --- network (the sandbox denies egress; the shell reports it as DNS failure) ---
+    if has("could not resolve host")
+        || has("temporary failure in name resolution")
+        || has("network is unreachable")
+        || has("connection refused")
+    {
+        return Some(
+            "network access is not available to shell commands here. Do not retry — if the task \
+             needs the network, say so instead of working around it",
+        );
+    }
+    // --- build/test toolchains ---
+    if has("blocking waiting for file lock") || has("waiting for file lock on build directory") {
+        return Some(
+            "another cargo build holds the target-directory lock. Do not retry in a loop — wait \
+             for it, or report the conflict",
+        );
+    }
+    if has("modulenotfounderror") || has("importerror") {
+        return Some(
+            "a Python import failed. Check the module name and whether it needs installing; \
+             package installs cross the approval boundary, so ask rather than assuming",
+        );
+    }
+    if has("syntaxerror") || has("indentationerror") {
+        return Some(
+            "the source file has a syntax error. Read the file at the reported line and fix it \
+             with edit_file before running it again",
+        );
+    }
+    if has("not a git repository") {
+        return Some("this workspace is not a git repository; do not use git commands here");
+    }
+    if has("timed out") {
+        return Some(
+            "the command exceeded its time budget. Run a smaller unit of work rather than \
+             repeating the same long command",
+        );
+    }
+    None
 }
 
 /// Endpoint template for `web_search`. `{query}` is replaced with the
@@ -2865,17 +3895,22 @@ fn clip(s: &str) -> String {
     if extended_shell_capture() {
         return clip_head_tail(s);
     }
+    // Strip terminal control sequences BEFORE measuring: a colorized `cargo` or
+    // `npm` log spends a large share of its bytes on escapes that carry no
+    // meaning for the model, and charging them against the budget evicts real
+    // output. Cheap no-op on plain text.
+    let stripped = strip_ansi(s);
+    let s: &str = &stripped;
     if s.len() <= MAX_OUTPUT_BYTES {
         s.trim_end().to_string()
     } else {
-        // Truncate on a UTF-8 char boundary: slicing raw bytes at a fixed offset
-        // panics when a multibyte char straddles the cut (e.g. a 3-byte char that
-        // begins at byte 16383). Walk back to the nearest boundary first.
-        let mut end = MAX_OUTPUT_BYTES;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\n…[truncated]", &s[..end])
+        // KEEP THE TAIL. Build and test runners put the thing the model needs —
+        // the failing assertion, the error summary, the exit verdict — at the
+        // END. Head-only truncation handed back 16 KiB of compile banner and
+        // dropped the verdict entirely, so the model's only recovery was to
+        // re-run the whole command piped through `tail`: a wasted decode plus a
+        // full re-execution, and the re-run clipped identically.
+        clip_head_tail_within(s, MAX_OUTPUT_BYTES)
     }
 }
 
@@ -2901,23 +3936,83 @@ fn extended_shell_capture() -> bool {
 }
 
 fn clip_head_tail(s: &str) -> String {
-    if s.len() <= EXTENDED_CAPTURE_HEAD_BYTES + EXTENDED_CAPTURE_TAIL_BYTES {
+    keep_head_and_tail(s, EXTENDED_CAPTURE_HEAD_BYTES, EXTENDED_CAPTURE_TAIL_BYTES)
+}
+
+/// Head+tail clip inside one total budget, weighted toward the tail (3/8 head,
+/// 5/8 tail) because that is where runners put the verdict.
+fn clip_head_tail_within(s: &str, budget: usize) -> String {
+    let head = budget * 3 / 8;
+    keep_head_and_tail(s, head, budget.saturating_sub(head))
+}
+
+fn keep_head_and_tail(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
+    if s.len() <= head_bytes + tail_bytes {
         return s.trim_end().to_string();
     }
-    let mut head_end = EXTENDED_CAPTURE_HEAD_BYTES;
+    let mut head_end = head_bytes;
     while head_end > 0 && !s.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    let mut tail_start = s.len() - EXTENDED_CAPTURE_TAIL_BYTES;
+    let mut tail_start = s.len() - tail_bytes;
     while tail_start < s.len() && !s.is_char_boundary(tail_start) {
         tail_start += 1;
+    }
+    // Defensive: a pathological boundary walk must never invert the window.
+    if tail_start <= head_end {
+        return s[..head_end].trim_end().to_string();
     }
     format!(
         "{}\n…[{} bytes omitted]…\n{}",
         &s[..head_end],
         tail_start - head_end,
-        &s[tail_start..]
+        s[tail_start..].trim_end()
     )
+}
+
+/// Remove ANSI/CSI escape sequences (colors, cursor moves, OSC titles).
+///
+/// Returns the input untouched when there is no ESC at all, so plain output
+/// pays a single scan and no allocation.
+fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: consume params/intermediates up to the final byte @..~
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: runs until BEL or ST (ESC \)
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // Two-character escape (or a trailing lone ESC): already consumed.
+            _ => {}
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn first_line(s: &str) -> String {
@@ -2964,6 +4059,144 @@ mod tests {
             name: name.into(),
             args,
         }
+    }
+
+    #[test]
+    fn the_fstring_lint_catches_the_defect_every_run_reproduced() {
+        // Verbatim from the runs: nine for nine, and it recurred after the model
+        // had already fixed it once in the same session.
+        let broken = "def add(args):\n    print(f'Added task {task.id}:\n  {task.description}')\n";
+        let (line, text) = unterminated_fstring_line(broken).expect("must flag");
+        assert_eq!(line, 2);
+        assert!(text.contains("Added task"), "{text}");
+    }
+
+    #[test]
+    fn the_fstring_lint_does_not_flag_legal_python() {
+        // False positives are worse than misses here: refusing a legitimate write
+        // strands the agent with no way to author the file at all. The syntax
+        // check still sits behind this lint to catch what it lets through.
+        let legal: [&str; 14] = [
+            r#"print(f'Added task {task.id}: {task.description}')"#,
+            r#"print(f"done: {n}")"#,
+            "x = f'''multi\nline is legal'''",
+            "y = f\"\"\"also\nlegal\"\"\"",
+            "doc = \"\"\"example source:\n    f'not executable code\n\"\"\"",
+            r#"s = 'plain unterminated"#,
+            r#"print(f'escaped \' quote inside')"#,
+            "continued = f'legal\\\nphysical line'",
+            "# example only: f'not executable code",
+            "value = 1  # example only: f'not executable code",
+            r#"raw = rf'{root}\\{name}'"#,
+            "path = f'{root}/{name}'",
+            "",
+            "# no strings at all",
+        ];
+        for ok in legal {
+            assert!(
+                unterminated_fstring_line(ok).is_none(),
+                "false positive on: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_file_refuses_a_broken_fstring_and_says_how_to_fix_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("main.py");
+        let broken = "print(f'Added task {task.id}:\n  {task.description}')\n";
+        match write_file(&target, broken, "main.py") {
+            ToolOutcome::Err(message) => {
+                assert!(message.contains("line 1"), "{message}");
+                assert!(message.contains("\\n"), "must name the fix: {message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!target.exists(), "a refused write must not land on disk");
+    }
+
+    #[test]
+    fn write_file_still_accepts_correct_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("main.py");
+        let good = "print(f'Added task {task.id}:\\n  {task.description}')\n";
+        match write_file(&target, good, "main.py") {
+            ToolOutcome::Ok(_) => {}
+            other => panic!("the fixed form must be accepted, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), good);
+    }
+
+    #[test]
+    fn list_dir_on_a_file_names_the_tool_that_reads_it() {
+        // A raw `Not a directory (os error 20)` was retried three times in one
+        // run. Every failure in that same run whose message named the fix was
+        // recovered from on the first try.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.py");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        match list_dir(&file, 0, None) {
+            ToolOutcome::Err(message) => {
+                assert!(message.contains("is a file, not a directory"), "{message}");
+                assert!(
+                    message.contains("read_file"),
+                    "must route to read_file: {message}"
+                );
+                assert!(
+                    !message.contains("os error"),
+                    "must not surface the errno: {message}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_file_creates_the_package_directories_it_was_given() {
+        // Laying down a package is the ordinary shape of a from-scratch task, and
+        // it used to be impossible: `resolve` canonicalized the parent, which does
+        // not exist yet, so every one of these writes was refused and the model
+        // had to guess `run_shell mkdir -p` to make progress.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        for (path, body) in [
+            ("rpncalc/__init__.py", ""),
+            ("rpncalc/deep/nested/mod.py", "X = 1\n"),
+            ("tests/test_rpncalc.py", "import unittest\n"),
+        ] {
+            let resolved = sb.resolve(path, false).expect("resolves a missing parent");
+            let display = sb.rel(&resolved);
+            match write_file(&resolved, body, &display) {
+                ToolOutcome::Ok(_) => {}
+                other => panic!("write_file({path}) failed: {other:?}"),
+            }
+            assert_eq!(std::fs::read_to_string(&resolved).unwrap(), body);
+        }
+        assert!(dir.path().join("rpncalc/deep/nested/mod.py").is_file());
+    }
+
+    #[test]
+    fn a_missing_parent_still_cannot_be_used_to_escape_the_root() {
+        // Canonicalizing the parent is what resolved `..` and made the
+        // starts_with(root) check meaningful. Now that a missing parent is
+        // reconstructed instead of canonicalized, the `..` it may contain has to
+        // be refused explicitly or the escape backstop is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        for escape in [
+            "nope/../../../etc/passwd",
+            "a/b/../../../../outside.txt",
+            "missing/../../sibling.txt",
+        ] {
+            let result = sb.resolve(escape, false);
+            assert!(
+                result.is_err(),
+                "{escape} resolved to {:?} instead of being refused",
+                result.ok()
+            );
+        }
+        // A legitimate deep path with no `..` is still allowed.
+        assert!(sb.resolve("pkg/sub/file.py", false).is_ok());
     }
 
     #[test]
@@ -3033,7 +4266,9 @@ mod tests {
                 clipped.text().len() <= limit,
                 "{profile:?} exceeded its own ceiling"
             );
-            assert!(clipped.text().ends_with("...[truncated for Workspace]"));
+            // The marker must ANCHOR the cut, not merely announce it.
+            assert!(clipped.text().contains("showing the first"), "{profile:?}");
+            assert!(clipped.text().contains("start_line="), "{profile:?}");
         }
         // Generous enough that ordinary coding output is untouched.
         let ordinary = "cargo test output\n".repeat(200);
@@ -3048,7 +4283,8 @@ mod tests {
         text.push('—');
         let clipped = ToolOutcome::Ok(text).clipped(4 * 1024);
         assert!(clipped.text().len() <= 4 * 1024);
-        assert!(clipped.text().ends_with("...[truncated for Workspace]"));
+        assert!(clipped.text().contains("bytes total"));
+        assert!(clipped.text().contains("start_line="));
     }
 
     #[test]
@@ -3115,8 +4351,8 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert!(read.text().contains("2: two"));
-        assert!(read.text().contains("3: three"));
+        assert!(read.text().contains(&format!("2{LINE_ANCHOR}two")));
+        assert!(read.text().contains(&format!("3{LINE_ANCHOR}three")));
         assert!(read.text().contains("continue at start_line=4"));
 
         let list = validate(
@@ -3135,7 +4371,15 @@ mod tests {
         .unwrap()
         .execute(&sb);
         assert_eq!(search.text().lines().count(), 2);
-        assert!(search.text().contains("search truncated"));
+        // The hit cap is now named as the hit cap, with the correct remedy —
+        // raising `limit` or narrowing the PATH, never narrowing the pattern
+        // (which would silently discard real matches).
+        assert!(search.text().contains("hit limit"), "{}", search.text());
+        assert!(
+            !search.text().contains("narrow pattern or path"),
+            "the old catch-all advice was wrong for this cause: {}",
+            search.text()
+        );
     }
 
     #[test]
@@ -3202,6 +4446,25 @@ mod tests {
         // absolute outside-root is refused too
         let err2 = validate(&call("read_file", json!({"path":"/etc/passwd"})), &sb).unwrap_err();
         assert!(err2.contains("escapes") || err2.contains("cannot access"));
+    }
+
+    /// A refusal the model cannot act on is how a small model ends up repeating the
+    /// same call until the validation-repeat guard kills the turn. The escape error
+    /// must name the correction, and must NOT advertise `--allow-fs`: that is a CLI
+    /// flag, and the Workspace/Code web surfaces have no way to pass it.
+    #[test]
+    fn sandbox_escape_error_is_actionable_and_names_no_cli_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let err = validate(&call("list_dir", json!({"path":"/"})), &sb).unwrap_err();
+        assert!(
+            !err.contains("--allow-fs"),
+            "escape error must not advertise a CLI-only flag: {err}"
+        );
+        assert!(
+            err.contains("relative to"),
+            "escape error must state the correction: {err}"
+        );
     }
 
     #[test]
@@ -3749,6 +5012,358 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("marker.txt")));
     }
 
+    /// A stringified integer is a formatting tic, not a reasoning failure — and
+    /// with VALIDATION_REPEAT_LIMIT at 2, two of them end the run.
+    #[test]
+    fn tool_arguments_are_coerced_toward_the_declared_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let sb = sandbox(dir.path());
+
+        // start_line/max_lines declared integer, sent as strings.
+        let action = validate(
+            &call(
+                "read_file",
+                json!({"path":"a.txt","start_line":"2","max_lines":"1"}),
+            ),
+            &sb,
+        )
+        .expect("stringified integers must coerce, not fail the call");
+        let out = action.execute(&sb);
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(out.text().contains("two"), "{}", out.text());
+
+        // An explicit null for an OPTIONAL field means "not applicable".
+        validate(
+            &call("read_file", json!({"path":"a.txt","start_line":null})),
+            &sb,
+        )
+        .expect("an explicit null on an optional field must not fail the call");
+
+        // replace_all declared boolean, sent as a string.
+        std::fs::write(dir.path().join("m.txt"), "x x\n").unwrap();
+        let edit = validate(
+            &call(
+                "edit_file",
+                json!({"path":"m.txt","old":"x","new":"y","replace_all":"true"}),
+            ),
+            &sb,
+        )
+        .expect("a stringified boolean must coerce");
+        assert!(!edit.execute(&sb).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("m.txt")).unwrap(),
+            "y y\n"
+        );
+
+        // Coercion must NOT invent meaning: genuine nonsense still fails.
+        assert!(validate(
+            &call(
+                "read_file",
+                json!({"path":"a.txt","start_line":"not-a-number"})
+            ),
+            &sb,
+        )
+        .is_err());
+    }
+
+    /// Tool schemas ride in EVERY request on this lane, so their size is paid
+    /// once per step forever — and on the context-paging lane they are mandatory
+    /// content that evicts real source pages when they grow.
+    ///
+    /// This is the guard for that. Growing the schemas is allowed; doing it
+    /// ACCIDENTALLY is not. If this fails, either earn the tokens back elsewhere
+    /// or raise the ceiling deliberately, in the same commit as the description
+    /// that needed the room.
+    #[test]
+    fn tool_schemas_stay_within_their_token_budget() {
+        // ~4 chars/token is the conservative estimator this repo uses elsewhere.
+        const CEILING_TOKENS: usize = 1_200;
+        let specs = specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
+        let rendered: usize = specs
+            .iter()
+            .map(|spec| spec.name.len() + spec.description.len() + spec.params.to_string().len())
+            .sum();
+        let estimated = rendered / 4;
+        assert!(
+            estimated <= CEILING_TOKENS,
+            "WebCode tool schemas grew to ~{estimated} tokens ({rendered} chars), over the \
+             {CEILING_TOKENS}-token ceiling. They are sent on every request and are mandatory \
+             capsule content; trim a description or raise this ceiling on purpose."
+        );
+    }
+
+    /// A 4B reconstructs the needle from an earlier read and gets indentation,
+    /// line endings, or a quote character wrong far more often than it gets the
+    /// INTENT wrong. Exact-match-only turned each of those into a failed edit,
+    /// and two failures escalated to a full-file rewrite — the most expensive
+    /// path in the loop. The ladder must absorb that drift.
+    #[test]
+    fn edit_file_absorbs_indentation_line_ending_and_quote_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let edit = |body: &str, old: &str, new: &str| {
+            let f = dir.path().join("t.rs");
+            std::fs::write(&f, body).unwrap();
+            let out = edit_file(&f, old, new, "t.rs", false);
+            (out, std::fs::read_to_string(&f).unwrap())
+        };
+
+        // Indentation drift: model sent 2 spaces, file has 4.
+        let (out, after) = edit(
+            "fn a() {\n    let x = 1;\n}\n",
+            "  let x = 1;",
+            "    let x = 2;",
+        );
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(after.contains("let x = 2;"), "{after}");
+
+        // CRLF file, LF needle.
+        let (out, after) = edit("a\r\ntarget\r\nb\r\n", "target", "changed");
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(after.contains("changed"), "{after}");
+
+        // Smart quotes in the needle, straight quotes in the file.
+        let (out, after) = edit(
+            "let s = \"hi\";\n",
+            "let s = \u{201c}hi\u{201d};",
+            "let s = \"bye\";",
+        );
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(after.contains("bye"), "{after}");
+
+        // A genuine miss still fails — but hands back GROUND TRUTH so the retry
+        // is informed instead of another guess.
+        let (out, after) = edit("alpha\nbeta\n", "gamma", "delta");
+        assert!(out.is_err());
+        assert!(
+            out.text().contains("alpha") || out.text().contains("beta"),
+            "must return the real file text: {}",
+            out.text()
+        );
+        assert_eq!(
+            after, "alpha\nbeta\n",
+            "a failed edit must not modify the file"
+        );
+    }
+
+    /// Renaming an identifier across N sites cost N decodes, each needing a
+    /// unique anchor the model is bad at inventing. One flag, one decode.
+    #[test]
+    fn edit_file_replace_all_changes_every_occurrence_and_is_named_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.rs");
+        std::fs::write(&f, "let a = old_name;\nlet b = old_name;\n").unwrap();
+
+        // Without the flag the ambiguity error must NAME the flag as the fix.
+        let refused = edit_file(&f, "old_name", "new_name", "m.rs", false);
+        assert!(refused.is_err());
+        assert!(refused.text().contains("replace_all"), "{}", refused.text());
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "let a = old_name;\nlet b = old_name;\n",
+            "the refusal must not have edited anything"
+        );
+
+        let done = edit_file(&f, "old_name", "new_name", "m.rs", true);
+        assert!(!done.is_err(), "{}", done.text());
+        assert!(
+            done.text().contains('2'),
+            "reports the count: {}",
+            done.text()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "let a = new_name;\nlet b = new_name;\n"
+        );
+    }
+
+    /// A wrong path guess cost a bare OS error, a list_dir, and a retry.
+    #[test]
+    fn a_missing_path_suggests_similar_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "x").unwrap();
+        let missing = dir.path().join("confg.toml");
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let message = read_failure_message(&missing, &error);
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("workspace root"), "{message}");
+        // A non-NotFound error stays terse — no directory scan, no noise.
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(!read_failure_message(&missing, &denied).contains("Similar"));
+    }
+
+    /// Build and test runners print the verdict — the failing assertion, the
+    /// error summary — at the END. A head-only clip dropped exactly that and
+    /// left the model to re-run the whole command piped through `tail`.
+    #[test]
+    fn shell_clipping_keeps_the_tail_where_the_verdict_is() {
+        let banner = "compiling crate\n".repeat(4000); // ~64 KiB, over budget
+        let log = format!("{banner}error[E0425]: cannot find value `x`\ntest result: FAILED");
+        assert!(log.len() > MAX_OUTPUT_BYTES);
+        let clipped = clip(&log);
+        assert!(
+            clipped.contains("test result: FAILED"),
+            "the verdict at the tail must survive"
+        );
+        assert!(
+            clipped.contains("error[E0425]"),
+            "the failing diagnostic must survive"
+        );
+        assert!(
+            clipped.contains("bytes omitted"),
+            "the cut must be disclosed"
+        );
+        assert!(
+            clipped.len() <= MAX_OUTPUT_BYTES + 128,
+            "still within budget, got {}",
+            clipped.len()
+        );
+        // Short output is untouched.
+        assert_eq!(clip("all good"), "all good");
+    }
+
+    /// Escape bytes carry no meaning for the model; charging them against the
+    /// byte budget evicts real output on colorized cargo/npm logs.
+    #[test]
+    fn ansi_escapes_are_stripped_before_the_budget_is_charged() {
+        let colored = "\u{1b}[1m\u{1b}[31merror\u{1b}[0m: boom\n";
+        assert_eq!(clip(colored), "error: boom");
+        // OSC title sequence terminated by BEL.
+        assert_eq!(clip("\u{1b}]0;title\u{7}hello"), "hello");
+        // Plain text is returned unchanged (and borrows, not allocates).
+        assert!(matches!(
+            strip_ansi("plain"),
+            std::borrow::Cow::Borrowed("plain")
+        ));
+        // A multibyte char adjacent to an escape must not panic or corrupt.
+        assert_eq!(clip("\u{1b}[32m✓ ok\u{1b}[0m"), "✓ ok");
+    }
+
+    /// A bare non-zero exit makes a small model retry the identical command and
+    /// burn a whole decode pass. Every failure class we know about must name the
+    /// next action instead — and a SUCCESS must never carry a hint.
+    #[test]
+    fn failed_shell_results_carry_one_actionable_hint() {
+        assert!(
+            shell_failure_hint("", "").is_none(),
+            "no hint without a known class"
+        );
+        let sandbox_hint = shell_failure_hint("", "touch: /etc/probe: Operation not permitted")
+            .expect("sandbox denial must hint");
+        assert!(sandbox_hint.contains("sandbox"), "{sandbox_hint}");
+        assert!(
+            sandbox_hint.to_ascii_lowercase().contains("not retry"),
+            "must tell the model not to retry unchanged: {sandbox_hint}"
+        );
+        // The sandbox arm must win over the generic permission arm: a Seatbelt
+        // denial also prints "not permitted", and the generic advice is wrong for it.
+        let generic = shell_failure_hint("", "cat: f.txt: Permission denied").unwrap();
+        assert!(generic.contains("permission denied"), "{generic}");
+        assert!(!generic.contains("sandbox"), "{generic}");
+        // Platform-correct interpreter advice on macOS.
+        let python = shell_failure_hint("", "sh: python: command not found").unwrap();
+        assert!(python.contains("python3"), "{python}");
+        let py = shell_failure_hint("", "sh: py: command not found").unwrap();
+        assert!(py.contains("python3"), "{py}");
+        // Network is denied by the jail; the shell reports it as a DNS failure.
+        let net = shell_failure_hint("", "curl: (6) Could not resolve host: example.com").unwrap();
+        assert!(net.contains("network"), "{net}");
+        // A compile error is the model's problem, not the harness's.
+        let rustc = shell_failure_hint("", "error[E0425]: cannot find value `x`").unwrap();
+        assert!(rustc.contains("compile error"), "{rustc}");
+        assert!(
+            shell_failure_hint("all good\n", "").is_none(),
+            "clean output must not be hinted"
+        );
+    }
+
+    /// A spelling variant of a real tool should EXECUTE, not burn a validation
+    /// strike plus a full local decode pass to re-emit the same intent — while a
+    /// genuinely different tool must never be silently substituted.
+    #[test]
+    fn tool_name_repair_fixes_variants_but_never_swaps_tools() {
+        let p = ToolProfile::WebCode;
+        for variant in [
+            "WriteFile",
+            "write-file",
+            "Write File",
+            "write_file_tool",
+            "functions.write_file",
+            "  write_file  ",
+        ] {
+            assert_eq!(
+                repair_tool_name(variant, p),
+                Some("write_file"),
+                "variant {variant:?} must repair to write_file"
+            );
+        }
+        assert_eq!(repair_tool_name("ReadFile", p), Some("read_file"));
+        assert_eq!(repair_tool_name("list-dir", p), Some("list_dir"));
+        // NEVER silently swap one real tool for another: read_file and edit_file
+        // are both advertised and close in spelling, so a repair here would run
+        // the wrong tool on the user's files.
+        assert_eq!(
+            repair_tool_name("read_file", p),
+            Some("read_file"),
+            "an exact name must stay itself"
+        );
+        assert_eq!(
+            repair_tool_name("totally_unrelated_name", p),
+            None,
+            "an unrecognizable name must not be force-fitted"
+        );
+        // Profile-scoped: a tool this profile does not advertise is not conjured.
+        assert_eq!(repair_tool_name("screenshot", ToolProfile::WebCode), None);
+    }
+
+    /// Echoed tool-call JSON lifted out of file contents must get a terse,
+    /// catalog-free error: repeating the tool list primes more phantom calls.
+    #[test]
+    fn unrecoverable_tool_names_are_detected_for_anti_priming() {
+        assert!(tool_name_is_unrecoverable(""));
+        assert!(tool_name_is_unrecoverable("   "));
+        assert!(tool_name_is_unrecoverable("{\"name\": \"x\"}"));
+        assert!(tool_name_is_unrecoverable("1234"));
+        assert!(!tool_name_is_unrecoverable("write_file"));
+        assert!(!tool_name_is_unrecoverable("WriteFile"));
+    }
+
+    /// A user Stop must interrupt an in-flight shell command within a poll, not
+    /// be ignored for the whole shell timeout (120s on the Web Code lane). The
+    /// cancel flag is pre-set so the wait loop takes the cancel arm on its first
+    /// iteration; a 30s sleep would hang the test if the flag were not honored.
+    #[cfg(unix)]
+    #[test]
+    fn run_shell_honors_a_preset_cancel_within_the_wait_loop() {
+        use super::ShellSandbox;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path()).with_shell_mode(ShellSandbox::Unrestricted);
+        let cancel = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        // A BACKGROUNDED descendant that inherits the pipes: killing the direct
+        // `/bin/sh` leaves it holding the write ends, so a teardown that joins
+        // the reader threads blocks until it exits. This is the shape that made
+        // the cancel path take a full 30s on Linux CI while passing on macOS
+        // (where `sh -c` execs a lone `sleep` and the fds die with it).
+        let out = run_shell_cancellable(&sb, "sleep 30 & sleep 30", &cancel);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel should return promptly, took {:?}",
+            started.elapsed()
+        );
+        match out {
+            ToolOutcome::Err(ref message) => {
+                assert!(
+                    message.contains("cancelled"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected a cancelled error, got {other:?}"),
+        }
+        let _ = cancel.load(Ordering::Relaxed);
+    }
+
     // On Windows the default (sandboxed) mode is enforced natively (cwd-pin +
     // hard timeout, no seccomp) — run_shell MUST run here, gated by approval. This
     // is the behavior exercised on the Windows dev box.
@@ -3834,7 +5449,18 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert_eq!(edited.text(), "edited note.txt");
+        // The result now echoes the changed region so the model never spends a
+        // round trip re-reading to confirm the write landed.
+        assert!(
+            edited.text().starts_with("edited note.txt"),
+            "{}",
+            edited.text()
+        );
+        assert!(
+            edited.text().contains(&format!("1{LINE_ANCHOR}done")),
+            "{}",
+            edited.text()
+        );
     }
 
     #[test]
@@ -4002,7 +5628,10 @@ mod tests {
         s.push('—');
         s.push_str(&"b".repeat(64));
         let out = clip(&s); // must not panic
-        assert!(out.ends_with("…[truncated]"));
+                            // Tail-inclusive now: the cut is disclosed mid-string and the LAST
+                            // bytes (where a runner puts its verdict) survive.
+        assert!(out.contains("bytes omitted"), "{out:.120}");
+        assert!(out.ends_with('b'), "the tail must be kept");
     }
 
     #[test]
@@ -4205,7 +5834,7 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(out.text().contains("bytes omitted"), "{}", out.text());
     }
 
     #[cfg(windows)]
@@ -4284,7 +5913,7 @@ mod tests {
             "should complete, not time out: {}",
             out.text()
         );
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(out.text().contains("bytes omitted"), "{}", out.text());
     }
 
     #[cfg(windows)]

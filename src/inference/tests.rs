@@ -12237,6 +12237,68 @@ fn kv_cache_storage_matches_llama_cpp_f16_rounding() {
 }
 
 #[test]
+fn gpu_kv_mirror_stores_exactly_without_disturbing_the_cpu_oracle_rounding() {
+    use crate::inference::kv_cache::KvStoreFidelity;
+    // The GPU -> CPU mirror is the ONLY writer allowed to skip the f16 rounding, and
+    // skipping it is what lets an F32-primary Metal session use the prompt-prefix
+    // cache instead of re-prefilling every step. The two halves are asserted together
+    // so that widening the exemption to the CPU forward's writers fails here: the
+    // llama.cpp oracle contract lives on `store_kv_head_row`, and mirrored device K/V
+    // (which never touched the CPU reference lane) is the documented exception.
+    let plan = LlamaKvCachePlan {
+        max_sequence_length: 1,
+        layer_count: 1,
+        kv_head_count: 1,
+        head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
+        key_shape: vec![1, 1, 1, 2],
+        value_shape: vec![1, 1, 1, 2],
+    };
+    // Values chosen so f16 rounding is observable: each differs from its f16 image.
+    let keys = vec![1.0001_f32, -2.0003];
+    let values = vec![3.0007_f32, -4.0009];
+    let rounded = |xs: &[f32]| -> Vec<f32> {
+        xs.iter()
+            .copied()
+            .map(|v| f16_bits_to_f32(f32_to_f16_bits(v)))
+            .collect()
+    };
+    assert_ne!(
+        rounded(&keys),
+        keys,
+        "fixture must be f16-lossy to prove anything"
+    );
+
+    let mut exact =
+        LlamaKvCache::new(plan.clone(), crate::model::KvCacheQuantization::F16).expect("KV cache");
+    exact
+        .store_mirrored_layer_kv(0, 1, &keys, &values, KvStoreFidelity::ExactF32)
+        .expect("mirror");
+    assert_eq!(exact.keys, keys, "an ExactF32 mirror must not round");
+    assert_eq!(exact.values, values, "an ExactF32 mirror must not round");
+
+    let mut lossy =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
+    lossy
+        .store_mirrored_layer_kv(0, 1, &keys, &values, KvStoreFidelity::F16Rounded)
+        .expect("mirror");
+    assert_eq!(
+        lossy.keys,
+        rounded(&keys),
+        "F16Rounded must keep the CUDA behavior"
+    );
+    assert_eq!(
+        lossy.values,
+        rounded(&values),
+        "F16Rounded must keep the CUDA behavior"
+    );
+
+    // And the default CPU-forward entry point stays rounded, whatever the mirror does.
+    assert_eq!(lossy.materialized_through, 1);
+}
+
+#[test]
 fn quantized_attention_matches_its_dequantized_cache_for_tail_rows() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");

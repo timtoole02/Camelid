@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Last updated: 2026-07-28
+Last updated: 2026-08-14
 
 This guide documents Camelid's current local configuration reality without pretending every workflow is fully automated.
 
@@ -186,10 +186,61 @@ Current public docs assume:
 
 Backend runtime knobs used during performance work:
 
+- Web Code resolves one adaptive prompt-plus-generation context envelope when a
+  session starts, using the active GGUF's native limit, Camelid's validated
+  agent-context ceiling, and a conservative share of currently available host
+  memory divided across active generation slots (including their retained CPU
+  mirrors) and prompt-prefix cache entries. Native
+  metadata alone never widens the supported agent window. The selected value
+  remains fixed for all follow-up turns and child agents in that session. Set
+  `CAMELID_AGENT_CONTEXT_MAX_TOKENS` to impose a process-wide maximum; invalid
+  and zero values leave automatic selection in control. A cap too small for the
+  mandatory paging capsule plus output and safety reserves fails closed instead
+  of truncating the task contract. Session diagnostics distinguish the raw
+  memory-derived capacity from the 8K minimum operational recommendation; the
+  latter is not a claim that an already memory-starved host can allocate 8K.
+  With paging enabled, the exact Qwen3 4B Q8_0 Code row exposes a 16K logical
+  task envelope while each actual model request remains bounded to the 8K
+  paging working set. Disabling paging restores the ordinary 8K operational
+  agent ceiling; this does not certify a 16K single prompt. The exact
+  Qwen3-4B-Q4_K_M row keeps that legacy 8K operational envelope so the paging
+  capsule and reply reserves can fit, but it receives no 16K logical exception:
+  its promoted parity-context ladder remains only 512/1,024. The operational
+  envelope is not a Q4 context-support promotion; the non-contiguous 4K/8K
+  sweep matches remain unclaimed while the 2K bucket is a disclosed near-tie.
+- Web Code uses bounded Context Paging by default so long coding turns do not
+  replay an ever-growing transcript into the model window. Set
+  `CAMELID_CONTEXT_PAGING=0` only to diagnose or roll back to the legacy loop.
+  Paging uses the ordinary native file/shell tools; host retry feedback is
+  carried into the next fresh capsule instead of relying on discarded history.
+  The bounded defaults are 5,500 input tokens, 1,300 output tokens, and a 1,200
+  token safety reserve; tune them with `CAMELID_CONTEXT_MAX_INPUT_TOKENS`,
+  `CAMELID_CONTEXT_OUTPUT_RESERVE`, and `CAMELID_CONTEXT_SAFETY_RESERVE`.
+- Prompt-prefix lookup uses verified token-block hashes to select retained KV
+  prefixes and reports the exact first divergent token plus the admission or
+  rejection reason on every Web Code model step. Set
+  `CAMELID_PREFIX_CACHE_BLOCK_TOKENS` to a power of two from 16 through 1024 to
+  override the 64-token default. Hashes are only indexes—the underlying token
+  IDs are compared before reuse—and existing Metal profitability and
+  low-memory cache-disable gates still apply.
+- Ornith/Qwen35 Metal uses a separate hybrid prompt cache because its recurrent
+  layers cannot be restored from attention KV alone. The runtime keeps exact
+  token prefixes, resident attention KV, and bounded host snapshots of the SSM
+  convolution/recurrent state. It is enabled by default. Set
+  `CAMELID_QWEN35_PREFIX_CACHE=0` to disable it;
+  `CAMELID_QWEN35_PREFIX_CACHE_BLOCK_TOKENS` selects a power-of-two checkpoint
+  interval from 32 through 1024 (default `128`),
+  `CAMELID_QWEN35_PREFIX_CACHE_CHECKPOINTS` keeps 1 through 8 recent checkpoints
+  (default `4`), and `CAMELID_QWEN35_PREFIX_CACHE_MAX_MIB` bounds their host
+  storage from 32 through 1024 MiB (default `256`). The default Qwen35 Metal
+  resident capacity is 8,192 positions; `CAMELID_QWEN35_METAL_MAXPOS` may lower
+  or raise that allocation for diagnosis. Prompts larger than the resident
+  allocation fail closed rather than silently replaying an agent prompt on the
+  hours-slower CPU fallback.
 - `CAMELID_GPU_TEMP_SAMPLING` controls the CUDA-resident Gumbel-max path for plain temperature sampling. It defaults to enabled after seeded device/reference and streaming validation, avoiding a full-vocabulary device-to-host copy and CPU sort on each sampled token. Set it to `0`, `false`, `off`, or `no` to force the CPU sampling fallback for diagnosis.
 - `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED` overrides the resident CUDA prefill policy. Q8_0 uses batched prefill by default; Q4_K/Q6_K keep the sustained-throughput winner (serial prefill) by default on the Windows/WDDM reference host. Set it to `1`, `true`, or `on` to exercise the parity-checked Q4_K/Q6_K batched kernels, or `0`, `false`, or `off` to force serial prefill for any quant lane.
 - `CAMELID_CUDA_KQUANT_BATCH_TOKENS` selects the requested Q4_K/Q6_K CUDA prefill tile size from `1` through `4` when batched K-quant prefill is explicitly enabled. Default: `2`; the runtime clamps it to the model dimensions and portable shared-memory budget. This remains a diagnostic tuning knob until a target GPU shows a sustained gain.
-- `CAMELID_PREFILL_CHUNK_TOKENS` controls how many non-final prompt tokens the backend processes per chunk in the chunked prefill path. Default: `256`, matching the current long-prefill performance lane while keeping the global lazy Q8 file cache disabled outside explicit/scoped reuse. Set it to `1` to force the older sequential prefill path while debugging; invalid/zero values fall back to the default. This is a runtime/performance knob only; it is not support evidence for any model row by itself; the separate published source/runtime-head PASS bundle and synchronized docs/API/frontend updates are what close exact Llama 3 8B checked 1024/2048 packs; the knob itself is not evidence for today's checkout.
+- `CAMELID_PREFILL_CHUNK_TOKENS` controls how many non-final prompt tokens the backend processes per chunk in the chunked prefill path. Default: `256`, matching the current long-prefill performance lane while keeping the global lazy Q8 file cache disabled outside explicit/scoped reuse. When more than one cooperative stream is active, an eligible CPU chunk-major prefill yields to the engine scheduler between these exact same chunks; a lone stream and resident GPU, layer-major, single-token, and windowed-attention prefills retain their existing paths. Set it to `1` to force the older sequential prefill path while debugging; invalid/zero values fall back to the default. This is a runtime/performance knob only; it is not support evidence for any model row by itself; the separate published source/runtime-head PASS bundle and synchronized docs/API/frontend updates are what close exact Llama 3 8B checked 1024/2048 packs; the knob itself is not evidence for today's checkout.
 - `CAMELID_PREFILL_LAYER_MAJOR` controls the long-context prefill schedule that processes all prefill chunks one layer at a time, reusing file-backed Q8_0 weights across chunks before moving to the next layer. By default it is enabled only when lazy Q8_0 file-backed weights are present. Set it to `0`, `false`, `off`, or `disabled` to force the older chunk-major schedule while debugging.
 - `CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS` controls the per-layer prompt chunk size only for the layer-major schedule. Default: `512`, unless `CAMELID_PREFILL_CHUNK_TOKENS` is explicitly set, in which case the shared chunk setting is reused for comparability. It also accepts `all`, `full`, `prompt`, or `unbounded` for one diagnostic full-prompt prefill chunk. This is a runtime/performance knob only and does not promote any 8B 1024/2048 support bucket by itself.
 - `CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES` controls the layer-major-only scoped Q8_0 raw-byte reuse window when lazy file-backed Q8_0 weights are present and `CAMELID_Q8_0_FILE_CACHE_BYTES` is unset. Default: `268435456` (256 MiB) only for multi-chunk layer-major prefill, where file-backed Q8_0 weights can be reused across chunks; single-chunk prefill skips the default scoped cache unless this scoped knob is set explicitly. Set it to `0` to disable the scoped layer-major cache, or set the global cache knob explicitly to take over all Q8 file-reader cache sizing. This is a bounded RSS/read-reuse tuning knob only and does not promote any 8B support bucket by itself.
@@ -200,6 +251,8 @@ Backend runtime knobs used during performance work:
 - `CAMELID_Q8_0_FILE_READER_RETAINED_SCRATCH_BYTES` caps how much per-thread Q8 file-reader scratch capacity is retained after oversized row, scale, quantized-input, and output chunks. Default: `67108864` (64 MiB). This is an RSS headroom knob only; it does not promote 8B 1024/2048 support by itself.
 - `CAMELID_KV_CACHE_GROW_TOKENS` controls KV-cache allocation growth for model-sized contexts. Default: `256` positions when context length is at least 512; tiny diagnostic/test contexts keep exact one-position growth. This reduces repeated realloc/copy churn during decode and is a runtime performance knob only.
 - `CAMELID_METAL_Q8` / `--metal-q8` enables the macOS Metal Q8_0 encoded file-backed row-dot path. It falls back to CPU when unavailable and is not support evidence by itself.
+- `CAMELID_METAL_KQUANT_QUANT_REUSE` controls the default-on macOS Metal optimization that quantizes a shared normalized activation once for Q/K/V and once for FFN gate/up on Q4_K/Q6_K resident decode. Set it to `0` or `false` to restore independent per-projection activation quantization for same-binary diagnosis; this switch does not change the Q8_0 lane.
+- `CAMELID_METAL_KQUANT_PARALLEL_QUANT` controls the default-on strict Q8_K activation quantizer used by the macOS Q4_K/Q6_K resident lane. Its 256-thread kernel preserves the scalar quantizer's lowest-index signed-maximum tie rule and emitted bytes while distributing one super-block across the GPU. Set it to `0` or `false` to select the scalar diagnostic fallback.
 - `CAMELID_PROFILE` selects the execution-planning profile: `safe` keeps only conservative known-good paths, `auto` keeps default-off experiment lanes disabled, `experimental` allows evidence-lane experiments with a warning, and `debug` favors diagnostics over performance claims.
 - On the Ubuntu x86_64 dense Llama Q8_0 evidence lane, the appliance planner keeps x86 Q8 experiment flags off by default. Manual developer overrides remain evidence-lane only and must not be treated as support-contract, portability, accelerator-backend, or broader model-family evidence. Current reference truth for this lane is `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/README.md`.
 - `CAMELID_X86_Q8_REPACK=on` is a default-off Ubuntu x86_64 developer experiment that loads selected dense Llama Q8_0 linears into backend-owned packed runtime storage instead of retaining a duplicate row-major packed sidecar. The current x86 slice covers the dense attention projection family (`blk.*.attn_{q,k,v}.weight`, `blk.*.attn_output.weight`), dense FFN gate/up/down rows, and `output.weight`; leave it unset for the safe fallback.

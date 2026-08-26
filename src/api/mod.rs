@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    env, mem,
+    env,
+    hash::{DefaultHasher, Hash, Hasher},
+    mem,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -97,8 +99,16 @@ const SPEC_NGRAM_MIN_ENV: &str = "CAMELID_SPEC_NGRAM_MIN";
 const SPEC_NGRAM_MAX_ENV: &str = "CAMELID_SPEC_NGRAM_MAX";
 const PROMPT_PREFIX_CACHE_CAPACITY_ENV: &str = "CAMELID_PREFIX_CACHE_CAPACITY";
 const PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV: &str = "CAMELID_PREFIX_CACHE_MIN_TOKENS";
+const PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV: &str = "CAMELID_PREFIX_CACHE_BLOCK_TOKENS";
 const DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY: usize = 1;
 const DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS: usize = 16;
+const DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS: usize = 64;
+// An F32 Metal-resident prefix can only resume its divergent suffix through the
+// CPU prefill path, followed by a full CPU -> Metal KV seed. On an M4, reusing a
+// 3,062-token prefix for a 74-token suffix was already slower than a cold
+// batched Metal prefill; a 23-token suffix was still comfortably faster. Keep
+// the measured break-even conservative and scale it with prefix length.
+const METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO: usize = 48;
 /// Reserved model id for the speculative draft model; loaded without becoming
 /// the active model.
 const SPEC_DRAFT_MODEL_ID: &str = "spec-draft";
@@ -147,6 +157,11 @@ pub struct AppState {
     embedding_runtime_load: Arc<tokio::sync::Mutex<()>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
+    /// Serializes the cache-miss admission, LRU eviction, weight materialization, and
+    /// publication window. A read/write lock around only `cached_weights` is insufficient:
+    /// two misses can both observe the same under-budget snapshot and then materialize a full
+    /// model apiece before either publishes it.
+    weight_load_admission: Arc<tokio::sync::Mutex<()>>,
     active_model_id: Arc<RwLock<Option<String>>>,
     model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     cached_prompt_prefix: Arc<Mutex<PromptPrefixCachePool>>,
@@ -228,6 +243,7 @@ impl Default for AppState {
             embedding_runtime_load: Arc::new(tokio::sync::Mutex::new(())),
             execution_plans: Arc::new(RwLock::new(HashMap::new())),
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
+            weight_load_admission: Arc::new(tokio::sync::Mutex::new(())),
             active_model_id: Arc::new(RwLock::new(None)),
             model_last_used: Arc::new(RwLock::new(HashMap::new())),
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::from_env())),
@@ -357,11 +373,41 @@ struct CachedPromptPrefix {
     model_id: String,
     model_path: PathBuf,
     token_ids: Vec<u32>,
+    /// Lookup accelerators for complete token blocks. A hash match is never
+    /// trusted by itself: lookup verifies the underlying token slice before
+    /// any KV state is reused.
+    block_hashes: Vec<u64>,
+    block_tokens: usize,
     sampling: SamplingConfig,
-    session: LlamaInferenceSession,
+    /// Physical KV blocks for exact-F32 CPU-authoritative sessions. Blocks are
+    /// independently reference-counted so retained prefixes can share their
+    /// identical leading storage without cloning a whole inference session.
+    kv_blocks: Vec<Arc<crate::inference::kv_cache::LlamaKvBlockSnapshot>>,
+    /// Legacy fail-safe for F16/quantized CPU KV formats that retain less
+    /// memory in their native typed session than normalized f32 blocks would.
+    legacy_session: Option<LlamaInferenceSession>,
+    kv_position: usize,
     logits: CpuTensor,
     hidden_state: CpuTensor,
     output_norm_state: CpuTensor,
+    /// The source session held an exact-F32 Metal KV cache when this entry was
+    /// mirrored. Its clone is CPU-only, but a partial resume will return to the
+    /// same expensive CPU-suffix/Metal-reseed path.
+    metal_f32_resident_kv: bool,
+}
+
+impl CachedPromptPrefix {
+    fn kv_allocated_bytes(&self, seen_blocks: &mut HashSet<usize>) -> u64 {
+        if let Some(session) = &self.legacy_session {
+            session.kv_cache_allocated_bytes()
+        } else {
+            self.kv_blocks
+                .iter()
+                .filter(|block| seen_blocks.insert(Arc::as_ptr(block) as usize))
+                .map(|block| block.allocated_bytes())
+                .sum()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -373,30 +419,136 @@ struct PromptPrefixCacheEntry {
 struct PromptPrefixCachePool {
     entries: Vec<PromptPrefixCacheEntry>,
     capacity: usize,
+    /// Models whose materialized weights were removed by the LRU. A generation prepared before
+    /// that eviction can finish later and try to store a new prefix; keep it out until the model
+    /// is materialized and budget-accounted again.
+    weight_evicted_models: HashSet<String>,
 }
 
 impl PromptPrefixCachePool {
     fn from_env() -> Self {
-        let capacity = env::var(PROMPT_PREFIX_CACHE_CAPACITY_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY);
-        Self::with_capacity(capacity)
+        Self::with_capacity(prompt_prefix_cache_capacity())
     }
 
     fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::new(),
             capacity: capacity.max(1),
+            weight_evicted_models: HashSet::new(),
         }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        // Do not clear weight-eviction tombstones here. Active-model changes clear prompt
+        // entries too, and a generation prepared before an LRU eviction can still finish after
+        // that change. Only a successful weight hit/publication may readmit the model.
     }
 
-    fn insert(&mut self, cached: CachedPromptPrefix) {
+    /// Drop every retained KV prefix for one materialized model. Legacy typed
+    /// sessions own the same `Arc<LlamaLoadedWeights>` as the registry; F32
+    /// block entries do not, but must still be invalidated with the model.
+    fn evict_model(&mut self, model_id: &str) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| entry.cached.model_id != model_id);
+        self.weight_evicted_models.insert(model_id.to_string());
+        before - self.entries.len()
+    }
+
+    fn admit_model(&mut self, model_id: &str) {
+        self.weight_evicted_models.remove(model_id);
+    }
+
+    fn model_is_admitted(&self, model_id: &str) -> bool {
+        !self.weight_evicted_models.contains(model_id)
+    }
+
+    /// Permanently release and turn off retained KV entries. Capacity zero is
+    /// an internal low-memory state; environment parsing still treats zero as
+    /// invalid so ordinary startup behavior remains unchanged.
+    fn disable(&mut self) {
+        self.entries.clear();
+        self.capacity = 0;
+    }
+
+    /// Free the slot that a newly cloned KV entry will occupy *before* the
+    /// clone is built. Evicting inside `insert` is too late: a full pool plus
+    /// the active session plus the replacement clone creates a transient extra
+    /// multi-gigabyte KV owner on long prompts.
+    fn reserve_for_insert(
+        &mut self,
+        model_id: &str,
+        model_path: &Path,
+        token_ids: &[u32],
+        sampling: &SamplingConfig,
+    ) {
+        if self.capacity == 0 {
+            return;
+        }
+        let replace_index = self.entries.iter().position(|entry| {
+            entry.cached.model_id == model_id
+                && entry.cached.model_path == model_path
+                && entry.cached.token_ids == token_ids
+                && entry.cached.sampling == *sampling
+        });
+        let evict_index = replace_index.or_else(|| {
+            (self.entries.len() >= self.capacity).then(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(index, _)| index)
+                    .expect("a full positive-capacity pool has an LRU entry")
+            })
+        });
+        if let Some(index) = evict_index {
+            self.entries.remove(index);
+        }
+    }
+
+    fn touch_exact(
+        &mut self,
+        model_id: &str,
+        model_path: &Path,
+        token_ids: &[u32],
+        sampling: &SamplingConfig,
+    ) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.cached.model_id == model_id
+                && entry.cached.model_path == model_path
+                && entry.cached.token_ids == token_ids
+                && entry.cached.sampling == *sampling
+        }) {
+            entry.last_used = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn insert(&mut self, mut cached: CachedPromptPrefix) {
+        if self.capacity == 0 || !self.model_is_admitted(&cached.model_id) {
+            return;
+        }
+        if !cached.kv_blocks.is_empty() {
+            for block_index in 0..cached.kv_blocks.len() {
+                let end = ((block_index + 1) * cached.block_tokens).min(cached.token_ids.len());
+                if let Some(shared) = self.entries.iter().find_map(|entry| {
+                    let existing = &entry.cached;
+                    (existing.model_id == cached.model_id
+                        && existing.model_path == cached.model_path
+                        && existing.sampling == cached.sampling
+                        && existing.block_tokens == cached.block_tokens
+                        && existing.kv_blocks.len() > block_index
+                        && existing.token_ids.len() >= end
+                        && existing.token_ids[..end] == cached.token_ids[..end])
+                        .then(|| Arc::clone(&existing.kv_blocks[block_index]))
+                }) {
+                    cached.kv_blocks[block_index] = shared;
+                }
+            }
+        }
         let cached = Arc::new(cached);
         let now = std::time::Instant::now();
 
@@ -428,6 +580,14 @@ impl PromptPrefixCachePool {
             last_used: now,
         });
     }
+}
+
+pub(crate) fn prompt_prefix_cache_capacity() -> usize {
+    env::var(PROMPT_PREFIX_CACHE_CAPACITY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY)
 }
 
 #[derive(Clone)]
@@ -843,6 +1003,10 @@ pub struct ChatCompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Private Web Code opt-in for a compact timing receipt on the terminal
+    /// streaming chunk. This avoids enabling verbose timing diagnostics for
+    /// unrelated API callers while exposing prompt-cache behavior per step.
+    pub camelid_stream_timing_diagnostics: Option<bool>,
     /// Optional hard ceiling for the exact rendered prompt plus generation.
     /// Workspace sets this private extension; ordinary OpenAI callers omit it.
     pub camelid_context_budget_tokens: Option<u32>,
@@ -867,8 +1031,9 @@ pub struct ChatCompletionRequest {
     /// a certified tool branch fail closed instead of silently dropping tools.
     pub tools: Option<Vec<serde_json::Value>>,
     /// OpenAI `tool_choice`: `"auto"` (default), `"none"` (suppress parsing), or
-    /// `"required"`/a specific function (treated as `auto`). Parsed permissively
-    /// as a raw value. Declaring it here removes it from `unsupported_fields`.
+    /// `"required"`/a specific function. Qwen35/Ornith honors a specific
+    /// function with a cache-compatible assistant prefill; other lanes retain
+    /// their existing permissive behavior.
     pub tool_choice: Option<serde_json::Value>,
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
@@ -1551,6 +1716,10 @@ pub struct GenerationSessionRequest {
     /// template (agent mode). `None` renders identically to before.
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI tool choice, retained by runnable preflight so its exact token
+    /// count matches the served Qwen35/Ornith prompt.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
@@ -1688,6 +1857,20 @@ pub struct GenerationTimings {
     pub weight_load: u128,
     pub weight_cache_hit: bool,
     pub prompt_cache_hit: bool,
+    /// Prompt tokens restored from an accepted exact/partial prefix entry.
+    pub prompt_reused_tokens: usize,
+    /// Prompt tokens evaluated for this request after any accepted reuse.
+    pub prompt_prefilled_tokens: usize,
+    /// Stable machine-readable reason for the prompt-cache outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_decision: Option<&'static str>,
+    /// Best same-key candidate's exact token prefix, even when reuse was
+    /// rejected. This is the first divergent token index.
+    pub prompt_cache_common_prefix_tokens: usize,
+    pub prompt_cache_divergent_suffix_tokens: usize,
+    pub prompt_cache_candidate_tokens: usize,
+    pub prompt_cache_block_tokens: usize,
+    pub prompt_cache_matched_blocks: usize,
     pub session_create: u128,
     pub generate: u128,
     pub generation: GenerationPhaseTimings,
@@ -2095,6 +2278,62 @@ fn prompt_prefix_cache_min_tokens_from_env() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS)
+}
+
+fn prompt_prefix_cache_block_tokens_from_env() -> usize {
+    env::var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| value.is_power_of_two() && (16..=1024).contains(value))
+        .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS)
+}
+
+fn prompt_token_block_hashes(token_ids: &[u32], block_tokens: usize) -> Vec<u64> {
+    token_ids
+        .chunks_exact(block_tokens)
+        .map(|block| {
+            let mut hasher = DefaultHasher::new();
+            block.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
+}
+
+/// Return the exact common prefix while using fixed token blocks to avoid a
+/// full token-by-token scan of every retained candidate. Hash matches only
+/// select blocks; their source tokens are compared before the corresponding
+/// KV positions are considered reusable, so collisions fail harmlessly.
+fn block_indexed_common_prefix_len(cached: &CachedPromptPrefix, request: &[u32]) -> (usize, usize) {
+    let block_tokens = cached.block_tokens.max(1);
+    let request_hashes = prompt_token_block_hashes(request, block_tokens);
+    let mut matched_blocks = 0usize;
+    for (index, (cached_hash, request_hash)) in cached
+        .block_hashes
+        .iter()
+        .zip(request_hashes.iter())
+        .enumerate()
+    {
+        if cached_hash != request_hash {
+            break;
+        }
+        let start = index * block_tokens;
+        let end = start + block_tokens;
+        if end > cached.token_ids.len() || end > request.len() {
+            break;
+        }
+        if cached.token_ids[start..end] != request[start..end] {
+            break;
+        }
+        matched_blocks += 1;
+    }
+
+    let verified = matched_blocks * block_tokens;
+    let tail = cached.token_ids[verified..]
+        .iter()
+        .zip(request[verified..].iter())
+        .take_while(|(&left, &right)| left == right)
+        .count();
+    (verified + tail, matched_blocks)
 }
 
 /// Per-request speculative decoding state: the drafter plus round counters
@@ -3317,12 +3556,13 @@ fn kv_cache_memory_snapshot(state: &AppState) -> (Vec<KvCacheEntryMemory>, usize
     let Ok(pool) = state.cached_prompt_prefix.lock() else {
         return (Vec::new(), 0);
     };
+    let mut seen_blocks = HashSet::new();
     let entries = pool
         .entries
         .iter()
         .map(|entry| KvCacheEntryMemory {
             model_id: entry.cached.model_id.clone(),
-            bytes: entry.cached.session.kv_cache_allocated_bytes(),
+            bytes: entry.cached.kv_allocated_bytes(&mut seen_blocks),
             tokens: entry.cached.token_ids.len(),
         })
         .collect();
@@ -4427,6 +4667,7 @@ async fn llama_server_completion(
         camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
+        tool_choice: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         constraint: None,
@@ -5647,7 +5888,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "cuda_5_prompt_pass_cross_backend_tolerance_attributed_near_ties_vs_llamacpp_acd79d6",
                 performance_measured: "cuda_device_decode_loop_18_8_toks_median_measured",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0) and CAMELID_QWEN35_CUDA=1",
+                frontend_readiness_gate: "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf; certified sha256 2711bf1e... on CUDA or 5720d1f6... on Apple Metal) is loaded_now=true, generation_ready=true, matching active_model_id, and served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
                 tested_context: "short_serve_smoke_plus_agent_eval_read_list_write",
                 chat_template_renderer: "ornith-chatml-native",
                 chat_template_shape_pack: "not_promoted",
@@ -5670,8 +5911,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "agent_eval_read_list_write",
                 latest_checked_result: "pass",
                 latest_checked_output: "camelid.agent_eval/v1 PASS (full 3-case battery)",
-                evidence: "qwen35 (Ornith-1.0-9B) Q4_K_M fully GPU-resident (CAMELID_QWEN35_CUDA=1): 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle PASSES under the cross-backend tolerance policy — 2/5 token-identical at n=64 and every flip probed and attributed to soft positions with <=0.33-nat top-2 gaps where the oracle's own CPU-vs-CUDA backends also flip (qa/ornith/constrained-vram/RECEIPT_ITEM2_qwen35_parity_cuda.json, probes + oracle/camelid internal-variance controls committed alongside). The full read_file/list_dir/write_file agent battery passes on this exact file with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json); tool_capable earned ONLY by that receipt. Decode throughput 18.8 tok/s median via the device-side decode loop (qa/ornith/constrained-vram profile CSVs). NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
-                next_step: "preserve the CUDA parity + agent capability for this exact row; NOTE a macOS resident Metal lane now accepts qwen35 K-quant files by default (opt-out CAMELID_QWEN35_METAL=0) and would serve THESE bytes on Apple Silicon with no receipt covering them — the only Metal K-quant parity evidence is qa/ornith/G-PARITY-qwen35-kquant-metal-macos.md, taken on a DIFFERENT artifact (sha256 5720d1f6, the HuggingFace imatrix quant, not this row's 2711bf1e); a Metal receipt on these exact bytes, context-pack coverage, the frontend picker load path, and a normalized full-support bundle remain before any broader claim",
+                evidence: "qwen35 (Ornith-1.0-9B) Q4_K_M has two byte-pinned platform receipts under this filename. The in-house requant (sha256 2711bf1e...) is fully CUDA-resident and passes 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle under the cross-backend tolerance policy; its full read_file/list_dir/write_file agent battery is qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json. The public HuggingFace imatrix quant (sha256 5720d1f6...) runs on the resident Apple Metal qwen35 K-quant lane and passes the same full three-case agent battery after command-buffer completion was made fail-closed; receipt qa/agent-eval/ornith-1.0-9b-Q4_K_M-1786773670-PASS.json. Tool capability is admitted only for one of those two exact digests. CUDA decode throughput was 18.8 tok/s median via the device-side decode loop. NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
+                next_step: "preserve both byte-pinned platform receipts; add bounded-context coverage, frontend picker load evidence, repeated current-head bundles, and a normalized full-support bundle before broadening the claim",
             },
             ModelCompatibilityTarget {
                 id: "ornith_1_0_9b_q3_k_m",
@@ -9279,7 +9520,7 @@ mod gemma4_template_tests {
     fn lfm2_runnable_stream_finish_exposes_ids_and_terminal_usage_is_exact() {
         let prompt = [124_894, 10, 11, 12];
         let generated = [20, 124_902, 21, 22];
-        let diagnostics = runnable_generation_diagnostics("lfm2", Some(&prompt), &generated);
+        let diagnostics = runnable_generation_diagnostics("lfm2", Some(&prompt), &generated, None);
         let finish = runnable_stream_chunk(
             "lfm2_5_2_6b_q8_0",
             123,
@@ -9310,6 +9551,36 @@ mod gemma4_template_tests {
             prompt.len() + generated.len()
         );
         assert!(usage.get("camelid").is_none());
+    }
+
+    #[test]
+    fn runnable_qwen35_terminal_diagnostics_expose_hybrid_prefix_reuse() {
+        let cache = crate::runnable::Qwen35PromptCacheStats {
+            hit: true,
+            decision: Some("qwen35_hybrid_block_prefix_hit"),
+            common_prefix_tokens: 2_517,
+            divergent_suffix_tokens: 150,
+            candidate_tokens: 2_642,
+            reused_tokens: 2_432,
+            prefilled_tokens: 235,
+            block_tokens: 128,
+            matched_blocks: 19,
+            checkpoint_bytes: 188 * 1024 * 1024,
+            prefill_ms: 18_250,
+        };
+        let diagnostics =
+            runnable_generation_diagnostics("qwen35", Some(&[1, 2]), &[3], Some(cache));
+        let timings = &diagnostics["stream_timing_diagnostics"]["timings_ms"];
+        assert_eq!(timings["prompt_cache_hit"], true);
+        assert_eq!(
+            timings["prompt_cache_decision"],
+            "qwen35_hybrid_block_prefix_hit"
+        );
+        assert_eq!(timings["prompt_reused_tokens"], 2_432);
+        assert_eq!(timings["prompt_prefilled_tokens"], 235);
+        assert_eq!(timings["prompt_cache_block_tokens"], 128);
+        assert_eq!(timings["prompt_cache_matched_blocks"], 19);
+        assert_eq!(timings["prefill_forward_total"], 18_250.0);
     }
 
     #[test]
@@ -10615,6 +10886,11 @@ pub struct RunnableServeRuntime {
     tokenizer: std::sync::Arc<Tokenizer>,
     architecture: String,
     vision: Option<crate::runnable::PrismVisionProjector>,
+    /// Keeps generation and its prompt-cache receipt in one ownership epoch.
+    /// The model's resident engine is already single-owner; this outer lock
+    /// prevents a second request from replacing `last_cache_stats` between the
+    /// completed generation and the API copying its terminal diagnostics.
+    generation_lock: std::sync::Mutex<()>,
 }
 
 /// Lives inside the SSE body. Dropping the response (for example when the UI
@@ -10671,6 +10947,7 @@ impl RunnableServeRuntime {
             tokenizer,
             architecture,
             vision,
+            generation_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -10687,13 +10964,24 @@ impl RunnableServeRuntime {
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
-    ) -> std::result::Result<(String, Vec<u32>), BackendError> {
+    ) -> std::result::Result<
+        (
+            String,
+            Vec<u32>,
+            Option<crate::runnable::Qwen35PromptCacheStats>,
+        ),
+        BackendError,
+    > {
+        let _generation = self.generation_lock.lock().map_err(|_| {
+            BackendError::InvalidTensorData("runnable generation mutex poisoned".into())
+        })?;
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
         let ids = self
             .model
             .generate_stopping_with_sampling(prompt_ids, max_new, &stop, sampling)?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        let cache_stats = self.model.qwen35_prompt_cache_stats();
+        Ok((text, ids, cache_stats))
     }
 
     /// Streaming generation with a cooperative disconnect check. The generic
@@ -10707,7 +10995,17 @@ impl RunnableServeRuntime {
         sampling: &SamplingConfig,
         is_cancelled: &dyn Fn() -> bool,
         mut on_token: F,
-    ) -> std::result::Result<(String, Vec<u32>), BackendError> {
+    ) -> std::result::Result<
+        (
+            String,
+            Vec<u32>,
+            Option<crate::runnable::Qwen35PromptCacheStats>,
+        ),
+        BackendError,
+    > {
+        let _generation = self.generation_lock.lock().map_err(|_| {
+            BackendError::InvalidTensorData("runnable generation mutex poisoned".into())
+        })?;
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
         let ids = self
             .model
@@ -10720,7 +11018,8 @@ impl RunnableServeRuntime {
                 &mut on_token,
             )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        let cache_stats = self.model.qwen35_prompt_cache_stats();
+        Ok((text, ids, cache_stats))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10758,6 +11057,9 @@ impl RunnableServeRuntime {
         sampling: &SamplingConfig,
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
+        let _generation = self.generation_lock.lock().map_err(|_| {
+            BackendError::InvalidTensorData("runnable generation mutex poisoned".into())
+        })?;
         let projector = self.vision.as_ref().ok_or_else(|| {
             BackendError::UnsupportedGguf("no Prism vision projector is loaded".into())
         })?;
@@ -11488,6 +11790,7 @@ fn render_ornith_chatml_prompt_with_tools(
     messages: &[ChatMessage],
     tools: &[serde_json::Value],
     enable_thinking: bool,
+    forced_tool_name: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("<|im_start|>system\n");
@@ -11535,8 +11838,23 @@ fn render_ornith_chatml_prompt_with_tools(
         } else {
             "<think>\n\n</think>\n\n"
         });
+        if let Some(name) = forced_tool_name {
+            // This is deliberately an assistant PREFILL after the ordinary
+            // generation prompt. The prior prompt remains an exact prefix, so
+            // forcing a recovery tool does not discard the resident KV cache.
+            prompt.push_str("<tool_call>\n<function=");
+            prompt.push_str(name);
+            prompt.push_str(">\n");
+        }
     }
     prompt
+}
+
+fn ornith_forced_tool_parse_text(forced_tool_name: Option<&str>, content: &str) -> String {
+    match forced_tool_name {
+        Some(name) => format!("<tool_call>\n<function={name}>\n{content}"),
+        None => content.to_string(),
+    }
 }
 
 /// Split a generation into `(reasoning, content)` at the `</think>` TOKEN.
@@ -11873,6 +12191,34 @@ fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Respon
 }
 
 #[allow(clippy::result_large_err)]
+fn tokenize_runnable_text_prompt(
+    architecture: &str,
+    tokenizer: &Tokenizer,
+    prompt_text: &str,
+) -> std::result::Result<Vec<u32>, Response> {
+    // `add_special` supplies the leading BOS for templates that emit
+    // `bos_token` outside their returned text. Without it the whole prompt is
+    // shifted and the forward diverges from the reference.  This helper is the
+    // single tokenization path for live runnable chat and its exact preflight.
+    let llama_template_omits_bos = architecture == "llama"
+        && tokenizer.config.add_bos
+        && tokenizer
+            .token_text(tokenizer.special.bos)
+            .is_some_and(|bos| !prompt_text.starts_with(bos));
+    let add_special = runnable_prompt_add_special(architecture) || llama_template_omits_bos;
+    tokenizer
+        .encode(prompt_text, add_special, true)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tokenize_error",
+                error.to_string(),
+                None,
+            )
+        })
+}
+
+#[allow(clippy::result_large_err)]
 fn prepare_runnable_prompt(
     runtime: &RunnableServeRuntime,
     req: &ChatCompletionRequest,
@@ -11885,28 +12231,11 @@ fn prepare_runnable_prompt(
         .flat_map(|message| message.image_urls.iter().map(String::as_str))
         .collect();
     if image_urls.is_empty() {
-        // `add_special` supplies the leading BOS for templates that emit
-        // `bos_token` outside their returned text. Without it the whole prompt
-        // is shifted and the forward diverges from the reference.
-        let llama_template_omits_bos = runtime.architecture == "llama"
-            && runtime.tokenizer.config.add_bos
-            && runtime
-                .tokenizer
-                .token_text(runtime.tokenizer.special.bos)
-                .is_some_and(|bos| !prompt_text.starts_with(bos));
-        let add_special =
-            runnable_prompt_add_special(&runtime.architecture) || llama_template_omits_bos;
-        let ids = runtime
-            .tokenizer
-            .encode(prompt_text, add_special, true)
-            .map_err(|error| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "tokenize_error",
-                    error.to_string(),
-                    None,
-                )
-            })?;
+        let ids = tokenize_runnable_text_prompt(
+            &runtime.architecture,
+            runtime.tokenizer.as_ref(),
+            prompt_text,
+        )?;
         return Ok(RunnablePreparedPrompt::Text(ids));
     }
     if image_urls.len() != 1 {
@@ -12024,12 +12353,75 @@ struct RunnableGenerationResult {
     generated_token_ids: Vec<u32>,
     prompt_token_ids: Option<Vec<u32>>,
     prompt_token_count: usize,
+    prompt_cache: Option<crate::runnable::Qwen35PromptCacheStats>,
+}
+
+/// Apply Workspace's private total-context ceiling to a prepared runnable
+/// prompt before any expensive prefill begins. Text prompts have an exact token
+/// representation and are therefore enforceable. Vision projection produces a
+/// data-dependent embedding span, so that unrelated surface fails closed when
+/// asked to honor a text-token budget rather than claiming a guessed count.
+async fn runnable_max_tokens_for_prepared(
+    state: &AppState,
+    model_id: &str,
+    prepared: &RunnablePreparedPrompt,
+    req: &ChatCompletionRequest,
+) -> std::result::Result<usize, Response> {
+    match prepared {
+        RunnablePreparedPrompt::Text(prompt_ids) => {
+            let model = state
+                .loaded_models
+                .read()
+                .await
+                .get(model_id)
+                .cloned()
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::CONFLICT,
+                        "model_transitioned",
+                        "the runnable model was unloaded while generation was preparing; retry the request"
+                            .to_string(),
+                        Some("model"),
+                    )
+                })?;
+            runnable_effective_max_tokens(
+                state,
+                &model,
+                prompt_ids.len(),
+                req.max_tokens,
+                req.camelid_context_budget_tokens,
+            )
+            .map(|tokens| tokens as usize)
+            .map_err(RunnableBudgetError::into_response)
+        }
+        RunnablePreparedPrompt::Vision { .. } => {
+            if req.camelid_context_budget_tokens.is_some() {
+                return Err(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_context_budget",
+                    "camelid_context_budget_tokens requires an exact text-token prompt and is not supported for projected image embeddings"
+                        .to_string(),
+                    Some("camelid_context_budget_tokens"),
+                ));
+            }
+            if req.max_tokens == Some(0) {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_max_tokens",
+                    "max_tokens must be greater than zero".to_string(),
+                    Some("max_tokens"),
+                ));
+            }
+            Ok(req.max_tokens.unwrap_or(256).min(4096) as usize)
+        }
+    }
 }
 
 fn runnable_generation_diagnostics(
     architecture: &str,
     prompt_token_ids: Option<&[u32]>,
     generated_token_ids: &[u32],
+    prompt_cache: Option<crate::runnable::Qwen35PromptCacheStats>,
 ) -> serde_json::Value {
     let mut diagnostics = serde_json::json!({
         "generated_token_ids": generated_token_ids,
@@ -12038,6 +12430,23 @@ fn runnable_generation_diagnostics(
     });
     if let Some(prompt_token_ids) = prompt_token_ids {
         diagnostics["prompt_token_ids"] = serde_json::json!(prompt_token_ids);
+    }
+    if let Some(cache) = prompt_cache {
+        diagnostics["stream_timing_diagnostics"] = serde_json::json!({
+            "timings_ms": {
+                "prefill_forward_total": cache.prefill_ms as f64,
+                "prompt_cache_hit": cache.hit,
+                "prompt_reused_tokens": cache.reused_tokens,
+                "prompt_prefilled_tokens": cache.prefilled_tokens,
+                "prompt_cache_decision": cache.decision,
+                "prompt_cache_common_prefix_tokens": cache.common_prefix_tokens,
+                "prompt_cache_divergent_suffix_tokens": cache.divergent_suffix_tokens,
+                "prompt_cache_candidate_tokens": cache.candidate_tokens,
+                "prompt_cache_block_tokens": cache.block_tokens,
+                "prompt_cache_matched_blocks": cache.matched_blocks,
+                "prompt_cache_checkpoint_bytes": cache.checkpoint_bytes,
+            }
+        });
     }
     diagnostics
 }
@@ -12138,6 +12547,9 @@ async fn runnable_chat_nonstreaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
+    let forced_tool_name = (runtime.architecture == "qwen35")
+        .then(|| runnable_forced_tool_name(req.tool_choice.as_ref(), &tools))
+        .flatten();
     let prompt_text = if runtime.architecture == "gemma2" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
@@ -12194,7 +12606,12 @@ async fn runnable_chat_nonstreaming(
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+        render_ornith_chatml_prompt_with_tools(
+            &messages,
+            &tools,
+            enable_thinking,
+            forced_tool_name.as_deref(),
+        )
     };
     let prepared =
         match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
@@ -12208,17 +12625,21 @@ async fn runnable_chat_nonstreaming(
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = match runnable_max_tokens_for_prepared(state, &id, &prepared, req).await {
+        Ok(max_tokens) => max_tokens,
+        Err(response) => return response,
+    };
     let rt = runtime.clone();
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
             rt.generate_greedy(&prompt_ids, max_tokens, &sampling).map(
-                |(text, generated_token_ids)| RunnableGenerationResult {
+                |(text, generated_token_ids, prompt_cache)| RunnableGenerationResult {
                     text,
                     generated_token_ids,
                     prompt_token_ids: Some(prompt_ids),
                     prompt_token_count,
+                    prompt_cache,
                 },
             )
         }
@@ -12244,6 +12665,7 @@ async fn runnable_chat_nonstreaming(
                     generated_token_ids,
                     prompt_token_ids: None,
                     prompt_token_count,
+                    prompt_cache: None,
                 },
             ),
     })
@@ -12253,6 +12675,7 @@ async fn runnable_chat_nonstreaming(
         generated_token_ids: ids,
         prompt_token_ids,
         prompt_token_count,
+        prompt_cache,
     } = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -12294,10 +12717,11 @@ async fn runnable_chat_nonstreaming(
     // covers). Without this a request that was REFUSED a tools array could still
     // come back with `finish_reason: "tool_calls"` if the model echoed Ornith
     // syntax from its history.
+    let tool_parse_text = ornith_forced_tool_parse_text(forced_tool_name.as_deref(), &content);
     let tool_calls = if !matches!(runtime.architecture.as_str(), "lfm2" | "bitnet-b1.58")
         && tool_choice_allows_calls(req.tool_choice.as_ref())
     {
-        parse_ornith_tool_calls_json(&content)
+        parse_ornith_tool_calls_json(&tool_parse_text)
     } else {
         Vec::new()
     };
@@ -12330,6 +12754,7 @@ async fn runnable_chat_nonstreaming(
         runtime.architecture.as_str(),
         prompt_token_ids.as_deref(),
         &ids,
+        prompt_cache,
     );
     let mut body = serde_json::json!({
         "id": "chatcmpl-runnable",
@@ -12365,6 +12790,7 @@ async fn runnable_chat_nonstreaming(
 /// scanning is needed; per-phase text is decoded incrementally with UTF-8
 /// hold-back (a multi-token code point emits only once complete).
 async fn runnable_chat_streaming(
+    state: &AppState,
     id: String,
     runtime: Arc<RunnableServeRuntime>,
     req: &ChatCompletionRequest,
@@ -12375,6 +12801,9 @@ async fn runnable_chat_streaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
+    let forced_tool_name = (runtime.architecture == "qwen35")
+        .then(|| runnable_forced_tool_name(req.tool_choice.as_ref(), &tools))
+        .flatten();
     let prompt_text = if runtime.architecture == "gemma2" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
@@ -12431,7 +12860,12 @@ async fn runnable_chat_streaming(
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+        render_ornith_chatml_prompt_with_tools(
+            &messages,
+            &tools,
+            enable_thinking,
+            forced_tool_name.as_deref(),
+        )
     };
     let prepared =
         match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
@@ -12442,7 +12876,10 @@ async fn runnable_chat_streaming(
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = match runnable_max_tokens_for_prepared(state, &id, &prepared, req).await {
+        Ok(max_tokens) => max_tokens,
+        Err(response) => return response,
+    };
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
     // Post-hoc envelope lifting is gated on tool_choice, not tool presence:
@@ -12484,12 +12921,15 @@ async fn runnable_chat_streaming(
                         }
                     },
                 )
-                .map(|(text, generated_token_ids)| RunnableGenerationResult {
-                    text,
-                    generated_token_ids,
-                    prompt_token_ids: Some(prompt_ids),
-                    prompt_token_count,
-                })
+                .map(
+                    |(text, generated_token_ids, prompt_cache)| RunnableGenerationResult {
+                        text,
+                        generated_token_ids,
+                        prompt_token_ids: Some(prompt_ids),
+                        prompt_token_count,
+                        prompt_cache,
+                    },
+                )
             }
             RunnablePreparedPrompt::Vision {
                 prefix,
@@ -12518,6 +12958,7 @@ async fn runnable_chat_streaming(
                         generated_token_ids,
                         prompt_token_ids: None,
                         prompt_token_count,
+                        prompt_cache: None,
                     },
                 ),
         };
@@ -12635,14 +13076,17 @@ async fn runnable_chat_streaming(
                 generated_token_ids: ids,
                 prompt_token_ids,
                 prompt_token_count,
+                prompt_cache,
             })) => {
                 let content = if bitnet_stream {
                     text
                 } else {
                     split_ornith_think(&text).1
                 };
+                let tool_parse_text =
+                    ornith_forced_tool_parse_text(forced_tool_name.as_deref(), &content);
                 let tool_calls = if lift_tool_calls {
-                    parse_ornith_tool_calls_json(&content)
+                    parse_ornith_tool_calls_json(&tool_parse_text)
                 } else {
                     Vec::new()
                 };
@@ -12684,6 +13128,7 @@ async fn runnable_chat_streaming(
                     runtime.architecture.as_str(),
                     prompt_token_ids.as_deref(),
                     &ids,
+                    prompt_cache,
                 );
                 yield Ok(Event::default().data(
                     runnable_stream_chunk(
@@ -13803,11 +14248,14 @@ async fn unload_model(
 ///
 /// Shared by `/api/models/unload` and the `replace` load path so both free the
 /// SAME things. That sharing is load-bearing, not tidiness: the registry clears
-/// below are CPU-side only, and the resident decode engine keeps its weights in
-/// process-global caches. Skipping `reset_resident_caches` leaves ~4.7 GB parked
-/// on the device, which starves the next model into an NVIDIA sysmem spill and
-/// makes decode ~20x slower — so a `replace` that hand-rolled the teardown would
-/// silently reintroduce exactly the bug this reset exists to prevent.
+/// below are CPU-side only, while both GPU backends retain model state in
+/// process-global caches. CUDA can leave multi-GB resident engines and allocator
+/// pages parked on the device; Metal's permanent linear cache can keep no-copy
+/// `WirePages` alive after the registry's last model reference is gone. Skipping
+/// `reset_resident_caches` therefore either starves the next CUDA model into an
+/// NVIDIA sysmem spill or leaves roughly a GGUF's worth of anonymous host pages
+/// eligible for macOS compression. A `replace` that hand-rolled the teardown
+/// would silently reintroduce exactly the bug this reset exists to prevent.
 ///
 /// The caller must already hold the model-transition lock and an exclusive
 /// `model_file_lifecycle` guard. `Err` carries a ready-to-return response.
@@ -13847,12 +14295,12 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
     }
 
     clear_prompt_prefix_cache(state);
-    // Free the GPU VRAM held by the resident decode engine. The clears above only drop
-    // the CPU-side registries; the Llama resident engine lives in process-global caches
-    // (see inference::reset_resident_caches) that unload never touched, so its ~4.7 GB
-    // stayed on the device and starved the next model into a host-RAM spill (NVIDIA
-    // sysmem fallback), making decode ~20x slower. (A gemma4 CUDA runtime's VRAM is
-    // freed by dropping it from gemma4_runtimes above.)
+    // Free process-global GPU/model-weight state. The clears above only drop the API
+    // registries. CUDA's Llama resident engine and allocator pool otherwise keep VRAM
+    // alive, which can starve the next model into the ~20x-slower NVIDIA sysmem fallback.
+    // Metal's permanent linear cache otherwise keeps Arc<WirePages> no-copy weights alive,
+    // pinning anonymous host pages (and therefore macOS compressor pressure) until process
+    // exit. A gemma4 CUDA runtime's own VRAM is freed by dropping it above.
     //
     // The reset mutates engine-owned GPU state, so it runs as an ENGINE JOB —
     // it can never race a decode. A failed post is surfaced, never skipped
@@ -14200,16 +14648,29 @@ async fn load_weights_lru(
     model: &LoadedModel,
     binding: &LlamaTensorBinding,
 ) -> Result<Arc<LlamaLoadedWeights>, Response> {
-    {
-        let cached = state.cached_weights.read().await;
-        if let Some(weights) = cached.get(&model.id) {
-            state
-                .model_last_used
-                .write()
-                .await
-                .insert(model.id.clone(), std::time::Instant::now());
-            return Ok(weights.clone());
-        }
+    let cached = state.cached_weights.read().await.get(&model.id).cloned();
+    if let Some(weights) = cached {
+        state
+            .model_last_used
+            .write()
+            .await
+            .insert(model.id.clone(), std::time::Instant::now());
+        return Ok(weights);
+    }
+
+    // Only cache misses enter the expensive lane. Double-check after acquiring it: another
+    // caller may have loaded this exact model while we waited. Keep the guard through budget
+    // admission, all evictions, materialization, and publication so two distinct misses cannot
+    // independently pass the same budget snapshot and transiently oversubscribe host memory.
+    let _admission = state.weight_load_admission.lock().await;
+    let cached = state.cached_weights.read().await.get(&model.id).cloned();
+    if let Some(weights) = cached {
+        state
+            .model_last_used
+            .write()
+            .await
+            .insert(model.id.clone(), std::time::Instant::now());
+        return Ok(weights);
     }
 
     let (layer_range, load_embedding, load_output) = api_weight_load_ownership();
@@ -14230,6 +14691,7 @@ async fn load_weights_lru(
 
     let limit_bytes = cpu_weight_materialization_limit_bytes().unwrap_or(u64::MAX);
 
+    let mut evicted_weights = Vec::new();
     loop {
         let loaded = state.loaded_models.read().await;
         let cached = state.cached_weights.read().await;
@@ -14279,11 +14741,71 @@ async fn load_weights_lru(
 
         if let Some(evict_id) = lru_id {
             tracing::info!(model=%evict_id, "LRU evicting weights of model to stay under budget");
-            let mut cached_write = state.cached_weights.write().await;
-            cached_write.remove(&evict_id);
+            let removed_weights = {
+                let mut cached_write = state.cached_weights.write().await;
+                remove_lru_entry(&mut cached_write, &evict_id)
+            };
+            if let Some(weights) = removed_weights {
+                let last_used = state.model_last_used.write().await.remove(&evict_id);
+                evicted_weights.push((evict_id, weights, last_used));
+            }
         } else {
             break;
         }
+    }
+
+    if !evicted_weights.is_empty() {
+        // Every registry guard is out of scope before this await. Prompt-prefix sessions are
+        // secondary owners of the evicted Arc<LlamaLoadedWeights>, so release those entries in
+        // the same engine job as the Metal reset. Running both on the compute owner orders them
+        // after any decode already storing a prefix and prevents clearing Metal no-copy buffers
+        // underneath active GPU work. Do NOT call inference::reset_resident_caches here: unlike
+        // explicit unload, LRU admission holds only a shared model lifecycle lease, and clearing
+        // CUDA's process-global engine/KV between cooperative stream steps corrupts that stream.
+        let prompt_cache = Arc::clone(&state.cached_prompt_prefix);
+        let evicted_model_ids = evicted_weights
+            .iter()
+            .map(|(model_id, _, _)| model_id.clone())
+            .collect::<Vec<_>>();
+        let rollback_model_ids = evicted_model_ids.clone();
+        let evicted_count = evicted_weights.len();
+        tracing::info!(
+            evicted_models = evicted_count,
+            "LRU eviction completed; releasing prompt prefixes and Metal weight caches"
+        );
+        if let Err(err) = state
+            .engine
+            .run_exclusive(move || {
+                {
+                    let mut pool = prompt_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for model_id in &evicted_model_ids {
+                        pool.evict_model(model_id);
+                    }
+                }
+                crate::metal::reset_model_caches();
+            })
+            .await
+        {
+            // A rejected/lost engine job means the prefix owners and backend caches may not
+            // have been released. Restore the exact registry state so a retry cannot observe
+            // an artificially empty budget and load a replacement on top of those owners.
+            restore_lru_weight_transaction(state, evicted_weights, &rollback_model_ids).await;
+            return Err(*engine_post_error_response(err));
+        }
+        let retained_model_ids = externally_retained_lru_model_ids(&evicted_weights);
+        if !retained_model_ids.is_empty() {
+            // Do not wait for active requests while holding admission: their completion may
+            // itself need this server to keep scheduling work. Restore the transaction and ask
+            // this caller to retry after those owners naturally finish.
+            restore_lru_weight_transaction(state, evicted_weights, &rollback_model_ids).await;
+            return Err(lru_weights_in_use_response(&retained_model_ids));
+        }
+        // The reset completed and prompt-prefix owners are gone. Release the rollback Arcs
+        // before materializing the replacement, otherwise this safety mechanism itself would
+        // create a transient two-model resident peak.
+        drop(evicted_weights);
     }
 
     let store = TensorStore::open(&model.path, &model.gguf);
@@ -14321,6 +14843,9 @@ async fn load_weights_lru(
         .write()
         .await
         .insert(model.id.clone(), weights.clone());
+    // No await between publication and readmission: a stale cache-hit clone racing an eviction
+    // must never clear the tombstone after that eviction has completed.
+    admit_prompt_prefix_cache_model(state, &model.id);
     state
         .model_last_used
         .write()
@@ -14328,6 +14853,79 @@ async fn load_weights_lru(
         .insert(model.id.clone(), std::time::Instant::now());
 
     Ok(weights)
+}
+
+/// Remove an entry selected by the LRU scan and return its value as rollback authority.
+/// Keeping the removed value until the engine reset succeeds prevents a failed post from
+/// permanently hiding still-retained memory from the next budget calculation.
+fn remove_lru_entry<V>(cache: &mut HashMap<String, V>, model_id: &str) -> Option<V> {
+    cache.remove(model_id)
+}
+
+/// Restore a failed eviction transaction exactly, including the prior LRU timestamp. Consuming
+/// the values transfers the original weight Arcs back into the registry without a transient clone.
+fn restore_lru_entries<V>(
+    cache: &mut HashMap<String, V>,
+    last_used: &mut HashMap<String, std::time::Instant>,
+    entries: Vec<(String, V, Option<std::time::Instant>)>,
+) {
+    for (model_id, value, prior_last_used) in entries {
+        cache.insert(model_id.clone(), value);
+        if let Some(prior) = prior_last_used {
+            last_used.insert(model_id, prior);
+        } else {
+            last_used.remove(&model_id);
+        }
+    }
+}
+
+/// Models still owned outside the removed registry value. At this point prompt-cache owners have
+/// already been released, so any extra strong owner is an in-flight prepared/generating request.
+fn externally_retained_lru_model_ids<V>(
+    entries: &[(String, Arc<V>, Option<std::time::Instant>)],
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(_, value, _)| Arc::strong_count(value) > 1)
+        .map(|(model_id, _, _)| model_id.clone())
+        .collect()
+}
+
+async fn restore_lru_weight_transaction(
+    state: &AppState,
+    entries: Vec<(String, Arc<LlamaLoadedWeights>, Option<std::time::Instant>)>,
+    model_ids: &[String],
+) {
+    let (mut cached, mut last_used) =
+        tokio::join!(state.cached_weights.write(), state.model_last_used.write());
+    restore_lru_entries(&mut cached, &mut last_used, entries);
+    drop(cached);
+    drop(last_used);
+
+    let mut pool = state
+        .cached_prompt_prefix
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for model_id in model_ids {
+        pool.admit_model(model_id);
+    }
+}
+
+fn lru_weights_in_use_response(model_ids: &[String]) -> Response {
+    let mut response = api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "model_weights_in_use",
+        format!(
+            "cannot evict model weights still owned by an active request ({}); retry after the active generation finishes",
+            model_ids.join(", ")
+        ),
+        Some("model"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        "1".parse().expect("static header"),
+    );
+    response
 }
 
 async fn tokenizer_encode(
@@ -14806,10 +15404,138 @@ async fn preflight_generation(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
-    match validate_generation_request(&state, req).await {
-        Ok(summary) => Json(summary).into_response(),
+    // Workspace sends chat-shaped requests here to obtain the exact rendered
+    // prompt count before it decides whether to retain or trim history.  The
+    // dense validator below deliberately rejects runnable-only architectures,
+    // because it would otherwise bind them to the wrong graph.  Ornith/qwen35
+    // nevertheless has a real chat renderer and tokenizer, so count that exact
+    // runnable prompt without constructing (or claiming) a dense session.
+    match preflight_runnable_chat_request(&state, &req).await {
+        Ok(Some(summary)) => Json(summary).into_response(),
+        Ok(None) => match validate_generation_request(&state, req).await {
+            Ok(summary) => Json(summary).into_response(),
+            Err(response) => response,
+        },
         Err(response) => response,
     }
+}
+
+/// Tokenization-only preflight for the runnable Ornith/qwen35 chat lane.
+///
+/// Raw completion requests intentionally keep flowing to the dense validator,
+/// which returns `unsupported_completions_lane` for qwen35.  This branch is
+/// only for the chat-shaped request Workspace already sends: it renders the
+/// same Ornith tool prompt and calls the same tokenizer helper as the runnable
+/// chat handler, then applies the same private prompt+generation ceiling.  It
+/// does not build a dense inference session or publish dense prompt-cache
+/// readiness; runnable prefill has separate runtime state and diagnostics.
+async fn preflight_runnable_chat_request(
+    state: &AppState,
+    req: &GenerationSessionRequest,
+) -> std::result::Result<Option<GenerationSessionSummary>, Response> {
+    // Preserve the raw-completions gate, including the existing qwen35
+    // `/api/generation/preflight` test that submits `prompt` rather than chat
+    // `messages`.
+    if req.messages.is_none() {
+        return Ok(None);
+    }
+
+    let model_id = match req.model.as_deref() {
+        Some(id) => Some(id.to_string()),
+        None => state.active_model_id.read().await.clone(),
+    };
+    let Some(model_id) = model_id else {
+        return Ok(None);
+    };
+    let model = state.loaded_models.read().await.get(&model_id).cloned();
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    if model.gguf.architecture() != Some("qwen35") || !is_runnable_serve_file(&model.gguf) {
+        return Ok(None);
+    }
+
+    validate_unsupported_generation_fields(req).map_err(|response| *response)?;
+    validate_choice_and_logprob_fields(req).map_err(|response| *response)?;
+    // Keep request validation aligned with the served chat path even though
+    // sampling does not affect token count.
+    let _ = sampling_config_from_request(req).map_err(|response| *response)?;
+    let _ = stop_sequences_from_request(req.stop.as_ref()).map_err(|response| *response)?;
+    if req.max_tokens == Some(0) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_tokens",
+            "max_tokens must be greater than zero".to_string(),
+            Some("max_tokens"),
+        ));
+    }
+    if req.prompt.is_some() || req.camelid_prompt_token_ids.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "ambiguous_generation_input",
+            "runnable chat preflight accepts messages only; do not combine messages with prompt or camelid_prompt_token_ids"
+                .to_string(),
+            None,
+        ));
+    }
+    let messages = req
+        .messages
+        .as_deref()
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_generation_input",
+                "runnable chat preflight requires a non-empty messages array".to_string(),
+                Some("messages"),
+            )
+        })?;
+    validate_chat_messages(messages).map_err(|response| *response)?;
+
+    let tokenizer = model.tokenizer_runtime.as_deref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tokenizer_unavailable",
+            format!("model '{}' has no usable runnable tokenizer", model.id),
+            Some("model"),
+        )
+    })?;
+    let tools = unwrap_runnable_tools(req.tools.clone().unwrap_or_default());
+    let forced_tool_name = runnable_forced_tool_name(req.tool_choice.as_ref(), &tools);
+    let prompt = if tools.is_empty() {
+        render_ornith_chatml_prompt(messages, req.camelid_enable_thinking.unwrap_or(false))
+    } else {
+        render_ornith_chatml_prompt_with_tools(
+            messages,
+            &tools,
+            req.camelid_enable_thinking.unwrap_or(false),
+            forced_tool_name.as_deref(),
+        )
+    };
+    let token_ids = tokenize_runnable_text_prompt("qwen35", tokenizer, &prompt)?;
+    let max_tokens = runnable_effective_max_tokens(
+        state,
+        &model,
+        token_ids.len(),
+        req.max_tokens,
+        req.camelid_context_budget_tokens,
+    )
+    .map_err(RunnableBudgetError::into_response)?;
+
+    Ok(Some(GenerationSessionSummary {
+        id: format!(
+            "gen-{}-{}",
+            model.id,
+            state.generation_sessions.read().await.len() + 1
+        ),
+        object: "generation.session",
+        model: model.id,
+        prompt_token_count: token_ids.len(),
+        max_tokens,
+        state: "validated",
+        dense_session_ready: false,
+        next_step: "the exact runnable chat prompt fits; /v1/chat/completions will enforce the same total context budget without claiming dense prompt-cache telemetry",
+    }))
 }
 
 /// Every choice of an n>1 request, prepared upfront (KV caches allocate
@@ -15087,6 +15813,7 @@ async fn completions(
         camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
+        tool_choice: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
         constraint: None,
@@ -15105,7 +15832,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false, false);
+        return stream_completion(&state, prepared, false, false, false, false);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -15372,7 +16099,7 @@ async fn chat_completions(
                 return constraint_unsupported_on_lane();
             }
             if req.stream.unwrap_or(false) {
-                return runnable_chat_streaming(id, runtime, &req).await;
+                return runnable_chat_streaming(&state, id, runtime, &req).await;
             }
             return runnable_chat_nonstreaming(&state, id, runtime, &req).await;
         }
@@ -15506,6 +16233,7 @@ async fn chat_completions(
     // request. Threaded into stream_completion; ignored on the non-streaming
     // branch, which already returns `usage`.
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
+    let request_timing_diagnostics = req.camelid_stream_timing_diagnostics.unwrap_or(false);
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: None,
@@ -15546,6 +16274,7 @@ async fn chat_completions(
         // has no certified tools branch keep serving plain chat instead of
         // failing closed on a request that never wanted calls.
         tools: if tools_active { req.tools } else { None },
+        tool_choice: req.tool_choice,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         constraint,
@@ -15572,6 +16301,7 @@ async fn chat_completions(
             true,
             include_usage,
             tools_active && !constraint_active,
+            request_timing_diagnostics,
         );
     }
 
@@ -16056,6 +16786,7 @@ async fn replay_loaded_receipt_request(
         camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
+        tool_choice: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
         constraint,
@@ -16914,6 +17645,127 @@ fn enforce_context_budget(
     Ok(())
 }
 
+#[derive(Debug)]
+struct RunnableBudgetError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    param: Option<&'static str>,
+}
+
+impl RunnableBudgetError {
+    fn new(
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        param: Option<&'static str>,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message,
+            param,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        api_error(self.status, self.code, self.message, self.param)
+    }
+}
+
+/// Resolve the runnable text lane's effective generation allowance and enforce
+/// the same total prompt+generation ceiling Workspace selected for the turn.
+///
+/// This deliberately carries no dense cache/session state: runnable qwen35 has
+/// its own resident/CPU runtime and the only shared contract here is exact
+/// rendered token count plus a hard total-token bound.
+fn runnable_effective_max_tokens(
+    state: &AppState,
+    model: &LoadedModel,
+    prompt_tokens: usize,
+    requested_max_tokens: Option<u32>,
+    context_budget_tokens: Option<u32>,
+) -> std::result::Result<u32, RunnableBudgetError> {
+    if requested_max_tokens == Some(0) {
+        return Err(RunnableBudgetError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_tokens",
+            "max_tokens must be greater than zero".to_string(),
+            Some("max_tokens"),
+        ));
+    }
+    if prompt_tokens > state.server_limits.max_prompt_tokens {
+        return Err(RunnableBudgetError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            format!(
+                "prompt encoded to {prompt_tokens} tokens, above the server ceiling of {}",
+                state.server_limits.max_prompt_tokens
+            ),
+            Some("prompt"),
+        ));
+    }
+    let context_length = model
+        .llama_config
+        .as_ref()
+        .map(|config| config.context_length as usize)
+        .ok_or_else(|| {
+            RunnableBudgetError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_model_architecture",
+                "loaded runnable model does not expose a context length".to_string(),
+                Some("model"),
+            )
+        })?;
+    if prompt_tokens >= context_length {
+        return Err(RunnableBudgetError::new(
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+            format!(
+                "prompt token count {prompt_tokens} leaves no room for generation in context length {context_length}"
+            ),
+            Some("prompt"),
+        ));
+    }
+
+    // Keep the runnable bridge's existing public default and 4096-token output
+    // cap, then clamp it to model headroom exactly as the dense lane does.
+    let max_tokens = requested_max_tokens
+        .unwrap_or(256)
+        .min(4096)
+        .min((context_length - prompt_tokens) as u32);
+    if max_tokens > state.server_limits.max_generation_tokens {
+        return Err(RunnableBudgetError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "generation_token_limit_exceeded",
+            format!(
+                "effective max_tokens exceeds the server ceiling of {}",
+                state.server_limits.max_generation_tokens
+            ),
+            Some("max_tokens"),
+        ));
+    }
+    if let Some(budget_tokens) = context_budget_tokens {
+        if budget_tokens == 0 {
+            return Err(RunnableBudgetError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_context_budget",
+                "camelid_context_budget_tokens must be greater than zero".to_string(),
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+        if let Err(message) = enforce_context_budget(prompt_tokens, max_tokens, budget_tokens) {
+            return Err(RunnableBudgetError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "context_budget_exceeded",
+                message,
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+    }
+    Ok(max_tokens)
+}
+
 pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -17238,6 +18090,7 @@ async fn prepare_generation(
             Some("prompt"),
         ));
     }
+    timings.prompt_prefilled_tokens = token_ids.len();
     if token_ids.len() > state.server_limits.max_prompt_tokens {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -18538,75 +19391,250 @@ fn clear_prompt_prefix_cache(state: &AppState) {
     }
 }
 
-fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMatchResult> {
-    if prepared.constraint.is_some() {
-        return None;
-    }
-    let mut pool = prepared.cached_prompt_prefix.lock().ok()?;
-    let min_prefix = prompt_prefix_cache_min_tokens_from_env();
-    let mut best: Option<(usize, bool, usize, std::time::Instant)> = None;
-
-    for (index, entry) in pool.entries.iter().enumerate() {
-        let cached = &entry.cached;
-        let same_cache_key = cached.model_id == prepared.model_id
-            && cached.model_path == prepared.model_path
-            && cached.sampling == prepared.sampling;
-        if !same_cache_key || cached.session.kv_position() != cached.token_ids.len() {
-            continue;
-        }
-
-        let common_len = common_prefix_len(&cached.token_ids, &prepared.token_ids);
-        let is_exact_match = cached.token_ids == prepared.token_ids;
-        if !is_exact_match && common_len < min_prefix {
-            continue;
-        }
-
-        let candidate_rank = (is_exact_match, common_len, entry.last_used);
-        let should_replace = best
-            .as_ref()
-            .map(|(_, exact, prefix_len, last_used)| {
-                candidate_rank > (*exact, *prefix_len, *last_used)
-            })
-            .unwrap_or(true);
-        if should_replace {
-            best = Some((index, is_exact_match, common_len, entry.last_used));
-        }
-    }
-
-    if let Some((index, is_exact_match, common_len, _)) = best {
-        let entry = &mut pool.entries[index];
-        entry.last_used = std::time::Instant::now();
-        let cached = Arc::clone(&entry.cached);
-        let prefix_len = if is_exact_match {
-            common_len
-        } else {
-            common_len.min(prepared.token_ids.len().saturating_sub(1))
-        };
-        Some(PrefixMatchResult {
-            cached,
-            prefix_len,
-            is_exact_match,
-        })
-    } else {
-        None
-    }
+/// A successful weight publication/rollback makes this model budget-accounted again, so
+/// generations prepared from it may retain prompt prefixes.
+fn admit_prompt_prefix_cache_model(state: &AppState, model_id: &str) {
+    state
+        .cached_prompt_prefix
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .admit_model(model_id);
 }
 
-fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(&x, &y)| x == y).count()
+fn disable_prompt_prefix_cache(state: &AppState) {
+    let mut pool = state
+        .cached_prompt_prefix
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pool.disable();
+}
+
+fn lookup_prompt_prefix_cache(prepared: &mut PreparedGeneration) -> Option<PrefixMatchResult> {
+    // A constraint no longer disqualifies a hit. The cached artifact is prompt
+    // KV plus the logits for the first output token — both independent of the
+    // constraint, which only governs which OUTPUT tokens are legal. The exact-
+    // hit path masks those logits before sampling (`sample_cached_prompt_prefix`)
+    // and the partial-hit path re-enters the main decode loop, which masks
+    // every step. Refusing outright meant a constrained request paid a full
+    // cold prefill every time — the very cost this cache exists to remove.
+    #[derive(Clone, Copy)]
+    struct CandidateTelemetry {
+        decision: &'static str,
+        common: usize,
+        suffix: usize,
+        candidate: usize,
+        block_tokens: usize,
+        matched_blocks: usize,
+    }
+
+    let request_len = prepared.token_ids.len();
+    let (result, telemetry) = {
+        let Ok(mut pool) = prepared.cached_prompt_prefix.lock() else {
+            return None;
+        };
+        if pool.capacity == 0 {
+            (
+                None,
+                CandidateTelemetry {
+                    decision: "disabled",
+                    common: 0,
+                    suffix: request_len,
+                    candidate: 0,
+                    block_tokens: prompt_prefix_cache_block_tokens_from_env(),
+                    matched_blocks: 0,
+                },
+            )
+        } else {
+            let min_prefix = prompt_prefix_cache_min_tokens_from_env();
+            let mut best: Option<(usize, bool, usize, usize, std::time::Instant)> = None;
+            let mut observed: Option<CandidateTelemetry> = None;
+
+            for (index, entry) in pool.entries.iter().enumerate() {
+                let cached = &entry.cached;
+                let same_cache_key = cached.model_id == prepared.model_id
+                    && cached.model_path == prepared.model_path
+                    && cached.sampling == prepared.sampling;
+                if !same_cache_key || cached.kv_position != cached.token_ids.len() {
+                    continue;
+                }
+
+                let (common_len, matched_blocks) =
+                    block_indexed_common_prefix_len(cached, &prepared.token_ids);
+                let is_exact_match = cached.token_ids == prepared.token_ids;
+                let divergent_suffix_len = request_len.saturating_sub(common_len);
+                let mut decision = "miss_below_minimum";
+                let eligible_by_size = is_exact_match || common_len >= min_prefix;
+                let profitable = is_exact_match
+                    || !cached.metal_f32_resident_kv
+                    || metal_f32_partial_prefix_is_profitable(common_len, divergent_suffix_len);
+                if eligible_by_size && !profitable {
+                    decision = "rejected_metal_ratio";
+                    tracing::debug!(
+                        target: "camelid::prompt_cache",
+                        decision = "candidate_rejected_metal_ratio",
+                        common_prefix_tokens = common_len,
+                        divergent_suffix_tokens = divergent_suffix_len,
+                        cached_prompt_tokens = cached.token_ids.len(),
+                        request_prompt_tokens = request_len,
+                        block_tokens = cached.block_tokens,
+                        matched_blocks,
+                        min_reuse_ratio = METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO,
+                        "prompt-cache candidate is below the measured Metal F32 reuse threshold"
+                    );
+                }
+                let candidate_telemetry = CandidateTelemetry {
+                    decision,
+                    common: common_len,
+                    suffix: divergent_suffix_len,
+                    candidate: cached.token_ids.len(),
+                    block_tokens: cached.block_tokens,
+                    matched_blocks,
+                };
+                if observed
+                    .as_ref()
+                    .map(|current| common_len > current.common)
+                    .unwrap_or(true)
+                {
+                    observed = Some(candidate_telemetry);
+                }
+                if !eligible_by_size || !profitable {
+                    continue;
+                }
+
+                let candidate_rank = (is_exact_match, common_len, entry.last_used);
+                let should_replace = best
+                    .as_ref()
+                    .map(|(_, exact, prefix_len, _, last_used)| {
+                        candidate_rank > (*exact, *prefix_len, *last_used)
+                    })
+                    .unwrap_or(true);
+                if should_replace {
+                    best = Some((
+                        index,
+                        is_exact_match,
+                        common_len,
+                        matched_blocks,
+                        entry.last_used,
+                    ));
+                }
+            }
+
+            if let Some((index, is_exact_match, common_len, matched_blocks, _)) = best {
+                let entry = &mut pool.entries[index];
+                entry.last_used = std::time::Instant::now();
+                let cached = Arc::clone(&entry.cached);
+                let prefix_len = if is_exact_match {
+                    common_len
+                } else {
+                    common_len.min(request_len.saturating_sub(1))
+                };
+                let telemetry = CandidateTelemetry {
+                    decision: if is_exact_match {
+                        "exact_hit"
+                    } else if matched_blocks > 0 {
+                        "block_prefix_hit"
+                    } else {
+                        "partial_prefix_hit"
+                    },
+                    common: prefix_len,
+                    suffix: request_len.saturating_sub(prefix_len),
+                    candidate: cached.token_ids.len(),
+                    block_tokens: cached.block_tokens,
+                    matched_blocks,
+                };
+                (
+                    Some(PrefixMatchResult {
+                        cached,
+                        prefix_len,
+                        is_exact_match,
+                    }),
+                    telemetry,
+                )
+            } else {
+                (
+                    None,
+                    observed.unwrap_or(CandidateTelemetry {
+                        decision: "miss_no_candidate",
+                        common: 0,
+                        suffix: request_len,
+                        candidate: 0,
+                        block_tokens: prompt_prefix_cache_block_tokens_from_env(),
+                        matched_blocks: 0,
+                    }),
+                )
+            }
+        }
+    };
+
+    prepared.timings.prompt_cache_decision = Some(telemetry.decision);
+    prepared.timings.prompt_cache_common_prefix_tokens = telemetry.common;
+    prepared.timings.prompt_cache_divergent_suffix_tokens = telemetry.suffix;
+    prepared.timings.prompt_cache_candidate_tokens = telemetry.candidate;
+    prepared.timings.prompt_cache_block_tokens = telemetry.block_tokens;
+    prepared.timings.prompt_cache_matched_blocks = telemetry.matched_blocks;
+    result
+}
+
+fn metal_f32_partial_prefix_is_profitable(prefix_len: usize, suffix_len: usize) -> bool {
+    suffix_len > 0 && prefix_len / suffix_len >= METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO
+}
+
+fn mark_prompt_cache_bypassed(prepared: &mut PreparedGeneration, decision: &'static str) {
+    prepared.timings.prompt_cache_decision = Some(decision);
+    prepared.timings.prompt_cache_divergent_suffix_tokens = prepared.token_ids.len();
+    prepared.timings.prompt_cache_block_tokens = prompt_prefix_cache_block_tokens_from_env();
+}
+
+fn restore_cached_prompt_prefix(
+    prepared: &mut PreparedGeneration,
+    cached: &CachedPromptPrefix,
+    position: usize,
+) -> bool {
+    if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return false;
+    }
+    let restored = if !cached.kv_blocks.is_empty() {
+        prepared
+            .session
+            .restore_prompt_kv_blocks(&cached.kv_blocks, position)
+            .is_ok()
+    } else if let Some(mut session) = cached.legacy_session.clone() {
+        if session.rollback_to_position(position).is_ok() {
+            prepared.session = session;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if restored {
+        prepared
+            .session
+            .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
+    }
+    restored
+}
+
+fn mark_prompt_cache_restore_failed(prepared: &mut PreparedGeneration) {
+    prepared.timings.prompt_cache_decision = Some("rollback_failed");
+    prepared.timings.prompt_cache_common_prefix_tokens = 0;
+    prepared.timings.prompt_cache_divergent_suffix_tokens = prepared.token_ids.len();
+    prepared.timings.prompt_cache_matched_blocks = 0;
 }
 
 fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGenerationStep) {
-    if prepared.constraint.is_some() {
-        return;
-    }
+    // Storing is constraint-independent for the same reason: what is retained
+    // is the PROMPT's KV and its raw (unmasked) logits. A later request applies
+    // its own constraint to those logits, so an entry seeded by a constrained
+    // request is equally valid for an unconstrained one and vice versa.
     // Windowed-attention archs (gemma3): NEVER store a prefix entry. Any later
     // partial hit would resume the cached session at `kv_position = k > 0` and
     // re-prefill the divergent suffix on the CPU dense forward — which has no
     // sliding-window mask and none of the arch's structure, so ordinary
     // multi-turn chat would silently attend full-causal over the whole cached
     // history (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1). Refused at the
-    // store site AND at both partial-resume sites (`resume_partial_prefix_hit`)
+    // store site AND at the shared cached-prefix restore path
     // so the bypass holds even against a stale pool.
     if crate::model::arch_has_windowed_attention(&prepared.session.config) {
         return;
@@ -18618,29 +19646,71 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
     // entry must never be a differently-answering shortcut.
     // Position check FIRST: it is free, and mirroring is not — a session that is
     // about to be rejected must not pay for hundreds of MiB of KV readback.
-    if prepared.session.kv_position() != prepared.token_ids.len()
-        || !prepared.session.prepare_for_prompt_prefix_cache()
-    {
+    if prepared.session.kv_position() != prepared.token_ids.len() {
         return;
     }
 
-    // Cloning a populated session can copy hundreds of MiB of KV data. Do that
-    // outside the global cache lock so concurrent requests can still look up
-    // their own prefixes.
+    // Serialize reservation, Metal->CPU mirroring and the KV block/session snapshot.
+    // This briefly blocks cache lookups, but keeps replacement peak memory to
+    // the configured pool capacity instead of capacity+1. A cache is an
+    // optimization; if mirroring declines after eviction, the next request
+    // simply cold-prefills.
+    let Ok(mut pool) = prepared.cached_prompt_prefix.lock() else {
+        return;
+    };
+    // Low-memory admission disables the cache before the expensive
+    // Metal->CPU mirror and populated KV snapshot. Checking only in `insert`
+    // would avoid retention but still create the transient owners that this
+    // mode exists to prevent.
+    if pool.capacity == 0 || !pool.model_is_admitted(&prepared.model_id) {
+        return;
+    }
+    if pool.touch_exact(
+        &prepared.model_id,
+        &prepared.model_path,
+        &prepared.token_ids,
+        &prepared.sampling,
+    ) {
+        return;
+    }
+    pool.reserve_for_insert(
+        &prepared.model_id,
+        &prepared.model_path,
+        &prepared.token_ids,
+        &prepared.sampling,
+    );
+    if !prepared.session.prepare_for_prompt_prefix_cache() {
+        return;
+    }
+
+    let metal_f32_resident_kv = prepared.session.uses_f32_metal_resident_kv();
+    let block_tokens = prompt_prefix_cache_block_tokens_from_env();
+    let kv_blocks = prepared
+        .session
+        .snapshot_prompt_kv_blocks(block_tokens)
+        .unwrap_or_default();
+    let legacy_session = kv_blocks.is_empty().then(|| prepared.session.clone());
+
+    // Exact-F32 sessions retain normalized, independently shareable KV blocks.
+    // F16/quantized CPU KV formats keep the legacy whole-session snapshot so
+    // this optimization never increases their retained memory.
     let cached = CachedPromptPrefix {
         model_id: prepared.model_id.clone(),
         model_path: prepared.model_path.clone(),
         token_ids: prepared.token_ids.clone(),
+        block_hashes: prompt_token_block_hashes(&prepared.token_ids, block_tokens),
+        block_tokens,
         sampling: prepared.sampling.clone(),
-        session: prepared.session.clone(),
+        kv_blocks,
+        legacy_session,
+        kv_position: prepared.token_ids.len(),
         logits: step.logits.clone(),
         hidden_state: step.hidden_state.clone(),
         output_norm_state: step.output_norm_state.clone(),
+        metal_f32_resident_kv,
     };
 
-    if let Ok(mut pool) = prepared.cached_prompt_prefix.lock() {
-        pool.insert(cached);
-    }
+    pool.insert(cached);
 }
 
 /// Resume a PARTIAL prompt-prefix-cache hit: roll the cached session back to
@@ -18659,6 +19729,7 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
 /// A malformed/stale cache entry must never make generation fail: when
 /// rollback cannot establish the requested prefix position the caller retains
 /// the fresh session and performs a cold prefill.
+#[cfg(test)]
 fn resume_partial_prefix_hit(
     prepared: &mut PreparedGeneration,
     mut cached_session: LlamaInferenceSession,
@@ -18672,12 +19743,44 @@ fn resume_partial_prefix_hit(
         prepared.session = cached_session;
         *input = prepared.token_ids[prefix_len..].to_vec();
         prepared.timings.prompt_cache_hit = true;
+        prepared.timings.prompt_reused_tokens = prefix_len;
+        prepared.timings.prompt_prefilled_tokens = input.len();
+    } else {
+        mark_prompt_cache_restore_failed(prepared);
     }
 }
 
+fn resume_cached_prefix_hit(
+    prepared: &mut PreparedGeneration,
+    cached: &CachedPromptPrefix,
+    prefix_len: usize,
+    input: &mut Vec<u32>,
+) {
+    if restore_cached_prompt_prefix(prepared, cached, prefix_len) {
+        *input = prepared.token_ids[prefix_len..].to_vec();
+        prepared.timings.prompt_cache_hit = true;
+        prepared.timings.prompt_reused_tokens = prefix_len;
+        prepared.timings.prompt_prefilled_tokens = input.len();
+    } else {
+        mark_prompt_cache_restore_failed(prepared);
+    }
+}
+
+/// Sample the first output token from a fully-cached prompt.
+///
+/// `allowed` is the grammar mask for that token when a structured-output
+/// constraint is active. It MUST be applied here: this path bypasses the main
+/// decode loop (which masks at src/api/mod.rs `compute_mask`), so without it a
+/// cache hit would emit exactly one unconstrained token and silently break the
+/// constraint. That single gap is why the prefix cache used to refuse every
+/// constrained request outright.
+///
+/// A fresh grammar state is correct here: the cache holds PROMPT tokens, the
+/// grammar constrains OUTPUT, and no output token has been emitted yet.
 fn sample_cached_prompt_prefix(
     cached: &CachedPromptPrefix,
     history: &[u32],
+    allowed: Option<&[bool]>,
 ) -> std::result::Result<LlamaGenerationStep, Box<Response>> {
     let sampler = if cached.sampling == SamplingConfig::default() {
         LlamaSampler::Greedy
@@ -18685,8 +19788,23 @@ fn sample_cached_prompt_prefix(
         LlamaSampler::Sampling(cached.sampling.clone())
     };
     let sample_started = Instant::now();
+    let masked_logits = match allowed {
+        Some(mask) => {
+            let mut logits = cached.logits.clone();
+            crate::inference::apply_token_mask(&mut logits, mask).map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "constraint_unsatisfiable",
+                    format!("the structured-output constraint could not be applied: {err}"),
+                    Some("response_format"),
+                ))
+            })?;
+            std::borrow::Cow::Owned(logits)
+        }
+        None => std::borrow::Cow::Borrowed(&cached.logits),
+    };
     let next_token_id = sampler
-        .sample_with_history(&cached.logits, history)
+        .sample_with_history(&masked_logits, history)
         .map_err(|err| {
             Box::new(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -18844,44 +19962,84 @@ fn generate_token_ids(
     let resident_cuda_active = crate::inference::resident_decode_cuda_active();
 
     if !prepared.collect_dense_diagnostics && !want_execution_trace && !resident_cuda_active {
-        if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
-            let mut cached_session = match_res.cached.session.clone();
-            // The cached session's resident-path pin reflects the request
-            // that stored it; re-pin for this request's mode.
-            cached_session
-                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
-
+        if let Some(match_res) = lookup_prompt_prefix_cache(&mut prepared) {
             if match_res.is_exact_match {
-                prepared.session = cached_session;
-                input.clear();
-                let first_step = sample_cached_prompt_prefix(&match_res.cached, &history)?;
-                let cached_next_token = first_step.next_token_id;
-                sample += first_step.sample;
-                prepared.timings.prompt_cache_hit = true;
-                consume_generation_step(
-                    &prepared,
-                    first_step,
-                    GenerationStepAccumulator {
-                        generated: &mut generated,
-                        history: &mut history,
-                        top_logits: &mut top_logits,
-                        output_projection: &mut output_projection,
-                        dense: &mut dense,
-                        finish_reason: &mut finish_reason,
-                    },
-                )?;
-                if finish_reason == "length" {
-                    input.push(cached_next_token);
+                if restore_cached_prompt_prefix(
+                    &mut prepared,
+                    &match_res.cached,
+                    match_res.prefix_len,
+                ) {
+                    input.clear();
+                    // Mask the cached logits with the constraint's first-token set,
+                    // exactly as the main loop would have for a cold prefill.
+                    let first_mask = match grammar.as_mut() {
+                        Some(state) => {
+                            state.compute_mask(&mut grammar_mask).map_err(|err| {
+                                Box::new(api_error(
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    "constraint_evaluation_failed",
+                                    format!(
+                                        "LLGuidance could not compute the next-token mask: {err}"
+                                    ),
+                                    Some("response_format"),
+                                ))
+                            })?;
+                            Some(grammar_mask.as_slice())
+                        }
+                        None => None,
+                    };
+                    let first_step =
+                        sample_cached_prompt_prefix(&match_res.cached, &history, first_mask)?;
+                    if let Some(state) = grammar.as_mut() {
+                        state
+                            .commit_token(first_step.next_token_id)
+                            .map_err(|err| {
+                                Box::new(api_error(
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    "constraint_commit_failed",
+                                    format!("LLGuidance rejected the sampled token: {err}"),
+                                    Some("response_format"),
+                                ))
+                            })?;
+                    }
+                    let cached_next_token = first_step.next_token_id;
+                    sample += first_step.sample;
+                    prepared.timings.prompt_cache_hit = true;
+                    prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
+                    prepared.timings.prompt_prefilled_tokens = 0;
+                    consume_generation_step(
+                        &prepared,
+                        first_step,
+                        GenerationStepAccumulator {
+                            generated: &mut generated,
+                            history: &mut history,
+                            top_logits: &mut top_logits,
+                            output_projection: &mut output_projection,
+                            dense: &mut dense,
+                            finish_reason: &mut finish_reason,
+                        },
+                    )?;
+                    if finish_reason == "length" {
+                        input.push(cached_next_token);
+                    }
+                } else {
+                    mark_prompt_cache_restore_failed(&mut prepared);
                 }
             } else {
-                resume_partial_prefix_hit(
+                resume_cached_prefix_hit(
                     &mut prepared,
-                    cached_session,
+                    &match_res.cached,
                     match_res.prefix_len,
                     &mut input,
                 );
             }
         }
+    } else if prepared.collect_dense_diagnostics {
+        mark_prompt_cache_bypassed(&mut prepared, "bypassed_dense_diagnostics");
+    } else if want_execution_trace {
+        mark_prompt_cache_bypassed(&mut prepared, "bypassed_execution_trace");
+    } else {
+        mark_prompt_cache_bypassed(&mut prepared, "bypassed_cuda_resident");
     }
 
     // Arm the rollup now that the session is settled (past any prompt-cache swap). Fails closed
@@ -19601,6 +20759,21 @@ fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
     !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
 }
 
+/// Resolve a specific OpenAI function choice against the definitions that are
+/// actually rendered. Unknown/malformed choices retain the historical `auto`
+/// behavior; the Web Code host only emits canonical names from this list.
+fn runnable_forced_tool_name(
+    tool_choice: Option<&serde_json::Value>,
+    tools: &[serde_json::Value],
+) -> Option<String> {
+    let requested = tool_choice?.get("function")?.get("name")?.as_str()?;
+    tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .find(|name| *name == requested)
+        .map(str::to_owned)
+}
+
 /// Tools the runnable serve lane should render and parse for this request,
 /// unwrapped from the OpenAI `{"type":"function","function":{...}}` envelope.
 /// `tool_choice: "none"` disables tool calling for the request (OpenAI
@@ -19613,9 +20786,14 @@ fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value>
     if !tool_choice_allows_calls(req.tool_choice.as_ref()) {
         return Vec::new();
     }
-    req.tools
-        .clone()
-        .unwrap_or_default()
+    unwrap_runnable_tools(req.tools.clone().unwrap_or_default())
+}
+
+/// Normalize OpenAI function-tool envelopes into the flat definitions Ornith's
+/// native template consumes. Shared with runnable preflight so its exact token
+/// count cannot drift from the prompt that generation will actually see.
+fn unwrap_runnable_tools(tools: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    tools
         .into_iter()
         .map(|t| t.get("function").cloned().unwrap_or(t))
         .collect()
@@ -19989,6 +21167,14 @@ fn stream_timing_diagnostics_json(
                 "weight_load": timings.weight_load,
                 "weight_cache_hit": timings.weight_cache_hit,
                 "prompt_cache_hit": timings.prompt_cache_hit,
+                "prompt_reused_tokens": timings.prompt_reused_tokens,
+                "prompt_prefilled_tokens": timings.prompt_prefilled_tokens,
+                "prompt_cache_decision": timings.prompt_cache_decision,
+                "prompt_cache_common_prefix_tokens": timings.prompt_cache_common_prefix_tokens,
+                "prompt_cache_divergent_suffix_tokens": timings.prompt_cache_divergent_suffix_tokens,
+                "prompt_cache_candidate_tokens": timings.prompt_cache_candidate_tokens,
+                "prompt_cache_block_tokens": timings.prompt_cache_block_tokens,
+                "prompt_cache_matched_blocks": timings.prompt_cache_matched_blocks,
                 "session_create": timings.session_create,
                 "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
                 "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
@@ -20003,6 +21189,39 @@ fn stream_timing_diagnostics_json(
                 },
             },
             "q8_schedule": timings.q8_schedule,
+        }
+    })
+}
+
+/// Small terminal receipt used by Web Code on every model step. The existing
+/// env-gated diagnostics above intentionally include per-role/per-layer maps
+/// and Q8 schedule detail; serializing that verbose payload on every agent
+/// request would make the performance instrument part of the performance
+/// problem it is measuring.
+fn stream_timing_receipt_json(
+    timings: &GenerationTimings,
+    first_content_ms: Option<u128>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "stream_timing_diagnostics": {
+            "timings_ms": {
+                "first_content": first_content_ms,
+                "weight_load": timings.weight_load,
+                "weight_cache_hit": timings.weight_cache_hit,
+                "prompt_cache_hit": timings.prompt_cache_hit,
+                "prompt_reused_tokens": timings.prompt_reused_tokens,
+                "prompt_prefilled_tokens": timings.prompt_prefilled_tokens,
+                "prompt_cache_decision": timings.prompt_cache_decision,
+                "prompt_cache_common_prefix_tokens": timings.prompt_cache_common_prefix_tokens,
+                "prompt_cache_divergent_suffix_tokens": timings.prompt_cache_divergent_suffix_tokens,
+                "prompt_cache_candidate_tokens": timings.prompt_cache_candidate_tokens,
+                "prompt_cache_block_tokens": timings.prompt_cache_block_tokens,
+                "prompt_cache_matched_blocks": timings.prompt_cache_matched_blocks,
+                "session_create": timings.session_create,
+                "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
+                "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
+                "generation_forward_total": timings.generation.forward_total,
+            }
         }
     })
 }
@@ -20160,47 +21379,55 @@ fn stream_prompt_cache_prologue(
     } = state;
     if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
         if let Some(match_res) = lookup_prompt_prefix_cache(prepared) {
-            let mut cached_session = match_res.cached.session.clone();
-            cached_session
-                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
             if match_res.is_exact_match {
-                prepared.session = cached_session;
-                input.clear();
-                match sample_cached_prompt_prefix(&match_res.cached, history) {
-                    Ok(first_step) => {
-                        let cached_next_token = first_step.next_token_id;
-                        prepared.timings.prompt_cache_hit = true;
-                        *sample += first_step.sample;
-                        if let Err(response) = consume_generation_step(
-                            prepared,
-                            first_step,
-                            GenerationStepAccumulator {
-                                generated,
-                                history,
-                                top_logits,
-                                output_projection,
-                                dense,
-                                finish_reason,
-                            },
-                        ) {
+                if restore_cached_prompt_prefix(prepared, &match_res.cached, match_res.prefix_len) {
+                    input.clear();
+                    // Streaming with a constraint is refused before dispatch, so no
+                    // mask can apply on this path.
+                    match sample_cached_prompt_prefix(&match_res.cached, history, None) {
+                        Ok(first_step) => {
+                            let cached_next_token = first_step.next_token_id;
+                            prepared.timings.prompt_cache_hit = true;
+                            prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
+                            prepared.timings.prompt_prefilled_tokens = 0;
+                            *sample += first_step.sample;
+                            if let Err(response) = consume_generation_step(
+                                prepared,
+                                first_step,
+                                GenerationStepAccumulator {
+                                    generated,
+                                    history,
+                                    top_logits,
+                                    output_projection,
+                                    dense,
+                                    finish_reason,
+                                },
+                            ) {
+                                let (code, message) = stream_error_parts(&response);
+                                send(StreamDecodeEvent::Failed { code, message });
+                                return StreamPrologue::Stop;
+                            }
+                            if *finish_reason == "length" {
+                                input.push(cached_next_token);
+                            }
+                        }
+                        Err(response) => {
                             let (code, message) = stream_error_parts(&response);
                             send(StreamDecodeEvent::Failed { code, message });
                             return StreamPrologue::Stop;
                         }
-                        if *finish_reason == "length" {
-                            input.push(cached_next_token);
-                        }
                     }
-                    Err(response) => {
-                        let (code, message) = stream_error_parts(&response);
-                        send(StreamDecodeEvent::Failed { code, message });
-                        return StreamPrologue::Stop;
-                    }
+                } else {
+                    mark_prompt_cache_restore_failed(prepared);
                 }
             } else {
-                resume_partial_prefix_hit(prepared, cached_session, match_res.prefix_len, input);
+                resume_cached_prefix_hit(prepared, &match_res.cached, match_res.prefix_len, input);
             }
         }
+    } else if prepared.collect_dense_diagnostics {
+        mark_prompt_cache_bypassed(prepared, "bypassed_dense_diagnostics");
+    } else {
+        mark_prompt_cache_bypassed(prepared, "bypassed_cuda_resident");
     }
 
     // An exact prompt-cache hit samples the first token above, before the main
@@ -20462,6 +21689,14 @@ fn run_stream_decode_job(
 /// Cooperative streaming state machine for continuous batching. Unlike
 /// `run_stream_decode_job`, one call to `step` performs at most one model token and then
 /// yields ownership back to the engine scheduler.
+struct CooperativePrefillState {
+    prompt_tokens: usize,
+    prefill_tokens: usize,
+    cursor: usize,
+    chunk_tokens: usize,
+    timings: LlamaForwardTimings,
+}
+
 struct CooperativeStreamDecodeJob {
     prepared: PreparedGeneration,
     events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
@@ -20479,6 +21714,7 @@ struct CooperativeStreamDecodeJob {
     streamed_text: String,
     first_content_ms: Option<u128>,
     forward_timings: LlamaForwardTimings,
+    cooperative_prefill: Option<CooperativePrefillState>,
     sample: u128,
     finished: bool,
     #[cfg(test)]
@@ -20560,6 +21796,7 @@ impl CooperativeStreamDecodeJob {
             streamed_text,
             first_content_ms,
             forward_timings: LlamaForwardTimings::default(),
+            cooperative_prefill: None,
             sample,
             finished: false,
             #[cfg(test)]
@@ -20675,6 +21912,101 @@ impl CooperativeStreamDecodeJob {
             return engine::StepOutcome::Complete;
         }
 
+        // The CPU path already evaluates long prompts in fixed-size chunks.
+        // Under contention, expose those exact chunk boundaries to the engine
+        // scheduler so another stream can run between them. The decision is
+        // made once, before the first prompt token is evaluated; a lone stream
+        // and every resident/layer-major/windowed lane retain their existing
+        // run-to-completion prefill.
+        if self.cooperative_prefill.is_none()
+            && self.generated.is_empty()
+            && context.active_slots > 1
+            && self.input.len() > 1
+        {
+            let prefill_tokens = self.input.len() - 1;
+            if let Some(chunk_tokens) = self
+                .prepared
+                .session
+                .cooperative_prefill_chunk_tokens(prefill_tokens)
+            {
+                telemetry::emit(telemetry::Event::PrefillStarted {
+                    prefill_tokens,
+                    path: "cooperative_chunked",
+                    layers_total: self.prepared.session.weights.layers.len(),
+                });
+                self.cooperative_prefill = Some(CooperativePrefillState {
+                    prompt_tokens: self.input.len(),
+                    prefill_tokens,
+                    cursor: 0,
+                    chunk_tokens,
+                    timings: LlamaForwardTimings::default(),
+                });
+            }
+        }
+
+        if self
+            .cooperative_prefill
+            .as_ref()
+            .is_some_and(|state| state.cursor < state.prefill_tokens)
+        {
+            let (start, end, total) = {
+                let state = self.cooperative_prefill.as_ref().expect("checked above");
+                (
+                    state.cursor,
+                    (state.cursor + state.chunk_tokens).min(state.prefill_tokens),
+                    state.prefill_tokens,
+                )
+            };
+            let result = self
+                .prepared
+                .session
+                .cooperative_prefill_chunk(&self.input[start..end]);
+            let chunk_timings = match result {
+                Ok(timings) => timings,
+                Err(err) => {
+                    let response = api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_step_failed",
+                        err.to_string(),
+                        None,
+                    );
+                    return self.fail(&response);
+                }
+            };
+            let state = self
+                .cooperative_prefill
+                .as_mut()
+                .expect("cooperative prefill remains active");
+            state.cursor = end;
+            state.timings.add_assign(&chunk_timings);
+            telemetry::emit(telemetry::Event::PrefillProgress {
+                tokens_done: end,
+                tokens_total: total,
+            });
+            self.prepared.engine_progress.record_progress(end);
+            tracing::debug!(
+                target: "camelid::prefill",
+                decision = "cooperative_yield",
+                chunk_start = start,
+                chunk_end = end,
+                prefill_tokens = total,
+                active_slots = context.active_slots,
+                "yielding between numerically identical CPU prefill chunks"
+            );
+            return engine::StepOutcome::Continue;
+        }
+
+        let completed_prefill = self.cooperative_prefill.take();
+        if let Some(state) = &completed_prefill {
+            debug_assert_eq!(state.cursor, state.prefill_tokens);
+            let final_prompt_token = self.input[state.prefill_tokens];
+            self.input.clear();
+            self.input.push(final_prompt_token);
+            telemetry::emit(telemetry::Event::DecodeStarted {
+                context_position: self.prepared.session.kv_position(),
+            });
+        }
+
         let generated_index = self.generated.len();
         let collect_dense_for_step =
             collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index);
@@ -20691,7 +22023,7 @@ impl CooperativeStreamDecodeJob {
             && matches!(sampler, LlamaSampler::Greedy)
             && !collect_dense_for_step
             && !self.top_logits.is_empty();
-        let step = match run_stream_step(
+        let mut step = match run_stream_step(
             &mut self.prepared.session,
             StreamStepRequest {
                 greedy_fast,
@@ -20704,6 +22036,12 @@ impl CooperativeStreamDecodeJob {
             Ok(step) => step,
             Err(response) => return self.fail(&response),
         };
+        if let Some(prefill) = completed_prefill {
+            step.prompt_token_count = prefill.prompt_tokens;
+            step.prefill_token_count = prefill.prefill_tokens;
+            step.timings.add_assign(&prefill.timings);
+            step.prefill_timings.add_assign(&prefill.timings);
+        }
         if self.generated.is_empty()
             && !self.prepared.collect_dense_diagnostics
             && step.diagnostics.is_none()
@@ -20799,6 +22137,7 @@ fn stream_completion(
     chat: bool,
     include_usage: bool,
     parse_stream_tool_calls: bool,
+    request_timing_diagnostics: bool,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -20809,7 +22148,8 @@ fn stream_completion(
     // Captured before the job so the streaming usage frame reports the exact
     // same prompt count as the non-streaming path (single source of truth).
     let prompt_token_count = prepared.token_ids.len();
-    let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    let verbose_stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    let stream_timing_diagnostics = request_timing_diagnostics || verbose_stream_timing_diagnostics;
     let stream_poll_yield = stream_poll_yield_enabled();
     let stream_id = if chat {
         format!("chatcmpl-{}", uuid::Uuid::new_v4())
@@ -20950,7 +22290,15 @@ fn stream_completion(
                 } => {
                     stream_event_timings.final_yield = Some(stream_started.elapsed().as_millis());
                     let camelid_diagnostics = stream_timing_diagnostics.then(|| {
-                        stream_timing_diagnostics_json(&timings, first_content_ms, stream_event_timings)
+                        if verbose_stream_timing_diagnostics {
+                            stream_timing_diagnostics_json(
+                                &timings,
+                                first_content_ms,
+                                stream_event_timings,
+                            )
+                        } else {
+                            stream_timing_receipt_json(&timings, first_content_ms)
+                        }
                     });
                     if chat {
                         let mut resolved_finish_reason = finish_reason;
@@ -23477,6 +24825,85 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn lru_eviction_reset_is_armed_only_by_an_actual_removal() {
+        let mut cache = HashMap::from([("resident".to_string(), 1_u8)]);
+
+        assert_eq!(remove_lru_entry(&mut cache, "already-evicted"), None);
+        assert_eq!(remove_lru_entry(&mut cache, "resident"), Some(1));
+        assert_eq!(remove_lru_entry(&mut cache, "resident"), None);
+    }
+
+    #[test]
+    fn failed_lru_reset_restores_weights_and_exact_timestamp_state() {
+        let prior = std::time::Instant::now();
+        let mut cache = HashMap::new();
+        let mut last_used = HashMap::from([
+            ("without-prior".to_string(), prior),
+            ("unrelated".to_string(), prior),
+        ]);
+
+        restore_lru_entries(
+            &mut cache,
+            &mut last_used,
+            vec![
+                ("with-prior".to_string(), 1_u8, Some(prior)),
+                ("without-prior".to_string(), 2_u8, None),
+            ],
+        );
+
+        assert_eq!(cache.get("with-prior"), Some(&1));
+        assert_eq!(cache.get("without-prior"), Some(&2));
+        assert_eq!(last_used.get("with-prior"), Some(&prior));
+        assert!(!last_used.contains_key("without-prior"));
+        assert_eq!(last_used.get("unrelated"), Some(&prior));
+    }
+
+    #[test]
+    fn lru_admission_detects_an_in_flight_weight_owner() {
+        let entries = vec![("active".to_string(), Arc::new(1_u8), None)];
+        assert!(externally_retained_lru_model_ids(&entries).is_empty());
+
+        let active_request = Arc::clone(&entries[0].1);
+        assert_eq!(
+            externally_retained_lru_model_ids(&entries),
+            vec!["active".to_string()]
+        );
+        let response = lru_weights_in_use_response(&["active".to_string()]);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&"1".parse().unwrap())
+        );
+
+        drop(active_request);
+        assert!(externally_retained_lru_model_ids(&entries).is_empty());
+    }
+
+    #[tokio::test]
+    async fn weight_load_admission_serializes_cache_miss_windows() {
+        let state = AppState::default();
+        let first = Arc::clone(&state.weight_load_admission).lock_owned().await;
+        let second_admission = Arc::clone(&state.weight_load_admission);
+        let second = tokio::spawn(async move {
+            let _guard = second_admission.lock_owned().await;
+            "admitted"
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "a second cache miss must not enter admission while materialization is in flight"
+        );
+
+        drop(first);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("the next cache miss is admitted after publication")
+            .expect("admission task");
+        assert_eq!(outcome, "admitted");
+    }
+
     #[tokio::test]
     async fn runtime_memory_reports_empty_state_and_purge_is_idempotent() {
         let state = AppState::default();
@@ -23886,6 +25313,7 @@ mod tests {
             &state,
             orphan_test_prepared("model-a.gguf"),
             true,
+            false,
             false,
             false,
         );
@@ -24428,6 +25856,48 @@ mod tests {
     }
 
     #[test]
+    fn api_and_agent_tool_call_parsers_agree_on_the_shared_corpus() {
+        for (family, text) in [
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+            ),
+            (
+                "mistral",
+                r#"[TOOL_CALLS] [{"name":"list_dir","arguments":{"path":"."}}]"#,
+            ),
+            (
+                "llama_bpe_decoder",
+                r#"<|python_tag|>{"name":"search","parameters":{"query":"TODO","path":"src"}}"#,
+            ),
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"write_file","arguments":{"path":"quote.py","content":"print('it\'s valid')\n"}}</tool_call>"#,
+            ),
+        ] {
+            let api = parse_tool_calls(text).expect("API parser accepts corpus entry");
+            let agent = crate::chat::tool_parse::parse(text, family);
+            assert_eq!(api.len(), agent.len(), "family={family}, text={text}");
+            for (api, agent) in api.iter().zip(&agent) {
+                assert_eq!(api.function.name, agent.name);
+                let api_args: serde_json::Value =
+                    serde_json::from_str(&api.function.arguments).unwrap();
+                assert_eq!(api_args, agent.args);
+            }
+        }
+
+        for truncated in [
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs""#,
+            r#"[TOOL_CALLS] [{"name":"read_file","arguments":{"path":"src/lib.rs"}"#,
+        ] {
+            assert!(
+                parse_tool_calls(truncated).is_none(),
+                "truncated output must stay content instead of fabricating a tool call"
+            );
+        }
+    }
+
+    #[test]
     fn chat_message_accepts_tool_call_roundtrip_wire_shape() {
         let assistant: ChatMessage = serde_json::from_value(serde_json::json!({
             "role": "assistant",
@@ -24487,6 +25957,45 @@ mod tests {
             "required"
         ))));
         assert!(tool_choice_allows_calls(None));
+    }
+
+    #[test]
+    fn ornith_specific_tool_choice_is_an_exact_prompt_extension_and_parses() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Create the first requested file.".into(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        }];
+        let tools = vec![serde_json::json!({
+            "name": "write_file",
+            "description": "Write a workspace file",
+            "parameters": {"type": "object"}
+        })];
+        let ordinary = render_ornith_chatml_prompt_with_tools(&messages, &tools, false, None);
+        let forced =
+            render_ornith_chatml_prompt_with_tools(&messages, &tools, false, Some("write_file"));
+        assert_eq!(
+            forced.strip_prefix(&ordinary),
+            Some("<tool_call>\n<function=write_file>\n"),
+            "forcing a tool must preserve the complete ordinary prompt as its prefix"
+        );
+
+        let continuation = concat!(
+            "<parameter=path>\napp.py\n</parameter>\n",
+            "<parameter=content>\nprint('ready')\n\n</parameter>\n",
+            "</function>\n</tool_call>"
+        );
+        let parsed = parse_ornith_tool_calls_json(&ornith_forced_tool_parse_text(
+            Some("write_file"),
+            continuation,
+        ));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["function"]["name"], "write_file");
+        let args: serde_json::Value =
+            serde_json::from_str(parsed[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "app.py");
+        assert_eq!(args["content"], "print('ready')\n");
     }
 
     #[test]
@@ -24742,6 +26251,52 @@ mod tests {
             13.0
         );
         assert!(diagnostics["q8_schedule"].is_null());
+    }
+
+    #[test]
+    fn stream_timing_receipt_omits_verbose_layer_and_schedule_payloads() {
+        let mut timings = GenerationTimings {
+            weight_load: 17,
+            weight_cache_hit: true,
+            prompt_cache_hit: true,
+            prompt_reused_tokens: 1_200,
+            prompt_prefilled_tokens: 178,
+            prompt_cache_decision: Some("block_prefix_hit"),
+            prompt_cache_common_prefix_tokens: 1_200,
+            prompt_cache_divergent_suffix_tokens: 178,
+            prompt_cache_candidate_tokens: 1_280,
+            prompt_cache_block_tokens: 64,
+            prompt_cache_matched_blocks: 18,
+            session_create: 9,
+            ..GenerationTimings::default()
+        };
+        timings.prompt_evaluation.prefill.forward_total = 41.5;
+        timings.prompt_evaluation.first_token.forward_total = 3.0;
+        timings.generation.forward_total = 88.25;
+        timings.prompt_evaluation.prefill_layers = vec![GenerationLayerTimings {
+            layer_index: 7,
+            ffn_down: 99.0,
+            ..GenerationLayerTimings::default()
+        }];
+
+        let value = stream_timing_receipt_json(&timings, Some(123));
+        let receipt = &value["stream_timing_diagnostics"]["timings_ms"];
+        assert_eq!(receipt["first_content"], 123);
+        assert_eq!(receipt["prefill_forward_total"], 41.5);
+        assert_eq!(receipt["prompt_cache_hit"], true);
+        assert_eq!(receipt["prompt_reused_tokens"], 1_200);
+        assert_eq!(receipt["prompt_prefilled_tokens"], 178);
+        assert_eq!(receipt["prompt_cache_decision"], "block_prefix_hit");
+        assert_eq!(receipt["prompt_cache_common_prefix_tokens"], 1_200);
+        assert_eq!(receipt["prompt_cache_divergent_suffix_tokens"], 178);
+        assert_eq!(receipt["prompt_cache_candidate_tokens"], 1_280);
+        assert_eq!(receipt["prompt_cache_block_tokens"], 64);
+        assert_eq!(receipt["prompt_cache_matched_blocks"], 18);
+        assert!(receipt.get("prefill_role_timings").is_none());
+        assert!(receipt.get("layer_role_hotspots").is_none());
+        assert!(value["stream_timing_diagnostics"]
+            .get("q8_schedule")
+            .is_none());
     }
 
     #[test]
@@ -25825,31 +27380,34 @@ mod tests {
     }
 
     #[test]
-    fn certified_filename_with_wrong_bytes_is_not_a_supported_row() {
-        // THE REGRESSION this guard exists for. `ornith-1.0-9b-Q4_K_M.gguf` names
-        // two different sets of weights: the CERTIFIED in-house requant with no
-        // imatrix (2711bf1e..., 5,629,108,416 B) that the CUDA parity + agent-eval
-        // receipts were captured against, and the public HuggingFace imatrix quant
-        // of the exact same name (5720d1f6..., 5,629,108,704 B). Classifying on the
-        // filename alone made the second one report the first one's support claims
-        // and parity evidence through /api/capabilities and the frontend.
-        const CERTIFIED: &str = "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
-        const HF_IMATRIX_SAME_NAME: &str =
+    fn ornith_q4_filename_admits_only_its_two_independently_certified_artifacts() {
+        // `ornith-1.0-9b-Q4_K_M.gguf` names two genuinely different artifacts.
+        // Both now have independent platform + agent receipts, so both exact
+        // digests are admitted while any third same-named file fails closed.
+        const CUDA_REQUANT: &str =
+            "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
+        const METAL_IMATRIX: &str =
             "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106";
 
-        assert_eq!(
-            classify_loaded_model_identity(Some("qwen35"), "ornith-1.0-9b-Q4_K_M.gguf", CERTIFIED),
-            ModelLaneClass::Supported,
-            "the certified bytes keep the row"
-        );
+        for certified in [CUDA_REQUANT, METAL_IMATRIX] {
+            assert_eq!(
+                classify_loaded_model_identity(
+                    Some("qwen35"),
+                    "ornith-1.0-9b-Q4_K_M.gguf",
+                    certified,
+                ),
+                ModelLaneClass::Supported,
+                "each independently certified artifact keeps the row"
+            );
+        }
         assert_eq!(
             classify_loaded_model_identity(
                 Some("qwen35"),
                 "ornith-1.0-9b-Q4_K_M.gguf",
-                HF_IMATRIX_SAME_NAME,
+                &"00".repeat(32),
             ),
             ModelLaneClass::ExperimentalImplemented,
-            "a same-named file with uncertified bytes must NOT inherit the row"
+            "an unrecorded same-named file must not inherit either receipt"
         );
         // Case-insensitive on the hex, since digests reach us from several
         // producers, but never lenient about which digest.
@@ -25857,7 +27415,7 @@ mod tests {
             classify_loaded_model_identity(
                 Some("qwen35"),
                 "ornith-1.0-9b-Q4_K_M.gguf",
-                &CERTIFIED.to_uppercase(),
+                &METAL_IMATRIX.to_uppercase(),
             ),
             ModelLaneClass::Supported,
         );
@@ -25865,11 +27423,10 @@ mod tests {
 
     #[test]
     fn every_non_catalog_allowlist_entry_is_hash_pinned() {
-        // The 3-tuple makes a pin-less allowlist entry unrepresentable; this pins
-        // the digest SHAPE and that the entry resolves to its own recorded value
-        // (a copy/paste that duplicates a filename would otherwise resolve to
-        // whichever row came first).
-        let mut seen = std::collections::HashMap::new();
+        // The 3-tuple makes a pin-less allowlist entry unrepresentable. Multiple
+        // independently certified byte identities may deliberately share one
+        // upstream filename, so uniqueness is on (filename, digest), not name.
+        let mut seen = std::collections::HashSet::new();
         for (filename, _, sha256) in NON_CATALOG_SUPPORTED_ARTIFACTS {
             assert_eq!(sha256.len(), 64, "{filename} digest is not a sha256");
             assert!(
@@ -25878,20 +27435,22 @@ mod tests {
                     .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
                 "{filename} digest must be lowercase hex"
             );
-            assert_eq!(
-                supported_artifact_expected_sha256(filename),
-                Some(*sha256),
-                "{filename} must resolve to its own recorded digest"
+            assert!(
+                supported_artifact_identity_matches(filename, sha256),
+                "{filename} must admit its own recorded digest"
             );
             assert!(
-                seen.insert(*filename, *sha256).is_none(),
-                "{filename} is allowlisted twice"
+                seen.insert((*filename, *sha256)),
+                "{filename} repeats the same certified digest"
             );
         }
         // The two hash-pinned tables must never disagree about the same file.
         for (filename, sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
-            if let Some(other) = seen.get(filename) {
-                assert_eq!(other, sha256, "{filename} is pinned to two digests");
+            if seen.iter().any(|(other, _)| other == filename) {
+                assert!(
+                    seen.contains(&(*filename, *sha256)),
+                    "{filename} is pinned to an unshared Prism digest"
+                );
             }
         }
     }
@@ -27652,6 +29211,8 @@ mod tests {
             "the cooperative streaming job must consume the prompt-prefix cache, \
              not re-prefill the prompt it already has"
         );
+        assert_eq!(job.prepared.timings.prompt_reused_tokens, 2);
+        assert_eq!(job.prepared.timings.prompt_prefilled_tokens, 0);
         assert_eq!(
             job.generated,
             vec![cached_next_token],
@@ -27666,13 +29227,261 @@ mod tests {
     }
 
     #[test]
+    fn cooperative_prefill_matches_the_existing_cpu_chunk_boundaries_exactly() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", "0");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "2");
+        let prompt = [0, 1, 2, 1];
+
+        let mut monolithic = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let expected = monolithic
+            .generate_next_token_with_history_diagnostics(
+                &prompt,
+                LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let mut cooperative = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let chunk_tokens = cooperative
+            .cooperative_prefill_chunk_tokens(prompt.len() - 1)
+            .expect("the CPU chunk path can yield between its existing chunks");
+        assert_eq!(chunk_tokens, 2);
+        for chunk in prompt[..prompt.len() - 1].chunks(chunk_tokens) {
+            cooperative.cooperative_prefill_chunk(chunk).unwrap();
+        }
+        let actual = cooperative
+            .generate_next_token_with_history_diagnostics(
+                &prompt[prompt.len() - 1..],
+                LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(actual.next_token_id, expected.next_token_id);
+        assert_eq!(actual.logits, expected.logits);
+        assert_eq!(actual.hidden_state, expected.hidden_state);
+        assert_eq!(actual.output_norm_state, expected.output_norm_state);
+        assert_eq!(cooperative.kv_position(), monolithic.kv_position());
+
+        std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
+    }
+
+    #[test]
+    fn cooperative_stream_prefill_yields_cancels_and_preserves_the_single_stream_fast_path() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", "0");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "2");
+        let prompt = vec![0, 1, 2, 1];
+
+        let make_job = || {
+            let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+            let mut prepared = prepared_for_cache("tiny", "model-a.gguf", prompt.clone(), session);
+            prepared.max_tokens = 2;
+            prepared.tokenizer = Arc::new(tiny_vocab_tokenizer());
+            let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+            (
+                CooperativeStreamDecodeJob::new(prepared, events_tx).unwrap(),
+                _events_rx,
+            )
+        };
+
+        let (mut contended, _events_rx) = make_job();
+        assert_eq!(
+            contended.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        assert_eq!(contended.prepared.session.kv_position(), 2);
+        assert!(contended.generated.is_empty());
+        assert_eq!(contended.cooperative_prefill.as_ref().unwrap().cursor, 2);
+        assert_eq!(
+            contended.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        assert_eq!(contended.prepared.session.kv_position(), 3);
+        assert!(contended.generated.is_empty());
+        assert_eq!(
+            contended.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        assert_eq!(contended.generated.len(), 1);
+        assert_eq!(
+            contended
+                .prepared
+                .timings
+                .prompt_evaluation
+                .prompt_token_count,
+            prompt.len()
+        );
+        assert_eq!(
+            contended
+                .prepared
+                .timings
+                .prompt_evaluation
+                .prefill_token_count,
+            prompt.len() - 1
+        );
+
+        let (mut cancelled, _events_rx) = make_job();
+        assert_eq!(
+            cancelled.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        cancelled.prepared.cancel.token.cancel();
+        assert_eq!(
+            cancelled.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Complete
+        );
+        assert_eq!(cancelled.prepared.session.kv_position(), 2);
+        assert!(cancelled.generated.is_empty());
+
+        let (mut single, _events_rx) = make_job();
+        assert_eq!(
+            single.step(engine::CooperativeStepContext { active_slots: 1 }),
+            engine::StepOutcome::Continue,
+            "one stream keeps the pre-existing one-step prompt fast path"
+        );
+        assert!(single.cooperative_prefill.is_none());
+        assert_eq!(single.generated.len(), 1);
+
+        std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
+    }
+
+    #[test]
+    fn prompt_prefix_model_eviction_removes_only_that_models_entries() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let pool = Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(8)));
+
+        let weights_a = Arc::new(tiny_weights());
+        let weak_a = Arc::downgrade(&weights_a);
+        let mut session_a =
+            LlamaInferenceSession::new(tiny_config(), Arc::clone(&weights_a)).unwrap();
+        drop(weights_a);
+        let step_a = session_a
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared_a = prepared_for_cache("model-a", "model-a.gguf", vec![1, 2], session_a);
+        prepared_a.cached_prompt_prefix = Arc::clone(&pool);
+        store_prompt_prefix_cache(&mut prepared_a, &step_a);
+
+        let weights_b = Arc::new(tiny_weights());
+        let weak_b = Arc::downgrade(&weights_b);
+        let mut session_b =
+            LlamaInferenceSession::new(tiny_config(), Arc::clone(&weights_b)).unwrap();
+        drop(weights_b);
+        let step_b = session_b
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared_b = prepared_for_cache("model-b", "model-b.gguf", vec![1, 2], session_b);
+        prepared_b.cached_prompt_prefix = Arc::clone(&pool);
+        store_prompt_prefix_cache(&mut prepared_b, &step_b);
+
+        drop(prepared_a);
+        drop(prepared_b);
+        assert!(
+            weak_a.upgrade().is_none() && weak_b.upgrade().is_none(),
+            "exact-F32 block entries must not pin either model's weights"
+        );
+
+        let removed = pool.lock().unwrap().evict_model("model-a");
+        assert_eq!(removed, 1);
+        let guard = pool.lock().unwrap();
+        assert_eq!(guard.entries.len(), 1);
+        assert_eq!(guard.entries[0].cached.model_id, "model-b");
+        drop(guard);
+
+        pool.lock().unwrap().clear();
+        assert!(pool.lock().unwrap().entries.is_empty());
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn weight_evicted_model_rejects_late_prefix_store_until_readmitted() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("evicted", "evicted.gguf", vec![1, 2], session);
+
+        {
+            let mut pool = prepared.cached_prompt_prefix.lock().unwrap();
+            pool.evict_model("evicted");
+            // Active-model transitions clear entries, but must not erase the LRU tombstone
+            // while an already-prepared generation can still arrive late.
+            pool.clear();
+            assert!(!pool.model_is_admitted("evicted"));
+        }
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert!(prepared
+            .cached_prompt_prefix
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
+
+        prepared
+            .cached_prompt_prefix
+            .lock()
+            .unwrap()
+            .admit_model("evicted");
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert_eq!(
+            prepared.cached_prompt_prefix.lock().unwrap().entries.len(),
+            1
+        );
+
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
     fn prompt_prefix_cache_reuses_exact_prompt_and_invalidates_key_changes() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
         std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
         let config = tiny_config();
-        let weights = tiny_weights();
+        let weights = Arc::new(tiny_weights());
         let mut session = LlamaInferenceSession::new(config.clone(), weights).unwrap();
         let step = session
             .generate_next_token_with_history_diagnostics(
@@ -27685,14 +29494,17 @@ mod tests {
             .unwrap();
         let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
 
-        assert!(lookup_prompt_prefix_cache(&prepared).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut prepared).is_none());
         store_prompt_prefix_cache(&mut prepared, &step);
 
-        let match_res = lookup_prompt_prefix_cache(&prepared).expect("exact key cache hit");
-        assert_eq!(match_res.cached.session.kv_cache.position, 2);
+        let match_res = lookup_prompt_prefix_cache(&mut prepared).expect("exact key cache hit");
+        assert_eq!(prepared.timings.prompt_cache_decision, Some("exact_hit"));
+        assert_eq!(prepared.timings.prompt_cache_common_prefix_tokens, 2);
+        assert_eq!(prepared.timings.prompt_cache_divergent_suffix_tokens, 0);
+        assert_eq!(match_res.cached.kv_position, 2);
         assert_eq!(match_res.cached.logits, step.logits);
         assert_eq!(
-            sample_cached_prompt_prefix(&match_res.cached, &[1, 2])
+            sample_cached_prompt_prefix(&match_res.cached, &[1, 2], None)
                 .unwrap()
                 .next_token_id,
             step.next_token_id
@@ -27714,7 +29526,7 @@ mod tests {
         let mut longer = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 0], longer_session);
         longer.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         store_prompt_prefix_cache(&mut longer, &longer_step);
-        let exact = lookup_prompt_prefix_cache(&prepared).expect("exact entry still wins");
+        let exact = lookup_prompt_prefix_cache(&mut prepared).expect("exact entry still wins");
         assert!(exact.is_exact_match);
         assert_eq!(exact.cached.token_ids, vec![1, 2]);
 
@@ -27722,29 +29534,97 @@ mod tests {
             "tiny",
             "model-a.gguf",
             vec![99, 98],
-            match_res.cached.session.clone(),
+            prepared.session.clone(),
         );
         different_prompt.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
-        assert!(lookup_prompt_prefix_cache(&different_prompt).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut different_prompt).is_none());
 
-        let mut different_sampling = prepared_for_cache(
-            "tiny",
-            "model-a.gguf",
-            vec![1, 2],
-            match_res.cached.session.clone(),
-        );
+        let mut different_sampling =
+            prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], prepared.session.clone());
         different_sampling.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         different_sampling.sampling.temperature = 0.7;
-        assert!(lookup_prompt_prefix_cache(&different_sampling).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut different_sampling).is_none());
 
-        let mut different_model = prepared_for_cache(
-            "tiny",
-            "model-b.gguf",
-            vec![1, 2],
-            match_res.cached.session.clone(),
-        );
+        let mut different_model =
+            prepared_for_cache("tiny", "model-b.gguf", vec![1, 2], prepared.session.clone());
         different_model.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
-        assert!(lookup_prompt_prefix_cache(&different_model).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut different_model).is_none());
+    }
+
+    #[test]
+    fn metal_f32_partial_prefix_admission_tracks_measured_break_even() {
+        assert!(metal_f32_partial_prefix_is_profitable(3_062, 23));
+        assert!(!metal_f32_partial_prefix_is_profitable(3_062, 74));
+        assert!(!metal_f32_partial_prefix_is_profitable(3_062, 346));
+        assert!(!metal_f32_partial_prefix_is_profitable(3_062, 0));
+    }
+
+    #[test]
+    fn compact_paging_task_state_receipt_clears_the_metal_f32_gate() {
+        // Exact Qwen3-4B-Q8_0 token counts from the TaskForge objective with
+        // Camelid's six active-work schemas. Agent-loop tests pin the compact
+        // action/focus strings; this pins their relationship to the measured
+        // M4 Metal admission rule without requiring a 4 GiB model in CI.
+        let receipts = [
+            (2_071, 39, 53), // Modify -> pending Verify.
+            (2_074, 31, 66), // Pending Verify -> plain Verify.
+            (2_086, 31, 67), // Missing-source retry.
+        ];
+        for (prefix, suffix, integer_ratio) in receipts {
+            assert_eq!(prefix / suffix, integer_ratio);
+            assert!(metal_f32_partial_prefix_is_profitable(prefix, suffix));
+        }
+    }
+
+    #[test]
+    fn metal_f32_prompt_cache_keeps_exact_hits_but_rejects_large_suffixes() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "2");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+
+        let mut session = LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
+        {
+            let mut pool = prepared.cached_prompt_prefix.lock().unwrap();
+            let cached = Arc::get_mut(&mut pool.entries[0].cached)
+                .expect("the freshly stored entry has one owner");
+            cached.metal_f32_resident_kv = true;
+        }
+
+        let exact = lookup_prompt_prefix_cache(&mut prepared).expect("exact hit remains eligible");
+        assert!(exact.is_exact_match);
+
+        let mut extended = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![0, 1, 2, 0, 1],
+            prepared.session.clone(),
+        );
+        extended.cached_prompt_prefix = Arc::clone(&prepared.cached_prompt_prefix);
+        assert!(
+            lookup_prompt_prefix_cache(&mut extended).is_none(),
+            "a suffix too large for the cached prefix must take cold Metal prefill"
+        );
+        assert_eq!(
+            extended.timings.prompt_cache_decision,
+            Some("rejected_metal_ratio")
+        );
+        assert_eq!(extended.timings.prompt_cache_common_prefix_tokens, 3);
+        assert_eq!(extended.timings.prompt_cache_divergent_suffix_tokens, 2);
+
+        std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
     #[test]
@@ -27777,7 +29657,7 @@ mod tests {
         );
         extended.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
 
-        let hit = lookup_prompt_prefix_cache(&extended).expect("partial prefix cache hit");
+        let hit = lookup_prompt_prefix_cache(&mut extended).expect("partial prefix cache hit");
         assert!(!hit.is_exact_match);
         assert_eq!(hit.prefix_len, 3);
 
@@ -27801,6 +29681,10 @@ mod tests {
         let cold_output = generate_token_ids(cold).expect("cold generation");
         assert_eq!(warm_output.token_ids, cold_output.token_ids);
         assert!(warm_output.timings.prompt_cache_hit);
+        assert_eq!(warm_output.timings.prompt_reused_tokens, 2);
+        assert_eq!(warm_output.timings.prompt_prefilled_tokens, 2);
+        assert_eq!(cold_output.timings.prompt_reused_tokens, 0);
+        assert_eq!(cold_output.timings.prompt_prefilled_tokens, 4);
         assert!(
             warm_output.timings.prompt_evaluation.prefill.forward_total
                 + warm_output
@@ -27860,7 +29744,7 @@ mod tests {
 
         store_prompt_prefix_cache(&mut prep1, &step1);
         store_prompt_prefix_cache(&mut prep2, &step2);
-        assert!(lookup_prompt_prefix_cache(&prep1).is_some());
+        assert!(lookup_prompt_prefix_cache(&mut prep1).is_some());
         {
             let mut pool = pool_ref.lock().unwrap();
             let newest = std::time::Instant::now();
@@ -27891,6 +29775,187 @@ mod tests {
     }
 
     #[test]
+    fn block_indexed_prompt_cache_reports_divergence_and_preserves_parity() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "16");
+        std::env::set_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV, "16");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+
+        let config = tiny_spec_config();
+        let weights = Arc::new(tiny_weights());
+        let prompt: Vec<u32> = (0..32).map(|index| (index % 3) as u32).collect();
+        let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(&weights)).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &prompt,
+                crate::inference::LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+        let mut seeded = prepared_for_cache("tiny", "model-a.gguf", prompt.clone(), session);
+        store_prompt_prefix_cache(&mut seeded, &step);
+
+        let mut request = prompt.clone();
+        request.extend([2, 1]);
+        let mut warm = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            request.clone(),
+            LlamaInferenceSession::new(config.clone(), Arc::clone(&weights)).unwrap(),
+        );
+        warm.max_tokens = 2;
+        warm.cached_prompt_prefix = Arc::clone(&seeded.cached_prompt_prefix);
+        let hit = lookup_prompt_prefix_cache(&mut warm).expect("two matching KV blocks");
+        assert_eq!(hit.prefix_len, 32);
+        assert_eq!(warm.timings.prompt_cache_decision, Some("block_prefix_hit"));
+        assert_eq!(warm.timings.prompt_cache_common_prefix_tokens, 32);
+        assert_eq!(warm.timings.prompt_cache_divergent_suffix_tokens, 2);
+        assert_eq!(warm.timings.prompt_cache_block_tokens, 16);
+        assert_eq!(warm.timings.prompt_cache_matched_blocks, 2);
+
+        let mut warm_for_generation = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            request.clone(),
+            LlamaInferenceSession::new(config.clone(), Arc::clone(&weights)).unwrap(),
+        );
+        warm_for_generation.max_tokens = 2;
+        warm_for_generation.cached_prompt_prefix = Arc::clone(&seeded.cached_prompt_prefix);
+        let mut cold = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            request,
+            LlamaInferenceSession::new(config, Arc::clone(&weights)).unwrap(),
+        );
+        cold.max_tokens = 2;
+        let warm_output = generate_token_ids(warm_for_generation).expect("block-cache generation");
+        let cold_output = generate_token_ids(cold).expect("cold generation");
+        assert_eq!(warm_output.token_ids, cold_output.token_ids);
+        assert_eq!(warm_output.timings.prompt_reused_tokens, 32);
+
+        // Divergence inside the second block restores only the seven matching
+        // rows from that block, not the mismatching tail.
+        let mut mid_block_request = prompt.clone();
+        mid_block_request[23] = (mid_block_request[23] + 1) % 3;
+        let mut mid_block_warm = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            mid_block_request.clone(),
+            LlamaInferenceSession::new(tiny_spec_config(), Arc::clone(&weights)).unwrap(),
+        );
+        mid_block_warm.max_tokens = 2;
+        mid_block_warm.cached_prompt_prefix = Arc::clone(&seeded.cached_prompt_prefix);
+        let mut mid_block_cold = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            mid_block_request,
+            LlamaInferenceSession::new(tiny_spec_config(), Arc::clone(&weights)).unwrap(),
+        );
+        mid_block_cold.max_tokens = 2;
+        let mid_block_output =
+            generate_token_ids(mid_block_warm).expect("partial-block cache generation");
+        let mid_block_control =
+            generate_token_ids(mid_block_cold).expect("partial-block cold generation");
+        assert_eq!(mid_block_output.token_ids, mid_block_control.token_ids);
+        assert_eq!(mid_block_output.timings.prompt_reused_tokens, 23);
+        assert_eq!(mid_block_output.timings.prompt_cache_matched_blocks, 1);
+
+        std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+        std::env::remove_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn block_hash_collision_never_authorizes_kv_reuse() {
+        let block_tokens = 16;
+        let cached_tokens: Vec<u32> = (0..32).map(|index| (index % 3) as u32).collect();
+        let mut different = cached_tokens.clone();
+        different[0] = (different[0] + 1) % 3;
+        let session = LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+        let cached = CachedPromptPrefix {
+            model_id: "tiny".into(),
+            model_path: PathBuf::from("model-a.gguf"),
+            token_ids: cached_tokens,
+            // Deliberately forge the request's hashes. Exact token verification
+            // must still stop at the first position.
+            block_hashes: prompt_token_block_hashes(&different, block_tokens),
+            block_tokens,
+            sampling: SamplingConfig::default(),
+            kv_blocks: Vec::new(),
+            legacy_session: Some(session),
+            kv_position: 32,
+            logits: CpuTensor::from_f32("logits", vec![1, 3], vec![0.0; 3]).unwrap(),
+            hidden_state: CpuTensor::from_f32("hidden", vec![1, 4], vec![0.0; 4]).unwrap(),
+            output_norm_state: CpuTensor::from_f32("norm", vec![1, 4], vec![0.0; 4]).unwrap(),
+            metal_f32_resident_kv: false,
+        };
+        assert_eq!(block_indexed_common_prefix_len(&cached, &different), (0, 0));
+    }
+
+    #[test]
+    fn retained_prefixes_physically_share_identical_kv_blocks() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV, "16");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+
+        let pool = Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(2)));
+        let first_prompt: Vec<u32> = (0..32).map(|index| (index % 3) as u32).collect();
+        let mut second_prompt = first_prompt.clone();
+        second_prompt[20] = (second_prompt[20] + 1) % 3;
+
+        for prompt in [&first_prompt, &second_prompt] {
+            let mut session =
+                LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+            let step = session
+                .generate_next_token_with_history_diagnostics(
+                    prompt,
+                    crate::inference::LlamaSampler::Greedy,
+                    prompt,
+                    false,
+                    None,
+                )
+                .unwrap();
+            let mut prepared =
+                prepared_for_cache("tiny", "model-a.gguf", (*prompt).clone(), session);
+            prepared.cached_prompt_prefix = Arc::clone(&pool);
+            store_prompt_prefix_cache(&mut prepared, &step);
+        }
+
+        let guard = pool.lock().unwrap();
+        assert_eq!(guard.entries.len(), 2);
+        assert_eq!(guard.entries[0].cached.kv_blocks.len(), 2);
+        assert_eq!(guard.entries[1].cached.kv_blocks.len(), 2);
+        assert!(Arc::ptr_eq(
+            &guard.entries[0].cached.kv_blocks[0],
+            &guard.entries[1].cached.kv_blocks[0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &guard.entries[0].cached.kv_blocks[1],
+            &guard.entries[1].cached.kv_blocks[1]
+        ));
+        let naive_bytes: u64 = guard
+            .entries
+            .iter()
+            .flat_map(|entry| entry.cached.kv_blocks.iter())
+            .map(|block| block.allocated_bytes())
+            .sum();
+        let mut seen = HashSet::new();
+        let unique_bytes: u64 = guard
+            .entries
+            .iter()
+            .map(|entry| entry.cached.kv_allocated_bytes(&mut seen))
+            .sum();
+        assert!(unique_bytes < naive_bytes);
+
+        std::env::remove_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
     fn prompt_prefix_cache_defaults_to_one_session_and_rejects_invalid_capacity() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var(PROMPT_PREFIX_CACHE_CAPACITY_ENV);
@@ -27910,6 +29975,75 @@ mod tests {
             );
         }
         std::env::remove_var(PROMPT_PREFIX_CACHE_CAPACITY_ENV);
+    }
+
+    #[test]
+    fn prompt_prefix_cache_reserves_replacement_slot_before_large_clone() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1], session);
+        prepared.cached_prompt_prefix =
+            Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(1)));
+        store_prompt_prefix_cache(&mut prepared, &step);
+
+        let mut pool = prepared.cached_prompt_prefix.lock().unwrap();
+        assert_eq!(pool.entries.len(), 1);
+        pool.reserve_for_insert(
+            "tiny",
+            Path::new("model-a.gguf"),
+            &[0, 2],
+            &SamplingConfig::default(),
+        );
+        assert!(
+            pool.entries.is_empty(),
+            "the old KV entry must be dropped before replacement allocation starts"
+        );
+    }
+
+    #[test]
+    fn disabled_prompt_prefix_cache_releases_entries_and_refuses_new_stores() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1], session);
+        prepared.cached_prompt_prefix =
+            Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(1)));
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert_eq!(
+            prepared.cached_prompt_prefix.lock().unwrap().entries.len(),
+            1
+        );
+
+        prepared.cached_prompt_prefix.lock().unwrap().disable();
+        store_prompt_prefix_cache(&mut prepared, &step);
+        let pool = prepared.cached_prompt_prefix.lock().unwrap();
+        assert_eq!(pool.capacity, 0);
+        assert!(
+            pool.entries.is_empty(),
+            "disabled cache must neither retain the old KV nor clone a replacement"
+        );
+        drop(pool);
+        assert!(lookup_prompt_prefix_cache(&mut prepared).is_none());
+        assert_eq!(prepared.timings.prompt_cache_decision, Some("disabled"));
+        assert_eq!(
+            prepared.timings.prompt_cache_divergent_suffix_tokens,
+            prepared.token_ids.len()
+        );
     }
 
     #[test]
@@ -27936,11 +30070,17 @@ mod tests {
 
     #[test]
     fn constrained_generation_skips_prompt_prefix_cache_lookup() {
-        // B1 regression: the cache key is (model, path, tokens, sampling) -- the
-        // constraint is NOT in the key. On a warm hit the first token would be
-        // sampled from raw cached logits with no mask and the grammar state never
-        // advanced over it, breaking the response_format guarantee on the second
-        // identical request. Constrained requests must not read the cache.
+        // B1, now handled rather than avoided. The cache key is still
+        // (model, path, tokens, sampling) with the constraint deliberately NOT
+        // in it — that is correct, because what is cached is the PROMPT's KV and
+        // its raw logits, neither of which depends on the constraint. Both legs
+        // of the original hazard are closed at the point of use instead:
+        //   * the exact-hit path masks the cached logits before sampling, and
+        //   * it commits the sampled token to the grammar state,
+        // so the second token's mask is computed from a correctly advanced
+        // state. The partial-hit path re-enters the main decode loop, which
+        // already masks and commits every step. Refusing the cache outright cost
+        // a full cold prefill on every constrained request.
         let config = tiny_config();
         let weights = tiny_weights();
         let mut session = LlamaInferenceSession::new(config, weights).unwrap();
@@ -27956,7 +30096,7 @@ mod tests {
         let mut unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
         store_prompt_prefix_cache(&mut unconstrained, &step);
         assert!(
-            lookup_prompt_prefix_cache(&unconstrained).is_some(),
+            lookup_prompt_prefix_cache(&mut unconstrained).is_some(),
             "control: the unconstrained twin hits the warm cache"
         );
 
@@ -27964,25 +30104,24 @@ mod tests {
             "tiny",
             "model-a.gguf",
             vec![1, 2],
-            lookup_prompt_prefix_cache(&unconstrained)
-                .unwrap()
-                .cached
-                .session
-                .clone(),
+            unconstrained.session.clone(),
         );
         constrained.cached_prompt_prefix = unconstrained.cached_prompt_prefix.clone();
         constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
         assert!(
-            lookup_prompt_prefix_cache(&constrained).is_none(),
-            "a constrained request must never read the prompt-prefix cache"
+            lookup_prompt_prefix_cache(&mut constrained).is_some(),
+            "a constrained request must now REUSE the prompt cache; the constraint is \
+             enforced when the cached logits are sampled, not by refusing the hit"
         );
     }
 
     #[test]
     fn constrained_generation_does_not_store_prompt_prefix_cache() {
         // Mirror of the lookup test: skipping both directions keeps the invariant
-        // one sentence -- the prompt-prefix cache never interacts with constrained
-        // decoding.
+        // The stored artifact is constraint-INDEPENDENT: prompt KV plus raw
+        // logits. Storing from a constrained request is therefore safe and
+        // useful, because every reader applies its own constraint at sample
+        // time (or none at all).
         let config = tiny_config();
         let weights = tiny_weights();
         let mut session = LlamaInferenceSession::new(config, weights).unwrap();
@@ -28007,8 +30146,10 @@ mod tests {
         );
         unconstrained.cached_prompt_prefix = constrained.cached_prompt_prefix.clone();
         assert!(
-            lookup_prompt_prefix_cache(&unconstrained).is_none(),
-            "a constrained request must never write the prompt-prefix cache"
+            lookup_prompt_prefix_cache(&mut unconstrained).is_some(),
+            "a constrained request now SEEDS the cache: the stored artifact is the \
+             prompt's KV and its raw, unmasked logits, so an unconstrained twin may \
+             reuse it (and vice versa) — the constraint is applied at sample time"
         );
     }
 
@@ -28039,7 +30180,7 @@ mod tests {
         let mut prepared = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2], session);
         store_prompt_prefix_cache(&mut prepared, &step);
         assert!(
-            lookup_prompt_prefix_cache(&prepared).is_none(),
+            lookup_prompt_prefix_cache(&mut prepared).is_none(),
             "a windowed-attention arch must never populate the prompt-prefix cache"
         );
 
@@ -28058,7 +30199,7 @@ mod tests {
         let mut control = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], control_session);
         store_prompt_prefix_cache(&mut control, &control_step);
         assert!(
-            lookup_prompt_prefix_cache(&control).is_some(),
+            lookup_prompt_prefix_cache(&mut control).is_some(),
             "the control fixture must store — otherwise this test is not \
              exercising the windowed-arch bypass"
         );
@@ -28170,11 +30311,19 @@ mod tests {
                 model_id: warm.model_id.clone(),
                 model_path: warm.model_path.clone(),
                 token_ids: warm.token_ids.clone(),
+                block_hashes: prompt_token_block_hashes(
+                    &warm.token_ids,
+                    DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS,
+                ),
+                block_tokens: DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS,
                 sampling: warm.sampling.clone(),
-                session: warm.session.clone(),
+                kv_blocks: Vec::new(),
+                legacy_session: Some(warm.session.clone()),
+                kv_position: warm.token_ids.len(),
                 logits: step.logits.clone(),
                 hidden_state: step.hidden_state.clone(),
                 output_norm_state: step.output_norm_state.clone(),
+                metal_f32_resident_kv: false,
             });
 
         // A longer prompt sharing the pool: a partial hit (the shared
@@ -30649,6 +32798,10 @@ mod tests {
         token_ids: Vec<u32>,
         session: LlamaInferenceSession,
     ) -> PreparedGeneration {
+        let timings = GenerationTimings {
+            prompt_prefilled_tokens: token_ids.len(),
+            ..GenerationTimings::default()
+        };
         PreparedGeneration {
             _model_file_lease: None,
             model_id: model_id.to_string(),
@@ -30665,7 +32818,7 @@ mod tests {
             collect_dense_diagnostics: false,
             dense_diagnostic_generated_index: None,
             dense_metadata: dummy_dense_metadata(),
-            timings: GenerationTimings::default(),
+            timings,
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(8))),
             metrics: metrics::ServerMetrics::default(),
             engine_progress: engine::EngineHandle::spawn(),
@@ -32849,14 +35002,15 @@ mod default_model_api_tests {
 #[cfg(test)]
 mod runnable_completions_gate_api_tests {
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap},
         sync::OnceLock,
     };
 
     use super::*;
     use crate::gguf::{GgufMetadataValue, GgufTensorDescriptor};
     use crate::tokenizer::{
-        BpePreTokenizer, BpeRegistry, SpecialTokens, TokenizerConfig, TokenizerModel,
+        BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, TokenizerConfig,
+        TokenizerModel,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -33056,6 +35210,118 @@ mod runnable_completions_gate_api_tests {
             chat_template: None,
             specials_index: OnceLock::new(),
         }
+    }
+
+    /// Complete byte vocabulary with no merges: every ASCII byte in the
+    /// rendered Ornith prompt is exactly one token.  That makes the router test
+    /// below an independent exact-count oracle while still exercising the real
+    /// qwen35 pre-tokenizer and runnable prompt tokenization helper.
+    fn qwen35_byte_test_tokenizer() -> Tokenizer {
+        fn byte_char(byte: u8) -> char {
+            let byte = u32::from(byte);
+            if (33..=126).contains(&byte)
+                || (161..=172).contains(&byte)
+                || (174..=255).contains(&byte)
+            {
+                return char::from_u32(byte).unwrap();
+            }
+            let offset = (0..byte)
+                .filter(|candidate| {
+                    !((33..=126).contains(candidate)
+                        || (161..=172).contains(candidate)
+                        || (174..=255).contains(candidate))
+                })
+                .count() as u32;
+            char::from_u32(256 + offset).unwrap()
+        }
+
+        let tokens = (0..=u8::MAX)
+            .map(|byte| Token {
+                id: u32::from(byte),
+                text: byte_char(byte).to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            })
+            .collect::<Vec<_>>();
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::Qwen35,
+            token_to_id: tokens
+                .iter()
+                .map(|token| (token.text.clone(), token.id))
+                .collect(),
+            tokens,
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens {
+                eog: BTreeSet::new(),
+                ..SpecialTokens::default()
+            },
+            config: TokenizerConfig {
+                add_bos: false,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some("ornith-chatml-native".to_string()),
+            specials_index: OnceLock::new(),
+        }
+    }
+
+    fn qwen35_preflight_config() -> LlamaModelConfig {
+        LlamaModelConfig {
+            architecture: "qwen35".to_string(),
+            context_length: 8_192,
+            embedding_length: 4,
+            block_count: 1,
+            feed_forward_length: 6,
+            attention_head_count: 2,
+            attention_head_count_kv: 1,
+            kv_quant: crate::model::KvCacheQuantization::F16,
+            rope_dimension_count: Some(2),
+            rope_freq_base: Some(10_000.0),
+            rope_scaling_type: None,
+            rope_scaling_factor: None,
+            rope_scaling_original_context_length: None,
+            rope_scaling_low_freq_factor: None,
+            rope_scaling_high_freq_factor: None,
+            rms_norm_epsilon: 1e-6,
+            vocab_size: Some(256),
+            file_type: Some(0),
+            rope_neox_pairing: false,
+            no_rope_layer_step: None,
+            attention_key_length: None,
+            logit_scale: None,
+            moe: None,
+            gemma3: None,
+            gemma4: None,
+            qwen35: None,
+            lfm2: None,
+            mla: None,
+        }
+    }
+
+    async fn state_with_exact_tool_capable_ornith_preflight() -> AppState {
+        const FILENAME: &str = "ornith-1.0-9b-Q8_0.gguf";
+        let state = state_with_loaded_arch("qwen35").await;
+        let tokenizer = Arc::new(qwen35_byte_test_tokenizer());
+        let mut loaded = state.loaded_models.write().await;
+        let model = loaded
+            .get_mut("gate-test")
+            .expect("synthetic qwen35 row is loaded");
+        model.path = PathBuf::from(FILENAME);
+        model.llama_config = Some(qwen35_preflight_config());
+        model.tokenizer = TokenizerLoadState::Available(tokenizer_summary(&tokenizer));
+        model.tokenizer_runtime = Some(tokenizer);
+        model.lane.gguf_filename = FILENAME.to_string();
+        model.lane.gguf_sha256 = supported_artifact_expected_sha256(FILENAME)
+            .expect("Ornith Q8 exact row is hash-pinned")
+            .to_string();
+        model.lane.quantization = "Q8_0".to_string();
+        drop(loaded);
+        state
     }
 
     async fn state_with_loaded_qwen3_moe_template(template: Option<&str>) -> AppState {
@@ -33710,6 +35976,122 @@ mod runnable_completions_gate_api_tests {
         let (status, body) =
             post_json(app, "/api/generation/preflight", json!({ "prompt": "hi" })).await;
         assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn ornith_workspace_preflight_counts_exact_tool_prompt_and_enforces_budget() {
+        let state = state_with_exact_tool_capable_ornith_preflight().await;
+        {
+            let loaded = state.loaded_models.read().await;
+            let model = loaded.get("gate-test").unwrap();
+            assert_eq!(classify_loaded_model(model), ModelLaneClass::Supported);
+            let row = capabilities_response()
+                .model_compatibility
+                .into_iter()
+                .find(|row| row.id == "Ornith 1.0 9B")
+                .expect("exact Ornith Q8 compatibility row");
+            assert!(row.tool_capable, "precondition: Workspace-earned row");
+        }
+
+        let app = router_with_state(state.clone());
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one workspace file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        });
+        let request = json!({
+            "model": "gate-test",
+            "messages": [
+                {"role": "system", "content": "Use workspace tools."},
+                {"role": "user", "content": "Read notes.txt"}
+            ],
+            "tools": [tool],
+            "stream": true,
+            "max_tokens": 32
+        });
+
+        let (status, body) =
+            post_json(app.clone(), "/api/generation/preflight", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "validated");
+        assert_eq!(body["dense_session_ready"], false);
+        assert_eq!(body["max_tokens"], 32);
+        assert!(
+            body.get("camelid").is_none(),
+            "runnable preflight must not fabricate dense cache diagnostics: {body}"
+        );
+
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "Use workspace tools.".to_string(),
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Read notes.txt".to_string(),
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+            },
+        ];
+        let flat_tool = request["tools"][0]["function"].clone();
+        let rendered = render_ornith_chatml_prompt_with_tools(&messages, &[flat_tool], false, None);
+        let prompt_tokens = body["prompt_token_count"].as_u64().unwrap() as u32;
+        assert_eq!(
+            prompt_tokens as usize,
+            rendered.len(),
+            "the byte-vocab fixture makes rendered bytes the independent exact-token oracle"
+        );
+
+        let mut within = request.clone();
+        within["camelid_context_budget_tokens"] = json!(prompt_tokens + 32);
+        let (status, body) = post_json(app.clone(), "/api/generation/preflight", within).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["prompt_token_count"], prompt_tokens);
+
+        let mut over = request;
+        over["camelid_context_budget_tokens"] = json!(prompt_tokens + 31);
+        let (status, body) = post_json(app, "/api/generation/preflight", over).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "context_budget_exceeded");
+        assert_eq!(body["error"]["param"], "camelid_context_budget_tokens");
+
+        // The served runnable handlers call this guard after preparing the
+        // exact same token ids and before prefill. Pin that integration seam so
+        // a future route refactor cannot leave preflight safe while live
+        // Workspace generation silently exceeds its frozen session budget.
+        let live_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gate-test",
+            "messages": [{"role": "user", "content": "Read notes.txt"}],
+            "max_tokens": 32,
+            "camelid_context_budget_tokens": prompt_tokens + 31
+        }))
+        .unwrap();
+        let live_prepared = RunnablePreparedPrompt::Text(vec![0; prompt_tokens as usize]);
+        let response = match runnable_max_tokens_for_prepared(
+            &state,
+            "gate-test",
+            &live_prepared,
+            &live_request,
+        )
+        .await
+        {
+            Ok(_) => panic!("live runnable generation must enforce the Workspace budget"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "context_budget_exceeded");
     }
 
     #[tokio::test]
@@ -34711,6 +37093,14 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
         "ornith_1_0_9b_q4_k_m",
         "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f",
     ),
+    // Public HuggingFace imatrix quant under the same filename. This is a
+    // genuinely different artifact from the in-house requant above; its own
+    // resident-Metal agent battery earns this second digest admission.
+    (
+        "ornith-1.0-9b-Q4_K_M.gguf",
+        "ornith_1_0_9b_q4_k_m",
+        "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106",
+    ),
     (
         "ornith-1.0-9b-Q3_K_M.gguf",
         "ornith_1_0_9b_q3_k_m",
@@ -34980,8 +37370,17 @@ fn supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
 /// callers must therefore ask `supported_artifact_expected_sha256` first if they
 /// need to distinguish "wrong bytes" from "not hash-pinned".
 fn supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
-    supported_artifact_expected_sha256(filename)
-        .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
+    prism_supported_artifact_identity_matches(filename, gguf_sha256)
+        || NON_CATALOG_SUPPORTED_ARTIFACTS
+            .iter()
+            .any(|(artifact, _, sha256)| {
+                *artifact == filename && gguf_sha256.eq_ignore_ascii_case(sha256)
+            })
+        || CURATED_SUPPORTED_ARTIFACT_SHA256
+            .iter()
+            .any(|(artifact, sha256)| {
+                *artifact == filename && gguf_sha256.eq_ignore_ascii_case(sha256)
+            })
 }
 
 /// True when `filename` is the exact GGUF artifact of a curated row whose
@@ -35257,12 +37656,15 @@ fn classify_loaded_model_identity(
     gguf_sha256: &str,
 ) -> ModelLaneClass {
     let class = classify_model_lane(architecture, filename);
-    let expected_sha256 = supported_artifact_expected_sha256(filename)
-        .or_else(|| phase2_curated_artifact_expected_sha256(filename));
+    let artifact_is_pinned = supported_artifact_expected_sha256(filename).is_some()
+        || phase2_curated_artifact_expected_sha256(filename).is_some();
     if matches!(
         class,
         ModelLaneClass::Supported | ModelLaneClass::RunnableWithVariance
-    ) && expected_sha256.is_some_and(|expected| !gguf_sha256.eq_ignore_ascii_case(expected))
+    ) && artifact_is_pinned
+        && !supported_artifact_identity_matches(filename, gguf_sha256)
+        && !phase2_curated_artifact_expected_sha256(filename)
+            .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
     {
         ModelLaneClass::ExperimentalImplemented
     } else {

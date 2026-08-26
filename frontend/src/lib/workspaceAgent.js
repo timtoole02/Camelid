@@ -1,5 +1,42 @@
 const MAX_WORKSPACE_ACTIVITY_EVENTS = 240
 
+/// Rows kept for the inspector's model-step table. The aggregate lives in
+/// `runTotals`, which is a counter, so capping rows never changes the total.
+const MAX_MODEL_STEP_ROWS = 60
+/// Plan steps are model-authored and nothing bounds how many lines
+/// `update_plan` can emit, so the list is capped before it reaches a render.
+const MAX_PLAN_STEPS = 120
+const PLAN_STEP_LINE = /^\[([x~ ])\]\s+(.+)$/
+const MODEL_TIMING_ACTIVITY_FIELDS = [
+  'total_model_ms',
+  'ttft_ms',
+  'prefill_ms',
+  'server_first_content_ms',
+  'decode_ms',
+  'prompt_cache_hit',
+  'reused_tokens',
+  'prefilled_tokens',
+  'prompt_cache_decision',
+  'common_prefix_tokens',
+  'divergent_suffix_tokens',
+  'candidate_tokens',
+  'cache_block_tokens',
+  'matched_cache_blocks',
+]
+
+/// The only structured plan the agent publishes. Exported so the transcript
+/// card and the inspector's Plan group read one parse, not two that can drift.
+export function parsePlanSteps(content) {
+  const steps = []
+  for (const line of String(content || '').split(/\r?\n/)) {
+    const match = PLAN_STEP_LINE.exec(line.trim())
+    if (!match) continue
+    steps.push({ status: match[1] === 'x' ? 'done' : match[1] === '~' ? 'active' : 'pending', text: match[2] })
+    if (steps.length >= MAX_PLAN_STEPS) break
+  }
+  return steps
+}
+
 export const WORKSPACE_IDLE_STATE = Object.freeze({
   phase: 'idle',
   events: [],
@@ -27,6 +64,27 @@ export const WORKSPACE_IDLE_STATE = Object.freeze({
   latestResult: null,
   liveActivity: null,
   agents: [],
+  // Monotonic run totals. Accumulated HERE rather than recomputed by scanning
+  // `events`, for the same reason `liveTurns` is: that array is a ring capped
+  // at MAX_WORKSPACE_ACTIVITY_EVENTS, so a long turn evicts its oldest
+  // `model.timing` and `tool.result` entries and any re-scan silently
+  // UNDERCOUNTS. A sidebar readout that drifts downward as a run gets longer
+  // is worse than no readout.
+  runTotals: Object.freeze({ steps: 0, outputTokens: 0, elapsedMs: 0, tools: 0, toolFailures: 0 }),
+  // Latest `memory.updated` snapshot: the live context-budget position and its
+  // composition. Replaced wholesale, never appended to — this is the current
+  // state of the window, not a history of it.
+  context: null,
+  // The last `update_plan` result, already parsed. Held here because the event
+  // that carried it is among the first the 240-entry ring evicts.
+  planSteps: [],
+  // One row per completed model step, capped at MAX_MODEL_STEP_ROWS.
+  modelSteps: [],
+  // Client-observed first/last sighting per agent id. Deliberately NOT stored
+  // on the agent objects: `activity.snapshot` replaces `agents` wholesale about
+  // once a second with the six server fields, so anything derived onto an agent
+  // is wiped every poll. The server reports no per-agent clock at all.
+  agentSeen: {},
 })
 
 function appendActivity(events, event) {
@@ -56,11 +114,20 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       liveTurns: 0,
       liveActivity: null,
       agents: [],
+      planSteps: [],
+      modelSteps: [],
+      agentSeen: {},
       error: '',
     }
   }
   if (event === 'session.starting' || event === 'turn.starting') {
     const task = String(envelope.task || '')
+    const main = { id: 'main', parent_id: null, label: 'Camelid', status: 'starting', task, detail: 'Preparing the coding session' }
+    // A follow-up turn KEEPS the agents earlier turns finished — the panel
+    // groups them under Finished, and wiping the list every turn made that
+    // group unreachable in the common case. A new session starts empty.
+    const carried = event === 'turn.starting' ? (state.agents || []).filter((agent) => agent.id !== 'main') : []
+    const agents = [main, ...carried]
     const activity = {
       phase: 'starting',
       stage: 'starting',
@@ -68,9 +135,19 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       task,
       started_at_ms: Date.now(),
       updated_at_ms: Date.now(),
-      agents: [{ id: 'main', parent_id: null, label: 'Camelid', status: 'starting', task, detail: 'Preparing the coding session' }],
+      agents,
     }
-    return { ...state, phase: 'starting', error: '', approval: null, liveActivity: activity, agents: activity.agents }
+    return {
+      ...state,
+      phase: 'starting',
+      error: '',
+      approval: null,
+      liveActivity: activity,
+      agents,
+      // The plan belongs to the turn that published it.
+      planSteps: [],
+      agentSeen: event === 'turn.starting' ? (state.agentSeen || {}) : {},
+    }
   }
   if (event === 'turn.stopping') {
     const liveActivity = state.liveActivity
@@ -86,15 +163,43 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
     return { ...state, phase: 'cancel_error', liveActivity, error: message }
   }
   if (event === 'activity.snapshot') {
-    const activity = envelope.activity || null
+    const snapshot = envelope.activity || null
+    // The durable activity endpoint intentionally carries a smaller timing
+    // summary than the live SSE event. Preserve fields that belong to the last
+    // completed model step when a poll for that same activity arrives, or the
+    // richer diagnostics blink out of the inspector one second after receipt.
+    const activity = snapshot ? { ...snapshot } : null
     if (!activity) return state
+    for (const field of MODEL_TIMING_ACTIVITY_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(activity, field) && state.liveActivity?.[field] != null) {
+        activity[field] = state.liveActivity[field]
+      }
+    }
     if (state.liveActivity?.updated_at_ms === activity.updated_at_ms
       && state.liveActivity?.phase === activity.phase) return state
+    const snapshotAgents = Array.isArray(activity.agents) ? activity.agents : state.agents
+    // The poll fires every second and `updated_at_ms` moves on every applied
+    // event, so the early return above never holds during a run. Reusing the
+    // previous array when nothing the panel shows has changed is what lets the
+    // memoized inspector skip that re-render.
+    const sameAgents = snapshotAgents.length === state.agents.length
+      && snapshotAgents.every((agent, index) => {
+        const previous = state.agents[index]
+        return previous && agent.id === previous.id && agent.status === previous.status
+          && agent.label === previous.label && agent.task === previous.task && agent.detail === previous.detail
+      })
+    let agentSeen = state.agentSeen || {}
+    const seenAt = Date.now()
+    for (const agent of snapshotAgents) {
+      const id = String(agent?.id || '')
+      if (id && !agentSeen[id]) agentSeen = { ...agentSeen, [id]: { firstSeenAt: seenAt, lastSeenAt: seenAt } }
+    }
     return {
       ...state,
       phase: String(activity.phase || state.phase || 'idle'),
       liveActivity: activity,
-      agents: Array.isArray(activity.agents) ? activity.agents : state.agents,
+      agents: sameAgents ? state.agents : snapshotAgents,
+      agentSeen,
       error: activity.phase === 'error' ? String(activity.detail || 'Workspace stopped.') : state.error,
     }
   }
@@ -176,7 +281,17 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
     return { ...appended, phase: 'running', approval: null, error: '' }
   }
   if (event === 'tool.result') {
-    return { ...appended, phase: state.phase === 'cancel_error' ? state.phase : 'running', approval: null }
+    const plan = envelope.tool === 'update_plan' && envelope.outcome !== 'error'
+      ? parsePlanSteps(envelope.content)
+      : null
+    return {
+      ...appended,
+      phase: state.phase === 'cancel_error' ? state.phase : 'running',
+      approval: null,
+      // Only replace on a parse that produced steps: a plan the agent wrote as
+      // free prose must not wipe the last good one.
+      planSteps: plan && plan.length ? plan : state.planSteps,
+    }
   }
   if (event === 'agent.updated') {
     const incoming = {
@@ -192,7 +307,13 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       || (agent.parent_id && incoming.parent_id && agent.label === incoming.label))
     if (index === -1) agents.push(incoming)
     else agents[index] = { ...agents[index], ...incoming, task: incoming.task || agents[index].task }
-    return { ...appended, agents }
+    const seenAt = Date.now()
+    const seen = (state.agentSeen || {})[incoming.id]
+    return {
+      ...appended,
+      agents,
+      agentSeen: { ...(state.agentSeen || {}), [incoming.id]: { firstSeenAt: seen?.firstSeenAt ?? seenAt, lastSeenAt: seenAt } },
+    }
   }
   if (event === 'session.finished') {
     if (envelope.outcome !== 'answered' && turns.length) {
@@ -238,7 +359,170 @@ function withDerived(previous, next, envelope) {
     derived.latestTool = null
     derived.latestResult = null
   }
+
+  // ---- Monotonic totals (see `runTotals` in WORKSPACE_IDLE_STATE) ----
+  // A restore replaces the event list wholesale, so its totals restart too;
+  // anything else only ever adds.
+  if (event === 'thread.restored') {
+    derived.runTotals = WORKSPACE_IDLE_STATE.runTotals
+    derived.context = null
+    derived.modelSteps = []
+  } else if (event === 'model.timing') {
+    const base = previous.runTotals || WORKSPACE_IDLE_STATE.runTotals
+    const timing = modelTimingStep(envelope)
+    derived.runTotals = {
+      ...base,
+      steps: base.steps + 1,
+      outputTokens: base.outputTokens + numeric(envelope.output_tokens),
+      elapsedMs: base.elapsedMs + numeric(envelope.total_ms),
+    }
+    derived.modelSteps = [...(previous.modelSteps || []), {
+      index: base.steps + 1,
+      ...timing,
+    }].slice(-MAX_MODEL_STEP_ROWS)
+  } else if (event === 'tool.result') {
+    const base = previous.runTotals || WORKSPACE_IDLE_STATE.runTotals
+    derived.runTotals = {
+      ...base,
+      tools: base.tools + 1,
+      toolFailures: base.toolFailures + (envelope.outcome === 'error' ? 1 : 0),
+    }
+  } else if (event === 'memory.updated') {
+    derived.context = {
+      promptTokens: numeric(envelope.prompt_tokens),
+      generationTokens: numeric(envelope.generation_tokens),
+      budgetTotal: numeric(envelope.budget_total),
+      // Composition, in the order the window is actually assembled.
+      parts: [
+        { key: 'system', label: 'System', tokens: numeric(envelope.system_tokens_estimate) },
+        { key: 'tools', label: 'Tool schemas', tokens: numeric(envelope.tool_definition_tokens_estimate) },
+        { key: 'messages', label: 'Messages', tokens: numeric(envelope.message_tokens_estimate) },
+        { key: 'recent', label: 'Recent memory', tokens: numeric(envelope.recent_memory_tokens_estimate) },
+        { key: 'retrieved', label: 'Retrieved memory', tokens: numeric(envelope.retrieved_memory_tokens_estimate) },
+        { key: 'evidence', label: 'Evidence', tokens: numeric(envelope.evidence_memory_tokens_estimate) },
+        { key: 'results', label: 'Tool results', tokens: numeric(envelope.tool_result_tokens_estimate) },
+      ],
+    }
+  }
   return derived
+}
+
+/** Event payloads are JSON off the wire; a missing or malformed field must
+ *  contribute zero to a running total rather than poison it with NaN. */
+function numeric(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function finiteMetric(value) {
+  return Number.isFinite(value) ? value : null
+}
+
+function booleanMetric(value) {
+  return typeof value === 'boolean' ? value : null
+}
+
+function modelTimingStep(envelope) {
+  return {
+    totalMs: finiteMetric(envelope.total_ms),
+    ttftMs: finiteMetric(envelope.ttft_ms),
+    outputTokens: finiteMetric(envelope.output_tokens),
+    prefillMs: finiteMetric(envelope.prefill_ms),
+    serverFirstContentMs: finiteMetric(envelope.server_first_content_ms ?? envelope.first_token_ms),
+    decodeMs: finiteMetric(envelope.decode_ms),
+    promptCacheHit: booleanMetric(envelope.prompt_cache_hit),
+    reusedTokens: finiteMetric(envelope.reused_tokens),
+    prefilledTokens: finiteMetric(envelope.prefilled_tokens),
+    promptCacheDecision: typeof envelope.prompt_cache_decision === 'string'
+      ? envelope.prompt_cache_decision
+      : null,
+    commonPrefixTokens: finiteMetric(envelope.common_prefix_tokens),
+    divergentSuffixTokens: finiteMetric(envelope.divergent_suffix_tokens),
+    candidateTokens: finiteMetric(envelope.candidate_tokens),
+    cacheBlockTokens: finiteMetric(envelope.cache_block_tokens),
+    matchedCacheBlocks: finiteMetric(envelope.matched_cache_blocks),
+  }
+}
+
+function positiveTokenCount(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null
+}
+
+function nonNegativeTokenCount(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : null
+}
+
+/** Normalize the adaptive-window response while keeping older backends useful.
+ * Older sessions have no `context_window`, but their memory event still carries
+ * the effective prompt budget, so the UI can show that instead of disappearing.
+ */
+export function normalizeContextWindow(selection, fallbackBudget = 0) {
+  const source = selection && typeof selection === 'object' && !Array.isArray(selection)
+    ? selection
+    : null
+  const readTokens = (snakeCase, camelCase) => positiveTokenCount(source?.[snakeCase] ?? source?.[camelCase])
+  const effectiveTokens = readTokens('effective_tokens', 'effectiveTokens') || positiveTokenCount(fallbackBudget)
+  if (!effectiveTokens) return null
+
+  const rawMode = String(source?.mode || 'auto').trim().toLowerCase()
+  const rawLimit = source?.limiting_factor ?? source?.limitingFactor
+  return {
+    mode: rawMode === 'fixed' || rawMode === 'manual' ? 'fixed' : 'auto',
+    effectiveTokens,
+    recommendedMaxTokens: readTokens('recommended_max_tokens', 'recommendedMaxTokens'),
+    memorySafeMaxTokens: nonNegativeTokenCount(source?.memory_safe_max_tokens ?? source?.memorySafeMaxTokens),
+    modelMaxTokens: readTokens('model_max_tokens', 'modelMaxTokens'),
+    validatedMaxTokens: readTokens('validated_max_tokens', 'validatedMaxTokens'),
+    kvOwnerSlots: readTokens('kv_owner_slots', 'kvOwnerSlots'),
+    availableMemoryBytes: readTokens('available_memory_bytes', 'availableMemoryBytes'),
+    kvBytesPerToken: readTokens('kv_bytes_per_token', 'kvBytesPerToken'),
+    residentCapacityTokens: readTokens('resident_capacity_tokens', 'residentCapacityTokens'),
+    configuredMaxTokens: readTokens('configured_max_tokens', 'configuredMaxTokens'),
+    pagedTargetTokens: readTokens('paged_target_tokens', 'pagedTargetTokens'),
+    pagedWorkingSetTokens: readTokens('paged_working_set_tokens', 'pagedWorkingSetTokens'),
+    limitingFactor: typeof rawLimit === 'string' && rawLimit.trim() ? rawLimit.trim() : null,
+  }
+}
+
+/** Render context sizes in binary K/M units so capacities such as 12,288 and
+ * 16,384 tokens become the familiar 12K and 16K model-window labels.
+ */
+export function formatContextTokens(value) {
+  const tokens = nonNegativeTokenCount(value)
+  if (tokens == null) return '—'
+  if (tokens === 0) return '0'
+  if (tokens < 1024) return tokens.toLocaleString()
+  const unit = tokens >= 1024 * 1024 ? 1024 * 1024 : 1024
+  const suffix = unit === 1024 ? 'K' : 'M'
+  const scaled = tokens / unit
+  const rounded = Number(scaled.toFixed(1))
+  return `${rounded}${suffix}`
+}
+
+export function contextWindowModeLabel(selection) {
+  return selection?.mode === 'fixed' ? 'Fixed' : 'Auto'
+}
+
+export function contextLimitingFactorLabel(value) {
+  const factor = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!factor) return ''
+  const known = {
+    available_memory: 'Available memory',
+    configured_maximum: 'Configured maximum',
+    validated_agent_maximum: 'Validated agent maximum',
+    model_maximum: 'Model maximum',
+    server_context_maximum: 'Server context maximum',
+    minimum_operational_envelope: 'Minimum operational envelope',
+    operational_ceiling: 'Operational ceiling',
+    unknown_telemetry_fallback: 'Telemetry fallback',
+    paged_model_target: 'Qwen 4B paged target',
+  }
+  if (known[factor]) return known[factor]
+  return factor.split('_').filter(Boolean).map((word, index) => (
+    index === 0 ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : word
+  )).join(' ')
 }
 
 export function reduceWorkspaceEvent(state, envelope) {
@@ -284,11 +568,37 @@ function advanceLiveActivity(current, envelope) {
   } else if (event === 'model.delta') {
     Object.assign(next, { phase: 'running', stage: 'generating', detail: 'The model is generating its next action', current_tool: null })
   } else if (event === 'model.timing') {
+    const timing = modelTimingStep(envelope)
+    const stepDetail = []
+    if (Number.isFinite(timing.ttftMs)) stepDetail.push(`${Math.round(timing.ttftMs)}ms TTFT`)
+    if (Number.isFinite(timing.serverFirstContentMs)) {
+      stepDetail.push(`${Math.round(timing.serverFirstContentMs)}ms server first content`)
+    }
+    if (Number.isFinite(timing.prefillMs)) stepDetail.push(`${Math.round(timing.prefillMs)}ms prefill`)
+    if (timing.promptCacheHit === true) stepDetail.push('prompt-cache hit')
+    if (timing.promptCacheHit === false) stepDetail.push('prompt-cache miss')
+    if (Number.isFinite(timing.reusedTokens) && timing.reusedTokens > 0) {
+      stepDetail.push(`${timing.reusedTokens.toLocaleString()} prompt tokens reused`)
+    }
     Object.assign(next, {
-      output_tokens: Number.isFinite(envelope.output_tokens) ? envelope.output_tokens : next.output_tokens,
-      detail: Number.isFinite(envelope.output_tokens)
-        ? `The model finished a ${envelope.output_tokens}-token generation step`
-        : 'The model finished a generation step',
+      total_model_ms: timing.totalMs,
+      ttft_ms: timing.ttftMs,
+      output_tokens: timing.outputTokens,
+      prefill_ms: timing.prefillMs,
+      server_first_content_ms: timing.serverFirstContentMs,
+      decode_ms: timing.decodeMs,
+      prompt_cache_hit: timing.promptCacheHit,
+      reused_tokens: timing.reusedTokens,
+      prefilled_tokens: timing.prefilledTokens,
+      prompt_cache_decision: timing.promptCacheDecision,
+      common_prefix_tokens: timing.commonPrefixTokens,
+      divergent_suffix_tokens: timing.divergentSuffixTokens,
+      candidate_tokens: timing.candidateTokens,
+      cache_block_tokens: timing.cacheBlockTokens,
+      matched_cache_blocks: timing.matchedCacheBlocks,
+      detail: `${Number.isFinite(timing.outputTokens)
+        ? `The model finished a ${timing.outputTokens}-token generation step`
+        : 'The model finished a generation step'}${stepDetail.length ? ` · ${stepDetail.join(' · ')}` : ''}`,
     })
   } else if (event === 'model.answer') {
     Object.assign(next, { phase: 'running', stage: 'finishing', detail: 'Reviewing and saving the final answer', current_tool: null })
@@ -366,6 +676,25 @@ export async function getRecentCodeThreads(apiBase, { signal } = {}) {
   if (!response.ok) throw new Error(await readError(response, `Coding history failed (${response.status}).`))
   const payload = await response.json()
   return Array.isArray(payload?.threads) ? payload.threads : []
+}
+
+/// Delete one saved coding session. The server refuses to delete the thread of a
+/// session that is still running (it returns a 409 naming the live turn), so the
+/// message it sends back is surfaced rather than replaced with a generic one.
+export async function deleteCodeThread(apiBase, threadId, workspace) {
+  const base = String(apiBase || '').replace(/\/$/, '')
+  // `workspace` is REQUIRED by the endpoint, which cross-checks it against the
+  // thread's stored canonical_root and rejects the request outright without it
+  // ("missing field `workspace`"). Pass the thread's own root.
+  const query = new URLSearchParams({ workspace: String(workspace || ''), mode: 'code' })
+  const response = await fetch(
+    `${base}/api/agent/workspace/threads/${encodeURIComponent(threadId)}?${query}`,
+    { method: 'DELETE' },
+  )
+  if (!response.ok) {
+    throw new Error(await readError(response, `Coding session could not be deleted (${response.status}).`))
+  }
+  return true
 }
 
 export async function getWorkspaceThread(apiBase, workspace, threadId, { signal } = {}) {
