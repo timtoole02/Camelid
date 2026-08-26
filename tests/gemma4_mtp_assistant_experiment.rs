@@ -3156,11 +3156,13 @@ enum MonitorEvent {
 
 #[derive(Clone)]
 struct ExperimentControl {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     abort: Arc<AtomicBool>,
     events: mpsc::Sender<MonitorEvent>,
 }
 
 impl ExperimentControl {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn should_abort(&self) -> bool {
         self.abort.load(Ordering::Acquire)
     }
@@ -3180,6 +3182,7 @@ struct MonitorGuard {
 }
 
 impl MonitorGuard {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn start(baseline: MemorySnapshot) -> Self {
         let (sender, receiver) = mpsc::channel();
         let abort = Arc::new(AtomicBool::new(false));
@@ -3250,10 +3253,12 @@ impl MonitorGuard {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn control(&self) -> ExperimentControl {
         self.control.clone()
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn finish(mut self) -> MonitorResults {
         let _ = self.control.events.send(MonitorEvent::Stop);
         if let Some(join) = self.join.take() {
@@ -3277,6 +3282,7 @@ impl Drop for MonitorGuard {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn record_kill(abort: &AtomicBool, results: &Mutex<MonitorResults>, reason: KillReason) {
     abort.store(true, Ordering::Release);
     if let Ok(mut results) = results.lock() {
@@ -3284,6 +3290,7 @@ fn record_kill(abort: &AtomicBool, results: &Mutex<MonitorResults>, reason: Kill
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
