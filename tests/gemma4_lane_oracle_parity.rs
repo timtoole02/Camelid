@@ -5,12 +5,9 @@
 //! is uniformly wrong. This test pins the three lanes against each other and
 //! prints token ids for an external llama.cpp comparison:
 //!
-//!   1. HEAD lane greedy    — `step()`, the lane the oracle parity was
-//!     established on (see the K=1 HEAD lane work).
-//!   2. chained lane greedy — `step_chunk(&[tok])`, the lane the K>1 verifier
-//!     uses and therefore the lane speculative decode falls back to for
-//!     draft-less rounds.
-//!   3. speculative         — `spec_decode_generate`.
+//! 1. HEAD lane greedy — `step()`, the lane the oracle parity was established on.
+//! 2. Chained lane greedy — `step_chunk(&[tok])`, the K>1 verifier and fallback lane.
+//! 3. Speculative — `spec_decode_generate`.
 //!
 //! Each lane is also compared against llama.cpp's greedy token ids, captured
 //! from `llama-server` on the FULL GGUF (CPU graph, temp 0 / top_k 1) and
