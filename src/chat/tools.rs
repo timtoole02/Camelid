@@ -6175,7 +6175,7 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(out.text().contains("bytes omitted"), "{}", out.text());
     }
 
     #[cfg(windows)]
@@ -6254,7 +6254,7 @@ mod tests {
             "should complete, not time out: {}",
             out.text()
         );
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(out.text().contains("bytes omitted"), "{}", out.text());
     }
 
     #[cfg(windows)]
