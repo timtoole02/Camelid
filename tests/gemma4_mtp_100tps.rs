@@ -41,6 +41,16 @@ fn test_gemma4_mtp_100_tokens_per_second_with_bit_exact_parity() {
                 .join("gemma4-26b-a4b-mtp-qat-assistant/model.safetensors")
         });
 
+    if !model_path.is_file() || !cghost_path.is_file() || !assistant_path.is_file() {
+        eprintln!(
+            "SKIP MTP 100 tok/s benchmark: required artifacts not found at {} / {} / {}",
+            model_path.display(),
+            cghost_path.display(),
+            assistant_path.display()
+        );
+        return;
+    }
+
     std::env::set_var("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL", "1");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL_SLOTS", "1");

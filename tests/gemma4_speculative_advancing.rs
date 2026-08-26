@@ -34,6 +34,15 @@ fn test_gemma4_26b_speculative_advancing() {
             }
         });
 
+    if !model_path.is_file() || !cghost_path.is_file() {
+        eprintln!(
+            "SKIP speculative advancing benchmark: model pair not found at {} / {}",
+            model_path.display(),
+            cghost_path.display()
+        );
+        return;
+    }
+
     std::env::set_var("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL", "1");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL_SLOTS", "1");
