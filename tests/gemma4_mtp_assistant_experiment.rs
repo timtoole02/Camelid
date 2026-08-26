@@ -62,7 +62,9 @@ const CHILD_TIMEOUT_SECS_ENV: &str = "CAMELID_GEMMA4_MTP_CHILD_TIMEOUT_SECS";
 const NATIVE_ADMISSION_EVIDENCE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSION_EVIDENCE_JSON";
 const NATIVE_ADMISSION_RUN_NONCE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSION_RUN_NONCE";
 const NATIVE_ADMISSION_TEST_EXE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSION_TEST_EXE";
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_PROBE_ENABLE_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_PROBE";
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_PROBE_REPORT_PATH_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_REPORT_PATH";
 const HYBRID_RESIDENCY_PROFILE_SELECTOR_ENV: &str = "CAMELID_HYBRID_RESIDENCY_PROFILE";
 const HYBRID_RESIDENCY_PROFILE_V5: &str = "v5-k8-max-960";
@@ -200,8 +202,10 @@ const NO_GAIN_WALL_RATIO_LIMIT: f64 = 1.05;
 // traffic is ZERO. The old 32-token budget measured only the cold-start window, so the whole
 // 93.8 MB/token figure was warmup amortized over too few tokens. Generate past saturation.
 const PILOT_TOKENS: u64 = 256;
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_REPORT_SCHEMA_VERSION: u32 = 4;
 const LOAD_ONLY_MIN_RECLAIMABLE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_SOAK_SECONDS: u64 = 30;
 
 fn pilot_only_from(value: Option<&str>) -> Result<bool, String> {
@@ -394,15 +398,14 @@ fn canonical_internal_timed_file(path: &Path, label: &str) -> Result<PathBuf, St
                 canonical.display()
             ));
         }
+        Ok(canonical)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = label;
-        return Err("the internal-only MTP experiment is scoped to macOS".into());
+        Err("the internal-only MTP experiment is scoped to macOS".into())
     }
-
-    Ok(canonical)
 }
 
 fn current_internal_executable_sha256(label: &str) -> Result<String, String> {
@@ -1465,6 +1468,7 @@ fn native_source_sha256() -> String {
     bytes_sha256(GEMMA4_MTP_SOURCE.as_bytes())
 }
 
+#[cfg(target_os = "macos")]
 fn native_admission_command_output(program: &str, arguments: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(arguments)
@@ -1487,15 +1491,26 @@ fn native_admission_command_output(program: &str, arguments: &[&str]) -> Result<
 }
 
 fn current_native_admission_platform() -> Result<NativeAdmissionPlatform, String> {
-    let device = metal::Device::system_default()
-        .ok_or_else(|| "no system-default Metal device is available".to_string())?;
-    Ok(NativeAdmissionPlatform {
-        os: std::env::consts::OS.to_owned(),
-        os_version: native_admission_command_output("/usr/bin/sw_vers", &["-productVersion"])?,
-        machine_arch: std::env::consts::ARCH.to_owned(),
-        machine_model: native_admission_command_output("/usr/sbin/sysctl", &["-n", "hw.model"])?,
-        metal_device_name: device.name().to_owned(),
-    })
+    #[cfg(target_os = "macos")]
+    {
+        let device = metal::Device::system_default()
+            .ok_or_else(|| "no system-default Metal device is available".to_string())?;
+        Ok(NativeAdmissionPlatform {
+            os: std::env::consts::OS.to_owned(),
+            os_version: native_admission_command_output("/usr/bin/sw_vers", &["-productVersion"])?,
+            machine_arch: std::env::consts::ARCH.to_owned(),
+            machine_model: native_admission_command_output(
+                "/usr/sbin/sysctl",
+                &["-n", "hw.model"],
+            )?,
+            metal_device_name: device.name().to_owned(),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("native MTP admission requires a macOS Metal device".into())
+    }
 }
 
 fn json_u32(root: &serde_json::Value, pointer: &str) -> Result<u32, String> {
@@ -2199,6 +2214,7 @@ struct LoadOnlyProbeReport {
     target_kv_borrows: u64,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn load_only_operation_violation(report: &LoadOnlyProbeReport) -> Option<String> {
     let nonzero = [
         ("assistant_warmups", report.assistant_warmups),
@@ -3427,6 +3443,7 @@ fn checkpoint_load_only_probe(
     atomic_write_json(report_path, report)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn capture_load_only_checkpoint(
     report_path: &Path,
     report: &mut LoadOnlyProbeReport,
@@ -3514,6 +3531,7 @@ fn capture_load_only_residency_checkpoint(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn persist_load_only_failure(
     report_path: &Path,
     report: &mut LoadOnlyProbeReport,
@@ -4568,10 +4586,17 @@ impl ExperimentReport {
         // actually loaded the assistant; it stayed latent only because no lane
         // that loads the assistant had ever completed before 2026-08-21.
         let page_size = {
-            let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if raw > 0 {
-                raw as u64
-            } else {
+            #[cfg(unix)]
+            {
+                let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if raw > 0 {
+                    raw as u64
+                } else {
+                    16_384
+                }
+            }
+            #[cfg(not(unix))]
+            {
                 16_384
             }
         };
@@ -5961,6 +5986,7 @@ fn apply_child_environment(request: &ChildLaneRequest) -> Result<(), String> {
 /// Apply only the exact target load environment. This is intentionally not
 /// shared with the N/I/M child: the load probe has no proposal environment and
 /// must not inherit one from an earlier benchmark shell.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn apply_load_only_environment(
     target_runtime: &TargetRuntimeConfig,
     assistant_path: &Path,

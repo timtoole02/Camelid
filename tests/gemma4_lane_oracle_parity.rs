@@ -6,10 +6,10 @@
 //! prints token ids for an external llama.cpp comparison:
 //!
 //!   1. HEAD lane greedy    — `step()`, the lane the oracle parity was
-//!                            established on (see the K=1 HEAD lane work).
+//!     established on (see the K=1 HEAD lane work).
 //!   2. chained lane greedy — `step_chunk(&[tok])`, the lane the K>1 verifier
-//!                            uses and therefore the lane speculative decode
-//!                            falls back to for draft-less rounds.
+//!     uses and therefore the lane speculative decode falls back to for
+//!     draft-less rounds.
 //!   3. speculative         — `spec_decode_generate`.
 //!
 //! Each lane is also compared against llama.cpp's greedy token ids, captured
@@ -38,6 +38,8 @@ mod support;
 use camelid::gemma4_runtime::{gemma4_stop_token_ids, Gemma4Runtime};
 use std::{path::PathBuf, time::Instant};
 
+type Top2 = ((u32, f32), (u32, f32), f32);
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -54,7 +56,7 @@ fn argmax(l: &[f32]) -> u32 {
 /// position whose gap is a few ULP is two lanes rounding a genuine tie in
 /// different directions; a divergence at a position with a wide gap is a real
 /// numerical error and must be treated as a bug.
-fn top2(l: &[f32]) -> ((u32, f32), (u32, f32), f32) {
+fn top2(l: &[f32]) -> Top2 {
     let (mut b1, mut v1, mut b2, mut v2) = (0u32, f32::NEG_INFINITY, 0u32, f32::NEG_INFINITY);
     for (i, &v) in l.iter().enumerate() {
         if v > v1 {
@@ -163,8 +165,8 @@ fn gemma4_lane_oracle_parity() {
         let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true).unwrap();
         println!("[prompt ids] {prompt_tokens:?}");
 
-        let mut head_top2: Vec<((u32, f32), (u32, f32), f32)> = Vec::new();
-        let mut chained_top2: Vec<((u32, f32), (u32, f32), f32)> = Vec::new();
+        let mut head_top2: Vec<Top2> = Vec::new();
+        let mut chained_top2: Vec<Top2> = Vec::new();
 
         // --- lane 1: HEAD lane greedy (step) ---
         let head_ids = {
