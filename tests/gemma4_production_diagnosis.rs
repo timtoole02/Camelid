@@ -37,19 +37,21 @@ fn test_phase1_to_phase6_production_diagnosis() {
     println!("PHASE 1: PROVE WHAT MODEL THE GUI / SERVER IS RUNNING");
     println!("================================================================================");
 
-    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
+    let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf"));
+    let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost"));
 
-    assert!(
-        model_path.exists(),
-        "model_path must exist: {}",
-        model_path.display()
-    );
-    assert!(
-        cghost_path.exists(),
-        "cghost_path must exist: {}",
-        cghost_path.display()
-    );
+    if !model_path.is_file() || !cghost_path.is_file() {
+        eprintln!(
+            "SKIP production diagnosis: model pair not found at {} / {}",
+            model_path.display(),
+            cghost_path.display()
+        );
+        return;
+    }
 
     let (model_hash_prefix, model_size) = compute_file_sha256(&model_path, 64 * 1024 * 1024);
     let (cghost_hash_prefix, cghost_size) = compute_file_sha256(&cghost_path, 64 * 1024 * 1024);
