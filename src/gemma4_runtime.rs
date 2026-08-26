@@ -2140,6 +2140,19 @@ const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
     46, 56, 59, 56, 58, 51,
 ];
 
+/// Operator-authorized capacity descendant of the legacy H40 shape: the same
+/// per-layer weighting scaled 2,100 -> 2,400 slots (the PROFILE_FREE ceiling),
+/// admitted only under the raised supervision caps recorded per receipt. The
+/// literal stays frozen for the same reason as the others: a merely same-total
+/// distribution must not silently change the I/O or footprint contract.
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_LEGACY_CAP_2400_HOT_SLOTS: usize = 2_400;
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_LEGACY_CAP_2400_HOT_PROFILE: [usize; 30] = [
+    85, 110, 71, 69, 87, 61, 71, 73, 73, 110, 110, 110, 87, 91, 110, 72, 59, 58, 66, 69, 60, 67,
+    73, 87, 67, 80, 83, 79, 82, 80,
+];
+
 #[cfg(any(target_os = "macos", test))]
 fn ghost_metal_live_sequential_mini2_hot_profile_admitted(profile: &[usize]) -> bool {
     profile == GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
@@ -2150,6 +2163,8 @@ fn ghost_metal_live_sequential_mini2_hot_profile_admitted(profile: &[usize]) -> 
 fn ghost_metal_live_sequential_hot_profile_admitted(profile: &[usize]) -> bool {
     (profile == GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE
         && profile.iter().copied().sum::<usize>() == GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS)
+        || (profile == GHOST_METAL_LEGACY_CAP_2400_HOT_PROFILE
+            && profile.iter().copied().sum::<usize>() == GHOST_METAL_LEGACY_CAP_2400_HOT_SLOTS)
         || ghost_metal_live_sequential_mini2_hot_profile_admitted(profile)
 }
 /// Default-off exact I/O A/B for the compact cold stage. When the host expert
@@ -29178,6 +29193,24 @@ mod mtp_target_seam_tests {
         ));
         assert!(ghost_metal_live_sequential_mini2_hot_profile_admitted(
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+        ));
+
+        assert_eq!(
+            GHOST_METAL_LEGACY_CAP_2400_HOT_PROFILE
+                .iter()
+                .sum::<usize>(),
+            GHOST_METAL_LEGACY_CAP_2400_HOT_SLOTS
+        );
+        assert!(ghost_metal_live_sequential_hot_profile_admitted(
+            &GHOST_METAL_LEGACY_CAP_2400_HOT_PROFILE
+        ));
+        assert!(!ghost_metal_live_sequential_mini2_hot_profile_admitted(
+            &GHOST_METAL_LEGACY_CAP_2400_HOT_PROFILE
+        ));
+        let mut permuted_2400 = GHOST_METAL_LEGACY_CAP_2400_HOT_PROFILE;
+        permuted_2400.swap(0, 1);
+        assert!(!ghost_metal_live_sequential_hot_profile_admitted(
+            &permuted_2400
         ));
 
         let mut permuted = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
