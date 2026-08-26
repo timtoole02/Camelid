@@ -329,9 +329,11 @@ impl GgufWireMmap {
 /// A page-aligned, heap-owned copy of one tensor's wire-format bytes, suitable
 /// for an offset-0 `newBufferWithBytesNoCopy` Metal buffer: the GPU reads this
 /// allocation in place, so it is the ONLY resident copy of the weight (no
-/// 36-byte CPU decode, no GPU upload copy). Filled by one sequential read of
-/// the tensor's file range with the page cache enabled, so reloading a model
-/// runs at page-cache speed instead of re-streaming the disk.
+/// 36-byte CPU decode, no GPU upload copy). Filled by reading the tensor's
+/// file range with the page cache enabled — one sequential read by default,
+/// or parallel chunked preads under the CAMELID_DENSE_WAVE_CHUNKED_READ
+/// opt-in — so reloading a model runs at page-cache speed instead of
+/// re-streaming the disk.
 #[derive(Debug)]
 pub struct WirePages {
     ptr: *mut u8,
@@ -361,7 +363,11 @@ impl Drop for WirePages {
 
 impl WirePages {
     /// Allocate page-aligned storage and fill it with `byte_len` bytes read from
-    /// `file` at `offset` (one sequential read, page cache enabled).
+    /// `file` at `offset`. One sequential read with the page cache enabled by
+    /// default; the CAMELID_DENSE_WAVE_CHUNKED_READ opt-in fills the same bytes
+    /// through up to four parallel positioned reads instead. Every
+    /// `WirePages` consumer (dense, gemma4 resident/ghost-common, vision)
+    /// inherits that opt-in.
     pub fn read_from_file(file: &File, offset: u64, byte_len: usize) -> Result<Arc<Self>> {
         if byte_len == 0 {
             return Err(BackendError::InvalidTensorData(

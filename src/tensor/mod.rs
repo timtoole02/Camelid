@@ -1159,9 +1159,13 @@ fn q8_wave_chunk_count(enabled: bool, expected_len: usize, read_threads: usize) 
     }
 }
 
-/// Balanced chunk size with interior boundaries kept on a 16 KiB page,
-/// mirroring the ghost reader's `routed_expert_positioned_chunk_bytes`. The
-/// final chunk stays exact rather than padded.
+/// Balanced chunk size rounded to a 16 KiB multiple, mirroring the ghost
+/// reader's `routed_expert_positioned_chunk_bytes`. Note the alignment is
+/// buffer-relative: interior preads land on 16 KiB FILE pages only when the
+/// caller's offset is itself aligned (the ghost original got that for free
+/// from the .cghost writer's 16 KiB record padding; GGUF tensor offsets are
+/// generally not page-aligned). The final chunk stays exact rather than
+/// padded.
 fn q8_wave_chunk_bytes(expected_len: usize, requested_chunks: usize) -> usize {
     const CHUNK_ALIGNMENT: usize = 16 * 1024;
     let chunks = requested_chunks.max(1).min(expected_len.max(1));
