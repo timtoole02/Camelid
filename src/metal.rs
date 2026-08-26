@@ -181,6 +181,9 @@ struct MetalLinearKernel {
     q4k_linear_tiled_pipeline: ComputePipelineState,
     q5k_linear_tiled_pipeline: ComputePipelineState,
     q6k_linear_tiled_pipeline: ComputePipelineState,
+    q4k_linear_simd_mc_pipeline: ComputePipelineState,
+    q5k_linear_simd_mc_pipeline: ComputePipelineState,
+    q6k_linear_simd_mc_pipeline: ComputePipelineState,
     q1_0_linear_pipeline: ComputePipelineState,
     q2_0_g64_linear_pipeline: ComputePipelineState,
     q2_0_g128_linear_pipeline: ComputePipelineState,
@@ -2377,6 +2380,252 @@ kernel void q6k_linear_simd(
         float acc = 0.0f;
         for (uint l = 0; l < 8; ++l) acc += sums[l];
         output[row] = acc;
+    }
+}
+
+// Multi-column siblings of the three `*_linear_simd` GEMVs for bounded
+// column windows (the speculative-verify rows): the same one-SIMD-group-per-
+// output-row decomposition, with the inner dot repeated per column while the
+// super-block bytes are cache-hot, and the ordered f32 tail replayed by one
+// lane per column. Weight bytes therefore stream from DRAM once per window,
+// instead of once per four-column tile of the single-thread-per-row
+// `*_linear_tiled` kernels (whose rows*ceil(k/4) total threads also cannot
+// occupy the GPU). Each column's output is bit-identical to the
+// corresponding single-token `*_linear_simd` dispatch: the per-unit integer
+// math, the four-lane shuffle combine, and the per-super-block f32 tail run
+// in the same order with no cross-column arithmetic. `n_tokens` must be
+// <= 32 (one tail lane per column); the host caps it far lower.
+kernel void q4k_linear_simd_mc(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    threadgroup int* scratch [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows) return;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint g = u & 3u;
+        device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
+        uchar sc[8], mn[8];
+        if (active) {
+            q4k_scale_min(block, sc, mn);
+        }
+        for (uint t = 0; t < n_tokens; ++t) {
+            int aux[8] = {0,0,0,0,0,0,0,0};
+            int sumi = 0;
+            if (active) {
+                device const char* y = input_quants + t * n_sb * 256 + sb * 256;
+                int sumlo = 0;
+                int sumhi = 0;
+                for (uint k = 0; k < 4; ++k) {
+                    for (uint l = 0; l < 8; ++l) {
+                        const uint p = k * 8 + l;
+                        const uint packed = uint(block[16 + g * 32 + p]);
+                        const int ylo = int(y[g * 64 + p]);
+                        const int yhi = int(y[g * 64 + 32 + p]);
+                        aux[l] += int(sc[2 * g]) * ylo * int(packed & 0x0fu);
+                        aux[l] += int(sc[2 * g + 1]) * yhi * int(packed >> 4);
+                        sumlo += ylo;
+                        sumhi += yhi;
+                    }
+                }
+                sumi = int(mn[2 * g]) * sumlo + int(mn[2 * g + 1]) * sumhi;
+            }
+            for (uint off = 2; off >= 1; off >>= 1) {
+                for (uint l = 0; l < 8; ++l) {
+                    aux[l] += simd_shuffle_down(aux[l], off);
+                }
+                sumi += simd_shuffle_down(sumi, off);
+            }
+            if (active && g == 0) {
+                for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 9 + l] = aux[l];
+                scratch[(t * n_sb + sb) * 9 + 8] = sumi;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < n_tokens) {
+        const uint t = lane;
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        float sumf = 0.0f;
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
+            const float dw = float(*reinterpret_cast<device const half*>(block));
+            const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+            const float da = input_scales[t * n_sb + sb];
+            const float dd = dw * da;
+            for (uint l = 0; l < 8; ++l) sums[l] += dd * float(scratch[(t * n_sb + sb) * 9 + l]);
+            sumf -= dm * da * float(scratch[(t * n_sb + sb) * 9 + 8]);
+        }
+        float main = 0.0f;
+        for (uint l = 0; l < 8; ++l) main += sums[l];
+        output[t * rows + row] = sumf + main;
+    }
+}
+
+kernel void q5k_linear_simd_mc(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    threadgroup int* scratch [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows) return;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint g = u & 3u;
+        device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
+        uchar sc[8], mn[8];
+        if (active) {
+            q4k_scale_min(block, sc, mn);
+        }
+        for (uint t = 0; t < n_tokens; ++t) {
+            int aux[8] = {0,0,0,0,0,0,0,0};
+            int sumi = 0;
+            if (active) {
+                device const char* y = input_quants + t * n_sb * 256 + sb * 256;
+                int sumlo = 0;
+                int sumhi = 0;
+                for (uint k = 0; k < 4; ++k) {
+                    for (uint l = 0; l < 8; ++l) {
+                        const uint p = k * 8 + l;
+                        const uint packed = uint(block[48 + g * 32 + p]);
+                        const uint high = uint(block[16 + p]);
+                        const int wlo = int(packed & 0x0fu)
+                            + (((high >> (2u * g)) & 1u) != 0u ? 16 : 0);
+                        const int whi = int(packed >> 4)
+                            + (((high >> (2u * g + 1u)) & 1u) != 0u ? 16 : 0);
+                        const int ylo = int(y[g * 64 + p]);
+                        const int yhi = int(y[g * 64 + 32 + p]);
+                        aux[l] += int(sc[2 * g]) * ylo * wlo;
+                        aux[l] += int(sc[2 * g + 1]) * yhi * whi;
+                        sumlo += ylo;
+                        sumhi += yhi;
+                    }
+                }
+                sumi = int(mn[2 * g]) * sumlo + int(mn[2 * g + 1]) * sumhi;
+            }
+            for (uint off = 2; off >= 1; off >>= 1) {
+                for (uint l = 0; l < 8; ++l) {
+                    aux[l] += simd_shuffle_down(aux[l], off);
+                }
+                sumi += simd_shuffle_down(sumi, off);
+            }
+            if (active && g == 0) {
+                for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 9 + l] = aux[l];
+                scratch[(t * n_sb + sb) * 9 + 8] = sumi;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < n_tokens) {
+        const uint t = lane;
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        float sumf = 0.0f;
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
+            const float dw = float(*reinterpret_cast<device const half*>(block));
+            const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+            const float da = input_scales[t * n_sb + sb];
+            const float dd = dw * da;
+            for (uint l = 0; l < 8; ++l) sums[l] += dd * float(scratch[(t * n_sb + sb) * 9 + l]);
+            sumf -= dm * da * float(scratch[(t * n_sb + sb) * 9 + 8]);
+        }
+        float main = 0.0f;
+        for (uint l = 0; l < 8; ++l) main += sums[l];
+        output[t * rows + row] = sumf + main;
+    }
+}
+
+kernel void q6k_linear_simd_mc(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    threadgroup int* scratch [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows) return;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint quarter = u & 3u;
+        device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
+        const uint h = quarter >> 1;
+        const uint s = quarter & 1u;
+        const uint qlb = h * 64;
+        const uint qhb = 128 + h * 32;
+        const uint base = h * 128 + s * 16;
+        for (uint t = 0; t < n_tokens; ++t) {
+            int aux[8] = {0,0,0,0,0,0,0,0};
+            if (active) {
+                device const char* y = input_quants + t * n_sb * 256 + sb * 256;
+                device const char* scales = reinterpret_cast<device const char*>(block + 192);
+                const int s0 = int(scales[8 * h + s]);
+                const int s1 = int(scales[8 * h + s + 2]);
+                const int s2 = int(scales[8 * h + s + 4]);
+                const int s3 = int(scales[8 * h + s + 6]);
+                for (uint l = 0; l < 16; ++l) {
+                    const uint albyte = uint(block[qlb + s * 16 + l]);
+                    const uint ahbyte = uint(block[qlb + 32 + s * 16 + l]);
+                    const uint hbyte = uint(block[qhb + s * 16 + l]);
+                    const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                    const int a1 = int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
+                    const int a2 = int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
+                    const int a3 = int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
+                    const uint al = l & 7u;
+                    aux[al] += s0 * int(y[base + l]) * a0;
+                    aux[al] += s1 * int(y[base + l + 32]) * a1;
+                    aux[al] += s2 * int(y[base + l + 64]) * a2;
+                    aux[al] += s3 * int(y[base + l + 96]) * a3;
+                }
+            }
+            for (uint off = 2; off >= 1; off >>= 1) {
+                for (uint l = 0; l < 8; ++l) {
+                    aux[l] += simd_shuffle_down(aux[l], off);
+                }
+            }
+            if (active && quarter == 0) {
+                for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 8 + l] = aux[l];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < n_tokens) {
+        const uint t = lane;
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
+            const float d = float(*reinterpret_cast<device const half*>(block + 208))
+                * input_scales[t * n_sb + sb];
+            for (uint l = 0; l < 8; ++l) sums[l] += d * float(scratch[(t * n_sb + sb) * 8 + l]);
+        }
+        float acc = 0.0f;
+        for (uint l = 0; l < 8; ++l) acc += sums[l];
+        output[t * rows + row] = acc;
     }
 }
 
@@ -8442,6 +8691,21 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q6k_linear_tiled_pipeline = device
                 .new_compute_pipeline_state_with_function(&q6k_linear_tiled_function)
                 .ok()?;
+            let q4k_linear_simd_mc_function =
+                library.get_function("q4k_linear_simd_mc", None).ok()?;
+            let q4k_linear_simd_mc_pipeline = device
+                .new_compute_pipeline_state_with_function(&q4k_linear_simd_mc_function)
+                .ok()?;
+            let q5k_linear_simd_mc_function =
+                library.get_function("q5k_linear_simd_mc", None).ok()?;
+            let q5k_linear_simd_mc_pipeline = device
+                .new_compute_pipeline_state_with_function(&q5k_linear_simd_mc_function)
+                .ok()?;
+            let q6k_linear_simd_mc_function =
+                library.get_function("q6k_linear_simd_mc", None).ok()?;
+            let q6k_linear_simd_mc_pipeline = device
+                .new_compute_pipeline_state_with_function(&q6k_linear_simd_mc_function)
+                .ok()?;
             let q1_0_linear_function = library.get_function("q1_0_linear_f32", None).ok()?;
             let q1_0_linear_pipeline = device
                 .new_compute_pipeline_state_with_function(&q1_0_linear_function)
@@ -8529,6 +8793,9 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4k_linear_tiled_pipeline,
                 q5k_linear_tiled_pipeline,
                 q6k_linear_tiled_pipeline,
+                q4k_linear_simd_mc_pipeline,
+                q5k_linear_simd_mc_pipeline,
+                q6k_linear_simd_mc_pipeline,
                 q1_0_linear_pipeline,
                 q2_0_g64_linear_pipeline,
                 q2_0_g128_linear_pipeline,
@@ -13473,20 +13740,30 @@ fn encode_resident_kquant_matmul_f32(
     e.set_buffer(4, Some(scalar), 8);
     dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
 
-    let pipeline = match (weight.format, n_tokens == 1) {
-        (ResidentWeightFormat::Q4K, true) => &k.q4k_linear_simd_pipeline,
-        (ResidentWeightFormat::Q5K, true) => &k.q5k_linear_simd_pipeline,
-        (ResidentWeightFormat::Q6K, true) => &k.q6k_linear_simd_pipeline,
-        (ResidentWeightFormat::Q4K, false) => &k.q4k_linear_tiled_pipeline,
-        (ResidentWeightFormat::Q5K, false) => &k.q5k_linear_tiled_pipeline,
-        (ResidentWeightFormat::Q6K, false) => &k.q6k_linear_tiled_pipeline,
-        (ResidentWeightFormat::Q8_0, _)
-        | (ResidentWeightFormat::DenseF32, _)
-        | (ResidentWeightFormat::DenseF16, _)
-        | (ResidentWeightFormat::DenseBF16, _)
-        | (ResidentWeightFormat::Q1_0, _)
-        | (ResidentWeightFormat::Q2_0G64, _)
-        | (ResidentWeightFormat::Q2_0G128, _) => unreachable!(),
+    // Multi-column lane: for bounded column windows (the speculative-verify
+    // rows), keep the one-SIMD-group-per-row decomposition and dot each
+    // cache-hot super-block against every column, so weights stream from DRAM
+    // once per window. Per-column results are bit-identical to the
+    // single-token GEMV; the wide-batch tiled kernels remain the fallback.
+    let mc_columns =
+        (2..=KQUANT_MC_MAX_COLUMNS).contains(&n_tokens) && kquant_mc_gemv_enabled();
+    let pipeline = match (weight.format, n_tokens == 1, mc_columns) {
+        (ResidentWeightFormat::Q4K, true, _) => &k.q4k_linear_simd_pipeline,
+        (ResidentWeightFormat::Q5K, true, _) => &k.q5k_linear_simd_pipeline,
+        (ResidentWeightFormat::Q6K, true, _) => &k.q6k_linear_simd_pipeline,
+        (ResidentWeightFormat::Q4K, false, true) => &k.q4k_linear_simd_mc_pipeline,
+        (ResidentWeightFormat::Q5K, false, true) => &k.q5k_linear_simd_mc_pipeline,
+        (ResidentWeightFormat::Q6K, false, true) => &k.q6k_linear_simd_mc_pipeline,
+        (ResidentWeightFormat::Q4K, false, false) => &k.q4k_linear_tiled_pipeline,
+        (ResidentWeightFormat::Q5K, false, false) => &k.q5k_linear_tiled_pipeline,
+        (ResidentWeightFormat::Q6K, false, false) => &k.q6k_linear_tiled_pipeline,
+        (ResidentWeightFormat::Q8_0, _, _)
+        | (ResidentWeightFormat::DenseF32, _, _)
+        | (ResidentWeightFormat::DenseF16, _, _)
+        | (ResidentWeightFormat::DenseBF16, _, _)
+        | (ResidentWeightFormat::Q1_0, _, _)
+        | (ResidentWeightFormat::Q2_0G64, _, _)
+        | (ResidentWeightFormat::Q2_0G128, _, _) => unreachable!(),
     };
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(scales), 0);
@@ -13496,8 +13773,8 @@ fn encode_resident_kquant_matmul_f32(
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
     e.set_buffer(6, Some(scalar), 8);
-    if n_tokens == 1 {
-        let scratch_ints = n_sb
+    if n_tokens == 1 || mc_columns {
+        let scratch_ints_per_column = n_sb
             * match weight.format {
                 ResidentWeightFormat::Q4K | ResidentWeightFormat::Q5K => 9,
                 ResidentWeightFormat::Q6K => 8,
@@ -13509,6 +13786,8 @@ fn encode_resident_kquant_matmul_f32(
                 | ResidentWeightFormat::Q2_0G64
                 | ResidentWeightFormat::Q2_0G128 => unreachable!(),
             };
+        // The multi-column kernel keeps one scratch region per column.
+        let scratch_ints = scratch_ints_per_column * n_tokens;
         // `setThreadgroupMemoryLength:` requires a multiple of 16 bytes
         // (MTLDebugComputeCommandEncoder hard-asserts otherwise). `n_sb` is odd
         // or 2 mod 4 for plenty of real shapes — Llama-2-7B ffn_dim 11008 gives
@@ -13532,6 +13811,26 @@ fn encode_resident_kquant_matmul_f32(
     } else {
         dispatch_1d(e, pipeline, rows * n_tokens.div_ceil(4));
     }
+}
+
+/// Column cap for the multi-column K-quant GEMV: the verify window is at most
+/// 8 (`MAX_VERIFY_K`); one tail lane per column bounds any caller at 32, and
+/// per-column threadgroup scratch grows linearly. Wider batches (prefill)
+/// stay on the tiled kernels.
+const KQUANT_MC_MAX_COLUMNS: usize = 8;
+
+fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+/// Exact opt-in for the multi-column K-quant GEMV lane, so an A/B can hold
+/// every other knob fixed. Latched once per process like the other Metal
+/// gates.
+fn kquant_mc_gemv_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        kquant_mc_gemv_from(std::env::var("CAMELID_KQUANT_MC_GEMV").ok().as_deref())
+    })
 }
 
 /// Batched-column mirror of [`encode_q8_matmul_f32y`]'s production NSG=8 wire GEMV.
@@ -29893,6 +30192,219 @@ mod tests {
             eprintln!(
                 "metal_verify_gemv_batched_bit_identical: k={k} BIT-IDENTICAL ({rows} rows x {blocks_per_row} blocks)"
             );
+        }
+    }
+
+    /// The multi-column K-quant GEMVs must reproduce the single-token
+    /// `*_linear_simd` output bit-for-bit per column: same lane partition,
+    /// same shuffle combine, same ordered f32 tail — only the column loop
+    /// added. Drives the pipelines raw (no env gates involved), sharing one
+    /// Q8K staging between both paths via buffer offsets so the comparison
+    /// isolates the GEMV kernels themselves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_mc_gemv_bit_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let device = &kernel.device;
+
+        let rows = 130usize; // prime-ish: exercises the row-guard tail
+        let n_sb = 3usize; // odd super-block count: partial final lane wave
+        let cols = n_sb * 256;
+        let max_k = 8usize;
+
+        // Deterministic activations, one column per verify row.
+        let mut y_flat = vec![0.0f32; max_k * cols];
+        for (i, y) in y_flat.iter_mut().enumerate() {
+            let t = i / cols;
+            let c = i % cols;
+            *y = ((((t * 131 + c * 17) % 251) as f32) - 125.0) * 0.017 + t as f32 * 0.0011;
+        }
+        let y_buf =
+            device.new_buffer((y_flat.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+        write_buffer_f32(&y_buf, &y_flat);
+
+        // One shared Q8K staging for all columns; the reference dispatches
+        // read column t through buffer offsets, so both paths consume the
+        // exact same quantized bytes.
+        let scales_buf = device.new_buffer(
+            (max_k * n_sb * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let quants_buf = device.new_buffer(
+            (max_k * cols) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let qscalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let p = qscalar.contents() as *mut u32;
+            *p = n_sb as u32;
+            *p.add(1) = rows as u32;
+            *p.add(2) = max_k as u32;
+        }
+        {
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
+            e.set_buffer(0, Some(&y_buf), 0);
+            e.set_buffer(1, Some(&scales_buf), 0);
+            e.set_buffer(2, Some(&quants_buf), 0);
+            e.set_buffer(3, Some(&qscalar), 0);
+            e.set_buffer(4, Some(&qscalar), 8);
+            dispatch_1d(e, &kernel.quantize_q8k_rows_pipeline, max_k * n_sb);
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        struct FormatCase {
+            name: &'static str,
+            block_bytes: usize,
+            scratch_ints_per_sb: usize,
+        }
+        let cases = [
+            FormatCase {
+                name: "q4k",
+                block_bytes: 144,
+                scratch_ints_per_sb: 9,
+            },
+            FormatCase {
+                name: "q5k",
+                block_bytes: 176,
+                scratch_ints_per_sb: 9,
+            },
+            FormatCase {
+                name: "q6k",
+                block_bytes: 210,
+                scratch_ints_per_sb: 8,
+            },
+        ];
+        for case in &cases {
+            let (single_pipeline, mc_pipeline) = match case.name {
+                "q4k" => (
+                    &kernel.q4k_linear_simd_pipeline,
+                    &kernel.q4k_linear_simd_mc_pipeline,
+                ),
+                "q5k" => (
+                    &kernel.q5k_linear_simd_pipeline,
+                    &kernel.q5k_linear_simd_mc_pipeline,
+                ),
+                "q6k" => (
+                    &kernel.q6k_linear_simd_pipeline,
+                    &kernel.q6k_linear_simd_mc_pipeline,
+                ),
+                _ => unreachable!(),
+            };
+            // Deterministic wire blocks; any byte pattern decodes identically
+            // on both paths, so realism is not required, only determinism.
+            let mut wire = vec![0u8; rows * n_sb * case.block_bytes];
+            for (i, b) in wire.iter_mut().enumerate() {
+                *b = ((i * 13 + i / 97 + 5) % 256) as u8;
+            }
+            let w_buf =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&w_buf, &wire);
+
+            for k in [2usize, 3, 8] {
+                let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = scalar.contents() as *mut u32;
+                    *p = n_sb as u32;
+                    *p.add(1) = rows as u32;
+                    *p.add(2) = k as u32;
+                }
+
+                // Reference: k single-token simd dispatches via column offsets.
+                let mut reference = vec![0.0f32; k * rows];
+                for t in 0..k {
+                    let out_buf = device
+                        .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                    let cb = kernel.queue.new_command_buffer();
+                    let e = cb.new_compute_command_encoder();
+                    e.set_compute_pipeline_state(single_pipeline);
+                    e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
+                    e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
+                    e.set_buffer(2, Some(&w_buf), 0);
+                    e.set_buffer(3, Some(&out_buf), 0);
+                    e.set_buffer(4, Some(&scalar), 0);
+                    e.set_buffer(5, Some(&scalar), 4);
+                    let tg_bytes =
+                        (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
+                    e.set_threadgroup_memory_length(0, tg_bytes as u64);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: rows as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    e.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    read_buffer_f32(&out_buf, &mut reference[t * rows..(t + 1) * rows]);
+                }
+
+                // Candidate: one multi-column dispatch over the same staging.
+                let out_buf = device
+                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let cb = kernel.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                e.set_compute_pipeline_state(mc_pipeline);
+                e.set_buffer(0, Some(&scales_buf), 0);
+                e.set_buffer(1, Some(&quants_buf), 0);
+                e.set_buffer(2, Some(&w_buf), 0);
+                e.set_buffer(3, Some(&out_buf), 0);
+                e.set_buffer(4, Some(&scalar), 0);
+                e.set_buffer(5, Some(&scalar), 4);
+                e.set_buffer(6, Some(&scalar), 8);
+                let tg_bytes =
+                    (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
+                e.set_threadgroup_memory_length(0, tg_bytes as u64);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: rows as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let mut batched = vec![0.0f32; k * rows];
+                read_buffer_f32(&out_buf, &mut batched);
+
+                for t in 0..k {
+                    for r in 0..rows {
+                        let a = batched[t * rows + r];
+                        let b = reference[t * rows + r];
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{} k={k} column {t} row {r}: mc {a} ({:#010x}) != \
+                             single-token {b} ({:#010x})",
+                            case.name,
+                            a.to_bits(),
+                            b.to_bits(),
+                        );
+                    }
+                }
+                eprintln!(
+                    "metal_kquant_mc_gemv_bit_identical: {} k={k} BIT-IDENTICAL ({rows} rows x {n_sb} super-blocks)",
+                    case.name
+                );
+            }
         }
     }
 
