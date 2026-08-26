@@ -16904,7 +16904,10 @@ mod tests {
     #[test]
     fn host_verification_rejects_invalid_python_before_completion() {
         let dir = tempfile::tempdir().unwrap();
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        // `py` may cold-start alongside several other real subprocess tests on
+        // a loaded Windows runner. Keep the liveness bound, but leave enough
+        // room for the verifier to return the syntax diagnostic under test.
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
         let mut driver = MockDriver {
             steps: vec![
                 ModelStep::Calls(vec![tc(
@@ -16942,10 +16945,14 @@ mod tests {
             std::fs::read_to_string(dir.path().join("game.py")).unwrap(),
             "print('fixed')\n"
         );
-        assert!(reporter
-            .results
-            .iter()
-            .any(|result| result.contains("SyntaxError")));
+        assert!(
+            reporter
+                .results
+                .iter()
+                .any(|result| result.contains("SyntaxError")),
+            "host verification results: {:?}",
+            reporter.results
+        );
     }
 
     /// Is `python` on THIS host the Windows Store alias stub?
