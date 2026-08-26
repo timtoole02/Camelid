@@ -9136,9 +9136,9 @@ impl GhostMetalExpertRuntime {
         // literal before the strict Mini2 reset re-pinned it; both frozen
         // literals are exact admissions, so the shape accepts either.
         let live_sequential_h49_execution_shape = live_sequential_profile_shape
-            && live_sequential_hot_profile.as_ref().is_some_and(|profile| {
-                ghost_metal_live_sequential_hot_profile_admitted(profile)
-            })
+            && live_sequential_hot_profile
+                .as_ref()
+                .is_some_and(|profile| ghost_metal_live_sequential_hot_profile_admitted(profile))
             && !crate::metal::gemma4_hybrid_hot_cold_overlap_publish_enabled()
             && std::env::var(GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV).is_ok_and(|value| value == "1")
             && !std::env::var("CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_MAPPED_WAVE")
