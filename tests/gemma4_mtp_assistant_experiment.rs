@@ -7206,6 +7206,12 @@ fn gemma4_mtp_assistant_experiment() {
 mod pure_tests {
     use super::*;
 
+    fn absolute_test_path(relative: &str) -> PathBuf {
+        std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(relative)
+    }
+
     fn system_sample(
         elapsed_ms: u64,
         swapins_bytes: u64,
@@ -7703,27 +7709,29 @@ mod pure_tests {
             pair_gate_passed: true,
             target_repository: OFFICIAL_TARGET_REPOSITORY.into(),
             target_revision: OFFICIAL_TARGET_REVISION.into(),
-            target_source_path: "/Volumes/source/target.gguf".into(),
+            target_source_path: absolute_test_path("source/target.gguf"),
             target_source_bytes: OFFICIAL_TARGET_BYTES,
             target_source_sha256: OFFICIAL_TARGET_SHA256.into(),
             target_source_matches_official: true,
-            target_staged_runtime_path: "/runtime/target.hot.gguf".into(),
-            target_staged_cghost_path: "/runtime/target.cghost".into(),
+            target_staged_runtime_path: absolute_test_path("runtime/target.hot.gguf"),
+            target_staged_cghost_path: absolute_test_path("runtime/target.cghost"),
             target_staged_identity_scheme: STAGED_TARGET_IDENTITY_SCHEME.into(),
             target_staged_metadata_matches_source: true,
             target_cghost_matches_official_source: true,
             target_cghost_matches_staged_runtime: true,
             assistant_repository: OFFICIAL_ASSISTANT_REPOSITORY.into(),
             assistant_revision: OFFICIAL_ASSISTANT_REVISION.into(),
-            assistant_staged_model_path: "/stage/assistant/model.safetensors".into(),
+            assistant_staged_model_path: absolute_test_path("stage/assistant/model.safetensors"),
             assistant_staged_model_bytes: OFFICIAL_ASSISTANT_MODEL_BYTES,
             assistant_staged_model_sha256: OFFICIAL_ASSISTANT_MODEL_SHA256.into(),
-            assistant_staged_config_path: "/stage/assistant/config.json".into(),
+            assistant_staged_config_path: absolute_test_path("stage/assistant/config.json"),
             assistant_staged_config_sha256: OFFICIAL_ASSISTANT_CONFIG_SHA256.into(),
-            assistant_staged_tokenizer_config_path: "/stage/assistant/tokenizer_config.json".into(),
+            assistant_staged_tokenizer_config_path: absolute_test_path(
+                "stage/assistant/tokenizer_config.json",
+            ),
             assistant_staged_tokenizer_config_sha256: OFFICIAL_ASSISTANT_TOKENIZER_CONFIG_SHA256
                 .into(),
-            assistant_staged_tokenizer_path: "/stage/assistant/tokenizer.json".into(),
+            assistant_staged_tokenizer_path: absolute_test_path("stage/assistant/tokenizer.json"),
             assistant_staged_tokenizer_sha256: OFFICIAL_ASSISTANT_TOKENIZER_SHA256.into(),
             assistant_staged_files_match_official: true,
             shared_vocab_size: SHARED_VOCAB_SIZE,
@@ -7791,8 +7799,8 @@ mod pure_tests {
     #[test]
     fn target_runtime_settings_pin_the_current_exact_lane() {
         let config = TargetRuntimeConfig {
-            runtime_gguf_path: "/runtime/target.gguf".into(),
-            cghost_path: "/runtime/target.cghost".into(),
+            runtime_gguf_path: absolute_test_path("runtime/target.gguf"),
+            cghost_path: absolute_test_path("runtime/target.cghost"),
             expert_cache_mib: DEFAULT_TARGET_CACHE_MIB,
             environment: exact_target_environment(),
         };
@@ -7849,8 +7857,8 @@ mod pure_tests {
         }
 
         let profiled = TargetRuntimeConfig {
-            runtime_gguf_path: "/runtime/target.gguf".into(),
-            cghost_path: "/runtime/target.cghost".into(),
+            runtime_gguf_path: absolute_test_path("runtime/target.gguf"),
+            cghost_path: absolute_test_path("runtime/target.cghost"),
             expert_cache_mib: DEFAULT_TARGET_CACHE_MIB,
             environment: exact_target_environment_with_profile(true),
         };
@@ -7951,7 +7959,7 @@ mod pure_tests {
             .unwrap_err()
             .contains("not bound to the official source"));
 
-        let wrong_selected_path = PathBuf::from("/stage/other/model.safetensors");
+        let wrong_selected_path = absolute_test_path("stage/other/model.safetensors");
         assert!(exact
             .validate(&wrong_selected_path)
             .unwrap_err()
