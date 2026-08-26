@@ -1,0 +1,72 @@
+{
+  "schema": "camelid.agent_eval/v1",
+  "outcome": "PASS",
+  "model_id": "26B_dequant_it_hf",
+  "gguf": "/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf",
+  "gguf_bytes": 14439361440,
+  "quantization": "Q4_0",
+  "note": "battery complete",
+  "cases": [
+    {
+      "case": "read_and_count",
+      "goal": "Read the file notes.txt and tell me how many lines it has. Use the read_file tool, then give the count.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "read_file(notes.txt, start_line=1, max_lines=all)"
+      ],
+      "tool_results": [
+        {
+          "tool": "read_file",
+          "ok": true,
+          "output": "1 | alpha\n2 | beta\n3 | gamma\n"
+        }
+      ],
+      "final_answer": "The file `notes.txt` has 3 lines.",
+      "passed": true
+    },
+    {
+      "case": "list_dir_find",
+      "goal": "List the entries of the current directory '.' with the list_dir tool, then tell me the name of the text file you find there.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "list_dir(., offset=0, limit=all)",
+        "update_plan(3 steps)"
+      ],
+      "tool_results": [
+        {
+          "tool": "list_dir",
+          "ok": true,
+          "output": "notes.txt"
+        },
+        {
+          "tool": "update_plan",
+          "ok": true,
+          "output": "plan updated\n[x] List directory entries.\n[ ] Identify the text file.\n[ ] State the name of the text file."
+        }
+      ],
+      "final_answer": "The text file found in the current directory is `notes.txt`.",
+      "passed": true
+    },
+    {
+      "case": "write_greeting",
+      "goal": "Create a file named greeting.txt whose exact contents are: hello there\nUse the write_file tool ONCE, then reply in words that you created it. Do not call any further tools and do not read the file back.",
+      "loop_end": "Answered",
+      "tool_calls": [
+        "write_file(\"greeting.txt\", 13 bytes)"
+      ],
+      "tool_results": [
+        {
+          "tool": "write_file",
+          "ok": true,
+          "output": "wrote 13 bytes to \"greeting.txt\""
+        }
+      ],
+      "final_answer": "I created the file greeting.txt.",
+      "passed": true
+    }
+  ],
+  "host_loadavg_1m": 0.982421875,
+  "timestamp_unix": 1787782175,
+  "promotion_eligible": true,
+  "receipt_id": "5dc1d6437a13c6b36702eee942b8152374fc64098c6f826262f3e3ab6ff96c4e"
+}
