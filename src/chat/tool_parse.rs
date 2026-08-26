@@ -34,6 +34,23 @@ pub fn parse(text: &str, family: &str) -> Vec<ToolCall> {
         }
         return parse_json(text);
     }
+    // Gemma 4 emits `<|tool_call>call:NAME{argsâ€¦}<tool_call|>` (certified
+    // serve-lane branch; the streamed content this parser sees has the
+    // `<|"|>` string-quote token already stripped by detokenization, which
+    // `parse_gemma4` tolerates). Matching "gemma" is safe for gemma2/gemma3
+    // sessions too: those templates never emit the marker, and the JSON
+    // fallbacks below are unchanged.
+    if family.contains("gemma") {
+        let calls = parse_gemma4(text);
+        if !calls.is_empty() {
+            return calls;
+        }
+        let calls = parse_json(text);
+        if !calls.is_empty() {
+            return calls;
+        }
+        return parse_bare_call(text);
+    }
     let hermes_first = family.contains("qwen") || family.contains("hermes");
     if hermes_first {
         let calls = parse_hermes(text);
@@ -387,6 +404,21 @@ fn parse_ornith(text: &str) -> Vec<ToolCall> {
         rest = next;
     }
     calls
+}
+
+/// Gemma 4 `<|tool_call>call:NAME{argsâ€¦}<tool_call|>` envelopes, delegated to
+/// the serve lane's certified parser (one scanner, no drift): both the native
+/// pseudo-JSON argument dialect and the raw-JSON arm lift, and a truncated
+/// envelope parses to its emitted prefix.
+fn parse_gemma4(text: &str) -> Vec<ToolCall> {
+    crate::api::parse_gemma4_tool_calls_json(text)
+        .into_iter()
+        .filter_map(|call| {
+            let name = call["function"]["name"].as_str()?.to_string();
+            let args = serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
+            Some(ToolCall { name, args })
+        })
+        .collect()
 }
 
 /// Bare/`python_tag`-wrapped JSON tool call(s) (Llama 3.x).
@@ -1144,5 +1176,38 @@ mod tests {
     fn ornith_plain_answer_no_calls() {
         let text = "<think>\nThe answer is 3.\n</think>\n\nThe file has 3 lines.";
         assert!(parse(text, "qwen35").is_empty());
+    }
+
+    /// Gemma 4 streamed content: envelope markers survive detokenization but
+    /// the `<|"|>` string-quote token does not — the degraded bare-value scan
+    /// still lifts the call.
+    #[test]
+    fn parses_gemma4_envelope_with_and_without_quote_token() {
+        let quoted =
+            "<|tool_call>call:read_file{path:<|\"|>notes.txt<|\"|>,start_line:2}<tool_call|>";
+        let out = parse(quoted, "gemma4_a4b_moe_decoder");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].args["path"], "notes.txt");
+        assert_eq!(out[0].args["start_line"], 2);
+
+        let stripped = "<|tool_call>call:list_dir{path:.}<tool_call|>";
+        let out = parse(stripped, "gemma4_a4b_moe_decoder");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "list_dir");
+        assert_eq!(out[0].args["path"], ".");
+    }
+
+    /// Gemma-family plain answers never mis-fire, and the JSON fallbacks stay
+    /// reachable for gemma sessions.
+    #[test]
+    fn gemma4_plain_answer_no_calls_and_json_fallback_reachable() {
+        assert!(parse("The file has 3 lines.", "gemma4_a4b_moe_decoder").is_empty());
+        let out = parse(
+            "{\"name\":\"read_file\",\"parameters\":{\"path\":\"a.txt\"}}",
+            "gemma4_a4b_moe_decoder",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
     }
 }

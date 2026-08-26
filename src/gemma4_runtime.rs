@@ -1063,6 +1063,26 @@ pub fn gemma4_stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     ids
 }
 
+/// Extra stop ids for TOOL-enabled serve requests: generation ends the moment
+/// the model completes a tool-call envelope (`<tool_call|>`) or opens a tool
+/// RESPONSE block (`<|tool_response>`). In the reference template the tool
+/// response follows the call inside the SAME open model turn, so without
+/// these stops the model keeps decoding past its call and hallucinates a
+/// response; the serve layer parses the envelope and returns structured
+/// `tool_calls` instead. Empty when the vocab lacks the markers, in which
+/// case generation falls back to the ordinary stop set unchanged.
+pub fn gemma4_tool_stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for marker in ["<tool_call|>", "<|tool_response>"] {
+        if let Ok(tokens) = tokenizer.encode(marker, false, true) {
+            if tokens.len() == 1 {
+                ids.push(tokens[0]);
+            }
+        }
+    }
+    ids
+}
+
 pub(crate) fn f32_matvec(w: &[f32], in_dim: usize, out_dim: usize, x: &[f32]) -> Vec<f32> {
     // Sequential scalar accumulation, matching the base (oracle-locked)
     // semantics. Multi-accumulator NEON FMA variants change the float summation
@@ -23025,7 +23045,27 @@ impl Gemma4Runtime {
         max_new: usize,
         should_cancel: C,
     ) -> Result<Gemma4GenerationOutcome> {
-        self.generate_greedy_controlled(prompt, max_new, None::<fn(&str)>, should_cancel, None)
+        self.generate_greedy_controlled(prompt, max_new, None::<fn(&str)>, should_cancel, None, &[])
+    }
+
+    /// [`Self::generate_greedy_cancellable`] with request-scoped extra stop
+    /// ids appended to the stop set (the tools lane stops on the tool-call
+    /// envelope terminator; see [`gemma4_tool_stop_token_ids`]).
+    pub fn generate_greedy_cancellable_with_stops<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        extra_stop_token_ids: &[u32],
+        should_cancel: C,
+    ) -> Result<Gemma4GenerationOutcome> {
+        self.generate_greedy_controlled(
+            prompt,
+            max_new,
+            None::<fn(&str)>,
+            should_cancel,
+            None,
+            extra_stop_token_ids,
+        )
     }
 
     /// Non-streaming serve seam that preserves [`Gemma4GenerationOutcome`]
@@ -23038,6 +23078,23 @@ impl Gemma4Runtime {
         max_new: usize,
         should_cancel: C,
     ) -> Result<(Gemma4GenerationOutcome, Option<Gemma4HybridTelemetry>)> {
+        self.generate_greedy_cancellable_with_hybrid_telemetry_and_stops(
+            prompt,
+            max_new,
+            &[],
+            should_cancel,
+        )
+    }
+
+    /// [`Self::generate_greedy_cancellable_with_hybrid_telemetry`] with
+    /// request-scoped extra stop ids (tools lane).
+    pub fn generate_greedy_cancellable_with_hybrid_telemetry_and_stops<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        extra_stop_token_ids: &[u32],
+        should_cancel: C,
+    ) -> Result<(Gemma4GenerationOutcome, Option<Gemma4HybridTelemetry>)> {
         let mut hybrid_telemetry = None;
         let outcome = self.generate_greedy_controlled(
             prompt,
@@ -23045,6 +23102,7 @@ impl Gemma4Runtime {
             None::<fn(&str)>,
             should_cancel,
             Some(&mut hybrid_telemetry),
+            extra_stop_token_ids,
         )?;
         Ok((outcome, hybrid_telemetry))
     }
@@ -23057,7 +23115,7 @@ impl Gemma4Runtime {
         on_delta: F,
         should_cancel: C,
     ) -> Result<Gemma4GenerationOutcome> {
-        self.generate_greedy_controlled(prompt, max_new, Some(on_delta), should_cancel, None)
+        self.generate_greedy_controlled(prompt, max_new, Some(on_delta), should_cancel, None, &[])
     }
 
     fn generate_greedy_controlled<F: FnMut(&str), C: FnMut() -> bool>(
@@ -23067,6 +23125,7 @@ impl Gemma4Runtime {
         mut on_delta: Option<F>,
         mut should_cancel: C,
         mut hybrid_telemetry_out: Option<&mut Option<Gemma4HybridTelemetry>>,
+        extra_stop_token_ids: &[u32],
     ) -> Result<Gemma4GenerationOutcome> {
         #[cfg(target_os = "macos")]
         let _ghost_common_request = self.lock_ghost_common_generation()?;
@@ -23081,7 +23140,12 @@ impl Gemma4Runtime {
         if std::env::var("CAMELID_GEMMA4_DUMP_PROMPT_TOKENS").is_ok() {
             eprintln!("[prompt tokens] {prompt_tokens:?}");
         }
-        let eot = gemma4_stop_token_ids(&self.tokenizer);
+        let mut eot = gemma4_stop_token_ids(&self.tokenizer);
+        // Request-scoped extra stops (the tools lane stops on the tool-call
+        // envelope terminator); the MTP/chained paths below take the same set.
+        eot.extend_from_slice(extra_stop_token_ids);
+        eot.sort_unstable();
+        eot.dedup();
         if let Some(output) = hybrid_telemetry_out.as_mut() {
             **output = None;
         }

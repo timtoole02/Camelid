@@ -8801,6 +8801,30 @@ fn gemma4_ghost_moe_serve_config(
             catalog_managed: false,
         }));
     }
+    // A pair loaded by its RESOLVED artifact name (`<base>.hot.gguf` — e.g. an
+    // operator or harness canonicalized the catalog symlink) still owns its
+    // sibling expert pack. The sparse hot shadow served WITHOUT the pack
+    // decodes every routed expert as zeros and emits fluent-looking garbage
+    // (measured on the 26B pair), so probe the `<base>` cghost spellings
+    // beside the file rather than failing open onto the bare shadow.
+    if let Some(base) = model_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_suffix(".hot"))
+    {
+        let dir = model_path.parent().unwrap_or_else(|| Path::new("."));
+        for candidate in [format!("{base}.v3.cghost"), format!("{base}.cghost")] {
+            let sibling = dir.join(candidate);
+            if sibling.is_file() {
+                return Ok(Some(crate::ghost_install::GhostMoeRuntimeConfig {
+                    cghost: sibling,
+                    cache_mib: DEFAULT_GEMMA4_GHOST_CACHE_MIB,
+                    strict_cache: false,
+                    catalog_managed: false,
+                }));
+            }
+        }
+    }
     Ok(None)
 }
 
@@ -8850,6 +8874,37 @@ mod gemma4_ghost_moe_serve_config_tests {
         )
         .unwrap_err();
         assert!(error.contains(GEMMA4_GHOST_STRICT_CACHE_ENV));
+    }
+
+    /// A `<base>.hot.gguf` loaded by its resolved name (canonicalized catalog
+    /// symlink) must find the sibling `<base>.v3.cghost` pack — the sparse hot
+    /// shadow without its pack decodes routed experts as zeros.
+    #[test]
+    fn hot_shadow_loaded_by_resolved_name_finds_the_sibling_pack() {
+        let _guard = crate::test_support::env_lock();
+        assert!(
+            std::env::var_os(GEMMA4_GHOST_CGHOST_ENV).is_none(),
+            "test needs the env override unset"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "camelid-hot-shadow-pair-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hot = dir.join("gemma-4-26B_q4_0-it.hot.gguf");
+        let pack = dir.join("gemma-4-26B_q4_0-it.v3.cghost");
+        std::fs::write(&hot, b"stub").unwrap();
+        std::fs::write(&pack, b"stub").unwrap();
+        let config = gemma4_ghost_moe_serve_config(&hot)
+            .expect("config parses")
+            .expect("hot shadow wires its sibling pack instead of failing open");
+        assert_eq!(config.cghost, pack);
+        assert!(!config.catalog_managed);
+        // Without ANY pack sibling the probe still yields None (the bare-GGUF
+        // lanes remain reachable for genuinely packless files).
+        std::fs::remove_file(&pack).unwrap();
+        assert!(gemma4_ghost_moe_serve_config(&hot).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -9023,6 +9078,823 @@ pub(crate) const GEMMA4_CHANNEL_END: &str = "<channel|>";
 /// Thinking-mode token (id 98), injected at the top of the system turn when
 /// the reference template runs with `enable_thinking` (its `--jinja` default).
 pub(crate) const GEMMA4_THINK: &str = "<|think|>";
+/// Gemma 4 tool markers (vocab ids 46-52). The GGUF-embedded Jinja template
+/// carries a full function-calling branch built from these: per-tool
+/// `<|tool>declaration:â€¦<tool|>` blocks in the system turn, model calls as
+/// `<|tool_call>call:NAME{argsâ€¦}<tool_call|>`, and tool results as
+/// `<|tool_response>response:NAME{â€¦}<tool_response|>` continuing the SAME open
+/// model turn. Strings inside the pseudo-JSON argument dialect are delimited
+/// by the dedicated quote token `<|"|>`. The renderer is locked byte-for-byte
+/// to the reference template's rendering by
+/// `qa/gemma4/tool_template_shapes_v1.json`.
+pub(crate) const GEMMA4_TOOL_START: &str = "<|tool>";
+pub(crate) const GEMMA4_TOOL_END: &str = "<tool|>";
+pub(crate) const GEMMA4_TOOL_CALL_START: &str = "<|tool_call>";
+pub(crate) const GEMMA4_TOOL_CALL_END: &str = "<tool_call|>";
+pub(crate) const GEMMA4_TOOL_RESPONSE_START: &str = "<|tool_response>";
+pub(crate) const GEMMA4_TOOL_RESPONSE_END: &str = "<tool_response|>";
+pub(crate) const GEMMA4_QUOTE: &str = "<|\"|>";
+
+/// True when a loaded gemma4 row's GGUF-embedded chat template carries the
+/// certified tool-call branch. Rows whose template lacks the branch (earlier
+/// gemma4 template revisions) keep the typed fail-closed 422: their weights
+/// were not trained on the tool markers and rendering tools at them would
+/// silently misbehave.
+fn gemma4_template_has_tools_branch(template: Option<&str>) -> bool {
+    template.is_some_and(|t| {
+        t.contains(GEMMA4_TOOL_CALL_START)
+            && t.contains(GEMMA4_TOOL_RESPONSE_START)
+            && t.contains(GEMMA4_TOOL_START)
+    })
+}
+
+/// Jinja `dictsort` over a JSON object: stable sort by lowercased key (the
+/// reference template dictsorts every properties/arguments map it renders).
+fn gemma4_dictsort(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(&String, &serde_json::Value)> {
+    let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    entries
+}
+
+/// The reference template's `format_argument` macro: strings are wrapped in
+/// the `<|"|>` quote token, booleans render bare, mappings render dictsorted
+/// `key:value` pairs in braces (keys quoted only when `escape_keys`), arrays
+/// render bracketed. Numbers keep their JSON spelling. JSON null renders as
+/// `null` (out of the certified envelope either way).
+fn gemma4_format_argument(value: &serde_json::Value, escape_keys: bool, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => {
+            out.push_str(GEMMA4_QUOTE);
+            out.push_str(s);
+            out.push_str(GEMMA4_QUOTE);
+        }
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            let mut first = true;
+            for (key, item) in gemma4_dictsort(map) {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if escape_keys {
+                    out.push_str(GEMMA4_QUOTE);
+                    out.push_str(key);
+                    out.push_str(GEMMA4_QUOTE);
+                } else {
+                    out.push_str(key);
+                }
+                out.push(':');
+                gemma4_format_argument(item, escape_keys, out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                gemma4_format_argument(item, escape_keys, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::Null => out.push_str("null"),
+    }
+}
+
+/// The reference template's `format_parameters` macro: one `key:{â€¦}` block per
+/// dictsorted property, keeping description/enum/items/nullable/nested-object
+/// clauses and ALWAYS closing with `type:<|"|>TYPE<|"|>`. Schema keys the
+/// reference does not render (minimum/maximum etc.) are dropped exactly as it
+/// drops them.
+fn gemma4_render_parameters(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    filter_keys: bool,
+    out: &mut String,
+) {
+    const STANDARD_KEYS: [&str; 5] = ["description", "type", "properties", "required", "nullable"];
+    let mut found_first = false;
+    for (key, value) in gemma4_dictsort(properties) {
+        if filter_keys && STANDARD_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if found_first {
+            out.push(',');
+        }
+        found_first = true;
+        out.push_str(key);
+        out.push_str(":{");
+        let mut add_comma = false;
+        let comma = |out: &mut String, add_comma: &mut bool| {
+            if *add_comma {
+                out.push(',');
+            } else {
+                *add_comma = true;
+            }
+        };
+        if let Some(description) = value
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .filter(|d| !d.is_empty())
+        {
+            out.push_str("description:");
+            out.push_str(GEMMA4_QUOTE);
+            out.push_str(description);
+            out.push_str(GEMMA4_QUOTE);
+            add_comma = true;
+        }
+        let value_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_uppercase();
+        if value_type == "STRING" {
+            if let Some(enum_values) = value
+                .get("enum")
+                .filter(|e| e.as_array().is_some_and(|a| !a.is_empty()))
+            {
+                comma(out, &mut add_comma);
+                out.push_str("enum:");
+                gemma4_format_argument(enum_values, true, out);
+            }
+        } else if value_type == "ARRAY" {
+            if let Some(items) = value
+                .get("items")
+                .and_then(serde_json::Value::as_object)
+                .filter(|m| !m.is_empty())
+            {
+                comma(out, &mut add_comma);
+                out.push_str("items:{");
+                let mut items_first = true;
+                for (item_key, item_value) in gemma4_dictsort(items) {
+                    if item_value.is_null() {
+                        continue;
+                    }
+                    if !items_first {
+                        out.push(',');
+                    }
+                    items_first = false;
+                    match item_key.as_str() {
+                        "properties" => {
+                            out.push_str("properties:{");
+                            if let Some(map) = item_value.as_object() {
+                                gemma4_render_parameters(map, false, out);
+                            }
+                            out.push('}');
+                        }
+                        "required" => {
+                            out.push_str("required:[");
+                            if let Some(entries) = item_value.as_array() {
+                                for (i, entry) in entries.iter().enumerate() {
+                                    if i > 0 {
+                                        out.push(',');
+                                    }
+                                    out.push_str(GEMMA4_QUOTE);
+                                    out.push_str(entry.as_str().unwrap_or_default());
+                                    out.push_str(GEMMA4_QUOTE);
+                                }
+                            }
+                            out.push(']');
+                        }
+                        "type" => {
+                            out.push_str("type:");
+                            match item_value {
+                                serde_json::Value::String(s) => gemma4_format_argument(
+                                    &serde_json::Value::String(s.to_uppercase()),
+                                    true,
+                                    out,
+                                ),
+                                serde_json::Value::Array(list) => {
+                                    let upper: Vec<serde_json::Value> = list
+                                        .iter()
+                                        .map(|v| {
+                                            serde_json::Value::String(
+                                                v.as_str().unwrap_or_default().to_uppercase(),
+                                            )
+                                        })
+                                        .collect();
+                                    gemma4_format_argument(
+                                        &serde_json::Value::Array(upper),
+                                        true,
+                                        out,
+                                    );
+                                }
+                                other => gemma4_format_argument(other, true, out),
+                            }
+                        }
+                        _ => {
+                            out.push_str(item_key);
+                            out.push(':');
+                            gemma4_format_argument(item_value, true, out);
+                        }
+                    }
+                }
+                out.push('}');
+            }
+        }
+        if value
+            .get("nullable")
+            .is_some_and(|n| n.as_bool().unwrap_or(false))
+        {
+            comma(out, &mut add_comma);
+            out.push_str("nullable:true");
+        }
+        if value_type == "OBJECT" {
+            if let Some(nested) = value
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
+                comma(out, &mut add_comma);
+                out.push_str("properties:{");
+                gemma4_render_parameters(nested, false, out);
+                out.push('}');
+            } else if let Some(map) = value.as_object() {
+                comma(out, &mut add_comma);
+                out.push_str("properties:{");
+                gemma4_render_parameters(map, true, out);
+                out.push('}');
+            }
+            if let Some(required) = value
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .filter(|r| !r.is_empty())
+            {
+                comma(out, &mut add_comma);
+                out.push_str("required:[");
+                for (i, entry) in required.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(GEMMA4_QUOTE);
+                    out.push_str(entry.as_str().unwrap_or_default());
+                    out.push_str(GEMMA4_QUOTE);
+                }
+                out.push(']');
+            }
+        }
+        comma(out, &mut add_comma);
+        out.push_str("type:");
+        out.push_str(GEMMA4_QUOTE);
+        out.push_str(&value_type);
+        out.push_str(GEMMA4_QUOTE);
+        out.push('}');
+    }
+}
+
+/// The reference template's `format_function_declaration` macro over one
+/// unwrapped tool definition (`{name, description, parameters}`).
+fn gemma4_render_tool_declaration(tool: &serde_json::Value) -> String {
+    let mut out = String::new();
+    out.push_str("declaration:");
+    out.push_str(
+        tool.get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    );
+    out.push_str("{description:");
+    out.push_str(GEMMA4_QUOTE);
+    out.push_str(
+        tool.get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    );
+    out.push_str(GEMMA4_QUOTE);
+    if let Some(params) = tool
+        .get("parameters")
+        .and_then(serde_json::Value::as_object)
+        .filter(|m| !m.is_empty())
+    {
+        out.push_str(",parameters:{");
+        if let Some(properties) = params
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .filter(|m| !m.is_empty())
+        {
+            out.push_str("properties:{");
+            gemma4_render_parameters(properties, false, &mut out);
+            out.push_str("},");
+        }
+        if let Some(required) = params
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .filter(|r| !r.is_empty())
+        {
+            out.push_str("required:[");
+            for (i, entry) in required.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(GEMMA4_QUOTE);
+                out.push_str(entry.as_str().unwrap_or_default());
+                out.push_str(GEMMA4_QUOTE);
+            }
+            out.push_str("],");
+        }
+        if let Some(param_type) = params
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
+            out.push_str("type:");
+            out.push_str(GEMMA4_QUOTE);
+            out.push_str(&param_type.to_uppercase());
+            out.push_str(GEMMA4_QUOTE);
+            out.push('}');
+        }
+    }
+    out.push('}');
+    out.trim().to_string()
+}
+
+/// One structured tool call re-rendered from an assistant history message.
+struct Gemma4HistoryCall {
+    name: String,
+    arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Split an assistant history message that carries canonicalized structured
+/// `tool_calls` (see `canonical_incoming_tool_calls`: one
+/// `{"name":â€¦,"parameters":â€¦}` JSON line per call, appended after any plain
+/// content) back into (plain content, calls). Lines are only interpreted as
+/// calls when the message carries the internal tool-call marker.
+fn gemma4_split_canonical_tool_calls(content: &str) -> (String, Vec<Gemma4HistoryCall>) {
+    let mut calls = Vec::new();
+    let mut content_lines: Vec<&str> = Vec::new();
+    for line in content.lines() {
+        let parsed: Option<Gemma4HistoryCall> =
+            serde_json::from_str::<serde_json::Value>(line.trim())
+                .ok()
+                .and_then(|value| {
+                    let object = value.as_object()?;
+                    if object.len() != 2 {
+                        return None;
+                    }
+                    let name = object.get("name")?.as_str()?.to_string();
+                    let arguments = match object.get("parameters")? {
+                        serde_json::Value::Object(map) => map.clone(),
+                        _ => return None,
+                    };
+                    Some(Gemma4HistoryCall { name, arguments })
+                });
+        match parsed {
+            Some(call) => calls.push(call),
+            None => content_lines.push(line),
+        }
+    }
+    (content_lines.join("\n").trim().to_string(), calls)
+}
+
+/// Camelid extension for the agent bridge's TEXT-form history: an assistant
+/// turn whose entire content is pseudo-call lines (`name({json-args})`, the
+/// shape `history_to_messages` renders for non-native families) directly
+/// followed by `role:"tool"` results. Lifting these back into native
+/// `<|tool_call>` blocks keeps multi-step agent loops in-distribution. The
+/// parse is deliberately strict (every non-empty line must be one identifier
+/// plus one balanced JSON object) so prose is never rewritten.
+fn gemma4_parse_pseudo_call_lines(content: &str) -> Option<Vec<Gemma4HistoryCall>> {
+    let mut calls = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let open = line.find('(')?;
+        let name = &line[..open];
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let args_text = line[open + 1..].strip_suffix(')')?;
+        let arguments = match serde_json::from_str::<serde_json::Value>(args_text.trim()) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => return None,
+        };
+        calls.push(Gemma4HistoryCall {
+            name: name.to_string(),
+            arguments,
+        });
+    }
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+fn gemma4_render_tool_call(call: &Gemma4HistoryCall, out: &mut String) {
+    out.push_str(GEMMA4_TOOL_CALL_START);
+    out.push_str("call:");
+    out.push_str(&call.name);
+    out.push('{');
+    let mut first = true;
+    for (key, value) in gemma4_dictsort(&call.arguments) {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(key);
+        out.push(':');
+        gemma4_format_argument(value, false, out);
+    }
+    out.push('}');
+    out.push_str(GEMMA4_TOOL_CALL_END);
+}
+
+fn gemma4_render_tool_response(name: &str, content: &str, out: &mut String) {
+    out.push_str(GEMMA4_TOOL_RESPONSE_START);
+    out.push_str("response:");
+    out.push_str(name);
+    out.push_str("{value:");
+    out.push_str(GEMMA4_QUOTE);
+    out.push_str(content);
+    out.push_str(GEMMA4_QUOTE);
+    out.push('}');
+    out.push_str(GEMMA4_TOOL_RESPONSE_END);
+}
+
+/// Tools-branch Gemma 4 prompt renderer, mirroring the GGUF-embedded reference
+/// template's function-calling branch byte-for-byte for the certified envelope
+/// (`qa/gemma4/tool_template_shapes_v1.json`): tool declarations close the
+/// system turn, assistant tool calls and their in-call-order results share one
+/// model turn that stays OPEN through the tool cycle, and the generation
+/// prompt after a plain turn prefills an empty thought channel when thinking
+/// is off. Response names are resolved positionally (Camelid's canonical
+/// history keeps neither ids nor names). Beyond the reference, the agent
+/// bridge's text-form call turns are lifted back into native blocks (see
+/// `gemma4_parse_pseudo_call_lines`); a following tool result is then rendered
+/// exactly like the structured case instead of being dropped.
+fn gemma4_chat_prompt_with_tools(
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking: bool,
+    forced_tool_name: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    let mut system_text = String::new();
+    let mut rest_start = 0;
+    for message in messages {
+        if message.role == "system" {
+            if !system_text.is_empty() {
+                system_text.push_str("\n\n");
+            }
+            system_text.push_str(&message.content);
+            rest_start += 1;
+        } else {
+            break;
+        }
+    }
+    if thinking || !tools.is_empty() || !system_text.trim().is_empty() {
+        out.push_str(GEMMA4_TURN_START);
+        out.push_str("system\n");
+        if thinking {
+            out.push_str(GEMMA4_THINK);
+            out.push('\n');
+        }
+        out.push_str(system_text.trim());
+        for tool in tools {
+            out.push_str(GEMMA4_TOOL_START);
+            out.push_str(&gemma4_render_tool_declaration(tool));
+            out.push_str(GEMMA4_TOOL_END);
+        }
+        out.push_str(GEMMA4_TURN_END);
+        out.push('\n');
+    }
+
+    #[derive(PartialEq)]
+    enum Prev {
+        Other,
+        ToolCall,
+        ToolResponse,
+    }
+    let rest = &messages[rest_start..];
+    let mut prev = Prev::Other;
+    let mut prev_non_tool_was_assistant = false;
+    for (index, message) in rest.iter().enumerate() {
+        if message.role == "tool" {
+            // Consumed by the forward scan below; an orphan tool message (no
+            // preceding assistant call turn) is dropped exactly like the
+            // reference drops it.
+            continue;
+        }
+        prev = Prev::Other;
+        let is_assistant = message.role == "assistant";
+        let role = if is_assistant {
+            "model"
+        } else {
+            message.role.as_str()
+        };
+        let continuation = is_assistant && prev_non_tool_was_assistant;
+        if !continuation {
+            out.push_str(GEMMA4_TURN_START);
+            out.push_str(role);
+            out.push('\n');
+        }
+        let next_is_tool = rest.get(index + 1).is_some_and(|next| next.role == "tool");
+        let (content, calls) = if is_assistant
+            && message
+                .unsupported_content_parts
+                .iter()
+                .any(|part| part == INTERNAL_TOOL_CALL_HISTORY_MARKER)
+        {
+            gemma4_split_canonical_tool_calls(&message.content)
+        } else if is_assistant && next_is_tool {
+            match gemma4_parse_pseudo_call_lines(&message.content) {
+                Some(calls) => (String::new(), calls),
+                None => (message.content.clone(), Vec::new()),
+            }
+        } else {
+            (message.content.clone(), Vec::new())
+        };
+        for call in &calls {
+            gemma4_render_tool_call(call, &mut out);
+            prev = Prev::ToolCall;
+        }
+        let mut responses_emitted = false;
+        if !calls.is_empty() {
+            let mut call_names = calls.iter().map(|call| call.name.as_str());
+            for follow in rest[index + 1..]
+                .iter()
+                .take_while(|follow| follow.role == "tool")
+            {
+                gemma4_render_tool_response(
+                    call_names.next().unwrap_or("unknown"),
+                    &follow.content,
+                    &mut out,
+                );
+                prev = Prev::ToolResponse;
+                responses_emitted = true;
+            }
+        }
+        let rendered_content = if is_assistant {
+            gemma4_strip_channels(&content).trim().to_string()
+        } else {
+            content.trim().to_string()
+        };
+        out.push_str(&rendered_content);
+        let has_content = !rendered_content.is_empty();
+        if prev == Prev::ToolCall && !responses_emitted {
+            // Reference dangling-call shape: the response marker is primed and
+            // the model turn stays open.
+            out.push_str(GEMMA4_TOOL_RESPONSE_START);
+        } else if !(responses_emitted && !has_content) {
+            out.push_str(GEMMA4_TURN_END);
+            out.push('\n');
+        }
+        prev_non_tool_was_assistant = is_assistant;
+    }
+    if prev == Prev::Other {
+        out.push_str(GEMMA4_TURN_START);
+        out.push_str("model\n");
+        if !thinking {
+            // Reference tools branch: thinking-off generation prefills an
+            // EMPTY thought channel so the model answers (or calls) directly.
+            out.push_str(GEMMA4_CHANNEL_START);
+            out.push_str("thought\n");
+            out.push_str(GEMMA4_CHANNEL_END);
+        }
+    }
+    if let Some(name) = forced_tool_name {
+        // Assistant PREFILL after the ordinary generation prompt: the prior
+        // prompt stays an exact prefix (prompt-cache friendly), and parsing
+        // re-attaches this prefix via `gemma4_forced_tool_parse_text`.
+        out.push_str(GEMMA4_TOOL_CALL_START);
+        out.push_str("call:");
+        out.push_str(name);
+        out.push('{');
+    }
+    out
+}
+
+/// Re-attach the forced-tool prompt prefix before parsing (mirror of
+/// `ornith_forced_tool_parse_text` for the gemma4 envelope).
+fn gemma4_forced_tool_parse_text(forced_tool_name: Option<&str>, content: &str) -> String {
+    match forced_tool_name {
+        Some(name) => format!("{GEMMA4_TOOL_CALL_START}call:{name}{{{content}"),
+        None => content.to_string(),
+    }
+}
+
+/// Scan one pseudo-JSON argument value from the gemma4 tool-call dialect.
+/// Handles both the full server-side form (strings delimited by the `<|"|>`
+/// quote token, available when the generation is re-decoded with specials
+/// kept) and the degraded streamed form where detokenization already stripped
+/// the quote token (bare values are then read up to a top-level delimiter with
+/// brace/bracket depth tracking). Always makes progress; truncated output
+/// (generation stops ON `<tool_call|>`, so the closing marker is absent)
+/// parses to the prefix that was emitted.
+fn gemma4_scan_argument_value(text: &str) -> (serde_json::Value, usize) {
+    let rest = text.trim_start();
+    let mut offset = text.len() - rest.len();
+    if let Some(after) = rest.strip_prefix(GEMMA4_QUOTE) {
+        offset += GEMMA4_QUOTE.len();
+        return match after.find(GEMMA4_QUOTE) {
+            Some(end) => (
+                serde_json::Value::String(after[..end].to_string()),
+                offset + end + GEMMA4_QUOTE.len(),
+            ),
+            None => (serde_json::Value::String(after.to_string()), text.len()),
+        };
+    }
+    if rest.starts_with('{') {
+        let (object, used) = gemma4_scan_argument_object(&rest[1..]);
+        return (serde_json::Value::Object(object), offset + 1 + used);
+    }
+    if rest.starts_with('[') {
+        let mut items = Vec::new();
+        let mut i = 1;
+        loop {
+            let after = &rest[i..];
+            let trimmed = after.trim_start();
+            i += after.len() - trimmed.len();
+            match trimmed.chars().next() {
+                None => break,
+                Some(']') => {
+                    i += 1;
+                    break;
+                }
+                Some(',') => {
+                    i += 1;
+                    continue;
+                }
+                Some(_) => {
+                    let (value, used) = gemma4_scan_argument_value(&rest[i..]);
+                    items.push(value);
+                    i += used.max(1);
+                }
+            }
+        }
+        return (serde_json::Value::Array(items), offset + i);
+    }
+    // Bare token: read to a top-level delimiter, tracking nesting so balanced
+    // braces inside an unquoted string (code snippets in the degraded streamed
+    // form) survive.
+    let mut depth = 0usize;
+    let mut end = rest.len();
+    for (i, c) in rest.char_indices() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let raw = &rest[..end];
+    let trimmed = raw.trim();
+    let value = if trimmed == "true" {
+        serde_json::Value::Bool(true)
+    } else if trimmed == "false" {
+        serde_json::Value::Bool(false)
+    } else if trimmed == "null" {
+        serde_json::Value::Null
+    } else if let Ok(number) = trimmed.parse::<i64>() {
+        serde_json::Value::Number(number.into())
+    } else if let Some(number) = trimmed
+        .parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
+        .and_then(serde_json::Number::from_f64)
+    {
+        serde_json::Value::Number(number)
+    } else {
+        serde_json::Value::String(trimmed.to_string())
+    };
+    (value, offset + end)
+}
+
+/// Scan the `key:value,â€¦}` body of a gemma4 pseudo-JSON argument object,
+/// starting just AFTER the opening brace. Returns the parsed map and the
+/// number of bytes consumed including the closing brace when present.
+fn gemma4_scan_argument_object(text: &str) -> (serde_json::Map<String, serde_json::Value>, usize) {
+    let mut map = serde_json::Map::new();
+    let mut i = 0usize;
+    loop {
+        let rest = &text[i..];
+        let trimmed = rest.trim_start();
+        i += rest.len() - trimmed.len();
+        match trimmed.chars().next() {
+            None => break,
+            Some('}') => {
+                i += 1;
+                break;
+            }
+            Some(',') => {
+                i += 1;
+                continue;
+            }
+            Some(_) => {}
+        }
+        // Key: optionally `<|"|>`-quoted, else bare up to ':'.
+        let rest = &text[i..];
+        let key = if let Some(after) = rest.strip_prefix(GEMMA4_QUOTE) {
+            match after.find(GEMMA4_QUOTE) {
+                Some(end) => {
+                    let key = after[..end].to_string();
+                    i += GEMMA4_QUOTE.len() * 2 + end;
+                    key
+                }
+                None => {
+                    i = text.len();
+                    break;
+                }
+            }
+        } else {
+            match rest.find(':') {
+                Some(colon) => {
+                    let key = rest[..colon].trim().to_string();
+                    i += colon;
+                    key
+                }
+                None => {
+                    i = text.len();
+                    break;
+                }
+            }
+        };
+        let rest = &text[i..];
+        let after_ws = rest.trim_start();
+        i += rest.len() - after_ws.len();
+        if !after_ws.starts_with(':') {
+            break;
+        }
+        i += 1;
+        let (value, used) = gemma4_scan_argument_value(&text[i..]);
+        i = (i + used.max(1)).min(text.len());
+        if !key.is_empty() {
+            map.insert(key, value);
+        }
+    }
+    (map, i.min(text.len()))
+}
+
+/// Lift gemma4 `<|tool_call>call:NAME{argsâ€¦}<tool_call|>` envelopes into
+/// OpenAI `tool_calls` JSON (`{id,type:"function",function:{name,arguments:
+/// <json-string>}}`). Thinking channels are stripped first so envelope-shaped
+/// text inside hidden reasoning is never lifted. Both argument dialects the
+/// reference template understands are accepted: the native pseudo-JSON mapping
+/// form (bare keys, `<|"|>`-quoted strings) and the raw-JSON string form
+/// (`call:NAME{{"k":"v"}}`). A truncated envelope (generation stops ON the
+/// `<tool_call|>` marker) parses to the emitted prefix.
+pub(crate) fn parse_gemma4_tool_calls_json(text: &str) -> Vec<serde_json::Value> {
+    let text = gemma4_strip_channels(text);
+    let mut calls = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find(GEMMA4_TOOL_CALL_START) {
+        let after = &rest[start + GEMMA4_TOOL_CALL_START.len()..];
+        let body = after.trim_start();
+        let Some(body) = body.strip_prefix("call:") else {
+            rest = after;
+            continue;
+        };
+        let Some(brace) = body.find('{') else {
+            rest = after;
+            continue;
+        };
+        let name = body[..brace].trim().to_string();
+        let mut args_region = &body[brace..];
+        // Bound the argument scan at the envelope terminator when present so a
+        // following envelope is never swallowed by a truncated object.
+        let next_from = match args_region.find(GEMMA4_TOOL_CALL_END) {
+            Some(end) => {
+                args_region = &args_region[..end];
+                &body[brace + end + GEMMA4_TOOL_CALL_END.len()..]
+            }
+            None => "",
+        };
+        let inner = args_region.trim();
+        let inner = inner.strip_prefix('{').unwrap_or(inner);
+        let inner = inner.strip_suffix('}').unwrap_or(inner);
+        // Raw-JSON dialect first (an inner body that IS a JSON object), then
+        // the native pseudo-JSON scan.
+        let arguments = match serde_json::from_str::<serde_json::Value>(inner.trim()) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => gemma4_scan_argument_object(inner).0,
+        };
+        if !name.is_empty() {
+            calls.push(serde_json::json!({
+                "id": format!("call_{}", calls.len()),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::Value::Object(arguments).to_string(),
+                },
+            }));
+        }
+        rest = next_from;
+    }
+    calls
+}
 
 #[cfg(test)]
 mod gemma4_template_tests {
@@ -9051,6 +9923,206 @@ mod gemma4_template_tests {
             chat_template: Some(template.to_string()),
             specials_index: OnceLock::new(),
         }
+    }
+
+    /// Certified tools branch: every shape in the committed pack (rendered by
+    /// Jinja2 from the GGUF-embedded reference template) must be reproduced
+    /// byte-for-byte, with the wire messages travelling through the REAL
+    /// `ChatMessage` deserializer (structured tool_calls canonicalization
+    /// included) and the tools through the real OpenAI-envelope unwrap.
+    #[test]
+    fn gemma4_tools_renderer_matches_reference_template_pack() {
+        let pack: serde_json::Value =
+            serde_json::from_str(include_str!("../../qa/gemma4/tool_template_shapes_v1.json"))
+                .expect("tool template shape pack parses");
+        let shapes = pack["shapes"].as_array().expect("pack carries shapes");
+        assert!(!shapes.is_empty());
+        for shape in shapes {
+            let id = shape["id"].as_str().unwrap();
+            let thinking = shape["thinking"].as_bool().unwrap();
+            let tools = unwrap_runnable_tools(shape["tools"].as_array().unwrap().clone());
+            let messages: Vec<ChatMessage> = shape["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    serde_json::from_value(m.clone())
+                        .unwrap_or_else(|e| panic!("shape {id}: message deserializes: {e}"))
+                })
+                .collect();
+            let rendered = gemma4_chat_prompt_with_tools(&messages, &tools, thinking, None);
+            assert_eq!(
+                rendered,
+                shape["rendered_prompt"].as_str().unwrap(),
+                "shape {id} must render byte-identically to the reference template"
+            );
+        }
+    }
+
+    /// Camelid extension beyond the reference envelope: the agent bridge's
+    /// TEXT-form history (`name({json})` assistant lines + role:"tool"
+    /// results, the shape `history_to_messages` emits for non-native
+    /// families) lifts back into native `<|tool_call>` blocks instead of the
+    /// reference behavior of dropping the tool results.
+    #[test]
+    fn gemma4_tools_renderer_lifts_agent_text_form_history() {
+        let wire = serde_json::json!([
+            {"role": "user", "content": "How many lines does notes.txt have?"},
+            {"role": "assistant", "content": "read_file({\"path\":\"notes.txt\"})"},
+            {"role": "tool", "name": "read_file", "content": "alpha\nbeta\ngamma\n"},
+        ]);
+        let messages: Vec<ChatMessage> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::from_value(m.clone()).unwrap())
+            .collect();
+        let tools = vec![serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        })];
+        let rendered = gemma4_chat_prompt_with_tools(&messages, &tools, false, None);
+        assert!(
+            rendered.contains(
+                "<|turn>model\n<|tool_call>call:read_file{path:<|\"|>notes.txt<|\"|>}<tool_call|>\
+                 <|tool_response>response:read_file{value:<|\"|>alpha\nbeta\ngamma\n<|\"|>}<tool_response|>"
+            ),
+            "pseudo-call turn must lift into native blocks with the result attached: {rendered}"
+        );
+        // The tool cycle leaves the model turn OPEN: generation continues
+        // directly after the response block, with no fresh turn marker.
+        assert!(rendered.ends_with("<tool_response|>"), "{rendered}");
+        // Prose assistant turns are never rewritten: without a following tool
+        // message the same text renders as plain content.
+        let plain_wire = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "read_file({\"path\":\"notes.txt\"})"},
+            {"role": "user", "content": "ok"},
+        ]);
+        let plain: Vec<ChatMessage> = plain_wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::from_value(m.clone()).unwrap())
+            .collect();
+        let rendered_plain = gemma4_chat_prompt_with_tools(&plain, &tools, false, None);
+        assert!(
+            rendered_plain.contains("<|turn>model\nread_file({\"path\":\"notes.txt\"})<turn|>"),
+            "{rendered_plain}"
+        );
+    }
+
+    #[test]
+    fn gemma4_tools_renderer_forced_tool_prefills_call_envelope() {
+        let messages = [ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "Read notes.txt".to_string(),
+        }];
+        let tools = vec![serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        })];
+        let rendered = gemma4_chat_prompt_with_tools(&messages, &tools, false, Some("read_file"));
+        let unforced = gemma4_chat_prompt_with_tools(&messages, &tools, false, None);
+        // Prefill only APPENDS: the unforced prompt stays an exact prefix so
+        // forcing a tool never discards a resident prompt cache.
+        assert!(rendered.starts_with(&unforced));
+        assert!(rendered.ends_with("<|tool_call>call:read_file{"));
+        // The parse-side reconstruction re-attaches exactly that prefix.
+        assert_eq!(
+            gemma4_forced_tool_parse_text(Some("read_file"), "path:<|\"|>x<|\"|>}"),
+            "<|tool_call>call:read_file{path:<|\"|>x<|\"|>}"
+        );
+    }
+
+    #[test]
+    fn gemma4_tool_call_parse_lifts_native_dialect() {
+        // Full server-side form: specials-kept re-decode, `<|"|>` quotes
+        // intact, terminator present.
+        let calls = parse_gemma4_tool_calls_json(
+            "<|channel>thought\nI should read the file.\n<channel|>\
+             <|tool_call>call:read_file{path:<|\"|>notes.txt<|\"|>,start_line:2}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        assert_eq!(calls[0]["id"], "call_0");
+        assert_eq!(calls[0]["type"], "function");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args,
+            serde_json::json!({"path": "notes.txt", "start_line": 2})
+        );
+    }
+
+    #[test]
+    fn gemma4_tool_call_parse_handles_truncated_and_degraded_forms() {
+        // Truncated: generation stops ON `<tool_call|>`, so the terminator
+        // (and possibly the closing brace) never decodes.
+        let calls = parse_gemma4_tool_calls_json(
+            "<|tool_call>call:write_file{content:<|\"|>hello there\n<|\"|>,path:<|\"|>greeting.txt<|\"|>",
+        );
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args,
+            serde_json::json!({"content": "hello there\n", "path": "greeting.txt"})
+        );
+        // Degraded streamed form: detokenization stripped the quote token, so
+        // values scan to top-level delimiters (balanced braces survive).
+        let calls = parse_gemma4_tool_calls_json(
+            "<|tool_call>call:write_file{content:fn main() { }\n,path:x.rs}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "x.rs");
+        assert_eq!(args["content"], "fn main() { }");
+        // Raw-JSON dialect (the reference template's string-arguments arm).
+        let calls = parse_gemma4_tool_calls_json(
+            "<|tool_call>call:read_file{{\"path\":\"notes.txt\"}}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, serde_json::json!({"path": "notes.txt"}));
+    }
+
+    #[test]
+    fn gemma4_tool_call_parse_ignores_thought_channels_and_plain_text() {
+        // Envelope-shaped text INSIDE a thought channel is hidden reasoning
+        // and must never lift.
+        assert!(parse_gemma4_tool_calls_json(
+            "<|channel>thought\n<|tool_call>call:read_file{path:<|\"|>x<|\"|>}<tool_call|>\n<channel|>The answer is 3."
+        )
+        .is_empty());
+        assert!(parse_gemma4_tool_calls_json("The file has 3 lines.").is_empty());
+        // Multiple sequential envelopes lift in order with stable ids.
+        let calls = parse_gemma4_tool_calls_json(
+            "<|tool_call>call:read_file{path:<|\"|>a<|\"|>}<tool_call|>\
+             <|tool_call>call:list_dir{path:<|\"|>.<|\"|>}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_0");
+        assert_eq!(calls[1]["function"]["name"], "list_dir");
+    }
+
+    #[test]
+    fn gemma4_tools_branch_gate_requires_the_template_markers() {
+        assert!(gemma4_template_has_tools_branch(Some(
+            "â€¦{{- '<|tool>' -}}â€¦'<|tool_call>call:'â€¦'<|tool_response>'â€¦"
+        )));
+        // The locked no-tools envelope (qa/gemma4/template_shapes_v1.json era
+        // templates) has no tool markers and must keep failing closed.
+        assert!(!gemma4_template_has_tools_branch(Some(
+            "{{ '<|turn>' + role + '\\n' }}â€¦{{ '<turn|>\\n' }}"
+        )));
+        assert!(!gemma4_template_has_tools_branch(None));
     }
 
     #[test]
@@ -10345,6 +11417,123 @@ impl Gemma4ServeRuntime {
         Ok(tokens.len())
     }
 
+    /// The GGUF-embedded chat template of the loaded row (drives the certified
+    /// tools-branch gate; see `gemma4_template_has_tools_branch`).
+    fn chat_template(&self) -> Option<String> {
+        match self {
+            Self::Local(r) => r.tokenizer().chat_template.clone(),
+            Self::Distributed(r) => r.tokenizer().chat_template.clone(),
+            #[cfg(target_os = "macos")]
+            Self::Gpu(m) => m
+                .lock()
+                .expect("gemma4 gpu runtime lock")
+                .tokenizer()
+                .chat_template
+                .clone(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda { runtime, .. } => runtime
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .tokenizer()
+                .chat_template
+                .clone(),
+        }
+    }
+
+    /// Extra stop ids for tool-enabled requests (empty when the vocab lacks
+    /// the tool markers; generation then falls back to the ordinary stop set).
+    fn tool_stop_token_ids(&self) -> Vec<u32> {
+        match self {
+            Self::Local(r) => crate::gemma4_runtime::gemma4_tool_stop_token_ids(r.tokenizer()),
+            Self::Distributed(r) => {
+                crate::gemma4_runtime::gemma4_tool_stop_token_ids(r.tokenizer())
+            }
+            #[cfg(target_os = "macos")]
+            Self::Gpu(m) => crate::gemma4_runtime::gemma4_tool_stop_token_ids(
+                m.lock().expect("gemma4 gpu runtime lock").tokenizer(),
+            ),
+            #[cfg(feature = "cuda")]
+            Self::Cuda { runtime, .. } => crate::gemma4_runtime::gemma4_tool_stop_token_ids(
+                runtime
+                    .lock()
+                    .expect("gemma4 cuda runtime lock")
+                    .tokenizer(),
+            ),
+        }
+    }
+
+    /// Re-decode generated ids KEEPING special tokens. The tools lane parses
+    /// tool-call envelopes from this text: the `<|"|>` string-quote token is a
+    /// `<|â€¦|>`-shaped user_defined token that the ordinary
+    /// `remove_special=true` decode strips, which would degrade exact string
+    /// arguments to the delimiter-scanned fallback.
+    fn decode_with_specials(&self, ids: &[u32]) -> crate::Result<String> {
+        match self {
+            Self::Local(r) => r.tokenizer().decode(ids, false),
+            Self::Distributed(r) => r.tokenizer().decode(ids, false),
+            #[cfg(target_os = "macos")]
+            Self::Gpu(m) => m
+                .lock()
+                .expect("gemma4 gpu runtime lock")
+                .tokenizer()
+                .decode(ids, false),
+            #[cfg(feature = "cuda")]
+            Self::Cuda { runtime, .. } => runtime
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .tokenizer()
+                .decode(ids, false),
+        }
+    }
+
+    /// [`Self::generate_greedy_cancellable`] with request-scoped extra stop
+    /// ids. Only the Local runtime implements the extended stop set today; the
+    /// other serve variants fall back to the ordinary stop set, which is an
+    /// efficiency (not correctness) difference — the tools parser lifts the
+    /// FIRST envelope and discards anything decoded past it.
+    fn generate_greedy_cancellable_with_stops<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        extra_stop_token_ids: &[u32],
+        should_cancel: C,
+    ) -> crate::Result<crate::gemma4_runtime::Gemma4GenerationOutcome> {
+        match self {
+            Self::Local(r) => r.generate_greedy_cancellable_with_stops(
+                prompt,
+                max_new,
+                extra_stop_token_ids,
+                should_cancel,
+            ),
+            other => other.generate_greedy_cancellable(prompt, max_new, should_cancel),
+        }
+    }
+
+    /// [`Self::generate_greedy_cancellable_receipted`] with request-scoped
+    /// extra stop ids (same Local-only extension as
+    /// [`Self::generate_greedy_cancellable_with_stops`]).
+    fn generate_greedy_cancellable_receipted_with_stops<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        extra_stop_token_ids: &[u32],
+        should_cancel: C,
+    ) -> crate::Result<(
+        crate::gemma4_runtime::Gemma4GenerationOutcome,
+        Option<crate::gemma4_runtime::Gemma4HybridTelemetry>,
+    )> {
+        match self {
+            Self::Local(runtime) => runtime
+                .generate_greedy_cancellable_with_hybrid_telemetry_and_stops(
+                    prompt,
+                    max_new,
+                    extra_stop_token_ids,
+                    should_cancel,
+                ),
+            other => other.generate_greedy_cancellable_receipted(prompt, max_new, should_cancel),
+        }
+    }
+
     fn generate_greedy_cancellable<C: FnMut() -> bool>(
         &self,
         prompt: &str,
@@ -10462,9 +11651,15 @@ async fn gemma4_generate_on_engine(
     runtime: Arc<Gemma4ServeRuntime>,
     prompt: String,
     max_tokens: usize,
+    extra_stop_token_ids: Vec<u32>,
 ) -> std::result::Result<crate::gemma4_runtime::Gemma4GenerationOutcome, Box<Response>> {
     match run_cancellable_gemma4_job(state, move |worker_cancel| {
-        runtime.generate_greedy_cancellable(&prompt, max_tokens, || worker_cancel.is_cancelled())
+        runtime.generate_greedy_cancellable_with_stops(
+            &prompt,
+            max_tokens,
+            &extra_stop_token_ids,
+            || worker_cancel.is_cancelled(),
+        )
     })
     .await
     {
@@ -10488,6 +11683,7 @@ async fn gemma4_generate_receipted_on_engine(
     runtime: Arc<Gemma4ServeRuntime>,
     prompt: String,
     max_tokens: usize,
+    extra_stop_token_ids: Vec<u32>,
 ) -> std::result::Result<
     (
         crate::gemma4_runtime::Gemma4GenerationOutcome,
@@ -10496,9 +11692,12 @@ async fn gemma4_generate_receipted_on_engine(
     Box<Response>,
 > {
     match run_cancellable_gemma4_job(state, move |worker_cancel| {
-        runtime.generate_greedy_cancellable_receipted(&prompt, max_tokens, || {
-            worker_cancel.is_cancelled()
-        })
+        runtime.generate_greedy_cancellable_receipted_with_stops(
+            &prompt,
+            max_tokens,
+            &extra_stop_token_ids,
+            || worker_cancel.is_cancelled(),
+        )
     })
     .await
     {
@@ -10738,7 +11937,7 @@ async fn gemma4_completion_nonstreaming(
     };
     let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let t_generate = std::time::Instant::now();
-    let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
+    let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens, Vec::new()).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (text, ids) = match result {
         Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
@@ -10860,6 +12059,122 @@ async fn gemma4_completion_streaming(
     Sse::new(events).into_response()
 }
 
+/// Tool-enabled Gemma 4 streaming: run the tools-branch generation to
+/// completion (it stops on the tool-call envelope terminator), then emit the
+/// OpenAI chunk sequence — role, one `tool_calls` delta chunk (or one content
+/// chunk), the finish chunk with usage, `[DONE]`. Mirrors the runnable lane's
+/// hold-until-complete contract: a raw envelope never leaks through
+/// `delta.content`.
+async fn gemma4_chat_streaming_with_tools(
+    state: &AppState,
+    id: String,
+    runtime: Arc<Gemma4ServeRuntime>,
+    req: &ChatCompletionRequest,
+) -> Response {
+    let messages = req.messages.clone().unwrap_or_default();
+    let thinking = req.camelid_enable_thinking.unwrap_or(false);
+    let tools = runnable_request_tools(req);
+    let forced_tool_name = runnable_forced_tool_name(req.tool_choice.as_ref(), &tools);
+    let prompt =
+        gemma4_chat_prompt_with_tools(&messages, &tools, thinking, forced_tool_name.as_deref());
+    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
+    let created = unix_secs();
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
+    {
+        Ok(count) => count,
+        Err(response) => return response,
+    };
+    let telemetry_guard = telemetry::RequestGuard::begin(gemma4_telemetry_start(
+        &id,
+        prompt_tokens,
+        max_tokens as u32,
+        true,
+    ));
+    let result = gemma4_generate_on_engine(
+        state,
+        Arc::clone(&runtime),
+        prompt,
+        max_tokens,
+        runtime.tool_stop_token_ids(),
+    )
+    .await;
+    let (text, ids) = match result {
+        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
+            (text, token_ids)
+        }
+        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
+            telemetry_guard.finish(gemma4_telemetry_error(
+                "gemma4 generation cancelled by disconnected request".to_string(),
+            ));
+            return *generation_cancelled_response(generated_tokens);
+        }
+        Err(response) => {
+            telemetry_guard.finish(gemma4_telemetry_error(
+                "gemma4 generation failed on the engine worker".to_string(),
+            ));
+            return *response;
+        }
+    };
+    let parse_text = runtime
+        .decode_with_specials(&ids)
+        .unwrap_or_else(|_| text.clone());
+    let tool_calls = parse_gemma4_tool_calls_json(&gemma4_forced_tool_parse_text(
+        forced_tool_name.as_deref(),
+        &parse_text,
+    ));
+    let finish_reason = if tool_calls.is_empty() {
+        gemma4_finish_reason(ids.len(), max_tokens)
+    } else {
+        "tool_calls"
+    };
+    telemetry_guard.finish(telemetry::RequestFinish {
+        status: "ok",
+        finish_reason: Some(finish_reason.to_string()),
+        completion_tokens: ids.len(),
+        ttft_ms: None,
+        decode_tps: None,
+        prefill_tps: None,
+        error: None,
+    });
+    let content = gemma4_strip_channels(&text);
+    let completion_tokens = ids.len();
+    let chunk = |delta: serde_json::Value, finish: Option<&str>| {
+        serde_json::json!({
+            "id": "chatcmpl-gemma4",
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": id,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+        })
+    };
+    let mut events_out: Vec<String> = Vec::new();
+    events_out.push(chunk(serde_json::json!({ "role": "assistant" }), None).to_string());
+    if !tool_calls.is_empty() {
+        let deltas: Vec<serde_json::Value> = tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, call)| {
+                let mut delta = call.clone();
+                delta["index"] = serde_json::json!(i);
+                delta
+            })
+            .collect();
+        events_out.push(chunk(serde_json::json!({ "tool_calls": deltas }), None).to_string());
+    } else if !content.is_empty() {
+        events_out.push(chunk(serde_json::json!({ "content": content }), None).to_string());
+    }
+    let mut done = chunk(serde_json::json!({}), Some(finish_reason));
+    done["usage"] = serde_json::json!(gemma4_usage(prompt_tokens, completion_tokens));
+    events_out.push(done.to_string());
+    let events = async_stream::stream! {
+        for event in events_out {
+            yield Ok::<Event, std::convert::Infallible>(Event::default().data(event));
+        }
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    Sse::new(events).into_response()
+}
+
 async fn gemma4_chat_nonstreaming(
     state: &AppState,
     id: String,
@@ -10867,7 +12182,23 @@ async fn gemma4_chat_nonstreaming(
     req: &ChatCompletionRequest,
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
-    let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
+    let thinking = req.camelid_enable_thinking.unwrap_or(false);
+    // Certified tools branch: tools (already gated on the loaded row's
+    // template carrying the branch, and emptied by `tool_choice:"none"`)
+    // render through the reference template's function-calling format, and
+    // generation stops on the tool-call envelope terminator.
+    let tools = runnable_request_tools(req);
+    let forced_tool_name = runnable_forced_tool_name(req.tool_choice.as_ref(), &tools);
+    let prompt = if tools.is_empty() {
+        gemma4_chat_prompt(&messages, thinking)
+    } else {
+        gemma4_chat_prompt_with_tools(&messages, &tools, thinking, forced_tool_name.as_deref())
+    };
+    let extra_stop_token_ids = if tools.is_empty() {
+        Vec::new()
+    } else {
+        runtime.tool_stop_token_ids()
+    };
     let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
     {
@@ -10885,11 +12216,24 @@ async fn gemma4_chat_nonstreaming(
     // the original generation path, including no route-interval epoch reset and
     // no per-round residency snapshots.
     let result = if req.camelid_receipt.unwrap_or(false) {
-        gemma4_generate_receipted_on_engine(state, runtime, prompt, max_tokens).await
+        gemma4_generate_receipted_on_engine(
+            state,
+            Arc::clone(&runtime),
+            prompt,
+            max_tokens,
+            extra_stop_token_ids,
+        )
+        .await
     } else {
-        gemma4_generate_on_engine(state, runtime, prompt, max_tokens)
-            .await
-            .map(|outcome| (outcome, None))
+        gemma4_generate_on_engine(
+            state,
+            Arc::clone(&runtime),
+            prompt,
+            max_tokens,
+            extra_stop_token_ids,
+        )
+        .await
+        .map(|outcome| (outcome, None))
     };
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (outcome, hybrid_telemetry) = match result {
@@ -10927,7 +12271,26 @@ async fn gemma4_chat_nonstreaming(
             );
         }
     };
-    let finish_reason = gemma4_finish_reason(ids.len(), max_tokens);
+    // Structured tool_calls, lifted from the generation only when tools were
+    // rendered into the prompt. The parse runs over a specials-kept re-decode
+    // so `<|"|>`-quoted string arguments survive exactly; the ordinary decode
+    // (quote token stripped) stands in if the re-decode fails.
+    let tool_calls = if tools.is_empty() {
+        Vec::new()
+    } else {
+        let parse_text = runtime
+            .decode_with_specials(&ids)
+            .unwrap_or_else(|_| text.clone());
+        parse_gemma4_tool_calls_json(&gemma4_forced_tool_parse_text(
+            forced_tool_name.as_deref(),
+            &parse_text,
+        ))
+    };
+    let finish_reason = if tool_calls.is_empty() {
+        gemma4_finish_reason(ids.len(), max_tokens)
+    } else {
+        "tool_calls"
+    };
     let camelid = match gemma4_chat_camelid_payload(&ids, generate_ms, hybrid_telemetry) {
         Ok(camelid) => camelid,
         Err(error) => {
@@ -10951,6 +12314,17 @@ async fn gemma4_chat_nonstreaming(
         prefill_tps: None,
         error: None,
     });
+    // Thinking channels are stripped: hidden reasoning never reaches the
+    // client or re-enters chat history. Tool-call envelope text stays in
+    // content beside the structured tool_calls (same contract as the runnable
+    // lane: agent clients re-parse content on streamed paths).
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": gemma4_strip_channels(&text),
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
     let body = serde_json::json!({
         "id": "chatcmpl-gemma4",
         "object": "chat.completion",
@@ -10958,9 +12332,7 @@ async fn gemma4_chat_nonstreaming(
         "model": id,
         "choices": [{
             "index": 0,
-            // Thinking channels are stripped: hidden reasoning never reaches
-            // the client or re-enters chat history.
-            "message": { "role": "assistant", "content": gemma4_strip_channels(&text) },
+            "message": message,
             "finish_reason": finish_reason,
         }],
         "usage": gemma4_usage(prompt_tokens, ids.len()),
@@ -13921,6 +15293,12 @@ async fn gemma4_chat_streaming(
     runtime: Arc<Gemma4ServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
+    // Tool-enabled streams hold the generation and emit structured tool_calls
+    // deltas (or one content delta) at completion, so a raw `<|tool_call>`
+    // envelope never streams to the client piecemeal.
+    if !runnable_request_tools(req).is_empty() {
+        return gemma4_chat_streaming_with_tools(state, id, runtime, req).await;
+    }
     let messages = req.messages.clone().unwrap_or_default();
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
     let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
@@ -16422,7 +17800,11 @@ async fn chat_completions(
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
             }
-            if tools_active {
+            // Tools are certified per ROW, not per lane: only a loaded GGUF
+            // whose embedded chat template carries the gemma4 tool-call branch
+            // may render them; earlier template revisions keep failing closed.
+            if tools_active && !gemma4_template_has_tools_branch(runtime.chat_template().as_deref())
+            {
                 return tools_unsupported_on_lane("gemma4");
             }
             return if req.stream.unwrap_or(false) {

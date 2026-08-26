@@ -185,7 +185,15 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
     let _server = ServerHandle::ensure(cfg.addr, &client)?;
 
     // --- bounded load: a contended box yields INCONCLUSIVE, never FAIL ------
-    let abs = std::fs::canonicalize(&cfg.model).unwrap_or_else(|_| cfg.model.clone());
+    // Absolute WITHOUT resolving symlinks: the serve lane is selected from the
+    // path AS NAMED (a catalog-managed Ghost-MoE pair is detected via the
+    // catalog filename's `.cghost` sibling), so canonicalizing a catalog
+    // symlink silently reroutes the load onto the bare artifact — measured on
+    // the 26B pair: the resolved sparse hot shadow loaded WITHOUT its expert
+    // pack and every generation decoded routed experts as zeros (fluent-looking
+    // garbage), failing the battery for a reason that was never tool
+    // capability. The receipt records exactly the path that was loaded.
+    let abs = std::path::absolute(&cfg.model).unwrap_or_else(|_| cfg.model.clone());
     eprintln!("loading {} (timeout {}s)…", abs.display(), cfg.load_timeout);
     let started = Instant::now();
     let (tx, rx) = mpsc::channel();
@@ -470,6 +478,10 @@ fn family_for(gguf: &std::path::Path) -> String {
         "qwen".into()
     } else if name.contains("mistral") {
         "mistral".into()
+    } else if name.contains("gemma-4") || name.contains("gemma4") {
+        // Routes the content-text fallback to `parse_gemma4` (the primary path
+        // stays the server's structured tool_calls).
+        "gemma4".into()
     } else {
         "llama".into()
     }
