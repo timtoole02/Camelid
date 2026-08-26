@@ -10396,6 +10396,9 @@ fn gemma4_max_tokens_for_runtime_context(
     Ok(requested_max_tokens.min(capacity - prompt_tokens))
 }
 
+// Axum's concrete response carries the public error envelope; boxing it here
+// would only move that cost into every caller's error path.
+#[allow(clippy::result_large_err)]
 fn gemma4_context_bounded_max_tokens(
     runtime: &Gemma4ServeRuntime,
     prompt_tokens: usize,
@@ -14635,6 +14638,7 @@ const GEMMA4_GHOST_HYBRID_METAL_PREFILL: &str = "gemma4_ghost_moe_hybrid_metal_p
 const GEMMA4_GHOST_HYBRID_METAL_DECODE: &str = "gemma4_ghost_moe_hybrid_metal_decode";
 const GEMMA4_GHOST_METAL_DECODE_WITHOUT_MTP: &str = "gemma4_ghost_moe_metal_decode";
 
+#[cfg(any(target_os = "macos", test))]
 fn gemma4_metal_ghost_support_scope_matches(
     operating_system: &str,
     architecture: &str,
@@ -14670,14 +14674,14 @@ fn gemma4_metal_ghost_supported_on_current_host() -> bool {
                         .unwrap_or_else(|| "unknown".into()),
                 )
             });
-        return gemma4_metal_ghost_support_scope_matches(
+        gemma4_metal_ghost_support_scope_matches(
             env::consts::OS,
             env::consts::ARCH,
             Some(model_identifier),
             Some(cpu_model),
             Some(operating_system_version),
             true,
-        );
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
