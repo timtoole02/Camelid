@@ -1597,6 +1597,7 @@ struct MappedRdadviseDispatchReceipt {
 /// phases of a target round. The identity set bounds syscall attempts, not
 /// merely concurrently executing calls, and contains no expert payload.
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug, Default)]
 struct MappedRdadviseRoundReservation {
     expected_start_pos: usize,
@@ -2016,23 +2017,28 @@ const GHOST_METAL_DEMAND_LOAD_ONLY_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAN
 /// Exact opt-in for the macOS clean-file-pager lane. Canonical expert records
 /// stay in the retained read-only `.cghost` mmap and are exposed through
 /// transient no-copy Tier-2 tables.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_FILE_MAPPED_EXPERTS_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS";
 /// Exact opt-in for the mixed 32-hot/mapped-cold lane. The value is the
 /// receipted uniform physical cache size and must be canonical `32`; absence
 /// preserves the mapped-only foundation.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_HOT_SLOTS_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS";
 const GHOST_METAL_HYBRID_HOT_SLOTS: usize = 32;
 /// Default-off exact A/B selector for a uniform 40-record anonymous cache.
 /// Like Hot48, this remains subordinate to the canonical Hot32 parent opt-in;
 /// the experiment name changes physical geometry without widening the public
 /// parent selector. The verifier is admitted only for exact K=1..=8 rounds.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT40_EXPERIMENT";
 const GHOST_METAL_HYBRID_HOT40_SLOTS: usize = 40;
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_HOT40_MAX_K: usize = 8;
 /// Runtime-only exact A/B selector for a uniform 48-record anonymous cache.
 /// It remains subordinate to the frozen `HYBRID_HOT_SLOTS=32` admission so
 /// merely changing the receipted parent selector can never enter this lane.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_HOT48_EXPERIMENT_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT48_EXPERIMENT";
 const GHOST_METAL_HYBRID_HOT48_SLOTS: usize = 48;
@@ -2041,6 +2047,7 @@ const GHOST_METAL_HYBRID_HOT48_SLOTS: usize = 48;
 /// absence preserves uniform Hot32, while presence must be exactly 30
 /// canonical comma-separated decimals whose fixed 960-record total preserves
 /// the already receipted anonymous-memory ceiling.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER";
 /// Exact hybrid-only policy for post-terminal decode promotion. Unset and the
@@ -2048,6 +2055,7 @@ const GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV: &str =
 /// keeps the mapped tier authoritative without copying the just-consumed
 /// decode union into anonymous hot storage. The final-prefill handoff remains
 /// a distinct, unconditional hybrid seed.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_DECODE_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION";
 /// Exact hybrid-only opt-in for selected-cold mapped-record page advice. The
 /// routing thread only resolves and enqueues record-sized ranges; advisory work
@@ -2067,19 +2075,23 @@ const GHOST_METAL_DECODE_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DECOD
 /// which is the point of this switch. Refusal (a live table lease or a union
 /// wider than the hot budget) simply retains the mapped fallback, so the switch
 /// is a performance opt-in and never a correctness dependency.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_DEMAND_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION";
 /// Exact decode-only A/B: execute the already-resident routed experts while
 /// the host fills newly-routed records into one reusable cold staging slab.
 /// The cold wave is committed only after its complete records and directory
 /// are published; unset keeps the established demand-promotion schedule.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_HOT_COLD_OVERLAP_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP";
 /// Exact opt-in for the six-record-per-layer retained cold bank. It is armed
 /// only on the frozen H40 shape; every other configuration keeps the existing
 /// direct-stage schedule unchanged.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_RETAINED_COLD_BANK_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_BANK";
 /// Exact opt-in for restoring read-pool queue depth after retained hits leave
 /// only a few fresh records in a layer. It has no effect unless the retained
 /// bank is successfully armed.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_RETAINED_COLD_CHUNKED_READ_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_CHUNKED_READ";
 /// Exact decode-only H45 opt-in. Fresh retained-bank replacements are read
@@ -2087,23 +2099,30 @@ const GHOST_METAL_RETAINED_COLD_CHUNKED_READ_ENV: &str =
 /// its original compact-stage slot. This removes the post-Down bank blits
 /// without letting the committed hot command reference any destination that
 /// the CPU can still mutate.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_RETAINED_COLD_DIRECT_BANK_FILL";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_SINGLE_DOWN";
 /// H54 exact three-wave GateUp schedule. Already-ready live-sequential cold
 /// records use a separate bounded Metal slab while authoritative direct reads
 /// write the disjoint demand slab. The full-union Down remains single.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_THREE_WAVE_GATEUP_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_THREE_WAVE_GATEUP";
 /// Exact H55-only opt-in for restoring read-pool queue depth when live-stage
 /// hits leave fewer authoritative demand records than read workers. It changes
 /// only the positioned-read fanout inside `StageColdLaunch`; the established
 /// fallback, slot policy, byte count, and command schedule remain unchanged.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_ASYNC_TWO_WAVE_CHUNKED_READ";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_RETAINED_COLD_H40_HOT_SLOTS: usize = 2_100;
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE: [usize; 30] = [
     74, 96, 62, 60, 76, 53, 62, 64, 64, 96, 96, 96, 76, 80, 96, 63, 52, 51, 58, 60, 53, 59, 64, 76,
     59, 70, 73, 69, 72, 70,
@@ -2113,7 +2132,9 @@ const GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE: [usize; 30] = [
 /// watchdog ceilings while retaining its per-layer weighting. Keeping the
 /// literal frozen prevents a merely same-total profile from silently changing
 /// the I/O and physical-footprint contract.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS: usize = 1_408;
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
     60, 64, 45, 43, 40, 41, 44, 42, 47, 46, 40, 41, 44, 46, 42, 50, 40, 39, 46, 47, 41, 46, 45, 43,
     46, 56, 59, 56, 58, 51,
@@ -2300,27 +2321,35 @@ fn ghost_metal_live_sequential_hot_profile_admitted(profile: &[usize]) -> bool {
 /// its final Metal stage slot instead of allocating an intermediate record and
 /// copying it a second time. H50 can admit a separately bounded previous-cold
 /// source, but only through its own exact literal opt-in below.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_DIRECT_STAGE_READ_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DIRECT_STAGE_READ";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
 const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 512;
 /// Default-off A/B that reads a bounded subset of the previous successful
 /// decode's exact cold routes while the MTP assistant runs. The current
 /// router remains authoritative; staged bytes are only an alternate source
 /// for its exact `StageCold` identities.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_RECORDS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE_RECORDS";
 /// H50 exact compatibility gate. When both previous-cold staging and the
 /// direct-to-stage lane are enabled, only already-ready matching private bytes
 /// may substitute for one exact direct read. Every other state is claimed by
 /// authoritative demand without waiting.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_DIRECT_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PREVIOUS_COLD_STAGE_DIRECT";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_DEFAULT_RECORDS: usize = 96;
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_PREVIOUS_COLD_STAGE_MAX_RECORDS: usize = 96;
 /// Darwin-only stronger page-in experiment. It is deliberately subordinate to
 /// mapped readahead so existing launch receipts cannot silently change pager
 /// strategy. The early and total limits share one per-target identity set.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_RDADVISE_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE";
 const GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS: usize = 32;
 const GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS: usize = 64;
@@ -2329,14 +2358,17 @@ const GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS: usize = 64;
 /// assistant proposals against exact start residency and post-router unions.
 /// Neither receipt changes a slot, table, command buffer, token, or fallback
 /// decision.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_SPARSE_PREDICT_PROBE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_SPARSE_PREDICT_PROBE";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_SPARSE_PREDICT_CAP: usize = 48;
 /// Observation-only sequential predictor probe. After layer L's exact
 /// attention/router barrier, the Metal lane exposes the completed post-attention
 /// hidden rows to the existing CPU router predictor for layer L+1. The ranked
 /// result is compared with L+1's later exact union, but never drives a read,
 /// slot, table, command buffer, route, or fallback decision.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE";
 /// H56 observation-only replay of the official assistant's post-projection
@@ -2344,38 +2376,46 @@ const GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV: &str =
 /// verification, but projection and comparison run only after the exact target
 /// head has fixed the verifier output. No candidate from this probe is ever
 /// passed to a stage, slot filler, route table, or execution admission path.
+#[cfg(any(target_os = "macos", test))]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_ENV: &str = "CAMELID_GEMMA4_MTP_ASSISTANT_ROUTER_PROBE";
 /// Exact H40-only consumer for the live sequential signal. Private bounded
 /// readers may prepare next-layer cold records, but exact demand never waits
 /// for them and remains the only authority for slots and routing.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE";
 /// H48 expansion of the exact H47 lane: a second private reader under the same
 /// cap-eight candidate set. This remains subordinate to the stage opt-in and
 /// literal `1` so a stale profile cannot silently widen I/O or memory.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER";
 /// Replace the per-row advisory router matvecs with one Accelerate SGEMM per
 /// layer. The signal remains advisory and exact StageCold demand is unchanged.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT";
 /// H70 widens only the private rolling prediction payload. The exact router,
 /// static hot profile, compact Metal stage, and demand reader remain unchanged.
 /// Admission is deliberately stricter than the parent stage selector below.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16";
 /// Observation-only exact route/residency trace for offline placement work.
 /// This is not inherited by H49/H69: a dedicated literal-1 selector is
 /// required so ordinary throughput receipts do not pay formatting/log I/O.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_EXACT_RESIDENCY_TRACE_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_EXACT_RESIDENCY_TRACE";
 /// Default-off H71 policy: select the fixed Mini2 hot footprint from exact
 /// prompt-only route recency/chunk-presence scores at the prefill handoff.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF";
 /// Default-off H71 subordinate policy: when the prompt route union does not
 /// fill a layer's fixed footprint, retain deterministically ranked identities
 /// that already occupy that layer. The parent H71 selector remains mandatory.
+#[cfg(target_os = "macos")]
 const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL";
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP: usize = 8;
@@ -2391,6 +2431,7 @@ const _: () = assert!(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_PAYLOAD_BYTE
 const _: () = assert!(
     GHOST_METAL_LIVE_SEQUENTIAL_STAGE_RECORD_BYTES == crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES
 );
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS: usize = 2;
 
 #[cfg(any(target_os = "macos", test))]
@@ -2438,9 +2479,11 @@ const GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER: &str =
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_RDADVISE_POLICY_MARKER: &str =
     "[gemma4-ghost-metal] mapped-cold rdadvise policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE effective=1 parent=CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD strategy=F_RDADVISE dispatch=direct exact_record_ranges=1 early_max_records=32 total_max_records=64 anonymous_capacity_bytes=0 correctness_dependency=0";
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_PROFILE_LAYERS: usize = 30;
 const GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS: usize = 8;
 const GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS: usize = 64;
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS: usize =
     GHOST_METAL_HYBRID_PROFILE_LAYERS * GHOST_METAL_HYBRID_HOT_SLOTS;
 /// Exact demand-only residency bound. The runtime preserves the full logical
@@ -2448,6 +2491,7 @@ const GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS: usize =
 /// physical prefix. Keeping unbound records out of the Tier-2 table matters:
 /// the first compute use may materialize every buffer encoded in it even when
 /// the encoder declares only the active route resources.
+#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER";
 /// Global overflow experts reused across layers. 24 resident + 18 covers the
@@ -2482,6 +2526,7 @@ fn ghost_metal_demand_load_only_from_env() -> bool {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_sparse_predict_probe_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -2878,7 +2923,7 @@ fn format_exact_residency_trace(
             return Err("capacity-domain");
         }
         let layer_wave_ms = wave_load_ms_per_layer[layer_idx];
-        if !layer_wave_ms.is_finite() || layer_wave_ms < 0.0 || layer_wave_ms > 1.0e9 {
+        if !layer_wave_ms.is_finite() || !(0.0..=1.0e9).contains(&layer_wave_ms) {
             return Err("wave-domain");
         }
         let layer_wave_us = (layer_wave_ms * 1_000.0).round() as u64;
@@ -3010,6 +3055,7 @@ fn sparse_candidate_missing(actual: &[usize], candidates: &[usize]) -> Vec<usize
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_file_mapped_experts_from(value: Option<&str>) -> bool {
     value.is_some_and(|raw| raw.trim() == "1")
 }
@@ -3469,6 +3515,7 @@ fn ghost_metal_allocation_order(demand_load_only: bool) -> GhostMetalAllocationO
 /// identical per-layer arithmetic on the unpredicted schedule, where completed
 /// command buffers can release each prior slab before later layers execute.
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(test, allow(dead_code))]
 const DEFAULT_GEMMA4_26B_LAYER_SLOTS: [usize; 30] = [
     104, 112, 92, 88, 92, 80, 80, 80, 80, 80, 76, 76, 80, 84, 80, 84, 84, 88, 88, 84, 84, 84, 84,
     88, 84, 92, 96, 100, 104, 112,
@@ -3517,6 +3564,7 @@ fn ghost_exact_expert_policy_admitted(
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(test, allow(dead_code))]
 fn parse_ghost_metal_per_layer_slots(
     raw_per_layer: Option<&str>,
     default_slots: usize,
@@ -3934,6 +3982,7 @@ impl GhostMetalSlotDirectory {
     /// Snapshot the complete physical-slot -> canonical-expert bijection.
     /// Any directory/table drift is rejected before the mixed backing can
     /// publish an override.
+    #[cfg_attr(test, allow(dead_code))]
     fn hot_slot_ids(&self) -> Option<Vec<Option<usize>>> {
         if self.static_identity || self.entries.len() > 128 {
             return None;
@@ -3963,6 +4012,7 @@ impl GhostMetalSlotDirectory {
         Some(result)
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     fn clear_dynamic(&mut self) {
         if self.static_identity {
             return;
@@ -4469,6 +4519,7 @@ fn previous_cold_stage_candidates(
 /// prepared for a planned verifier width or position from being consumed by a
 /// shortened/aborted round. Record identity remains `(layer, expert)` and the
 /// target router is still the sole authority for which records are requested.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct PreviousColdRoundStage {
     expected_start_pos: usize,
     planned_k: usize,
@@ -4479,6 +4530,7 @@ struct PreviousColdRoundStage {
     claim_wait_us: std::sync::atomic::AtomicU64,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl PreviousColdRoundStage {
     fn matches(&self, start_pos: usize, k_tokens: usize) -> bool {
         self.expected_start_pos == start_pos && self.planned_k == k_tokens
@@ -5100,6 +5152,7 @@ fn ghost_metal_previous_cold_stage_direct_enabled() -> bool {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_ghost_metal_previous_cold_stage_records(
     enabled: Option<&str>,
     records: Option<&str>,
@@ -10258,7 +10311,7 @@ impl GhostMetalExpertRuntime {
         self.last_chained_k = Some(k_tokens);
         self.last_chained_succeeded = ok;
         if ok {
-            if let Some(output) = assistant_router_probe_truth.as_deref_mut() {
+            if let Some(output) = assistant_router_probe_truth {
                 if self.layers.len() == GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS
                     && collected_routes.len() == GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS
                 {
@@ -14143,7 +14196,9 @@ fn refresh_ghost_load_mapping_residency(
 pub struct Gemma4GhostLoadOnlyRuntime {
     _runtime: Gemma4Runtime,
     allocation_ledger: Gemma4GhostLoadAllocationLedger,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     target_mapping: Arc<GgufWireMmap>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     cghost_mapping: Arc<GgufWireMmap>,
 }
 
@@ -14200,6 +14255,7 @@ struct Gemma4GhostLoadObserver<'a> {
         &'a mut dyn FnMut(Gemma4GhostLoadPhase, Gemma4GhostLoadAllocationLedger) -> Result<()>,
     ledger: Gemma4GhostLoadAllocationLedger,
     target_mapping: Option<Arc<GgufWireMmap>>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     cghost_mapping: Arc<GgufWireMmap>,
 }
 
@@ -14378,6 +14434,7 @@ pub struct Gemma4MtpGenerationResult {
 /// identified by the opaque state digest. Private fields and the absence of
 /// `Clone` keep the request-local seed move-only for safe callers.
 #[doc(hidden)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug)]
 pub struct Gemma4MtpPrefillSeed {
     provenance_nonce: u64,
@@ -14396,6 +14453,7 @@ pub struct Gemma4MtpPrefillOutput {
     pub mtp_seed: Option<Gemma4MtpPrefillSeed>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct Gemma4MtpCommitPlan {
     committed_tokens: Vec<u32>,
@@ -14409,8 +14467,11 @@ fn mtp_us_saturating(micros: u128) -> u64 {
 }
 
 const GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP_ENV: &str = "CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP";
+#[cfg(target_os = "macos")]
 const GEMMA4_MTP_BOUNDARY_ARBITRATION_ENV: &str = "CAMELID_GEMMA4_MTP_BOUNDARY_ARBITRATION";
+#[cfg(target_os = "macos")]
 const GEMMA4_MTP_ADAPTIVE_WIDTH_ENV: &str = "CAMELID_GEMMA4_MTP_ADAPTIVE_WIDTH";
+#[cfg(target_os = "macos")]
 const GEMMA4_MTP_WIDTH_SCHEDULE_ENV: &str = "CAMELID_GEMMA4_MTP_WIDTH_SCHEDULE";
 static GEMMA4_MTP_PREFILL_SEED_NONCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -14435,6 +14496,7 @@ fn mtp_prefill_seed_bootstrap_enabled() -> bool {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_boundary_arbitration_enabled_value(value: Option<&str>) -> bool {
     value
         .map(str::trim)
@@ -14447,6 +14509,7 @@ fn mtp_boundary_arbitration_enabled_value(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
 fn mtp_boundary_arbitration_enabled() -> bool {
     mtp_boundary_arbitration_enabled_value(
         std::env::var(GEMMA4_MTP_BOUNDARY_ARBITRATION_ENV)
@@ -14455,6 +14518,7 @@ fn mtp_boundary_arbitration_enabled() -> bool {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_boundary_initial_draft_limit(capture_boundary_logits: bool, draft_limit: usize) -> usize {
     if capture_boundary_logits {
         draft_limit.min(MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX + 1)
@@ -14463,6 +14527,7 @@ fn mtp_boundary_initial_draft_limit(capture_boundary_logits: bool, draft_limit: 
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_boundary_resume_token(
     capture_boundary_logits: bool,
     original_token: Option<u32>,
@@ -14476,6 +14541,7 @@ fn mtp_boundary_resume_token(
     (!eot.contains(&selected)).then_some(selected)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_adaptive_width_enabled_value(value: Option<&str>) -> bool {
     value
         .map(str::trim)
@@ -14488,10 +14554,12 @@ fn mtp_adaptive_width_enabled_value(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
 fn mtp_adaptive_width_enabled() -> bool {
     mtp_adaptive_width_enabled_value(std::env::var(GEMMA4_MTP_ADAPTIVE_WIDTH_ENV).ok().as_deref())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_width_schedule_value(value: Option<&str>) -> Option<Vec<usize>> {
     let value = value?.trim();
     if value.is_empty() {
@@ -14506,10 +14574,12 @@ fn mtp_width_schedule_value(value: Option<&str>) -> Option<Vec<usize>> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 fn mtp_width_schedule() -> Option<Vec<usize>> {
     mtp_width_schedule_value(std::env::var(GEMMA4_MTP_WIDTH_SCHEDULE_ENV).ok().as_deref())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_scheduled_verify_width(
     schedule: &[usize],
     round_index: usize,
@@ -14527,9 +14597,12 @@ fn mtp_scheduled_verify_width(
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 const MTP_ADAPTIVE_BASE_VERIFY_K: usize = 10;
+#[cfg(any(target_os = "macos", test))]
 const MTP_ADAPTIVE_MIN_VERIFY_K: usize = 4;
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_initial_verify_width(adaptive: bool, max_verify_k: usize) -> usize {
     if adaptive {
         max_verify_k.min(MTP_ADAPTIVE_BASE_VERIFY_K)
@@ -14538,6 +14611,7 @@ fn mtp_initial_verify_width(adaptive: bool, max_verify_k: usize) -> usize {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_next_verify_width(
     adaptive: bool,
     max_verify_k: usize,
@@ -14560,14 +14634,17 @@ fn mtp_next_verify_width(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_spec_timing_enabled_value(value: Option<&str>) -> bool {
     value.is_some()
 }
 
+#[cfg(target_os = "macos")]
 fn mtp_spec_timing_enabled() -> bool {
     mtp_spec_timing_enabled_value(std::env::var("CAMELID_GEMMA4_SPEC_TIMING").ok().as_deref())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_code_output_hint(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
     let has_output_intent = [
@@ -14628,6 +14705,7 @@ fn mtp_prefill_state_sha256(
     output
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_mtp_prefill_seed(
     seed: &Gemma4MtpPrefillSeed,
     pending_nonce: u64,
@@ -14664,6 +14742,7 @@ fn validate_mtp_prefill_seed(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_argmax(logits: &[f32]) -> Result<u32> {
     let (&first, rest) = logits.split_first().ok_or_else(|| {
         BackendError::RuntimeShapeMismatch("Gemma 4 MTP received empty target logits".into())
@@ -14689,14 +14768,17 @@ fn mtp_argmax(logits: &[f32]) -> Result<u32> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 const MTP_STEP3_LOGIT_TRACE_DRAFT_INDEX: usize = 3;
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MtpAssistantTop2 {
     first: u32,
     second: u32,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_assistant_top2(logits: &[f32]) -> Option<MtpAssistantTop2> {
     if logits.len() < 2 || logits.iter().any(|value| !value.is_finite()) {
         return None;
@@ -14721,10 +14803,12 @@ fn mtp_assistant_top2(logits: &[f32]) -> Option<MtpAssistantTop2> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_piece_is_code_fence(piece: &str) -> bool {
     piece.trim().trim_start_matches(['\u{2581}', '\u{0120}']) == "```"
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_prefix_pieces_are_control_only(pieces: &[&str]) -> bool {
     if pieces.len() < 2 {
         return pieces.iter().all(|piece| piece.trim().is_empty());
@@ -14744,6 +14828,7 @@ fn mtp_prefix_pieces_are_control_only(pieces: &[&str]) -> bool {
         })
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MtpAssistantTargetRank {
     target_rank: usize,
@@ -14752,6 +14837,7 @@ struct MtpAssistantTargetRank {
     selected_minus_target_margin: f32,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_verifier_target_token_at(
     proposed_drafts: &[u32],
     accepted_drafts: usize,
@@ -14779,6 +14865,7 @@ fn mtp_step3_verifier_target_token(
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_assistant_target_rank(
     assistant_logits: &[f32],
     selected_token: u32,
@@ -14810,6 +14897,7 @@ fn mtp_assistant_target_rank(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn trace_mtp_assistant_logits(
     round_index: usize,
     draft_index: usize,
@@ -14913,6 +15001,7 @@ fn truncate_spec_host_kv(kc: &mut [Vec<Vec<f32>>], vc: &mut [Vec<Vec<f32>>], kee
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_terminal_unforwarded_target_token(logits: &[f32], eot: &[u32]) -> Result<Option<u32>> {
     let token = mtp_argmax(logits)?;
     Ok((!eot.contains(&token)).then_some(token))
@@ -14961,6 +15050,7 @@ fn spec_experiment_gpu_delta(before: Option<(u64, u64)>) -> u64 {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn mtp_commit_plan(
     anchor: u32,
     proposed_drafts: &[u32],
@@ -15015,9 +15105,13 @@ struct Gemma4SpeculativeStepResult {
     target_hidden_normalized: Option<Vec<f32>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_LAYERS: usize = 30;
+#[cfg(any(target_os = "macos", test))]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_HIDDEN: usize = 2_816;
+#[cfg(any(target_os = "macos", test))]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_EXPERTS: usize = 128;
+#[cfg(any(target_os = "macos", test))]
 const GEMMA4_MTP_ASSISTANT_ROUTER_PROBE_TOP_K: usize = 8;
 
 /// Request-local H56 source. The official assistant already applied its
@@ -15037,6 +15131,7 @@ struct Gemma4MtpAssistantRouterProbeSource {
 /// the verifier back to the tied head. They are read only after that head has
 /// fixed acceptance and logits.
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug, Clone)]
 struct Gemma4MtpAssistantRouterProbeTruth {
     round_seq: u32,
@@ -18571,11 +18666,13 @@ impl Gemma4Runtime {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn pending_mtp_prefill_seed_nonce(&self) -> u64 {
         self.mtp_prefill_seed_pending_nonce
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(target_os = "macos")]
     fn consume_mtp_prefill_seed_nonce(&self, nonce: u64) -> bool {
         self.mtp_prefill_seed_pending_nonce
             .compare_exchange(
@@ -21081,6 +21178,7 @@ impl Gemma4Runtime {
                     prof.cp_router_topk_ms += router_dur.as_secs_f64() * 1000.0;
                 }
 
+                #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
                 let unique_experts = &unique_experts_buf[..num_unique];
 
                 #[cfg(target_os = "macos")]
@@ -21417,6 +21515,7 @@ impl Gemma4Runtime {
 
         let mut mlp_rows;
         let mut multi_expert_metal_result: Option<Vec<Vec<f32>>> = None;
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut shared_times = crate::metal::Gemma4SharedExpertBatchTimes::default();
         let mut batch_times = crate::metal::Gemma4MultiExpertBatchTimes::default();
         let mut expert_records: Vec<Option<Arc<GhostMoeExpert>>> = Vec::new();
@@ -21424,6 +21523,7 @@ impl Gemma4Runtime {
 
         if direct_resolved {
             let (raw_slab, slot_indices) = slab_buf_slot_indices.as_ref().unwrap();
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             let slab_buf = unsafe { &**raw_slab };
 
             let mut shared_q8_store = [[crate::tensor::Q8_0Block::default(); 88]; 8];
@@ -21461,6 +21561,7 @@ impl Gemma4Runtime {
                 }
             }
 
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             let shared_q8_refs: Vec<&[crate::tensor::Q8_0Block]> =
                 if precomputed_shared_mlp.is_none() {
                     (0..n_tokens)
@@ -21469,6 +21570,7 @@ impl Gemma4Runtime {
                 } else {
                     Vec::new()
                 };
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             let moe_q8_refs: Vec<&[crate::tensor::Q8_0Block]> = if precomputed_shared_mlp.is_none()
             {
                 (0..n_tokens)
@@ -21518,6 +21620,7 @@ impl Gemma4Runtime {
             }
 
             let mut output_mlp = vec![vec![0.0f32; hidden]; attn_rows.len()];
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut output_moe = vec![vec![0.0f32; hidden]; attn_rows.len()];
 
             #[cfg(target_os = "macos")]

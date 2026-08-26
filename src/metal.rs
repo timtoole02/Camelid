@@ -557,19 +557,19 @@ fn command_buffer_error_details(cb: &metal::CommandBufferRef) -> String {
 }
 
 /// In-encoder GPU stage ids matching the chained-verifier harness columns.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_QKV_O: u8 = 0;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_ATTN: u8 = 1;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_ROUTER: u8 = 2;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_SHARED: u8 = 3;
 #[cfg(any(target_os = "macos", test))]
 const GPU_STAGE_GATEUP: u8 = 4;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_DOWN: u8 = 5;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_RESID: u8 = 6;
 #[cfg(any(target_os = "macos", test))]
 const GPU_STAGE_COUNT: usize = 7;
@@ -762,7 +762,7 @@ fn chained_stage_profile_enabled() -> bool {
 /// the one the serial path would have encoded, and any round shape the
 /// overlap cannot prove safe (expert-union overflow, stage profiling, layer
 /// dumps) falls back to the serial path for that layer.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn overlap_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| overlap_flag_from(std::env::var("CAMELID_GEMMA4_OVERLAP").ok().as_deref()))
@@ -848,6 +848,7 @@ pub(crate) fn gemma4_hybrid_async_two_wave_collapse_enabled() -> bool {
     })
 }
 
+#[cfg(target_os = "macos")]
 const GEMMA4_TERMINAL_COLD_MMA_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_TERMINAL_COLD_MMA";
 
 /// H63 is deliberately strict and default-off. It is not a global kernel
@@ -13580,7 +13581,7 @@ pub(crate) const GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER: usize = 6;
 /// This is a physical-record budget, not a limit on routed canonical expert
 /// IDs: every one of the 128 experts remains addressable through the mapped
 /// fallback.
-#[cfg(test)]
+#[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_Q4_HYBRID_HOT_SLOTS: usize = 32;
 /// Global overflow experts reused across layers. 20 resident + 24 overflow covers
 /// measured K=8 unique max of 42.
@@ -14845,7 +14846,7 @@ impl Gemma4Q4ExpertSlots {
     /// Exact 32-hot/mapped-cold backing. The logical and GPU-visible
     /// namespaces both remain the complete 128 canonical expert IDs; only the
     /// anonymous writable cache is bounded to 32 physical records.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn new_hybrid_mapped_record_granular(
         mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
         offset: u64,
@@ -16472,6 +16473,7 @@ impl Gemma4MultiExpertLayerBatch {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_gpu_quants(
     input_scales: &Buffer,
     input_quants: &Buffer,
@@ -16546,6 +16548,7 @@ pub struct Gemma4SharedExpertBatchTimes {
     pub down_gpu_us: u64,
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_shared_expert_chunk(
     _input_q8: &[&[crate::tensor::Q8_0Block]],
     _gate_w: &Buffer,
@@ -16558,6 +16561,7 @@ pub(crate) fn try_gemma4_q4_shared_expert_chunk(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_buffer(
     _input_q8: &[&[crate::tensor::Q8_0Block]],
     _expert_weights_buffer: &Buffer,
@@ -16570,6 +16574,7 @@ pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_buffer(
     None
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_norm(
     _attn_rows: &[Vec<f32>],
     _norm: &[f32],
@@ -16585,6 +16590,7 @@ pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_norm(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_fused_moe_layer_chunk(
     _shared_input_q8: &[&[crate::tensor::Q8_0Block]],
     _gate_w: &Buffer,
@@ -23264,6 +23270,7 @@ pub fn gemma4_max_spec_chunk() -> usize {
 }
 
 /// Fixed accumulator depth of the dense `*_batch_k` kernels (`float sums[4][8]`).
+#[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_DENSE_BATCH_K_MAX: usize = 8;
 
 /// Pre-allocated resident activation scratch slab.
@@ -24431,6 +24438,7 @@ impl ChainedRoundHostLedger {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn same_expert_set(a: &[usize], b: &[usize]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -25440,6 +25448,7 @@ impl Gemma4RetainedColdPlan {
         self.ready_count() + self.fresh.len()
     }
 
+    #[cfg(target_os = "macos")]
     fn retained_experts(&self) -> Vec<usize> {
         self.retained.iter().map(|hit| hit.expert).collect()
     }
@@ -25451,7 +25460,7 @@ struct Gemma4RetainedColdLayer {
     slot_ids: [Option<usize>; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER],
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Gemma4PendingRetainedColdPublish {
     layer_idx: usize,
@@ -25642,7 +25651,7 @@ fn retained_cold_compact_slot_table(plan: &Gemma4RetainedColdPlan) -> Option<[u3
     Some(table)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn compact_stage_slot_table(experts: &[usize]) -> Option<[u32; 128]> {
     let mut table = [u32::MAX; 128];
     let mut seen = [false; 128];
@@ -27161,6 +27170,7 @@ mod hot_cold_overlap_plan_tests {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn expert_set_is_covered(actual: &[usize], covered: &[usize]) -> bool {
     let mut keep = [false; 128];
     for &e in covered {
@@ -27171,6 +27181,7 @@ fn expert_set_is_covered(actual: &[usize], covered: &[usize]) -> bool {
     actual.iter().all(|&e| e < 128 && keep[e])
 }
 
+#[cfg(target_os = "macos")]
 fn mask_slot_table_to_wave(table: &mut [u32; 128], wave: &[usize]) {
     let mut keep = [false; 128];
     for &expert in wave {
@@ -27185,22 +27196,7 @@ fn mask_slot_table_to_wave(table: &mut [u32; 128], wave: &[usize]) {
     }
 }
 
-#[cfg(test)]
-const SLOT_OVERFLOW_BIT: u32 = 24;
-
-#[cfg(test)]
-fn merge_unified_slot_table(ping: &[u32; 128], pong: &[u32; 128]) -> [u32; 128] {
-    let mut unified = [0xFFFFFFFFu32; 128];
-    for e in 0..128 {
-        if ping[e] != 0xFFFFFFFFu32 {
-            unified[e] = ping[e];
-        } else if pong[e] != 0xFFFFFFFFu32 {
-            unified[e] = SLOT_OVERFLOW_BIT + pong[e];
-        }
-    }
-    unified
-}
-
+#[cfg(target_os = "macos")]
 fn wave_slots_ready(table: &[u32; 128], wave: &[usize], num_slots: usize) -> Option<usize> {
     for &expert in wave {
         let slot = table.get(expert).copied().unwrap_or(0xFFFFFFFFu32);
@@ -27215,6 +27211,7 @@ fn wave_slots_ready(table: &[u32; 128], wave: &[usize], num_slots: usize) -> Opt
 /// the exact distinct slot resources that its argument-buffer kernels may
 /// dereference. Invalid experts, missing mappings, out-of-range slots, or two
 /// experts aliasing one mutable slot fail closed.
+#[cfg(target_os = "macos")]
 fn active_slots_for_wave(
     table: &[u32; 128],
     wave: &[usize],
@@ -27357,6 +27354,7 @@ mod record_work_address_tests {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn gemma4_top8_union_from_router_logits(logits: &[f32], k_tokens: usize) -> Vec<usize> {
     let mut selected = Vec::with_capacity(k_tokens * 8);
     for t in 0..k_tokens {

@@ -1106,7 +1106,7 @@ fn routed_expert_positioned_chunk_bytes(expected_len: usize, requested_chunks: u
 impl GhostFile {
     /// Retained file-backed payload mapping for non-faulting load-probe
     /// residency snapshots. Strict no-page-cache mode intentionally has none.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     pub(crate) fn wire_mapping(&self) -> Option<&Arc<GgufWireMmap>> {
         self.mmap.as_ref()
     }

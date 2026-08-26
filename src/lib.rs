@@ -38,6 +38,10 @@ pub mod model_default;
 pub mod model_source;
 pub mod offload;
 pub mod platform_fs;
+// Production consumers are the macOS Metal staging lanes. Keep the portable
+// implementation available to unit tests without treating that dormant API as
+// live production code on Linux and Windows.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod predictive_record_stage;
 pub mod quality;
 pub mod receipt;
