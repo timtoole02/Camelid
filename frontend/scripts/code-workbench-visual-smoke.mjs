@@ -29,17 +29,19 @@ const health = {
   engine: 'camelid',
   loaded_now: true,
   generation_ready: true,
-  active_model_id: 'Qwen3-4B-Q8_0.gguf',
+  // Deliberately use the catalog id rather than the filename. Context-profile
+  // eligibility must follow the resolved exact row, not this display/runtime id.
+  active_model_id: 'qwen3_4b_instruct_q8_0',
   backend: 'llama',
   model_family: 'qwen3',
   execution_plan: { selected_backend: 'cuda_resident_q8', cuda_resident_active: true },
 }
 const models = {
   object: 'list',
-  data: [{ id: 'Qwen3-4B-Q8_0.gguf', object: 'model', created: 0, owned_by: 'camelid', meta: { size: 4_280_404_704 } }],
+  data: [{ id: 'qwen3_4b_instruct_q8_0', object: 'model', created: 0, owned_by: 'camelid', meta: { size: 4_280_404_704 } }],
 }
 const currentModel = {
-  id: 'Qwen3-4B-Q8_0.gguf',
+  id: 'qwen3_4b_instruct_q8_0',
   path: 'models/Qwen3-4B-Q8_0.gguf',
   gguf: { metadata: { 'general.file_type': 7 } },
   tokenizer: { status: 'available' },
@@ -60,7 +62,7 @@ const localModels = {
 }
 const capabilities = {
   model_compatibility: [{
-    id: 'Qwen3-4B-Q8_0.gguf',
+    id: 'qwen3_4b_instruct_q8_0',
     family: 'qwen3',
     quantization: 'Q8_0',
     status: 'supported_exact_row_smoke',
@@ -241,9 +243,11 @@ try {
     if (url.endsWith('/api/agent/workspace/sessions') && request.method() === 'POST') {
       const body = JSON.parse(request.postData() || '{}')
       sessionBodies.push(body)
-      // The third start answers slowly on purpose: the composer offers Stop from
-      // the moment it is submitted, which is before any session id exists.
-      if (sessionBodies.length === 3) await new Promise((resolve) => setTimeout(resolve, 500))
+      // The third request is an in-thread replacement and the fifth a brand-new
+      // session. Both answer slowly so Stop lands before a session id exists.
+      if (sessionBodies.length === 3) await new Promise((resolve) => setTimeout(resolve, 1_250))
+      if (sessionBodies.length === 5) await new Promise((resolve) => setTimeout(resolve, 500))
+      const standardContext = body.context_profile === 'standard'
       return respondJson(request, {
         id: 'code-workbench-smoke',
         workspace: 'C:/projects/camelid-demo',
@@ -251,17 +255,18 @@ try {
         state: 'waiting_for_events',
         max_steps: 0,
         max_tokens: 768,
+        context_profile: body.context_profile || 'auto',
         context_window: {
           mode: 'auto',
-          effective_tokens: 16_384,
+          effective_tokens: standardContext ? 8_192 : 16_384,
           recommended_max_tokens: 8_192,
           memory_safe_max_tokens: 2_048,
           model_max_tokens: 40_960,
           validated_max_tokens: 8_192,
           kv_owner_slots: 1,
-          paged_target_tokens: 16_384,
-          paged_working_set_tokens: 8_000,
-          limiting_factor: 'paged_model_target',
+          paged_target_tokens: standardContext ? null : 16_384,
+          paged_working_set_tokens: standardContext ? null : 8_000,
+          limiting_factor: standardContext ? 'validated_agent_maximum' : 'paged_model_target',
         },
         allow_writes: true,
         approval_mode: body.approval_mode,
@@ -274,7 +279,9 @@ try {
       return request.respond({ status: 204, body: '' })
     }
     if (url.endsWith('/api/agent/workspace/sessions/code-workbench-smoke/changes')) {
-      const completed = decisions.length > 0
+      // A replacement session on the same saved thread owns a fresh checkpoint
+      // journal. Its Changes view must not retain files from the prior session.
+      const completed = decisions.length > 0 && sessionBodies.length < 2
       return respondJson(request, completed ? {
         summary: '1 file changed',
         diff: '+++ frontend/src/components/InteractiveAgent.jsx\\n+export function InteractiveAgent() {\\n+  return <section>Interactive agent</section>\\n+}',
@@ -360,6 +367,7 @@ try {
     || sessionBodies[0].mode !== 'code'
     || Object.hasOwn(sessionBodies[0], 'max_steps')
     || sessionBodies[0].approval_mode !== 'approval_gated'
+    || sessionBodies[0].context_profile !== 'auto'
     || sessionBodies[0].allow_network !== false) {
     throw new Error(`Code session contract mismatch: ${JSON.stringify(sessionBodies)}`)
   }
@@ -406,7 +414,7 @@ try {
   }
 
   await page.click('.code-inline-approval__actions .cx-btn--primary')
-  await page.waitForFunction(() => document.body.textContent.includes('Decision sent'), { timeout: 5000 })
+  await page.waitForFunction(() => document.body.textContent.includes('Reviewed'), { timeout: 5000 })
   await page.evaluate(() => globalThis.__finishCodeTurn())
   await page.waitForFunction(() => document.body.textContent.includes('Implemented the interactive agent component'), { timeout: 5000 })
   await page.waitForFunction(() => document.body.textContent.includes('InteractiveAgent.jsx'), { timeout: 5000 })
@@ -533,6 +541,98 @@ try {
   await page.keyboard.press('Escape')
   await page.waitForSelector('.code-access-menu', { hidden: true })
 
+  // Access and context are fixed per session. Changing either after a turn must
+  // resume the same saved thread through a replacement session, not silently
+  // send a follow-up under the old configuration. The replacement owns fresh
+  // diagnostics and a fresh checkpoint journal.
+  await page.click('.code-access-chip')
+  await page.waitForSelector('.code-access-menu')
+  await page.click('.code-access-menu > button.is-writes-auto')
+  await page.click('.code-context-chip')
+  await page.waitForSelector('.code-context-menu', { timeout: 5000 })
+  await page.click('.code-context-menu > button:last-child')
+  await page.click('.code-composer textarea')
+  await page.type('.code-composer textarea', 'Continue with automatic writes in the standard context.')
+  await page.click('.code-composer__send')
+  await page.waitForFunction(
+    () => globalThis.__codeStreamsOpened === 3
+      && document.querySelector('.code-context-chip')?.textContent.includes('Q4 8K'),
+    { timeout: 5000 },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 650))
+  const replacementState = await page.evaluate(() => ({
+    primary: document.querySelector('.code-agent-list li')?.textContent.replace(/\s+/g, ' ').trim(),
+    contextChip: document.querySelector('.code-context-chip')?.textContent.replace(/\s+/g, ' ').trim(),
+    changedFiles: document.querySelectorAll('.code-file-list li').length,
+    hasContextComposition: [...document.querySelectorAll('.ci-fold > summary')]
+      .some((summary) => summary.textContent.includes('Composition')),
+  }))
+  if (sessionBodies.length !== 2
+    || sessionBodies[1].thread_id !== 'code-workbench-smoke'
+    || sessionBodies[1].approval_mode !== 'writes_auto'
+    || sessionBodies[1].context_profile !== 'standard'
+    || sessionBodies[1].allow_network !== false
+    || !replacementState.primary?.includes('0 model steps this session')
+    || replacementState.contextChip !== 'Q4 8K · 8K'
+    || replacementState.changedFiles !== 0
+    || replacementState.hasContextComposition) {
+    throw new Error(`replacement session kept stale configuration or diagnostics: ${JSON.stringify({ sessionBodies, replacementState })}`)
+  }
+  await page.click('.code-composer__send.is-stop')
+  await page.evaluate(() => globalThis.__abortCodeTurn())
+  await page.waitForFunction(() => !document.querySelector('.code-composer__send.is-stop'), { timeout: 8000 })
+
+  // Cancelling a replacement while its POST is still pending must put the old
+  // completed session back exactly as it was. `session.starting` clears
+  // diagnostics optimistically, so treating the abandoned replacement as a
+  // terminal event would leave the old session mislabeled and half-empty.
+  const beforeAbandonedReplacement = await page.evaluate(() => ({
+    status: document.querySelector('.code-stage__status')?.textContent.trim(),
+    elapsed: document.querySelector('.code-elapsed')?.textContent.trim(),
+    transcript: document.querySelector('.code-thread')?.textContent.replace(/\s+/g, ' ').trim(),
+    environment: document.querySelector('.ci-environment__rows')?.textContent.replace(/\s+/g, ' ').trim(),
+    runSummary: [...(document.querySelector('.code-agent-list li')?.querySelectorAll('.ci-task__meta') || [])]
+      .at(-1)?.textContent.replace(/\s+/g, ' ').trim(),
+    process: document.querySelector('.code-process-row')?.textContent.replace(/\s+/g, ' ').trim(),
+    changedFiles: document.querySelectorAll('.code-file-list li').length,
+  }))
+  await page.click('.code-context-chip')
+  await page.waitForSelector('.code-context-menu')
+  await page.click('.code-context-menu > button:first-of-type')
+  await page.click('.code-composer textarea')
+  await page.type('.code-composer textarea', 'Try a replacement, then stop before it starts.')
+  await page.click('.code-composer__send')
+  await page.waitForSelector('.code-composer__send.is-stop', { timeout: 3000 })
+  await page.click('.code-composer__send.is-stop')
+  await page.waitForFunction(() => !document.querySelector('.code-composer__send.is-stop'), { timeout: 8000 })
+  const abandonedReplacement = await page.evaluate(() => ({
+    status: document.querySelector('.code-stage__status')?.textContent.trim(),
+    elapsed: document.querySelector('.code-elapsed')?.textContent.trim(),
+    transcript: document.querySelector('.code-thread')?.textContent.replace(/\s+/g, ' ').trim(),
+    environment: document.querySelector('.ci-environment__rows')?.textContent.replace(/\s+/g, ' ').trim(),
+    runSummary: [...(document.querySelector('.code-agent-list li')?.querySelectorAll('.ci-task__meta') || [])]
+      .at(-1)?.textContent.replace(/\s+/g, ' ').trim(),
+    process: document.querySelector('.code-process-row')?.textContent.replace(/\s+/g, ' ').trim(),
+    changedFiles: document.querySelectorAll('.code-file-list li').length,
+    streamsOpened: globalThis.__codeStreamsOpened,
+    contextChip: document.querySelector('.code-context-chip')?.textContent.replace(/\s+/g, ' ').trim(),
+  }))
+  if (sessionBodies.length !== 3
+    || sessionBodies[2].thread_id !== 'code-workbench-smoke'
+    || sessionBodies[2].context_profile !== 'auto'
+    || cancels.length !== 3
+    || abandonedReplacement.streamsOpened !== 3
+    || abandonedReplacement.status !== beforeAbandonedReplacement.status
+    || abandonedReplacement.elapsed !== beforeAbandonedReplacement.elapsed
+    || abandonedReplacement.transcript !== beforeAbandonedReplacement.transcript
+    || abandonedReplacement.environment !== beforeAbandonedReplacement.environment
+    || abandonedReplacement.runSummary !== beforeAbandonedReplacement.runSummary
+    || abandonedReplacement.process !== beforeAbandonedReplacement.process
+    || abandonedReplacement.changedFiles !== beforeAbandonedReplacement.changedFiles
+    || abandonedReplacement.contextChip !== 'Auto') {
+    throw new Error(`abandoned replacement did not restore the prior session: ${JSON.stringify({ beforeAbandonedReplacement, abandonedReplacement, sessionBodies, cancels: cancels.length })}`)
+  }
+
   await page.click('button[aria-label="New coding session"]')
   await page.click('.code-access-chip')
   await page.waitForSelector('.code-access-menu')
@@ -541,14 +641,81 @@ try {
     checked: [...document.querySelectorAll('.code-access-menu > button')].map((node) => node.getAttribute('aria-checked')),
     bodyWidth: [document.documentElement.clientWidth, document.documentElement.scrollWidth],
   }))
-  if (!menuState.text?.includes('Today is a good day to die')
+  if (!menuState.text?.includes('Writes auto')
+    || !menuState.text?.includes('Full auto')
     || !menuState.text?.includes('Network and web search')
     || menuState.checked.at(-1) !== 'false'
     || menuState.bodyWidth[0] !== menuState.bodyWidth[1]) {
     throw new Error(`access menu mismatch: ${JSON.stringify(menuState)}`)
   }
   await page.screenshot({ path: join(outputDir, 'code-workbench-access-menu.png'), fullPage: true })
-  await page.click('.code-access-menu > button.is-danger')
+  await page.waitForFunction(() => document.activeElement?.getAttribute('role') === 'menuitemradio')
+  await page.keyboard.press('ArrowDown')
+  const accessArrowFocus = await page.evaluate(() => document.activeElement?.textContent.replace(/\s+/g, ' ').trim())
+  if (!accessArrowFocus?.startsWith('Writes auto')) {
+    throw new Error(`access menu did not move focus with ArrowDown: ${accessArrowFocus}`)
+  }
+  await page.keyboard.press('Escape')
+  await page.waitForSelector('.code-access-menu', { hidden: true })
+  const accessReturnedFocus = await page.evaluate(() => document.activeElement?.classList.contains('code-access-chip'))
+  if (!accessReturnedFocus) throw new Error('access menu Escape did not restore trigger focus')
+
+  // A wrapped context chip sits near the left edge on phones. The popup must
+  // clamp to the viewport instead of anchoring its right edge there and opening
+  // mostly offscreen. Exercise the same ARIA focus contract while narrow.
+  await page.setViewport({ width: 320, height: 820, deviceScaleFactor: 1 })
+  await page.click('.code-inspector__header button')
+  await page.waitForSelector('.code-inspector', { hidden: true })
+  await page.$eval('.code-context-chip', (node) => node.click())
+  await page.waitForSelector('.code-context-menu', { timeout: 5000 })
+  await page.waitForFunction(() => document.activeElement?.getAttribute('role') === 'menuitemradio')
+  const narrowContextMenu = await page.evaluate(() => {
+    const rect = document.querySelector('.code-context-menu')?.getBoundingClientRect()
+    const trigger = document.querySelector('.code-context-chip')?.getBoundingClientRect()
+    const firstChip = document.querySelector('.code-access-chip')?.getBoundingClientRect()
+    const footer = document.querySelector('.code-composer__footer')?.getBoundingClientRect()
+    return rect && trigger && firstChip && footer ? {
+      left: rect.left,
+      right: rect.right,
+      width: rect.width,
+      viewport: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+      wrapped: trigger.top > firstChip.top + 2,
+      footerLeft: footer.left,
+      footerRight: footer.right,
+    } : null
+  })
+  if (!narrowContextMenu
+    || !narrowContextMenu.wrapped
+    || narrowContextMenu.width < 240
+    || narrowContextMenu.left < -0.5
+    || narrowContextMenu.right > narrowContextMenu.viewport + 0.5
+    || narrowContextMenu.left < narrowContextMenu.footerLeft - 0.5
+    || narrowContextMenu.right > narrowContextMenu.footerRight + 0.5
+    || narrowContextMenu.scrollWidth !== narrowContextMenu.viewport) {
+    throw new Error(`context menu escaped the narrow viewport: ${JSON.stringify(narrowContextMenu)}`)
+  }
+  await page.keyboard.press('ArrowDown')
+  const contextArrowFocus = await page.evaluate(() => document.activeElement?.textContent.replace(/\s+/g, ' ').trim())
+  if (!contextArrowFocus?.startsWith('Q8 16K')) {
+    throw new Error(`context menu did not move focus with ArrowDown: ${contextArrowFocus}`)
+  }
+  await page.keyboard.press('Escape')
+  await page.waitForSelector('.code-context-menu', { hidden: true })
+  const contextReturnedFocus = await page.evaluate(() => document.activeElement?.classList.contains('code-context-chip'))
+  if (!contextReturnedFocus) throw new Error('context menu Escape did not restore trigger focus')
+  await page.setViewport({ width: 1180, height: 820, deviceScaleFactor: 1 })
+
+  await page.click('.code-access-chip')
+  await page.waitForSelector('.code-access-menu')
+  await page.waitForFunction(() => document.activeElement?.getAttribute('role') === 'menuitemradio')
+  await page.keyboard.press('ArrowDown')
+  await page.keyboard.press('ArrowDown')
+  const fullAutoKeyboardFocus = await page.evaluate(() => document.activeElement?.textContent.replace(/\s+/g, ' ').trim())
+  if (!fullAutoKeyboardFocus?.startsWith('Full auto')) {
+    throw new Error(`access menu did not reach Full auto by keyboard: ${fullAutoKeyboardFocus}`)
+  }
+  await page.keyboard.press('Enter')
   await page.waitForSelector('.cx-modal')
   const confirmation = await page.$eval('.cx-modal', (node) => node.textContent)
   // The warning must state what full auto grants AND how far confinement
@@ -573,9 +740,10 @@ try {
   await page.type('.code-composer textarea', 'Run the complete test suite and research any failing dependency.')
   await page.click('.code-composer__send')
   await new Promise((resolve) => setTimeout(resolve, 120))
-  if (sessionBodies.length !== 2
-    || sessionBodies[1].approval_mode !== 'full_auto'
-    || sessionBodies[1].allow_network !== true) {
+  if (sessionBodies.length !== 4
+    || sessionBodies[3].approval_mode !== 'full_auto'
+    || sessionBodies[3].context_profile !== 'auto'
+    || sessionBodies[3].allow_network !== true) {
     throw new Error(`full-auto session contract mismatch: ${JSON.stringify(sessionBodies)}`)
   }
 
@@ -597,14 +765,14 @@ try {
     streamsOpened: globalThis.__codeStreamsOpened,
     composerPlaceholder: document.querySelector('.code-composer textarea')?.placeholder,
   }))
-  if (sessionBodies.length !== 3
-    || cancels.length !== 4
-    || abandonedStart.streamsOpened !== 3
+  if (sessionBodies.length !== 5
+    || cancels.length !== 6
+    || abandonedStart.streamsOpened !== 4
     || !abandonedStart.composerPlaceholder?.includes('Describe the change')) {
     throw new Error(`Stop during session creation did not take: ${JSON.stringify({ ...abandonedStart, sessions: sessionBodies.length, cancels: cancels.length })}`)
   }
 
-  console.log(`code-workbench: PASS ${JSON.stringify({ pendingState, railGuard, backgroundSwitchState, pairedState, completedState, followUpState, evictedState, stoppedState, menuState, fullAutoBody: sessionBodies[1], abandonedStart })}`)
+  console.log(`code-workbench: PASS ${JSON.stringify({ pendingState, railGuard, backgroundSwitchState, pairedState, completedState, followUpState, evictedState, stoppedState, abandonedReplacement: { status: abandonedReplacement.status, streamsOpened: abandonedReplacement.streamsOpened, contextChip: abandonedReplacement.contextChip }, menuState, fullAutoBody: sessionBodies[3], abandonedStart })}`)
 } finally {
   await browser.close()
 }

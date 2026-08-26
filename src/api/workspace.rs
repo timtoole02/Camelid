@@ -29,6 +29,15 @@ use crate::chat::workspace_memory::{
     default_store_path, EvidenceInput, StoredThread, WorkspaceMemoryStore,
 };
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceContextProfile {
+    #[default]
+    Auto,
+    Q8_16k,
+    Standard,
+}
+
 // Every generated token is one `model.delta` through this bounded channel, and
 // the send BLOCKS. It used to be the browser's render loop that could throttle
 // decode through it; the forwarder on the other end now drains into a retained
@@ -151,6 +160,14 @@ fn workspace_max_steps(mode: WorkspaceRunMode, requested: Option<usize>) -> Resu
         .then_some(max_steps)
         .ok_or(())
 }
+
+fn approval_mode_available_in(
+    mode: WorkspaceRunMode,
+    approval_mode: WorkspaceApprovalMode,
+) -> bool {
+    mode.is_code() || !approval_mode.auto_approve_writes()
+}
+
 const AUTO_COMPACT_MIN_TURNS: u32 = 4;
 
 async fn run_workspace_blocking<T, F>(operation: F) -> Result<T, Response>
@@ -201,6 +218,7 @@ struct ActiveWorkspaceSession {
     /// created. It stays fixed for the session so follow-up turns and spawned
     /// children share one predictable prompt/cache contract.
     context_window: ContextWindowSelection,
+    context_profile: WorkspaceContextProfile,
     max_steps: usize,
     max_tokens: u32,
     temperature: f32,
@@ -1315,6 +1333,8 @@ pub(super) struct CreateWorkspaceSessionRequest {
     #[serde(default)]
     approval_mode: WorkspaceApprovalMode,
     #[serde(default)]
+    context_profile: WorkspaceContextProfile,
+    #[serde(default)]
     allow_network: bool,
 }
 
@@ -1333,6 +1353,7 @@ struct WorkspaceSessionResponse {
     max_steps: usize,
     max_tokens: u32,
     context_window: ContextWindowSelection,
+    context_profile: WorkspaceContextProfile,
     allow_writes: bool,
     approval_mode: WorkspaceApprovalMode,
     allow_network: bool,
@@ -1350,6 +1371,7 @@ struct WorkspaceSessionStatusResponse {
     state: &'static str,
     context_budget_tokens: u32,
     context_window: ContextWindowSelection,
+    context_profile: WorkspaceContextProfile,
     resident_cuda: Option<crate::inference::ResidentCudaStatus>,
     allow_writes: bool,
     approval_mode: WorkspaceApprovalMode,
@@ -1367,6 +1389,7 @@ struct WorkspaceActivityResponse {
     model_id: String,
     state: &'static str,
     context_window: ContextWindowSelection,
+    context_profile: WorkspaceContextProfile,
     approval_mode: WorkspaceApprovalMode,
     allow_network: bool,
     mode: WorkspaceRunMode,
@@ -2118,6 +2141,7 @@ pub(super) async fn create_session(
         );
     }
     let approval_mode = request.approval_mode;
+    let context_profile = request.context_profile;
     let allow_network = request.allow_network;
     if request.allow_writes.unwrap_or(false) && !mode.is_code() {
         return api_error(
@@ -2127,11 +2151,16 @@ pub(super) async fn create_session(
             Some("allow_writes"),
         );
     }
-    if approval_mode.is_full_auto() && !mode.is_code() {
+    if !approval_mode_available_in(mode, approval_mode) {
+        let message = if approval_mode.is_yolo() {
+            "Full-auto approval mode is available only in Code mode"
+        } else {
+            "Writes-auto approval mode is available only in Code mode"
+        };
         return api_error(
             StatusCode::BAD_REQUEST,
             "workspace_read_only",
-            "Full-auto approval mode is available only in Code mode".to_string(),
+            message.to_string(),
             Some("approval_mode"),
         );
     }
@@ -2143,11 +2172,22 @@ pub(super) async fn create_session(
             Some("allow_network"),
         );
     }
-    if approval_mode.is_full_auto() && crate::chat::agent::is_production() {
+    if approval_mode.auto_approve_writes() && crate::chat::agent::is_production() {
+        let (code, message) = if approval_mode.is_yolo() {
+            (
+                "workspace_full_auto_refused",
+                "Full auto is disabled while CAMELID_PRODUCTION is set",
+            )
+        } else {
+            (
+                "workspace_writes_auto_refused",
+                "Writes auto is disabled while CAMELID_PRODUCTION is set",
+            )
+        };
         return api_error(
             StatusCode::FORBIDDEN,
-            "workspace_full_auto_refused",
-            "Full auto is disabled while CAMELID_PRODUCTION is set".to_string(),
+            code,
+            message.to_string(),
             Some("approval_mode"),
         );
     }
@@ -2196,8 +2236,13 @@ pub(super) async fn create_session(
         .is_code()
         .then(crate::chat::context_paging::ContextPagingConfig::from_env);
     let enabled_paging_config = paging_config.as_ref().filter(|config| config.enabled);
-    let (context_window, enable_single_kv_owner_mode) =
-        select_workspace_context_window(&state, &model, max_tokens, enabled_paging_config);
+    let (context_window, enable_single_kv_owner_mode) = select_workspace_context_window(
+        &state,
+        &model,
+        max_tokens,
+        enabled_paging_config,
+        context_profile,
+    );
     if let Some((memory_safe, required)) = workspace_context_memory_shortfall(&context_window) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2370,6 +2415,7 @@ pub(super) async fn create_session(
         model_id: model.id.clone(),
         model_sha256: model.lane.gguf_sha256.to_string(),
         context_window,
+        context_profile,
         max_steps,
         max_tokens,
         temperature,
@@ -2421,6 +2467,7 @@ pub(super) async fn create_session(
             max_steps,
             max_tokens,
             context_window,
+            context_profile,
             allow_writes,
             approval_mode,
             allow_network,
@@ -2781,6 +2828,7 @@ pub(super) async fn session_status(
         state: status,
         context_budget_tokens: session.context_window.effective_tokens,
         context_window: session.context_window,
+        context_profile: session.context_profile,
         resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
             &session.model_id,
         )),
@@ -2835,6 +2883,7 @@ pub(super) async fn current_activity(
             model_id: session.model_id.clone(),
             state,
             context_window: session.context_window,
+            context_profile: session.context_profile,
             approval_mode: session.approval_mode,
             allow_network: session.allow_network,
             mode: session.mode,
@@ -3230,9 +3279,14 @@ const QWEN3_4B_PAGED_CONTEXT_TARGET_TOKENS: u32 = 16_384;
 fn paged_context_policy_for_row(
     row_id: Option<&str>,
     paging_config: Option<&crate::chat::context_paging::ContextPagingConfig>,
+    profile: WorkspaceContextProfile,
 ) -> (Option<u32>, Option<u32>) {
     let qwen3_4b_q8 = matches!(row_id, Some("qwen3_4b_instruct_q8_0"));
-    match paging_config.filter(|config| config.enabled && qwen3_4b_q8) {
+    let permits_q8_16k = matches!(
+        profile,
+        WorkspaceContextProfile::Auto | WorkspaceContextProfile::Q8_16k
+    );
+    match paging_config.filter(|config| config.enabled && qwen3_4b_q8 && permits_q8_16k) {
         Some(config) => (
             Some(QWEN3_4B_PAGED_CONTEXT_TARGET_TOKENS),
             Some(config.working_set_tokens()),
@@ -3246,6 +3300,7 @@ fn select_workspace_context_window(
     model: &LoadedModel,
     generation_allowance_tokens: u32,
     paging_config: Option<&crate::chat::context_paging::ContextPagingConfig>,
+    profile: WorkspaceContextProfile,
 ) -> (ContextWindowSelection, bool) {
     let native_context_tokens = model
         .llama_config
@@ -3267,7 +3322,7 @@ fn select_workspace_context_window(
     let row_id = tool_capable_row_for_loaded_artifact(filename, &model.lane.gguf_sha256)
         .map(|(row_id, _)| row_id);
     let (paged_target_tokens, paged_working_set_tokens) =
-        paged_context_policy_for_row(row_id, paging_config);
+        paged_context_policy_for_row(row_id, paging_config, profile);
 
     let kv_owner_slots = if state.engine.single_kv_owner_mode() {
         1
@@ -3807,7 +3862,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_session_request_defaults_to_gated_and_offline() {
+    fn workspace_session_request_defaults_preserve_conservative_access_and_auto_context() {
         let request: CreateWorkspaceSessionRequest = serde_json::from_value(serde_json::json!({
             "workspace": ".",
             "goal": "inspect the project",
@@ -3815,7 +3870,43 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(request.approval_mode, WorkspaceApprovalMode::ApprovalGated);
+        assert_eq!(request.context_profile, WorkspaceContextProfile::Auto);
         assert!(!request.allow_network);
+
+        let configured: CreateWorkspaceSessionRequest = serde_json::from_value(serde_json::json!({
+            "workspace": ".",
+            "goal": "edit the project",
+            "mode": "code",
+            "approval_mode": "writes_auto",
+            "context_profile": "q8_16k"
+        }))
+        .unwrap();
+        assert_eq!(configured.approval_mode, WorkspaceApprovalMode::WritesAuto);
+        assert_eq!(configured.context_profile, WorkspaceContextProfile::Q8_16k);
+        assert_eq!(
+            serde_json::to_value(configured.context_profile).unwrap(),
+            serde_json::json!("q8_16k")
+        );
+    }
+
+    #[test]
+    fn automatic_approval_modes_are_code_only() {
+        assert!(approval_mode_available_in(
+            WorkspaceRunMode::ReadOnly,
+            WorkspaceApprovalMode::ApprovalGated,
+        ));
+        assert!(!approval_mode_available_in(
+            WorkspaceRunMode::ReadOnly,
+            WorkspaceApprovalMode::WritesAuto,
+        ));
+        assert!(!approval_mode_available_in(
+            WorkspaceRunMode::ReadOnly,
+            WorkspaceApprovalMode::FullAuto,
+        ));
+        assert!(approval_mode_available_in(
+            WorkspaceRunMode::Code,
+            WorkspaceApprovalMode::WritesAuto,
+        ));
     }
 
     #[test]
@@ -3909,6 +4000,7 @@ mod tests {
                 model_id: "model-test".to_string(),
                 model_sha256: "sha-test".to_string(),
                 context_window: test_context_window(),
+                context_profile: WorkspaceContextProfile::Auto,
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -3965,6 +4057,7 @@ mod tests {
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
             context_window: test_context_window(),
+            context_profile: WorkspaceContextProfile::Auto,
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -4042,6 +4135,7 @@ mod tests {
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
             context_window: test_context_window(),
+            context_profile: WorkspaceContextProfile::Auto,
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -4079,6 +4173,7 @@ mod tests {
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
             context_window: test_context_window(),
+            context_profile: WorkspaceContextProfile::Auto,
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -4150,6 +4245,7 @@ mod tests {
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
             context_window: test_context_window(),
+            context_profile: WorkspaceContextProfile::Auto,
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -4250,6 +4346,7 @@ mod tests {
                 model_id: "model".into(),
                 model_sha256: "sha-test".to_string(),
                 context_window: test_context_window(),
+                context_profile: WorkspaceContextProfile::Auto,
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -4314,6 +4411,7 @@ mod tests {
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
             context_window: test_context_window(),
+            context_profile: WorkspaceContextProfile::Auto,
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -4534,30 +4632,72 @@ mod tests {
     }
 
     #[test]
-    fn exact_qwen3_4b_paging_policy_gives_only_q8_the_16k_target() {
+    fn context_profiles_keep_the_16k_target_on_the_exact_q8_row() {
         let config = crate::chat::context_paging::ContextPagingConfig::default();
         assert_eq!(
-            paged_context_policy_for_row(Some("qwen3_4b_instruct_q8_0"), Some(&config)),
+            paged_context_policy_for_row(
+                Some("qwen3_4b_instruct_q8_0"),
+                Some(&config),
+                WorkspaceContextProfile::Auto,
+            ),
             (Some(16_384), Some(8_000))
         );
         assert_eq!(
-            paged_context_policy_for_row(Some("qwen3_4b_q4_k_m"), Some(&config)),
+            paged_context_policy_for_row(
+                Some("qwen3_4b_instruct_q8_0"),
+                Some(&config),
+                WorkspaceContextProfile::Q8_16k,
+            ),
+            (Some(16_384), Some(8_000))
+        );
+        assert_eq!(
+            paged_context_policy_for_row(
+                Some("qwen3_4b_q4_k_m"),
+                Some(&config),
+                WorkspaceContextProfile::Q8_16k,
+            ),
+            (None, None),
+            "the Q8 16K preset must not promote a neighboring quantization"
+        );
+        assert_eq!(
+            paged_context_policy_for_row(
+                Some("qwen3_4b_q4_k_m"),
+                Some(&config),
+                WorkspaceContextProfile::Auto,
+            ),
             (None, None),
             "Q4_K_M's legacy 8K operational envelope is not a promoted context bucket"
         );
         assert_eq!(
-            paged_context_policy_for_row(Some("llama32_3b_instruct_q8_0"), Some(&config)),
+            paged_context_policy_for_row(
+                Some("llama32_3b_instruct_q8_0"),
+                Some(&config),
+                WorkspaceContextProfile::Auto,
+            ),
             (None, None)
+        );
+        assert_eq!(
+            paged_context_policy_for_row(
+                Some("qwen3_4b_instruct_q8_0"),
+                Some(&config),
+                WorkspaceContextProfile::Standard,
+            ),
+            (None, None),
+            "the standard profile must force the operational 8K envelope"
         );
 
         let mut disabled = config.clone();
         disabled.enabled = false;
         assert_eq!(
-            paged_context_policy_for_row(Some("qwen3_4b_instruct_q8_0"), Some(&disabled)),
+            paged_context_policy_for_row(
+                Some("qwen3_4b_instruct_q8_0"),
+                Some(&disabled),
+                WorkspaceContextProfile::Auto,
+            ),
             (None, None)
         );
 
-        let q4_operational = select_context_window(ContextWindowInputs {
+        let standard_operational = select_context_window(ContextWindowInputs {
             native_context_tokens: 40_960,
             validated_context_tokens: crate::chat::agent::AGENT_VALIDATED_CTX,
             server_context_tokens: 131_072,
@@ -4567,17 +4707,19 @@ mod tests {
             resident_capacity_tokens: None,
             configured_max_tokens: None,
             paged_target_tokens: paged_context_policy_for_row(
-                Some("qwen3_4b_q4_k_m"),
+                Some("qwen3_4b_instruct_q8_0"),
                 Some(&config),
+                WorkspaceContextProfile::Standard,
             )
             .0,
             paged_working_set_tokens: paged_context_policy_for_row(
-                Some("qwen3_4b_q4_k_m"),
+                Some("qwen3_4b_instruct_q8_0"),
                 Some(&config),
+                WorkspaceContextProfile::Standard,
             )
             .1,
         });
-        assert_eq!(q4_operational.effective_tokens, 8_192);
-        assert_eq!(q4_operational.paged_target_tokens, None);
+        assert_eq!(standard_operational.effective_tokens, 8_192);
+        assert_eq!(standard_operational.paged_target_tokens, None);
     }
 }

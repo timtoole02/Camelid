@@ -64,12 +64,17 @@ pub(crate) enum WorkspaceRunMode {
 pub(crate) enum WorkspaceApprovalMode {
     #[default]
     ApprovalGated,
+    WritesAuto,
     FullAuto,
 }
 
 impl WorkspaceApprovalMode {
-    pub(crate) fn is_full_auto(self) -> bool {
-        self == Self::FullAuto
+    pub(crate) fn auto_approve_writes(self) -> bool {
+        matches!(self, Self::WritesAuto | Self::FullAuto)
+    }
+
+    pub(crate) fn is_yolo(self) -> bool {
+        matches!(self, Self::FullAuto)
     }
 }
 
@@ -783,8 +788,8 @@ pub(crate) fn run_live(
         }
     };
     let mut policy = match super::agent::resolve_policy(
-        false,
-        config.approval_mode.is_full_auto(),
+        config.approval_mode.auto_approve_writes(),
+        config.approval_mode.is_yolo(),
         super::agent::is_production(),
     ) {
         Ok(policy) => policy,
@@ -834,7 +839,8 @@ pub(crate) fn run_live(
             config.family.clone(),
             config.max_tokens,
             config.context_budget_tokens,
-            config.approval_mode.is_full_auto(),
+            config.approval_mode.auto_approve_writes(),
+            config.approval_mode.is_yolo(),
             config.allow_network,
             shell_sandbox,
         ));
@@ -910,8 +916,8 @@ pub(crate) fn run_live(
     let agent_config = AgentConfig {
         workdir: config.workspace,
         max_steps: config.max_steps,
-        auto_approve: config.approval_mode.is_full_auto(),
-        yolo: config.approval_mode.is_full_auto(),
+        auto_approve: config.approval_mode.auto_approve_writes(),
+        yolo: config.approval_mode.is_yolo(),
         allow_net: config.allow_network,
         allow_fs: false,
         shell_timeout: Duration::from_secs(30),
@@ -1022,6 +1028,7 @@ mod tests {
             "llama".into(),
             2048,
             32_768,
+            true,
             true,
             true,
             WorkspaceRunMode::Code.shell_sandbox(),
@@ -1178,12 +1185,40 @@ mod tests {
     }
 
     #[test]
+    fn writes_auto_promotes_writes_without_promoting_exec() {
+        let mode = WorkspaceApprovalMode::WritesAuto;
+        assert!(mode.auto_approve_writes());
+        assert!(!mode.is_yolo());
+
+        let policy =
+            crate::chat::agent::resolve_policy(mode.auto_approve_writes(), mode.is_yolo(), false)
+                .unwrap();
+        assert_eq!(
+            policy.tier_for(&Action::WriteFile {
+                path: PathBuf::from("result.txt"),
+                content: "done".to_string(),
+                summary: "write result".to_string(),
+            }),
+            ApprovalTier::Auto
+        );
+        assert_eq!(
+            policy.tier_for(&Action::RunShell {
+                command: "cargo test".to_string(),
+            }),
+            ApprovalTier::Confirm
+        );
+    }
+
+    #[test]
     fn workspace_access_defaults_fail_closed() {
         assert_eq!(
             WorkspaceApprovalMode::default(),
             WorkspaceApprovalMode::ApprovalGated
         );
-        assert!(!WorkspaceApprovalMode::default().is_full_auto());
+        assert!(!WorkspaceApprovalMode::default().auto_approve_writes());
+        assert!(!WorkspaceApprovalMode::default().is_yolo());
+        assert!(WorkspaceApprovalMode::FullAuto.auto_approve_writes());
+        assert!(WorkspaceApprovalMode::FullAuto.is_yolo());
     }
 
     #[test]

@@ -269,7 +269,8 @@ impl SubagentConfig {
 
     /// Browser/Desktop Code child configuration. Unlike the legacy terminal
     /// constructor, this preserves the complete parent capability boundary:
-    /// narrow WebCode tools, the explicit network switch, and full-auto Exec.
+    /// narrow WebCode tools, the explicit network switch, and independent
+    /// write-auto and full-auto Exec grants.
     #[allow(clippy::too_many_arguments)]
     pub fn for_web_code_session(
         addr: SocketAddr,
@@ -277,15 +278,16 @@ impl SubagentConfig {
         family: String,
         max_tokens: u32,
         context_budget_tokens: u32,
-        full_auto: bool,
+        auto_approve: bool,
+        yolo: bool,
         allow_net: bool,
         shell_mode: super::shell_sandbox::ShellSandbox,
     ) -> Self {
         let mut config =
-            Self::for_session(addr, model_id, family, max_tokens, full_auto, shell_mode);
+            Self::for_session(addr, model_id, family, max_tokens, auto_approve, shell_mode);
         config.context_budget_tokens = context_budget_tokens.max(1);
         config.allow_net = allow_net;
-        config.yolo = full_auto;
+        config.yolo = yolo;
         config.web_code = true;
         config
     }
@@ -1184,8 +1186,11 @@ mod tests {
             32_768,
             true,
             false,
+            false,
             super::super::shell_sandbox::ShellSandbox::Sandboxed,
         );
+        assert!(config.auto_approve);
+        assert!(!config.yolo);
         let _configured = configure_for_test(config);
         assert!(is_enabled());
         assert!(std::thread::spawn(|| !is_enabled()).join().unwrap());
@@ -1235,6 +1240,7 @@ mod tests {
             "qwen3".into(),
             2048,
             32_768,
+            true,
             true,
             true,
             super::super::shell_sandbox::ShellSandbox::Sandboxed,

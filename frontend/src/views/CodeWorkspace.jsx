@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { findCompatibilityHint } from '../lib/capabilities'
+import { CONTEXT_PROFILES, DEFAULT_CONTEXT_PROFILE, contextProfileMeta } from '../lib/contextProfiles'
 import {
   cancelWorkspaceSession,
   createWorkspaceSession,
@@ -25,9 +26,9 @@ import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { AssistantMarkdown } from '../lib/markdown'
 import { FolderPicker } from './WorkspaceView'
 import {
-  IconBolt, IconCheck, IconCheckCircle, IconChevronDown, IconChevronRight, IconClose, IconEdit,
-  IconError, IconHistory, IconNetwork, IconRefresh, IconSearch, IconSend, IconSidebar,
-  IconStop, IconWarning,
+  IconBolt, IconBranch, IconCheck, IconCheckCircle, IconChevronDown, IconChevronRight, IconClose,
+  IconCommit, IconEdit, IconError, IconFile, IconHistory, IconLaptop, IconNetwork, IconRefresh,
+  IconSearch, IconSend, IconSidebar, IconStop, IconTerminal, IconWarning,
 } from '../components/ui/icons'
 
 // `cancel_error` is deliberately NOT here. It means a Stop could not be
@@ -74,6 +75,52 @@ const EMPTY_CHANGES = Object.freeze({
   diff: 'No changes this session',
   files: [],
 })
+
+const APPROVAL_MODE_LABELS = Object.freeze({
+  approval_gated: 'Approval gated',
+  writes_auto: 'Writes auto',
+  full_auto: 'Full auto',
+})
+
+function approvalModeLabel(mode) {
+  return APPROVAL_MODE_LABELS[mode] || APPROVAL_MODE_LABELS.approval_gated
+}
+
+const APPROVAL_RISKS = Object.freeze({
+  read: Object.freeze({ label: 'Read', detail: 'Reads workspace data without changing it.', tone: 'is-read' }),
+  plan: Object.freeze({ label: 'Plan', detail: 'Updates the agent plan without changing files.', tone: 'is-plan' }),
+  write: Object.freeze({ label: 'Workspace write', detail: 'Creates, edits, or removes files in this workspace.', tone: 'is-write' }),
+  exec: Object.freeze({ label: 'Shell command', detail: 'Starts a local process. Review the command and its arguments.', tone: 'is-exec' }),
+  network: Object.freeze({ label: 'Network', detail: 'Sends a request outside this workspace.', tone: 'is-network' }),
+})
+
+function approvalRiskMeta(risk) {
+  const key = String(risk || '').trim().toLowerCase()
+  return APPROVAL_RISKS[key] || {
+    label: key ? formatToolName(key) : 'Agent action',
+    detail: 'Review this action before Camelid continues.',
+    tone: 'is-unknown',
+  }
+}
+
+function handleMenuNavigation(event, onEscape) {
+  const items = [...event.currentTarget.querySelectorAll('button[role^="menuitem"]:not(:disabled)')]
+  if (!items.length) return
+  const current = items.indexOf(document.activeElement)
+  let next = null
+  if (event.key === 'ArrowDown') next = current === -1 ? items[0] : items[(current + 1) % items.length]
+  else if (event.key === 'ArrowUp') next = current === -1 ? items.at(-1) : items[(current - 1 + items.length) % items.length]
+  else if (event.key === 'Home') next = items[0]
+  else if (event.key === 'End') next = items.at(-1)
+  else if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    onEscape()
+    return
+  } else return
+  event.preventDefault()
+  next?.focus()
+}
 
 function initialCodeState() {
   return { ...WORKSPACE_IDLE_STATE, events: [], turns: [], approval: null }
@@ -305,6 +352,37 @@ function visibleLiveText(raw) {
   return text.trim()
 }
 
+// A stable mark lets the eye follow a delegated agent between Running and
+// Finished without depending on its model-authored label. The palette is CSS
+// driven so it remains legible in both themes; only the deterministic slot is
+// chosen here.
+const AGENT_MARKS = Object.freeze([
+  Object.freeze({ glyph: 'A', tone: 'violet' }),
+  Object.freeze({ glyph: 'B', tone: 'blue' }),
+  Object.freeze({ glyph: 'C', tone: 'teal' }),
+  Object.freeze({ glyph: 'D', tone: 'amber' }),
+  Object.freeze({ glyph: 'E', tone: 'rose' }),
+  Object.freeze({ glyph: 'F', tone: 'indigo' }),
+])
+
+function agentMarkIndex(agent) {
+  const value = String(agent?.id || agent?.label || 'agent')
+  let hash = 0
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0
+  }
+  return Math.abs(hash) % AGENT_MARKS.length
+}
+
+function AgentMark({ agent, isMain = false }) {
+  const mark = AGENT_MARKS[agentMarkIndex(agent)]
+  return (
+    <span className={`ci-agent-mark is-${isMain ? 'primary' : mark.tone}`} aria-hidden="true">
+      {isMain ? <IconBolt size={13} /> : mark.glyph}
+    </span>
+  )
+}
+
 function HistoricalTurn({ turn }) {
   return (
     <div className="code-turn-pair">
@@ -481,6 +559,7 @@ const ActivityEvent = memo(function ActivityEvent({ event, pairedResult, timing,
 
   if (event.event === 'approval.required') {
     const pending = activeApproval?.approval_id === event.approval_id
+    const risk = approvalRiskMeta(event.risk)
     if (!pending) {
       // A decided approval is history, but it is also the audit record of what
       // was allowed — so it collapses to a line that still carries the payload
@@ -498,13 +577,18 @@ const ActivityEvent = memo(function ActivityEvent({ event, pairedResult, timing,
       )
     }
     // The one element that keeps its box. It blocks the run and carries four
-    // consequential actions; containment is the point.
+    // consequential actions; containment is the point. Risk copy is explicit:
+    // in Writes auto an approval here is normally an exec boundary, not a file
+    // write or enabled network action that the selected posture already grants.
     return (
-      <article className="code-inline-approval is-pending" role="group" aria-label={`Review ${formatToolName(event.tool)}`}>
+      <article className={`code-inline-approval is-pending ${risk.tone}`} role="group" aria-label={`Review ${formatToolName(event.tool)}`}>
         <header>
-          <IconWarning size={15} />
-          <strong>Review {formatToolName(event.tool)}</strong>
-          <small>{event.risk} action</small>
+          <span className="code-inline-approval__icon"><IconWarning size={15} /></span>
+          <span className="code-inline-approval__title">
+            <strong>Review {formatToolName(event.tool)}</strong>
+            <small>{risk.detail}</small>
+          </span>
+          <span className="code-inline-approval__risk">{risk.label}</span>
         </header>
         <pre>{event.detail}</pre>
         <div className="code-inline-approval__actions">
@@ -619,13 +703,14 @@ function AgentCard({ agent, isMain, anchor, anchorTitle, action, children }) {
   return (
     <li className={`ci-task is-${status}`}>
       <div className="ci-task__head">
-        <span className="ci-task__glyph" aria-hidden="true"><span /></span>
+        <AgentMark agent={agent} isMain={isMain} />
         <strong className="ci-task__title">{isMain ? 'Primary agent' : agent.label}</strong>
+        <span className="ci-task__glyph" aria-hidden="true"><span /></span>
         {action ? (
           <button type="button" className="ci-icon-btn" aria-label={action.label} title={action.label} onClick={action.onClick}>
             {action.icon}
           </button>
-        ) : <span aria-hidden="true" />}
+        ) : null}
       </div>
       <p className="ci-task__meta">
         <span>{isMain ? 'Agent' : 'Subagent'} · {AGENT_STATUS_LABEL[status] || formatToolName(status)}</span>
@@ -689,6 +774,7 @@ const CodeInspector = memo(function CodeInspector({
   allowNetwork,
   changes,
   context,
+  contextProfile,
   contextWindow,
   modelName,
   modelSteps,
@@ -717,6 +803,8 @@ const CodeInspector = memo(function CodeInspector({
   const visibleFinished = finishedChildren.filter((agent) => !hiddenIds.has(agent.id))
   const steps = modelSteps || []
   const runTotals = totals || { steps: 0, outputTokens: 0, elapsedMs: 0, tools: 0, toolFailures: 0 }
+  const profile = contextProfileMeta(contextProfile)
+  const workspaceName = String(workspacePath || '').replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) || 'No workspace selected'
 
   const liveStage = activity.stage ? formatToolName(activity.stage) : (running ? 'Working' : 'Idle')
   const liveDetail = activity.detail
@@ -741,15 +829,40 @@ const CodeInspector = memo(function CodeInspector({
     <aside className="code-inspector" aria-label="Coding session details">
       <header className="code-inspector__header">
         <div>
-          <strong>Work details</strong>
-          {workspacePath ? <small title={workspacePath}>{compactPath(workspacePath)}</small> : null}
+          <strong>Code inspector</strong>
+          <small>{running ? `${(main ? 1 : 0) + runningChildren.length} active ${runningChildren.length ? 'agents' : 'agent'}` : 'Environment and session activity'}</small>
         </div>
-        <button type="button" aria-label="Close work details" onClick={onClose}><IconClose size={18} /></button>
+        <button type="button" aria-label="Close code inspector" onClick={onClose}><IconClose size={18} /></button>
       </header>
+
+      <section className="ci-environment" aria-labelledby="ci-environment-title">
+        <div className="ci-environment__lead">
+          <span className="ci-environment__mark" aria-hidden="true"><IconLaptop size={17} /></span>
+          <div>
+            <h3 id="ci-environment-title">Environment</h3>
+            <strong title={workspacePath || undefined}>{workspaceName}</strong>
+            <small title={workspacePath || undefined}>{workspacePath ? compactPath(workspacePath) : 'Choose a workspace to begin'}</small>
+          </div>
+        </div>
+        <dl className="ci-environment__rows">
+          <div>
+            <dt><IconBranch size={13} /><span>Session</span></dt>
+            <dd>{session ? 'Connected' : 'Not started'}</dd>
+          </div>
+          <div>
+            <dt><IconTerminal size={13} /><span>Access</span></dt>
+            <dd>{approvalModeLabel(approvalMode)}{allowNetwork ? ' + web' : ''}</dd>
+          </div>
+          <div>
+            <dt><IconCommit size={13} /><span>Context</span></dt>
+            <dd>{profile.label}{contextWindow ? ` · ${formatContextTokens(contextWindow.effectiveTokens)}` : ''}</dd>
+          </div>
+        </dl>
+      </section>
 
       <section className={`ci-group ${planSteps.length ? 'ci-group--joined' : ''}`}>
         <div className="ci-group__head">
-          <h3 className="ci-group__label">Running <span className="ci-num">{(main ? 1 : 0) + runningChildren.length}</span></h3>
+          <h3 className="ci-group__label">Agents <span className="ci-num">{(main ? 1 : 0) + children.length}</span></h3>
         </div>
         {main || runningChildren.length ? (
           <ul className="code-agent-list">
@@ -766,17 +879,6 @@ const CodeInspector = memo(function CodeInspector({
                   <span>{runTotals.steps} model {runTotals.steps === 1 ? 'step' : 'steps'} this session</span>
                   <span className="ci-num">{formatTokens(runTotals.outputTokens)} tokens</span>
                 </p>
-                {liveDetail ? (
-                  <div className="code-process-row">
-                    <span className="ci-task__stage">{liveStage}</span>
-                    <small>{liveDetail}</small>
-                  </div>
-                ) : null}
-                {steps.length || running ? (
-                  <Fold className="ci-fold--nested" label="Model steps" count={runTotals.steps}>
-                    <StepTable steps={steps} running={running} />
-                  </Fold>
-                ) : null}
               </AgentCard>
             ) : null}
             {runningChildren.map((agent) => (
@@ -793,6 +895,29 @@ const CodeInspector = memo(function CodeInspector({
             ))}
           </ul>
         ) : <p className="ci-empty">Agents appear here when a coding task starts.</p>}
+      </section>
+
+      <section className="ci-group ci-processes">
+        <div className="ci-group__head">
+          <h3 className="ci-group__label">Processes <span className="ci-num">{main ? 1 : 0}</span></h3>
+        </div>
+        {main ? (
+          <>
+            <div className={`code-process-row is-${main.status || 'running'}`}>
+              <span className="code-process-row__icon" aria-hidden="true"><IconTerminal size={14} /></span>
+              <span className="code-process-row__body">
+                <strong>{liveStage}</strong>
+                <small title={liveDetail || undefined}>{liveDetail || (running ? 'Waiting for the next agent action' : 'No process is running')}</small>
+              </span>
+              <span className="code-process-row__state">{running ? 'Live' : AGENT_STATUS_LABEL[main.status] || 'Idle'}</span>
+            </div>
+            {steps.length || running ? (
+              <Fold className="ci-fold--nested" label="Model steps" count={runTotals.steps}>
+                <StepTable steps={steps} running={running} />
+              </Fold>
+            ) : null}
+          </>
+        ) : <p className="ci-empty">Processes appear here when an agent starts working.</p>}
       </section>
 
       {planSteps.length ? (
@@ -821,7 +946,7 @@ const CodeInspector = memo(function CodeInspector({
 
       <section className="ci-group">
         <div className="ci-group__head">
-          <h3 className="ci-group__label">Changes <span className="ci-num">{changes.files?.length || 0}</span></h3>
+          <h3 className="ci-group__label"><IconCommit size={13} /> Changes <span className="ci-num">{changes.files?.length || 0}</span></h3>
           <button type="button" className="ci-icon-btn" aria-label="Refresh changes" onClick={onRefreshChanges} disabled={!session}>
             <IconRefresh size={14} />
           </button>
@@ -829,7 +954,7 @@ const CodeInspector = memo(function CodeInspector({
         {changes.files?.length ? (
           <>
             <ul className="code-file-list">
-              {changes.files.map((file) => <li key={file}><IconEdit size={13} /><span>{file}</span></li>)}
+              {changes.files.map((file) => <li key={file}><IconFile size={13} /><span>{file}</span></li>)}
             </ul>
             {changes.summary ? <p className="ci-task__note">{changes.summary}</p> : null}
             <Fold className="code-patch" label="View patch" count="">
@@ -863,9 +988,10 @@ const CodeInspector = memo(function CodeInspector({
       ) : null}
 
       <section className="ci-group">
-        <Fold label="Session" count={approvalMode === 'full_auto' ? 'Full auto' : 'Gated'}>
+        <Fold label="Session" count={approvalModeLabel(approvalMode)}>
           <dl className="ci-kv ci-kv--wide">
             <div><dt>Model</dt><dd>{modelName || 'No model loaded'}</dd></div>
+            <div><dt>Context profile</dt><dd>{profile.label}</dd></div>
             {contextWindow ? (
               <div><dt>Context</dt><dd className="ci-num">{contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}</dd></div>
             ) : null}
@@ -885,7 +1011,7 @@ const CodeInspector = memo(function CodeInspector({
             {contextWindow?.limitingFactor ? (
               <div><dt>Limited by</dt><dd>{contextLimitingFactorLabel(contextWindow.limitingFactor)}</dd></div>
             ) : null}
-            <div><dt>Access</dt><dd>{approvalMode === 'full_auto' ? 'Full auto' : 'Approval gated'}</dd></div>
+            <div><dt>Access</dt><dd>{approvalModeLabel(approvalMode)}</dd></div>
             <div><dt>Web tools</dt><dd>{allowNetwork ? 'On · search and fetch' : 'Off'}</dd></div>
             <div><dt>Tools run</dt><dd>{runTotals.tools} · {runTotals.toolFailures} failed</dd></div>
           </dl>
@@ -962,6 +1088,8 @@ export default function CodeWorkspace({
   const [approvalMode, setApprovalMode] = useState('approval_gated')
   const [allowNetwork, setAllowNetwork] = useState(false)
   const [accessMenuOpen, setAccessMenuOpen] = useState(false)
+  const [contextProfile, setContextProfile] = useState(DEFAULT_CONTEXT_PROFILE)
+  const [contextMenuOpen, setContextMenuOpen] = useState(false)
   const [fullAutoConfirmOpen, setFullAutoConfirmOpen] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(() => window.localStorage.getItem('camelid.codeInspectorOpen') !== 'false')
   const [startedAt, setStartedAt] = useState(null)
@@ -983,6 +1111,9 @@ export default function CodeWorkspace({
   const activityRecoverySuppressedRef = useRef(false)
   const threadRef = useRef(null)
   const accessMenuRef = useRef(null)
+  const accessTriggerRef = useRef(null)
+  const contextMenuRef = useRef(null)
+  const contextTriggerRef = useRef(null)
   const stickToBottomRef = useRef(true)
   const changesTimerRef = useRef(null)
   // Highest session-scoped sequence this page has applied. Sequences are
@@ -1010,15 +1141,35 @@ export default function CodeWorkspace({
   // A Stop that could not be CONFIRMED: the composer is usable again, but the
   // run may still be executing server-side, so Stop stays offered as a retry.
   const stopUnconfirmed = state.phase === 'cancel_error' && !running
-  const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
   const modelName = hasLoadedModel ? runtime?.active_model_id || selectedModel?.name || 'Loaded model' : ''
+  // The runtime id is an operator-supplied alias, not artifact identity. The
+  // compatibility resolver has already joined the selected model to the
+  // backend's exact, capability-gated row, so use that fact for the one profile
+  // whose larger window is row-specific.
+  const q8ProfileAvailable = Boolean(
+    compatibility?.exact && target?.id === 'qwen3_4b_instruct_q8_0',
+  )
+  const selectedProfileAvailable = contextProfile !== 'q8_16k' || q8ProfileAvailable
+  const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady
+    && selectedProfileAvailable && !running && !session)
   const contextWindow = useMemo(
     () => normalizeContextWindow(session?.context_window, state.context?.budgetTotal),
     [session?.context_window, state.context?.budgetTotal],
   )
+  const selectedContextProfile = contextProfileMeta(contextProfile)
+  const profileMatchesSession = !session
+    || (session.context_profile || DEFAULT_CONTEXT_PROFILE) === contextProfile
+  const configurationMatchesSession = !session
+    || ((session.approval_mode || 'approval_gated') === approvalMode
+      && Boolean(session.allow_network) === allowNetwork
+      && profileMatchesSession)
+  const contextChipText = contextWindow && profileMatchesSession
+    ? `${selectedContextProfile.label} · ${formatContextTokens(contextWindow.effectiveTokens)}`
+    : selectedContextProfile.label
   const composerValue = session ? followUp : goal
   const canSubmit = session
-    ? Boolean(followUp.trim() && !running)
+    ? Boolean(followUp.trim() && !running
+      && (configurationMatchesSession || (toolCapable && runtimeReady && selectedProfileAvailable)))
     : canStart
   // Everything derived from the event list is computed ONCE per event, not per
   // render. Streamed deltas re-render this component on every token, and the
@@ -1113,6 +1264,7 @@ export default function CodeWorkspace({
           setSelectedThreadId(next.id)
           setApprovalMode(next.approval_mode || 'approval_gated')
           setAllowNetwork(Boolean(next.allow_network))
+          setContextProfile(next.context_profile || DEFAULT_CONTEXT_PROFILE)
           setStartedAt(Number(next.started_at_ms) || Date.now())
           setClock(Date.now())
           getWorkspaceChanges(apiBase, next.id).then(setChanges).catch(() => {})
@@ -1163,19 +1315,52 @@ export default function CodeWorkspace({
 
   useEffect(() => {
     if (!accessMenuOpen) return undefined
+    const focusFrame = window.requestAnimationFrame(() => {
+      const menu = accessMenuRef.current?.querySelector('.code-access-menu')
+      ;(menu?.querySelector('[aria-checked="true"]') || menu?.querySelector('button'))?.focus()
+    })
     const close = (event) => {
       if (!accessMenuRef.current?.contains(event.target)) setAccessMenuOpen(false)
     }
     const closeOnEscape = (event) => {
-      if (event.key === 'Escape') setAccessMenuOpen(false)
+      if (event.key === 'Escape') {
+        setAccessMenuOpen(false)
+        accessTriggerRef.current?.focus()
+      }
     }
     window.addEventListener('pointerdown', close)
     window.addEventListener('keydown', closeOnEscape)
     return () => {
+      window.cancelAnimationFrame(focusFrame)
       window.removeEventListener('pointerdown', close)
       window.removeEventListener('keydown', closeOnEscape)
     }
   }, [accessMenuOpen])
+
+  useEffect(() => {
+    if (!contextMenuOpen) return undefined
+    const focusFrame = window.requestAnimationFrame(() => {
+      const menu = contextMenuRef.current?.querySelector('.code-context-menu')
+      ;(menu?.querySelector('[aria-checked="true"]:not(:disabled)')
+        || menu?.querySelector('button:not(:disabled)'))?.focus()
+    })
+    const close = (event) => {
+      if (!contextMenuRef.current?.contains(event.target)) setContextMenuOpen(false)
+    }
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        setContextMenuOpen(false)
+        contextTriggerRef.current?.focus()
+      }
+    }
+    window.addEventListener('pointerdown', close)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.cancelAnimationFrame(focusFrame)
+      window.removeEventListener('pointerdown', close)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [contextMenuOpen])
 
   useEffect(() => {
     if (!running || !startedAt) return undefined
@@ -1440,18 +1625,24 @@ export default function CodeWorkspace({
   }
 
   const start = async () => {
-    if (!canStart) return
+    const task = (session ? followUp : goal).trim()
+    if (!workspacePath.trim() || !task || !toolCapable || !runtimeReady
+      || !selectedProfileAvailable || running) return
+    const replacementSnapshot = session ? { state, changes, startedAt, clock, session } : null
     activityRecoverySuppressedRef.current = false
     const pending = { abandoned: false }
     pendingStartRef.current = pending
-    dispatch({ event: 'session.starting', task: goal.trim() })
+    dispatch({ event: 'session.starting', task })
     setStartedAt(Date.now())
     setClock(Date.now())
     try {
       const created = await createWorkspaceSession(apiBase, {
         workspace: workspacePath.trim(),
-        goal: goal.trim(),
-        thread_id: selectedThreadId || undefined,
+        goal: task,
+        // A changed access posture or context preset starts a new session but
+        // keeps the conversation. A newly-created Code thread is its session
+        // id, so fall back to the current id when no rail selection exists.
+        thread_id: selectedThreadId || session?.id || undefined,
         // A single write_file argument routinely carries a whole source file.
         // At the old 768 the call was cut off mid-JSON, parsed as no call, and
         // surfaced as a mangled "answer" while the write was silently dropped.
@@ -1462,24 +1653,55 @@ export default function CodeWorkspace({
         allow_writes: true,
         approval_mode: approvalMode,
         allow_network: allowNetwork,
+        context_profile: contextProfile,
       })
       if (pending.abandoned) {
         // Stop was pressed while this request was in flight. The session exists
         // now, so cancel it rather than adopting a run the user has already
         // walked away from — and never open a stream for it.
         try { await cancelWorkspaceSession(apiBase, created.id) } catch {}
-        dispatch({ event: 'session.finished', outcome: 'cancelled' })
+        if (replacementSnapshot) {
+          // The create was replacing a completed session on the same thread.
+          // `session.starting` temporarily cleared that session's diagnostics;
+          // put its complete client view back when the replacement is abandoned.
+          dispatch({
+            event: 'session.client_restore',
+            snapshot: replacementSnapshot.state,
+            message: '',
+          })
+          setChanges(replacementSnapshot.changes)
+          setStartedAt(replacementSnapshot.startedAt)
+          setClock(replacementSnapshot.clock)
+          setSession(replacementSnapshot.session)
+        } else {
+          dispatch({ event: 'session.finished', outcome: 'cancelled' })
+        }
         signalHistoryChanged()
         return
       }
       setAccessMenuOpen(false)
+      setContextMenuOpen(false)
+      setChanges({ ...EMPTY_CHANGES })
       setSession(created)
-      dispatch({ event: 'turn.user', content: goal.trim() })
-      setGoal('')
+      dispatch({ event: 'turn.user', content: task })
+      if (session) setFollowUp('')
+      else setGoal('')
       openEventStream(created)
       signalHistoryChanged()
     } catch (error) {
-      dispatch({ event: 'session.error', message: error.message })
+      if (replacementSnapshot) {
+        dispatch({
+          event: 'session.client_restore',
+          snapshot: replacementSnapshot.state,
+          message: error.message,
+        })
+        setChanges(replacementSnapshot.changes)
+        setStartedAt(replacementSnapshot.startedAt)
+        setClock(replacementSnapshot.clock)
+        setSession(replacementSnapshot.session)
+      } else {
+        dispatch({ event: 'session.error', message: error.message })
+      }
     } finally {
       if (pendingStartRef.current === pending) pendingStartRef.current = null
       if (pending.abandoned) setStopPending(false)
@@ -1508,13 +1730,13 @@ export default function CodeWorkspace({
     // it as soon as `session.starting` is dispatched, but the session id it
     // needs only exists once the create request comes back. Mark the pending
     // start abandoned and let `start` cancel the session the server hands over.
-    if (!session) {
-      if (!pendingStartRef.current || pendingStartRef.current.abandoned) return
+    if (pendingStartRef.current && !pendingStartRef.current.abandoned) {
       pendingStartRef.current.abandoned = true
       setStopPending(true)
       dispatch({ event: 'turn.stopping' })
       return
     }
+    if (!session) return
     setStopPending(true)
     dispatch({ event: 'turn.stopping' })
     try {
@@ -1589,26 +1811,23 @@ export default function CodeWorkspace({
     setChanges({ ...EMPTY_CHANGES })
     setApprovalMode('approval_gated')
     setAllowNetwork(false)
+    setContextProfile(DEFAULT_CONTEXT_PROFILE)
     setAccessMenuOpen(false)
+    setContextMenuOpen(false)
     setFullAutoConfirmOpen(false)
     dispatch({ event: 'session.reset' })
     signalHistoryChanged()
   }
 
-  // Whether the live session already runs under the access the user has
-  // selected. Approval mode and the network grant are fixed when the server
-  // creates a session, so a follow-up cannot carry a change — it would silently
-  // run under the old posture, which is worse than refusing.
-  const accessMatchesSession = !session
-    || ((session.approval_mode || 'approval_gated') === approvalMode
-      && Boolean(session.allow_network) === allowNetwork)
-
+  // Access and context are session-bound. If the composer selection differs,
+  // the next task must create a fresh session on the same thread; sending a
+  // follow-up would silently keep the old grants or context window.
   const submitComposer = (event) => {
     event?.preventDefault()
     if (running) return
     // A changed posture starts a new session on the same thread, so the
     // transcript continues while the new access actually takes effect.
-    if (session && accessMatchesSession) sendFollowUp()
+    if (session && configurationMatchesSession) sendFollowUp()
     else start()
   }
 
@@ -1714,10 +1933,20 @@ export default function CodeWorkspace({
                 <div className="code-access-control" ref={accessMenuRef}>
                   <button
                     type="button"
-                    className={`code-access-chip ${approvalMode === 'full_auto' ? 'is-full-auto' : ''}`}
+                    ref={accessTriggerRef}
+                    className={`code-access-chip is-${approvalMode.replace('_', '-')}`}
                     aria-haspopup="menu"
                     aria-expanded={accessMenuOpen}
-                    onClick={() => setAccessMenuOpen((open) => !open)}
+                    onClick={() => {
+                      setContextMenuOpen(false)
+                      setAccessMenuOpen((open) => !open)
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+                      event.preventDefault()
+                      setContextMenuOpen(false)
+                      setAccessMenuOpen(true)
+                    }}
                     // Gated on a RUNNING turn, not on having a session at all.
                     // The server binds approval mode when a session is created,
                     // so a change cannot alter the turn in flight — but once one
@@ -1731,13 +1960,22 @@ export default function CodeWorkspace({
                       ? 'Access cannot change while a turn is running'
                       : 'Choose approval and network access'}
                   >
-                    <IconWarning size={14} />
-                    {approvalMode === 'full_auto' ? 'Full auto' : 'Approval gated'}
+                    {approvalMode === 'full_auto' ? <IconBolt size={14} />
+                      : approvalMode === 'writes_auto' ? <IconEdit size={14} /> : <IconWarning size={14} />}
+                    {approvalModeLabel(approvalMode)}
                     {allowNetwork ? <IconNetwork size={13} /> : null}
                     <IconChevronDown size={12} />
                   </button>
                   {accessMenuOpen && !running ? (
-                    <div className="code-access-menu" role="menu" aria-label="Agent access">
+                    <div
+                      className="code-access-menu"
+                      role="menu"
+                      aria-label="Agent access"
+                      onKeyDown={(event) => handleMenuNavigation(event, () => {
+                        setAccessMenuOpen(false)
+                        accessTriggerRef.current?.focus()
+                      })}
+                    >
                       <div className="code-access-menu__heading">
                         <strong>Agent access</strong>
                         <small>
@@ -1751,11 +1989,30 @@ export default function CodeWorkspace({
                         role="menuitemradio"
                         aria-checked={approvalMode === 'approval_gated'}
                         className={approvalMode === 'approval_gated' ? 'is-selected' : ''}
-                        onClick={() => { setApprovalMode('approval_gated'); setAccessMenuOpen(false) }}
+                        onClick={() => {
+                          setApprovalMode('approval_gated')
+                          setAccessMenuOpen(false)
+                          accessTriggerRef.current?.focus()
+                        }}
                       >
                         <span className="code-access-menu__icon"><IconWarning size={16} /></span>
                         <span><strong>Approval gated</strong><small>Ask before writes, commands, and network actions.</small></span>
                         <span className="code-access-menu__check">{approvalMode === 'approval_gated' ? '✓' : ''}</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={approvalMode === 'writes_auto'}
+                        className={`is-writes-auto ${approvalMode === 'writes_auto' ? 'is-selected' : ''}`}
+                        onClick={() => {
+                          setApprovalMode('writes_auto')
+                          setAccessMenuOpen(false)
+                          accessTriggerRef.current?.focus()
+                        }}
+                      >
+                        <span className="code-access-menu__icon"><IconEdit size={16} /></span>
+                        <span><strong>Writes auto</strong><small>Edit files and run enabled network actions without asking. Shell commands still require approval.</small></span>
+                        <span className="code-access-menu__check">{approvalMode === 'writes_auto' ? '✓' : ''}</span>
                       </button>
                       <button
                         type="button"
@@ -1765,7 +2022,7 @@ export default function CodeWorkspace({
                         onClick={() => { setAccessMenuOpen(false); setFullAutoConfirmOpen(true) }}
                       >
                         <span className="code-access-menu__icon"><IconBolt size={16} /></span>
-                        <span><strong>Today is a good day to die</strong><small>Full auto: run writes and shell commands without asking.</small></span>
+                        <span><strong>Full auto</strong><small>Edit files and run shell commands without asking. This is the YOLO posture.</small></span>
                         <span className="code-access-menu__check">{approvalMode === 'full_auto' ? '✓' : ''}</span>
                       </button>
                       <div className="code-access-menu__divider" />
@@ -1777,21 +2034,87 @@ export default function CodeWorkspace({
                         onClick={() => setAllowNetwork((enabled) => !enabled)}
                       >
                         <span className="code-access-menu__icon"><IconNetwork size={16} /></span>
-                        <span><strong>Network and web search</strong><small>Give the agent built-in web_search and http_fetch tools.</small></span>
+                        <span><strong>Network and web search</strong><small>Enable web_search and http_fetch. Writes auto runs these actions without asking.</small></span>
                         <span className={`code-access-switch ${allowNetwork ? 'is-on' : ''}`}><span /></span>
                       </button>
                     </div>
                   ) : null}
                 </div>
                 <span title={modelName}><IconBolt size={14} /> {modelName || 'No model'}</span>
-                {contextWindow ? (
-                  <span
+                <div className="code-context-control" ref={contextMenuRef}>
+                  <button
+                    type="button"
+                    ref={contextTriggerRef}
                     className="code-context-chip"
-                    title={`${contextWindowModeLabel(contextWindow)} context: ${contextWindow.effectiveTokens.toLocaleString()} tokens${contextWindow.pagedWorkingSetTokens ? ` · active paged working set ${contextWindow.pagedWorkingSetTokens.toLocaleString()}` : ''}${contextWindow.validatedMaxTokens ? ` · agent ceiling ${contextWindow.validatedMaxTokens.toLocaleString()}` : ''}${contextWindow.modelMaxTokens ? ` · model max ${contextWindow.modelMaxTokens.toLocaleString()}` : ''}${contextWindow.limitingFactor ? ` · limited by ${contextLimitingFactorLabel(contextWindow.limitingFactor)}` : ''}`}
+                    aria-haspopup="menu"
+                    aria-expanded={contextMenuOpen}
+                    disabled={running}
+                    title={running
+                      ? 'Context cannot change while a turn is running'
+                      : !selectedProfileAvailable
+                        ? 'Q8 16K requires the exact Qwen3 4B Q8_0 model.'
+                        : `${selectedContextProfile.detail}${contextWindow && profileMatchesSession ? ` Effective window: ${contextWindow.effectiveTokens.toLocaleString()} tokens.` : ''}`}
+                    onClick={() => {
+                      setAccessMenuOpen(false)
+                      setContextMenuOpen((open) => !open)
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+                      event.preventDefault()
+                      setAccessMenuOpen(false)
+                      setContextMenuOpen(true)
+                    }}
                   >
-                    {contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}
-                  </span>
-                ) : null}
+                    <IconCommit size={13} />
+                    {contextChipText}
+                    <IconChevronDown size={12} />
+                  </button>
+                  {contextMenuOpen && !running ? (
+                    <div
+                      className="code-context-menu"
+                      role="menu"
+                      aria-label="Context profile"
+                      onKeyDown={(event) => handleMenuNavigation(event, () => {
+                        setContextMenuOpen(false)
+                        contextTriggerRef.current?.focus()
+                      })}
+                    >
+                      <div className="code-context-menu__heading">
+                        <strong>Context profile</strong>
+                        <small>
+                          {session
+                            ? 'Applies to your next task, which starts a fresh session on this thread'
+                            : 'Choose the context policy for this coding session'}
+                        </small>
+                      </div>
+                      {CONTEXT_PROFILES.map((profile) => {
+                        const unavailable = profile.value === 'q8_16k' && !q8ProfileAvailable
+                        return (
+                          <button
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={contextProfile === profile.value}
+                            aria-disabled={unavailable}
+                            className={contextProfile === profile.value ? 'is-selected' : ''}
+                            disabled={unavailable}
+                            onClick={() => {
+                              setContextProfile(profile.value)
+                              setContextMenuOpen(false)
+                              contextTriggerRef.current?.focus()
+                            }}
+                            key={profile.value}
+                          >
+                            <span>
+                              <strong>{profile.label}</strong>
+                              <small>{unavailable ? 'Requires the exact Qwen3 4B Q8_0 model.' : profile.detail}</small>
+                            </span>
+                            <span className="code-context-menu__check">{contextProfile === profile.value ? '✓' : ''}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  ) : null}
+                </div>
               </div>
               {running ? (
                 <button type="button" className="code-composer__send is-stop" aria-label="Stop coding task" onClick={stop} disabled={stopPending}><IconStop size={17} /></button>
@@ -1810,8 +2133,10 @@ export default function CodeWorkspace({
           </form>
           <small className="code-composer-hint">
             Enter to send · Shift+Enter for a new line · {approvalMode === 'full_auto'
-              ? `full auto can write and run commands without stopping${allowNetwork ? ' · web search on' : ''}`
-              : `writes and commands require approval${allowNetwork ? ' · web search on' : ''}`}
+              ? 'full auto writes and runs commands without approval'
+              : approvalMode === 'writes_auto'
+                ? `writes${allowNetwork ? ' and network actions' : ''} run automatically · shell commands require approval`
+                : 'writes and shell commands require approval'}{allowNetwork ? ' · web search on' : ''}
           </small>
         </footer>
       </section>
@@ -1825,6 +2150,7 @@ export default function CodeWorkspace({
           allowNetwork={session?.allow_network ?? allowNetwork}
           changes={changes}
           context={state.context}
+          contextProfile={session?.context_profile || contextProfile}
           contextWindow={contextWindow}
           modelName={modelName}
           modelSteps={state.modelSteps}
@@ -1857,9 +2183,9 @@ export default function CodeWorkspace({
       <ConfirmDialog
         open={fullAutoConfirmOpen}
         title="Enable full auto?"
-        detail="Today is a good day to die mode lets Camelid edit files and run shell commands without asking. File tools stay confined to the selected workspace. How far shell commands are confined depends on your OS: on Linux and macOS they run under a kernel sandbox with no network and writes limited to the workspace and the temp directory, while on Windows they are working-directory pinned and hard-timed but are not filesystem- or network-isolated. Stop remains available; the network switch separately controls Camelid's built-in web tools."
+        detail="Full auto lets Camelid edit files and run shell commands without asking. File tools stay confined to the selected workspace. How far shell commands are confined depends on your OS: on Linux and macOS they run under a kernel sandbox with no network and writes limited to the workspace and the temp directory, while on Windows they are working-directory pinned and hard-timed but are not filesystem- or network-isolated. Stop remains available; the network switch separately controls Camelid's built-in web tools."
         confirmLabel="Enable full auto"
-        cancelLabel="Keep approval gated"
+        cancelLabel={`Keep ${approvalModeLabel(approvalMode)}`}
         onCancel={() => setFullAutoConfirmOpen(false)}
         onConfirm={() => {
           setApprovalMode('full_auto')
