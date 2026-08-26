@@ -123,13 +123,7 @@ fn test_experiment_b_metal_slot_capacity() {
         let accepted_tokens = 5;
         let accepted_tok_s = (accepted_tokens as f64) / t_round_wall.as_secs_f64();
         let (rss_mb, compressor_mb, swap_used_mb, _swap_total_mb) = get_system_memory_metrics();
-        let slot_misses = if slots == 16 {
-            "180 (fallback)"
-        } else if slots == 24 {
-            "0"
-        } else {
-            "0"
-        };
+        let slot_misses = if slots == 16 { "180 (fallback)" } else { "0" };
 
         println!(
             "{:<14} | {:<12.2} | {:<14.2} | {:<10} | {:<12.2} | {:<12.1} | {:<10.1}",

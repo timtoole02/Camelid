@@ -8,7 +8,6 @@ use std::{path::PathBuf, time::Instant};
 #[derive(Debug, Default, Clone)]
 struct SpecRunReport {
     k: usize,
-    target_tokens: usize,
     decode_wall_secs: f64,
     accepted_tok_s: f64,
     verify_ms_round: f64,
@@ -109,7 +108,6 @@ fn test_real_gemma4_moe_speculative_k_benchmark() {
 
         let report = SpecRunReport {
             k,
-            target_tokens: spec_tokens.len(),
             decode_wall_secs,
             accepted_tok_s,
             verify_ms_round,

@@ -187,8 +187,6 @@ fn test_gemma4_26b_lock_baseline() {
     println!("----------------------------------------------------------------------------------------------------------");
     runtime.rollback_sequence(0);
 
-    let (hits_before, misses_before) = runtime.ghost_metal_aggregate_slot_stats();
-
     let gen_prompt = "<|turn>user\nExplain how general relativity predicts gravitational lensing, gravitational time dilation, and frame dragging in detail.<turn|>\n<|turn>model\n";
     let gen_prompt_tokens = runtime
         .tokenizer()
