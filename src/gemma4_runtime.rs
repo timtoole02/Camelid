@@ -2132,9 +2132,7 @@ const GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE: [usize; 30] = [
 /// watchdog ceilings while retaining its per-layer weighting. Keeping the
 /// literal frozen prevents a merely same-total profile from silently changing
 /// the I/O and physical-footprint contract.
-#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS: usize = 1_408;
-#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
     60, 64, 45, 43, 40, 41, 44, 42, 47, 46, 40, 41, 44, 46, 42, 50, 40, 39, 46, 47, 41, 46, 45, 43,
     46, 56, 59, 56, 58, 51,
