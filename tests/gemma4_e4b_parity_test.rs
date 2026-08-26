@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Parity test for genuine Gemma 4 E4B Q4_0 against reference
 
 use camelid::gemma4_runtime::{Gemma4GpuRuntime, Gemma4Runtime};
