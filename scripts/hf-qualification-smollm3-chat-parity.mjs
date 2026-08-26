@@ -93,7 +93,7 @@ const GROUNDING_FILES = Object.freeze({
   }),
   runtime_envelope: Object.freeze({
     path: 'qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json',
-    sha256: '621a6017bc8c1d36264f4c764ba97b331f675b869a01b34222ddf9260546fd55',
+    sha256: '2e3cd7cf353033e8d14d045aeff0ea05bfb3b8ae3abb8c37190a5bd40f619491',
   }),
 })
 
