@@ -97,7 +97,7 @@ const GROUNDING_FILES = Object.freeze({
   }),
 })
 
-const RENDERER_GIT_BLOB_SHA1 = '20d9645c93754a39aea8960f8d4e632cf148910d'
+const RENDERER_GIT_BLOB_SHA1 = 'e6c695a97a3069d275160ae8bc39f1cd82d53bc5'
 const SHAPE_CASE_ID = 'default_think_single_user_generation_prompt'
 const NORMALIZED_PROMPT_UTF8_BYTES = 1_392
 const NORMALIZED_PROMPT_SHA256 = '7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1'
