@@ -1,0 +1,14 @@
+{
+  "schema": "camelid.agent_eval/v1",
+  "outcome": "INCONCLUSIVE",
+  "model_id": null,
+  "gguf": "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf",
+  "gguf_bytes": 14439361440,
+  "quantization": "Q4_0",
+  "note": "host refused the load, so tool capability was never exercised: This model (~14.4 GB) is larger than this machine can hold in memory. The largest catalog model that fits here is Qwen2.5 Coder 7B Q8_0 (`camelid pull qwen25_coder_7b_q8_0`). Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway.",
+  "cases": [],
+  "host_loadavg_1m": 3.005859375,
+  "timestamp_unix": 1787775958,
+  "promotion_eligible": false,
+  "receipt_id": "b11a3aeb64a89e356e336f0a2c4c9f52567dbe0b218f4a29c33320383b23a476"
+}

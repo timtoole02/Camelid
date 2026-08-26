@@ -1,0 +1,42 @@
+{
+  "schema": "camelid.agent_eval/v1",
+  "outcome": "FAIL",
+  "model_id": "26B_dequant_it_hf",
+  "gguf": "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf",
+  "gguf_bytes": 14439361440,
+  "quantization": "Q4_0",
+  "note": "battery complete",
+  "cases": [
+    {
+      "case": "read_and_count",
+      "goal": "Read the file notes.txt and tell me how many lines it has. Use the read_file tool, then give the count.",
+      "loop_end": "DriverError",
+      "tool_calls": [],
+      "tool_results": [],
+      "final_answer": "",
+      "passed": false
+    },
+    {
+      "case": "list_dir_find",
+      "goal": "List the entries of the current directory '.' with the list_dir tool, then tell me the name of the text file you find there.",
+      "loop_end": "DriverError",
+      "tool_calls": [],
+      "tool_results": [],
+      "final_answer": "",
+      "passed": false
+    },
+    {
+      "case": "write_greeting",
+      "goal": "Create a file named greeting.txt whose exact contents are: hello there\nUse the write_file tool ONCE, then reply in words that you created it. Do not call any further tools and do not read the file back.",
+      "loop_end": "DriverError",
+      "tool_calls": [],
+      "tool_results": [],
+      "final_answer": "",
+      "passed": false
+    }
+  ],
+  "host_loadavg_1m": 2.720703125,
+  "timestamp_unix": 1787775978,
+  "promotion_eligible": false,
+  "receipt_id": "ebb003aa7de34a477300de4223b846969e85afc9930be5d42176a3071c0e30cf"
+}
