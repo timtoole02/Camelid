@@ -170,14 +170,12 @@ fn gemma4_spec50_bench() {
         let mut vc = vec![Vec::new(); n_layers];
         let t = Instant::now();
         let mut logits = runtime.prefill_tokens(&toks, &mut kc, &mut vc, 31).unwrap();
-        let mut pos = toks.len();
-        for _ in 0..24 {
+        for pos in (toks.len()..).take(24) {
             let tok = argmax(&logits);
             if eot.contains(&tok) {
                 break;
             }
             logits = runtime.step(tok, pos, &mut kc, &mut vc).unwrap();
-            pos += 1;
         }
         eprintln!("[spec50] warm-up done in {:.1}s", t.elapsed().as_secs_f64());
     }

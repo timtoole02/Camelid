@@ -63,8 +63,7 @@ fn profile_real_gemma4_26b_moe_metal() {
 
     // Warm up 32 tokens so cache is 100% warm
     let mut cur_tok = last_tok;
-    let mut cur_pos = decode_pos;
-    for _ in 0..32 {
+    for cur_pos in (decode_pos..).take(32) {
         let (out, _) = runtime
             .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
             .expect("step");
@@ -81,12 +80,11 @@ fn profile_real_gemma4_26b_moe_metal() {
             }
         }
         cur_tok = next_id;
-        cur_pos += 1;
     }
 
     // Now profile 1 WARM decode token step with Metal expert execution
     let (out, profile) = runtime
-        .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
+        .step_range_profiled(cur_tok, decode_pos + 32, None, &mut kc, &mut vc)
         .expect("step_range_profiled");
     let logits = match out {
         Gemma4StepOutput::Logits(l) => l,

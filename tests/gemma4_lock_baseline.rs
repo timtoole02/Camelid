@@ -159,8 +159,7 @@ fn test_gemma4_26b_lock_baseline() {
 
     let mut qkd_tokens = Vec::new();
     let mut qkd_logits = qkd_init_logits;
-    let mut qkd_pos = qkd_prompt_tokens.len();
-    for _ in 0..48 {
+    for qkd_pos in (qkd_prompt_tokens.len()..).take(48) {
         let tok = qkd_logits
             .iter()
             .enumerate()
@@ -171,7 +170,6 @@ fn test_gemma4_26b_lock_baseline() {
         qkd_logits = runtime
             .step(tok, qkd_pos, &mut qkd_kc, &mut qkd_vc)
             .expect("step");
-        qkd_pos += 1;
     }
     println!("48 tokens generated: {:?}", qkd_tokens);
     let qkd_text = runtime
@@ -217,10 +215,9 @@ fn test_gemma4_26b_lock_baseline() {
     let mut generated_tokens = Vec::with_capacity(n_tokens);
     let mut token_latencies_ms = Vec::with_capacity(n_tokens);
     let mut cur_logits = init_logits;
-    let mut cur_pos = gen_prompt_tokens.len();
 
     let t_decode_start = Instant::now();
-    for step_i in 0..n_tokens {
+    for (cur_pos, step_i) in (gen_prompt_tokens.len()..).zip(0..n_tokens) {
         let t_tok_start = Instant::now();
         let tok = cur_logits
             .iter()
@@ -233,8 +230,6 @@ fn test_gemma4_26b_lock_baseline() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut gen_kc, &mut gen_vc)
             .expect("step");
-        cur_pos += 1;
-
         let tok_ms = t_tok_start.elapsed().as_secs_f64() * 1000.0;
         token_latencies_ms.push(tok_ms);
 

@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Top-N Pruning Sweep Benchmark for K=8 on Genuine Gemma 4 26B-A4B
 //!
 //! Sweeps Top-N candidate prefetch widths (N = 8, 9, 10, 11, 12, 14, 16)
@@ -75,8 +77,7 @@ fn test_genuine_gemma4_top_n_pruning_sweep_k8() {
     let mut cur_logits = initial_logits.clone();
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut cur_pos = prompt_tokens.len();
-    for _ in 0..16 {
+    for cur_pos in (prompt_tokens.len()..).take(16) {
         let tok = cur_logits
             .iter()
             .enumerate()
@@ -87,7 +88,6 @@ fn test_genuine_gemma4_top_n_pruning_sweep_k8() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        cur_pos += 1;
     }
 
     let k = 8;
@@ -141,8 +141,8 @@ fn test_genuine_gemma4_top_n_pruning_sweep_k8() {
             actual_tok_s,
         };
 
-        println!("  Top-N = {:2} | Prefetch: {:7.2} ms ({:5} majflt) | Verifier: {:7.2} ms (GPU {:6.2}ms, Head {:6.2}ms) | Demand NVMe Faults: {:5} | Emitted: {:5.2} tok/s",
-            res.top_n, res.prefetch_ms, res.prefetch_maj_faults, res.verifier_ms, res.verifier_pure_gpu_ms, res.verifier_head_ms, res.verifier_maj_faults, res.actual_tok_s);
+        println!("  Top-N = {:2} | Prefetch: {:7.2} ms / {:4} experts ({:5} majflt) | Verifier: {:7.2} ms (GPU {:6.2}ms, Head {:6.2}ms) | Demand Faults: {:5} maj / {:5} min | Emitted: {:5.2} tok/s",
+            res.top_n, res.prefetch_ms, res.prefetched_experts, res.prefetch_maj_faults, res.verifier_ms, res.verifier_pure_gpu_ms, res.verifier_head_ms, res.verifier_maj_faults, res.verifier_min_faults, res.actual_tok_s);
 
         results.push(res);
     }

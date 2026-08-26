@@ -76,9 +76,7 @@ fn test_genuine_gemma4_outer_round_pipeline_ledger_k8() {
     let mut temp_logits = initial_logits;
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut temp_pos = prompt_tokens.len();
-
-    for _ in 0..48 {
+    for temp_pos in (prompt_tokens.len()..).take(48) {
         let tok = temp_logits
             .iter()
             .enumerate()
@@ -89,7 +87,6 @@ fn test_genuine_gemma4_outer_round_pipeline_ledger_k8() {
         temp_logits = runtime
             .step(tok, temp_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        temp_pos += 1;
     }
 
     // Warmup Round 1 prefetch

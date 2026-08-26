@@ -69,8 +69,7 @@ fn benchmark_speculative_moe_batch_k() {
 
     // Warm up 16 tokens
     let mut cur_tok = last_tok;
-    let mut cur_pos = decode_pos;
-    for _ in 0..16 {
+    for cur_pos in (decode_pos..).take(16) {
         let (out, _) = runtime
             .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
             .expect("step");
@@ -87,8 +86,8 @@ fn benchmark_speculative_moe_batch_k() {
             }
         }
         cur_tok = next_id;
-        cur_pos += 1;
     }
+    let cur_pos = decode_pos + 16;
 
     println!("--------------------------------------------------------------------------------");
     println!("MEASURING SPECULATIVE BATCH-K EXPERT LOCALITY & UNION SIZE (K = 1 to 8)");
