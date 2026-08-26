@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 mod support;
 
 use camelid::gemma4_runtime::{gemma4_stop_token_ids, Gemma4Runtime};
