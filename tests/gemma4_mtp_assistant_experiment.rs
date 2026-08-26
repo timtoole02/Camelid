@@ -1944,6 +1944,7 @@ struct LoadOnlyAssistantLedger {
     load_wall_us: u128,
 }
 
+#[cfg(target_os = "macos")]
 impl From<camelid::metal::Gemma4MtpResidentLedger> for LoadOnlyAssistantLedger {
     fn from(value: camelid::metal::Gemma4MtpResidentLedger) -> Self {
         Self {
@@ -4221,6 +4222,7 @@ fn visible_committed_tokens(committed: &[u32], eot: &[u32]) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn ngram_lane_run(
     run_id: String,
     phase: RunPhase,
@@ -4309,6 +4311,7 @@ fn ngram_lane_run(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn mtp_lane_run(
     run_id: String,
     phase: RunPhase,
@@ -5861,6 +5864,7 @@ impl NativeMtpExperimentAdapter for NativeChildProcessAdapter {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn apply_child_environment(request: &ChildLaneRequest) -> Result<(), String> {
     if request.schema_version != REPORT_SCHEMA_VERSION {
         return Err(format!(
@@ -6006,6 +6010,7 @@ fn shipping_argmax(logits: &[f32]) -> Result<u32, String> {
         .ok_or_else(|| "target returned empty logits".into())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn warm_target_runtime<C: FnMut() -> bool>(
     runtime: &camelid::gemma4_runtime::Gemma4Runtime,
     mut should_abort: C,
@@ -6046,6 +6051,7 @@ fn warm_target_runtime<C: FnMut() -> bool>(
     Ok(true)
 }
 
+#[cfg(target_os = "macos")]
 fn assistant_memory_from_ledger(
     ledger: camelid::metal::Gemma4MtpResidentLedger,
     page_size: u64,
@@ -6088,6 +6094,7 @@ fn empty_lane_memory(request: &ChildLaneRequest) -> LaneMemoryReceipt {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn finish_lane_memory(
     request: &ChildLaneRequest,
     baseline: &MemorySnapshot,
@@ -6135,6 +6142,7 @@ fn finish_lane_memory(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn warm_assistant_once(
     assistant: &mut camelid::metal::Gemma4MtpAssistantMetal,
     control: &ExperimentControl,
@@ -6157,6 +6165,7 @@ fn warm_assistant_once(
     Ok(true)
 }
 
+#[cfg(target_os = "macos")]
 fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, String> {
     apply_child_environment(request)?;
     #[cfg(unix)]
@@ -6593,6 +6602,7 @@ fn explicit_native_admission_run_nonce() -> Result<String, String> {
     Ok(nonce)
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "private subprocess entry point for the isolated parent experiment"]
 fn gemma4_mtp_assistant_lane_child() {
@@ -7023,6 +7033,10 @@ fn gemma4_mtp_assistant_load_only_probe() {
 #[test]
 #[ignore = "default-off isolated MTP experiment; requires explicit opt-in and exact assistant path"]
 fn gemma4_mtp_assistant_experiment() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("SKIP: the native MTP assistant experiment requires macOS Metal");
+        return;
+    }
     if std::env::var(EXPERIMENT_ENABLE_ENV).ok().as_deref() != Some("1") {
         eprintln!("SKIP: set {EXPERIMENT_ENABLE_ENV}=1 for the isolated MTP experiment");
         return;

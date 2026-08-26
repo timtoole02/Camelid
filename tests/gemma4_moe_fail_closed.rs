@@ -6,9 +6,12 @@
 
 mod support;
 
-use camelid::gemma4_runtime::{Gemma4GpuRuntime, Gemma4Runtime};
+#[cfg(target_os = "macos")]
+use camelid::gemma4_runtime::Gemma4GpuRuntime;
+use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 #[test]
 fn gemma4_moe_fails_closed_in_dense_gpu_runtime() {
     let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");

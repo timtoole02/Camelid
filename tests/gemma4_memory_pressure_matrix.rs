@@ -75,8 +75,10 @@ fn get_process_rss_bytes() -> u64 {
         let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
             / std::mem::size_of::<libc::natural_t>())
             as libc::mach_msg_type_number_t;
+        #[allow(deprecated)]
+        let task = libc::mach_task_self();
         let kret = libc::task_info(
-            libc::mach_task_self(),
+            task,
             libc::MACH_TASK_BASIC_INFO,
             &mut info as *mut _ as *mut libc::integer_t,
             &mut count,
@@ -122,13 +124,9 @@ struct BudgetResult {
     system_free_gib: f64,
     file_backed_gib: f64,
     compressed_gib: f64,
-    vm_pressure: u32,
-    k1_round_ms: f64,
-    k1_tok_s: f64,
     k5_round_ms: f64,
     k5_candidate_tok_s: f64,
     k5_emitted_tok_s: f64,
-    parity_pass: bool,
 }
 
 #[test]
@@ -217,13 +215,9 @@ fn test_genuine_gemma4_memory_pressure_matrix() {
             system_free_gib: vm_after.free_gib(),
             file_backed_gib: vm_after.file_backed_gib(),
             compressed_gib: vm_after.compressed_gib(),
-            vm_pressure,
-            k1_round_ms,
-            k1_tok_s,
             k5_round_ms,
             k5_candidate_tok_s,
             k5_emitted_tok_s,
-            parity_pass,
         });
     }
 

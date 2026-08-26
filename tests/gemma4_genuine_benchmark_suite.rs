@@ -9,14 +9,11 @@ use std::{path::PathBuf, time::Instant};
 #[derive(Debug, Clone)]
 struct BenchmarkResult {
     category: &'static str,
-    prompt: &'static str,
     k1_tok_s: f64,
-    k1_text_preview: String,
     k5_ngram_verify_ms: f64,
     k5_ngram_candidate_tok_s: f64,
     k5_ngram_accepted_per_round: f64,
     k5_ngram_emitted_tok_s: f64,
-    k5_ngram_text_preview: String,
 }
 
 #[test]
@@ -139,14 +136,11 @@ fn test_genuine_gemma4_10_prompt_suite() {
 
         results.push(BenchmarkResult {
             category: cat,
-            prompt: raw_prompt,
             k1_tok_s,
-            k1_text_preview: k1_preview,
             k5_ngram_verify_ms: verify_ms_round,
             k5_ngram_candidate_tok_s: candidate_tok_s,
             k5_ngram_accepted_per_round: accepted_per_round,
             k5_ngram_emitted_tok_s: k5_emitted_tok_s,
-            k5_ngram_text_preview: k5_preview,
         });
     }
 

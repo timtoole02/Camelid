@@ -210,6 +210,10 @@ fn test_genuine_gemma4_outer_round_pipeline_ledger_k8() {
             "Draft generation:                   {:7.2} ms",
             ledger.draft_ms
         );
+        println!(
+            "Prefetch issue:                     {:7.2} ms",
+            ledger.prefetch_ms
+        );
         println!("\nPrefetch:");
         println!(
             "  already-ready future experts:     {:7}",
