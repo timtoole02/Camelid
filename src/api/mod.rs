@@ -29080,7 +29080,7 @@ mod tests {
             .generation_runs
             .contains("apple_m4_full_metal_mtp_short_chat_and_frozen_48_token_smoke"));
         assert!(target.frontend_load_path_verified.contains(
-            "hash_host_exact_policy_and_reconciled_apple_m4_full_metal_mtp_execution_plan"
+            "target_and_full_cghost_hashes_host_exact_policy_immutable_profile_and_reconciled_apple_m4_full_metal_mtp_execution_plan"
         ));
         assert!(target
             .frontend_readiness_gate
