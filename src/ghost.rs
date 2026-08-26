@@ -41,6 +41,8 @@ const MOE_SOURCE_IDENTITY_SCHEME: &str = "gemma4-moe-sampled-sha256-v1";
 pub(crate) const MOE_IDENTITY_SAMPLE_BYTES: u64 = 128;
 const MOE_IDENTITY_SAMPLE_ALIGNMENT: u64 = 4096;
 const ALLOW_LEGACY_SPARSE_IDENTITY_ENV: &str = "CAMELID_GHOST_ALLOW_LEGACY_SPARSE";
+const ALLOW_SPARSE_REPACK_ENV: &str = "CAMELID_GHOST_ALLOW_SPARSE_REPACK";
+const ALLOW_HOLLOW_EXPERTS_ENV: &str = "CAMELID_GHOST_ALLOW_HOLLOW_EXPERTS";
 
 /// Physical organization of a `.cghost` payload. Old indexes predate this
 /// discriminator and deserialize as [`DenseLayers`].
@@ -271,19 +273,77 @@ fn source_is_sparse(_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
 fn allow_legacy_sparse_identity() -> bool {
     // Fail closed (base semantics): a legacy .cghost with no sampled source
     // identity pairs with a sparse GGUF only under an explicit opt-in. The
     // silent default-allow that crept in here is exactly how the sparse
     // hot-shadow got run as if it were the full model.
-    std::env::var(ALLOW_LEGACY_SPARSE_IDENTITY_ENV)
-        .ok()
-        .is_some_and(|value| {
-            value == "1"
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes")
-                || value.eq_ignore_ascii_case("on")
-        })
+    env_flag_enabled(ALLOW_LEGACY_SPARSE_IDENTITY_ENV)
+}
+
+fn allow_sparse_repack() -> bool {
+    env_flag_enabled(ALLOW_SPARSE_REPACK_ENV)
+}
+
+fn allow_hollow_experts() -> bool {
+    env_flag_enabled(ALLOW_HOLLOW_EXPERTS_ENV)
+}
+
+/// Whether any routed-expert tensor region of `source` is backed by a
+/// filesystem hole. A hole reads back as zeros, so a repack from such a source
+/// silently emits hollow expert records. `source_is_sparse` cannot answer this
+/// per-region (a hot shadow is legitimately sparse everywhere *else* too), and
+/// on filesystems without `SEEK_HOLE` this scan reports no holes and the
+/// block-count check remains the only sparse signal.
+#[cfg(unix)]
+fn moe_expert_regions_have_holes(source: &File, binding: &Gemma4Binding) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = source.as_raw_fd();
+    for layer in &binding.layers {
+        let Some(moe) = layer.moe.as_ref() else {
+            continue;
+        };
+        for desc in [&moe.gate_up_exps, &moe.down_exps] {
+            if desc.n_bytes == 0 {
+                continue;
+            }
+            let Ok(offset) = libc::off_t::try_from(desc.absolute_offset) else {
+                return Ok(true);
+            };
+            // SAFETY: lseek on an owned open descriptor. Moving its shared
+            // cursor is harmless: every payload read in this module is
+            // positioned.
+            let hole = unsafe { libc::lseek(fd, offset, libc::SEEK_HOLE) };
+            if hole < 0 {
+                let raw = std::io::Error::last_os_error().raw_os_error();
+                if raw == Some(libc::ENXIO) {
+                    // The region starts at or past EOF: all of it is missing.
+                    return Ok(true);
+                }
+                // No SEEK_HOLE support here; defer to the block-count check.
+                return Ok(false);
+            }
+            if (hole as u64) < desc.absolute_offset.saturating_add(desc.n_bytes) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn moe_expert_regions_have_holes(_source: &File, _binding: &Gemma4Binding) -> Result<bool> {
+    Ok(false)
 }
 
 fn sha256_hex(hasher: Sha256) -> String {
@@ -749,6 +809,19 @@ fn write_cghost_moe_with_counts(
         .metadata()
         .map_err(|e| io_err(store.source_path(), e))?
         .len();
+    // A sparse source (a common-core hot shadow, or any GGUF with holes over
+    // its routed-expert tensors) reads back zeros for every missing page, so
+    // the repack would emit a well-formed but hollow .cghost whose sampled
+    // identity islands still match. Refuse before the output file exists.
+    if !allow_sparse_repack()
+        && (source_is_sparse(store.source_path())?
+            || moe_expert_regions_have_holes(&source, binding)?)
+    {
+        return Err(invalid(format!(
+            "refusing to repack a .cghost from sparse source GGUF {}: hole regions over the routed-expert tensors would produce zero-filled (hollow) expert records. Repack from the full GGUF, or set {ALLOW_SPARSE_REPACK_ENV}=1 to accept a hollow artifact deliberately",
+            store.source_path().display()
+        )));
+    }
     let mut file = File::create(out_path).map_err(|e| io_err(out_path, e))?;
     // Repacking a 26B artifact is a one-pass conversion, not a workload that
     // benefits from retaining either the source or destination expert pages.
@@ -1291,6 +1364,10 @@ impl GhostFile {
         binding: &Gemma4Binding,
         expert_count: usize,
     ) -> Result<()> {
+        // Sampled identity cannot tell a hollow repack from a genuine one (a
+        // sparse shadow retains exactly the sampled islands), so the payload
+        // side gets a density probe before any source-side hashing.
+        self.validate_moe_expert_density()?;
         let Some(identity) = self.index.source_identity.as_ref() else {
             if source_is_sparse(source_path)? && !allow_legacy_sparse_identity() {
                 return Err(invalid(format!(
@@ -1364,6 +1441,146 @@ impl GhostFile {
                         "Ghost-MoE expert identity mismatch at {}: the source GGUF/hot shadow and .cghost are not a matching pair. If this is a sparse shadow created by an older Camelid, regenerate it to retain identity islands.",
                         group.id
                     )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Cheap always-on guard against hollow artifacts: probe one window per
+    /// expert tensor and refuse a file whose records are overwhelmingly zero
+    /// bytes. Genuine quantized expert payloads are dense in nonzero bytes
+    /// (Q4_0 encodes a zero weight as nibble 8, not 0x00), while a record
+    /// repacked from a filesystem hole reads back all zeros except its
+    /// 128-byte identity island — a difference the sampled source/payload
+    /// identity checks are structurally unable to see.
+    pub fn validate_moe_expert_density(&self) -> Result<()> {
+        if self.index.version != 2 || self.index.layout != CghostLayout::MoeExperts {
+            return Ok(());
+        }
+        const PROBE_BYTES: u64 = 4096;
+        let mut scratch = vec![0u8; PROBE_BYTES as usize];
+        let mut probed_groups = 0u64;
+        let mut hollow_groups = 0u64;
+        for group in &self.index.groups {
+            let mut window_bytes = 0u64;
+            let mut nonzero_bytes = 0u64;
+            for tensor in &group.tensors {
+                if tensor.len == 0 {
+                    continue;
+                }
+                let take = tensor.len.min(PROBE_BYTES);
+                let start = ((tensor.len - take) / 2) & !(MOE_IDENTITY_SAMPLE_ALIGNMENT - 1);
+                self.read_positioned_span_into(
+                    tensor.offset + start,
+                    take,
+                    &mut scratch[..take as usize],
+                )?;
+                window_bytes += take;
+                nonzero_bytes += scratch[..take as usize]
+                    .iter()
+                    .filter(|byte| **byte != 0)
+                    .count() as u64;
+            }
+            if window_bytes == 0 {
+                continue;
+            }
+            probed_groups += 1;
+            // Dead record: under 1/16 nonzero bytes in its probe windows. Real
+            // quantized data sits far above; a hole-backed record sits at
+            // (near) zero even when an identity island lands inside a window.
+            if nonzero_bytes * 16 < window_bytes {
+                hollow_groups += 1;
+            }
+        }
+        if hollow_groups == 0 {
+            return Ok(());
+        }
+        let message = format!(
+            "Ghost-MoE payload density check: {hollow_groups} of {probed_groups} probed expert records are (almost) entirely zero bytes; this .cghost is hollow or corrupt (e.g. repacked from a sparse hot shadow) and would generate garbage. Repack it from the full GGUF, or set {ALLOW_HOLLOW_EXPERTS_ENV}=1 to run it anyway"
+        );
+        if hollow_groups * 4 > probed_groups && !allow_hollow_experts() {
+            return Err(invalid(message));
+        }
+        eprintln!("[ghost] WARNING: {message}");
+        Ok(())
+    }
+
+    /// Full byte-for-byte verification of every routed-expert record against
+    /// the expert tensors of a FULL source GGUF — the strong complement to the
+    /// sampled checks, which cannot reject a hollow repack. Reads both
+    /// artifacts end to end, so it belongs in install/repair flows rather than
+    /// on every load. A sparse source is refused outright: comparing against
+    /// hole-backed zeros would vouch for the wrong bytes.
+    pub fn verify_moe_expert_payload_against_source(
+        &self,
+        source_path: &Path,
+        binding: &Gemma4Binding,
+        expert_count: usize,
+    ) -> Result<()> {
+        if expert_count == 0 {
+            return Err(invalid("expert_count must be nonzero".into()));
+        }
+        let source = File::open(source_path).map_err(|err| io_err(source_path, err))?;
+        if source_is_sparse(source_path)? || moe_expert_regions_have_holes(&source, binding)? {
+            return Err(invalid(format!(
+                "cannot verify expert payloads against {}: the source GGUF is sparse over its expert tensors; full-payload verification requires the full GGUF",
+                source_path.display()
+            )));
+        }
+        let mut ours = vec![0u8; 1024 * 1024];
+        let mut theirs = vec![0u8; 1024 * 1024];
+        for layer_idx in 0..binding.layers.len() {
+            let moe = binding.layers[layer_idx].moe.as_ref().ok_or_else(|| {
+                invalid(format!(
+                    "model layer {layer_idx} has no routed-expert binding"
+                ))
+            })?;
+            for expert_idx in 0..expert_count {
+                let (group, access) = self.moe_group_access(layer_idx, expert_idx)?;
+                for (role, desc) in [
+                    ("gate_up_exps", &moe.gate_up_exps),
+                    ("down_exps", &moe.down_exps),
+                ] {
+                    if !desc.n_bytes.is_multiple_of(expert_count as u64) {
+                        return Err(invalid(format!(
+                            "model tensor {} byte length {} is not divisible by expert_count {expert_count}",
+                            desc.name, desc.n_bytes
+                        )));
+                    }
+                    let expert_len = desc.n_bytes / expert_count as u64;
+                    let tensor = self.moe_group_tensor(group, access, role)?;
+                    if tensor.len != expert_len {
+                        return Err(invalid(format!(
+                            "group {} role {role} length {} does not match the source expert slice length {expert_len}",
+                            group.id, tensor.len
+                        )));
+                    }
+                    let source_start = desc.absolute_offset + expert_idx as u64 * expert_len;
+                    let mut done = 0u64;
+                    while done < expert_len {
+                        let take = (expert_len - done).min(ours.len() as u64) as usize;
+                        self.read_positioned_span_into(
+                            tensor.offset + done,
+                            take as u64,
+                            &mut ours[..take],
+                        )?;
+                        read_exact_at(&source, &mut theirs[..take], source_start + done)
+                            .map_err(|err| io_err(source_path, err))?;
+                        if ours[..take] != theirs[..take] {
+                            let first_bad = ours[..take]
+                                .iter()
+                                .zip(&theirs[..take])
+                                .position(|(a, b)| a != b)
+                                .unwrap_or(0) as u64;
+                            return Err(invalid(format!(
+                                "Ghost-MoE expert payload mismatch in {} role {role} at byte {}: the .cghost does not hold this GGUF's expert bytes",
+                                group.id,
+                                done + first_bad
+                            )));
+                        }
+                        done += take as u64;
+                    }
                 }
             }
         }
@@ -3105,5 +3322,260 @@ mod tests {
         assert!(err.to_string().contains("payload identity mismatch"));
         let err = ghost.read_moe_expert(0, 0).unwrap_err();
         assert!(err.to_string().contains("payload identity mismatch"));
+    }
+
+    /// One MoE layer, two experts, `expert_len` bytes per expert per tensor:
+    /// [64-byte 0xcc prefix][gate_up 2×expert_len][down 2×expert_len].
+    fn synthetic_moe_metadata(source_path: &Path, expert_len: u64) -> (GgufFile, Gemma4Binding) {
+        let descriptor = |name: &str, offset: u64| GgufTensorDescriptor {
+            name: name.into(),
+            dimensions: vec![expert_len / 4, 1, 2],
+            tensor_type: GgufTensorType::F32,
+            relative_offset: offset,
+            absolute_offset: offset,
+            n_bytes: expert_len * 2,
+        };
+        let gate = descriptor("blk.0.ffn_gate_up_exps.weight", 64);
+        let down = descriptor("blk.0.ffn_down_exps.weight", 64 + expert_len * 2);
+        let dummy = GgufTensorDescriptor {
+            name: "dummy".into(),
+            dimensions: vec![1],
+            tensor_type: GgufTensorType::F32,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 4,
+        };
+        let gguf = GgufFile {
+            path: source_path.to_path_buf(),
+            version: 3,
+            tensor_count: 2,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: BTreeMap::new(),
+            tensors: vec![gate.clone(), down.clone()],
+        };
+        let layer = Gemma4LayerTensors {
+            attn_norm: dummy.clone(),
+            attn_q: dummy.clone(),
+            attn_k: Some(dummy.clone()),
+            attn_v: Some(dummy.clone()),
+            attn_output: dummy.clone(),
+            attn_q_norm: dummy.clone(),
+            attn_k_norm: Some(dummy.clone()),
+            post_attention_norm: dummy.clone(),
+            ffn_norm: dummy.clone(),
+            post_ffw_norm: dummy.clone(),
+            post_norm: None,
+            ffn_gate: dummy.clone(),
+            ffn_up: dummy.clone(),
+            ffn_down: dummy.clone(),
+            ple_inp_gate: None,
+            ple_proj: None,
+            ple_output_scale: None,
+            moe: Some(Gemma4MoeLayerTensors {
+                gate_inp: dummy.clone(),
+                gate_inp_scale: dummy.clone(),
+                gate_up_exps: gate,
+                down_exps: down,
+                down_exps_scale: dummy.clone(),
+                pre_norm_2: dummy.clone(),
+                post_norm_1: dummy.clone(),
+                post_norm_2: dummy.clone(),
+            }),
+        };
+        let binding = Gemma4Binding {
+            token_embedding: dummy.clone(),
+            output_norm: dummy.clone(),
+            output: dummy,
+            output_is_tied_embedding: true,
+            rope_freqs: None,
+            per_layer_token_embd: None,
+            per_layer_model_proj: None,
+            per_layer_proj_norm: None,
+            layers: vec![layer],
+        };
+        (gguf, binding)
+    }
+
+    fn synthetic_moe_fixture(
+        dir: &Path,
+        expert_len: u64,
+    ) -> (std::path::PathBuf, GgufFile, Gemma4Binding) {
+        let source_path = dir.join("dense-experts.gguf");
+        let payload: Vec<u8> = (0..expert_len * 4).map(|i| (i % 251 + 1) as u8).collect();
+        let mut source = File::create(&source_path).unwrap();
+        source.write_all(&[0xcc; 64]).unwrap();
+        source.write_all(&payload).unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+        let (gguf, binding) = synthetic_moe_metadata(&source_path, expert_len);
+        (source_path, gguf, binding)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moe_repack_refuses_sparse_source() {
+        if allow_sparse_repack() {
+            return; // operator override active in this environment
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let expert_len = 8192u64;
+        let source_path = dir.path().join("hollow-shadow.gguf");
+        let source = File::create(&source_path).unwrap();
+        // No byte is ever written: the whole expert region is a filesystem
+        // hole, exactly like a common-core hot shadow's evicted experts.
+        source.set_len(64 + expert_len * 4).unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+        let (gguf, binding) = synthetic_moe_metadata(&source_path, expert_len);
+        let store = TensorStore::open(&source_path, &gguf);
+        let out_path = dir.path().join("hollow.cghost");
+        let err = write_cghost_moe_with_counts(
+            &store,
+            &binding,
+            2,
+            1,
+            "hollow-shadow.gguf",
+            &out_path,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("hollow"));
+        assert!(err.to_string().contains(ALLOW_SPARSE_REPACK_ENV));
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn hollow_cghost_fails_density_validation() {
+        if allow_hollow_experts() {
+            return; // operator override active in this environment
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (source_path, gguf, binding) = synthetic_moe_fixture(dir.path(), 8192);
+        let store = TensorStore::open(&source_path, &gguf);
+        let out_path = dir.path().join("dense-experts.cghost");
+        write_cghost_moe_with_counts(
+            &store,
+            &binding,
+            2,
+            1,
+            "dense-experts.gguf",
+            &out_path,
+            None,
+        )
+        .unwrap();
+
+        let ghost = GhostFile::open(&out_path).unwrap();
+        ghost
+            .validate_moe_source_identity(&source_path, &binding, 2)
+            .unwrap();
+        ghost
+            .verify_moe_expert_payload_against_source(&source_path, &binding, 2)
+            .unwrap();
+
+        // Zero every expert record in place — the payload a repack from a
+        // hole-backed source produces. Source-side sampled identity still
+        // matches, so only the density probe stands between this artifact and
+        // the runtime.
+        let payload_start = ghost
+            .index
+            .groups
+            .iter()
+            .flat_map(|group| group.tensors.iter())
+            .map(|tensor| tensor.offset)
+            .min()
+            .unwrap();
+        let payload_end = ghost
+            .index
+            .groups
+            .iter()
+            .flat_map(|group| group.tensors.iter())
+            .map(|tensor| tensor.offset + tensor.len)
+            .max()
+            .unwrap();
+        drop(ghost);
+        let mut hollow = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&out_path)
+            .unwrap();
+        hollow.seek(SeekFrom::Start(payload_start)).unwrap();
+        hollow
+            .write_all(&vec![0u8; (payload_end - payload_start) as usize])
+            .unwrap();
+        hollow.sync_all().unwrap();
+        drop(hollow);
+
+        let ghost = GhostFile::open(&out_path).unwrap();
+        let err = ghost
+            .validate_moe_source_identity(&source_path, &binding, 2)
+            .unwrap_err();
+        assert!(err.to_string().contains("density"));
+        assert!(err.to_string().contains(ALLOW_HOLLOW_EXPERTS_ENV));
+    }
+
+    #[test]
+    fn deep_verify_catches_off_island_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let expert_len = 8192u64;
+        let (source_path, gguf, binding) = synthetic_moe_fixture(dir.path(), expert_len);
+        let store = TensorStore::open(&source_path, &gguf);
+        let out_path = dir.path().join("dense-experts.cghost");
+        write_cghost_moe_with_counts(
+            &store,
+            &binding,
+            2,
+            1,
+            "dense-experts.gguf",
+            &out_path,
+            None,
+        )
+        .unwrap();
+        let ghost = GhostFile::open(&out_path).unwrap();
+
+        // Corrupt one payload byte outside the sampled identity island.
+        let (tensor_offset, tensor_len) = {
+            let tensor = &ghost.index.groups[0].tensors[0];
+            (tensor.offset, tensor.len)
+        };
+        let island = moe_identity_sample_range(0, tensor_len, 0, 0, "gate_up_exps");
+        let victim = (0..tensor_len).find(|off| !island.contains(off)).unwrap();
+        drop(ghost);
+        let mut corrupt = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&out_path)
+            .unwrap();
+        corrupt
+            .seek(SeekFrom::Start(tensor_offset + victim))
+            .unwrap();
+        corrupt.write_all(&[0x00]).unwrap();
+        corrupt.sync_all().unwrap();
+        drop(corrupt);
+
+        let ghost = GhostFile::open(&out_path).unwrap();
+        // Every sampled layer is blind to the corruption...
+        ghost
+            .validate_moe_source_identity(&source_path, &binding, 2)
+            .unwrap();
+        // ...the full source comparison is not.
+        let err = ghost
+            .verify_moe_expert_payload_against_source(&source_path, &binding, 2)
+            .unwrap_err();
+        assert!(err.to_string().contains("expert payload mismatch"));
+
+        // A sparse source is never an acceptable comparison baseline.
+        #[cfg(unix)]
+        {
+            let sparse_path = dir.path().join("sparse-baseline.gguf");
+            let sparse = File::create(&sparse_path).unwrap();
+            sparse.set_len(64 + expert_len * 4).unwrap();
+            drop(sparse);
+            let err = ghost
+                .verify_moe_expert_payload_against_source(&sparse_path, &binding, 2)
+                .unwrap_err();
+            assert!(err.to_string().contains("sparse"));
+        }
     }
 }

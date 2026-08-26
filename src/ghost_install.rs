@@ -262,6 +262,14 @@ fn validate_existing_cghost(
             && ghost
                 .validate_moe_source_identity(source_path, binding, expert_count)
                 .is_ok()
+            // The sampled checks are structurally unable to reject a hollow
+            // repack, and prepare() is about to replace the full GGUF with its
+            // sparse shadow — the one moment a bad .cghost becomes
+            // unrecoverable. Pay for the full byte comparison while the full
+            // source still exists.
+            && ghost
+                .verify_moe_expert_payload_against_source(source_path, binding, expert_count)
+                .is_ok()
     })
 }
 
