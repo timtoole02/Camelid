@@ -48,8 +48,7 @@ fn test_genuine_gemma4_chained_layer_verifier_10_rounds() {
     let mut cur_logits = initial_logits;
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut cur_pos = prompt_tokens.len();
-    for _ in 0..16 {
+    for cur_pos in (prompt_tokens.len()..).take(16) {
         let tok = cur_logits
             .iter()
             .enumerate()
@@ -60,7 +59,6 @@ fn test_genuine_gemma4_chained_layer_verifier_10_rounds() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        cur_pos += 1;
     }
 
     let k = 8;
@@ -279,7 +277,6 @@ fn test_genuine_gemma4_chained_layer_verifier_10_rounds() {
         parity_pass: bool,
         slot_wait: f64,
         final_wait: f64,
-        host_sum: f64,
         prefetch: f64,
         setup: f64,
         unique_sum: u32,
@@ -364,7 +361,6 @@ fn test_genuine_gemma4_chained_layer_verifier_10_rounds() {
             parity_pass,
             slot_wait: prof.chained_slot_wait_ms,
             final_wait: prof.chained_final_wait_ms,
-            host_sum: prof.chained_host_sum_ms,
             prefetch: prof.chained_prefetch_ms,
             setup: prof.chained_setup_ms,
             unique_sum: prof.unique_experts_sum,
