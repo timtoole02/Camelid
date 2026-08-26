@@ -17441,9 +17441,13 @@ pub fn try_gemma4_head(
 /// dispatch, scalar soft-cap after readback); the 605 MB ordered Q6_K GEMV runs
 /// on Metal in one command buffer and is bit-exact with the CPU row-dot oracle.
 ///
-/// The mapping is retained for the lifetime of the Metal buffer. There is no
-/// anonymous 605 MB weight copy: under memory pressure these pages remain clean,
-/// file-backed, and evictable. Calls are serialized because the scratch buffers
+/// The mapping is retained for the lifetime of the Metal buffer. By default
+/// there is no anonymous 605 MB weight copy: under memory pressure these pages
+/// remain clean, file-backed, and evictable.
+/// `CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT=1` instead copies the aligned
+/// window verbatim into an owned shared buffer at the same offset — bit-equal
+/// bytes, pinned — and falls back to the no-copy mapping if that allocation
+/// fails. Calls are serialized because the scratch buffers
 /// are reused in place; the serving runtime is single-request today, but keeping
 /// that invariant here prevents accidental cross-request races later.
 #[cfg(target_os = "macos")]
@@ -17455,7 +17459,6 @@ pub(crate) struct Gemma4Q6KHead {
     _mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
     weight_window_aligned_offset: usize,
     weight_window_bytes: usize,
-    weight_file_backed_no_copy: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -17493,7 +17496,11 @@ struct Gemma4Q6KHeadInner {
 
 #[cfg(target_os = "macos")]
 impl Gemma4Q6KHead {
-    /// Borrow the no-copy Q6_K token table for the opt-in MTP device chain.
+    /// Borrow the head's Q6_K token table for the opt-in MTP device chain.
+    /// The table is either the default file-backed no-copy mapping or, under
+    /// `CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT=1`, an owned resident copy;
+    /// both are the same shared-mode bytes at the same buffer offset, so the
+    /// chain is raw-bit identical over either backing.
     ///
     /// This refuses every geometry except the exact Gemma 4 26B-A4B target and
     /// keeps the head mutex (and therefore the mmap-owning `self`) borrowed for
@@ -17509,8 +17516,7 @@ impl Gemma4Q6KHead {
         const Q6K_WIRE: usize = 210;
 
         let state = self.inner.lock().ok()?;
-        if !self.weight_file_backed_no_copy
-            || state.hidden != TARGET_HIDDEN
+        if state.hidden != TARGET_HIDDEN
             || state.vocab != TARGET_VOCAB
             || !state.hidden.is_multiple_of(Q6K_VALUES)
         {
@@ -17631,28 +17637,42 @@ impl Gemma4Q6KHead {
         // SAFETY: `wire_mmap_tensors` returns a page-aligned window entirely
         // inside `mmap`, which this struct retains for the buffer's lifetime.
         let weight_ptr = unsafe { mmap.base_ptr().add(tensor.window.aligned_offset as usize) };
-        let weight = if resident_head {
-            let owned = kernel.device.new_buffer(
-                tensor.window.len as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            // SAFETY: source window is `len` readable bytes inside the mmap;
-            // destination is a fresh shared buffer of exactly `len` bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    weight_ptr,
-                    owned.contents().cast::<u8>(),
-                    tensor.window.len as usize,
-                );
-            }
-            owned
-        } else {
+        let file_backed_no_copy = || {
             kernel.device.new_buffer_with_bytes_no_copy(
                 weight_ptr.cast(),
                 tensor.window.len as u64,
                 MTLResourceOptions::StorageModeShared,
                 None,
             )
+        };
+        let weight = if resident_head {
+            let owned = kernel.device.new_buffer(
+                tensor.window.len as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            // A failed device allocation surfaces as a nil buffer whose length
+            // and contents both read as zero; the no-copy mapping serves the
+            // identical bytes, so keep serving instead of copying into null.
+            if owned.length() < tensor.window.len as u64 || owned.contents().is_null() {
+                eprintln!(
+                    "[gemma4-q6k-head] resident opt-in: owned {} byte Metal allocation failed; continuing with the file-backed no-copy mapping",
+                    tensor.window.len
+                );
+                file_backed_no_copy()
+            } else {
+                // SAFETY: source window is `len` readable bytes inside the mmap;
+                // destination is a fresh shared buffer of exactly `len` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        weight_ptr,
+                        owned.contents().cast::<u8>(),
+                        tensor.window.len as usize,
+                    );
+                }
+                owned
+            }
+        } else {
+            file_backed_no_copy()
         };
         let shared = |bytes: usize| {
             kernel
@@ -17744,7 +17764,6 @@ impl Gemma4Q6KHead {
                 _mmap: mmap,
                 weight_window_aligned_offset: tensor.window.aligned_offset as usize,
                 weight_window_bytes: tensor.window.len as usize,
-                weight_file_backed_no_copy: !resident_head,
             },
             ledger,
         ))

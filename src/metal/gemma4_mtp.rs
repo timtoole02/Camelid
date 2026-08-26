@@ -5623,7 +5623,7 @@ fn validate_target_embedding(
     )?;
     if view.buffer().storage_mode() != MTLStorageMode::Shared {
         return Err(invalid(format!(
-            "target embedding storage mode is {:?}, expected Shared no-copy GGUF pages",
+            "target embedding storage mode is {:?}, expected the Shared-mode Q6_K token table",
             view.buffer().storage_mode()
         )));
     }

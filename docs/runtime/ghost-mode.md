@@ -153,7 +153,10 @@ ordered kernel.
 Metal allocation at load instead of the default file-backed no-copy mapping. The default costs
 nothing at load but its clean pages are evictable, so heavy expert paging can silently turn the
 per-token head sweep into SSD refaults; the resident copy pins it at the cost of one load-time
-copy and ~600 MB of anonymous memory.
+copy and ~600 MB of anonymous memory. The copy is the same aligned window at the same buffer
+offset, so every consumer — including the opt-in MTP device chain
+(`CAMELID_GEMMA4_MTP_DEVICE_CHAIN=1`) — is raw-bit identical over either backing. If the owned
+allocation fails, the head logs one line and continues on the file-backed no-copy mapping.
 
 `CAMELID_GEMMA4_GHOST_METAL_STATS=1` prints one compact per-generation slot hit/I/O summary.
 `CAMELID_GEMMA4_GHOST_READ_THREADS` controls concurrent positioned reads (default 4, range 1–8).
