@@ -85,3 +85,8 @@ export const IconGrid = (p) => <Svg {...p}><path d="M3 3h7v7H3V3zm11 0h7v7h-7V3z
 export const IconCpu = (p) => <Svg {...p} strokeIcon><rect x="7" y="7" width="10" height="10" rx="1.5" /><path d="M9.5 3v2M14.5 3v2M9.5 19v2M14.5 19v2M3 9.5h2M3 14.5h2M19 9.5h2M19 14.5h2" /></Svg>
 export const IconWifi = (p) => <Svg {...p} strokeIcon><path d="M5 12.5a10 10 0 0 1 14 0M8 15.5a6 6 0 0 1 8 0" /><circle cx="12" cy="18.5" r="1" fill="currentColor" stroke="none" /></Svg>
 export const IconLink = (p) => <Svg {...p} strokeIcon><path d="M9 12h6M8.5 8H7a4 4 0 0 0 0 8h1.5M15.5 8H17a4 4 0 0 1 0 8h-1.5" /></Svg>
+export const IconLaptop = (p) => <Svg {...p} strokeIcon><rect x="4" y="5" width="16" height="11" rx="1.5" /><path d="M2.5 19h19M8.5 19l.8-3h5.4l.8 3" /></Svg>
+export const IconBranch = (p) => <Svg {...p} strokeIcon><circle cx="7" cy="5" r="2" /><circle cx="17" cy="7" r="2" /><circle cx="7" cy="19" r="2" /><path d="M7 7v10M9 13h2a6 6 0 0 0 6-4" /></Svg>
+export const IconTerminal = (p) => <Svg {...p} strokeIcon><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M12.5 15H17" /></Svg>
+export const IconFile = (p) => <Svg {...p} strokeIcon><path d="M6 3h8l4 4v14H6zM14 3v5h4" /></Svg>
+export const IconCommit = (p) => <Svg {...p} strokeIcon><path d="M3 12h6M15 12h6" /><circle cx="12" cy="12" r="3" /></Svg>

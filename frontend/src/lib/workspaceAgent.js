@@ -98,6 +98,11 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
   const event = envelope?.event
   if (!event) return state
   if (event === 'session.reset') return { ...WORKSPACE_IDLE_STATE, events: [], turns: [], totalTurns: 0 }
+  if (event === 'session.client_restore') {
+    const snapshot = envelope.snapshot
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return state
+    return { ...snapshot, error: String(envelope.message || '') }
+  }
   if (event === 'thread.restored') {
     const turns = (Array.isArray(envelope.turns) ? envelope.turns : []).map((turn) => ({
       user: String(turn.user_text || ''),
@@ -355,15 +360,17 @@ function withDerived(previous, next, envelope) {
     derived.latestTool = null
     derived.latestResult = envelope
   }
-  else if (event === 'thread.restored') {
+  else if (event === 'session.starting' || event === 'thread.restored') {
     derived.latestTool = null
     derived.latestResult = null
   }
 
   // ---- Monotonic totals (see `runTotals` in WORKSPACE_IDLE_STATE) ----
-  // A restore replaces the event list wholesale, so its totals restart too;
-  // anything else only ever adds.
-  if (event === 'thread.restored') {
+  // A new session owns a new context window and run ledger even when it resumes
+  // the same saved thread under a different access/context configuration. A
+  // restore also replaces the event list wholesale. Follow-up turns within one
+  // session keep accumulating; these two session boundaries restart instead.
+  if (event === 'session.starting' || event === 'thread.restored') {
     derived.runTotals = WORKSPACE_IDLE_STATE.runTotals
     derived.context = null
     derived.modelSteps = []
