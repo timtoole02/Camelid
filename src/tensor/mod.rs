@@ -1091,6 +1091,140 @@ pub(crate) fn q8_0_retained_blocks_with_sidecars_bytes(
     q8_0_retained_blocks_with_sidecars_bytes_for_shape(name, &shape, block_count)
 }
 
+/// Exact opt-in for the dense wave-chunked positioned read: split one large
+/// file-backed weight read into several independent preads fanned across a
+/// bounded read pool. This transplants the gemma4 ghost reader's
+/// ASYNC_TWO_WAVE_CHUNKED_READ fanout (one record, few jobs, idle read
+/// threads) onto the dense streamed-linear lane, whose reader otherwise
+/// issues a single pread per weight chunk with `F_NOCACHE` set.
+const Q8_WAVE_CHUNKED_READ_ENV: &str = "CAMELID_Q8_WAVE_CHUNKED_READ";
+/// Read-pool width for the wave-chunked read. Mirrors the ghost pool's
+/// non-Windows default of 4 and its 1..=8 clamp; the pool is only built when
+/// the wave-chunked read is enabled.
+const Q8_WAVE_READ_THREADS_ENV: &str = "CAMELID_Q8_WAVE_READ_THREADS";
+/// Reads below this size stay on the established single-pread path: the
+/// fanout exists to fill SSD queue depth on multi-megabyte weight chunks, and
+/// chunking small reads only adds dispatch overhead.
+const Q8_WAVE_CHUNK_MIN_BYTES: usize = 256 * 1024;
+
+fn q8_wave_chunked_read_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+fn q8_wave_chunked_read_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        q8_wave_chunked_read_from(env::var(Q8_WAVE_CHUNKED_READ_ENV).ok().as_deref())
+    })
+}
+
+fn q8_wave_read_threads_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 8)
+}
+
+/// Dedicated read pool so chunked preads never contend with (or nest inside)
+/// the compute pools; positioned reads on a shared handle are documented
+/// concurrency-safe in `platform_fs`.
+fn q8_wave_read_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        if !q8_wave_chunked_read_enabled() {
+            return None;
+        }
+        let threads = q8_wave_read_threads_from(env::var(Q8_WAVE_READ_THREADS_ENV).ok().as_deref());
+        if threads <= 1 {
+            return None;
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("camelid-q8-wave-read-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Fanout policy, kept pure so tests never latch the env gate. One record job
+/// at a time, so this is the ghost policy `read_threads.div_ceil(jobs).min(4)`
+/// with `jobs == 1`: enough chunks to occupy the pool, capped at 4.
+fn q8_wave_chunk_count(enabled: bool, expected_len: usize, read_threads: usize) -> usize {
+    if !enabled || read_threads <= 1 || expected_len < Q8_WAVE_CHUNK_MIN_BYTES {
+        1
+    } else {
+        read_threads.min(4)
+    }
+}
+
+/// Balanced chunk size with interior boundaries kept on a 16 KiB page,
+/// mirroring the ghost reader's `routed_expert_positioned_chunk_bytes`. The
+/// final chunk stays exact rather than padded.
+fn q8_wave_chunk_bytes(expected_len: usize, requested_chunks: usize) -> usize {
+    const CHUNK_ALIGNMENT: usize = 16 * 1024;
+    let chunks = requested_chunks.max(1).min(expected_len.max(1));
+    if chunks == 1 || expected_len <= 1 {
+        return expected_len.max(1);
+    }
+    let balanced = expected_len.div_ceil(chunks);
+    if expected_len >= CHUNK_ALIGNMENT {
+        balanced.div_ceil(CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT
+    } else {
+        balanced
+    }
+}
+
+/// One positioned read split into `chunks` independent preads on the wave
+/// read pool. Every submitted chunk joins before any failure is reported, so
+/// a partial record can never be mistaken for a completed one.
+fn read_exact_at_wave_chunks(
+    file: &File,
+    path: &Path,
+    out: &mut [u8],
+    offset: u64,
+    chunks: usize,
+) -> Result<()> {
+    if chunks <= 1 || out.len() <= 1 {
+        return read_exact_at(file, out, offset).map_err(|source| BackendError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    let chunk_bytes = q8_wave_chunk_bytes(out.len(), chunks);
+    let read_one = |(chunk_idx, chunk): (usize, &mut [u8])| -> Result<()> {
+        let chunk_offset = chunk_idx.checked_mul(chunk_bytes).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "q8_0 wave-chunked read chunk offset overflow".to_string(),
+            )
+        })?;
+        let source = offset.checked_add(chunk_offset as u64).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "q8_0 wave-chunked read source offset overflow".to_string(),
+            )
+        })?;
+        read_exact_at(file, chunk, source).map_err(|source| BackendError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    };
+    let mut run = || -> Result<()> {
+        let outcomes: Vec<Result<()>> = out
+            .par_chunks_mut(chunk_bytes.max(1))
+            .enumerate()
+            .map(read_one)
+            .collect();
+        for outcome in outcomes {
+            outcome?;
+        }
+        Ok(())
+    };
+    match q8_wave_read_pool() {
+        Some(pool) => pool.install(run),
+        None => run(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Q8_0FileBacking {
     pub path: PathBuf,
@@ -1244,10 +1378,23 @@ impl Q8_0FileBacking {
             // cache-miss range bookkeeping for every streamed weight chunk.
             q8_file_cache_apply_capacity(0);
             let file = self.file()?;
-            read_exact_at(&file, out, offset).map_err(|source| BackendError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
+            let chunks = q8_wave_chunk_count(
+                q8_wave_chunked_read_enabled(),
+                out.len(),
+                q8_wave_read_pool().map_or(1, rayon::ThreadPool::current_num_threads),
+            );
+            if chunks > 1 {
+                // Announce engagement once so an A/B receipt can prove which
+                // arm actually ran the fanout.
+                static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+                ANNOUNCED.call_once(|| {
+                    eprintln!(
+                        "[camelid] {Q8_WAVE_CHUNKED_READ_ENV}: wave-chunked positioned reads active (chunks={chunks}, chunk_bytes={})",
+                        q8_wave_chunk_bytes(out.len(), chunks)
+                    );
+                });
+            }
+            read_exact_at_wave_chunks(&file, &self.path, out, offset, chunks)?;
             record_q8_0_file_read(out.len());
             if cache_decoded_q8_0_scales {
                 if let Some(scales) = &mut cached_scales {
@@ -7456,6 +7603,83 @@ mod tests {
     /// cascade into spurious failures across the rest of the family.
     fn q8_stats_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::tensor::q8_stats_test_lock()
+    }
+
+    /// The wave-chunked fanout policy is pure so these never latch the
+    /// process-wide env gate. Same admission shape as the ghost reader's
+    /// per-record fanout with one record job: strict "1" opt-in, small reads
+    /// and single-thread pools stay on the one-pread path, and the fanout is
+    /// capped at 4 chunks.
+    #[test]
+    fn q8_wave_chunk_policy_is_strict() {
+        use super::{q8_wave_chunk_count, q8_wave_chunked_read_from, q8_wave_read_threads_from};
+
+        assert!(!q8_wave_chunked_read_from(None));
+        assert!(q8_wave_chunked_read_from(Some("1")));
+        for value in ["0", "true", "yes", "2", ""] {
+            assert!(!q8_wave_chunked_read_from(Some(value)), "value={value}");
+        }
+
+        assert_eq!(q8_wave_read_threads_from(None), 4);
+        assert_eq!(q8_wave_read_threads_from(Some("6")), 6);
+        assert_eq!(q8_wave_read_threads_from(Some("0")), 1);
+        assert_eq!(q8_wave_read_threads_from(Some("64")), 8);
+        assert_eq!(q8_wave_read_threads_from(Some("junk")), 4);
+
+        const BIG: usize = 8 * 1024 * 1024;
+        assert_eq!(q8_wave_chunk_count(false, BIG, 8), 1);
+        assert_eq!(q8_wave_chunk_count(true, BIG, 1), 1);
+        assert_eq!(q8_wave_chunk_count(true, 4 * 1024, 8), 1);
+        assert_eq!(q8_wave_chunk_count(true, BIG, 2), 2);
+        assert_eq!(q8_wave_chunk_count(true, BIG, 8), 4);
+    }
+
+    /// Mirrors the ghost reader's chunk-plan receipt: interior boundaries stay
+    /// on the 16 KiB page, the plan is gapless, and the final chunk is exact.
+    #[test]
+    fn q8_wave_chunk_plan_is_aligned_gapless_and_exact() {
+        use super::q8_wave_chunk_bytes;
+
+        const ALIGNMENT: usize = 16 * 1024;
+        const RECORD_BYTES: usize = 11 * 1024 * 1024 + 4 * 1024 + 34;
+        let chunk_bytes = q8_wave_chunk_bytes(RECORD_BYTES, 4);
+        assert_eq!(chunk_bytes % ALIGNMENT, 0);
+        let full_chunks = RECORD_BYTES / chunk_bytes;
+        let tail = RECORD_BYTES - full_chunks * chunk_bytes;
+        assert!(tail < chunk_bytes);
+        assert_eq!(full_chunks * chunk_bytes + tail, RECORD_BYTES);
+
+        assert_eq!(q8_wave_chunk_bytes(RECORD_BYTES, 1), RECORD_BYTES);
+        assert_eq!(q8_wave_chunk_bytes(1024, 4), 256);
+        assert_eq!(q8_wave_chunk_bytes(0, 4), 1);
+    }
+
+    /// The chunked read must reassemble the same bytes as one pread for every
+    /// fanout, including counts that do not divide the payload.
+    #[test]
+    fn q8_wave_chunked_read_matches_the_single_read() {
+        use super::read_exact_at_wave_chunks;
+
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-wave-chunked-read-{}",
+            std::process::id()
+        ));
+        let payload: Vec<u8> = (0..(1024 * 1024 + 4096 + 7))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&path, &payload).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let mut expected = vec![0_u8; payload.len() - 17];
+        read_exact_at_wave_chunks(&file, &path, &mut expected, 17, 1).unwrap();
+        assert_eq!(expected, payload[17..]);
+
+        for chunks in [2, 3, 4, 8] {
+            let mut actual = vec![0_u8; payload.len() - 17];
+            read_exact_at_wave_chunks(&file, &path, &mut actual, 17, chunks).unwrap();
+            assert_eq!(actual, expected, "chunks={chunks}");
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     /// Dequant-parity receipts for the four legacy block formats, each hand-derived
