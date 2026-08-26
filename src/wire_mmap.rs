@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{platform_fs::read_exact_at, BackendError, Result};
+use crate::{BackendError, Result};
 
 /// System page size, used for window/buffer alignment.
 #[cfg(unix)]
@@ -387,7 +387,10 @@ impl WirePages {
         };
         // SAFETY: the allocation is alloc_len >= byte_len bytes and exclusively owned here.
         let fill = unsafe { std::slice::from_raw_parts_mut(ptr, byte_len) };
-        read_exact_at(file, fill, offset).map_err(|err| {
+        // Wave-chunked opt-in: fill the resident pages through parallel
+        // positioned reads instead of one serial pread per tensor. Off by
+        // default; the single-read path below it is byte-identical.
+        crate::tensor::wave_chunked_read_exact_at(file, fill, offset).map_err(|err| {
             BackendError::InvalidTensorData(format!(
                 "wire pages read of {byte_len} bytes at offset {offset} failed: {err}"
             ))
