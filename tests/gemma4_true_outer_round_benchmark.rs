@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Genuine Gemma 4 26B-A4B True Outer Round Ledger Benchmark
 //!
 //! Reconciles:
@@ -186,8 +188,7 @@ fn test_genuine_gemma4_true_outer_round_ledger_k5_to_k8() {
     let mut cur_logits = initial_logits.clone();
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut cur_pos = prompt_tokens.len();
-    for _ in 0..16 {
+    for cur_pos in (prompt_tokens.len()..).take(16) {
         let tok = cur_logits
             .iter()
             .enumerate()
@@ -198,7 +199,6 @@ fn test_genuine_gemma4_true_outer_round_ledger_k5_to_k8() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        cur_pos += 1;
     }
 
     let k_values = [5, 6, 7, 8];
@@ -261,7 +261,7 @@ fn test_genuine_gemma4_true_outer_round_ledger_k5_to_k8() {
         };
         let preds: Vec<u32> = (0..drafts.len()).map(|i| argmax(&rows[i])).collect();
         let mut accepted_count = 1; // t0 always accepted
-        for (_i, (&draft, &pred)) in drafts.iter().zip(&preds).enumerate() {
+        for (&draft, &pred) in drafts.iter().zip(&preds) {
             if draft == pred {
                 accepted_count += 1;
             } else {

@@ -48,8 +48,7 @@ fn test_genuine_gemma4_sub200ms_verifier_k8() {
     let mut cur_logits = initial_logits.clone();
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut cur_pos = prompt_tokens.len();
-    for _ in 0..16 {
+    for cur_pos in (prompt_tokens.len()..).take(16) {
         let tok = cur_logits
             .iter()
             .enumerate()
@@ -60,7 +59,6 @@ fn test_genuine_gemma4_sub200ms_verifier_k8() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        cur_pos += 1;
     }
 
     let k = 8;

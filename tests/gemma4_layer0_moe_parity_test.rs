@@ -557,21 +557,18 @@ fn gemma4_warm_decode_toks() {
         prompt.len() as f64 / prefill_s
     );
 
-    let mut pos = prompt.len();
-    for _ in 0..4 {
+    for pos in (prompt.len()..).take(4) {
         let next = argmax(&logits);
         logits = runtime.step(next, pos, &mut kc, &mut vc).expect("warmup");
-        pos += 1;
     }
 
     const N: usize = 64;
     let t_decode = std::time::Instant::now();
     let mut gen = Vec::with_capacity(N);
-    for _ in 0..N {
+    for pos in (prompt.len() + 4..).take(N) {
         let next = argmax(&logits);
         gen.push(next);
         logits = runtime.step(next, pos, &mut kc, &mut vc).expect("decode");
-        pos += 1;
     }
     let decode_s = t_decode.elapsed().as_secs_f64();
     let text = runtime.tokenizer().decode(&gen, true).unwrap_or_default();
