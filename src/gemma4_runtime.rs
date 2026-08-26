@@ -2276,6 +2276,16 @@ const _: () = assert!(
 );
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS: usize = 2;
+/// Default-off exact widening of the private record stage's reader pool from
+/// two to three workers. Subordinate to the dual-reader opt-in: without
+/// `..._STAGE_DUAL_READER=1` this selector is inert. The stage remains
+/// advisory-only — queued, late, failed, or absent records still fall through
+/// to the authoritative demand path, so reader count cannot change output.
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER";
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER_WORKERS: usize = 3;
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2299,7 +2309,8 @@ fn ghost_metal_live_sequential_stage_cap16_admitted(
         && lane.direct_stage_read_active
         && lane.fast_predict
         && lane.dual_reader
-        && lane.workers == GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS
+        && (lane.workers == GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS
+            || lane.workers == GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER_WORKERS)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2431,6 +2442,23 @@ fn ghost_metal_live_sequential_stage_enabled() -> bool {
 #[cfg(any(target_os = "macos", test))]
 fn ghost_metal_live_sequential_stage_dual_reader_from(value: Option<&str>) -> bool {
     value == Some("1")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_live_sequential_stage_triple_reader_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_live_sequential_stage_triple_reader_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ghost_metal_live_sequential_stage_triple_reader_from(
+            std::env::var(GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -9089,7 +9117,11 @@ impl GhostMetalExpertRuntime {
                 .is_some_and(|profile| ghost_metal_live_sequential_hot_profile_admitted(profile));
         let live_sequential_dual_reader = live_sequential_stage_requested
             && ghost_metal_live_sequential_stage_dual_reader_enabled();
-        let live_sequential_stage_workers = if live_sequential_dual_reader {
+        let live_sequential_triple_reader = live_sequential_dual_reader
+            && ghost_metal_live_sequential_stage_triple_reader_enabled();
+        let live_sequential_stage_workers = if live_sequential_triple_reader {
+            GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER_WORKERS
+        } else if live_sequential_dual_reader {
             GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS
         } else {
             1
@@ -9100,9 +9132,12 @@ impl GhostMetalExpertRuntime {
         // H49 execution envelope before widening private payload ownership:
         // exact frozen profile, direct stage, single-Down, no publication,
         // no competing stage/bank, and no diagnostic command schedule.
+        // The original H49 envelope was receipted on the legacy H40 2,100-slot
+        // literal before the strict Mini2 reset re-pinned it; both frozen
+        // literals are exact admissions, so the shape accepts either.
         let live_sequential_h49_execution_shape = live_sequential_profile_shape
             && live_sequential_hot_profile.as_ref().is_some_and(|profile| {
-                ghost_metal_live_sequential_mini2_hot_profile_admitted(profile)
+                ghost_metal_live_sequential_hot_profile_admitted(profile)
             })
             && !crate::metal::gemma4_hybrid_hot_cold_overlap_publish_enabled()
             && std::env::var(GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV).is_ok_and(|value| value == "1")
@@ -29404,6 +29439,24 @@ mod mtp_target_seam_tests {
         assert_eq!(ghost_metal_live_sequential_stage_cap(false, h49), 8);
         assert_eq!(ghost_metal_live_sequential_stage_cap(true, h49), 16);
 
+        // The widened reader pool keeps cap16 admission: exactly the dual- or
+        // triple-reader worker counts, nothing else.
+        let h49_triple = GhostMetalLiveSequentialCap16Lane {
+            workers: GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER_WORKERS,
+            ..h49
+        };
+        assert_eq!(ghost_metal_live_sequential_stage_cap(true, h49_triple), 16);
+        assert!(!ghost_metal_live_sequential_stage_triple_reader_from(None));
+        assert!(ghost_metal_live_sequential_stage_triple_reader_from(Some(
+            "1"
+        )));
+        for value in ["", "0", "01", "true", "3", " 1", "1 "] {
+            assert!(
+                !ghost_metal_live_sequential_stage_triple_reader_from(Some(value)),
+                "unexpected triple-reader admission for {value:?}"
+            );
+        }
+
         let refused = [
             GhostMetalLiveSequentialCap16Lane {
                 stage_requested: false,
@@ -29426,7 +29479,7 @@ mod mtp_target_seam_tests {
                 ..h49
             },
             GhostMetalLiveSequentialCap16Lane { workers: 1, ..h49 },
-            GhostMetalLiveSequentialCap16Lane { workers: 3, ..h49 },
+            GhostMetalLiveSequentialCap16Lane { workers: 4, ..h49 },
         ];
         for lane in refused {
             assert!(!ghost_metal_live_sequential_stage_cap16_admitted(
