@@ -2899,19 +2899,16 @@ fn condense_objective_for_capsule(objective: &str) -> String {
             }
             continue;
         }
-        if capture_section {
-            if trimmed.starts_with('*')
+        if capture_section
+            && (trimmed.starts_with('*')
                 || trimmed.starts_with('-')
                 || trimmed.starts_with("python ")
                 || trimmed.starts_with("def ")
                 || trimmed.starts_with("class ")
-            {
-                condensed.push(line);
-            } else if !trimmed.is_empty()
-                && (condensed.last().is_none_or(|l| l.trim().starts_with('#')))
-            {
-                condensed.push(line);
-            }
+                || (!trimmed.is_empty()
+                    && condensed.last().is_none_or(|l| l.trim().starts_with('#'))))
+        {
+            condensed.push(line);
         }
     }
     let result = condensed.join("\n");

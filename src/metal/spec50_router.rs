@@ -1520,7 +1520,7 @@ pub(crate) fn encode_spec50_router_gemv_variant(
     if k_tokens == 0
         || num_experts == 0
         || hidden == 0
-        || num_experts % SPEC50_ROUTER_EXPERTS_PER_TG != 0
+        || !num_experts.is_multiple_of(SPEC50_ROUTER_EXPERTS_PER_TG)
         || (variant.needs_r_stage() && r_stage.is_none())
         || (matches!(
             variant,
@@ -1532,7 +1532,7 @@ pub(crate) fn encode_spec50_router_gemv_variant(
                 | Spec50RouterVariant::StrictRVec4x8
                 | Spec50RouterVariant::StrictRVec4x16
                 | Spec50RouterVariant::StrictRVec4x24
-        ) && hidden % 4 != 0)
+        ) && !hidden.is_multiple_of(4))
     {
         return None;
     }

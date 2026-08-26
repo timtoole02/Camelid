@@ -68,6 +68,7 @@ impl VmStats {
     }
 }
 
+#[allow(deprecated)]
 fn get_process_rss_bytes() -> u64 {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -129,6 +130,7 @@ fn get_vm_pressure_level() -> u32 {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct FineBudgetResult {
     slots_per_layer: usize,
     metal_resident_gib: f64,

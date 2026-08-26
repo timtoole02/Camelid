@@ -83,10 +83,13 @@
 // pipelines and encoders read as dead until the integrator swaps them in.
 #![allow(dead_code)]
 
-use super::*;
-
-use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions};
+use metal::{Buffer, ComputePipelineState, Device};
 use std::sync::OnceLock;
+
+#[cfg(test)]
+use super::*;
+#[cfg(test)]
+use metal::{CommandQueue, MTLResourceOptions};
 
 // ---------------------------------------------------------------------------
 // Geometry mirrors (identical to the G4Q4_* shader defines / Rust mirrors).
@@ -111,7 +114,7 @@ const _: () = {
     assert!(S50_GATE_UP_BYTES == 2 * S50_FF * S50_GU_ROW_BYTES);
     assert!(S50_DOWN_BYTES == S50_HIDDEN * S50_DOWN_ROW_BYTES);
     assert!(S50_RECORD_BYTES == S50_GATE_UP_BYTES + S50_DOWN_BYTES);
-    assert!(S50_HIDDEN % S50_DOWN_ROWS_PER_SIMDGROUP == 0);
+    assert!(S50_HIDDEN.is_multiple_of(S50_DOWN_ROWS_PER_SIMDGROUP));
 };
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 //! Gemma 4 26B Layer-by-Layer Expert Routing and Working Set Profiler
 
 use camelid::gemma4_runtime::Gemma4Runtime;
-use std::{collections::HashSet, path::PathBuf, time::Instant};
+use std::{path::PathBuf, time::Instant};
 
 #[test]
 fn test_gemma4_26b_layer_profile() {
@@ -39,12 +39,10 @@ fn test_gemma4_26b_layer_profile() {
 
     let total_steps = 256;
     let mut cur_logits = initial_logits;
-    let mut cur_pos = prompt_tokens.len();
-
     let mut step_latencies = Vec::with_capacity(total_steps);
     let t_decode_start = Instant::now();
 
-    for step in 0..total_steps {
+    for cur_pos in prompt_tokens.len()..prompt_tokens.len() + total_steps {
         let tok = cur_logits
             .iter()
             .enumerate()
@@ -57,7 +55,6 @@ fn test_gemma4_26b_layer_profile() {
             .step(tok, cur_pos, &mut kc, &mut vc)
             .expect("step decode");
         let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
-        cur_pos += 1;
         step_latencies.push(step_ms);
     }
 

@@ -56,6 +56,7 @@ const EXPECTED_HEADER_BYTES: usize = 5_360;
 const PAYLOAD_FILE_OFFSET: usize = 8 + EXPECTED_HEADER_BYTES;
 const EXPECTED_PAYLOAD_BYTES: usize = 839_422_472;
 const EXPECTED_SHA256: &str = "c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801";
+#[cfg(test)]
 const EXPECTED_CONFIG_SHA256: &str =
     "23d2bc4a8920f24c23653ff6871437bbd95e52527bf50007aaad05b0b6cab510";
 
@@ -2548,6 +2549,7 @@ impl Gemma4MtpAssistantMetal {
         Self::load_with_options(path, full_q4, bf16_producer_fusion, bf16_lattice_loads)
     }
 
+    #[cfg(test)]
     fn load_with_full_q4(path: &Path, full_q4_requested: bool) -> Result<Self> {
         Self::load_with_options(path, full_q4_requested, false, false)
     }
@@ -3296,8 +3298,8 @@ impl Gemma4MtpAssistantMetal {
                 q4_emb,
                 &self.scratch.final_normalized,
                 &self.scratch.logits,
-                self.embedding.cols as u32,
-                self.embedding.rows as u32,
+                self.embedding.cols,
+                self.embedding.rows,
             );
         } else {
             encode_bf16_gemv(
@@ -3617,8 +3619,8 @@ impl Gemma4MtpAssistantMetal {
                     q4_emb,
                     &self.scratch.final_normalized,
                     &self.scratch.logits,
-                    self.embedding.cols as u32,
-                    self.embedding.rows as u32,
+                    self.embedding.cols,
+                    self.embedding.rows,
                 );
             } else {
                 encode_bf16_gemv(
@@ -3986,8 +3988,8 @@ impl Gemma4MtpAssistantMetal {
                     q4_emb,
                     &self.scratch.final_normalized,
                     &self.scratch.logits,
-                    self.embedding.cols as u32,
-                    self.embedding.rows as u32,
+                    self.embedding.cols,
+                    self.embedding.rows,
                 );
             } else {
                 encode_bf16_gemv(
@@ -5074,7 +5076,7 @@ fn encode_mtp_gather_q6k_embed_and_recurrent(
     encoder.set_bytes(8, 4, &embedding_scale as *const f32 as *const c_void);
     encoder.dispatch_thread_groups(
         MTLSize {
-            width: ((target_hidden + 255) / 256) as u64,
+            width: target_hidden.div_ceil(256) as u64,
             height: 1,
             depth: 1,
         },
@@ -7058,10 +7060,12 @@ mod tests {
         assert_eq!(full_q4.total_pages, 0);
         assert!(full_q4.quantize_us > 0);
         eprintln!(
-            "[gemma4-mtp full-q4 benchmark] baseline={baseline:?} full_q4={full_q4:?} traffic_ratio={:.3} gpu_speedup={:.3} proposal_wall_speedup={:.3}",
+            "[gemma4-mtp full-q4 benchmark] baseline={baseline:?} full_q4={full_q4:?} traffic_ratio={:.3} load_speedup={:.3} gpu_speedup={:.3} proposal_wall_speedup={:.3} outer_wall_speedup={:.3}",
             baseline.matrix_bytes_per_draft as f64 / full_q4.matrix_bytes_per_draft as f64,
+            baseline.load_wall_us as f64 / full_q4.load_wall_us as f64,
             baseline.k7_gpu_us as f64 / full_q4.k7_gpu_us as f64,
             baseline.k7_proposal_wall_us as f64 / full_q4.k7_proposal_wall_us as f64,
+            baseline.k7_outer_wall_us as f64 / full_q4.k7_outer_wall_us as f64,
         );
     }
 

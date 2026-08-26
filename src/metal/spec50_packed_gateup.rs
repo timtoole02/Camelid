@@ -324,7 +324,7 @@ pub(crate) const fn spec50_packed_gateup_row_complete_eligible(
     rows: usize,
     k_batch: usize,
 ) -> bool {
-    rows % 4 == 0 && k_batch == 8
+    rows.is_multiple_of(4) && k_batch == 8
 }
 
 pub(crate) fn spec50_packed_gateup_kernels() -> Option<&'static Spec50PackedGateupKernels> {
@@ -962,7 +962,7 @@ mod tests {
             let y_values = random_f32(&mut rng, WAVE_K * hidden);
             let mut guarded_y = vec![poison; GUARD];
             guarded_y.extend_from_slice(&y_values);
-            guarded_y.extend_from_slice(&vec![poison; GUARD]);
+            guarded_y.extend_from_slice(&[poison; GUARD]);
             let y = buffer_from(&shipped.device, &guarded_y);
             let reference = poisoned_f32(&shipped.device, GUARD + WAVE_K * rows + GUARD);
             let candidate_direct_sg = poisoned_f32(&shipped.device, GUARD + WAVE_K * rows + GUARD);
@@ -1118,7 +1118,7 @@ mod tests {
 
         let mut guarded_y = vec![poison; GUARD];
         guarded_y.extend_from_slice(&wide_y);
-        guarded_y.extend_from_slice(&vec![poison; GUARD]);
+        guarded_y.extend_from_slice(&[poison; GUARD]);
         let y = buffer_from(&shipped.device, &guarded_y);
         let act = poisoned_f32(&shipped.device, GUARD + WAVE_K * FFN + GUARD);
         let out = poisoned_f32(&shipped.device, GUARD + WAVE_K * HIDDEN + GUARD);
@@ -1426,12 +1426,12 @@ mod tests {
 
         // AB then BA order makes the steady result robust to which pipeline
         // pays the first-use residency/driver cost.
-        let tiled_a = timed_sweep_receipt(&shipped.queue, &tiled_body);
-        let direct_sg_a = timed_sweep_receipt(&shipped.queue, &direct_sg_body);
-        let wide_a = timed_sweep_receipt(&shipped.queue, &wide_body);
-        let wide_b = timed_sweep_receipt(&shipped.queue, &wide_body);
-        let direct_sg_b = timed_sweep_receipt(&shipped.queue, &direct_sg_body);
-        let tiled_b = timed_sweep_receipt(&shipped.queue, &tiled_body);
+        let tiled_a = timed_sweep_receipt(&shipped.queue, tiled_body);
+        let direct_sg_a = timed_sweep_receipt(&shipped.queue, direct_sg_body);
+        let wide_a = timed_sweep_receipt(&shipped.queue, wide_body);
+        let wide_b = timed_sweep_receipt(&shipped.queue, wide_body);
+        let direct_sg_b = timed_sweep_receipt(&shipped.queue, direct_sg_body);
+        let tiled_b = timed_sweep_receipt(&shipped.queue, tiled_body);
 
         let tiled_values = read_f32(&tiled, WAVE_K * ROWS);
         for (name, values) in [

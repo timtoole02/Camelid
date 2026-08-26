@@ -1,39 +1,15 @@
-#[cfg(target_os = "macos")]
-use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,
-};
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 #[cfg(target_os = "macos")]
-fn encode_gemma4_q4_0_gateup_matmul(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    y: &Buffer,
-    gate_weight: &Buffer,
-    up_weight: &Buffer,
-    act_output: &Buffer,
-    gateup_scalar: &Buffer,
-    rows: usize,
-) {
-    e.set_compute_pipeline_state(&k.q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline);
-    e.set_buffer(0, Some(y), 0);
-    e.set_buffer(1, Some(gate_weight), 0);
-    e.set_buffer(2, Some(up_weight), 0);
-    e.set_buffer(3, Some(act_output), 0);
-    e.set_buffer(4, Some(gateup_scalar), 0);
-    e.set_buffer(5, Some(gateup_scalar), 4);
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: (rows as u64).div_ceil(2),
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
-    );
-}
+pub(crate) use metal::Buffer;
+#[cfg(target_os = "macos")]
+use metal::{CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
+#[cfg(not(target_os = "macos"))]
+pub(crate) type Buffer = ();
 
 #[cfg(target_os = "macos")]
 use std::{
@@ -111,26 +87,18 @@ pub(crate) struct MetalLinearKernel {
     q8_0_block_ksplit_f32y_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q4_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
-    q4_0_qkv_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
-    q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q4_0_block_batch_k_pipeline: Option<ComputePipelineState>,
     q4_0_block_batch_k6_pipeline: Option<ComputePipelineState>,
     q4_0_block_batch_k8_pipeline: Option<ComputePipelineState>,
     q4_0_qkv_block_batch_k_pipeline: Option<ComputePipelineState>,
     q4_0_qkv_block_batch_k6_pipeline: Option<ComputePipelineState>,
     q4_0_qkv_block_batch_k8_pipeline: Option<ComputePipelineState>,
-    /// Same 32-thread / 2-row concatenated Q+K+V geometry as
-    /// `q4_0_qkv_block_linear_batch_k`, with RMSNorm applied on the activation
-    /// load so `normf_batch` is not written.
-    q4_0_qkv_block_batch_k_fused_rms_pipeline: Option<ComputePipelineState>,
     q4_0_gateup_geglu_block_batch_k_pipeline: Option<ComputePipelineState>,
     q4_0_gateup_geglu_block_batch_k6_pipeline: Option<ComputePipelineState>,
     q4_0_gateup_geglu_block_batch_k8_pipeline: Option<ComputePipelineState>,
     gemma4_fused_post_attn_residual_ffn_norm_pipeline: Option<ComputePipelineState>,
-    gemma4_fused_post_ffw_residual_pipeline: Option<ComputePipelineState>,
     gemma4_fused_q_norm_rope_batch_pipeline: Option<ComputePipelineState>,
     gemma4_fused_kv_norm_rope_scatter_batch_pipeline: Option<ComputePipelineState>,
-    q6k_linear_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_scores_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_softmax_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_context_batch_k_pipeline: Option<ComputePipelineState>,
@@ -162,13 +130,10 @@ pub(crate) struct MetalLinearKernel {
     gemma4_q4_expert_down_reduce_pipeline: ComputePipelineState,
     gemma4_q4_expert_down_reduce_simd_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline: Option<ComputePipelineState>,
-    gemma4_q4_multi_expert_gate_up_geglu_turbo_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_fused_gateup_geglu_quant_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_quantize_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline: Option<ComputePipelineState>,
-    gemma4_q4_multi_expert_down_scatter_reduce_batch_k_pipeline: Option<ComputePipelineState>,
-    gemma4_q4_multi_expert_down_scatter_reduce_turbo_pipeline: Option<ComputePipelineState>,
     gemma4_fused_layer_residual_pipeline: Option<ComputePipelineState>,
     gemma4_gpu_topk_routing_pipeline: Option<ComputePipelineState>,
     gemma4_router_batch_k_pipeline: Option<ComputePipelineState>,
@@ -256,7 +221,6 @@ pub(crate) struct MetalLinearKernel {
     kv_scatter_kvq8_pipeline: ComputePipelineState,
     f32_to_f16_pipeline: ComputePipelineState,
     rms_norm_batch_pipeline: ComputePipelineState,
-    rms_inv_batch_pipeline: Option<ComputePipelineState>,
     rms_norm_batch_f16o_pipeline: ComputePipelineState,
     silu_mul_f16o_pipeline: ComputePipelineState,
     rope_rotate_batch_pipeline: ComputePipelineState,
@@ -280,8 +244,6 @@ pub(crate) struct MetalLinearKernel {
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     argmax_f32_greedy_pipeline: ComputePipelineState,
-    argmax_f32_stage1_pipeline: ComputePipelineState,
-    argmax_f32_stage2_pipeline: ComputePipelineState,
     sample_gumbel_f32_pipeline: ComputePipelineState,
     attention_decode_splitk_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_pipeline: ComputePipelineState,
@@ -1264,7 +1226,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 
 /// f32 -> IEEE 754 binary16 bits, round-to-nearest-even (exact for values that started as
 /// f16, which all GGUF Q8_0 scales did).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -11525,10 +11487,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let rms_norm_batch_pipeline = device
                 .new_compute_pipeline_state_with_function(&rms_norm_batch_function)
                 .ok()?;
-            let rms_inv_batch_pipeline = elementwise_library
-                .get_function("rms_inv_batch_f32", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let rms_norm_batch_f16o_function = elementwise_library
                 .get_function("rms_norm_batch_f16o", None)
                 .ok()?;
@@ -11737,18 +11695,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let argmax_f32_greedy_pipeline = device
                 .new_compute_pipeline_state_with_function(&argmax_f32_greedy_function)
                 .ok()?;
-            let argmax_f32_stage1_function = elementwise_library
-                .get_function("argmax_f32_stage1", None)
-                .ok()?;
-            let argmax_f32_stage1_pipeline = device
-                .new_compute_pipeline_state_with_function(&argmax_f32_stage1_function)
-                .ok()?;
-            let argmax_f32_stage2_function = elementwise_library
-                .get_function("argmax_f32_stage2", None)
-                .ok()?;
-            let argmax_f32_stage2_pipeline = device
-                .new_compute_pipeline_state_with_function(&argmax_f32_stage2_function)
-                .ok()?;
             let sample_gumbel_f32_function = elementwise_library
                 .get_function("sample_gumbel_f32", None)
                 .ok()?;
@@ -11828,18 +11774,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q4_0_block_ksplit_f32y_wire_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4_0_block_ksplit_f32y_wire_function)
                 .ok()?;
-            let q4_0_qkv_block_ksplit_f32y_wire_function = library
-                .get_function("q4_0_qkv_block_linear_row_ksplit_f32y_wire", None)
-                .ok()?;
-            let q4_0_qkv_block_ksplit_f32y_wire_pipeline = device
-                .new_compute_pipeline_state_with_function(&q4_0_qkv_block_ksplit_f32y_wire_function)
-                .ok()?;
-            let q4_0_gateup_geglu_block_ksplit_f32y_wire_function = library
-                .get_function("q4_0_gateup_geglu_block_linear_row_ksplit_f32y_wire", None)
-                .ok()?;
-            let q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline = device
-                .new_compute_pipeline_state_with_function(&q4_0_gateup_geglu_block_ksplit_f32y_wire_function)
-                .ok()?;
             let q4_0_block_batch_k_pipeline = library
                 .get_function("q4_0_block_linear_batch_k", None)
                 .ok()
@@ -11864,24 +11798,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .get_function("q4_0_qkv_block_linear_batch_k8", None)
                 .ok()
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            let q4_0_qkv_block_batch_k_fused_rms_pipeline = library
-                .get_function("q4_0_qkv_block_linear_batch_k_fused_rms", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            if let (Some(orig), Some(fused)) = (
-                q4_0_qkv_block_batch_k_pipeline.as_ref(),
-                q4_0_qkv_block_batch_k_fused_rms_pipeline.as_ref(),
-            ) {
-                eprintln!(
-                    "[metal qkv occupancy] orig max_threads/TG={} texw={} tmem={} | fused_rms max_threads/TG={} texw={} tmem={} (lower max_threads/TG ⇒ more registers / lower occupancy)",
-                    orig.max_total_threads_per_threadgroup(),
-                    orig.thread_execution_width(),
-                    orig.static_threadgroup_memory_length(),
-                    fused.max_total_threads_per_threadgroup(),
-                    fused.thread_execution_width(),
-                    fused.static_threadgroup_memory_length(),
-                );
-            }
             let q4_0_gateup_geglu_block_batch_k_pipeline = library
                 .get_function("q4_0_gateup_geglu_block_linear_batch_k", None)
                 .ok()
@@ -11896,14 +11812,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let gemma4_fused_post_attn_residual_ffn_norm_pipeline = library
                 .get_function("gemma4_fused_post_attn_residual_ffn_norm_batch", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            let gemma4_fused_post_ffw_residual_pipeline = library
-                .get_function("gemma4_fused_post_ffw_residual_batch", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            let q6k_linear_batch_k_pipeline = library
-                .get_function("q6k_linear_batch_k", None)
                 .ok()
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let gemma4_fused_q_norm_rope_batch_pipeline = elementwise_library
@@ -12070,14 +11978,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
-            let gemma4_q4_multi_expert_gate_up_geglu_turbo_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_gate_up_geglu_turbo", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
             let gemma4_q4_multi_expert_fused_gateup_geglu_quant_pipeline = strict_q8k_library
                 .get_function("gemma4_q4_multi_expert_fused_gateup_geglu_quant", None)
                 .ok()
@@ -12086,14 +11986,18 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
-            let gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
+            let gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline =
+                strict_q8k_library
+                    .get_function(
+                        "gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k",
+                        None,
+                    )
+                    .ok()
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    });
             let gemma4_q4_multi_expert_quantize_pipeline = strict_q8k_library
                 .get_function("gemma4_q4_multi_expert_quantize_geglu", None)
                 .ok()
@@ -12104,22 +12008,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 });
             let gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline = strict_q8k_library
                 .get_function("gemma4_q4_multi_expert_down_scatter_reduce_simd", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
-            let gemma4_q4_multi_expert_down_scatter_reduce_batch_k_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_down_scatter_reduce_batch_k", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
-            let gemma4_q4_multi_expert_down_scatter_reduce_turbo_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_down_scatter_reduce_turbo", None)
                 .ok()
                 .and_then(|function| {
                     device
@@ -12247,23 +12135,18 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_ksplit_f32y_pipeline,
                 q8_0_block_ksplit_f32y_wire_pipeline,
                 q4_0_block_ksplit_f32y_wire_pipeline,
-                q4_0_qkv_block_ksplit_f32y_wire_pipeline,
-                q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline,
                 q4_0_block_batch_k_pipeline,
                 q4_0_block_batch_k6_pipeline,
                 q4_0_block_batch_k8_pipeline,
                 q4_0_qkv_block_batch_k_pipeline,
                 q4_0_qkv_block_batch_k6_pipeline,
                 q4_0_qkv_block_batch_k8_pipeline,
-                q4_0_qkv_block_batch_k_fused_rms_pipeline,
                 q4_0_gateup_geglu_block_batch_k_pipeline,
                 q4_0_gateup_geglu_block_batch_k6_pipeline,
                 q4_0_gateup_geglu_block_batch_k8_pipeline,
                 gemma4_fused_post_attn_residual_ffn_norm_pipeline,
-                gemma4_fused_post_ffw_residual_pipeline,
                 gemma4_fused_q_norm_rope_batch_pipeline,
                 gemma4_fused_kv_norm_rope_scatter_batch_pipeline,
-                q6k_linear_batch_k_pipeline,
                 attention_decode_scores_batch_k_pipeline,
                 attention_decode_softmax_batch_k_pipeline,
                 attention_decode_context_batch_k_pipeline,
@@ -12283,13 +12166,10 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 gemma4_q4_expert_down_reduce_pipeline,
                 gemma4_q4_expert_down_reduce_simd_pipeline,
                 gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline,
-                gemma4_q4_multi_expert_gate_up_geglu_turbo_pipeline,
                 gemma4_q4_multi_expert_fused_gateup_geglu_quant_pipeline,
                 gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline,
                 gemma4_q4_multi_expert_quantize_pipeline,
                 gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline,
-                gemma4_q4_multi_expert_down_scatter_reduce_batch_k_pipeline,
-                gemma4_q4_multi_expert_down_scatter_reduce_turbo_pipeline,
                 gemma4_fused_layer_residual_pipeline,
                 gemma4_gpu_topk_routing_pipeline,
                 gemma4_router_batch_k_pipeline,
@@ -12365,7 +12245,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 kv_scatter_kvq8_pipeline,
                 f32_to_f16_pipeline,
                 rms_norm_batch_pipeline,
-                rms_inv_batch_pipeline,
                 rms_norm_batch_f16o_pipeline,
                 silu_mul_f16o_pipeline,
                 rope_rotate_batch_pipeline,
@@ -12388,8 +12267,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 argmax_f32_greedy_pipeline,
-                argmax_f32_stage1_pipeline,
-                argmax_f32_stage2_pipeline,
                 sample_gumbel_f32_pipeline,
                 attention_decode_splitk_pipeline,
                 attention_decode_splitk_kv16_pipeline,
@@ -13692,12 +13569,7 @@ fn try_gemma4_q4_0_matmul_q8_batch_impl(
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_Q4_EXPERT_RECORD_BYTES: usize = 3_345_408;
 #[cfg(target_os = "macos")]
-pub(crate) const GEMMA4_Q4_EXPERT_GATE_UP_BYTES: usize = 2_230_272;
-#[cfg(target_os = "macos")]
-pub(crate) const GEMMA4_Q4_EXPERT_DOWN_BYTES: usize = 1_115_136;
-#[cfg(target_os = "macos")]
 const GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT: usize = 16 * 1024;
-#[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_Q4_EXPERT_SLOT_STRIDE: usize = 3_358_720;
 /// Default-off Mini2 retained-cold experiment. Six records per layer add
 /// 576.5625 MiB across the exact 30-layer row and are small enough to test
@@ -13708,7 +13580,7 @@ pub(crate) const GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER: usize = 6;
 /// This is a physical-record budget, not a limit on routed canonical expert
 /// IDs: every one of the 128 experts remains addressable through the mapped
 /// fallback.
-#[cfg(target_os = "macos")]
+#[cfg(test)]
 pub(crate) const GEMMA4_Q4_HYBRID_HOT_SLOTS: usize = 32;
 /// Global overflow experts reused across layers. 20 resident + 24 overflow covers
 /// measured K=8 unique max of 42.
@@ -14730,6 +14602,7 @@ impl Gemma4Q4ExpertSlotBinding {
     /// Bind the complete anonymous physical prefix directly. Production mixed
     /// tables use canonical mode; keeping this operation separate prevents an
     /// exact canonical prefix from being mistaken for physical slot IDs.
+    #[cfg(test)]
     fn materialize_for_physical_slots(&self, active_slots: &[usize]) -> Option<Self> {
         match self {
             Self::HybridMappedSource(source) => source
@@ -14972,6 +14845,7 @@ impl Gemma4Q4ExpertSlots {
     /// Exact 32-hot/mapped-cold backing. The logical and GPU-visible
     /// namespaces both remain the complete 128 canonical expert IDs; only the
     /// anonymous writable cache is bounded to 32 physical records.
+    #[cfg(test)]
     pub(crate) fn new_hybrid_mapped_record_granular(
         mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
         offset: u64,
@@ -15218,6 +15092,7 @@ impl Gemma4Q4ExpertSlots {
         }
     }
 
+    #[cfg(test)]
     fn record_table(&self) -> Option<&spec50_moe_argbuf::Gemma4MoeSlotArgTable> {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => None,
@@ -15250,6 +15125,7 @@ impl Gemma4Q4ExpertSlots {
     /// Entire aligned slab for safe disjoint parallel fills. Callers split with
     /// `par_chunks_mut(slot_stride_bytes())` and pass only each chunk's leading
     /// `slot_record_bytes()` bytes to `GhostFile::read_moe_expert_into`.
+    #[cfg(test)]
     pub(crate) fn slab_bytes_mut(&mut self) -> Option<&mut [u8]> {
         let Gemma4Q4ExpertSlotBacking::Monolithic { slab, slab_bytes } = &mut self.backing else {
             return None;
@@ -15287,6 +15163,7 @@ impl Gemma4Q4ExpertSlots {
     /// The caller must ensure that no live mutable slice or committed GPU
     /// command can access this physical slot, and that concurrent calls use
     /// distinct slots/resources for the full lifetime of every returned slice.
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn slot_bytes_mut_raw(&self, slot: usize) -> Option<&mut [u8]> {
         if slot >= self.writable_slot_count() || !self.hot_refill_available() {
             return None;
@@ -15428,10 +15305,6 @@ impl Gemma4DemandTableLoadOnlyProbe {
             chained_routes,
             chained_output,
         })
-    }
-
-    pub(crate) const fn table_slots(&self) -> usize {
-        self.table_slots
     }
 
     pub(crate) fn active_slots(&self) -> usize {
@@ -16373,9 +16246,6 @@ pub struct Gemma4MultiExpertBatchTimes {
 
 #[cfg(target_os = "macos")]
 pub(crate) struct Gemma4MultiExpertLayerBatch {
-    input_scales: Buffer,
-    input_quants: Buffer,
-    expert_weights: Buffer,
     work_list: Buffer,
     activated: Buffer,
     activation_scales: Buffer,
@@ -16396,11 +16266,6 @@ impl Gemma4MultiExpertLayerBatch {
                 .new_buffer(size as u64, MTLResourceOptions::StorageModeShared)
         };
         Some(Self {
-            input_scales: shared(
-                max_candidates * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>(),
-            ),
-            input_quants: shared(max_candidates * GEMMA4_Q4_EXPERT_HIDDEN),
-            expert_weights: shared(max_unique_experts * GEMMA4_Q4_EXPERT_RECORD_BYTES),
             work_list: shared(max_unique_experts * std::mem::size_of::<Gemma4UniqueExpertWork>()),
             activated: shared(
                 max_unique_experts
@@ -16428,177 +16293,6 @@ impl Gemma4MultiExpertLayerBatch {
         })
     }
 
-    pub fn execute(
-        &mut self,
-        input_q8: &[&[crate::tensor::Q8_0Block]],
-        unique_expert_gate_up: &[&[u8]],
-        unique_expert_down: &[&[u8]],
-        work_items: &[Gemma4UniqueExpertWork],
-        route_entries: &[Gemma4CandidateRouteEntry],
-        output_acc: &mut [Vec<f32>],
-    ) -> Option<()> {
-        let k_candidates = input_q8.len();
-        let num_unique_experts = unique_expert_gate_up.len();
-        if k_candidates == 0
-            || num_unique_experts == 0
-            || k_candidates > self.max_candidates
-            || num_unique_experts > self.max_unique_experts
-            || unique_expert_down.len() != num_unique_experts
-        {
-            return None;
-        }
-
-        unsafe {
-            let scale_out = self.input_scales.contents().cast::<f32>();
-            let quant_out = self.input_quants.contents().cast::<i8>();
-            for (t, &blocks) in input_q8.iter().enumerate() {
-                if blocks.len() != GEMMA4_Q4_EXPERT_INPUT_BLOCKS {
-                    return None;
-                }
-                for (b, block) in blocks.iter().enumerate() {
-                    *scale_out.add(t * GEMMA4_Q4_EXPERT_INPUT_BLOCKS + b) = block.scale;
-                    std::ptr::copy_nonoverlapping(
-                        block.quants.as_ptr(),
-                        quant_out.add(t * GEMMA4_Q4_EXPERT_HIDDEN + b * 32),
-                        32,
-                    );
-                }
-            }
-
-            let weights_out = self.expert_weights.contents().cast::<u8>();
-            for (u, (&gu, &dw)) in unique_expert_gate_up
-                .iter()
-                .zip(unique_expert_down)
-                .enumerate()
-            {
-                if gu.len() != GEMMA4_Q4_EXPERT_GATE_UP_BYTES
-                    || dw.len() != GEMMA4_Q4_EXPERT_DOWN_BYTES
-                {
-                    return None;
-                }
-                let expert_offset = u * GEMMA4_Q4_EXPERT_RECORD_BYTES;
-                std::ptr::copy_nonoverlapping(
-                    gu.as_ptr(),
-                    weights_out.add(expert_offset),
-                    GEMMA4_Q4_EXPERT_GATE_UP_BYTES,
-                );
-                std::ptr::copy_nonoverlapping(
-                    dw.as_ptr(),
-                    weights_out.add(expert_offset + GEMMA4_Q4_EXPERT_GATE_UP_BYTES),
-                    GEMMA4_Q4_EXPERT_DOWN_BYTES,
-                );
-            }
-
-            let work_out = self.work_list.contents().cast::<Gemma4UniqueExpertWork>();
-            std::ptr::copy_nonoverlapping(work_items.as_ptr(), work_out, num_unique_experts);
-
-            let routes_out = self
-                .candidate_routes
-                .contents()
-                .cast::<Gemma4CandidateRouteEntry>();
-            std::ptr::copy_nonoverlapping(
-                route_entries.as_ptr(),
-                routes_out,
-                k_candidates * GEMMA4_Q4_EXPERT_ROUTES,
-            );
-        }
-
-        let kernel = metal_linear_kernel()?;
-        let gate_pipeline = kernel
-            .gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline
-            .as_ref()?;
-        let quant_pipeline = kernel.gemma4_q4_multi_expert_quantize_pipeline.as_ref()?;
-        let down_pipeline = kernel
-            .gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline
-            .as_ref()?;
-
-        let command_buffer = kernel.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-
-        // Pass 1: GateUp + GeGLU
-        encoder.set_compute_pipeline_state(gate_pipeline);
-        encoder.set_buffer(0, Some(&self.input_scales), 0);
-        encoder.set_buffer(1, Some(&self.input_quants), 0);
-        encoder.set_buffer(2, Some(&self.expert_weights), 0);
-        encoder.set_buffer(3, Some(&self.work_list), 0);
-        encoder.set_buffer(4, Some(&self.activated), 0);
-        let num_unique_u32 = num_unique_experts as u32;
-        let k_candidates_u32 = k_candidates as u32;
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            &num_unique_u32 as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            6,
-            std::mem::size_of::<u32>() as u64,
-            &k_candidates_u32 as *const u32 as *const _,
-        );
-        dispatch_1d(
-            encoder,
-            gate_pipeline,
-            num_unique_experts * GEMMA4_Q4_EXPERT_FF,
-        );
-
-        // Pass 2: Quantize GeGLU to Q8_0
-        encoder.set_compute_pipeline_state(quant_pipeline);
-        encoder.set_buffer(0, Some(&self.activated), 0);
-        encoder.set_buffer(1, Some(&self.activation_scales), 0);
-        encoder.set_buffer(2, Some(&self.activation_quants), 0);
-        encoder.set_buffer(3, Some(&self.work_list), 0);
-        encoder.set_bytes(
-            4,
-            std::mem::size_of::<u32>() as u64,
-            &num_unique_u32 as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            &k_candidates_u32 as *const u32 as *const _,
-        );
-        dispatch_1d(
-            encoder,
-            quant_pipeline,
-            num_unique_experts * k_candidates * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
-        );
-
-        // Pass 3: Down GEMV + Router Weighted Scatter/Reduce
-        encoder.set_compute_pipeline_state(down_pipeline);
-        encoder.set_buffer(0, Some(&self.activation_scales), 0);
-        encoder.set_buffer(1, Some(&self.activation_quants), 0);
-        encoder.set_buffer(2, Some(&self.expert_weights), 0);
-        encoder.set_buffer(3, Some(&self.candidate_routes), 0);
-        encoder.set_buffer(4, Some(&self.work_list), 0);
-        encoder.set_buffer(5, Some(&self.output_moe_acc), 0);
-        encoder.set_bytes(
-            6,
-            std::mem::size_of::<u32>() as u64,
-            &k_candidates_u32 as *const u32 as *const _,
-        );
-        dispatch_one_simdgroup_per_row(encoder, k_candidates * GEMMA4_Q4_EXPERT_HIDDEN);
-
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-
-        if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
-            return None;
-        }
-
-        unsafe {
-            let out_ptr = self.output_moe_acc.contents().cast::<f32>();
-            for (t, row_vec) in output_acc.iter_mut().enumerate().take(k_candidates) {
-                row_vec.resize(GEMMA4_Q4_EXPERT_HIDDEN, 0.0);
-                std::ptr::copy_nonoverlapping(
-                    out_ptr.add(t * GEMMA4_Q4_EXPERT_HIDDEN),
-                    row_vec.as_mut_ptr(),
-                    GEMMA4_Q4_EXPERT_HIDDEN,
-                );
-            }
-        }
-        Some(())
-    }
-
     pub(crate) fn execute_with_metal_quant_buffers(
         &mut self,
         input_scales: &Buffer,
@@ -16612,7 +16306,6 @@ impl Gemma4MultiExpertLayerBatch {
         timing: Option<&mut Gemma4MultiExpertBatchTimes>,
         fused_residuals: Option<(&Buffer, &Buffer, &Buffer, &Buffer, &Buffer, f32)>,
     ) -> Option<()> {
-        let k_candidates = k_candidates;
         if k_candidates == 0
             || num_unique_experts == 0
             || k_candidates > self.max_candidates
@@ -16864,7 +16557,6 @@ pub(crate) fn try_gemma4_q4_shared_expert_chunk(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_buffer(
     _input_q8: &[&[crate::tensor::Q8_0Block]],
@@ -17244,43 +16936,6 @@ fn encode_q6k_ordered_batch(
         done += slab;
     }
 }
-#[cfg(target_os = "macos")]
-fn encode_q6k_batch_k(
-    encoder: &metal::ComputeCommandEncoderRef,
-    kernel: &MetalLinearKernel,
-    input_scales: &Buffer,
-    input_quants: &Buffer,
-    weight_blocks: &Buffer,
-    weight_offset: u64,
-    output: &Buffer,
-    scalar_buf: &Buffer,
-    _n_sb: usize,
-    rows: usize,
-    _k_batch: usize,
-) {
-    if let Some(pipeline) = &kernel.q6k_linear_batch_k_pipeline {
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(input_scales), 0);
-        encoder.set_buffer(1, Some(input_quants), 0);
-        encoder.set_buffer(2, Some(weight_blocks), weight_offset);
-        encoder.set_buffer(3, Some(output), 0);
-        encoder.set_buffer(4, Some(scalar_buf), 0);
-        encoder.set_buffer(5, Some(scalar_buf), 4);
-        encoder.set_buffer(6, Some(scalar_buf), 8);
-        let thread_groups = metal::MTLSize {
-            width: (rows as u64).div_ceil(16),
-            height: 1,
-            depth: 1,
-        };
-        let threads_per_group = metal::MTLSize {
-            width: 128,
-            height: 1,
-            depth: 1,
-        };
-        encoder.dispatch_thread_groups(thread_groups, threads_per_group);
-    }
-}
-
 /// NVFP4 wire GEMV on the GPU (GABBRO M3) — the NVFP4 counterpart of
 /// [`try_gemma4_q4_0_matmul_f32y`]. `weight_wire` is `rows * blocks_per_row`
 /// 36-byte NVFP4 superblocks; `y` is `blocks_per_row * 64` f32 activations (the
@@ -17765,8 +17420,6 @@ pub fn try_gemma4_head(
 /// that invariant here prevents accidental cross-request races later.
 #[cfg(target_os = "macos")]
 pub(crate) static GPU_HW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(target_os = "macos")]
-pub(crate) static KERNEL_HW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 pub(crate) struct Gemma4Q6KHead {
@@ -18245,26 +17898,23 @@ impl Gemma4Q6KHead {
         let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
 
         let logits_ptr = state.logits_batch.contents() as usize;
-        let mut results: Vec<Vec<f32>> = (0..k)
-            .map(|_| {
+        let results: Vec<Vec<f32>> = (0..k)
+            .into_par_iter()
+            .map(|i| {
                 let mut row = Vec::with_capacity(vocab);
-                // SAFETY: immediately overwritten from the mapped slab.
                 unsafe {
+                    // Initialize the spare capacity directly from the completed
+                    // shared Metal buffer, then expose only initialized values.
+                    std::ptr::copy_nonoverlapping(
+                        (logits_ptr as *const f32).add(i * vocab),
+                        row.as_mut_ptr(),
+                        vocab,
+                    );
                     row.set_len(vocab);
                 }
                 row
             })
             .collect();
-        results
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, row)| unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (logits_ptr as *const f32).add(i * vocab),
-                    row.as_mut_ptr(),
-                    vocab,
-                );
-            });
         if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         {
@@ -18460,12 +18110,12 @@ impl Gemma4Q6KHead {
 
         let mut next_logits = Vec::with_capacity(vocab);
         unsafe {
-            next_logits.set_len(vocab);
             std::ptr::copy_nonoverlapping(
                 logits_ptr.add(accepted_j * vocab),
                 next_logits.as_mut_ptr(),
                 vocab,
             );
+            next_logits.set_len(vocab);
         }
         Some((accepted_j, next_logits))
     }
@@ -20128,41 +19778,7 @@ fn encode_silu_mul_quantize(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn encode_gemma4_fused_post_ffw_residual_batch(
-    encoder: &metal::ComputeCommandEncoderRef,
-    kernel: &MetalLinearKernel,
-    down_in: &Buffer,
-    post_ffw_weight: &Buffer,
-    resid_out: &Buffer,
-    width: usize,
-    eps: f32,
-    k_tokens: usize,
-) -> Option<()> {
-    let pipeline = kernel.gemma4_fused_post_ffw_residual_pipeline.as_ref()?;
-    encoder.set_compute_pipeline_state(pipeline);
-    encoder.set_buffer(0, Some(down_in), 0);
-    encoder.set_buffer(1, Some(post_ffw_weight), 0);
-    encoder.set_buffer(2, Some(resid_out), 0);
-    let width_u32 = width as u32;
-    encoder.set_bytes(3, 4, &width_u32 as *const u32 as *const _);
-    encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
-    encoder.dispatch_thread_groups(
-        metal::MTLSize {
-            width: k_tokens as u64,
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Some(())
-}
-
-#[cfg(target_os = "macos")]
-pub fn encode_gemma4_router_batch_k(
+pub(crate) fn encode_gemma4_router_batch_k(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
     input: &Buffer,
@@ -20204,7 +19820,7 @@ pub fn encode_gemma4_router_batch_k(
 }
 
 #[cfg(target_os = "macos")]
-pub fn encode_rms_norm_quantize_batch_k(
+pub(crate) fn encode_rms_norm_quantize_batch_k(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
     input: &Buffer,
@@ -20255,27 +19871,6 @@ fn encode_quantize(
     e.set_buffer(0, Some(input), 0);
     e.set_buffer(1, Some(scales), 0);
     e.set_buffer(2, Some(quants), 0);
-    e.set_buffer(3, Some(nblocks_buf), 0);
-    dispatch_1d(e, &k.quantize_q8_0_pipeline, n_blocks);
-}
-
-#[cfg(target_os = "macos")]
-fn encode_quantize_offset(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    input: &Buffer,
-    input_offset: u64,
-    scales: &Buffer,
-    scales_offset: u64,
-    quants: &Buffer,
-    quants_offset: u64,
-    nblocks_buf: &Buffer,
-    n_blocks: usize,
-) {
-    e.set_compute_pipeline_state(&k.quantize_q8_0_pipeline);
-    e.set_buffer(0, Some(input), input_offset);
-    e.set_buffer(1, Some(scales), scales_offset);
-    e.set_buffer(2, Some(quants), quants_offset);
     e.set_buffer(3, Some(nblocks_buf), 0);
     dispatch_1d(e, &k.quantize_q8_0_pipeline, n_blocks);
 }
@@ -20413,39 +20008,6 @@ fn encode_rms_norm_batch(
     e.set_buffer(2, Some(output), 0);
     e.set_buffer(3, Some(scalar), 0);
     e.set_buffer(4, Some(scalar), 4);
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: rows as u64,
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        },
-    );
-}
-
-/// Per-row RMS inv scale only (`rms_inv_batch_f32`). Same reduction as
-/// [`encode_rms_norm_batch`], without writing the normalized hidden vector.
-#[cfg(target_os = "macos")]
-fn encode_rms_inv_batch(
-    k: &MetalLinearKernel,
-    e: &metal::ComputeCommandEncoderRef,
-    input: &Buffer,
-    inv_out: &Buffer,
-    scalar: &Buffer,
-    rows: usize,
-) {
-    let Some(pipe) = k.rms_inv_batch_pipeline.as_ref() else {
-        return;
-    };
-    e.set_compute_pipeline_state(pipe);
-    e.set_buffer(0, Some(input), 0);
-    e.set_buffer(1, Some(inv_out), 0);
-    e.set_buffer(2, Some(scalar), 0);
-    e.set_buffer(3, Some(scalar), 4);
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: rows as u64,
@@ -21918,74 +21480,6 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k(
 }
 
 #[cfg(target_os = "macos")]
-fn encode_gemma4_q4_0_qkv_matmul_batch_k_fused_rms(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    x: &Buffer,
-    rms_weight: &Buffer,
-    inv_rms: &Buffer,
-    q_weight: &Buffer,
-    k_weight: &Buffer,
-    v_weight: &Buffer,
-    query_out: &Buffer,
-    key_out: &Buffer,
-    val_out: &Buffer,
-    qkv_scalar: &Buffer,
-    k_batch: usize,
-) -> bool {
-    assert!(
-        k_batch <= 16,
-        "dense batch_k chunk {k_batch} exceeds the widened kernels' accumulator depth 16"
-    );
-    if k_batch > GEMMA4_DENSE_BATCH_K_MAX {
-        // No widened twin for the fused-RMS kernel: a verbatim `_k16` copy
-        // measured up to 492 ULP off the k<=8 kernel at k_batch=8 (widening
-        // the accumulator array shifted the compiled FMA contraction of the
-        // `(w * rms) * scale` chain), so it cannot satisfy the bitwise pinning
-        // contract. Returning false keeps the caller on its fallback
-        // (separate RMS + QKV), whose K>8 kernel IS bitwise-verified.
-        return false;
-    }
-    let Some(pipe) = k.q4_0_qkv_block_batch_k_fused_rms_pipeline.as_ref() else {
-        return false;
-    };
-    let (bpr_u32, q_rows_u32, k_rows_u32, v_rows_u32) = unsafe {
-        let ptr = qkv_scalar.contents() as *const u32;
-        (*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3))
-    };
-    let k_batch_u32 = k_batch as u32;
-    let disp = (q_rows_u32 as usize) + (k_rows_u32 as usize) + (v_rows_u32 as usize);
-    e.set_compute_pipeline_state(pipe);
-    e.set_buffer(0, Some(x), 0);
-    e.set_buffer(1, Some(q_weight), 0);
-    e.set_buffer(2, Some(k_weight), 0);
-    e.set_buffer(3, Some(v_weight), 0);
-    e.set_buffer(4, Some(query_out), 0);
-    e.set_buffer(5, Some(key_out), 0);
-    e.set_buffer(6, Some(val_out), 0);
-    e.set_bytes(7, 4, &bpr_u32 as *const u32 as *const _);
-    e.set_bytes(8, 4, &q_rows_u32 as *const u32 as *const _);
-    e.set_bytes(9, 4, &k_rows_u32 as *const u32 as *const _);
-    e.set_bytes(10, 4, &v_rows_u32 as *const u32 as *const _);
-    e.set_bytes(11, 4, &k_batch_u32 as *const u32 as *const _);
-    e.set_buffer(12, Some(rms_weight), 0);
-    e.set_buffer(13, Some(inv_rms), 0);
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: (disp as u64).div_ceil(4),
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
-    );
-    true
-}
-
-#[cfg(target_os = "macos")]
 fn encode_gemma4_q4_0_gateup_matmul_batch_k(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
@@ -22178,57 +21672,6 @@ fn encode_gemma4_q4_0_q8_ordered_single(
     e.set_buffer(1, Some(input_quants), 0);
     e.set_buffer(2, Some(weight), 0);
     e.set_buffer(3, Some(output), 0);
-    e.set_buffer(4, Some(scalar), 0);
-    e.set_buffer(5, Some(scalar), 4);
-    e.set_buffer(6, Some(scalar), 8);
-    if turbo_pipeline.is_some() {
-        dispatch_four_simdgroup_rows(e, rows);
-    } else if simd_pipeline.is_some() {
-        e.set_threadgroup_memory_length(
-            0,
-            simd_scratch_bytes.expect("admitted SIMD Q4 scratch length") as u64,
-        );
-        dispatch_one_simdgroup_per_row(e, rows);
-    } else {
-        dispatch_1d(e, pipeline, rows);
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
-fn encode_gemma4_q4_0_q8_ordered_single_offset(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    input_scales: &Buffer,
-    input_scales_offset: u64,
-    input_quants: &Buffer,
-    input_quants_offset: u64,
-    weight: &Buffer,
-    weight_offset: u64,
-    output: &Buffer,
-    output_offset: u64,
-    scalar: &Buffer,
-    rows: usize,
-    blocks_per_row: usize,
-    fused_fast: bool,
-) {
-    let turbo_pipeline = (fused_fast && gemma4_ghost_turbo_enabled())
-        .then(|| admitted_32_lane_pipeline(k.q4_0_q8_turbo_pipeline.as_ref()))
-        .flatten();
-    let simd_scratch_bytes = blocks_per_row.checked_mul(std::mem::size_of::<f32>());
-    let simd_pipeline = (fused_fast
-        && turbo_pipeline.is_none()
-        && simd_scratch_bytes.is_some_and(|bytes| threadgroup_alloc_fits(&k.device, bytes)))
-    .then(|| admitted_32_lane_pipeline(k.q4_0_q8_ordered_simd_pipeline.as_ref()))
-    .flatten();
-    let pipeline = turbo_pipeline
-        .or(simd_pipeline)
-        .unwrap_or(&k.q4_0_q8_ordered_pipeline);
-    e.set_compute_pipeline_state(pipeline);
-    e.set_buffer(0, Some(input_scales), input_scales_offset);
-    e.set_buffer(1, Some(input_quants), input_quants_offset);
-    e.set_buffer(2, Some(weight), weight_offset);
-    e.set_buffer(3, Some(output), output_offset);
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
     e.set_buffer(6, Some(scalar), 8);
@@ -27501,7 +26944,7 @@ mod hot_cold_overlap_plan_tests {
         assert_eq!(hot, vec![9, 2, 11]);
         assert_eq!(cold, vec![4, 8, 5]);
         for &expert in &union {
-            assert_eq!(hot.contains(&expert) ^ cold.contains(&expert), true);
+            assert!(hot.contains(&expert) ^ cold.contains(&expert));
         }
 
         let (hot_table, cold_table) = hot_cold_split_slot_tables(&hot, &cold).unwrap();
@@ -27678,8 +27121,10 @@ fn mask_slot_table_to_wave(table: &mut [u32; 128], wave: &[usize]) {
     }
 }
 
+#[cfg(test)]
 const SLOT_OVERFLOW_BIT: u32 = 24;
 
+#[cfg(test)]
 fn merge_unified_slot_table(ping: &[u32; 128], pong: &[u32; 128]) -> [u32; 128] {
     let mut unified = [0xFFFFFFFFu32; 128];
     for e in 0..128 {
@@ -27751,7 +27196,7 @@ fn record_work_address_plan(
         .map(|slot| {
             let offset = slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?;
             let expert_weight_offset = u32::try_from(offset).ok()?;
-            if expert_weight_offset as usize % GEMMA4_Q4_EXPERT_SLOT_STRIDE != 0
+            if !(expert_weight_offset as usize).is_multiple_of(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
                 || expert_weight_offset as usize / GEMMA4_Q4_EXPERT_SLOT_STRIDE != slot
             {
                 return None;
@@ -29651,17 +29096,6 @@ impl Gemma4GhostCommonMetal {
         out_rows
     }
 
-    pub(crate) fn execute_attention_chunk(
-        &mut self,
-        _layer_idx: usize,
-        _hidden_rows: &[Vec<f32>],
-        _rope_freq_base: f32,
-        _rope_factors: Option<&[f32]>,
-        _start_pos: usize,
-    ) -> Option<Vec<Vec<f32>>> {
-        None
-    }
-
     pub(crate) fn execute_attention_chunk_into(
         &mut self,
         _layer_idx: usize,
@@ -29696,10 +29130,6 @@ impl Gemma4GhostCommonMetal {
         )
     }
 
-    pub(crate) fn resident_residual_buffers(&self) -> (&Buffer, &Buffer, &Buffer) {
-        (&self.slab_a, &self.slab_b, &self.resident_scratch.dn_batch)
-    }
-
     pub(crate) fn resident_fused_tail_buffers(
         &self,
         layer_idx: usize,
@@ -29713,26 +29143,6 @@ impl Gemma4GhostCommonMetal {
             &moe.post_ffw_norm,
             moe.layer_output_scale,
         ))
-    }
-
-    pub(crate) fn read_slab_a_into(&self, k_tokens: usize, out_rows: &mut [Vec<f32>]) {
-        if let Some(kernel) = metal_linear_kernel() {
-            let cmd = kernel.queue.new_command_buffer();
-            cmd.commit();
-            cmd.wait_until_completed();
-        }
-        let hidden = self.hidden_size;
-        let ptr = self.slab_a.contents() as *const f32;
-        for i in 0..k_tokens.min(out_rows.len()) {
-            out_rows[i].resize(hidden, 0.0);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    ptr.add(i * hidden),
-                    out_rows[i].as_mut_ptr(),
-                    hidden,
-                );
-            }
-        }
     }
 
     pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[&[u32; 128]]) {
@@ -29939,7 +29349,7 @@ impl Gemma4GhostCommonMetal {
         let k_u32 = k_tokens as u32;
         let num_slots_u32 = num_slots as u32;
         let num_resident_slots_u32 = num_resident_slots as u32;
-        let gateup_unique = (k_tokens * 8).min(num_slots).min(128).max(1);
+        let gateup_unique = (k_tokens * 8).clamp(1, num_slots.clamp(1, 128));
         let gateup_unique_u32 = gateup_unique as u32;
         let topk_slots_u32 = num_slots.min(128) as u32;
         encoder.set_bytes(5, 4, &k_u32 as *const u32 as *const _);
@@ -30280,7 +29690,7 @@ impl Gemma4GhostCommonMetal {
     }
 
     /// Encode the layer tail (post-attention residual + MoE add + post-norms
-    /// + optional layer-output scale) into `encoder`, ending with a slab_a
+    /// and an optional layer-output scale) into `encoder`, ending with a slab_a
     /// barrier. Shared by the serial per-layer path and the pre-encoded
     /// overlap path (CAMELID_GEMMA4_OVERLAP) so both encode byte-identical
     /// command streams. GPU-side it reads slab_b, dn_batch and gpu_moe_acc
@@ -30590,14 +30000,16 @@ impl Gemma4GhostCommonMetal {
             return false;
         }
         let hidden = self.hidden_size;
-        let mut ledger = ChainedRoundHostLedger::default();
-        ledger.kv_capacity = self.kv_capacity as u32;
-        ledger.kv_bytes = self.geometry.kv_bytes as u64;
-        ledger.kv_filled = (start_pos + k_tokens) as u32;
-        ledger.overflow_slots = if file_mapped_demand {
-            0
-        } else {
-            GEMMA4_OVERFLOW_BANK_SLOTS as u32
+        let mut ledger = ChainedRoundHostLedger {
+            kv_capacity: self.kv_capacity as u32,
+            kv_bytes: self.geometry.kv_bytes as u64,
+            kv_filled: (start_pos + k_tokens) as u32,
+            overflow_slots: if file_mapped_demand {
+                0
+            } else {
+                GEMMA4_OVERFLOW_BANK_SLOTS as u32
+            },
+            ..ChainedRoundHostLedger::default()
         };
         // Bounded record demand owns one deliberately inert overflow bank and
         // refuses any union beyond the table/directory prefix before encode.
@@ -30697,8 +30109,6 @@ impl Gemma4GhostCommonMetal {
         ledger.rope_ms = t_rope.elapsed().as_secs_f64() * 1000.0;
 
         let n_layers = self.layers.len();
-        let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let predicted_ready = !record_demand
             && slot_filler.is_some()
             && predicted_unions.len() >= n_layers
@@ -30734,8 +30144,7 @@ impl Gemma4GhostCommonMetal {
                     .get(layer_idx)
                     .copied()
                     .unwrap_or(128)
-                    .min(128)
-                    .max(1);
+                    .clamp(1, 128);
                 let default_pred: Vec<usize> = (0..num_slots_fill).collect();
                 let pred = if layer_idx < predicted_unions.len()
                     && !predicted_unions[layer_idx].is_empty()
@@ -30987,10 +30396,10 @@ impl Gemma4GhostCommonMetal {
         // is known: without a predicted union it falls back to all 128 records,
         // reintroducing the mapped-tier bind that demand promotion exists to
         // remove. Serial encode for those rounds costs a few ms per round.
-        let overlap_round = overlap_enabled()
-            && !stage_profile
-            && !dump_layers
-            && !(file_mapped_demand && gemma4_hybrid_demand_promotion_enabled());
+        let overlap_round = !(!overlap_enabled()
+            || stage_profile
+            || dump_layers
+            || (file_mapped_demand && gemma4_hybrid_demand_promotion_enabled()));
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
                 if stage_profile {
@@ -31938,7 +31347,6 @@ impl Gemma4GhostCommonMetal {
                         last_committed_cb = Some(cb3);
                         self.next_position[layer_idx] = start_pos + k_tokens;
                         cb_closed = true;
-                        layer_committed = true;
                         encode_clock = std::time::Instant::now();
                         continue;
                     }
@@ -33341,8 +32749,6 @@ impl Gemma4GhostCommonMetal {
                         } else {
                             encode_pair(false, false)
                         };
-                        drop(encode_pair);
-
                         if let Some((
                             hot_cb,
                             cold_cb,
@@ -34773,7 +34179,7 @@ impl Gemma4GhostCommonMetal {
         }
         if let Some((staged_layer, staged_cold, mut staged_union)) = pending_staged_promotion.take()
         {
-            let Some(filler) = slot_filler.as_deref_mut() else {
+            let Some(filler) = slot_filler else {
                 self.last_chained_ledger = ledger;
                 return false;
             };
