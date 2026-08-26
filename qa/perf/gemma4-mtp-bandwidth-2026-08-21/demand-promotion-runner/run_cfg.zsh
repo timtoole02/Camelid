@@ -34,8 +34,21 @@ readonly expected_token_ids=$runner/expected-48-token-ids.json
 readonly out=${CAMELID_BENCH_OUT:-${0:A:h}/runs}/$label
 readonly cache_mib=${CAMELID_BENCH_CACHE_MIB:-0}
 readonly no_watchdog=${CAMELID_BENCH_NO_WATCHDOG:-0}
-readonly MAX_CHILD_PHYSICAL_FOOTPRINT_BYTES=8053063679
-readonly MAX_HOST_WIRED_BYTES=8589934591
+# Supervision memory caps. The strict-treaty defaults stay in place unless a
+# caller explicitly raises them (operator-authorized capacity lanes, e.g. the
+# legacy 2,100-slot profile whose prefill spike exceeds the strict child cap).
+# Overrides must be canonical positive integers; every receipt manifest records
+# the caps the run was supervised under. Zero-swap, swap-in-growth, pressure,
+# and reclaimable-headroom guards are NOT overridable.
+typeset cap_override
+for cap_override in "${CAMELID_BENCH_MAX_CHILD_BYTES:-}" "${CAMELID_BENCH_MAX_WIRED_BYTES:-}"; do
+  [[ -z $cap_override || ( $cap_override == <1-> && $cap_override != 0* ) ]] || {
+    print -u2 "REFUSED: supervision cap override must be a canonical positive integer: $cap_override"
+    exit 75
+  }
+done
+readonly MAX_CHILD_PHYSICAL_FOOTPRINT_BYTES=${CAMELID_BENCH_MAX_CHILD_BYTES:-8053063679}
+readonly MAX_HOST_WIRED_BYTES=${CAMELID_BENCH_MAX_WIRED_BYTES:-8589934591}
 readonly MAX_PRESSURE_LEVEL_RAW=1
 
 [[ -x $binary ]] || { print -u2 "REFUSED: no binary $binary"; exit 75 }
@@ -194,6 +207,8 @@ done < "$envfile"
 record_manifest_value binary "$binary"
 record_manifest_value cache_mib "$cache_mib"
 record_manifest_value supervision_mode "$supervision_mode"
+record_manifest_value max_child_physical_footprint_bytes "$MAX_CHILD_PHYSICAL_FOOTPRINT_BYTES"
+record_manifest_value max_host_wired_bytes "$MAX_HOST_WIRED_BYTES"
 record_manifest_value source_commit "$source_commit"
 record_manifest_value source_tree_clean "$source_tree_clean"
 record_manifest_value binary_sha256 "$binary_sha"
