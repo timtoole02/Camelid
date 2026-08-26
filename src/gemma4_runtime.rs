@@ -2159,6 +2159,19 @@ fn ghost_metal_live_sequential_hot_profile_admitted(profile: &[usize]) -> bool {
 /// source, but only through its own exact literal opt-in below.
 #[cfg(target_os = "macos")]
 const GHOST_METAL_DIRECT_STAGE_READ_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DIRECT_STAGE_READ";
+/// Default-off exact cross-round residency refresh for the chained decode
+/// terminal. The strict hot/cold overlap lane runs with publication disabled,
+/// which freezes every persistent hot-slot update: the same recurring cold
+/// experts are re-read from disk in every verifier round. This literal opt-in
+/// re-admits ONLY the established terminal-barrier promotion of the round's
+/// exact routed union (the same `fill_chained_hybrid_hot_layers` path the
+/// prefill handoff uses), scoped to the chained-round terminal call site. The
+/// exact router stays authoritative, promotion sources keep the established
+/// validated-payload reads, and prefill rounds remain excluded by
+/// `hybrid_terminal_promotion_allowed`. No other freeze consumer changes.
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_CHAINED_TERMINAL_REFRESH_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_CHAINED_TERMINAL_REFRESH";
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
 const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 512;
@@ -4836,6 +4849,20 @@ fn ghost_metal_direct_stage_read_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         let value = std::env::var(GHOST_METAL_DIRECT_STAGE_READ_ENV).ok();
         ghost_metal_direct_stage_read_from(value.as_deref())
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_chained_terminal_refresh_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_chained_terminal_refresh_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var(GHOST_METAL_CHAINED_TERMINAL_REFRESH_ENV).ok();
+        ghost_metal_chained_terminal_refresh_from(value.as_deref())
     })
 }
 
@@ -9917,14 +9944,16 @@ impl GhostMetalExpertRuntime {
                 }
             }
         }
+        let chained_terminal_refresh = ghost_metal_chained_terminal_refresh_enabled();
         if hybrid_terminal_promotion_allowed(
             ok,
             hybrid_mapped_backing,
             self.prefill_round,
-            self.hybrid_decode_promotion_enabled,
-            !hot_cold_overlap_freeze_hot,
+            self.hybrid_decode_promotion_enabled || chained_terminal_refresh,
+            !hot_cold_overlap_freeze_hot || chained_terminal_refresh,
         ) {
             if let Some(cache) = ghost_cache {
+                let refresh_t0 = std::time::Instant::now();
                 if !fill_chained_hybrid_hot_layers(
                     &mut self.layers,
                     &collected_routes,
@@ -9934,6 +9963,13 @@ impl GhostMetalExpertRuntime {
                 ) {
                     eprintln!("[gemma4-ghost-metal] chained hybrid terminal promotion refused");
                     ok = false;
+                } else if chained_terminal_refresh {
+                    eprintln!(
+                        "[gemma4-ghost-metal] chained terminal refresh round_seq={} layers={} elapsed_ms={:.1}",
+                        round_seq,
+                        collected_routes.len(),
+                        refresh_t0.elapsed().as_secs_f64() * 1000.0,
+                    );
                 }
             } else {
                 eprintln!(
@@ -32688,6 +32724,41 @@ mod ghost_moe_wire_tests {
                 "decode-promotion policy {invalid:?} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn metal_chained_terminal_refresh_opt_in_is_literal_and_scoped() {
+        assert!(ghost_metal_chained_terminal_refresh_from(Some("1")));
+        for rejected in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("00"),
+            Some("01"),
+            Some("+1"),
+            Some(" 1"),
+            Some("1 "),
+            Some("true"),
+            Some("false"),
+            Some("2"),
+            Some("junk"),
+        ] {
+            assert!(
+                !ghost_metal_chained_terminal_refresh_from(rejected),
+                "chained terminal refresh {rejected:?} must fail closed"
+            );
+        }
+        // The refresh widens only the chained terminal-promotion gate; it can
+        // never admit a prefill round or an unhealthy terminal.
+        assert!(hybrid_terminal_promotion_allowed(
+            true, true, false, true, true
+        ));
+        assert!(!hybrid_terminal_promotion_allowed(
+            true, true, true, true, true
+        ));
+        assert!(!hybrid_terminal_promotion_allowed(
+            false, true, false, true, true
+        ));
     }
 
     #[test]
