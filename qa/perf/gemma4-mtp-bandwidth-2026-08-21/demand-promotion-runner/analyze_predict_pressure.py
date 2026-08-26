@@ -78,6 +78,13 @@ class ReceiptError(RuntimeError):
     pass
 
 
+def popcount(value: int) -> int:
+    """Return a population count on Mini2's pre-3.10 system Python."""
+    if value < 0:
+        raise ReceiptError("cannot count bits in a negative mask")
+    return bin(value).count("1")
+
+
 def parse_env(path: Path) -> dict[str, str]:
     """Read a profile, a legacy receipt, or a strict base64-v1 manifest."""
     values: dict[str, str] = {}
@@ -224,7 +231,7 @@ def parse_probe(line: str) -> dict[str, Any]:
     approx_ranked_ids = parse_ranked_ids(fields["approx_ranked_ids"])
     for stem in ("actual", "hot", "approx"):
         if any(
-            size != mask.bit_count()
+            size != popcount(mask)
             for size, mask in zip(sizes[f"{stem}_sizes"], masks[f"{stem}_masks"])
         ):
             raise ReceiptError(f"{stem} size/mask popcount drifted")
@@ -252,9 +259,9 @@ def parse_probe(line: str) -> dict[str, Any]:
         for residual, approx in zip(residual_masks, masks["approx_masks"])
     ]
     derived = {
-        "residual_pairs": sum(mask.bit_count() for mask in residual_masks),
-        "predicted_cold_pairs": sum(mask.bit_count() for mask in predicted_cold_masks),
-        "predicted_residual_hits": sum(mask.bit_count() for mask in predicted_hit_masks),
+        "residual_pairs": sum(popcount(mask) for mask in residual_masks),
+        "predicted_cold_pairs": sum(popcount(mask) for mask in predicted_cold_masks),
+        "predicted_residual_hits": sum(popcount(mask) for mask in predicted_hit_masks),
     }
     if any(values[key] != value for key, value in derived.items()):
         raise ReceiptError("probe aggregate counters disagree with exact masks")
@@ -285,7 +292,7 @@ def validate_trace(probe: dict[str, Any], traces: list[dict[str, int]]) -> None:
         item = by_layer[layer]
         actual = probe["actual_masks"][layer]
         hot = probe["hot_masks"][layer]
-        residual = probe["residual_masks"][layer].bit_count()
+        residual = popcount(probe["residual_masks"][layer])
         if item["slots"] != H2_SLOTS[layer]:
             raise ReceiptError(f"layer {layer} is not exact H2 slot geometry")
         # `plan_hot_overrides` removes planned evictions before the trace
@@ -297,9 +304,9 @@ def validate_trace(probe: dict[str, Any], traces: list[dict[str, int]]) -> None:
             )
         if item["occupied"] > item["slots"] or probe["hot_sizes"][layer] > item["slots"]:
             raise ReceiptError(f"layer {layer} hot residency exceeds slot capacity")
-        if item["selected"] != actual.bit_count():
+        if item["selected"] != popcount(actual):
             raise ReceiptError(f"layer {layer} selected count disagrees with route truth")
-        if item["hits"] != (actual & hot).bit_count():
+        if item["hits"] != popcount(actual & hot):
             raise ReceiptError(f"layer {layer} hit count disagrees with start residency")
         if residual != item["loads"] + item["cold_fallback"]:
             raise ReceiptError(f"layer {layer} residual demand does not reconcile")
@@ -359,7 +366,7 @@ def cap_round_robin(probe: dict[str, Any], cap: int) -> dict[str, int]:
         if not progressed:
             break
     hits = sum(
-        (selected_masks[layer] & probe["residual_masks"][layer]).bit_count()
+        popcount(selected_masks[layer] & probe["residual_masks"][layer])
         for layer in range(LAYERS)
     )
     return {"selected": selected, "hits": hits}
@@ -524,13 +531,13 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     per_layer: list[dict[str, Any]] = []
     for layer in range(LAYERS):
         layer_residual = sum(
-            probe["residual_masks"][layer].bit_count() for probe, _ in rounds
+            popcount(probe["residual_masks"][layer]) for probe, _ in rounds
         )
         layer_predicted_cold = sum(
-            probe["predicted_cold_masks"][layer].bit_count() for probe, _ in rounds
+            popcount(probe["predicted_cold_masks"][layer]) for probe, _ in rounds
         )
         layer_hits = sum(
-            probe["predicted_hit_masks"][layer].bit_count() for probe, _ in rounds
+            popcount(probe["predicted_hit_masks"][layer]) for probe, _ in rounds
         )
         traces = [
             {item["layer"]: item for item in items}[layer]

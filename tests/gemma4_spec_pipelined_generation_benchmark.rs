@@ -6,13 +6,15 @@
 //! 3. Pipelined Inter-Round Prefetch Staging
 //! 4. 100% Bit-Exact Greedy Speculative Parity
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
 #[test]
 fn test_genuine_gemma4_pipelined_spec_generation_k8() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -80,9 +82,7 @@ fn test_genuine_gemma4_pipelined_spec_generation_k8() {
         let mut draft_logits = cur_logits.clone();
         let mut draft_kc = kc.clone();
         let mut draft_vc = vc.clone();
-        let mut draft_pos = cur_pos;
-
-        for _ in 0..k {
+        for draft_pos in (cur_pos..).take(k) {
             let tok = draft_logits
                 .iter()
                 .enumerate()
@@ -93,7 +93,6 @@ fn test_genuine_gemma4_pipelined_spec_generation_k8() {
             draft_logits = runtime
                 .step(tok, draft_pos, &mut draft_kc, &mut draft_vc)
                 .expect("draft step");
-            draft_pos += 1;
         }
 
         // 2. Prefetch Top-14 candidates for the chunk

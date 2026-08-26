@@ -18,8 +18,10 @@
 //! assumed (see [`EnforcedShell`]):
 //!
 //! - **Linux** (x86_64/aarch64): seccomp + uid-drop + rlimits + cwd-pin, and
-//!   chroot when the root is a usable rootfs. The seccomp filter blocks the
-//!   `socket` family, so the shell has no network.
+//!   chroot when the root is a usable rootfs. The seccomp filter blocks
+//!   `socket`, so the shell cannot create network sockets. It permits anonymous
+//!   `socketpair` IPC because Rust's process launcher uses it for local
+//!   fork/exec error reporting when a command cannot use `posix_spawn`.
 //! - **macOS**: the kernel Sandbox (Seatbelt) through `/usr/bin/sandbox-exec`
 //!   with an SBPL profile — writes confined to the workspace plus the process
 //!   temp directory, network denied (matching Linux), and credential stores
@@ -282,9 +284,12 @@ mod linux {
     }
 
     /// Syscalls denied with EPERM. The families called out by the threat model
-    /// (`ptrace`, `mount`, `socket`) plus the obvious privilege-escalation and
-    /// kernel-surface syscalls. Numbers come from `libc::SYS_*` so they are
-    /// arch-correct on both supported arches.
+    /// (`ptrace`, `mount`, network-socket creation) plus the obvious
+    /// privilege-escalation and kernel-surface syscalls. `socketpair` remains
+    /// available: it creates only a connected local pair and is required by
+    /// Rust's fork/exec fallback, while blocking `socket` still prevents the
+    /// shell from opening network or named Unix-domain sockets. Numbers come
+    /// from `libc::SYS_*` so they are arch-correct on both supported arches.
     fn blocked_syscalls() -> Vec<libc::c_long> {
         let mut v = vec![
             libc::SYS_ptrace,
@@ -294,7 +299,6 @@ mod linux {
             libc::SYS_umount2,
             libc::SYS_pivot_root,
             libc::SYS_socket,
-            libc::SYS_socketpair,
             libc::SYS_init_module,
             libc::SYS_finit_module,
             libc::SYS_delete_module,
@@ -472,6 +476,18 @@ mod linux {
             layers,
             note,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::blocked_syscalls;
+
+        #[test]
+        fn network_socket_creation_is_blocked_but_local_process_plumbing_is_allowed() {
+            let blocked = blocked_syscalls();
+            assert!(blocked.contains(&libc::SYS_socket));
+            assert!(!blocked.contains(&libc::SYS_socketpair));
+        }
     }
 }
 

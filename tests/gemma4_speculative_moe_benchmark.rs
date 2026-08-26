@@ -6,6 +6,8 @@
 //! - Decisive metric: unique expert weight bytes / accepted output token
 //! - Real verification latency and effective generation speed (tok/s)
 
+mod support;
+
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use camelid::{
@@ -15,8 +17,8 @@ use camelid::{
 
 #[test]
 fn benchmark_speculative_moe_batch_k() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -67,8 +69,7 @@ fn benchmark_speculative_moe_batch_k() {
 
     // Warm up 16 tokens
     let mut cur_tok = last_tok;
-    let mut cur_pos = decode_pos;
-    for _ in 0..16 {
+    for cur_pos in (decode_pos..).take(16) {
         let (out, _) = runtime
             .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
             .expect("step");
@@ -85,8 +86,8 @@ fn benchmark_speculative_moe_batch_k() {
             }
         }
         cur_tok = next_id;
-        cur_pos += 1;
     }
+    let cur_pos = decode_pos + 16;
 
     println!("--------------------------------------------------------------------------------");
     println!("MEASURING SPECULATIVE BATCH-K EXPERT LOCALITY & UNION SIZE (K = 1 to 8)");
@@ -111,11 +112,9 @@ fn benchmark_speculative_moe_batch_k() {
         let mut temp_kc = kc.clone();
         let mut temp_vc = vc.clone();
         let mut cand_tok = cur_tok;
-        let mut cand_pos = cur_pos;
-
         let mut round_layer_experts: Vec<HashSet<usize>> = vec![HashSet::new(); 30];
 
-        for _ in 0..k {
+        for cand_pos in (cur_pos..).take(k) {
             let (out, prof) = runtime
                 .step_range_profiled(cand_tok, cand_pos, None, &mut temp_kc, &mut temp_vc)
                 .expect("step");
@@ -139,7 +138,6 @@ fn benchmark_speculative_moe_batch_k() {
                 }
             }
             cand_tok = next_id;
-            cand_pos += 1;
         }
 
         let total_unique_experts: usize = round_layer_experts.iter().map(|s| s.len()).sum();

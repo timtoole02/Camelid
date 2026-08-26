@@ -1,13 +1,15 @@
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
 #[test]
 fn test_gemma4_reference_parity_prompt() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
-        eprintln!("Model files not found at /Users/timtoole/models/");
+        eprintln!("Model files not found under CAMELID_MODEL_ROOT or the operator model directory");
         return;
     }
 

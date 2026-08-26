@@ -1301,9 +1301,9 @@ pub(crate) fn encode_q6k_spec50_batch_at_offsets(
     );
 
     let (batch_pipeline, rows_per_sg, simdgroups_per_tg) =
-        if k_batch == 8 && kernels.batch_k8_compact.is_some() {
+        if let (8, Some(compact)) = (k_batch, kernels.batch_k8_compact.as_ref()) {
             (
-                kernels.batch_k8_compact.as_ref().expect("checked above"),
+                compact,
                 SPEC50_K8_COMPACT_ROWS_PER_SG,
                 SPEC50_K8_COMPACT_SG_PER_TG,
             )
@@ -2304,7 +2304,7 @@ mod tests {
             BYTE_POISON,
             GUARD_BYTES + ids_body_bytes + GUARD_BYTES,
         );
-        write_shared_at(&ids_buf, GUARD_BYTES, &vec![U32_POISON; WAVE_K]);
+        write_shared_at(&ids_buf, GUARD_BYTES, &[U32_POISON; WAVE_K]);
         let vals_buf = shared(&refs.device, GUARD_BYTES + ids_body_bytes + GUARD_BYTES);
         fill_shared(
             &vals_buf,
@@ -2314,7 +2314,7 @@ mod tests {
         write_shared_at(
             &vals_buf,
             GUARD_BYTES,
-            &vec![f32::from_bits(F32_POISON_BITS); WAVE_K],
+            &[f32::from_bits(F32_POISON_BITS); WAVE_K],
         );
 
         let cb = refs.queue.new_command_buffer();
@@ -2694,7 +2694,7 @@ mod tests {
             cb.commit();
             cb.wait_until_completed();
             assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
-            let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+            let (gpu_us, _) = command_buffer_gpu_times_us(cb);
             gpu_us as f64 / 1000.0 / reps as f64
         };
         let measure_candidate = |reps: usize| {
@@ -2725,7 +2725,7 @@ mod tests {
             cb.commit();
             cb.wait_until_completed();
             assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
-            let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+            let (gpu_us, _) = command_buffer_gpu_times_us(cb);
             gpu_us as f64 / 1000.0 / reps as f64
         };
 
@@ -2917,7 +2917,7 @@ mod tests {
                     cb.commit();
                     cb.wait_until_completed();
                     if pass == 1 {
-                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+                        let (gpu_us, _) = command_buffer_gpu_times_us(cb);
                         let ms = gpu_us as f64 / 1000.0 / REPS as f64;
                         eprintln!(
                             "[spec50] sweep rb={rb} rg={rg} sg={sg} flat={flat} ablate={ablate} yfmt={yfmt} K={k}: {ms:7.2} ms  {:6.1} GB/s",
@@ -2992,7 +2992,7 @@ mod tests {
                     cb.wait_until_completed();
                     assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
                     if pass == 1 {
-                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+                        let (gpu_us, _) = command_buffer_gpu_times_us(cb);
                         let ms = gpu_us as f64 / 1000.0 / REPS as f64;
                         eprintln!(
                             "[spec50] K={k} {label:<26} {ms:7.2} ms  {:6.1} GB/s",

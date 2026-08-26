@@ -1032,7 +1032,7 @@ mod tests {
                 );
                 if matched > 0 {
                     // The reported match must be a real suffix occurrence.
-                    assert!(matched >= 2 && matched <= 6);
+                    assert!((2..=6).contains(&matched));
                 }
             }
         }

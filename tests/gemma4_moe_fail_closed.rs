@@ -4,12 +4,17 @@
 //! 1. An MoE model refuses fail-closed in `Gemma4GpuRuntime::load` (never enters dense mode).
 //! 2. An MoE model with `.cghost` correctly records and executes `routed_expert_calls > 0`.
 
-use camelid::gemma4_runtime::{Gemma4GpuRuntime, Gemma4Runtime};
+mod support;
+
+#[cfg(target_os = "macos")]
+use camelid::gemma4_runtime::Gemma4GpuRuntime;
+use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 #[test]
 fn gemma4_moe_fails_closed_in_dense_gpu_runtime() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
     if !model_path.is_file() {
         eprintln!(
             "SKIP: 26B MoE test model not found at {}",
@@ -33,8 +38,8 @@ fn gemma4_moe_fails_closed_in_dense_gpu_runtime() {
 
 #[test]
 fn gemma4_moe_executes_routed_experts() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
         return;

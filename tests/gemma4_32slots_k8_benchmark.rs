@@ -1,6 +1,10 @@
+#![cfg(target_os = "macos")]
+
 //! Collapsed Verifier Benchmark with 32 Slots/Layer for K=8 on Genuine Gemma 4 26B-A4B
 //!
 //! Eliminates slot table thrashing so that all Top-12 candidate experts remain resident simultaneously.
+
+mod support;
 
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
@@ -19,8 +23,8 @@ fn get_page_faults() -> (u64, u64) {
 
 #[test]
 fn test_genuine_gemma4_32slots_k8() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -56,8 +60,7 @@ fn test_genuine_gemma4_32slots_k8() {
     let mut cur_logits = initial_logits.clone();
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut cur_pos = prompt_tokens.len();
-    for _ in 0..16 {
+    for cur_pos in (prompt_tokens.len()..).take(16) {
         let tok = cur_logits
             .iter()
             .enumerate()
@@ -68,7 +71,6 @@ fn test_genuine_gemma4_32slots_k8() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        cur_pos += 1;
     }
 
     let k = 8;

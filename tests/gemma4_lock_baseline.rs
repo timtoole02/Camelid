@@ -8,6 +8,8 @@
 //! - Process RSS, macOS compressed memory, swap usage
 //! - 48-token deterministic parity verification against llama.cpp oracle
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, process::Command, time::Instant};
 
@@ -83,10 +85,10 @@ fn get_macos_vm_info() -> (String, String) {
 fn test_gemma4_26b_lock_baseline() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf"));
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost"));
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!(
@@ -157,8 +159,7 @@ fn test_gemma4_26b_lock_baseline() {
 
     let mut qkd_tokens = Vec::new();
     let mut qkd_logits = qkd_init_logits;
-    let mut qkd_pos = qkd_prompt_tokens.len();
-    for _ in 0..48 {
+    for qkd_pos in (qkd_prompt_tokens.len()..).take(48) {
         let tok = qkd_logits
             .iter()
             .enumerate()
@@ -169,7 +170,6 @@ fn test_gemma4_26b_lock_baseline() {
         qkd_logits = runtime
             .step(tok, qkd_pos, &mut qkd_kc, &mut qkd_vc)
             .expect("step");
-        qkd_pos += 1;
     }
     println!("48 tokens generated: {:?}", qkd_tokens);
     let qkd_text = runtime
@@ -186,8 +186,6 @@ fn test_gemma4_26b_lock_baseline() {
     println!("PART 2: 256 ADVANCING TOKENS K=1 PROFILE");
     println!("----------------------------------------------------------------------------------------------------------");
     runtime.rollback_sequence(0);
-
-    let (hits_before, misses_before) = runtime.ghost_metal_aggregate_slot_stats();
 
     let gen_prompt = "<|turn>user\nExplain how general relativity predicts gravitational lensing, gravitational time dilation, and frame dragging in detail.<turn|>\n<|turn>model\n";
     let gen_prompt_tokens = runtime
@@ -215,10 +213,9 @@ fn test_gemma4_26b_lock_baseline() {
     let mut generated_tokens = Vec::with_capacity(n_tokens);
     let mut token_latencies_ms = Vec::with_capacity(n_tokens);
     let mut cur_logits = init_logits;
-    let mut cur_pos = gen_prompt_tokens.len();
 
     let t_decode_start = Instant::now();
-    for step_i in 0..n_tokens {
+    for (cur_pos, step_i) in (gen_prompt_tokens.len()..).zip(0..n_tokens) {
         let t_tok_start = Instant::now();
         let tok = cur_logits
             .iter()
@@ -231,8 +228,6 @@ fn test_gemma4_26b_lock_baseline() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut gen_kc, &mut gen_vc)
             .expect("step");
-        cur_pos += 1;
-
         let tok_ms = t_tok_start.elapsed().as_secs_f64() * 1000.0;
         token_latencies_ms.push(tok_ms);
 

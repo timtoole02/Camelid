@@ -15,7 +15,13 @@
 //! - effective SSD GB/s
 //! - Exact token sequence correctness across all configurations.
 
-use std::{path::PathBuf, process::Command, time::Instant};
+mod support;
+
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
 
 use camelid::gemma4_runtime::{Gemma4Runtime, Gemma4StepOutput};
 
@@ -72,8 +78,6 @@ struct SweepResult {
     warm_tok_s: f64,
     total_tok_s: f64,
     peak_rss_mb: f64,
-    compression: String,
-    swap: String,
     hit_rate: f64,
     compulsory_misses: u64,
     capacity_misses: u64,
@@ -83,11 +87,7 @@ struct SweepResult {
     tokens: Vec<u32>,
 }
 
-fn run_cache_benchmark(
-    model_path: &PathBuf,
-    cghost_path: &PathBuf,
-    budget_mib: usize,
-) -> SweepResult {
+fn run_cache_benchmark(model_path: &Path, cghost_path: &Path, budget_mib: usize) -> SweepResult {
     let budget_gib = budget_mib / 1024;
     println!("\n================================================================================");
     println!(
@@ -119,8 +119,6 @@ fn run_cache_benchmark(
     let num_tokens = 256;
     let mut generated_tokens = Vec::with_capacity(num_tokens);
     let mut cur_tok = last_tok;
-    let mut cur_pos = decode_pos;
-
     let mut total_ssd_time_us = 0u64;
     let mut total_ssd_bytes = 0u64;
 
@@ -128,7 +126,7 @@ fn run_cache_benchmark(
     let t_start_total = Instant::now();
     let mut t_cold_end = t_start_total;
 
-    for step in 0..num_tokens {
+    for (cur_pos, step) in (decode_pos..).zip(0..num_tokens) {
         let (out, prof) = runtime
             .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
             .expect("step");
@@ -151,8 +149,6 @@ fn run_cache_benchmark(
 
         generated_tokens.push(next_id);
         cur_tok = next_id;
-        cur_pos += 1;
-
         if step == 31 {
             t_cold_end = Instant::now();
         }
@@ -239,8 +235,6 @@ fn run_cache_benchmark(
         warm_tok_s,
         total_tok_s,
         peak_rss_mb,
-        compression,
-        swap,
         hit_rate,
         compulsory_misses: stats.compulsory_misses,
         capacity_misses: stats.capacity_misses,
@@ -253,8 +247,8 @@ fn run_cache_benchmark(
 
 #[test]
 fn sweep_real_gemma4_26b_expert_cache_budgets() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -280,7 +274,7 @@ fn sweep_real_gemma4_26b_expert_cache_budgets() {
 
     // Verify token identity across all runs
     let baseline_tokens = &results[0].tokens;
-    for (_i, res) in results.iter().enumerate().skip(1) {
+    for res in results.iter().skip(1) {
         assert_eq!(
             baseline_tokens, &res.tokens,
             "Token sequence mismatch between 1 GiB and {} GiB cache!",

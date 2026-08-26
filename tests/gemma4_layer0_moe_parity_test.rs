@@ -5,6 +5,8 @@
 //!
 //! Requires the local 26B GGUF + cghost pair.
 
+mod support;
+
 use std::path::PathBuf;
 
 use camelid::api::{gemma4_chat_prompt_for_tests, ChatMessage};
@@ -55,8 +57,8 @@ fn metal_top_is_near_cpu(logits: &[f32], metal_top: u32, cpu_top: u32, max_gap: 
 }
 
 fn model_paths() -> Option<(PathBuf, PathBuf)> {
-    let model = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
     if model.is_file() && cghost.is_file() {
         Some((model, cghost))
     } else {
@@ -363,10 +365,9 @@ fn capital_france_greedy_matches_oracle() {
     let mut kc = vec![Vec::new(); 30];
     let mut vc = vec![Vec::new(); 30];
     let mut metal_tops = Vec::new();
-    let mut last_logits = Vec::new();
     let mut first_mismatch: Option<(usize, u32, u32, u32)> = None;
     for (pos, &tok) in ORACLE_PROMPT_TOKENS.iter().enumerate() {
-        last_logits = runtime
+        let last_logits = runtime
             .step(tok, pos, &mut kc, &mut vc)
             .expect("metal step");
         let top = argmax(&last_logits);
@@ -556,21 +557,18 @@ fn gemma4_warm_decode_toks() {
         prompt.len() as f64 / prefill_s
     );
 
-    let mut pos = prompt.len();
-    for _ in 0..4 {
+    for pos in (prompt.len()..).take(4) {
         let next = argmax(&logits);
         logits = runtime.step(next, pos, &mut kc, &mut vc).expect("warmup");
-        pos += 1;
     }
 
     const N: usize = 64;
     let t_decode = std::time::Instant::now();
     let mut gen = Vec::with_capacity(N);
-    for _ in 0..N {
+    for pos in (prompt.len() + 4..).take(N) {
         let next = argmax(&logits);
         gen.push(next);
         logits = runtime.step(next, pos, &mut kc, &mut vc).expect("decode");
-        pos += 1;
     }
     let decode_s = t_decode.elapsed().as_secs_f64();
     let text = runtime.tokenizer().decode(&gen, true).unwrap_or_default();

@@ -52,6 +52,7 @@ pub(crate) struct WireMmapResidencySnapshot {
 /// One validated page-aligned window inside a wire mapping. This geometry is
 /// shared by non-faulting residency sampling and targeted cache-discard
 /// advisories, so callers cannot accidentally round the end past the mapping.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireMmapAlignedRange {
     pub(crate) aligned_offset: usize,
@@ -61,6 +62,7 @@ pub(crate) struct WireMmapAlignedRange {
 /// Result of one targeted `MADV_DONTNEED` advisory. The before/after snapshots
 /// are both collected with `mincore`, which does not fault the advised pages.
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireMmapDiscardSnapshot {
     pub(crate) range: WireMmapAlignedRange,
@@ -73,6 +75,7 @@ pub(crate) struct WireMmapDiscardSnapshot {
 
 /// Round an exact byte range outwards to system-page boundaries while proving
 /// that the resulting window remains inside `mapped_len`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn aligned_page_range(
     offset: u64,
     len: usize,
@@ -126,6 +129,7 @@ pub(crate) fn aligned_page_range(
 /// Page-align and merge exact byte ranges. Overlapping and directly adjacent
 /// windows coalesce, preventing a final cleanup pass from advising shared
 /// tensor-boundary pages more than once.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn merge_aligned_page_ranges(
     ranges: &[(u64, usize)],
     mapped_len: usize,
@@ -308,7 +312,7 @@ impl GgufWireMmap {
                     .cast_mut()
                     .cast::<libc::c_void>(),
                 mapped_bytes,
-                status.as_mut_ptr().cast::<libc::c_char>(),
+                status.as_mut_ptr().cast(),
             )
         };
         if result != 0 {
@@ -331,6 +335,7 @@ impl GgufWireMmap {
     /// Synchronously make every page in one aligned file-backed window
     /// required by issuing one volatile read per page. No readahead advisory or
     /// anonymous copy is involved.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn fault_pages_range(
         &self,
         aligned_offset: usize,
@@ -374,6 +379,7 @@ impl GgufWireMmap {
     /// a later CPU or GPU access simply faults the clean page back from disk.
     /// The call is advisory, so before/after `mincore` facts are returned and a
     /// higher-level load gate can fail closed if the kernel retained the pages.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn advise_dontneed_range(
         &self,
         offset: u64,
@@ -384,6 +390,7 @@ impl GgufWireMmap {
     }
 
     /// Aligned sibling used by a merged final cleanup pass.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn advise_dontneed_aligned_range(
         &self,
         range: WireMmapAlignedRange,

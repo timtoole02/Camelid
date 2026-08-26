@@ -16,6 +16,8 @@
 //!   SPEC50_MIN_MATCH      n-gram min match length for the drafter (default 3)
 //!   SPEC50_ADAPTIVE       set to enable adaptive draft width
 
+mod support;
+
 use camelid::gemma4_runtime::{gemma4_stop_token_ids, Gemma4Runtime};
 use std::{path::PathBuf, time::Instant};
 
@@ -107,10 +109,10 @@ fn workloads() -> Vec<(&'static str, String)> {
 fn gemma4_spec50_bench() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf"));
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost"));
     if !model_path.exists() || !cghost_path.exists() {
         eprintln!("model pair missing; skipping");
         return;
@@ -168,14 +170,12 @@ fn gemma4_spec50_bench() {
         let mut vc = vec![Vec::new(); n_layers];
         let t = Instant::now();
         let mut logits = runtime.prefill_tokens(&toks, &mut kc, &mut vc, 31).unwrap();
-        let mut pos = toks.len();
-        for _ in 0..24 {
+        for pos in (toks.len()..).take(24) {
             let tok = argmax(&logits);
             if eot.contains(&tok) {
                 break;
             }
             logits = runtime.step(tok, pos, &mut kc, &mut vc).unwrap();
-            pos += 1;
         }
         eprintln!("[spec50] warm-up done in {:.1}s", t.elapsed().as_secs_f64());
     }

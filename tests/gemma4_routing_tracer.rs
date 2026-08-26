@@ -1,10 +1,13 @@
 //! Routing Frequency & Expert Reuse Distance Tracer for Genuine Gemma 4 26B-A4B
 //! Captures empirical activation frequencies, reuse distances, and value scores across all 30 layers.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct ExpertTraceStats {
     activations: usize,
     last_position: Option<usize>,
@@ -13,6 +16,7 @@ struct ExpertTraceStats {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct LayerTrace {
     layer_idx: usize,
     expert_stats: [ExpertTraceStats; 128],
@@ -21,8 +25,8 @@ struct LayerTrace {
 
 #[test]
 fn test_genuine_gemma4_routing_trace() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

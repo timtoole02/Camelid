@@ -26,6 +26,8 @@ refuse() {
 readonly script_dir=${0:A:h}
 readonly runner=${0:A}
 readonly repo_root=$(/usr/bin/git -C "$script_dir" rev-parse --show-toplevel)
+readonly operator_home=${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}
+readonly model_root=${CAMELID_MODEL_ROOT:-$operator_home/models}
 readonly analyzer="$script_dir/analyze_hot48.py"
 readonly host_sampler="$script_dir/capture_host_memory.py"
 readonly hasher="$script_dir/sha256_nocache.py"
@@ -39,9 +41,9 @@ source_worktree_status=$(/usr/bin/git -C "$repo_root" status --porcelain=v1 --un
 (( ${+parameters[CAMELID_HOT48_BINARY]} )) || \
   refuse "set CAMELID_HOT48_BINARY to an absolute prebuilt binary on the internal Data volume"
 readonly binary=$CAMELID_HOT48_BINARY
-readonly model=${CAMELID_HOT48_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
-readonly cghost=${CAMELID_HOT48_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
-readonly assistant=${CAMELID_HOT48_ASSISTANT:-/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
+readonly model=${CAMELID_HOT48_MODEL:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
+readonly cghost=${CAMELID_HOT48_CGHOST:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
+readonly assistant=${CAMELID_HOT48_ASSISTANT:-$model_root/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
 readonly run_id=$(/bin/date -u '+%Y%m%dT%H%M%SZ')-$$
 readonly default_receipt_root="$repo_root/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hot48-experiment-$run_id"
 readonly receipt_root=${CAMELID_HOT48_RECEIPT_ROOT:-"$default_receipt_root"}
@@ -395,7 +397,7 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
 
 typeset -a experiment_env watchdog_args
 experiment_env=(
-  HOME=/Users/timtoole
+  HOME="$operator_home"
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
   TMPDIR=/tmp
   CAMELID_GHOST_ALLOW_LEGACY_SPARSE=0

@@ -4,6 +4,8 @@
 //! Track B: Multi-round prefetch pipeline with depth & lead-time instrumentation
 //! Track C: True outer round ledger with physical NVMe, page cache, Metal residency reconciliation
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
@@ -34,8 +36,8 @@ struct LedgerMetrics {
 
 #[test]
 fn test_genuine_gemma4_outer_round_pipeline_ledger_k8() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -74,9 +76,7 @@ fn test_genuine_gemma4_outer_round_pipeline_ledger_k8() {
     let mut temp_logits = initial_logits;
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut temp_pos = prompt_tokens.len();
-
-    for _ in 0..48 {
+    for temp_pos in (prompt_tokens.len()..).take(48) {
         let tok = temp_logits
             .iter()
             .enumerate()
@@ -87,7 +87,6 @@ fn test_genuine_gemma4_outer_round_pipeline_ledger_k8() {
         temp_logits = runtime
             .step(tok, temp_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        temp_pos += 1;
     }
 
     // Warmup Round 1 prefetch
@@ -210,6 +209,10 @@ fn test_genuine_gemma4_outer_round_pipeline_ledger_k8() {
         println!(
             "Draft generation:                   {:7.2} ms",
             ledger.draft_ms
+        );
+        println!(
+            "Prefetch issue:                     {:7.2} ms",
+            ledger.prefetch_ms
         );
         println!("\nPrefetch:");
         println!(

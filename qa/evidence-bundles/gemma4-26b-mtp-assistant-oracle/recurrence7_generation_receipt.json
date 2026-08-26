@@ -4,8 +4,8 @@
     "path": "qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/generate_recurrence_oracle.py",
     "sha256": "4b8217ae125a97b5de67fd2bb8bbf4723428a09be2a24fceb02419d9b8ba5e46"
   },
-  "interpreter": "/Volumes/Untitled/cargo-targets/gemma4-mtp-oracle.pLWdhU/venv/bin/python",
-  "assistant_model_dir": "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant",
+  "interpreter": "$CAMELID_ORACLE_WORKDIR/venv/bin/python",
+  "assistant_model_dir": "$CAMELID_MODEL_ROOT/gemma4-26b-a4b-mtp-qat-assistant",
   "assistant_model_sha256": "c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801",
   "canonical_oracle": {
     "path": "qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/assistant_recurrence7_bf16_cpu.json",
@@ -13,7 +13,7 @@
     "sha256": "08cf02bedfec09074eeebaa24b1ffaaa5362badd412b523de6a0d52952e94109"
   },
   "rerun_oracle": {
-    "path": "/Volumes/Untitled/cargo-targets/gemma4-mtp-oracle.pLWdhU/assistant_recurrence7_bf16_cpu.rerun.json",
+    "path": "$CAMELID_ORACLE_WORKDIR/assistant_recurrence7_bf16_cpu.rerun.json",
     "bytes": 127153,
     "sha256": "08cf02bedfec09074eeebaa24b1ffaaa5362badd412b523de6a0d52952e94109"
   },

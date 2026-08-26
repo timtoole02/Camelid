@@ -1,12 +1,14 @@
 //! Test Metal Routed Expert Acceleration for Real Gemma 4 26B-A4B
 
+mod support;
+
 use camelid::gemma4_runtime::{Gemma4Runtime, Gemma4StepOutput};
 use std::{path::PathBuf, time::Instant};
 
 #[test]
 fn test_metal_expert_moe() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -46,11 +48,10 @@ fn test_metal_expert_moe() {
     // Measure decode steps
     let num_tokens = 32;
     let mut cur_tok = last_tok;
-    let mut cur_pos = decode_pos;
     let mut generated = Vec::new();
 
     let t_start = Instant::now();
-    for _ in 0..num_tokens {
+    for cur_pos in (decode_pos..).take(num_tokens) {
         let (out, _prof) = runtime
             .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
             .expect("step");
@@ -70,7 +71,6 @@ fn test_metal_expert_moe() {
 
         generated.push(next_id);
         cur_tok = next_id;
-        cur_pos += 1;
     }
     let dur = t_start.elapsed();
 

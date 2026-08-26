@@ -1,5 +1,7 @@
 //! Real Gemma 4 26B-A4B Profiler on Metal Acceleration
 
+mod support;
+
 use camelid::{
     gemma4_runtime::{Gemma4Runtime, Gemma4StepOutput},
     ghost::GhostFile,
@@ -8,8 +10,8 @@ use std::{path::PathBuf, sync::Arc};
 
 #[test]
 fn profile_real_gemma4_26b_moe_metal() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -61,8 +63,7 @@ fn profile_real_gemma4_26b_moe_metal() {
 
     // Warm up 32 tokens so cache is 100% warm
     let mut cur_tok = last_tok;
-    let mut cur_pos = decode_pos;
-    for _ in 0..32 {
+    for cur_pos in (decode_pos..).take(32) {
         let (out, _) = runtime
             .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
             .expect("step");
@@ -79,12 +80,11 @@ fn profile_real_gemma4_26b_moe_metal() {
             }
         }
         cur_tok = next_id;
-        cur_pos += 1;
     }
 
     // Now profile 1 WARM decode token step with Metal expert execution
     let (out, profile) = runtime
-        .step_range_profiled(cur_tok, cur_pos, None, &mut kc, &mut vc)
+        .step_range_profiled(cur_tok, decode_pos + 32, None, &mut kc, &mut vc)
         .expect("step_range_profiled");
     let logits = match out {
         Gemma4StepOutput::Logits(l) => l,

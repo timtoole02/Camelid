@@ -243,7 +243,8 @@ fn replace_file_atomically(temp: &Path, path: &Path) -> std::io::Result<()> {
     let path_wide = wide(path);
     let temp_wide = wide(temp);
     let mut last_error = None;
-    for attempt in 0..8_u32 {
+    const MAX_ATTEMPTS: u32 = 32;
+    for attempt in 0..MAX_ATTEMPTS {
         // SAFETY: both buffers are live NUL-terminated UTF-16 paths. The source
         // is a closed same-directory file. MoveFileExW handles both the initial
         // publication and replacement without an exists/check race.
@@ -269,7 +270,13 @@ fn replace_file_atomically(temp: &Path, path: &Path) -> std::io::Result<()> {
             return Err(error);
         }
         last_error = Some(error);
-        std::thread::sleep(std::time::Duration::from_millis(1_u64 << attempt));
+        if attempt + 1 < MAX_ATTEMPTS {
+            // Exponential backoff reacts quickly to ordinary writer races, then
+            // caps at 64 ms while Defender/indexers release transient handles.
+            // The complete backoff sleep budget remains below two seconds.
+            let backoff_ms = 1_u64 << attempt.min(6);
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+        }
     }
     Err(last_error.unwrap_or_else(|| {
         std::io::Error::other(format!("could not atomically replace {}", path.display()))
@@ -2899,19 +2906,16 @@ fn condense_objective_for_capsule(objective: &str) -> String {
             }
             continue;
         }
-        if capture_section {
-            if trimmed.starts_with('*')
+        if capture_section
+            && (trimmed.starts_with('*')
                 || trimmed.starts_with('-')
                 || trimmed.starts_with("python ")
                 || trimmed.starts_with("def ")
                 || trimmed.starts_with("class ")
-            {
-                condensed.push(line);
-            } else if !trimmed.is_empty()
-                && (condensed.last().is_none_or(|l| l.trim().starts_with('#')))
-            {
-                condensed.push(line);
-            }
+                || (!trimmed.is_empty()
+                    && condensed.last().is_none_or(|l| l.trim().starts_with('#'))))
+        {
+            condensed.push(line);
         }
     }
     let result = condensed.join("\n");

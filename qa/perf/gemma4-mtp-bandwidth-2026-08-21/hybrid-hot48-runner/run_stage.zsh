@@ -35,6 +35,9 @@ esac
 
 readonly script_dir=${0:A:h}
 readonly repo_root=$(/usr/bin/git -C "$script_dir" rev-parse --show-toplevel)
+readonly operator_home=${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}
+readonly model_root=${CAMELID_MODEL_ROOT:-$operator_home/models}
+readonly operator_bin=${CAMELID_OPERATOR_BIN:-$operator_home/bin}
 readonly residency_profile=${CAMELID_HYBRID_RESIDENCY_PROFILE:-uniform-hot32}
 typeset default_receipt_root
 case "$residency_profile" in
@@ -53,10 +56,10 @@ readonly analyzer="$script_dir/hybrid_receipt.py"
 readonly receipt_root=${CAMELID_HYBRID_RECEIPT_ROOT:-"$default_receipt_root"}
 readonly server_binary=${CAMELID_HYBRID_SERVER_BINARY:-"$receipt_root/camelid"}
 readonly load_binary=${CAMELID_HYBRID_LOAD_BINARY:-"$receipt_root/gemma4-mtp-assistant-experiment"}
-readonly model=${CAMELID_HYBRID_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
-readonly cghost=${CAMELID_HYBRID_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
-readonly assistant=${CAMELID_HYBRID_ASSISTANT:-/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
-readonly cam_lock=${CAMELID_CAM_LOCK:-/Users/timtoole/bin/cam-lock.sh}
+readonly model=${CAMELID_HYBRID_MODEL:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
+readonly cghost=${CAMELID_HYBRID_CGHOST:-$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
+readonly assistant=${CAMELID_HYBRID_ASSISTANT:-$model_root/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
+readonly cam_lock=${CAMELID_CAM_LOCK:-$operator_bin/cam-lock.sh}
 readonly load_contract=${CAMELID_HYBRID_LOAD_CONTRACT:-"$receipt_root/hybrid-load-only-schema-v1.json"}
 readonly telemetry_contract=${CAMELID_HYBRID_TELEMETRY_CONTRACT:-"$receipt_root/hybrid-telemetry-schema-v2.json"}
 
@@ -368,7 +371,7 @@ readonly assistant_mtime=$(/usr/bin/stat -f '%m' "$assistant")
 
 typeset -a common_env lane_env watchdog_args
 common_env=(
-  HOME=/Users/timtoole
+  HOME="$operator_home"
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
   TMPDIR=/tmp
   CAMELID_GHOST_ALLOW_LEGACY_SPARSE=0

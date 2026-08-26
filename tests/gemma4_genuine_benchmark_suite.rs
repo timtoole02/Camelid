@@ -1,26 +1,25 @@
 //! Comprehensive 10-Prompt Genuine Gemma 4 26B-A4B Benchmark Suite
 //! Comparing K=1, K=5 N-Gram, and K=5 Predictive Drafter against Frozen 20.40ms Verifier
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
 #[derive(Debug, Clone)]
 struct BenchmarkResult {
     category: &'static str,
-    prompt: &'static str,
     k1_tok_s: f64,
-    k1_text_preview: String,
     k5_ngram_verify_ms: f64,
     k5_ngram_candidate_tok_s: f64,
     k5_ngram_accepted_per_round: f64,
     k5_ngram_emitted_tok_s: f64,
-    k5_ngram_text_preview: String,
 }
 
 #[test]
 fn test_genuine_gemma4_10_prompt_suite() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -137,14 +136,11 @@ fn test_genuine_gemma4_10_prompt_suite() {
 
         results.push(BenchmarkResult {
             category: cat,
-            prompt: raw_prompt,
             k1_tok_s,
-            k1_text_preview: k1_preview,
             k5_ngram_verify_ms: verify_ms_round,
             k5_ngram_candidate_tok_s: candidate_tok_s,
             k5_ngram_accepted_per_round: accepted_per_round,
             k5_ngram_emitted_tok_s: k5_emitted_tok_s,
-            k5_ngram_text_preview: k5_preview,
         });
     }
 

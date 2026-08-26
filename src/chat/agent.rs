@@ -2201,10 +2201,7 @@ fn host_python_unittest_command(
     if directories.is_empty() {
         return None;
     }
-    #[cfg(windows)]
-    let launcher = "py";
-    #[cfg(not(windows))]
-    let launcher = "python3";
+    let launcher = host_python_launcher();
     Some(
         directories
             .into_iter()
@@ -2212,6 +2209,17 @@ fn host_python_unittest_command(
             .collect::<Vec<_>>()
             .join(" && "),
     )
+}
+
+fn host_python_launcher() -> &'static str {
+    #[cfg(windows)]
+    {
+        "py"
+    }
+    #[cfg(not(windows))]
+    {
+        "python3"
+    }
 }
 
 fn paging_failed_attempts_require_full_rewrite(failed_attempts: &[String]) -> bool {
@@ -12372,10 +12380,13 @@ mod tests {
                         )])
                     }
                     2 => ModelStep::Calls(vec![tc("read_file", json!({"path": "app.rs"}))]),
-                    3 => ModelStep::Calls(vec![tc(
-                        "run_shell",
-                        json!({"command": "rustc --test app.rs -o app-tests && ./app-tests"}),
-                    )]),
+                    3 => {
+                        #[cfg(windows)]
+                        let command = r"rustc --test app.rs -o app-tests.exe && .\app-tests.exe";
+                        #[cfg(not(windows))]
+                        let command = "rustc --test app.rs -o app-tests && ./app-tests";
+                        ModelStep::Calls(vec![tc("run_shell", json!({"command": command}))])
+                    }
                     _ => {
                         assert!(tools.is_empty());
                         ModelStep::Text("Created, corrected, and verified app.rs.".into())
@@ -12413,7 +12424,11 @@ mod tests {
         assert!(std::fs::read_to_string(directory.path().join("app.rs"))
             .unwrap()
             .contains("fn value() -> i32 { 2 }"));
-        assert!(directory.path().join("app-tests").is_file());
+        #[cfg(windows)]
+        let test_binary = "app-tests.exe";
+        #[cfg(not(windows))]
+        let test_binary = "app-tests";
+        assert!(directory.path().join(test_binary).is_file());
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
@@ -12718,29 +12733,32 @@ mod tests {
             &python_suite,
             "create and run the unittest suite"
         ));
+        let python = host_python_launcher();
+        let taskforge_suite = format!("{python} -m unittest discover -s taskforge/tests");
         assert!(paging_verification_command_is_relevant(
-            "python3 -m unittest discover -s taskforge/tests",
+            &taskforge_suite,
             &work,
             &python_suite,
             "create and run the unittest suite"
         ));
+        let unrelated_suite = format!("{python} -m unittest discover -s unrelated/tests");
         assert!(!paging_verification_command_is_relevant(
-            "python3 -m unittest discover -s unrelated/tests",
+            &unrelated_suite,
             &work,
             &python_suite,
             "create and run the unittest suite"
         ));
         for bypass in [
-            "python3 -m unittest discover -s unrelated/tests && echo taskforge/tests",
-            "cd unrelated && python3 -m unittest discover",
-            "cd unrelated; python3 -m unittest discover",
-            "PYTHONPATH=unrelated python3 -m unittest discover -s taskforge/tests",
-            "python3 -m unittest discover -s taskforge/tests && echo done",
-            "python3 -m unittest discover -s taskforge/tests > test.log",
+            format!("{python} -m unittest discover -s unrelated/tests && echo taskforge/tests"),
+            format!("cd unrelated && {python} -m unittest discover"),
+            format!("cd unrelated; {python} -m unittest discover"),
+            format!("PYTHONPATH=unrelated {python} -m unittest discover -s taskforge/tests"),
+            format!("{python} -m unittest discover -s taskforge/tests && echo done"),
+            format!("{python} -m unittest discover -s taskforge/tests > test.log"),
         ] {
             assert!(
                 !paging_verification_command_is_relevant(
-                    bypass,
+                    &bypass,
                     &work,
                     &python_suite,
                     "create and run the unittest suite"
@@ -12753,13 +12771,17 @@ mod tests {
             "taskforge/integration/test_cli.py".to_string(),
         ]);
         assert!(!paging_verification_command_is_relevant(
-            "python3 -m unittest discover -s taskforge/tests",
+            &taskforge_suite,
             &work,
             &two_suites,
             "create and run both unittest suites"
         ));
+        let both_suites = format!(
+            "{python} -m unittest discover -s taskforge/integration && \
+             {python} -m unittest discover -s taskforge/tests"
+        );
         assert!(paging_verification_command_is_relevant(
-            "python3 -m unittest discover -s taskforge/integration && python3 -m unittest discover -s taskforge/tests",
+            &both_suites,
             &work,
             &two_suites,
             "create and run both unittest suites"
@@ -14145,10 +14167,11 @@ mod tests {
                         assert!(tools.iter().any(|tool| tool.name == "run_shell"));
                         ModelStep::Calls(vec![tc("read_file", json!({"path":"tic_tac_toe.py"}))])
                     }
-                    2 if !tools.is_empty() => ModelStep::Calls(vec![tc(
-                        "run_shell",
-                        json!({"command": "python3 -m py_compile tic_tac_toe.py"}),
-                    )]),
+                    2 if !tools.is_empty() => {
+                        let command = host_python_compile_command("tic_tac_toe.py")
+                            .expect("simple Python path must have a host compile command");
+                        ModelStep::Calls(vec![tc("run_shell", json!({"command": command}))])
+                    }
                     _ => {
                         assert!(tools.is_empty());
                         ModelStep::Text("Created and verified tic_tac_toe.py.".into())
@@ -14160,7 +14183,9 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        // This test runs a real Python compiler; allow for a cold launcher on a
+        // loaded Windows runner while retaining a finite liveness bound.
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(30)).unwrap();
         let source = concat!(
             "import tkinter as tk\n",
             "from tkinter import messagebox\n",
@@ -16753,7 +16778,9 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+        // Host-owned completion runs a real Python compiler after the read.
+        // A cold Windows launcher can exceed the generic 5-second test bound.
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(30))
             .unwrap()
             .with_shell_mode(ShellSandbox::Sandboxed);
         super::super::checkpoint::clear_for_workspace(sandbox.root());
@@ -16882,12 +16909,17 @@ mod tests {
     #[test]
     fn host_verification_rejects_invalid_python_before_completion() {
         let dir = tempfile::tempdir().unwrap();
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        // `py` may cold-start alongside several other real subprocess tests on
+        // a loaded Windows runner. Keep the liveness bound, but leave enough
+        // room for the verifier to return the syntax diagnostic under test.
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
         let mut driver = MockDriver {
             steps: vec![
+                // Keep delimiters balanced so the write-time truncation guard accepts
+                // the file and the host Python compiler owns the syntax diagnosis.
                 ModelStep::Calls(vec![tc(
                     "write_file",
-                    json!({"path": "game.py", "content": "def broken(:\n    pass\n"}),
+                    json!({"path": "game.py", "content": "def broken()\n    pass\n"}),
                 )]),
                 ModelStep::Text("Done with broken source.".into()),
                 ModelStep::Calls(vec![tc(
@@ -16920,10 +16952,14 @@ mod tests {
             std::fs::read_to_string(dir.path().join("game.py")).unwrap(),
             "print('fixed')\n"
         );
-        assert!(reporter
-            .results
-            .iter()
-            .any(|result| result.contains("SyntaxError")));
+        assert!(
+            reporter
+                .results
+                .iter()
+                .any(|result| result.contains("SyntaxError")),
+            "host verification results: {:?}",
+            reporter.results
+        );
     }
 
     /// Is `python` on THIS host the Windows Store alias stub?

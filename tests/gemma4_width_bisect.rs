@@ -13,6 +13,8 @@
 //!
 //! Env: CAMELID_GEMMA4_26B_GGUF / CAMELID_GEMMA4_26B_CGHOST, WIDTHS override.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
@@ -32,10 +34,10 @@ fn argmax(l: &[f32]) -> usize {
 fn gemma4_width_bisect() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf"));
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost"));
+        .unwrap_or_else(|| PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost"));
     if !model_path.exists() || !cghost_path.exists() {
         eprintln!("model pair missing; skipping");
         return;

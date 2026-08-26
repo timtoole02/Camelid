@@ -10994,10 +10994,10 @@ fn gemma4_chat_camelid_payload<T: serde::Serialize>(
     Ok(camelid)
 }
 
-fn gemma4_hybrid_telemetry_for_response<'a, T>(
+fn gemma4_hybrid_telemetry_for_response<T>(
     receipt_requested: bool,
-    telemetry: Option<&'a T>,
-) -> std::result::Result<Option<&'a T>, &'static str> {
+    telemetry: Option<&T>,
+) -> std::result::Result<Option<&T>, &'static str> {
     if receipt_requested && telemetry.is_none() {
         Err("camelid_receipt was requested, but the exact hybrid runtime could not produce a complete strict telemetry receipt")
     } else {
@@ -16319,6 +16319,7 @@ async fn chat_completions_multi_choice(
         .into_response()
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_chat_receipt_request_shape(
     req: &ChatCompletionRequest,
 ) -> std::result::Result<(), Response> {

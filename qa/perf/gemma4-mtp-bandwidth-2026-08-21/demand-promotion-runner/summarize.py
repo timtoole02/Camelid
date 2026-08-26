@@ -118,5 +118,12 @@ def summarize(d):
             out['response_error'] = str(e)[:120]
     return out
 
-for d in sys.argv[1:]:
-    print(json.dumps(summarize(d), indent=1))
+def main(argv=None):
+    paths = sys.argv[1:] if argv is None else argv
+    for path in paths:
+        print(json.dumps(summarize(path), indent=1))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -15,17 +15,20 @@ readonly MAX_CHILD_FOOTPRINT_BYTES=8053063680
 readonly MAX_HOST_WIRED_BYTES=8589934592
 readonly REQUEST_SHA256=b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939
 readonly EXPECTED_IDS_SHA256=45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975
-readonly PAGER_BASELINE_RECEIPT=/Users/timtoole/Documents/Camelid-hot48-receipts/run-hot40-49757102-v4
+readonly operator_home=${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}
+readonly model_root=${CAMELID_MODEL_ROOT:-$operator_home/models}
+readonly receipt_archive_root=${CAMELID_RECEIPT_ROOT:-$operator_home/Documents/Camelid-hot48-receipts}
+readonly PAGER_BASELINE_RECEIPT=${CAMELID_HOT40_PAGER_BASELINE_RECEIPT:-$receipt_archive_root/run-hot40-49757102-v4}
 readonly PAGER_BASELINE_INTENT_SHA256=3697a2e3c25c051de1d46d8ac3f008b87a55bfc89b4eaff2bbacd472f4f7689e
 readonly PAGER_BASELINE_WATCHDOG_SHA256=6165548cdfecb5f5e5ae9caf3dea33ad97040f5544be0c1f69ba9fa92b5c2965
 readonly PAGER_BASELINE_RESPONSE_SHA256=0eb42179050e4354dad2b597d10c742b6088c56e86078a5ae60646b6c1b43cbe
-readonly DEFAULT_MODEL=/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf
-readonly DEFAULT_CGHOST=/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost
-readonly DEFAULT_ASSISTANT=/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
+readonly DEFAULT_MODEL=$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf
+readonly DEFAULT_CGHOST=$model_root/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost
+readonly DEFAULT_ASSISTANT=$model_root/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
 readonly DEFAULT_MODEL_SHA256=66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d
 readonly DEFAULT_CGHOST_SHA256=b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757
 readonly DEFAULT_ASSISTANT_SHA256=c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801
-readonly DEFAULT_PROVENANCE_REFERENCE=/Users/timtoole/Documents/Camelid-hot48-receipts/run-hot48-301da730-v1/intent.json
+readonly DEFAULT_PROVENANCE_REFERENCE=$receipt_archive_root/run-hot48-301da730-v1/intent.json
 readonly DEFAULT_PROVENANCE_REFERENCE_SHA256=1009914429ef0417b44f2886299fab6f6be64165afa78e72fe8d6e7ebd715cc3
 readonly PROVENANCE_LIMITATION="Large model, cghost, and assistant contents are not hashed by this run. Historical SHA-256 claims are carried forward and bound only to live device/inode/size/mtime stat identity, avoiding pre-spawn page-cache pollution but providing weaker provenance than a fresh content hash."
 
@@ -670,7 +673,7 @@ fi
 
 typeset -a experiment_env watchdog_args
 experiment_env=(
-  HOME=/Users/timtoole
+  HOME="$operator_home"
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
   TMPDIR=/tmp
   CAMELID_GHOST_ALLOW_LEGACY_SPARSE=0

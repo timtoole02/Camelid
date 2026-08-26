@@ -1,6 +1,8 @@
 //! Genuine Gemma 4 26B-A4B Memory Pressure & Cache Budget Matrix Benchmark
 //! Comparing 32, 48, 64, 80, and 96 slots/layer holding model, prompt, and K=5 verifier constant.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, process::Command, time::Instant};
 
@@ -73,8 +75,10 @@ fn get_process_rss_bytes() -> u64 {
         let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
             / std::mem::size_of::<libc::natural_t>())
             as libc::mach_msg_type_number_t;
+        #[allow(deprecated)]
+        let task = libc::mach_task_self();
         let kret = libc::task_info(
-            libc::mach_task_self(),
+            task,
             libc::MACH_TASK_BASIC_INFO,
             &mut info as *mut _ as *mut libc::integer_t,
             &mut count,
@@ -120,19 +124,15 @@ struct BudgetResult {
     system_free_gib: f64,
     file_backed_gib: f64,
     compressed_gib: f64,
-    vm_pressure: u32,
-    k1_round_ms: f64,
-    k1_tok_s: f64,
     k5_round_ms: f64,
     k5_candidate_tok_s: f64,
     k5_emitted_tok_s: f64,
-    parity_pass: bool,
 }
 
 #[test]
 fn test_genuine_gemma4_memory_pressure_matrix() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -215,13 +215,9 @@ fn test_genuine_gemma4_memory_pressure_matrix() {
             system_free_gib: vm_after.free_gib(),
             file_backed_gib: vm_after.file_backed_gib(),
             compressed_gib: vm_after.compressed_gib(),
-            vm_pressure,
-            k1_round_ms,
-            k1_tok_s,
             k5_round_ms,
             k5_candidate_tok_s,
             k5_emitted_tok_s,
-            parity_pass,
         });
     }
 

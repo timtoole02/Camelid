@@ -1,6 +1,8 @@
 //! Fine-Grained Low-Budget Cache Matrix & Three-Tier Memory Telemetry Benchmark
 //! Budgets: 8, 16, 24, 32, and 40 slots/layer on Genuine Gemma 4 26B-A4B.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, process::Command, time::Instant};
 
@@ -66,6 +68,7 @@ impl VmStats {
     }
 }
 
+#[allow(deprecated)]
 fn get_process_rss_bytes() -> u64 {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -127,6 +130,7 @@ fn get_vm_pressure_level() -> u32 {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct FineBudgetResult {
     slots_per_layer: usize,
     metal_resident_gib: f64,
@@ -145,8 +149,8 @@ struct FineBudgetResult {
 
 #[test]
 fn test_genuine_gemma4_low_budget_matrix() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");

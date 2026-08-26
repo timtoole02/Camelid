@@ -1,39 +1,15 @@
-#[cfg(target_os = "macos")]
-use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,
-};
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 #[cfg(target_os = "macos")]
-fn encode_gemma4_q4_0_gateup_matmul(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    y: &Buffer,
-    gate_weight: &Buffer,
-    up_weight: &Buffer,
-    act_output: &Buffer,
-    gateup_scalar: &Buffer,
-    rows: usize,
-) {
-    e.set_compute_pipeline_state(&k.q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline);
-    e.set_buffer(0, Some(y), 0);
-    e.set_buffer(1, Some(gate_weight), 0);
-    e.set_buffer(2, Some(up_weight), 0);
-    e.set_buffer(3, Some(act_output), 0);
-    e.set_buffer(4, Some(gateup_scalar), 0);
-    e.set_buffer(5, Some(gateup_scalar), 4);
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: (rows as u64).div_ceil(2),
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
-    );
-}
+pub(crate) use metal::Buffer;
+#[cfg(target_os = "macos")]
+use metal::{CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
+#[cfg(not(target_os = "macos"))]
+pub(crate) type Buffer = ();
 
 #[cfg(target_os = "macos")]
 use std::{
@@ -111,26 +87,18 @@ pub(crate) struct MetalLinearKernel {
     q8_0_block_ksplit_f32y_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q4_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
-    q4_0_qkv_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
-    q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q4_0_block_batch_k_pipeline: Option<ComputePipelineState>,
     q4_0_block_batch_k6_pipeline: Option<ComputePipelineState>,
     q4_0_block_batch_k8_pipeline: Option<ComputePipelineState>,
     q4_0_qkv_block_batch_k_pipeline: Option<ComputePipelineState>,
     q4_0_qkv_block_batch_k6_pipeline: Option<ComputePipelineState>,
     q4_0_qkv_block_batch_k8_pipeline: Option<ComputePipelineState>,
-    /// Same 32-thread / 2-row concatenated Q+K+V geometry as
-    /// `q4_0_qkv_block_linear_batch_k`, with RMSNorm applied on the activation
-    /// load so `normf_batch` is not written.
-    q4_0_qkv_block_batch_k_fused_rms_pipeline: Option<ComputePipelineState>,
     q4_0_gateup_geglu_block_batch_k_pipeline: Option<ComputePipelineState>,
     q4_0_gateup_geglu_block_batch_k6_pipeline: Option<ComputePipelineState>,
     q4_0_gateup_geglu_block_batch_k8_pipeline: Option<ComputePipelineState>,
     gemma4_fused_post_attn_residual_ffn_norm_pipeline: Option<ComputePipelineState>,
-    gemma4_fused_post_ffw_residual_pipeline: Option<ComputePipelineState>,
     gemma4_fused_q_norm_rope_batch_pipeline: Option<ComputePipelineState>,
     gemma4_fused_kv_norm_rope_scatter_batch_pipeline: Option<ComputePipelineState>,
-    q6k_linear_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_scores_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_softmax_batch_k_pipeline: Option<ComputePipelineState>,
     attention_decode_context_batch_k_pipeline: Option<ComputePipelineState>,
@@ -162,13 +130,10 @@ pub(crate) struct MetalLinearKernel {
     gemma4_q4_expert_down_reduce_pipeline: ComputePipelineState,
     gemma4_q4_expert_down_reduce_simd_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline: Option<ComputePipelineState>,
-    gemma4_q4_multi_expert_gate_up_geglu_turbo_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_fused_gateup_geglu_quant_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_quantize_pipeline: Option<ComputePipelineState>,
     gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline: Option<ComputePipelineState>,
-    gemma4_q4_multi_expert_down_scatter_reduce_batch_k_pipeline: Option<ComputePipelineState>,
-    gemma4_q4_multi_expert_down_scatter_reduce_turbo_pipeline: Option<ComputePipelineState>,
     gemma4_fused_layer_residual_pipeline: Option<ComputePipelineState>,
     gemma4_gpu_topk_routing_pipeline: Option<ComputePipelineState>,
     gemma4_router_batch_k_pipeline: Option<ComputePipelineState>,
@@ -256,7 +221,6 @@ pub(crate) struct MetalLinearKernel {
     kv_scatter_kvq8_pipeline: ComputePipelineState,
     f32_to_f16_pipeline: ComputePipelineState,
     rms_norm_batch_pipeline: ComputePipelineState,
-    rms_inv_batch_pipeline: Option<ComputePipelineState>,
     rms_norm_batch_f16o_pipeline: ComputePipelineState,
     silu_mul_f16o_pipeline: ComputePipelineState,
     rope_rotate_batch_pipeline: ComputePipelineState,
@@ -280,8 +244,6 @@ pub(crate) struct MetalLinearKernel {
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     argmax_f32_greedy_pipeline: ComputePipelineState,
-    argmax_f32_stage1_pipeline: ComputePipelineState,
-    argmax_f32_stage2_pipeline: ComputePipelineState,
     sample_gumbel_f32_pipeline: ComputePipelineState,
     attention_decode_splitk_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_pipeline: ComputePipelineState,
@@ -595,19 +557,19 @@ fn command_buffer_error_details(cb: &metal::CommandBufferRef) -> String {
 }
 
 /// In-encoder GPU stage ids matching the chained-verifier harness columns.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_QKV_O: u8 = 0;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_ATTN: u8 = 1;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_ROUTER: u8 = 2;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_SHARED: u8 = 3;
 #[cfg(any(target_os = "macos", test))]
 const GPU_STAGE_GATEUP: u8 = 4;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_DOWN: u8 = 5;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GPU_STAGE_RESID: u8 = 6;
 #[cfg(any(target_os = "macos", test))]
 const GPU_STAGE_COUNT: usize = 7;
@@ -800,7 +762,7 @@ fn chained_stage_profile_enabled() -> bool {
 /// the one the serial path would have encoded, and any round shape the
 /// overlap cannot prove safe (expert-union overflow, stage profiling, layer
 /// dumps) falls back to the serial path for that layer.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn overlap_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| overlap_flag_from(std::env::var("CAMELID_GEMMA4_OVERLAP").ok().as_deref()))
@@ -886,6 +848,7 @@ pub(crate) fn gemma4_hybrid_async_two_wave_collapse_enabled() -> bool {
     })
 }
 
+#[cfg(target_os = "macos")]
 const GEMMA4_TERMINAL_COLD_MMA_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_TERMINAL_COLD_MMA";
 
 /// H63 is deliberately strict and default-off. It is not a global kernel
@@ -1264,7 +1227,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 
 /// f32 -> IEEE 754 binary16 bits, round-to-nearest-even (exact for values that started as
 /// f16, which all GGUF Q8_0 scales did).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -11525,10 +11488,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let rms_norm_batch_pipeline = device
                 .new_compute_pipeline_state_with_function(&rms_norm_batch_function)
                 .ok()?;
-            let rms_inv_batch_pipeline = elementwise_library
-                .get_function("rms_inv_batch_f32", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let rms_norm_batch_f16o_function = elementwise_library
                 .get_function("rms_norm_batch_f16o", None)
                 .ok()?;
@@ -11737,18 +11696,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let argmax_f32_greedy_pipeline = device
                 .new_compute_pipeline_state_with_function(&argmax_f32_greedy_function)
                 .ok()?;
-            let argmax_f32_stage1_function = elementwise_library
-                .get_function("argmax_f32_stage1", None)
-                .ok()?;
-            let argmax_f32_stage1_pipeline = device
-                .new_compute_pipeline_state_with_function(&argmax_f32_stage1_function)
-                .ok()?;
-            let argmax_f32_stage2_function = elementwise_library
-                .get_function("argmax_f32_stage2", None)
-                .ok()?;
-            let argmax_f32_stage2_pipeline = device
-                .new_compute_pipeline_state_with_function(&argmax_f32_stage2_function)
-                .ok()?;
             let sample_gumbel_f32_function = elementwise_library
                 .get_function("sample_gumbel_f32", None)
                 .ok()?;
@@ -11828,18 +11775,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q4_0_block_ksplit_f32y_wire_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4_0_block_ksplit_f32y_wire_function)
                 .ok()?;
-            let q4_0_qkv_block_ksplit_f32y_wire_function = library
-                .get_function("q4_0_qkv_block_linear_row_ksplit_f32y_wire", None)
-                .ok()?;
-            let q4_0_qkv_block_ksplit_f32y_wire_pipeline = device
-                .new_compute_pipeline_state_with_function(&q4_0_qkv_block_ksplit_f32y_wire_function)
-                .ok()?;
-            let q4_0_gateup_geglu_block_ksplit_f32y_wire_function = library
-                .get_function("q4_0_gateup_geglu_block_linear_row_ksplit_f32y_wire", None)
-                .ok()?;
-            let q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline = device
-                .new_compute_pipeline_state_with_function(&q4_0_gateup_geglu_block_ksplit_f32y_wire_function)
-                .ok()?;
             let q4_0_block_batch_k_pipeline = library
                 .get_function("q4_0_block_linear_batch_k", None)
                 .ok()
@@ -11864,24 +11799,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .get_function("q4_0_qkv_block_linear_batch_k8", None)
                 .ok()
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            let q4_0_qkv_block_batch_k_fused_rms_pipeline = library
-                .get_function("q4_0_qkv_block_linear_batch_k_fused_rms", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            if let (Some(orig), Some(fused)) = (
-                q4_0_qkv_block_batch_k_pipeline.as_ref(),
-                q4_0_qkv_block_batch_k_fused_rms_pipeline.as_ref(),
-            ) {
-                eprintln!(
-                    "[metal qkv occupancy] orig max_threads/TG={} texw={} tmem={} | fused_rms max_threads/TG={} texw={} tmem={} (lower max_threads/TG ⇒ more registers / lower occupancy)",
-                    orig.max_total_threads_per_threadgroup(),
-                    orig.thread_execution_width(),
-                    orig.static_threadgroup_memory_length(),
-                    fused.max_total_threads_per_threadgroup(),
-                    fused.thread_execution_width(),
-                    fused.static_threadgroup_memory_length(),
-                );
-            }
             let q4_0_gateup_geglu_block_batch_k_pipeline = library
                 .get_function("q4_0_gateup_geglu_block_linear_batch_k", None)
                 .ok()
@@ -11896,14 +11813,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let gemma4_fused_post_attn_residual_ffn_norm_pipeline = library
                 .get_function("gemma4_fused_post_attn_residual_ffn_norm_batch", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            let gemma4_fused_post_ffw_residual_pipeline = library
-                .get_function("gemma4_fused_post_ffw_residual_batch", None)
-                .ok()
-                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
-            let q6k_linear_batch_k_pipeline = library
-                .get_function("q6k_linear_batch_k", None)
                 .ok()
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
             let gemma4_fused_q_norm_rope_batch_pipeline = elementwise_library
@@ -12070,14 +11979,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
-            let gemma4_q4_multi_expert_gate_up_geglu_turbo_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_gate_up_geglu_turbo", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
             let gemma4_q4_multi_expert_fused_gateup_geglu_quant_pipeline = strict_q8k_library
                 .get_function("gemma4_q4_multi_expert_fused_gateup_geglu_quant", None)
                 .ok()
@@ -12086,14 +11987,18 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
-            let gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
+            let gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline =
+                strict_q8k_library
+                    .get_function(
+                        "gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k",
+                        None,
+                    )
+                    .ok()
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    });
             let gemma4_q4_multi_expert_quantize_pipeline = strict_q8k_library
                 .get_function("gemma4_q4_multi_expert_quantize_geglu", None)
                 .ok()
@@ -12104,22 +12009,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 });
             let gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline = strict_q8k_library
                 .get_function("gemma4_q4_multi_expert_down_scatter_reduce_simd", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
-            let gemma4_q4_multi_expert_down_scatter_reduce_batch_k_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_down_scatter_reduce_batch_k", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
-            let gemma4_q4_multi_expert_down_scatter_reduce_turbo_pipeline = strict_q8k_library
-                .get_function("gemma4_q4_multi_expert_down_scatter_reduce_turbo", None)
                 .ok()
                 .and_then(|function| {
                     device
@@ -12247,23 +12136,18 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_ksplit_f32y_pipeline,
                 q8_0_block_ksplit_f32y_wire_pipeline,
                 q4_0_block_ksplit_f32y_wire_pipeline,
-                q4_0_qkv_block_ksplit_f32y_wire_pipeline,
-                q4_0_gateup_geglu_block_ksplit_f32y_wire_pipeline,
                 q4_0_block_batch_k_pipeline,
                 q4_0_block_batch_k6_pipeline,
                 q4_0_block_batch_k8_pipeline,
                 q4_0_qkv_block_batch_k_pipeline,
                 q4_0_qkv_block_batch_k6_pipeline,
                 q4_0_qkv_block_batch_k8_pipeline,
-                q4_0_qkv_block_batch_k_fused_rms_pipeline,
                 q4_0_gateup_geglu_block_batch_k_pipeline,
                 q4_0_gateup_geglu_block_batch_k6_pipeline,
                 q4_0_gateup_geglu_block_batch_k8_pipeline,
                 gemma4_fused_post_attn_residual_ffn_norm_pipeline,
-                gemma4_fused_post_ffw_residual_pipeline,
                 gemma4_fused_q_norm_rope_batch_pipeline,
                 gemma4_fused_kv_norm_rope_scatter_batch_pipeline,
-                q6k_linear_batch_k_pipeline,
                 attention_decode_scores_batch_k_pipeline,
                 attention_decode_softmax_batch_k_pipeline,
                 attention_decode_context_batch_k_pipeline,
@@ -12283,13 +12167,10 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 gemma4_q4_expert_down_reduce_pipeline,
                 gemma4_q4_expert_down_reduce_simd_pipeline,
                 gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline,
-                gemma4_q4_multi_expert_gate_up_geglu_turbo_pipeline,
                 gemma4_q4_multi_expert_fused_gateup_geglu_quant_pipeline,
                 gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline,
                 gemma4_q4_multi_expert_quantize_pipeline,
                 gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline,
-                gemma4_q4_multi_expert_down_scatter_reduce_batch_k_pipeline,
-                gemma4_q4_multi_expert_down_scatter_reduce_turbo_pipeline,
                 gemma4_fused_layer_residual_pipeline,
                 gemma4_gpu_topk_routing_pipeline,
                 gemma4_router_batch_k_pipeline,
@@ -12365,7 +12246,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 kv_scatter_kvq8_pipeline,
                 f32_to_f16_pipeline,
                 rms_norm_batch_pipeline,
-                rms_inv_batch_pipeline,
                 rms_norm_batch_f16o_pipeline,
                 silu_mul_f16o_pipeline,
                 rope_rotate_batch_pipeline,
@@ -12388,8 +12268,6 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 argmax_f32_greedy_pipeline,
-                argmax_f32_stage1_pipeline,
-                argmax_f32_stage2_pipeline,
                 sample_gumbel_f32_pipeline,
                 attention_decode_splitk_pipeline,
                 attention_decode_splitk_kv16_pipeline,
@@ -13692,12 +13570,7 @@ fn try_gemma4_q4_0_matmul_q8_batch_impl(
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_Q4_EXPERT_RECORD_BYTES: usize = 3_345_408;
 #[cfg(target_os = "macos")]
-pub(crate) const GEMMA4_Q4_EXPERT_GATE_UP_BYTES: usize = 2_230_272;
-#[cfg(target_os = "macos")]
-pub(crate) const GEMMA4_Q4_EXPERT_DOWN_BYTES: usize = 1_115_136;
-#[cfg(target_os = "macos")]
 const GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT: usize = 16 * 1024;
-#[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_Q4_EXPERT_SLOT_STRIDE: usize = 3_358_720;
 /// Default-off Mini2 retained-cold experiment. Six records per layer add
 /// 576.5625 MiB across the exact 30-layer row and are small enough to test
@@ -13708,7 +13581,7 @@ pub(crate) const GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER: usize = 6;
 /// This is a physical-record budget, not a limit on routed canonical expert
 /// IDs: every one of the 128 experts remains addressable through the mapped
 /// fallback.
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) const GEMMA4_Q4_HYBRID_HOT_SLOTS: usize = 32;
 /// Global overflow experts reused across layers. 20 resident + 24 overflow covers
 /// measured K=8 unique max of 42.
@@ -14730,6 +14603,7 @@ impl Gemma4Q4ExpertSlotBinding {
     /// Bind the complete anonymous physical prefix directly. Production mixed
     /// tables use canonical mode; keeping this operation separate prevents an
     /// exact canonical prefix from being mistaken for physical slot IDs.
+    #[cfg(test)]
     fn materialize_for_physical_slots(&self, active_slots: &[usize]) -> Option<Self> {
         match self {
             Self::HybridMappedSource(source) => source
@@ -14972,6 +14846,7 @@ impl Gemma4Q4ExpertSlots {
     /// Exact 32-hot/mapped-cold backing. The logical and GPU-visible
     /// namespaces both remain the complete 128 canonical expert IDs; only the
     /// anonymous writable cache is bounded to 32 physical records.
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn new_hybrid_mapped_record_granular(
         mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
         offset: u64,
@@ -15218,6 +15093,7 @@ impl Gemma4Q4ExpertSlots {
         }
     }
 
+    #[cfg(test)]
     fn record_table(&self) -> Option<&spec50_moe_argbuf::Gemma4MoeSlotArgTable> {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => None,
@@ -15250,6 +15126,7 @@ impl Gemma4Q4ExpertSlots {
     /// Entire aligned slab for safe disjoint parallel fills. Callers split with
     /// `par_chunks_mut(slot_stride_bytes())` and pass only each chunk's leading
     /// `slot_record_bytes()` bytes to `GhostFile::read_moe_expert_into`.
+    #[cfg(test)]
     pub(crate) fn slab_bytes_mut(&mut self) -> Option<&mut [u8]> {
         let Gemma4Q4ExpertSlotBacking::Monolithic { slab, slab_bytes } = &mut self.backing else {
             return None;
@@ -15287,6 +15164,7 @@ impl Gemma4Q4ExpertSlots {
     /// The caller must ensure that no live mutable slice or committed GPU
     /// command can access this physical slot, and that concurrent calls use
     /// distinct slots/resources for the full lifetime of every returned slice.
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn slot_bytes_mut_raw(&self, slot: usize) -> Option<&mut [u8]> {
         if slot >= self.writable_slot_count() || !self.hot_refill_available() {
             return None;
@@ -15428,10 +15306,6 @@ impl Gemma4DemandTableLoadOnlyProbe {
             chained_routes,
             chained_output,
         })
-    }
-
-    pub(crate) const fn table_slots(&self) -> usize {
-        self.table_slots
     }
 
     pub(crate) fn active_slots(&self) -> usize {
@@ -16373,9 +16247,6 @@ pub struct Gemma4MultiExpertBatchTimes {
 
 #[cfg(target_os = "macos")]
 pub(crate) struct Gemma4MultiExpertLayerBatch {
-    input_scales: Buffer,
-    input_quants: Buffer,
-    expert_weights: Buffer,
     work_list: Buffer,
     activated: Buffer,
     activation_scales: Buffer,
@@ -16396,11 +16267,6 @@ impl Gemma4MultiExpertLayerBatch {
                 .new_buffer(size as u64, MTLResourceOptions::StorageModeShared)
         };
         Some(Self {
-            input_scales: shared(
-                max_candidates * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>(),
-            ),
-            input_quants: shared(max_candidates * GEMMA4_Q4_EXPERT_HIDDEN),
-            expert_weights: shared(max_unique_experts * GEMMA4_Q4_EXPERT_RECORD_BYTES),
             work_list: shared(max_unique_experts * std::mem::size_of::<Gemma4UniqueExpertWork>()),
             activated: shared(
                 max_unique_experts
@@ -16428,177 +16294,6 @@ impl Gemma4MultiExpertLayerBatch {
         })
     }
 
-    pub fn execute(
-        &mut self,
-        input_q8: &[&[crate::tensor::Q8_0Block]],
-        unique_expert_gate_up: &[&[u8]],
-        unique_expert_down: &[&[u8]],
-        work_items: &[Gemma4UniqueExpertWork],
-        route_entries: &[Gemma4CandidateRouteEntry],
-        output_acc: &mut [Vec<f32>],
-    ) -> Option<()> {
-        let k_candidates = input_q8.len();
-        let num_unique_experts = unique_expert_gate_up.len();
-        if k_candidates == 0
-            || num_unique_experts == 0
-            || k_candidates > self.max_candidates
-            || num_unique_experts > self.max_unique_experts
-            || unique_expert_down.len() != num_unique_experts
-        {
-            return None;
-        }
-
-        unsafe {
-            let scale_out = self.input_scales.contents().cast::<f32>();
-            let quant_out = self.input_quants.contents().cast::<i8>();
-            for (t, &blocks) in input_q8.iter().enumerate() {
-                if blocks.len() != GEMMA4_Q4_EXPERT_INPUT_BLOCKS {
-                    return None;
-                }
-                for (b, block) in blocks.iter().enumerate() {
-                    *scale_out.add(t * GEMMA4_Q4_EXPERT_INPUT_BLOCKS + b) = block.scale;
-                    std::ptr::copy_nonoverlapping(
-                        block.quants.as_ptr(),
-                        quant_out.add(t * GEMMA4_Q4_EXPERT_HIDDEN + b * 32),
-                        32,
-                    );
-                }
-            }
-
-            let weights_out = self.expert_weights.contents().cast::<u8>();
-            for (u, (&gu, &dw)) in unique_expert_gate_up
-                .iter()
-                .zip(unique_expert_down)
-                .enumerate()
-            {
-                if gu.len() != GEMMA4_Q4_EXPERT_GATE_UP_BYTES
-                    || dw.len() != GEMMA4_Q4_EXPERT_DOWN_BYTES
-                {
-                    return None;
-                }
-                let expert_offset = u * GEMMA4_Q4_EXPERT_RECORD_BYTES;
-                std::ptr::copy_nonoverlapping(
-                    gu.as_ptr(),
-                    weights_out.add(expert_offset),
-                    GEMMA4_Q4_EXPERT_GATE_UP_BYTES,
-                );
-                std::ptr::copy_nonoverlapping(
-                    dw.as_ptr(),
-                    weights_out.add(expert_offset + GEMMA4_Q4_EXPERT_GATE_UP_BYTES),
-                    GEMMA4_Q4_EXPERT_DOWN_BYTES,
-                );
-            }
-
-            let work_out = self.work_list.contents().cast::<Gemma4UniqueExpertWork>();
-            std::ptr::copy_nonoverlapping(work_items.as_ptr(), work_out, num_unique_experts);
-
-            let routes_out = self
-                .candidate_routes
-                .contents()
-                .cast::<Gemma4CandidateRouteEntry>();
-            std::ptr::copy_nonoverlapping(
-                route_entries.as_ptr(),
-                routes_out,
-                k_candidates * GEMMA4_Q4_EXPERT_ROUTES,
-            );
-        }
-
-        let kernel = metal_linear_kernel()?;
-        let gate_pipeline = kernel
-            .gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline
-            .as_ref()?;
-        let quant_pipeline = kernel.gemma4_q4_multi_expert_quantize_pipeline.as_ref()?;
-        let down_pipeline = kernel
-            .gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline
-            .as_ref()?;
-
-        let command_buffer = kernel.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-
-        // Pass 1: GateUp + GeGLU
-        encoder.set_compute_pipeline_state(gate_pipeline);
-        encoder.set_buffer(0, Some(&self.input_scales), 0);
-        encoder.set_buffer(1, Some(&self.input_quants), 0);
-        encoder.set_buffer(2, Some(&self.expert_weights), 0);
-        encoder.set_buffer(3, Some(&self.work_list), 0);
-        encoder.set_buffer(4, Some(&self.activated), 0);
-        let num_unique_u32 = num_unique_experts as u32;
-        let k_candidates_u32 = k_candidates as u32;
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            &num_unique_u32 as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            6,
-            std::mem::size_of::<u32>() as u64,
-            &k_candidates_u32 as *const u32 as *const _,
-        );
-        dispatch_1d(
-            encoder,
-            gate_pipeline,
-            num_unique_experts * GEMMA4_Q4_EXPERT_FF,
-        );
-
-        // Pass 2: Quantize GeGLU to Q8_0
-        encoder.set_compute_pipeline_state(quant_pipeline);
-        encoder.set_buffer(0, Some(&self.activated), 0);
-        encoder.set_buffer(1, Some(&self.activation_scales), 0);
-        encoder.set_buffer(2, Some(&self.activation_quants), 0);
-        encoder.set_buffer(3, Some(&self.work_list), 0);
-        encoder.set_bytes(
-            4,
-            std::mem::size_of::<u32>() as u64,
-            &num_unique_u32 as *const u32 as *const _,
-        );
-        encoder.set_bytes(
-            5,
-            std::mem::size_of::<u32>() as u64,
-            &k_candidates_u32 as *const u32 as *const _,
-        );
-        dispatch_1d(
-            encoder,
-            quant_pipeline,
-            num_unique_experts * k_candidates * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
-        );
-
-        // Pass 3: Down GEMV + Router Weighted Scatter/Reduce
-        encoder.set_compute_pipeline_state(down_pipeline);
-        encoder.set_buffer(0, Some(&self.activation_scales), 0);
-        encoder.set_buffer(1, Some(&self.activation_quants), 0);
-        encoder.set_buffer(2, Some(&self.expert_weights), 0);
-        encoder.set_buffer(3, Some(&self.candidate_routes), 0);
-        encoder.set_buffer(4, Some(&self.work_list), 0);
-        encoder.set_buffer(5, Some(&self.output_moe_acc), 0);
-        encoder.set_bytes(
-            6,
-            std::mem::size_of::<u32>() as u64,
-            &k_candidates_u32 as *const u32 as *const _,
-        );
-        dispatch_one_simdgroup_per_row(encoder, k_candidates * GEMMA4_Q4_EXPERT_HIDDEN);
-
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-
-        if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
-            return None;
-        }
-
-        unsafe {
-            let out_ptr = self.output_moe_acc.contents().cast::<f32>();
-            for (t, row_vec) in output_acc.iter_mut().enumerate().take(k_candidates) {
-                row_vec.resize(GEMMA4_Q4_EXPERT_HIDDEN, 0.0);
-                std::ptr::copy_nonoverlapping(
-                    out_ptr.add(t * GEMMA4_Q4_EXPERT_HIDDEN),
-                    row_vec.as_mut_ptr(),
-                    GEMMA4_Q4_EXPERT_HIDDEN,
-                );
-            }
-        }
-        Some(())
-    }
-
     pub(crate) fn execute_with_metal_quant_buffers(
         &mut self,
         input_scales: &Buffer,
@@ -16612,7 +16307,6 @@ impl Gemma4MultiExpertLayerBatch {
         timing: Option<&mut Gemma4MultiExpertBatchTimes>,
         fused_residuals: Option<(&Buffer, &Buffer, &Buffer, &Buffer, &Buffer, f32)>,
     ) -> Option<()> {
-        let k_candidates = k_candidates;
         if k_candidates == 0
             || num_unique_experts == 0
             || k_candidates > self.max_candidates
@@ -16779,6 +16473,7 @@ impl Gemma4MultiExpertLayerBatch {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_gpu_quants(
     input_scales: &Buffer,
     input_quants: &Buffer,
@@ -16853,6 +16548,7 @@ pub struct Gemma4SharedExpertBatchTimes {
     pub down_gpu_us: u64,
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_shared_expert_chunk(
     _input_q8: &[&[crate::tensor::Q8_0Block]],
     _gate_w: &Buffer,
@@ -16865,7 +16561,7 @@ pub(crate) fn try_gemma4_q4_shared_expert_chunk(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_buffer(
     _input_q8: &[&[crate::tensor::Q8_0Block]],
     _expert_weights_buffer: &Buffer,
@@ -16878,6 +16574,7 @@ pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_buffer(
     None
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_norm(
     _attn_rows: &[Vec<f32>],
     _norm: &[f32],
@@ -16893,6 +16590,7 @@ pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_norm(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "macos")]
 pub(crate) fn try_gemma4_q4_fused_moe_layer_chunk(
     _shared_input_q8: &[&[crate::tensor::Q8_0Block]],
     _gate_w: &Buffer,
@@ -16911,13 +16609,34 @@ pub(crate) fn try_gemma4_q4_fused_moe_layer_chunk(
     None
 }
 
-/// Encode the strict single-token Q6_K x Q8_K GEMV used by Gemma 4's tied
-/// head. `scalar` carries `n_superblocks` at byte 0 and `rows` at byte 4.
-/// `weight_offset` permits a file-backed, page-aligned Metal buffer window to
-/// expose a tensor that starts after the beginning of that window.
+/// Selects the reassociated turbo kernel or the strict ordered parity kernel
+/// for one Q6_K projection.
+#[cfg(target_os = "macos")]
+enum Q6kSingleKernel {
+    TurboIfAvailable,
+    Ordered,
+}
+
+#[cfg(target_os = "macos")]
+fn runtime_q6k_single_kernel() -> Q6kSingleKernel {
+    if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
+        .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+    {
+        Q6kSingleKernel::Ordered
+    } else {
+        Q6kSingleKernel::TurboIfAvailable
+    }
+}
+
+/// Encode the single-token Q6_K x Q8_K GEMV used by Gemma 4's tied head.
+/// `kernel_selection` lets strict arithmetic tests bypass the production turbo
+/// default without mutating process-global environment state. `scalar` carries
+/// `n_superblocks` at byte 0 and `rows` at byte 4. `weight_offset` permits a
+/// file-backed, page-aligned Metal buffer window to expose a tensor that starts
+/// after the beginning of that window.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn encode_q6k_ordered_single(
+fn encode_q6k_single(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
     input_scales: &Buffer,
@@ -16931,11 +16650,11 @@ fn encode_q6k_ordered_single(
     input_scales_offset: u64,
     input_quants_offset: u64,
     output_offset: u64,
+    kernel_selection: Q6kSingleKernel,
 ) {
-    let turbo_pipeline = (!std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
-        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false")))
-    .then(|| admitted_32_lane_pipeline(kernel.q6k_linear_turbo_pipeline.as_ref()))
-    .flatten();
+    let turbo_pipeline = matches!(kernel_selection, Q6kSingleKernel::TurboIfAvailable)
+        .then(|| admitted_32_lane_pipeline(kernel.q6k_linear_turbo_pipeline.as_ref()))
+        .flatten();
     encoder
         .set_compute_pipeline_state(turbo_pipeline.unwrap_or(&kernel.q6k_linear_ordered_pipeline));
     encoder.set_buffer(0, Some(input_scales), input_scales_offset);
@@ -17080,7 +16799,7 @@ fn encode_q6k_ordered_batch_at(
 }
 
 /// Encode K candidate Q6_K GEMVs. Prefers a tile-once kernel that matches the
-/// same per-token reduction `encode_q6k_ordered_single` / `forward()` uses
+/// same per-token reduction `encode_q6k_single` / `forward()` uses
 /// (turbo simd_sum when that lane is live, otherwise ordered lane-zero fold).
 /// Falls back to K serial GEMVs in this command buffer if the batch pipeline
 /// is missing or K>8.
@@ -17102,7 +16821,7 @@ fn encode_q6k_ordered_batch(
     softcap: f32,
 ) {
     if k_batch == 1 {
-        encode_q6k_ordered_single(
+        encode_q6k_single(
             encoder,
             kernel,
             input_scales,
@@ -17116,6 +16835,7 @@ fn encode_q6k_ordered_batch(
             0,
             0,
             0,
+            runtime_q6k_single_kernel(),
         );
         return;
     }
@@ -17244,43 +16964,6 @@ fn encode_q6k_ordered_batch(
         done += slab;
     }
 }
-#[cfg(target_os = "macos")]
-fn encode_q6k_batch_k(
-    encoder: &metal::ComputeCommandEncoderRef,
-    kernel: &MetalLinearKernel,
-    input_scales: &Buffer,
-    input_quants: &Buffer,
-    weight_blocks: &Buffer,
-    weight_offset: u64,
-    output: &Buffer,
-    scalar_buf: &Buffer,
-    _n_sb: usize,
-    rows: usize,
-    _k_batch: usize,
-) {
-    if let Some(pipeline) = &kernel.q6k_linear_batch_k_pipeline {
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(input_scales), 0);
-        encoder.set_buffer(1, Some(input_quants), 0);
-        encoder.set_buffer(2, Some(weight_blocks), weight_offset);
-        encoder.set_buffer(3, Some(output), 0);
-        encoder.set_buffer(4, Some(scalar_buf), 0);
-        encoder.set_buffer(5, Some(scalar_buf), 4);
-        encoder.set_buffer(6, Some(scalar_buf), 8);
-        let thread_groups = metal::MTLSize {
-            width: (rows as u64).div_ceil(16),
-            height: 1,
-            depth: 1,
-        };
-        let threads_per_group = metal::MTLSize {
-            width: 128,
-            height: 1,
-            depth: 1,
-        };
-        encoder.dispatch_thread_groups(thread_groups, threads_per_group);
-    }
-}
-
 /// NVFP4 wire GEMV on the GPU (GABBRO M3) — the NVFP4 counterpart of
 /// [`try_gemma4_q4_0_matmul_f32y`]. `weight_wire` is `rows * blocks_per_row`
 /// 36-byte NVFP4 superblocks; `y` is `blocks_per_row * 64` f32 activations (the
@@ -17765,8 +17448,6 @@ pub fn try_gemma4_head(
 /// that invariant here prevents accidental cross-request races later.
 #[cfg(target_os = "macos")]
 pub(crate) static GPU_HW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(target_os = "macos")]
-pub(crate) static KERNEL_HW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 pub(crate) struct Gemma4Q6KHead {
@@ -18123,7 +17804,7 @@ impl Gemma4Q6KHead {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         let n_superblocks = state.hidden / 256;
-        encode_q6k_ordered_single(
+        encode_q6k_single(
             encoder,
             kernel,
             &state.q8k_scales,
@@ -18137,6 +17818,7 @@ impl Gemma4Q6KHead {
             0,
             0,
             0,
+            runtime_q6k_single_kernel(),
         );
         encoder.end_encoding();
         cb.commit();
@@ -18245,26 +17927,23 @@ impl Gemma4Q6KHead {
         let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
 
         let logits_ptr = state.logits_batch.contents() as usize;
-        let mut results: Vec<Vec<f32>> = (0..k)
-            .map(|_| {
+        let results: Vec<Vec<f32>> = (0..k)
+            .into_par_iter()
+            .map(|i| {
                 let mut row = Vec::with_capacity(vocab);
-                // SAFETY: immediately overwritten from the mapped slab.
                 unsafe {
+                    // Initialize the spare capacity directly from the completed
+                    // shared Metal buffer, then expose only initialized values.
+                    std::ptr::copy_nonoverlapping(
+                        (logits_ptr as *const f32).add(i * vocab),
+                        row.as_mut_ptr(),
+                        vocab,
+                    );
                     row.set_len(vocab);
                 }
                 row
             })
             .collect();
-        results
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, row)| unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (logits_ptr as *const f32).add(i * vocab),
-                    row.as_mut_ptr(),
-                    vocab,
-                );
-            });
         if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         {
@@ -18460,12 +18139,12 @@ impl Gemma4Q6KHead {
 
         let mut next_logits = Vec::with_capacity(vocab);
         unsafe {
-            next_logits.set_len(vocab);
             std::ptr::copy_nonoverlapping(
                 logits_ptr.add(accepted_j * vocab),
                 next_logits.as_mut_ptr(),
                 vocab,
             );
+            next_logits.set_len(vocab);
         }
         Some((accepted_j, next_logits))
     }
@@ -18497,7 +18176,7 @@ impl Gemma4Q6KHead {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         let n_superblocks = state.hidden / 256;
-        encode_q6k_ordered_single(
+        encode_q6k_single(
             encoder,
             kernel,
             &state.q8k_scales,
@@ -18511,6 +18190,7 @@ impl Gemma4Q6KHead {
             0,
             0,
             0,
+            runtime_q6k_single_kernel(),
         );
 
         encoder.set_compute_pipeline_state(&kernel.argmax_f32_greedy_pipeline);
@@ -20128,41 +19808,7 @@ fn encode_silu_mul_quantize(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn encode_gemma4_fused_post_ffw_residual_batch(
-    encoder: &metal::ComputeCommandEncoderRef,
-    kernel: &MetalLinearKernel,
-    down_in: &Buffer,
-    post_ffw_weight: &Buffer,
-    resid_out: &Buffer,
-    width: usize,
-    eps: f32,
-    k_tokens: usize,
-) -> Option<()> {
-    let pipeline = kernel.gemma4_fused_post_ffw_residual_pipeline.as_ref()?;
-    encoder.set_compute_pipeline_state(pipeline);
-    encoder.set_buffer(0, Some(down_in), 0);
-    encoder.set_buffer(1, Some(post_ffw_weight), 0);
-    encoder.set_buffer(2, Some(resid_out), 0);
-    let width_u32 = width as u32;
-    encoder.set_bytes(3, 4, &width_u32 as *const u32 as *const _);
-    encoder.set_bytes(4, 4, &eps as *const f32 as *const _);
-    encoder.dispatch_thread_groups(
-        metal::MTLSize {
-            width: k_tokens as u64,
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Some(())
-}
-
-#[cfg(target_os = "macos")]
-pub fn encode_gemma4_router_batch_k(
+pub(crate) fn encode_gemma4_router_batch_k(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
     input: &Buffer,
@@ -20204,7 +19850,7 @@ pub fn encode_gemma4_router_batch_k(
 }
 
 #[cfg(target_os = "macos")]
-pub fn encode_rms_norm_quantize_batch_k(
+pub(crate) fn encode_rms_norm_quantize_batch_k(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
     input: &Buffer,
@@ -20255,27 +19901,6 @@ fn encode_quantize(
     e.set_buffer(0, Some(input), 0);
     e.set_buffer(1, Some(scales), 0);
     e.set_buffer(2, Some(quants), 0);
-    e.set_buffer(3, Some(nblocks_buf), 0);
-    dispatch_1d(e, &k.quantize_q8_0_pipeline, n_blocks);
-}
-
-#[cfg(target_os = "macos")]
-fn encode_quantize_offset(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    input: &Buffer,
-    input_offset: u64,
-    scales: &Buffer,
-    scales_offset: u64,
-    quants: &Buffer,
-    quants_offset: u64,
-    nblocks_buf: &Buffer,
-    n_blocks: usize,
-) {
-    e.set_compute_pipeline_state(&k.quantize_q8_0_pipeline);
-    e.set_buffer(0, Some(input), input_offset);
-    e.set_buffer(1, Some(scales), scales_offset);
-    e.set_buffer(2, Some(quants), quants_offset);
     e.set_buffer(3, Some(nblocks_buf), 0);
     dispatch_1d(e, &k.quantize_q8_0_pipeline, n_blocks);
 }
@@ -20413,39 +20038,6 @@ fn encode_rms_norm_batch(
     e.set_buffer(2, Some(output), 0);
     e.set_buffer(3, Some(scalar), 0);
     e.set_buffer(4, Some(scalar), 4);
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: rows as u64,
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        },
-    );
-}
-
-/// Per-row RMS inv scale only (`rms_inv_batch_f32`). Same reduction as
-/// [`encode_rms_norm_batch`], without writing the normalized hidden vector.
-#[cfg(target_os = "macos")]
-fn encode_rms_inv_batch(
-    k: &MetalLinearKernel,
-    e: &metal::ComputeCommandEncoderRef,
-    input: &Buffer,
-    inv_out: &Buffer,
-    scalar: &Buffer,
-    rows: usize,
-) {
-    let Some(pipe) = k.rms_inv_batch_pipeline.as_ref() else {
-        return;
-    };
-    e.set_compute_pipeline_state(pipe);
-    e.set_buffer(0, Some(input), 0);
-    e.set_buffer(1, Some(inv_out), 0);
-    e.set_buffer(2, Some(scalar), 0);
-    e.set_buffer(3, Some(scalar), 4);
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: rows as u64,
@@ -21499,6 +21091,7 @@ fn encode_q8_matmul_f32y_batched(
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
     e.set_buffer(6, Some(scalar), 8);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: (rows as u64).div_ceil(2),
@@ -21506,7 +21099,7 @@ fn encode_q8_matmul_f32y_batched(
             depth: 1,
         },
         metal::MTLSize {
-            width: 32,
+            width: 256,
             height: 1,
             depth: 1,
         },
@@ -21918,74 +21511,6 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k(
 }
 
 #[cfg(target_os = "macos")]
-fn encode_gemma4_q4_0_qkv_matmul_batch_k_fused_rms(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    x: &Buffer,
-    rms_weight: &Buffer,
-    inv_rms: &Buffer,
-    q_weight: &Buffer,
-    k_weight: &Buffer,
-    v_weight: &Buffer,
-    query_out: &Buffer,
-    key_out: &Buffer,
-    val_out: &Buffer,
-    qkv_scalar: &Buffer,
-    k_batch: usize,
-) -> bool {
-    assert!(
-        k_batch <= 16,
-        "dense batch_k chunk {k_batch} exceeds the widened kernels' accumulator depth 16"
-    );
-    if k_batch > GEMMA4_DENSE_BATCH_K_MAX {
-        // No widened twin for the fused-RMS kernel: a verbatim `_k16` copy
-        // measured up to 492 ULP off the k<=8 kernel at k_batch=8 (widening
-        // the accumulator array shifted the compiled FMA contraction of the
-        // `(w * rms) * scale` chain), so it cannot satisfy the bitwise pinning
-        // contract. Returning false keeps the caller on its fallback
-        // (separate RMS + QKV), whose K>8 kernel IS bitwise-verified.
-        return false;
-    }
-    let Some(pipe) = k.q4_0_qkv_block_batch_k_fused_rms_pipeline.as_ref() else {
-        return false;
-    };
-    let (bpr_u32, q_rows_u32, k_rows_u32, v_rows_u32) = unsafe {
-        let ptr = qkv_scalar.contents() as *const u32;
-        (*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3))
-    };
-    let k_batch_u32 = k_batch as u32;
-    let disp = (q_rows_u32 as usize) + (k_rows_u32 as usize) + (v_rows_u32 as usize);
-    e.set_compute_pipeline_state(pipe);
-    e.set_buffer(0, Some(x), 0);
-    e.set_buffer(1, Some(q_weight), 0);
-    e.set_buffer(2, Some(k_weight), 0);
-    e.set_buffer(3, Some(v_weight), 0);
-    e.set_buffer(4, Some(query_out), 0);
-    e.set_buffer(5, Some(key_out), 0);
-    e.set_buffer(6, Some(val_out), 0);
-    e.set_bytes(7, 4, &bpr_u32 as *const u32 as *const _);
-    e.set_bytes(8, 4, &q_rows_u32 as *const u32 as *const _);
-    e.set_bytes(9, 4, &k_rows_u32 as *const u32 as *const _);
-    e.set_bytes(10, 4, &v_rows_u32 as *const u32 as *const _);
-    e.set_bytes(11, 4, &k_batch_u32 as *const u32 as *const _);
-    e.set_buffer(12, Some(rms_weight), 0);
-    e.set_buffer(13, Some(inv_rms), 0);
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: (disp as u64).div_ceil(4),
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
-    );
-    true
-}
-
-#[cfg(target_os = "macos")]
 fn encode_gemma4_q4_0_gateup_matmul_batch_k(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
@@ -22178,57 +21703,6 @@ fn encode_gemma4_q4_0_q8_ordered_single(
     e.set_buffer(1, Some(input_quants), 0);
     e.set_buffer(2, Some(weight), 0);
     e.set_buffer(3, Some(output), 0);
-    e.set_buffer(4, Some(scalar), 0);
-    e.set_buffer(5, Some(scalar), 4);
-    e.set_buffer(6, Some(scalar), 8);
-    if turbo_pipeline.is_some() {
-        dispatch_four_simdgroup_rows(e, rows);
-    } else if simd_pipeline.is_some() {
-        e.set_threadgroup_memory_length(
-            0,
-            simd_scratch_bytes.expect("admitted SIMD Q4 scratch length") as u64,
-        );
-        dispatch_one_simdgroup_per_row(e, rows);
-    } else {
-        dispatch_1d(e, pipeline, rows);
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
-fn encode_gemma4_q4_0_q8_ordered_single_offset(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    input_scales: &Buffer,
-    input_scales_offset: u64,
-    input_quants: &Buffer,
-    input_quants_offset: u64,
-    weight: &Buffer,
-    weight_offset: u64,
-    output: &Buffer,
-    output_offset: u64,
-    scalar: &Buffer,
-    rows: usize,
-    blocks_per_row: usize,
-    fused_fast: bool,
-) {
-    let turbo_pipeline = (fused_fast && gemma4_ghost_turbo_enabled())
-        .then(|| admitted_32_lane_pipeline(k.q4_0_q8_turbo_pipeline.as_ref()))
-        .flatten();
-    let simd_scratch_bytes = blocks_per_row.checked_mul(std::mem::size_of::<f32>());
-    let simd_pipeline = (fused_fast
-        && turbo_pipeline.is_none()
-        && simd_scratch_bytes.is_some_and(|bytes| threadgroup_alloc_fits(&k.device, bytes)))
-    .then(|| admitted_32_lane_pipeline(k.q4_0_q8_ordered_simd_pipeline.as_ref()))
-    .flatten();
-    let pipeline = turbo_pipeline
-        .or(simd_pipeline)
-        .unwrap_or(&k.q4_0_q8_ordered_pipeline);
-    e.set_compute_pipeline_state(pipeline);
-    e.set_buffer(0, Some(input_scales), input_scales_offset);
-    e.set_buffer(1, Some(input_quants), input_quants_offset);
-    e.set_buffer(2, Some(weight), weight_offset);
-    e.set_buffer(3, Some(output), output_offset);
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
     e.set_buffer(6, Some(scalar), 8);
@@ -23821,6 +23295,7 @@ pub fn gemma4_max_spec_chunk() -> usize {
 }
 
 /// Fixed accumulator depth of the dense `*_batch_k` kernels (`float sums[4][8]`).
+#[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_DENSE_BATCH_K_MAX: usize = 8;
 
 /// Pre-allocated resident activation scratch slab.
@@ -24955,6 +24430,7 @@ impl ChainedRoundHostLedger {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn same_expert_set(a: &[usize], b: &[usize]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -25070,6 +24546,173 @@ struct LiveSequentialProbeTally {
     predicted_cold: u32,
 }
 
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_LAYER_COUNT: usize = 30;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_FIRST_LAYER: usize = 1;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_CAP4: usize = 4;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_CAP8: usize = 8;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_PROBE_CAP16: usize = 16;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_RECEIPT_US_PER_MS: f64 = 1_000.0;
+#[cfg(any(target_os = "macos", test))]
+const LIVE_SEQUENTIAL_RECEIPT_MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// One atomic H69 observation for a layer. All three tallies and both emitted
+/// identity lists are derived together from one immutable ranked vector, one
+/// immutable start-of-round hot mask, and one exact routed union.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSequentialProbeLayerObservation {
+    cap4: LiveSequentialProbeTally,
+    cap8: LiveSequentialProbeTally,
+    cap16: LiveSequentialProbeTally,
+    cap8_candidates: Vec<usize>,
+    cap16_candidates: Vec<usize>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_cap_lattice_valid(
+    cap4: LiveSequentialProbeTally,
+    cap8: LiveSequentialProbeTally,
+    cap16: LiveSequentialProbeTally,
+) -> bool {
+    let tally_valid = |tally: LiveSequentialProbeTally, cap: usize| {
+        u32::try_from(cap).is_ok_and(|cap| tally.predicted_cold <= cap)
+            && tally.hits <= tally.actual_cold
+            && tally.hits <= tally.predicted_cold
+    };
+    tally_valid(cap4, LIVE_SEQUENTIAL_PROBE_CAP4)
+        && tally_valid(cap8, LIVE_SEQUENTIAL_PROBE_CAP8)
+        && tally_valid(cap16, LIVE_SEQUENTIAL_PROBE_CAP16)
+        && cap4.actual_cold == cap8.actual_cold
+        && cap8.actual_cold == cap16.actual_cold
+        && cap4.hits <= cap8.hits
+        && cap8.hits <= cap16.hits
+        && cap4.predicted_cold <= cap8.predicted_cold
+        && cap8.predicted_cold <= cap16.predicted_cold
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_layer_observation_valid(
+    observation: &LiveSequentialProbeLayerObservation,
+) -> bool {
+    if !live_sequential_probe_cap_lattice_valid(
+        observation.cap4,
+        observation.cap8,
+        observation.cap16,
+    ) {
+        return false;
+    }
+    let predicted4 = observation.cap4.predicted_cold as usize;
+    let predicted8 = observation.cap8.predicted_cold as usize;
+    let predicted16 = observation.cap16.predicted_cold as usize;
+    if predicted4 != predicted8.min(LIVE_SEQUENTIAL_PROBE_CAP4)
+        || predicted8 != predicted16.min(LIVE_SEQUENTIAL_PROBE_CAP8)
+        || predicted8 != observation.cap8_candidates.len()
+        || predicted16 != observation.cap16_candidates.len()
+        || observation.cap8_candidates.len() > observation.cap16_candidates.len()
+        || observation.cap8_candidates
+            != observation.cap16_candidates[..observation.cap8_candidates.len()]
+    {
+        return false;
+    }
+    let mut seen = [false; 128];
+    for &expert in &observation.cap16_candidates {
+        if expert >= seen.len() || seen[expert] {
+            return false;
+        }
+        seen[expert] = true;
+    }
+    true
+}
+
+/// Produce the cap-4/8/16 observation in one pass over each immutable input.
+/// The helper owns no execution state and does not issue, widen, or publish
+/// any read. Invalid identities or arithmetic refuse only this observation.
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_observe_layer(
+    ranked: &[usize],
+    actual_union: &[usize],
+    hot_at_start: &[bool; 128],
+) -> Option<LiveSequentialProbeLayerObservation> {
+    if ranked.is_empty() {
+        return None;
+    }
+
+    let mut ranked_seen = [false; 128];
+    let mut candidate_rank = [u8::MAX; 128];
+    let mut cap16_candidates = Vec::with_capacity(LIVE_SEQUENTIAL_PROBE_CAP16);
+    for &expert in ranked {
+        if expert >= ranked_seen.len() || ranked_seen[expert] {
+            return None;
+        }
+        ranked_seen[expert] = true;
+        if !hot_at_start[expert] && cap16_candidates.len() < LIVE_SEQUENTIAL_PROBE_CAP16 {
+            candidate_rank[expert] = u8::try_from(cap16_candidates.len()).ok()?;
+            cap16_candidates.push(expert);
+        }
+    }
+    let cap8_candidates = cap16_candidates
+        .iter()
+        .copied()
+        .take(LIVE_SEQUENTIAL_PROBE_CAP8)
+        .collect::<Vec<_>>();
+
+    let mut actual_seen = [false; 128];
+    let mut actual_cold = 0u32;
+    let mut hits4 = 0u32;
+    let mut hits8 = 0u32;
+    let mut hits16 = 0u32;
+    for &expert in actual_union {
+        if expert >= actual_seen.len() || actual_seen[expert] {
+            return None;
+        }
+        actual_seen[expert] = true;
+        if hot_at_start[expert] {
+            continue;
+        }
+        actual_cold = actual_cold.checked_add(1)?;
+        let rank = candidate_rank[expert];
+        if rank != u8::MAX {
+            hits16 = hits16.checked_add(1)?;
+            if usize::from(rank) < LIVE_SEQUENTIAL_PROBE_CAP8 {
+                hits8 = hits8.checked_add(1)?;
+            }
+            if usize::from(rank) < LIVE_SEQUENTIAL_PROBE_CAP4 {
+                hits4 = hits4.checked_add(1)?;
+            }
+        }
+    }
+
+    let predicted16 = u32::try_from(cap16_candidates.len()).ok()?;
+    let predicted8 = u32::try_from(cap8_candidates.len()).ok()?;
+    let predicted4 = u32::try_from(cap8_candidates.len().min(LIVE_SEQUENTIAL_PROBE_CAP4)).ok()?;
+    let observation = LiveSequentialProbeLayerObservation {
+        cap4: LiveSequentialProbeTally {
+            hits: hits4,
+            actual_cold,
+            predicted_cold: predicted4,
+        },
+        cap8: LiveSequentialProbeTally {
+            hits: hits8,
+            actual_cold,
+            predicted_cold: predicted8,
+        },
+        cap16: LiveSequentialProbeTally {
+            hits: hits16,
+            actual_cold,
+            predicted_cold: predicted16,
+        },
+        cap8_candidates,
+        cap16_candidates,
+    };
+    live_sequential_probe_layer_observation_valid(&observation).then_some(observation)
+}
+
 /// Validate one deterministic ranked list and return its bounded cold prefix.
 /// Immutable start-of-round residency is filtered before `cap`, so a hot
 /// candidate never consumes speculative payload capacity. The helper owns no
@@ -25097,7 +24740,7 @@ fn live_sequential_cold_candidates(
     Some(cold)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn live_sequential_probe_tally(
     ranked: &[usize],
     actual_union: &[usize],
@@ -25122,26 +24765,87 @@ fn live_sequential_probe_tally(
         }
         actual_seen[expert] = true;
         if !hot_at_start[expert] {
-            actual_cold += 1;
-            hits += u32::from(predicted[expert]);
+            actual_cold = actual_cold.checked_add(1)?;
+            hits = hits.checked_add(u32::from(predicted[expert]))?;
         }
     }
     Some(LiveSequentialProbeTally {
         hits,
         actual_cold,
-        predicted_cold: cold_candidates.len().min(u32::MAX as usize) as u32,
+        predicted_cold: u32::try_from(cold_candidates.len()).ok()?,
     })
 }
 
 #[cfg(any(target_os = "macos", test))]
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LiveSequentialProbeSummary {
     compared_layers: u32,
     hits: u32,
     actual_cold: u32,
     predicted_cold: u32,
-    read_wall_ms: f64,
-    projected_saved_ms: f64,
+    read_wall_us: u64,
+    projected_saved_us: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_probe_summary_lattice_valid(
+    cap4: LiveSequentialProbeSummary,
+    cap8: LiveSequentialProbeSummary,
+    cap16: LiveSequentialProbeSummary,
+) -> bool {
+    let summary_valid = |summary: LiveSequentialProbeSummary| {
+        summary.hits <= summary.actual_cold
+            && summary.hits <= summary.predicted_cold
+            && summary.projected_saved_us <= summary.read_wall_us
+    };
+    summary_valid(cap4)
+        && summary_valid(cap8)
+        && summary_valid(cap16)
+        && cap4.compared_layers == cap8.compared_layers
+        && cap8.compared_layers == cap16.compared_layers
+        && cap4.actual_cold == cap8.actual_cold
+        && cap8.actual_cold == cap16.actual_cold
+        && cap4.hits <= cap8.hits
+        && cap8.hits <= cap16.hits
+        && cap4.predicted_cold <= cap8.predicted_cold
+        && cap8.predicted_cold <= cap16.predicted_cold
+        && cap4.read_wall_us == cap8.read_wall_us
+        && cap8.read_wall_us == cap16.read_wall_us
+        && cap4.projected_saved_us <= cap8.projected_saved_us
+        && cap8.projected_saved_us <= cap16.projected_saved_us
+}
+
+/// Quantize one measured wall duration to the schema-2 receipt domain. Every
+/// emitted per-layer and aggregate wall value is an integer number of
+/// microseconds rendered with exactly three decimal millisecond digits.
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_receipt_wall_us(wall_ms: f64) -> Option<u64> {
+    if !wall_ms.is_finite() || wall_ms < 0.0 {
+        return None;
+    }
+    let wall_us = wall_ms * LIVE_SEQUENTIAL_RECEIPT_US_PER_MS;
+    if !wall_us.is_finite() || wall_us > LIVE_SEQUENTIAL_RECEIPT_MAX_EXACT_INTEGER {
+        return None;
+    }
+    Some(wall_us.round() as u64)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_format_ms(wall_us: u64) -> String {
+    format!("{}.{:03}", wall_us / 1_000, wall_us % 1_000)
+}
+
+/// Fixed six-decimal, integer half-up ratio formatting. This avoids making the
+/// strict analyzer reproduce platform floating-point formatting decisions.
+#[cfg(any(target_os = "macos", test))]
+fn live_sequential_format_ratio(numerator: u64, denominator: u64) -> String {
+    if denominator == 0 {
+        return "na".to_owned();
+    }
+    const SCALE: u128 = 1_000_000;
+    let scaled =
+        (u128::from(numerator) * SCALE + u128::from(denominator / 2)) / u128::from(denominator);
+    format!("{}.{:06}", scaled / SCALE, scaled % SCALE)
 }
 
 /// Record-linear projection only: for each layer, price the predicted fraction
@@ -25149,32 +24853,359 @@ struct LiveSequentialProbeSummary {
 /// wall. This is a ceiling estimate, not a staging result; the probe performs
 /// no I/O and therefore cannot observe readiness or contention directly.
 #[cfg(any(target_os = "macos", test))]
-fn summarize_live_sequential_probe(
-    tallies: &[Option<LiveSequentialProbeTally>],
-    read_wall_ms: &[f64],
-) -> Option<LiveSequentialProbeSummary> {
-    if tallies.len() != read_wall_ms.len() {
+fn summarize_live_sequential_probe<I>(
+    tallies: I,
+    read_wall_us: &[u64],
+) -> Option<LiveSequentialProbeSummary>
+where
+    I: IntoIterator<Item = Option<LiveSequentialProbeTally>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let tallies = tallies.into_iter();
+    if tallies.len() != read_wall_us.len() {
         return None;
     }
     let mut summary = LiveSequentialProbeSummary::default();
-    for (tally, &wall_ms) in tallies.iter().zip(read_wall_ms) {
+    for (tally, &wall_us) in tallies.zip(read_wall_us) {
         let Some(tally) = tally else {
             continue;
         };
-        if !wall_ms.is_finite() || wall_ms < 0.0 {
+        if tally.hits > tally.actual_cold || tally.hits > tally.predicted_cold {
             return None;
         }
-        summary.compared_layers = summary.compared_layers.saturating_add(1);
-        summary.hits = summary.hits.saturating_add(tally.hits);
-        summary.actual_cold = summary.actual_cold.saturating_add(tally.actual_cold);
-        summary.predicted_cold = summary.predicted_cold.saturating_add(tally.predicted_cold);
-        summary.read_wall_ms += wall_ms;
+        summary.compared_layers = summary.compared_layers.checked_add(1)?;
+        summary.hits = summary.hits.checked_add(tally.hits)?;
+        summary.actual_cold = summary.actual_cold.checked_add(tally.actual_cold)?;
+        summary.predicted_cold = summary.predicted_cold.checked_add(tally.predicted_cold)?;
+        summary.read_wall_us = summary.read_wall_us.checked_add(wall_us)?;
         if tally.actual_cold != 0 {
-            summary.projected_saved_ms +=
-                wall_ms * f64::from(tally.hits) / f64::from(tally.actual_cold);
+            let saved_us = u128::from(wall_us).checked_mul(u128::from(tally.hits))?
+                / u128::from(tally.actual_cold);
+            summary.projected_saved_us = summary
+                .projected_saved_us
+                .checked_add(u64::try_from(saved_us).ok()?)?;
         }
     }
     Some(summary)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSequentialProbeReceipt {
+    cap4: LiveSequentialProbeSummary,
+    cap8: LiveSequentialProbeSummary,
+    cap16: LiveSequentialProbeSummary,
+    cap16_incremental_hits_vs_cap8: u32,
+    cap16_incremental_predicted_vs_cap8: u32,
+    cap16_incremental_saved_us_vs_cap8: u64,
+    total_wave_load_us: u64,
+    cap8_candidates: String,
+    cap16_candidates: String,
+    cap4_layers: String,
+    cap8_layers: String,
+    cap16_layers: String,
+}
+
+/// Validate the complete schema-2 H69 sample before any detailed data is
+/// rendered. A failure returns one compact reason token; callers must not
+/// synthesize missing summaries, identities, or layers as plausible zeros.
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(target_os = "macos", test))]
+fn validate_live_sequential_probe_receipt(
+    observations: &[Option<LiveSequentialProbeLayerObservation>],
+    read_wall_ms: &[f64],
+    n_layers: usize,
+    attempts: u32,
+    failures: u32,
+    accounting_valid: bool,
+    stage_admitted: bool,
+    stage_launch_attempts: u32,
+    stage_launches: u32,
+    stage_launch_failures: u32,
+    stage_candidates: u32,
+    stage_candidate_cap: usize,
+    total_wave_load_ms: f64,
+) -> Result<LiveSequentialProbeReceipt, &'static str> {
+    if !accounting_valid {
+        return Err("accounting-overflow");
+    }
+    if n_layers != LIVE_SEQUENTIAL_PROBE_LAYER_COUNT
+        || observations.len() != LIVE_SEQUENTIAL_PROBE_LAYER_COUNT
+        || read_wall_ms.len() != LIVE_SEQUENTIAL_PROBE_LAYER_COUNT
+    {
+        return Err("layer-shape");
+    }
+    let eligible =
+        u32::try_from(LIVE_SEQUENTIAL_PROBE_LAYER_COUNT - LIVE_SEQUENTIAL_PROBE_FIRST_LAYER)
+            .map_err(|_| "eligible-overflow")?;
+    if attempts != eligible || failures != 0 {
+        return Err("attempt-accounting");
+    }
+    if observations[LIVE_SEQUENTIAL_PROBE_FIRST_LAYER - 1].is_some()
+        || observations[LIVE_SEQUENTIAL_PROBE_FIRST_LAYER..]
+            .iter()
+            .any(|observation| {
+                observation.as_ref().is_none_or(|observation| {
+                    !live_sequential_probe_layer_observation_valid(observation)
+                })
+            })
+    {
+        return Err("layer-lattice");
+    }
+
+    let read_wall_us = read_wall_ms
+        .iter()
+        .copied()
+        .map(live_sequential_receipt_wall_us)
+        .collect::<Option<Vec<_>>>()
+        .ok_or("wall-domain")?;
+    let summarize =
+        |select: fn(&LiveSequentialProbeLayerObservation) -> LiveSequentialProbeTally| {
+            summarize_live_sequential_probe(
+                observations
+                    .iter()
+                    .map(|observation| observation.as_ref().map(select)),
+                &read_wall_us,
+            )
+        };
+    let cap4 = summarize(|observation| observation.cap4).ok_or("summary-arithmetic")?;
+    let cap8 = summarize(|observation| observation.cap8).ok_or("summary-arithmetic")?;
+    let cap16 = summarize(|observation| observation.cap16).ok_or("summary-arithmetic")?;
+    if cap4.compared_layers != eligible
+        || cap8.compared_layers != eligible
+        || cap16.compared_layers != eligible
+        || !live_sequential_probe_summary_lattice_valid(cap4, cap8, cap16)
+    {
+        return Err("summary-lattice");
+    }
+    let expected_stage_candidates = match stage_candidate_cap {
+        LIVE_SEQUENTIAL_PROBE_CAP8 => cap8.predicted_cold,
+        LIVE_SEQUENTIAL_PROBE_CAP16 => cap16.predicted_cold,
+        _ => return Err("stage-cap"),
+    };
+    if !stage_admitted
+        || stage_launch_attempts != eligible
+        || stage_launches != eligible
+        || stage_launch_failures != 0
+        || stage_candidates != expected_stage_candidates
+    {
+        return Err("stage-accounting");
+    }
+
+    let cap16_incremental_hits_vs_cap8 =
+        cap16.hits.checked_sub(cap8.hits).ok_or("increment-order")?;
+    let cap16_incremental_predicted_vs_cap8 = cap16
+        .predicted_cold
+        .checked_sub(cap8.predicted_cold)
+        .ok_or("increment-order")?;
+    let cap16_incremental_saved_us_vs_cap8 = cap16
+        .projected_saved_us
+        .checked_sub(cap8.projected_saved_us)
+        .ok_or("increment-order")?;
+    let total_wave_load_us =
+        live_sequential_receipt_wall_us(total_wave_load_ms).ok_or("total-wall-domain")?;
+
+    let mut cap8_candidate_layers = Vec::with_capacity(eligible as usize);
+    let mut cap16_candidate_layers = Vec::with_capacity(eligible as usize);
+    let mut cap4_layers = Vec::with_capacity(eligible as usize);
+    let mut cap8_layers = Vec::with_capacity(eligible as usize);
+    let mut cap16_layers = Vec::with_capacity(eligible as usize);
+    for layer_idx in LIVE_SEQUENTIAL_PROBE_FIRST_LAYER..LIVE_SEQUENTIAL_PROBE_LAYER_COUNT {
+        let observation = observations[layer_idx].as_ref().ok_or("missing-layer")?;
+        let wall = live_sequential_format_ms(read_wall_us[layer_idx]);
+        let candidate_list = |candidates: &[usize]| {
+            candidates
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        cap8_candidate_layers.push(format!(
+            "L{layer_idx}:{}",
+            candidate_list(&observation.cap8_candidates)
+        ));
+        cap16_candidate_layers.push(format!(
+            "L{layer_idx}:{}",
+            candidate_list(&observation.cap16_candidates)
+        ));
+        let format_layer = |tally: LiveSequentialProbeTally| {
+            format!(
+                "L{layer_idx}:{}/{}/{}@{wall}",
+                tally.hits, tally.actual_cold, tally.predicted_cold
+            )
+        };
+        cap4_layers.push(format_layer(observation.cap4));
+        cap8_layers.push(format_layer(observation.cap8));
+        cap16_layers.push(format_layer(observation.cap16));
+    }
+
+    Ok(LiveSequentialProbeReceipt {
+        cap4,
+        cap8,
+        cap16,
+        cap16_incremental_hits_vs_cap8,
+        cap16_incremental_predicted_vs_cap8,
+        cap16_incremental_saved_us_vs_cap8,
+        total_wave_load_us,
+        cap8_candidates: cap8_candidate_layers.join("/"),
+        cap16_candidates: cap16_candidate_layers.join("/"),
+        cap4_layers: cap4_layers.join(","),
+        cap8_layers: cap8_layers.join(","),
+        cap16_layers: cap16_layers.join(","),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(target_os = "macos", test))]
+fn format_live_sequential_probe_receipt(
+    receipt: &LiveSequentialProbeReceipt,
+    start_pos: usize,
+    k_tokens: usize,
+    attempts: u32,
+    failures: u32,
+    predict_us: u64,
+    stage_launches: u32,
+    stage_launch_failures: u32,
+    stage_candidates: u32,
+) -> String {
+    let eligible = LIVE_SEQUENTIAL_PROBE_LAYER_COUNT - LIVE_SEQUENTIAL_PROBE_FIRST_LAYER;
+    let cap4_hits = receipt.cap4.hits;
+    let cap4_actual_cold = receipt.cap4.actual_cold;
+    let cap4_predicted_cold = receipt.cap4.predicted_cold;
+    let cap4_recall =
+        live_sequential_format_ratio(u64::from(cap4_hits), u64::from(cap4_actual_cold));
+    let cap4_precision =
+        live_sequential_format_ratio(u64::from(cap4_hits), u64::from(cap4_predicted_cold));
+    let cap4_read_wall_ms = live_sequential_format_ms(receipt.cap4.read_wall_us);
+    let cap4_projected_saved_ms = live_sequential_format_ms(receipt.cap4.projected_saved_us);
+    let cap4_read_wall_weighted_recall =
+        live_sequential_format_ratio(receipt.cap4.projected_saved_us, receipt.cap4.read_wall_us);
+
+    let cap8_hits = receipt.cap8.hits;
+    let cap8_actual_cold = receipt.cap8.actual_cold;
+    let cap8_predicted_cold = receipt.cap8.predicted_cold;
+    let cap8_recall =
+        live_sequential_format_ratio(u64::from(cap8_hits), u64::from(cap8_actual_cold));
+    let cap8_precision =
+        live_sequential_format_ratio(u64::from(cap8_hits), u64::from(cap8_predicted_cold));
+    let cap8_read_wall_ms = live_sequential_format_ms(receipt.cap8.read_wall_us);
+    let cap8_projected_saved_ms = live_sequential_format_ms(receipt.cap8.projected_saved_us);
+    let cap8_read_wall_weighted_recall =
+        live_sequential_format_ratio(receipt.cap8.projected_saved_us, receipt.cap8.read_wall_us);
+
+    let cap16_hits = receipt.cap16.hits;
+    let cap16_actual_cold = receipt.cap16.actual_cold;
+    let cap16_predicted_cold = receipt.cap16.predicted_cold;
+    let cap16_recall =
+        live_sequential_format_ratio(u64::from(cap16_hits), u64::from(cap16_actual_cold));
+    let cap16_precision =
+        live_sequential_format_ratio(u64::from(cap16_hits), u64::from(cap16_predicted_cold));
+    let cap16_read_wall_ms = live_sequential_format_ms(receipt.cap16.read_wall_us);
+    let cap16_projected_saved_ms = live_sequential_format_ms(receipt.cap16.projected_saved_us);
+    let cap16_read_wall_weighted_recall =
+        live_sequential_format_ratio(receipt.cap16.projected_saved_us, receipt.cap16.read_wall_us);
+
+    let cap16_incremental_hits_vs_cap8 = receipt.cap16_incremental_hits_vs_cap8;
+    let cap16_incremental_predicted_vs_cap8 = receipt.cap16_incremental_predicted_vs_cap8;
+    let cap16_incremental_precision_vs_cap8 = live_sequential_format_ratio(
+        u64::from(cap16_incremental_hits_vs_cap8),
+        u64::from(cap16_incremental_predicted_vs_cap8),
+    );
+    let cap16_incremental_saved_ms_vs_cap8 =
+        live_sequential_format_ms(receipt.cap16_incremental_saved_us_vs_cap8);
+    let total_wave_load_ms = live_sequential_format_ms(receipt.total_wave_load_us);
+    let cap8_candidates = &receipt.cap8_candidates;
+    let cap16_candidates = &receipt.cap16_candidates;
+    let cap4_layers = &receipt.cap4_layers;
+    let cap8_layers = &receipt.cap8_layers;
+    let cap16_layers = &receipt.cap16_layers;
+
+    format!(
+        concat!(
+            "[metal live-sequential-predict probe] schema=2 admitted=1 ",
+            "profile=exact-live-sequential-hot-shape start_pos={start_pos} K={k_tokens} ",
+            "source=post-attention-slab-b target=next-layer-exact-union ",
+            "first_target_layer=1 eligible={eligible} attempts={attempts} failures={failures} ",
+            "truth_valid=1 predict_us={predict_us} predictor_top_k_per_row=8 probe_caps=4,8,16 ",
+            "cap4_hits={cap4_hits} cap4_actual_cold={cap4_actual_cold} ",
+            "cap4_predicted_cold={cap4_predicted_cold} cap4_recall={cap4_recall} ",
+            "cap4_precision={cap4_precision} cap4_read_wall_ms={cap4_read_wall_ms} ",
+            "cap4_projected_saved_ms={cap4_projected_saved_ms} ",
+            "cap4_read_wall_weighted_recall={cap4_read_wall_weighted_recall} ",
+            "cap8_hits={cap8_hits} cap8_actual_cold={cap8_actual_cold} ",
+            "cap8_predicted_cold={cap8_predicted_cold} cap8_recall={cap8_recall} ",
+            "cap8_precision={cap8_precision} cap8_read_wall_ms={cap8_read_wall_ms} ",
+            "cap8_projected_saved_ms={cap8_projected_saved_ms} ",
+            "cap8_read_wall_weighted_recall={cap8_read_wall_weighted_recall} ",
+            "cap16_hits={cap16_hits} cap16_actual_cold={cap16_actual_cold} ",
+            "cap16_predicted_cold={cap16_predicted_cold} cap16_recall={cap16_recall} ",
+            "cap16_precision={cap16_precision} cap16_read_wall_ms={cap16_read_wall_ms} ",
+            "cap16_projected_saved_ms={cap16_projected_saved_ms} ",
+            "cap16_read_wall_weighted_recall={cap16_read_wall_weighted_recall} ",
+            "cap16_incremental_hits_vs_cap8={cap16_incremental_hits_vs_cap8} ",
+            "cap16_incremental_predicted_vs_cap8={cap16_incremental_predicted_vs_cap8} ",
+            "cap16_incremental_precision_vs_cap8={cap16_incremental_precision_vs_cap8} ",
+            "cap16_incremental_saved_ms_vs_cap8={cap16_incremental_saved_ms_vs_cap8} ",
+            "total_wave_load_ms={total_wave_load_ms} ",
+            "projection=record-linear-per-layer-wave-load-ceiling stage_admitted=1 ",
+            "launches={stage_launches} launch_failures={stage_launch_failures} ",
+            "stage_candidates={stage_candidates} readiness_measured=1 contention_measured=1 ",
+            "output_mutation=0 io_mutation=1 slot_policy_mutation=0 ",
+            "routing_authority=exact-router cap8_candidates={cap8_candidates} ",
+            "cap16_candidates={cap16_candidates} cap4_layers={cap4_layers} ",
+            "cap8_layers={cap8_layers} cap16_layers={cap16_layers}"
+        ),
+        start_pos = start_pos,
+        k_tokens = k_tokens,
+        eligible = eligible,
+        attempts = attempts,
+        failures = failures,
+        predict_us = predict_us,
+        cap4_hits = cap4_hits,
+        cap4_actual_cold = cap4_actual_cold,
+        cap4_predicted_cold = cap4_predicted_cold,
+        cap4_recall = cap4_recall,
+        cap4_precision = cap4_precision,
+        cap4_read_wall_ms = cap4_read_wall_ms,
+        cap4_projected_saved_ms = cap4_projected_saved_ms,
+        cap4_read_wall_weighted_recall = cap4_read_wall_weighted_recall,
+        cap8_hits = cap8_hits,
+        cap8_actual_cold = cap8_actual_cold,
+        cap8_predicted_cold = cap8_predicted_cold,
+        cap8_recall = cap8_recall,
+        cap8_precision = cap8_precision,
+        cap8_read_wall_ms = cap8_read_wall_ms,
+        cap8_projected_saved_ms = cap8_projected_saved_ms,
+        cap8_read_wall_weighted_recall = cap8_read_wall_weighted_recall,
+        cap16_hits = cap16_hits,
+        cap16_actual_cold = cap16_actual_cold,
+        cap16_predicted_cold = cap16_predicted_cold,
+        cap16_recall = cap16_recall,
+        cap16_precision = cap16_precision,
+        cap16_read_wall_ms = cap16_read_wall_ms,
+        cap16_projected_saved_ms = cap16_projected_saved_ms,
+        cap16_read_wall_weighted_recall = cap16_read_wall_weighted_recall,
+        cap16_incremental_hits_vs_cap8 = cap16_incremental_hits_vs_cap8,
+        cap16_incremental_predicted_vs_cap8 = cap16_incremental_predicted_vs_cap8,
+        cap16_incremental_precision_vs_cap8 = cap16_incremental_precision_vs_cap8,
+        cap16_incremental_saved_ms_vs_cap8 = cap16_incremental_saved_ms_vs_cap8,
+        total_wave_load_ms = total_wave_load_ms,
+        stage_launches = stage_launches,
+        stage_launch_failures = stage_launch_failures,
+        stage_candidates = stage_candidates,
+        cap8_candidates = cap8_candidates,
+        cap16_candidates = cap16_candidates,
+        cap4_layers = cap4_layers,
+        cap8_layers = cap8_layers,
+        cap16_layers = cap16_layers,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn format_live_sequential_probe_invalid_receipt(reason: &'static str) -> String {
+    format!(
+        "[metal live-sequential-predict probe] schema=2 admitted=1 truth_valid=0 reason={reason}"
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -25401,6 +25432,7 @@ impl Gemma4RetainedColdPlan {
         self.ready_count() + self.fresh.len()
     }
 
+    #[cfg(target_os = "macos")]
     fn retained_experts(&self) -> Vec<usize> {
         self.retained.iter().map(|hit| hit.expert).collect()
     }
@@ -25412,7 +25444,7 @@ struct Gemma4RetainedColdLayer {
     slot_ids: [Option<usize>; GEMMA4_RETAINED_COLD_SLOTS_PER_LAYER],
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Gemma4PendingRetainedColdPublish {
     layer_idx: usize,
@@ -25603,7 +25635,7 @@ fn retained_cold_compact_slot_table(plan: &Gemma4RetainedColdPlan) -> Option<[u3
     Some(table)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn compact_stage_slot_table(experts: &[usize]) -> Option<[u32; 128]> {
     let mut table = [u32::MAX; 128];
     let mut seen = [false; 128];
@@ -26225,15 +26257,21 @@ mod hot_cold_overlap_plan_tests {
     use super::{
         cold_recurrence_tallies, cpu_cold_probe_exact_plan, cpu_cold_probe_expert_checksum,
         cpu_cold_probe_q8_snapshot, exact_cold_mask_from_union, f32_to_f16_bits,
+        format_live_sequential_probe_invalid_receipt, format_live_sequential_probe_receipt,
         gemma4_hybrid_cold_recurrence_probe_from, gemma4_hybrid_cold_recurrence_round_admitted,
         gemma4_hybrid_cpu_cold_probe_from, gemma4_hybrid_cpu_cold_probe_round_admitted,
         gemma4_hybrid_hot_cold_overlap_publish_from, gemma4_hybrid_hot_cold_prefill_from,
         gemma4_hybrid_hot_cold_publication_allowed, gemma4_hybrid_hot_cold_round_kind_admitted,
         hot_cold_compact_slot_table, hot_cold_split_slot_tables, live_sequential_cold_candidates,
-        live_sequential_probe_tally, partition_exact_union_by_hot, plan_retained_cold_layer,
-        retained_cold_compact_slot_table, summarize_live_sequential_probe, ColdRecurrenceTally,
-        CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
-        Gemma4RetainedColdPlacement, LiveSequentialProbeTally,
+        live_sequential_format_ms, live_sequential_format_ratio,
+        live_sequential_probe_cap_lattice_valid, live_sequential_probe_layer_observation_valid,
+        live_sequential_probe_observe_layer, live_sequential_probe_summary_lattice_valid,
+        live_sequential_probe_tally, live_sequential_receipt_wall_us, partition_exact_union_by_hot,
+        plan_retained_cold_layer, retained_cold_compact_slot_table,
+        summarize_live_sequential_probe, validate_live_sequential_probe_receipt,
+        ColdRecurrenceTally, CpuColdProbeAccounting, CpuColdProbeRoute, Gemma4RetainedColdHit,
+        Gemma4RetainedColdPlacement, LiveSequentialProbeSummary, LiveSequentialProbeTally,
+        LIVE_SEQUENTIAL_PROBE_CAP16, LIVE_SEQUENTIAL_PROBE_CAP8,
     };
 
     fn expert_mask(experts: &[usize]) -> [bool; 128] {
@@ -26282,6 +26320,103 @@ mod hot_cold_overlap_plan_tests {
     }
 
     #[test]
+    fn live_sequential_probe_observes_cap4_8_16_atomically_from_one_signal() {
+        let ranked = (0..24).collect::<Vec<_>>();
+        let actual = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+        let ranked_before = ranked.clone();
+        let actual_before = actual.clone();
+        let hot = expert_mask(&[0, 2, 4, 6]);
+
+        let observation = live_sequential_probe_observe_layer(&ranked, &actual, &hot).unwrap();
+        assert_eq!(
+            observation.cap4,
+            LiveSequentialProbeTally {
+                hits: 4,
+                actual_cold: 10,
+                predicted_cold: 4,
+            }
+        );
+        assert_eq!(
+            observation.cap8,
+            LiveSequentialProbeTally {
+                hits: 6,
+                actual_cold: 10,
+                predicted_cold: 8,
+            }
+        );
+        assert_eq!(
+            observation.cap16,
+            LiveSequentialProbeTally {
+                hits: 10,
+                actual_cold: 10,
+                predicted_cold: 16,
+            }
+        );
+        assert_eq!(
+            observation.cap16_candidates,
+            vec![1, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
+        assert_eq!(
+            observation.cap8_candidates,
+            observation.cap16_candidates[..8]
+        );
+        assert!(live_sequential_probe_layer_observation_valid(&observation));
+        assert_eq!(ranked, ranked_before);
+        assert_eq!(actual, actual_before);
+
+        assert!(live_sequential_probe_observe_layer(&[], &actual, &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&[1, 1], &actual, &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&[128], &actual, &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&ranked, &[1, 1], &hot).is_none());
+        assert!(live_sequential_probe_observe_layer(&ranked, &[128], &hot).is_none());
+    }
+
+    #[test]
+    fn live_sequential_probe_layer_lattice_rejects_forged_identity_and_counts() {
+        let ranked = (0..24).collect::<Vec<_>>();
+        let actual = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+        let hot = expert_mask(&[0, 2, 4, 6]);
+        let observation = live_sequential_probe_observe_layer(&ranked, &actual, &hot).unwrap();
+        assert!(live_sequential_probe_cap_lattice_valid(
+            observation.cap4,
+            observation.cap8,
+            observation.cap16,
+        ));
+
+        let mut wrong_prefix = observation.clone();
+        wrong_prefix.cap8_candidates.swap(0, 1);
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &wrong_prefix
+        ));
+
+        let mut wrong_cardinality = observation.clone();
+        wrong_cardinality.cap16.predicted_cold = 15;
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &wrong_cardinality
+        ));
+
+        // Keep every prior prefix/lattice/cardinality relationship internally
+        // consistent except the required cap8 == min(8, cap16) width.
+        let mut truncated_cap8 = observation.clone();
+        assert_eq!(truncated_cap8.cap8_candidates.pop(), Some(11));
+        truncated_cap8.cap8.predicted_cold = 7;
+        truncated_cap8.cap8.hits = 5;
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &truncated_cap8
+        ));
+
+        let mut duplicate = observation.clone();
+        duplicate.cap16_candidates[15] = duplicate.cap16_candidates[0];
+        assert!(!live_sequential_probe_layer_observation_valid(&duplicate));
+
+        let mut impossible_hits = observation.clone();
+        impossible_hits.cap8.hits = impossible_hits.cap4.hits - 1;
+        assert!(!live_sequential_probe_layer_observation_valid(
+            &impossible_hits
+        ));
+    }
+
+    #[test]
     fn live_sequential_probe_projects_per_layer_read_wall_only() {
         let tallies = [
             Some(LiveSequentialProbeTally {
@@ -26296,15 +26431,30 @@ mod hot_cold_overlap_plan_tests {
             }),
             None,
         ];
-        let summary = summarize_live_sequential_probe(&tallies, &[30.0, 10.0, 99.0]).unwrap();
+        let summary =
+            summarize_live_sequential_probe(tallies.iter().copied(), &[30_000, 10_000, 99_000])
+                .unwrap();
         assert_eq!(summary.compared_layers, 2);
         assert_eq!(summary.hits, 3);
         assert_eq!(summary.actual_cold, 4);
         assert_eq!(summary.predicted_cold, 6);
-        assert!((summary.read_wall_ms - 40.0).abs() < 1.0e-9);
-        assert!((summary.projected_saved_ms - 30.0).abs() < 1.0e-9);
-        assert!(summarize_live_sequential_probe(&tallies, &[1.0]).is_none());
-        assert!(summarize_live_sequential_probe(&[tallies[0]], &[f64::NAN]).is_none());
+        assert_eq!(summary.read_wall_us, 40_000);
+        assert_eq!(summary.projected_saved_us, 30_000);
+        assert!(summarize_live_sequential_probe(tallies.iter().copied(), &[1]).is_none());
+
+        let overflowing = [
+            Some(LiveSequentialProbeTally {
+                hits: u32::MAX,
+                actual_cold: u32::MAX,
+                predicted_cold: u32::MAX,
+            }),
+            Some(LiveSequentialProbeTally {
+                hits: 1,
+                actual_cold: 1,
+                predicted_cold: 1,
+            }),
+        ];
+        assert!(summarize_live_sequential_probe(overflowing, &[0, 0]).is_none());
     }
 
     #[test]
@@ -26316,13 +26466,225 @@ mod hot_cold_overlap_plan_tests {
         };
         let mut tallies = vec![Some(sample); 30];
         tallies[0] = None;
-        let summary = summarize_live_sequential_probe(&tallies, &[1.0; 30]).unwrap();
+        let summary =
+            summarize_live_sequential_probe(tallies.iter().copied(), &[1_000; 30]).unwrap();
         assert_eq!(summary.compared_layers, 29);
         assert_eq!(summary.hits, 29);
         assert_eq!(summary.actual_cold, 58);
         assert_eq!(summary.predicted_cold, 116);
-        assert!((summary.read_wall_ms - 29.0).abs() < 1.0e-9);
-        assert!((summary.projected_saved_ms - 14.5).abs() < 1.0e-9);
+        assert_eq!(summary.read_wall_us, 29_000);
+        assert_eq!(summary.projected_saved_us, 14_500);
+    }
+
+    #[test]
+    fn live_sequential_probe_receipt_domain_is_fixed_and_nonfinite_fails_closed() {
+        assert_eq!(live_sequential_receipt_wall_us(1.2346), Some(1_235));
+        assert_eq!(live_sequential_format_ms(1_235), "1.235");
+        assert_eq!(live_sequential_format_ratio(1, 3), "0.333333");
+        assert_eq!(live_sequential_format_ratio(2, 3), "0.666667");
+        assert_eq!(live_sequential_format_ratio(0, 0), "na");
+        assert!(live_sequential_receipt_wall_us(-0.001).is_none());
+        assert!(live_sequential_receipt_wall_us(f64::NAN).is_none());
+        assert!(live_sequential_receipt_wall_us(f64::INFINITY).is_none());
+
+        let cap4 = LiveSequentialProbeSummary {
+            compared_layers: 29,
+            hits: 20,
+            actual_cold: 60,
+            predicted_cold: 40,
+            read_wall_us: 100_000,
+            projected_saved_us: 30_000,
+        };
+        let cap8 = LiveSequentialProbeSummary {
+            hits: 30,
+            predicted_cold: 70,
+            projected_saved_us: 45_000,
+            ..cap4
+        };
+        let cap16 = LiveSequentialProbeSummary {
+            hits: 40,
+            predicted_cold: 100,
+            projected_saved_us: 62_500,
+            ..cap4
+        };
+        assert!(live_sequential_probe_summary_lattice_valid(
+            cap4, cap8, cap16
+        ));
+        assert!(!live_sequential_probe_summary_lattice_valid(
+            cap4,
+            cap8,
+            LiveSequentialProbeSummary {
+                projected_saved_us: 44_999,
+                ..cap16
+            },
+        ));
+    }
+
+    #[test]
+    fn live_sequential_probe_schema2_requires_exact_29_layer_truth() {
+        let ranked = (0..24).collect::<Vec<_>>();
+        let actual = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+        let hot = expert_mask(&[0, 2, 4, 6]);
+        let observation = live_sequential_probe_observe_layer(&ranked, &actual, &hot).unwrap();
+        let mut observations = vec![None; 30];
+        for slot in &mut observations[1..] {
+            *slot = Some(observation.clone());
+        }
+        let mut walls = vec![0.0; 30];
+        for wall in &mut walls[1..] {
+            *wall = 1.2346;
+        }
+        let cap8_candidates = 29 * observation.cap8.predicted_cold;
+        let receipt = validate_live_sequential_probe_receipt(
+            &observations,
+            &walls,
+            30,
+            29,
+            0,
+            true,
+            true,
+            29,
+            29,
+            0,
+            cap8_candidates,
+            LIVE_SEQUENTIAL_PROBE_CAP8,
+            35.815,
+        )
+        .unwrap();
+        assert_eq!(receipt.cap4.compared_layers, 29);
+        assert_eq!(receipt.cap8.read_wall_us, 35_815);
+        assert_eq!(receipt.cap8.projected_saved_us, 21_489);
+        assert_eq!(receipt.cap16.projected_saved_us, 35_815);
+        assert_eq!(receipt.cap16_incremental_hits_vs_cap8, 116);
+        assert_eq!(receipt.cap16_incremental_predicted_vs_cap8, 232);
+        assert_eq!(receipt.cap16_incremental_saved_us_vs_cap8, 14_326);
+        assert_eq!(receipt.cap8_candidates.matches('/').count(), 28);
+        assert_eq!(receipt.cap16_candidates.matches('/').count(), 28);
+        assert_eq!(receipt.cap4_layers.matches(',').count(), 28);
+        assert!(receipt.cap8_candidates.starts_with("L1:1,3,5,7,8,9,10,11/"));
+        assert!(receipt
+            .cap16_candidates
+            .ends_with("L29:1,3,5,7,8,9,10,11,12,13,14,15,16,17,18,19"));
+        let cap16_candidates = 29 * observation.cap16.predicted_cold;
+        let cap16_receipt = validate_live_sequential_probe_receipt(
+            &observations,
+            &walls,
+            30,
+            29,
+            0,
+            true,
+            true,
+            29,
+            29,
+            0,
+            cap16_candidates,
+            LIVE_SEQUENTIAL_PROBE_CAP16,
+            35.815,
+        )
+        .expect("cap16 stage accounting must reconcile against cap16 truth");
+        assert_eq!(cap16_receipt, receipt);
+        let rendered = format_live_sequential_probe_receipt(
+            &receipt,
+            104,
+            14,
+            29,
+            0,
+            123,
+            29,
+            0,
+            cap8_candidates,
+        );
+        assert!(rendered.contains("schema=2 admitted=1"));
+        assert!(rendered.contains("eligible=29 attempts=29 failures=0 truth_valid=1"));
+        assert!(rendered.contains("predictor_top_k_per_row=8 probe_caps=4,8,16"));
+        assert!(rendered.contains("cap8_read_wall_ms=35.815"));
+        assert!(rendered.contains("cap16_incremental_saved_ms_vs_cap8=14.326"));
+        assert!(rendered.contains("stage_admitted=1 launches=29 launch_failures=0"));
+        assert!(rendered.contains("output_mutation=0 io_mutation=1 slot_policy_mutation=0"));
+        assert!(!rendered.contains("cap16_go"));
+        assert!(!rendered.contains("eligible_layers="));
+        assert!(!rendered.contains("stage_launches="));
+
+        let mut missing = observations.clone();
+        missing[29] = None;
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &missing,
+                &walls,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                29,
+                0,
+                cap8_candidates,
+                LIVE_SEQUENTIAL_PROBE_CAP8,
+                35.815,
+            ),
+            Err("layer-lattice")
+        );
+        let mut nonfinite = walls.clone();
+        nonfinite[7] = f64::NAN;
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &observations,
+                &nonfinite,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                29,
+                0,
+                cap8_candidates,
+                LIVE_SEQUENTIAL_PROBE_CAP8,
+                35.815,
+            ),
+            Err("wall-domain")
+        );
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &observations,
+                &walls,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                28,
+                0,
+                cap8_candidates,
+                LIVE_SEQUENTIAL_PROBE_CAP8,
+                35.815,
+            ),
+            Err("stage-accounting")
+        );
+        assert_eq!(
+            validate_live_sequential_probe_receipt(
+                &observations,
+                &walls,
+                30,
+                29,
+                0,
+                true,
+                true,
+                29,
+                29,
+                0,
+                cap8_candidates,
+                12,
+                35.815,
+            ),
+            Err("stage-cap")
+        );
+        assert_eq!(
+            format_live_sequential_probe_invalid_receipt("layer-lattice"),
+            "[metal live-sequential-predict probe] schema=2 admitted=1 truth_valid=0 reason=layer-lattice"
+        );
     }
 
     fn fill_q4_matrix(wire: &mut [u8], rows: usize, blocks: usize, seed: usize) {
@@ -26616,7 +26978,7 @@ mod hot_cold_overlap_plan_tests {
         assert_eq!(hot, vec![9, 2, 11]);
         assert_eq!(cold, vec![4, 8, 5]);
         for &expert in &union {
-            assert_eq!(hot.contains(&expert) ^ cold.contains(&expert), true);
+            assert!(hot.contains(&expert) ^ cold.contains(&expert));
         }
 
         let (hot_table, cold_table) = hot_cold_split_slot_tables(&hot, &cold).unwrap();
@@ -26769,6 +27131,7 @@ mod hot_cold_overlap_plan_tests {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn expert_set_is_covered(actual: &[usize], covered: &[usize]) -> bool {
     let mut keep = [false; 128];
     for &e in covered {
@@ -26779,6 +27142,7 @@ fn expert_set_is_covered(actual: &[usize], covered: &[usize]) -> bool {
     actual.iter().all(|&e| e < 128 && keep[e])
 }
 
+#[cfg(target_os = "macos")]
 fn mask_slot_table_to_wave(table: &mut [u32; 128], wave: &[usize]) {
     let mut keep = [false; 128];
     for &expert in wave {
@@ -26793,20 +27157,7 @@ fn mask_slot_table_to_wave(table: &mut [u32; 128], wave: &[usize]) {
     }
 }
 
-const SLOT_OVERFLOW_BIT: u32 = 24;
-
-fn merge_unified_slot_table(ping: &[u32; 128], pong: &[u32; 128]) -> [u32; 128] {
-    let mut unified = [0xFFFFFFFFu32; 128];
-    for e in 0..128 {
-        if ping[e] != 0xFFFFFFFFu32 {
-            unified[e] = ping[e];
-        } else if pong[e] != 0xFFFFFFFFu32 {
-            unified[e] = SLOT_OVERFLOW_BIT + pong[e];
-        }
-    }
-    unified
-}
-
+#[cfg(target_os = "macos")]
 fn wave_slots_ready(table: &[u32; 128], wave: &[usize], num_slots: usize) -> Option<usize> {
     for &expert in wave {
         let slot = table.get(expert).copied().unwrap_or(0xFFFFFFFFu32);
@@ -26821,6 +27172,7 @@ fn wave_slots_ready(table: &[u32; 128], wave: &[usize], num_slots: usize) -> Opt
 /// the exact distinct slot resources that its argument-buffer kernels may
 /// dereference. Invalid experts, missing mappings, out-of-range slots, or two
 /// experts aliasing one mutable slot fail closed.
+#[cfg(target_os = "macos")]
 fn active_slots_for_wave(
     table: &[u32; 128],
     wave: &[usize],
@@ -26866,7 +27218,7 @@ fn record_work_address_plan(
         .map(|slot| {
             let offset = slot.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?;
             let expert_weight_offset = u32::try_from(offset).ok()?;
-            if expert_weight_offset as usize % GEMMA4_Q4_EXPERT_SLOT_STRIDE != 0
+            if !(expert_weight_offset as usize).is_multiple_of(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
                 || expert_weight_offset as usize / GEMMA4_Q4_EXPERT_SLOT_STRIDE != slot
             {
                 return None;
@@ -26963,6 +27315,7 @@ mod record_work_address_tests {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn gemma4_top8_union_from_router_logits(logits: &[f32], k_tokens: usize) -> Vec<usize> {
     let mut selected = Vec::with_capacity(k_tokens * 8);
     for t in 0..k_tokens {
@@ -28766,17 +29119,6 @@ impl Gemma4GhostCommonMetal {
         out_rows
     }
 
-    pub(crate) fn execute_attention_chunk(
-        &mut self,
-        _layer_idx: usize,
-        _hidden_rows: &[Vec<f32>],
-        _rope_freq_base: f32,
-        _rope_factors: Option<&[f32]>,
-        _start_pos: usize,
-    ) -> Option<Vec<Vec<f32>>> {
-        None
-    }
-
     pub(crate) fn execute_attention_chunk_into(
         &mut self,
         _layer_idx: usize,
@@ -28811,10 +29153,6 @@ impl Gemma4GhostCommonMetal {
         )
     }
 
-    pub(crate) fn resident_residual_buffers(&self) -> (&Buffer, &Buffer, &Buffer) {
-        (&self.slab_a, &self.slab_b, &self.resident_scratch.dn_batch)
-    }
-
     pub(crate) fn resident_fused_tail_buffers(
         &self,
         layer_idx: usize,
@@ -28828,26 +29166,6 @@ impl Gemma4GhostCommonMetal {
             &moe.post_ffw_norm,
             moe.layer_output_scale,
         ))
-    }
-
-    pub(crate) fn read_slab_a_into(&self, k_tokens: usize, out_rows: &mut [Vec<f32>]) {
-        if let Some(kernel) = metal_linear_kernel() {
-            let cmd = kernel.queue.new_command_buffer();
-            cmd.commit();
-            cmd.wait_until_completed();
-        }
-        let hidden = self.hidden_size;
-        let ptr = self.slab_a.contents() as *const f32;
-        for i in 0..k_tokens.min(out_rows.len()) {
-            out_rows[i].resize(hidden, 0.0);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    ptr.add(i * hidden),
-                    out_rows[i].as_mut_ptr(),
-                    hidden,
-                );
-            }
-        }
     }
 
     pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[&[u32; 128]]) {
@@ -29054,7 +29372,7 @@ impl Gemma4GhostCommonMetal {
         let k_u32 = k_tokens as u32;
         let num_slots_u32 = num_slots as u32;
         let num_resident_slots_u32 = num_resident_slots as u32;
-        let gateup_unique = (k_tokens * 8).min(num_slots).min(128).max(1);
+        let gateup_unique = (k_tokens * 8).clamp(1, num_slots.clamp(1, 128));
         let gateup_unique_u32 = gateup_unique as u32;
         let topk_slots_u32 = num_slots.min(128) as u32;
         encoder.set_bytes(5, 4, &k_u32 as *const u32 as *const _);
@@ -29395,7 +29713,7 @@ impl Gemma4GhostCommonMetal {
     }
 
     /// Encode the layer tail (post-attention residual + MoE add + post-norms
-    /// + optional layer-output scale) into `encoder`, ending with a slab_a
+    /// and an optional layer-output scale) into `encoder`, ending with a slab_a
     /// barrier. Shared by the serial per-layer path and the pre-encoded
     /// overlap path (CAMELID_GEMMA4_OVERLAP) so both encode byte-identical
     /// command streams. GPU-side it reads slab_b, dn_batch and gpu_moe_acc
@@ -29591,6 +29909,7 @@ impl Gemma4GhostCommonMetal {
             &mut dyn FnMut(usize, &[f32], usize) -> Option<Vec<usize>>,
         >,
         mut live_sequential_stage_launcher: Option<&mut dyn FnMut(usize, &[usize]) -> bool>,
+        live_sequential_stage_candidate_cap: usize,
         live_sequential_profile_shape: bool,
         pong_slab: Option<&Buffer>,
         predicted_unions: &[Vec<usize>],
@@ -29704,14 +30023,16 @@ impl Gemma4GhostCommonMetal {
             return false;
         }
         let hidden = self.hidden_size;
-        let mut ledger = ChainedRoundHostLedger::default();
-        ledger.kv_capacity = self.kv_capacity as u32;
-        ledger.kv_bytes = self.geometry.kv_bytes as u64;
-        ledger.kv_filled = (start_pos + k_tokens) as u32;
-        ledger.overflow_slots = if file_mapped_demand {
-            0
-        } else {
-            GEMMA4_OVERFLOW_BANK_SLOTS as u32
+        let mut ledger = ChainedRoundHostLedger {
+            kv_capacity: self.kv_capacity as u32,
+            kv_bytes: self.geometry.kv_bytes as u64,
+            kv_filled: (start_pos + k_tokens) as u32,
+            overflow_slots: if file_mapped_demand {
+                0
+            } else {
+                GEMMA4_OVERFLOW_BANK_SLOTS as u32
+            },
+            ..ChainedRoundHostLedger::default()
         };
         // Bounded record demand owns one deliberately inert overflow bank and
         // refuses any union beyond the table/directory prefix before encode.
@@ -29811,8 +30132,6 @@ impl Gemma4GhostCommonMetal {
         ledger.rope_ms = t_rope.elapsed().as_secs_f64() * 1000.0;
 
         let n_layers = self.layers.len();
-        let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let predicted_ready = !record_demand
             && slot_filler.is_some()
             && predicted_unions.len() >= n_layers
@@ -29848,8 +30167,7 @@ impl Gemma4GhostCommonMetal {
                     .get(layer_idx)
                     .copied()
                     .unwrap_or(128)
-                    .min(128)
-                    .max(1);
+                    .clamp(1, 128);
                 let default_pred: Vec<usize> = (0..num_slots_fill).collect();
                 let pred = if layer_idx < predicted_unions.len()
                     && !predicted_unions[layer_idx].is_empty()
@@ -30101,10 +30419,10 @@ impl Gemma4GhostCommonMetal {
         // is known: without a predicted union it falls back to all 128 records,
         // reintroducing the mapped-tier bind that demand promotion exists to
         // remove. Serial encode for those rounds costs a few ms per round.
-        let overlap_round = overlap_enabled()
-            && !stage_profile
-            && !dump_layers
-            && !(file_mapped_demand && gemma4_hybrid_demand_promotion_enabled());
+        let overlap_round = !(!overlap_enabled()
+            || stage_profile
+            || dump_layers
+            || (file_mapped_demand && gemma4_hybrid_demand_promotion_enabled()));
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
                 if stage_profile {
@@ -30153,11 +30471,15 @@ impl Gemma4GhostCommonMetal {
             && slot_filler.is_some()
             && hot_residency_at_start.is_some_and(|hot| hot.len() >= n_layers);
         let live_sequential_stage_requested = live_sequential_stage_launcher.is_some();
-        let live_sequential_stage_admitted =
-            live_sequential_stage_requested && live_sequential_probe_admitted;
+        let live_sequential_stage_admitted = live_sequential_stage_requested
+            && live_sequential_probe_admitted
+            && matches!(
+                live_sequential_stage_candidate_cap,
+                LIVE_SEQUENTIAL_PROBE_CAP8 | LIVE_SEQUENTIAL_PROBE_CAP16
+            );
         if live_sequential_probe_requested && !live_sequential_probe_admitted {
             eprintln!(
-                "[metal live-sequential-predict probe] schema=1 admitted=0 start_pos={start_pos} K={k_tokens} h40_shape={} record_demand={} file_mapped={} decode={} hot_cold_overlap={} single_down={} publish={} retained_bank={} unified={} filler={} hot_snapshot={} output_mutation=0 io_mutation=0 slot_mutation=0",
+                "[metal live-sequential-predict probe] schema=2 admitted=0 start_pos={start_pos} K={k_tokens} h40_shape={} record_demand={} file_mapped={} decode={} hot_cold_overlap={} single_down={} publish={} retained_bank={} unified={} filler={} hot_snapshot={} output_mutation=0 io_mutation=0 slot_policy_mutation=0",
                 u8::from(live_sequential_profile_shape),
                 u8::from(record_demand),
                 u8::from(file_mapped_demand),
@@ -30179,10 +30501,11 @@ impl Gemma4GhostCommonMetal {
             live_sequential_probe_admitted.then(|| vec![None::<Vec<usize>>; n_layers]);
         let mut live_sequential_failed =
             live_sequential_probe_admitted.then(|| vec![false; n_layers]);
-        let mut live_sequential_cap4 = live_sequential_probe_admitted
-            .then(|| vec![None::<LiveSequentialProbeTally>; n_layers]);
-        let mut live_sequential_cap8 = live_sequential_probe_admitted
-            .then(|| vec![None::<LiveSequentialProbeTally>; n_layers]);
+        // H69's cap-4/8/16 receipt is one atomic observation per layer. The
+        // extra cap-16 identities remain observation-only unless the exact
+        // default-off cap-16 execution profile above admits the stage launcher.
+        let mut live_sequential_observations = live_sequential_probe_admitted
+            .then(|| vec![None::<LiveSequentialProbeLayerObservation>; n_layers]);
         let mut live_sequential_read_wall_ms =
             live_sequential_probe_admitted.then(|| vec![0.0f64; n_layers]);
         let mut live_sequential_predict_us = 0u64;
@@ -30192,6 +30515,16 @@ impl Gemma4GhostCommonMetal {
         let mut live_sequential_stage_launches = 0u32;
         let mut live_sequential_stage_launch_failures = 0u32;
         let mut live_sequential_stage_candidates = 0u32;
+        let mut live_sequential_accounting_valid = true;
+        macro_rules! checked_live_sequential_add {
+            ($counter:ident, $delta:expr) => {{
+                if let Some(next) = $counter.checked_add($delta) {
+                    $counter = next;
+                } else {
+                    live_sequential_accounting_valid = false;
+                }
+            }};
+        }
         macro_rules! account_wave_load {
             ($layer_idx:expr, $elapsed_ms:expr) => {{
                 let elapsed_ms = $elapsed_ms;
@@ -31037,7 +31370,6 @@ impl Gemma4GhostCommonMetal {
                         last_committed_cb = Some(cb3);
                         self.next_position[layer_idx] = start_pos + k_tokens;
                         cb_closed = true;
-                        layer_committed = true;
                         encode_clock = std::time::Instant::now();
                         continue;
                     }
@@ -31095,7 +31427,7 @@ impl Gemma4GhostCommonMetal {
                 // exact StageCold work and expert/tail commit.
                 if layer_idx + 1 < n_layers {
                     if let Some(predictor) = live_sequential_predictor.as_deref_mut() {
-                        live_sequential_attempts = live_sequential_attempts.saturating_add(1);
+                        checked_live_sequential_add!(live_sequential_attempts, 1);
                         let next_layer_idx = layer_idx + 1;
                         let flat_hidden = unsafe {
                             std::slice::from_raw_parts(
@@ -31105,8 +31437,9 @@ impl Gemma4GhostCommonMetal {
                         };
                         let predict_started = std::time::Instant::now();
                         let ranked = predictor(next_layer_idx, flat_hidden, k_tokens);
-                        live_sequential_predict_us = live_sequential_predict_us.saturating_add(
-                            predict_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                        checked_live_sequential_add!(
+                            live_sequential_predict_us,
+                            predict_started.elapsed().as_micros().min(u64::MAX as u128) as u64
                         );
                         match ranked {
                             Some(ranked) if !ranked.is_empty() => {
@@ -31115,8 +31448,7 @@ impl Gemma4GhostCommonMetal {
                                 }
                             }
                             _ => {
-                                live_sequential_failures =
-                                    live_sequential_failures.saturating_add(1);
+                                checked_live_sequential_add!(live_sequential_failures, 1);
                                 if let Some(failed) = live_sequential_failed.as_mut() {
                                     failed[next_layer_idx] = true;
                                 }
@@ -31410,21 +31742,15 @@ impl Gemma4GhostCommonMetal {
                             .and_then(|predictions| predictions.get(layer_idx))
                             .and_then(Option::as_deref);
                         let hot = hot_residency_at_start.and_then(|hot| hot.get(layer_idx));
-                        let tallies = ranked.zip(hot).and_then(|(ranked, hot)| {
-                            Some((
-                                live_sequential_probe_tally(ranked, &union, hot, 4)?,
-                                live_sequential_probe_tally(ranked, &union, hot, 8)?,
-                            ))
+                        let observation = ranked.zip(hot).and_then(|(ranked, hot)| {
+                            live_sequential_probe_observe_layer(ranked, &union, hot)
                         });
-                        if let Some((cap4, cap8)) = tallies {
-                            if let Some(per_layer) = live_sequential_cap4.as_mut() {
-                                per_layer[layer_idx] = Some(cap4);
-                            }
-                            if let Some(per_layer) = live_sequential_cap8.as_mut() {
-                                per_layer[layer_idx] = Some(cap8);
+                        if let Some(observation) = observation {
+                            if let Some(per_layer) = live_sequential_observations.as_mut() {
+                                per_layer[layer_idx] = Some(observation);
                             }
                         } else {
-                            live_sequential_failures = live_sequential_failures.saturating_add(1);
+                            checked_live_sequential_add!(live_sequential_failures, 1);
                             if let Some(failed) = live_sequential_failed.as_mut() {
                                 failed[layer_idx] = true;
                             }
@@ -32446,8 +32772,6 @@ impl Gemma4GhostCommonMetal {
                         } else {
                             encode_pair(false, false)
                         };
-                        drop(encode_pair);
-
                         if let Some((
                             hot_cb,
                             cold_cb,
@@ -33655,19 +33979,30 @@ impl Gemma4GhostCommonMetal {
             // front of current exact demand. Its target is L+1, and the next
             // layer's exact router remains the sole consumer authority.
             if live_sequential_stage_admitted && layer_idx + 1 < n_layers {
-                live_sequential_stage_launch_attempts =
-                    live_sequential_stage_launch_attempts.saturating_add(1);
+                checked_live_sequential_add!(live_sequential_stage_launch_attempts, 1);
                 let next_layer_idx = layer_idx + 1;
                 let cold_candidates = live_sequential_ranked
                     .as_ref()
                     .and_then(|ranked| ranked.get(next_layer_idx))
                     .and_then(Option::as_deref)
                     .zip(hot_residency_at_start.and_then(|hot| hot.get(next_layer_idx)))
-                    .and_then(|(ranked, hot)| live_sequential_cold_candidates(ranked, hot, 8));
+                    .and_then(|(ranked, hot)| {
+                        live_sequential_cold_candidates(
+                            ranked,
+                            hot,
+                            live_sequential_stage_candidate_cap,
+                        )
+                    });
                 match cold_candidates {
                     Some(candidates) => {
-                        live_sequential_stage_candidates = live_sequential_stage_candidates
-                            .saturating_add(candidates.len().min(u32::MAX as usize) as u32);
+                        if let Ok(candidate_count) = u32::try_from(candidates.len()) {
+                            checked_live_sequential_add!(
+                                live_sequential_stage_candidates,
+                                candidate_count
+                            );
+                        } else {
+                            live_sequential_accounting_valid = false;
+                        }
                         // An empty launch is still meaningful: it replaces any
                         // stale generation so no obsolete private read can
                         // continue merely because every prediction was hot.
@@ -33675,16 +34010,13 @@ impl Gemma4GhostCommonMetal {
                             .as_deref_mut()
                             .is_some_and(|launcher| launcher(next_layer_idx, &candidates));
                         if launched {
-                            live_sequential_stage_launches =
-                                live_sequential_stage_launches.saturating_add(1);
+                            checked_live_sequential_add!(live_sequential_stage_launches, 1);
                         } else {
-                            live_sequential_stage_launch_failures =
-                                live_sequential_stage_launch_failures.saturating_add(1);
+                            checked_live_sequential_add!(live_sequential_stage_launch_failures, 1);
                         }
                     }
                     None => {
-                        live_sequential_stage_launch_failures =
-                            live_sequential_stage_launch_failures.saturating_add(1);
+                        checked_live_sequential_add!(live_sequential_stage_launch_failures, 1);
                     }
                 }
             }
@@ -33870,7 +34202,7 @@ impl Gemma4GhostCommonMetal {
         }
         if let Some((staged_layer, staged_cold, mut staged_union)) = pending_staged_promotion.take()
         {
-            let Some(filler) = slot_filler.as_deref_mut() else {
+            let Some(filler) = slot_filler else {
                 self.last_chained_ledger = ledger;
                 return false;
             };
@@ -34082,107 +34414,46 @@ impl Gemma4GhostCommonMetal {
             );
         }
         if live_sequential_probe_admitted {
-            let cap4 = live_sequential_cap4
+            let receipt = live_sequential_observations
                 .as_deref()
                 .zip(live_sequential_read_wall_ms.as_deref())
-                .and_then(|(tallies, wall)| summarize_live_sequential_probe(tallies, wall));
-            let cap8 = live_sequential_cap8
-                .as_deref()
-                .zip(live_sequential_read_wall_ms.as_deref())
-                .and_then(|(tallies, wall)| summarize_live_sequential_probe(tallies, wall));
-            let truth_valid = cap4.zip(cap8).is_some_and(|(cap4, cap8)| {
-                live_sequential_failures == 0
-                    && cap4.compared_layers == live_sequential_attempts
-                    && cap8.compared_layers == live_sequential_attempts
-                    && live_sequential_attempts == n_layers.saturating_sub(1) as u32
-            });
-            let cap4 = cap4.unwrap_or_default();
-            let cap8 = cap8.unwrap_or_default();
-            let ratio = |numerator: u32, denominator: u32| {
-                (denominator != 0)
-                    .then(|| format!("{:.6}", f64::from(numerator) / f64::from(denominator)))
-                    .unwrap_or_else(|| "na".to_owned())
-            };
-            let weighted_recall = |summary: LiveSequentialProbeSummary| {
-                (summary.read_wall_ms > 0.0)
-                    .then(|| format!("{:.6}", summary.projected_saved_ms / summary.read_wall_ms))
-                    .unwrap_or_else(|| "na".to_owned())
-            };
-            let cap8_candidates = live_sequential_ranked
-                .as_deref()
-                .zip(hot_residency_at_start)
-                .map(|(ranked, hot)| {
-                    ranked
-                        .iter()
-                        .zip(hot)
-                        .enumerate()
-                        .skip(1)
-                        .filter_map(|(layer_idx, (ranked, hot))| {
-                            ranked.as_ref().map(|ranked| {
-                                let ids = ranked
-                                    .iter()
-                                    .copied()
-                                    .filter(|&expert| expert < 128 && !hot[expert])
-                                    .take(8)
-                                    .map(|expert| expert.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                format!("L{layer_idx}:{ids}")
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .join("/")
-                })
-                .unwrap_or_default();
-            let cap8_layers = live_sequential_cap8
-                .as_deref()
-                .zip(live_sequential_read_wall_ms.as_deref())
-                .map(|(tallies, wall)| {
-                    tallies
-                        .iter()
-                        .zip(wall)
-                        .enumerate()
-                        .skip(1)
-                        .filter_map(|(layer_idx, (tally, wall_ms))| {
-                            tally.map(|tally| {
-                                format!(
-                                    "L{layer_idx}:{}/{}/{}@{wall_ms:.3}",
-                                    tally.hits, tally.actual_cold, tally.predicted_cold,
-                                )
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .unwrap_or_default();
-            eprintln!(
-                "[metal live-sequential-predict probe] schema=1 admitted=1 profile=exact-live-sequential-hot-shape start_pos={start_pos} K={k_tokens} source=post-attention-slab-b target=next-layer-exact-union first_target_layer=1 eligible_layers={} attempted_layers={live_sequential_attempts} failures={live_sequential_failures} truth_valid={} predict_us={live_sequential_predict_us} predictor_top_k_per_row=8 cap4_hits={} cap4_actual_cold={} cap4_predicted_cold={} cap4_recall={} cap4_precision={} cap4_read_wall_ms={:.3} cap4_projected_saved_ms={:.3} cap4_read_wall_weighted_recall={} cap8_hits={} cap8_actual_cold={} cap8_predicted_cold={} cap8_recall={} cap8_precision={} cap8_read_wall_ms={:.3} cap8_projected_saved_ms={:.3} cap8_read_wall_weighted_recall={} total_wave_load_ms={:.3} projection=record-linear-per-layer-wave-load-ceiling stage_admitted={} stage_launch_attempts={live_sequential_stage_launch_attempts} stage_launches={live_sequential_stage_launches} stage_launch_failures={live_sequential_stage_launch_failures} stage_candidates={live_sequential_stage_candidates} readiness_measured={} contention_measured={} output_mutation=0 io_mutation={} slot_policy_mutation=0 routing_authority=exact-router cap8_candidates={} cap8_layers={}",
-                n_layers.saturating_sub(1),
-                u8::from(truth_valid),
-                cap4.hits,
-                cap4.actual_cold,
-                cap4.predicted_cold,
-                ratio(cap4.hits, cap4.actual_cold),
-                ratio(cap4.hits, cap4.predicted_cold),
-                cap4.read_wall_ms,
-                cap4.projected_saved_ms,
-                weighted_recall(cap4),
-                cap8.hits,
-                cap8.actual_cold,
-                cap8.predicted_cold,
-                ratio(cap8.hits, cap8.actual_cold),
-                ratio(cap8.hits, cap8.predicted_cold),
-                cap8.read_wall_ms,
-                cap8.projected_saved_ms,
-                weighted_recall(cap8),
-                ledger.wave_load_ms,
-                u8::from(live_sequential_stage_admitted),
-                u8::from(live_sequential_stage_admitted),
-                u8::from(live_sequential_stage_admitted),
-                u8::from(live_sequential_stage_admitted),
-                cap8_candidates,
-                cap8_layers,
-            );
+                .ok_or("missing-observation-state")
+                .and_then(|(observations, read_wall_ms)| {
+                    validate_live_sequential_probe_receipt(
+                        observations,
+                        read_wall_ms,
+                        n_layers,
+                        live_sequential_attempts,
+                        live_sequential_failures,
+                        live_sequential_accounting_valid,
+                        live_sequential_stage_admitted,
+                        live_sequential_stage_launch_attempts,
+                        live_sequential_stage_launches,
+                        live_sequential_stage_launch_failures,
+                        live_sequential_stage_candidates,
+                        live_sequential_stage_candidate_cap,
+                        ledger.wave_load_ms,
+                    )
+                });
+            match receipt {
+                Ok(receipt) => eprintln!(
+                    "{}",
+                    format_live_sequential_probe_receipt(
+                        &receipt,
+                        start_pos,
+                        k_tokens,
+                        live_sequential_attempts,
+                        live_sequential_failures,
+                        live_sequential_predict_us,
+                        live_sequential_stage_launches,
+                        live_sequential_stage_launch_failures,
+                        live_sequential_stage_candidates,
+                    )
+                ),
+                Err(reason) => {
+                    eprintln!("{}", format_live_sequential_probe_invalid_receipt(reason))
+                }
+            }
         }
         self.last_chained_ledger = ledger;
         true
@@ -48168,7 +48439,7 @@ mod tests {
 
             let command_buffer = kernel.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encode_q6k_ordered_single(
+            encode_q6k_single(
                 encoder,
                 kernel,
                 &input_scales,
@@ -48182,6 +48453,7 @@ mod tests {
                 0,
                 0,
                 0,
+                Q6kSingleKernel::Ordered,
             );
             encoder.end_encoding();
             command_buffer.commit();
@@ -48799,9 +49071,7 @@ mod tests {
         }
         let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
-            });
+            .unwrap_or_else(|| crate::test_support::model_path("gemma-4-26B_q4_0-it.cghost"));
         if !cghost_path.is_file() {
             eprintln!(
                 "SKIP Tier-2 expert slab probe: {} not found",
@@ -50799,9 +51069,7 @@ kernel void sample_active_expert_records(
         let path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                std::path::PathBuf::from(
-                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
-                )
+                crate::test_support::model_path("gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
             });
         if !path.is_file() {
             return;

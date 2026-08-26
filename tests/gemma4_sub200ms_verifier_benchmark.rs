@@ -2,13 +2,15 @@
 //!
 //! Measures warm steady-state latency and verifies 100% bit-exact greedy parity.
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
 #[test]
 fn test_genuine_gemma4_sub200ms_verifier_k8() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -46,8 +48,7 @@ fn test_genuine_gemma4_sub200ms_verifier_k8() {
     let mut cur_logits = initial_logits.clone();
     let mut temp_kc = kc.clone();
     let mut temp_vc = vc.clone();
-    let mut cur_pos = prompt_tokens.len();
-    for _ in 0..16 {
+    for cur_pos in (prompt_tokens.len()..).take(16) {
         let tok = cur_logits
             .iter()
             .enumerate()
@@ -58,7 +59,6 @@ fn test_genuine_gemma4_sub200ms_verifier_k8() {
         cur_logits = runtime
             .step(tok, cur_pos, &mut temp_kc, &mut temp_vc)
             .expect("step");
-        cur_pos += 1;
     }
 
     let k = 8;

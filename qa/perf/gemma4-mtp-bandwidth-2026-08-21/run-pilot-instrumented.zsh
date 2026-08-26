@@ -1,21 +1,25 @@
 #!/bin/zsh
 setopt no_unset pipe_fail
 run_dir=$1
-repo=/Users/timtoole/.gemini/antigravity/scratch/Camelid
+operator_home=${CAMELID_OPERATOR_HOME:-${HOME:?set CAMELID_OPERATOR_HOME or HOME}}
+model_root=${CAMELID_MODEL_ROOT:-$operator_home/models}
+repo_candidate=${CAMELID_REPO_ROOT:-${0:A:h}/../../..}
+repo=${repo_candidate:A}
 bundle=${repo}/qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle
 wd=${bundle}/run_load_only_watchdog.py
 adm=${run_dir}/camelid-mtp-admission
 exp=${run_dir}/gemma4-mtp-assistant-experiment
-assistant=/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
-stage=/Users/timtoole/models/gemma4-mtp-pair/runs/mtp-nim.fPTehuPt/stage-oracle.json
+assistant=${CAMELID_GEMMA4_MTP_ASSISTANT_PATH:-$model_root/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
+stage=${CAMELID_GEMMA4_MTP_STAGE_ORACLE_JSON:-$model_root/gemma4-mtp-pair/runs/mtp-nim.fPTehuPt/stage-oracle.json}
+cam_lock=${CAMELID_CAM_LOCK:-$operator_home/bin/cam-lock.sh}
 ev=${run_dir}/native-admission.json
 nonce=$(/usr/bin/uuidgen | /usr/bin/tr -d '-' | /usr/bin/tr 'A-Z' 'a-z')$(/usr/bin/uuidgen | /usr/bin/tr -d '-' | /usr/bin/tr 'A-Z' 'a-z' | /usr/bin/cut -c1-16)
 print -r -- "${nonce}" > ${run_dir}/run-nonce.txt
 cd ${run_dir}
 
 print -r -- "== admission $(/bin/date -u +%FT%TZ)"
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh /usr/bin/env -i \
-  HOME=/Users/timtoole PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp \
+CAM_SESSION_PID=$$ $cam_lock /usr/bin/env -i \
+  HOME=$operator_home PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp \
   CAMELID_GEMMA4_MTP_NATIVE_ASSISTANT_PATH=${assistant} \
   CAMELID_GEMMA4_MTP_RECURRENCE_ORACLE_JSON=${bundle}/assistant_recurrence7_bf16_cpu.json \
   CAMELID_GEMMA4_MTP_STAGE_ORACLE_JSON=${stage} \
@@ -31,8 +35,8 @@ print -r -- "== admission rc=${arc}"
 (( arc == 0 )) || exit ${arc}
 
 print -r -- "== pilot (OBSERVABILITY ONLY: +CAMELID_GEMMA4_GHOST_METAL_TIMING=1) $(/bin/date -u +%FT%TZ)"
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh /usr/bin/env -i \
-  HOME=/Users/timtoole PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp \
+CAM_SESSION_PID=$$ $cam_lock /usr/bin/env -i \
+  HOME=$operator_home PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp \
   CAMELID_GEMMA4_GHOST_METAL_TIMING=1 \
   CAMELID_GEMMA4_MTP_EXPERIMENT=1 \
   CAMELID_GEMMA4_MTP_ASSISTANT_PATH=${assistant} \

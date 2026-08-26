@@ -1290,11 +1290,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
            false ramp-up delays. */
         const realTokens = Number(metrics?.completionTokens) || 0
         const decodeElapsedMs = metrics?.firstContentMs != null
-          ? Math.max(1, liveElapsedMs - metrics.firstContentMs)
-          : liveElapsedMs
-        const liveTps = realTokens > 1 && metrics?.firstContentMs != null
+          ? Math.max(0, metrics.elapsedMs - metrics.firstContentMs)
+          : 0
+        const liveTps = realTokens > 1 && decodeElapsedMs > 0
           ? tokensPerSecond(realTokens - 1, decodeElapsedMs)
-          : tokensPerSecond(realTokens, liveElapsedMs)
+          : null
         if (typeof window !== 'undefined' && realTokens > 0) {
           if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
           window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(liveElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
@@ -1344,12 +1344,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
       flushAssistantStreamPatch()
       const elapsedMs = performance.now() - requestStartedAt
       const generationElapsedMs = streamed.firstContentMs != null
-        ? Math.max(1, elapsedMs - streamed.firstContentMs)
-        : elapsedMs
+        ? Math.max(0, streamed.elapsedMs - streamed.firstContentMs)
+        : 0
       const completionTokenCount = streamed.completionTokens || estimateTokenCount(streamed.content)
-      const finalTokensOutPerSec = completionTokenCount > 1 && streamed.firstContentMs != null
+      const finalTokensOutPerSec = completionTokenCount > 1 && generationElapsedMs > 0
         ? tokensPerSecond(completionTokenCount - 1, generationElapsedMs)
-        : tokensPerSecond(completionTokenCount, elapsedMs)
+        : null
       const assistantMessage = {
         ...assistantMessageBase,
         content: paceDrain(pacer, streamed.content || ''),

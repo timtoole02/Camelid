@@ -1,12 +1,13 @@
 //! Real End-to-End Speculative Benchmark for Gemma 4 26B-A4B MoE across K=2..8
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::{path::PathBuf, time::Instant};
 
 #[derive(Debug, Default, Clone)]
 struct SpecRunReport {
     k: usize,
-    target_tokens: usize,
     decode_wall_secs: f64,
     accepted_tok_s: f64,
     verify_ms_round: f64,
@@ -31,8 +32,8 @@ struct SpecRunReport {
 
 #[test]
 fn test_real_gemma4_moe_speculative_k_benchmark() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -107,7 +108,6 @@ fn test_real_gemma4_moe_speculative_k_benchmark() {
 
         let report = SpecRunReport {
             k,
-            target_tokens: spec_tokens.len(),
             decode_wall_secs,
             accepted_tok_s,
             verify_ms_round,
@@ -238,8 +238,8 @@ fn test_real_gemma4_moe_speculative_k_benchmark() {
 
 #[test]
 fn test_speculative_greedy_parity_fast() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -278,8 +278,8 @@ fn test_speculative_greedy_parity_fast() {
 
 #[test]
 fn test_k5_verification_profile() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -430,8 +430,8 @@ fn test_k5_verification_profile() {
 
 #[test]
 fn test_chat_format_investigation() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
     if !model_path.is_file() || !cghost_path.is_file() {
         return;
     }

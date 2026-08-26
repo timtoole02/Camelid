@@ -11,10 +11,107 @@ Use `../hybrid-hot48-runner/run_50tps_gate.zsh` when you need a receipt.
 Note that gate's `env -i` list is frozen, so it does **not** pass any of the
 switches below; it must be edited before it can see them.
 
+### Explicit no-watchdog observation mode
+
+`run_cfg.zsh` retains the strict watchdog by default. Setting
+`CAMELID_BENCH_NO_WATCHDOG=1` is an explicit research-only escape hatch for a
+single observation request. It runs the server in an isolated process group
+with no continuously sampling or terminating watchdog. The runner still
+requires a clean source worktree, binds the binary's embedded full source
+commit at readiness, records that commit plus binary/runner/expected-token
+SHA-256 provenance, requires exact 48/48 output, and samples swap counters,
+pressure, wired memory, RSS, and physical footprint before launch, at
+readiness, and immediately after the request.
+
+The resulting `manual-safety.json` is always marked `qualifying=false` and
+`point_samples_only=true`. Passing point samples do not prove that the
+unsampled intervals stayed within a memory limit, so this mode cannot produce
+zero-swap qualification or promotion evidence. It is only a fast discriminator.
+The outer Mini2 serialization lock remains mandatory.
+
+H69 has no new performance profile. The corrected cap-4/8/16 observation is
+activated by the existing default-off probe switch already present in the
+literal 1,408-slot H49 control. Run exactly one observation from the clean H69
+worktree with:
+
+```sh
+ssh mini2 '
+  set -euo pipefail
+  repo=/path/to/camelid-h69-src
+  binary=/path/to/camelid-h69-target/release/camelid
+  receipts=/path/to/camelid-h69-receipts
+  cd "$repo"
+  CAM_SESSION_PID=$$ \
+  CARGO_BUILD_JOBS=2 \
+  CAMELID_BENCH_NO_WATCHDOG=1 \
+  CAMELID_BENCH_BINARY="$binary" \
+  CAMELID_BENCH_OUT="$receipts" \
+    "$HOME/bin/cam-lock.sh" \
+    qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cfg.zsh \
+    mini2-h69-observation-1 \
+    qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/env/H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control
+'
+```
+
+After the locked request completes, fail closed over the run directory and
+write the request-level GO/NO-GO receipt with:
+
+```sh
+ssh mini2 '
+  repo=/path/to/camelid-h69-src
+  receipts=/path/to/camelid-h69-receipts
+  cd "$repo"
+  python3 qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/analyze_live_sequential_cap16.py \
+    "$receipts/mini2-h69-observation-1" \
+    --output "$receipts/mini2-h69-observation-1/analysis.json"
+'
+```
+
+The analyzer can return a projection verdict from this mode, but its safety
+evidence remains explicitly non-qualifying.
+
+That exact inherited profile preserves `CAMELID_GEMMA4_KV_INIT=192`, the
+literal 1,408-slot per-layer list, direct stage reads, Accelerate SGEMM fast
+prediction, two private readers, and the `14,13,14,7` effective verifier
+schedule. The H49 cap-eight stage remains the only I/O mutation; cap 4 and cap
+16 are observation-only prices of the same ranked vector.
+
+### Measured cap16 ABBA
+
+After the observation gate, the sole executable cap16 descendant is
+`env/H69-live-hidden-sequential-fast-predict-dual-reader-kv192-cap16`. It is
+byte-for-byte H49 KV192/1,408 except for
+`CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16=1`. The stage receipt's
+existing `cap` field is authoritative: the analyzer requires every round to
+report cap 8 or 16, reconciles candidates and ready hits against that reported
+cap, and requires the environment selector to agree.
+
+Run a no-watchdog cap8/cap16/cap16/cap8 campaign on Mini2 with one fresh label:
+
+```sh
+ssh mini2 '
+  repo=/path/to/camelid-h69-src
+  binary=/path/to/camelid-h69-target/release/camelid
+  receipts=/path/to/camelid-h69-receipts
+  cd "$repo"
+  CAMELID_BENCH_BINARY="$binary" \
+  CAMELID_BENCH_OUT="$receipts" \
+    qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cap16_abba_no_watchdog.zsh \
+    mini2-h69-cap16-abba1
+'
+```
+
+The helper acquires `cam-lock.sh` once around all four runs, forces the explicit
+manual no-watchdog mode, runs the detailed H69 analyzer after every exact 48/48
+request, refuses to overwrite an existing run, and emits
+`mini2-h69-cap16-abba1-cap16-abba-summary.json`. That summary requires identical
+source, binary, runner, request, and environment provenance after removing only
+the cap16 selector. Manual point samples remain non-qualifying safety evidence.
+
 ## Run one
 
 ```sh
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh \
+CAM_SESSION_PID=$$ $CAMELID_OPERATOR_BIN/cam-lock.sh \
   qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/run_cfg.zsh \
   my-label \
   qa/perf/gemma4-mtp-bandwidth-2026-08-21/demand-promotion-runner/env/H2-proportional
@@ -83,7 +180,7 @@ construction; check `exact_prefix_len == 48` instead.
 | `H34-hot-cold-overlap-h2-fixed14-boundary-single-down` | Fixed K14; first exact four-pass improvement, 29.52–29.68 tok/s |
 | `H36-hot-cold-overlap-h2-schedule14-13-14-single-down` | Exact zero-waste `14,13,14,7` schedule; 30.82 tok/s |
 | `H38-hot-cold-overlap-h2-schedule14-13-14-direct-stage` | H36 plus direct-to-stage expert reads; 32.54–32.98 tok/s |
-| `H40-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100` | **Promoted Mini2 profile:** 34.69, 35.28, 35.08 tok/s exact; zero swap |
+| `H40-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100` | Historical 2,100-slot checkpoint: 34.69, 35.28, 35.08 tok/s exact with zero swap; the later physical-footprint treaty rejects this lane |
 | `H41-hot-cold-overlap-schedule14-13-14-direct-stage-hot2200` | 2,200-slot capacity check; exact but no faster, 34.77–34.93 tok/s |
 | `H42-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-rebalanced` | Same-memory rebalancing closure; exact at 34.82 tok/s, no-go |
 | `H43-hot-cold-overlap-schedule14-13-14-direct-stage-hot2100-retained-cold6` | Six retained cold records/layer; exact at 33.53 and 33.42 tok/s, zero swap, no-go |
@@ -92,13 +189,14 @@ construction; check `exact_prefix_len == 48` instead.
 | `H46-live-hidden-sequential-probe` | Observation-only live next-layer predictor; exact, cap-eight truth hits 318, weighted recall 54.91% |
 | `H47-live-hidden-sequential-stage-cap8` | Exact one-reader private cap-eight stage; 34.69–36.51 tok/s, modest gain, scalar predictor too costly |
 | `H48-live-hidden-sequential-fast-predict` | H47 plus batched Accelerate SGEMM predictor; exact at 36.22 tok/s, one-reader readiness limited |
-| `H49-live-hidden-sequential-fast-predict-dual-reader` | H48 plus a second private reader under the same cap; exact at 36.84 tok/s, zero swap; current research best |
+| `H49-live-hidden-sequential-fast-predict-dual-reader` | Historical 2,100-slot high-water mark: exact at 36.84 tok/s with zero swap; footprint-inadmissible under the later treaty |
 | `H50-live-hidden-dual-previous-cold96` | H49 plus capped previous-round staging; exact at 34.74 tok/s, zero swap, no-go |
 | `H51-live-hidden-fast-dual-k16x3` | Three K16 verifier passes; exact at 34.08 tok/s, zero swap, no-go |
 | `H52-k16-7-step3-rejection-rank-probe` | Diagnostic width/rank profile retained for reproducibility; superseded by the narrower H53 rejection probe |
 | `H53-k16-draft10-rank-probe` | Diagnostic K16 run; exact at 34.06 tok/s, but the decisive target token ranked 20th at draft index 10, closing the width-only shortcut |
 | `H54-three-wave-live-ready-gateup` | Exact three-wave hot/ready/demand GateUp overlap; 36.25 tok/s, zero swap, no-go because 82 extra GPU submissions erased the hidden I/O gain |
 | `H49-live-hidden-sequential-fast-predict-dual-reader-kv192-control` | Strict-memory H49 control: exact frozen 1,408-slot profile and KV192; ABBA mean 31.74 tok/s, zero swap |
+| `H69-live-hidden-sequential-fast-predict-dual-reader-kv192-cap16` | H49 KV192/1,408 plus the single default-off cap16 stage selector; measure only against the adjacent H49 control in no-watchdog ABBA |
 | `H55-async-two-wave-collapse` | H54 submission recovery: exact two-command hot/terminal path; strict-memory ABBA mean 31.45 tok/s versus H49 31.74, no-go |
 | `H56-mtp-assistant-router-probe` | Read-only assistant-hidden router projection; global-96 residual-cold recall 4.63% and 31.61 ms projected savings, so predictive host staging is closed |
 | `H57-mtp-private-queue-warmup` | Target-free assistant warmup on the measured chain's private queue; exact strict-memory ABBA mean 31.34 tok/s versus H49 31.38, and the ~23 ms first-chain setup remained, no-go |

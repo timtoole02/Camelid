@@ -26,6 +26,8 @@
 //! CAMELID_GEMMA4_MTP_ASSISTANT_PATH=/exact/path/to/model.safetensors
 //! ```
 
+mod support;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -60,7 +62,9 @@ const CHILD_TIMEOUT_SECS_ENV: &str = "CAMELID_GEMMA4_MTP_CHILD_TIMEOUT_SECS";
 const NATIVE_ADMISSION_EVIDENCE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSION_EVIDENCE_JSON";
 const NATIVE_ADMISSION_RUN_NONCE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSION_RUN_NONCE";
 const NATIVE_ADMISSION_TEST_EXE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSION_TEST_EXE";
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_PROBE_ENABLE_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_PROBE";
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_PROBE_REPORT_PATH_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_REPORT_PATH";
 const HYBRID_RESIDENCY_PROFILE_SELECTOR_ENV: &str = "CAMELID_HYBRID_RESIDENCY_PROFILE";
 const HYBRID_RESIDENCY_PROFILE_V5: &str = "v5-k8-max-960";
@@ -71,10 +75,8 @@ const HYBRID_HOT_PROFILE_V5_SLOTS: [u16; 30] = [
 ];
 const HYBRID_HOT_PROFILE_V5_ENCODED: &str =
     "39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37";
-const DEFAULT_TARGET_RUNTIME_PATH: &str =
-    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf";
-const DEFAULT_TARGET_CGHOST_PATH: &str =
-    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost";
+const DEFAULT_TARGET_RUNTIME_PATH: &str = "gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf";
+const DEFAULT_TARGET_CGHOST_PATH: &str = "gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost";
 const DEFAULT_TARGET_SOURCE_PATH: &str = "/Volumes/Untitled/models/gemma-4-26B_q4_0-it.gguf";
 const DEFAULT_TARGET_CACHE_MIB: usize = 0;
 const DEFAULT_SEEDED_NGRAM_TEXT: &str = "<|channel>thought\n<channel|>";
@@ -90,7 +92,7 @@ const NATIVE_RECURRENCE_TEST_NAME: &str =
 const NATIVE_RECURRENCE_ORACLE_SHA256: &str =
     "08cf02bedfec09074eeebaa24b1ffaaa5362badd412b523de6a0d52952e94109";
 const NATIVE_RECURRENCE_GENERATION_RECEIPT_SHA256: &str =
-    "573864f252b29b63932a440d9224733e086ae4de42b10caf457da975c623053d";
+    "ec2493eefd1e5b6a0620ece7ad062bbcb333f0fdcf73865773c376280a3ca597";
 const NATIVE_STAGE_ORACLE_SHA256: &str =
     "f18ed0a4ae9538ed5b41e74c39f9242e9b7a842a7c2d3cc5d7abf9765c4b983e";
 // These run-log identities are enforced by the admitted native test. Requiring
@@ -200,8 +202,10 @@ const NO_GAIN_WALL_RATIO_LIMIT: f64 = 1.05;
 // traffic is ZERO. The old 32-token budget measured only the cold-start window, so the whole
 // 93.8 MB/token figure was warmup amortized over too few tokens. Generate past saturation.
 const PILOT_TOKENS: u64 = 256;
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_REPORT_SCHEMA_VERSION: u32 = 4;
 const LOAD_ONLY_MIN_RECLAIMABLE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+#[cfg(target_os = "macos")]
 const LOAD_ONLY_SOAK_SECONDS: u64 = 30;
 
 fn pilot_only_from(value: Option<&str>) -> Result<bool, String> {
@@ -394,15 +398,14 @@ fn canonical_internal_timed_file(path: &Path, label: &str) -> Result<PathBuf, St
                 canonical.display()
             ));
         }
+        Ok(canonical)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = label;
-        return Err("the internal-only MTP experiment is scoped to macOS".into());
+        Err("the internal-only MTP experiment is scoped to macOS".into())
     }
-
-    Ok(canonical)
 }
 
 fn current_internal_executable_sha256(label: &str) -> Result<String, String> {
@@ -623,7 +626,7 @@ fn target_runtime_config_from_environment() -> Result<TargetRuntimeConfig, Strin
     let path = |name: &str, default: &str| -> Result<PathBuf, String> {
         let path = std::env::var_os(name)
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(default));
+            .unwrap_or_else(|| PathBuf::from(support::model_root()).join(default));
         if !path.is_absolute() {
             return Err(format!("{name} must be an absolute path"));
         }
@@ -1333,9 +1336,9 @@ impl NativeAdmissionReceipt {
             || self.receipt_modified_unix_ms == 0
             || self.parent_validated_unix_ms == 0
             || !self.admission_test_executable_path.is_absolute()
-            || !self
-                .admission_test_executable_path
-                .starts_with("/Users/timtoole/")
+            || !support::is_canonical_path_within_operator_home(
+                &self.admission_test_executable_path,
+            )
             || !is_sha256_hex(&self.admission_test_executable_sha256)
         {
             return Err("native admission receipt identity is incomplete".into());
@@ -1465,6 +1468,7 @@ fn native_source_sha256() -> String {
     bytes_sha256(GEMMA4_MTP_SOURCE.as_bytes())
 }
 
+#[cfg(target_os = "macos")]
 fn native_admission_command_output(program: &str, arguments: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(arguments)
@@ -1487,15 +1491,26 @@ fn native_admission_command_output(program: &str, arguments: &[&str]) -> Result<
 }
 
 fn current_native_admission_platform() -> Result<NativeAdmissionPlatform, String> {
-    let device = metal::Device::system_default()
-        .ok_or_else(|| "no system-default Metal device is available".to_string())?;
-    Ok(NativeAdmissionPlatform {
-        os: std::env::consts::OS.to_owned(),
-        os_version: native_admission_command_output("/usr/bin/sw_vers", &["-productVersion"])?,
-        machine_arch: std::env::consts::ARCH.to_owned(),
-        machine_model: native_admission_command_output("/usr/sbin/sysctl", &["-n", "hw.model"])?,
-        metal_device_name: device.name().to_owned(),
-    })
+    #[cfg(target_os = "macos")]
+    {
+        let device = metal::Device::system_default()
+            .ok_or_else(|| "no system-default Metal device is available".to_string())?;
+        Ok(NativeAdmissionPlatform {
+            os: std::env::consts::OS.to_owned(),
+            os_version: native_admission_command_output("/usr/bin/sw_vers", &["-productVersion"])?,
+            machine_arch: std::env::consts::ARCH.to_owned(),
+            machine_model: native_admission_command_output(
+                "/usr/sbin/sysctl",
+                &["-n", "hw.model"],
+            )?,
+            metal_device_name: device.name().to_owned(),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("native MTP admission requires a macOS Metal device".into())
+    }
 }
 
 fn json_u32(root: &serde_json::Value, pointer: &str) -> Result<u32, String> {
@@ -1944,6 +1959,7 @@ struct LoadOnlyAssistantLedger {
     load_wall_us: u128,
 }
 
+#[cfg(target_os = "macos")]
 impl From<camelid::metal::Gemma4MtpResidentLedger> for LoadOnlyAssistantLedger {
     fn from(value: camelid::metal::Gemma4MtpResidentLedger) -> Self {
         Self {
@@ -2198,6 +2214,7 @@ struct LoadOnlyProbeReport {
     target_kv_borrows: u64,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn load_only_operation_violation(report: &LoadOnlyProbeReport) -> Option<String> {
     let nonzero = [
         ("assistant_warmups", report.assistant_warmups),
@@ -3139,11 +3156,13 @@ enum MonitorEvent {
 
 #[derive(Clone)]
 struct ExperimentControl {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     abort: Arc<AtomicBool>,
     events: mpsc::Sender<MonitorEvent>,
 }
 
 impl ExperimentControl {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn should_abort(&self) -> bool {
         self.abort.load(Ordering::Acquire)
     }
@@ -3163,6 +3182,7 @@ struct MonitorGuard {
 }
 
 impl MonitorGuard {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn start(baseline: MemorySnapshot) -> Self {
         let (sender, receiver) = mpsc::channel();
         let abort = Arc::new(AtomicBool::new(false));
@@ -3233,10 +3253,12 @@ impl MonitorGuard {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn control(&self) -> ExperimentControl {
         self.control.clone()
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn finish(mut self) -> MonitorResults {
         let _ = self.control.events.send(MonitorEvent::Stop);
         if let Some(join) = self.join.take() {
@@ -3260,6 +3282,7 @@ impl Drop for MonitorGuard {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn record_kill(abort: &AtomicBool, results: &Mutex<MonitorResults>, reason: KillReason) {
     abort.store(true, Ordering::Release);
     if let Ok(mut results) = results.lock() {
@@ -3267,6 +3290,7 @@ fn record_kill(abort: &AtomicBool, results: &Mutex<MonitorResults>, reason: Kill
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3426,6 +3450,7 @@ fn checkpoint_load_only_probe(
     atomic_write_json(report_path, report)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn capture_load_only_checkpoint(
     report_path: &Path,
     report: &mut LoadOnlyProbeReport,
@@ -3513,6 +3538,7 @@ fn capture_load_only_residency_checkpoint(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn persist_load_only_failure(
     report_path: &Path,
     report: &mut LoadOnlyProbeReport,
@@ -3823,7 +3849,7 @@ fn validate_routed_expert_snapshot(
                 u32::from(*hot).saturating_add(u32::from(*mapped)) == u32::from(*unique)
             });
         if snapshot.last_chained_round_sequence == 0
-            || !snapshot.last_chained_k.is_some_and(|value| value > 0)
+            || snapshot.last_chained_k.is_none_or(|value| value == 0)
             || unique_sum != snapshot.last_chained_unique_experts_sum
             || unique_max != snapshot.last_chained_unique_experts_max
             || snapshot.last_chained_overflow_experts > unique_sum
@@ -4220,6 +4246,8 @@ fn visible_committed_tokens(committed: &[u32], eot: &[u32]) -> usize {
         .count()
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn ngram_lane_run(
     run_id: String,
     phase: RunPhase,
@@ -4307,6 +4335,8 @@ fn ngram_lane_run(
     Ok(run)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn mtp_lane_run(
     run_id: String,
     phase: RunPhase,
@@ -4563,10 +4593,17 @@ impl ExperimentReport {
         // actually loaded the assistant; it stayed latent only because no lane
         // that loads the assistant had ever completed before 2026-08-21.
         let page_size = {
-            let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if raw > 0 {
-                raw as u64
-            } else {
+            #[cfg(unix)]
+            {
+                let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if raw > 0 {
+                    raw as u64
+                } else {
+                    16_384
+                }
+            }
+            #[cfg(not(unix))]
+            {
                 16_384
             }
         };
@@ -5006,7 +5043,7 @@ fn load_native_admission_receipt(
         return Err(format!("{NATIVE_ADMISSION_EVIDENCE_ENV} must be absolute"));
     }
     let canonical = canonical_internal_timed_file(&path, "native admission receipt")?;
-    if !canonical.starts_with("/Users/timtoole/") {
+    if !support::is_canonical_path_within_operator_home(&canonical) {
         return Err(format!(
             "native admission receipt escaped its producer's internal path policy: {}",
             canonical.display()
@@ -5069,7 +5106,7 @@ fn load_native_admission_receipt(
         &admission_test_executable_path,
         "native admission test executable",
     )?;
-    if !admission_test_executable_path.starts_with("/Users/timtoole/") {
+    if !support::is_canonical_path_within_operator_home(&admission_test_executable_path) {
         return Err(format!(
             "native admission test executable escaped its internal path policy: {}",
             admission_test_executable_path.display()
@@ -5859,6 +5896,7 @@ impl NativeMtpExperimentAdapter for NativeChildProcessAdapter {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn apply_child_environment(request: &ChildLaneRequest) -> Result<(), String> {
     if request.schema_version != REPORT_SCHEMA_VERSION {
         return Err(format!(
@@ -5955,6 +5993,7 @@ fn apply_child_environment(request: &ChildLaneRequest) -> Result<(), String> {
 /// Apply only the exact target load environment. This is intentionally not
 /// shared with the N/I/M child: the load probe has no proposal environment and
 /// must not inherit one from an earlier benchmark shell.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn apply_load_only_environment(
     target_runtime: &TargetRuntimeConfig,
     assistant_path: &Path,
@@ -6004,6 +6043,7 @@ fn shipping_argmax(logits: &[f32]) -> Result<u32, String> {
         .ok_or_else(|| "target returned empty logits".into())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn warm_target_runtime<C: FnMut() -> bool>(
     runtime: &camelid::gemma4_runtime::Gemma4Runtime,
     mut should_abort: C,
@@ -6023,14 +6063,13 @@ fn warm_target_runtime<C: FnMut() -> bool>(
             &mut kc,
             &mut vc,
             TARGET_WARMUP_TOKENS as usize,
-            || should_abort(),
+            &mut should_abort,
         )
         .map_err(|error| format!("target warmup prefill: {error}"))?
     else {
         return Ok(false);
     };
-    let mut pos = tokens.len();
-    for _ in 0..TARGET_WARMUP_TOKENS {
+    for pos in tokens.len()..tokens.len() + TARGET_WARMUP_TOKENS as usize {
         if should_abort() {
             return Ok(false);
         }
@@ -6041,11 +6080,11 @@ fn warm_target_runtime<C: FnMut() -> bool>(
         logits = runtime
             .step(token, pos, &mut kc, &mut vc)
             .map_err(|error| format!("target warmup step: {error}"))?;
-        pos += 1;
     }
     Ok(true)
 }
 
+#[cfg(target_os = "macos")]
 fn assistant_memory_from_ledger(
     ledger: camelid::metal::Gemma4MtpResidentLedger,
     page_size: u64,
@@ -6087,6 +6126,8 @@ fn empty_lane_memory(request: &ChildLaneRequest) -> LaneMemoryReceipt {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn finish_lane_memory(
     request: &ChildLaneRequest,
     baseline: &MemorySnapshot,
@@ -6134,6 +6175,7 @@ fn finish_lane_memory(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn warm_assistant_once(
     assistant: &mut camelid::metal::Gemma4MtpAssistantMetal,
     control: &ExperimentControl,
@@ -6156,6 +6198,7 @@ fn warm_assistant_once(
     Ok(true)
 }
 
+#[cfg(target_os = "macos")]
 fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, String> {
     apply_child_environment(request)?;
     #[cfg(unix)]
@@ -6592,6 +6635,7 @@ fn explicit_native_admission_run_nonce() -> Result<String, String> {
     Ok(nonce)
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "private subprocess entry point for the isolated parent experiment"]
 fn gemma4_mtp_assistant_lane_child() {
@@ -6627,6 +6671,7 @@ fn gemma4_mtp_assistant_lane_child() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "default-off load-only residency probe; never tokenizes, prefills, steps, proposes, or generates"]
+#[allow(clippy::drop_non_drop)]
 fn gemma4_mtp_assistant_load_only_probe() {
     if std::env::var(LOAD_ONLY_PROBE_ENABLE_ENV).ok().as_deref() != Some("1") {
         eprintln!("SKIP: set {LOAD_ONLY_PROBE_ENABLE_ENV}=1 for the isolated load-only probe");
@@ -7021,6 +7066,10 @@ fn gemma4_mtp_assistant_load_only_probe() {
 #[test]
 #[ignore = "default-off isolated MTP experiment; requires explicit opt-in and exact assistant path"]
 fn gemma4_mtp_assistant_experiment() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("SKIP: the native MTP assistant experiment requires macOS Metal");
+        return;
+    }
     if std::env::var(EXPERIMENT_ENABLE_ENV).ok().as_deref() != Some("1") {
         eprintln!("SKIP: set {EXPERIMENT_ENABLE_ENV}=1 for the isolated MTP experiment");
         return;
@@ -7156,6 +7205,12 @@ fn gemma4_mtp_assistant_experiment() {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    fn absolute_test_path(relative: &str) -> PathBuf {
+        std::env::current_dir()
+            .expect("resolve test working directory")
+            .join(relative)
+    }
 
     fn system_sample(
         elapsed_ms: u64,
@@ -7390,8 +7445,8 @@ mod pure_tests {
 
     #[test]
     fn pilot_only_requires_exact_positive_opt_in() {
-        assert_eq!(pilot_only_from(None).unwrap(), false);
-        assert_eq!(pilot_only_from(Some("1")).unwrap(), true);
+        assert!(!pilot_only_from(None).unwrap());
+        assert!(pilot_only_from(Some("1")).unwrap());
         for invalid in ["", "0", "true", " 1 "] {
             assert!(pilot_only_from(Some(invalid)).is_err());
         }
@@ -7654,27 +7709,29 @@ mod pure_tests {
             pair_gate_passed: true,
             target_repository: OFFICIAL_TARGET_REPOSITORY.into(),
             target_revision: OFFICIAL_TARGET_REVISION.into(),
-            target_source_path: "/Volumes/source/target.gguf".into(),
+            target_source_path: absolute_test_path("source/target.gguf"),
             target_source_bytes: OFFICIAL_TARGET_BYTES,
             target_source_sha256: OFFICIAL_TARGET_SHA256.into(),
             target_source_matches_official: true,
-            target_staged_runtime_path: "/runtime/target.hot.gguf".into(),
-            target_staged_cghost_path: "/runtime/target.cghost".into(),
+            target_staged_runtime_path: absolute_test_path("runtime/target.hot.gguf"),
+            target_staged_cghost_path: absolute_test_path("runtime/target.cghost"),
             target_staged_identity_scheme: STAGED_TARGET_IDENTITY_SCHEME.into(),
             target_staged_metadata_matches_source: true,
             target_cghost_matches_official_source: true,
             target_cghost_matches_staged_runtime: true,
             assistant_repository: OFFICIAL_ASSISTANT_REPOSITORY.into(),
             assistant_revision: OFFICIAL_ASSISTANT_REVISION.into(),
-            assistant_staged_model_path: "/stage/assistant/model.safetensors".into(),
+            assistant_staged_model_path: absolute_test_path("stage/assistant/model.safetensors"),
             assistant_staged_model_bytes: OFFICIAL_ASSISTANT_MODEL_BYTES,
             assistant_staged_model_sha256: OFFICIAL_ASSISTANT_MODEL_SHA256.into(),
-            assistant_staged_config_path: "/stage/assistant/config.json".into(),
+            assistant_staged_config_path: absolute_test_path("stage/assistant/config.json"),
             assistant_staged_config_sha256: OFFICIAL_ASSISTANT_CONFIG_SHA256.into(),
-            assistant_staged_tokenizer_config_path: "/stage/assistant/tokenizer_config.json".into(),
+            assistant_staged_tokenizer_config_path: absolute_test_path(
+                "stage/assistant/tokenizer_config.json",
+            ),
             assistant_staged_tokenizer_config_sha256: OFFICIAL_ASSISTANT_TOKENIZER_CONFIG_SHA256
                 .into(),
-            assistant_staged_tokenizer_path: "/stage/assistant/tokenizer.json".into(),
+            assistant_staged_tokenizer_path: absolute_test_path("stage/assistant/tokenizer.json"),
             assistant_staged_tokenizer_sha256: OFFICIAL_ASSISTANT_TOKENIZER_SHA256.into(),
             assistant_staged_files_match_official: true,
             shared_vocab_size: SHARED_VOCAB_SIZE,
@@ -7742,8 +7799,8 @@ mod pure_tests {
     #[test]
     fn target_runtime_settings_pin_the_current_exact_lane() {
         let config = TargetRuntimeConfig {
-            runtime_gguf_path: "/runtime/target.gguf".into(),
-            cghost_path: "/runtime/target.cghost".into(),
+            runtime_gguf_path: absolute_test_path("runtime/target.gguf"),
+            cghost_path: absolute_test_path("runtime/target.cghost"),
             expert_cache_mib: DEFAULT_TARGET_CACHE_MIB,
             environment: exact_target_environment(),
         };
@@ -7800,8 +7857,8 @@ mod pure_tests {
         }
 
         let profiled = TargetRuntimeConfig {
-            runtime_gguf_path: "/runtime/target.gguf".into(),
-            cghost_path: "/runtime/target.cghost".into(),
+            runtime_gguf_path: absolute_test_path("runtime/target.gguf"),
+            cghost_path: absolute_test_path("runtime/target.cghost"),
             expert_cache_mib: DEFAULT_TARGET_CACHE_MIB,
             environment: exact_target_environment_with_profile(true),
         };
@@ -7902,7 +7959,7 @@ mod pure_tests {
             .unwrap_err()
             .contains("not bound to the official source"));
 
-        let wrong_selected_path = PathBuf::from("/stage/other/model.safetensors");
+        let wrong_selected_path = absolute_test_path("stage/other/model.safetensors");
         assert!(exact
             .validate(&wrong_selected_path)
             .unwrap_err()
@@ -8137,12 +8194,12 @@ mod pure_tests {
             delta_from_previous: LoadOnlyMemoryDelta::default(),
             target_observation: None,
         };
-        assert!(load_only_safety_violation(&baseline, &[safe.clone()], &[]).is_none());
+        assert!(load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[]).is_none());
 
         let mut swapped = baseline.clone();
         swapped.swapouts_bytes += swapped.page_size;
         assert!(
-            load_only_safety_violation(&baseline, &[safe.clone()], &[swapped])
+            load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[swapped])
                 .unwrap()
                 .contains("swapouts increased")
         );
@@ -8150,7 +8207,7 @@ mod pure_tests {
         let mut pressure = baseline.clone();
         pressure.pressure = MemoryPressure::Warn;
         assert!(
-            load_only_safety_violation(&baseline, &[safe.clone()], &[pressure])
+            load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[pressure])
                 .unwrap()
                 .contains("not normal")
         );
@@ -8161,16 +8218,22 @@ mod pure_tests {
         low_strict_free.reclaimable_headroom_bytes = low_strict_free
             .free_bytes
             .saturating_add(low_strict_free.inactive_bytes);
-        assert!(
-            load_only_safety_violation(&baseline, &[safe.clone()], &[low_strict_free]).is_none()
-        );
+        assert!(load_only_safety_violation(
+            &baseline,
+            std::slice::from_ref(&safe),
+            &[low_strict_free]
+        )
+        .is_none());
 
         let mut at_floor = baseline.clone();
         at_floor.free_bytes = 1;
         at_floor.inactive_bytes = LOAD_ONLY_MIN_RECLAIMABLE_HEADROOM_BYTES - 1;
         at_floor.reclaimable_headroom_bytes =
             at_floor.free_bytes.saturating_add(at_floor.inactive_bytes);
-        assert!(load_only_safety_violation(&baseline, &[safe.clone()], &[at_floor]).is_none());
+        assert!(
+            load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[at_floor])
+                .is_none()
+        );
 
         let mut low_headroom = baseline.clone();
         low_headroom.free_bytes = 1;
@@ -8191,7 +8254,10 @@ mod pure_tests {
             .free_bytes
             .saturating_add(saturated.inactive_bytes);
         assert_eq!(saturated.reclaimable_headroom_bytes, u64::MAX);
-        assert!(load_only_safety_violation(&saturated, &[], &[saturated.clone()]).is_none());
+        assert!(
+            load_only_safety_violation(&saturated, &[], std::slice::from_ref(&saturated),)
+                .is_none()
+        );
     }
 
     #[test]

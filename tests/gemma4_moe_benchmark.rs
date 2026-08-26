@@ -2,6 +2,8 @@
 //! Experiment A: Command-buffer chaining (1, 2, 5, 10 layers/sync)
 //! Experiment B: Metal-slot capacity (16, 24, 32 slots/layer)
 
+mod support;
+
 use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
@@ -61,8 +63,8 @@ fn get_system_memory_metrics() -> (f64, f64, f64, f64) {
 
 #[test]
 fn test_experiment_b_metal_slot_capacity() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -121,13 +123,7 @@ fn test_experiment_b_metal_slot_capacity() {
         let accepted_tokens = 5;
         let accepted_tok_s = (accepted_tokens as f64) / t_round_wall.as_secs_f64();
         let (rss_mb, compressor_mb, swap_used_mb, _swap_total_mb) = get_system_memory_metrics();
-        let slot_misses = if slots == 16 {
-            "180 (fallback)"
-        } else if slots == 24 {
-            "0"
-        } else {
-            "0"
-        };
+        let slot_misses = if slots == 16 { "180 (fallback)" } else { "0" };
 
         println!(
             "{:<14} | {:<12.2} | {:<14.2} | {:<10} | {:<12.2} | {:<12.1} | {:<10.1}",
@@ -146,8 +142,8 @@ fn test_experiment_b_metal_slot_capacity() {
 
 #[test]
 fn test_experiment_a_command_buffer_chaining() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
@@ -235,8 +231,8 @@ fn test_experiment_a_command_buffer_chaining() {
 
 #[test]
 fn test_cache_maintenance_granularity_and_metal_attention() {
-    let model_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf");
-    let cghost_path = PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost");
+    let model_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.gguf");
+    let cghost_path = PathBuf::from(support::model_root()).join("gemma-4-26B_q4_0-it.cghost");
 
     if !model_path.is_file() || !cghost_path.is_file() {
         eprintln!("SKIP: 26B MoE model/cghost not found");
