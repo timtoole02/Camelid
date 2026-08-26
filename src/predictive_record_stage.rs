@@ -58,7 +58,7 @@ enum PredictiveRecordState {
     Queued,
     Reading,
     Ready(Box<[u8]>),
-    Failed(String),
+    Failed(#[allow(dead_code)] String),
     DemandOwned,
     Taken,
 }
@@ -109,6 +109,7 @@ impl PredictiveRecordEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PredictiveRecordSource {
     Staged,
+    #[cfg(test)]
     Demand,
 }
 
@@ -164,6 +165,7 @@ pub(crate) enum PredictiveRecordTakeError {
     Cancelled,
     DemandInFlight(PredictiveRecordKey),
     AlreadyTaken(PredictiveRecordKey),
+    #[cfg(test)]
     LoadFailed {
         key: PredictiveRecordKey,
         message: String,
@@ -184,6 +186,7 @@ impl fmt::Display for PredictiveRecordTakeError {
                 "predictive record ({}, {}) was already taken",
                 key.layer, key.expert
             ),
+            #[cfg(test)]
             Self::LoadFailed { key, message } => write!(
                 f,
                 "predictive record ({}, {}) load failed: {message}",
@@ -326,6 +329,7 @@ impl PredictiveRecordStage {
     }
 
     /// Last loader failure for an admitted key, if it is still failed.
+    #[cfg(test)]
     pub(crate) fn failure_message(&self, key: PredictiveRecordKey) -> Option<String> {
         let entry = self.inner.entries.get(&key)?;
         let state = entry.lock();
@@ -343,6 +347,7 @@ impl PredictiveRecordStage {
     /// variable and consumes the published result, so the race never issues a
     /// duplicate load. Background failures are retried once by this demand
     /// call because predictive failure cannot replace authoritative I/O.
+    #[cfg(test)]
     pub(crate) fn take_or_demand(
         &self,
         key: PredictiveRecordKey,
@@ -641,6 +646,7 @@ fn run_coordinator(inner: Arc<PredictiveStageInner>) {
     }
 }
 
+#[cfg(test)]
 fn load_for_demand(
     loader: &PredictiveRecordLoader,
     key: PredictiveRecordKey,
@@ -831,6 +837,7 @@ pub(crate) struct RollingPredictiveRecordStage {
 
 impl RollingPredictiveRecordStage {
     /// Start one private serial worker that can serve many rolling launches.
+    #[cfg(test)]
     pub(crate) fn start(
         max_records: usize,
         loader: PredictiveRecordLoader,

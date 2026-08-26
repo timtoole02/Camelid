@@ -1098,7 +1098,7 @@ impl Spec50Cfg {
         self.nr >= 1
             && self.sg >= 1
             && self.sg <= 32
-            && (self.tb == 0 || (self.tb % 8 == 0 && self.tb <= 32))
+            && (self.tb == 0 || (self.tb.is_multiple_of(8) && self.tb <= 32))
     }
 }
 
@@ -1238,7 +1238,9 @@ pub(crate) struct Spec50ExactCfg {
 
 impl Spec50ExactCfg {
     fn valid(self) -> bool {
-        self.sg >= 1 && self.sg <= 16 && (self.tb == 0 || (self.tb % 8 == 0 && self.tb <= 32))
+        self.sg >= 1
+            && self.sg <= 16
+            && (self.tb == 0 || (self.tb.is_multiple_of(8) && self.tb <= 32))
     }
 
     fn suffix(self) -> String {
@@ -2225,7 +2227,7 @@ mod tests {
             let wb = buf_from(&c.device, &w);
             let yv = random_f32(&mut rng, blocks * 32 * K8);
             let yb = buf_from(&c.device, &yv);
-            let new = plain_new(&c, &ks, &yb, &wb, rows, blocks);
+            let new = plain_new(c, &ks, &yb, &wb, rows, blocks);
             let old = plain_old(c, &yb, &wb, rows, blocks);
             nonzero("plain", &new);
             bad += bits_equal(
@@ -2790,7 +2792,7 @@ mod tests {
 
         let mut guarded_qkv_y = vec![poison; GUARD];
         guarded_qkv_y.extend_from_slice(&qkv_y);
-        guarded_qkv_y.extend_from_slice(&vec![poison; GUARD]);
+        guarded_qkv_y.extend_from_slice(&[poison; GUARD]);
         let qkv_y_buf = buf_from(&c.device, &guarded_qkv_y);
         let q_out = poisoned_f32(&c.device, GUARD + WAVE_K * q_rows + GUARD);
         let k_out = poisoned_f32(&c.device, GUARD + WAVE_K * k_rows + GUARD);
@@ -2869,7 +2871,7 @@ mod tests {
 
         let mut guarded_o_y = vec![poison; GUARD];
         guarded_o_y.extend_from_slice(&o_y);
-        guarded_o_y.extend_from_slice(&vec![poison; GUARD]);
+        guarded_o_y.extend_from_slice(&[poison; GUARD]);
         let o_y_buf = buf_from(&c.device, &guarded_o_y);
         let o_out = poisoned_f32(&c.device, GUARD + WAVE_K * o_rows + GUARD);
         run(&c.queue, |encoder| {
@@ -2945,7 +2947,7 @@ mod tests {
             let wu = buf_from(&c.device, &random_q4_0(&mut rng, rows, blocks));
             let yv = random_f32(&mut rng, blocks * 32 * K8);
             let yb = buf_from(&c.device, &yv);
-            let new = gateup_new(&c, &ks, &yb, &wg, &wu, rows, blocks);
+            let new = gateup_new(c, &ks, &yb, &wg, &wu, rows, blocks);
             let old = gateup_old(c, &yb, &wg, &wu, rows, blocks);
             nonzero("gateup", &new);
             bad += bits_equal(

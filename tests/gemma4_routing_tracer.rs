@@ -7,6 +7,7 @@ use camelid::gemma4_runtime::Gemma4Runtime;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct ExpertTraceStats {
     activations: usize,
     last_position: Option<usize>,
@@ -15,6 +16,7 @@ struct ExpertTraceStats {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct LayerTrace {
     layer_idx: usize,
     expert_stats: [ExpertTraceStats; 128],

@@ -308,7 +308,7 @@ impl GgufWireMmap {
                     .cast_mut()
                     .cast::<libc::c_void>(),
                 mapped_bytes,
-                status.as_mut_ptr().cast::<libc::c_char>(),
+                status.as_mut_ptr().cast(),
             )
         };
         if result != 0 {

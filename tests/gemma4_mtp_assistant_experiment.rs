@@ -3823,7 +3823,7 @@ fn validate_routed_expert_snapshot(
                 u32::from(*hot).saturating_add(u32::from(*mapped)) == u32::from(*unique)
             });
         if snapshot.last_chained_round_sequence == 0
-            || !snapshot.last_chained_k.is_some_and(|value| value > 0)
+            || snapshot.last_chained_k.is_none_or(|value| value == 0)
             || unique_sum != snapshot.last_chained_unique_experts_sum
             || unique_max != snapshot.last_chained_unique_experts_max
             || snapshot.last_chained_overflow_experts > unique_sum
@@ -4220,6 +4220,7 @@ fn visible_committed_tokens(committed: &[u32], eot: &[u32]) -> usize {
         .count()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ngram_lane_run(
     run_id: String,
     phase: RunPhase,
@@ -4307,6 +4308,7 @@ fn ngram_lane_run(
     Ok(run)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mtp_lane_run(
     run_id: String,
     phase: RunPhase,
@@ -6023,14 +6025,13 @@ fn warm_target_runtime<C: FnMut() -> bool>(
             &mut kc,
             &mut vc,
             TARGET_WARMUP_TOKENS as usize,
-            || should_abort(),
+            &mut should_abort,
         )
         .map_err(|error| format!("target warmup prefill: {error}"))?
     else {
         return Ok(false);
     };
-    let mut pos = tokens.len();
-    for _ in 0..TARGET_WARMUP_TOKENS {
+    for pos in tokens.len()..tokens.len() + TARGET_WARMUP_TOKENS as usize {
         if should_abort() {
             return Ok(false);
         }
@@ -6041,7 +6042,6 @@ fn warm_target_runtime<C: FnMut() -> bool>(
         logits = runtime
             .step(token, pos, &mut kc, &mut vc)
             .map_err(|error| format!("target warmup step: {error}"))?;
-        pos += 1;
     }
     Ok(true)
 }
@@ -6087,6 +6087,7 @@ fn empty_lane_memory(request: &ChildLaneRequest) -> LaneMemoryReceipt {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_lane_memory(
     request: &ChildLaneRequest,
     baseline: &MemorySnapshot,
@@ -6627,6 +6628,7 @@ fn gemma4_mtp_assistant_lane_child() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "default-off load-only residency probe; never tokenizes, prefills, steps, proposes, or generates"]
+#[allow(clippy::drop_non_drop)]
 fn gemma4_mtp_assistant_load_only_probe() {
     if std::env::var(LOAD_ONLY_PROBE_ENABLE_ENV).ok().as_deref() != Some("1") {
         eprintln!("SKIP: set {LOAD_ONLY_PROBE_ENABLE_ENV}=1 for the isolated load-only probe");
@@ -7390,8 +7392,8 @@ mod pure_tests {
 
     #[test]
     fn pilot_only_requires_exact_positive_opt_in() {
-        assert_eq!(pilot_only_from(None).unwrap(), false);
-        assert_eq!(pilot_only_from(Some("1")).unwrap(), true);
+        assert!(!pilot_only_from(None).unwrap());
+        assert!(pilot_only_from(Some("1")).unwrap());
         for invalid in ["", "0", "true", " 1 "] {
             assert!(pilot_only_from(Some(invalid)).is_err());
         }
@@ -8137,12 +8139,12 @@ mod pure_tests {
             delta_from_previous: LoadOnlyMemoryDelta::default(),
             target_observation: None,
         };
-        assert!(load_only_safety_violation(&baseline, &[safe.clone()], &[]).is_none());
+        assert!(load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[]).is_none());
 
         let mut swapped = baseline.clone();
         swapped.swapouts_bytes += swapped.page_size;
         assert!(
-            load_only_safety_violation(&baseline, &[safe.clone()], &[swapped])
+            load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[swapped])
                 .unwrap()
                 .contains("swapouts increased")
         );
@@ -8150,7 +8152,7 @@ mod pure_tests {
         let mut pressure = baseline.clone();
         pressure.pressure = MemoryPressure::Warn;
         assert!(
-            load_only_safety_violation(&baseline, &[safe.clone()], &[pressure])
+            load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[pressure])
                 .unwrap()
                 .contains("not normal")
         );
@@ -8161,16 +8163,22 @@ mod pure_tests {
         low_strict_free.reclaimable_headroom_bytes = low_strict_free
             .free_bytes
             .saturating_add(low_strict_free.inactive_bytes);
-        assert!(
-            load_only_safety_violation(&baseline, &[safe.clone()], &[low_strict_free]).is_none()
-        );
+        assert!(load_only_safety_violation(
+            &baseline,
+            std::slice::from_ref(&safe),
+            &[low_strict_free]
+        )
+        .is_none());
 
         let mut at_floor = baseline.clone();
         at_floor.free_bytes = 1;
         at_floor.inactive_bytes = LOAD_ONLY_MIN_RECLAIMABLE_HEADROOM_BYTES - 1;
         at_floor.reclaimable_headroom_bytes =
             at_floor.free_bytes.saturating_add(at_floor.inactive_bytes);
-        assert!(load_only_safety_violation(&baseline, &[safe.clone()], &[at_floor]).is_none());
+        assert!(
+            load_only_safety_violation(&baseline, std::slice::from_ref(&safe), &[at_floor])
+                .is_none()
+        );
 
         let mut low_headroom = baseline.clone();
         low_headroom.free_bytes = 1;
@@ -8191,7 +8199,10 @@ mod pure_tests {
             .free_bytes
             .saturating_add(saturated.inactive_bytes);
         assert_eq!(saturated.reclaimable_headroom_bytes, u64::MAX);
-        assert!(load_only_safety_violation(&saturated, &[], &[saturated.clone()]).is_none());
+        assert!(
+            load_only_safety_violation(&saturated, &[], std::slice::from_ref(&saturated),)
+                .is_none()
+        );
     }
 
     #[test]

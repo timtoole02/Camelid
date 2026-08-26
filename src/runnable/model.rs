@@ -3010,6 +3010,8 @@ impl RunnableModel {
         is_cancelled: &dyn Fn() -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = is_cancelled;
         #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         let _ = stream_tokens_observable;
 

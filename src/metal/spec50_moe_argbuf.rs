@@ -2603,12 +2603,8 @@ impl Gemma4MoeSlotArgTable {
         k_candidates: usize,
         policy: Gemma4MoeGateupRangePolicy,
     ) -> Option<Gemma4MoeGateupRangeDispatch> {
-        let Some(work_end) = work_base.checked_add(work_count) else {
-            return None;
-        };
-        let Some(layout) = gateup_range_layout(work_base, work_count, k_candidates) else {
-            return None;
-        };
+        let work_end = work_base.checked_add(work_count)?;
+        let layout = gateup_range_layout(work_base, work_count, k_candidates)?;
         let input_scales_end = k_candidates
             .checked_mul(S50_GU_BLOCKS)
             .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()));
@@ -2622,12 +2618,8 @@ impl Gemma4MoeSlotArgTable {
         {
             return None;
         }
-        let Some(kernel) = metal_linear_kernel() else {
-            return None;
-        };
-        let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
-            return None;
-        };
+        let kernel = metal_linear_kernel()?;
+        let pipelines = spec50_moe_argbuf_kernels(&kernel.device)?;
         let Some(dispatch) = argbuf_gateup_range_dispatch(
             k_candidates,
             policy,
@@ -2704,10 +2696,10 @@ impl Gemma4MoeSlotArgTable {
         let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
             return false;
         };
-        if k_candidates <= 8 && pipelines.down_rows8.is_some() {
-            encode_argbuf_down_rows8(
+        match (k_candidates <= 8, pipelines.down_rows8.as_ref()) {
+            (true, Some(rows8)) => encode_argbuf_down_rows8(
                 encoder,
-                pipelines.down_rows8.as_ref().unwrap(),
+                rows8,
                 act_scales,
                 act_quants,
                 &self.table,
@@ -2715,9 +2707,8 @@ impl Gemma4MoeSlotArgTable {
                 work_list,
                 output,
                 k_candidates as u32,
-            );
-        } else {
-            encode_argbuf_down(
+            ),
+            _ => encode_argbuf_down(
                 encoder,
                 &pipelines.down,
                 act_scales,
@@ -2727,7 +2718,7 @@ impl Gemma4MoeSlotArgTable {
                 work_list,
                 output,
                 k_candidates as u32,
-            );
+            ),
         }
         true
     }
@@ -3231,7 +3222,7 @@ fn encode_argbuf_gateup_tile4(
     encoder.set_buffer(5, Some(output_quants), 0);
     encoder.set_bytes(6, 4, &num_unique_experts as *const u32 as *const _);
     encoder.set_bytes(7, 4, &k_candidates as *const u32 as *const _);
-    let tiles = (k_candidates + 3) / 4;
+    let tiles = k_candidates.div_ceil(4);
     encoder.dispatch_thread_groups(
         metal::MTLSize {
             width: u64::from(num_unique_experts) * u64::from(tiles) * (S50_FF as u64 / 32),
@@ -3377,7 +3368,7 @@ fn encode_argbuf_down_tg4(
     encoder.set_buffer(4, Some(work_list), 0);
     encoder.set_buffer(5, Some(output_moe_acc), 0);
     encoder.set_bytes(6, 4, &k_candidates as *const u32 as *const _);
-    let candidate_tiles = (k_candidates + 3) / 4;
+    let candidate_tiles = k_candidates.div_ceil(4);
     encoder.dispatch_thread_groups(
         metal::MTLSize {
             width: (S50_HIDDEN / S50_DOWN_ROWS_PER_SIMDGROUP) as u64 * u64::from(candidate_tiles),
@@ -3908,10 +3899,10 @@ mod tests {
         }
     }
 
-    fn shipping_head_gateup_pipeline<'a>(
-        kernel: &'a super::super::MetalLinearKernel,
+    fn shipping_head_gateup_pipeline(
+        kernel: &super::super::MetalLinearKernel,
         mode: Gemma4HeadArgbufGateMode,
-    ) -> Option<&'a ComputePipelineState> {
+    ) -> Option<&ComputePipelineState> {
         let pipeline = match mode {
             Gemma4HeadArgbufGateMode::Split => {
                 Some(&kernel.gemma4_q4_expert_gate_up_split_pipeline)
@@ -3980,10 +3971,10 @@ mod tests {
         true
     }
 
-    fn shipping_head_down_pipeline<'a>(
-        kernel: &'a super::super::MetalLinearKernel,
+    fn shipping_head_down_pipeline(
+        kernel: &super::super::MetalLinearKernel,
         mode: Gemma4HeadArgbufDownMode,
-    ) -> Option<&'a ComputePipelineState> {
+    ) -> Option<&ComputePipelineState> {
         let pipeline = match mode {
             Gemma4HeadArgbufDownMode::Scalar => Some(&kernel.gemma4_q4_expert_down_reduce_pipeline),
             Gemma4HeadArgbufDownMode::OrderedSimd => {
@@ -4426,7 +4417,7 @@ mod tests {
         let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
             .expect("anonymous per-slot Tier-2 table");
 
-        let mut rng = Rng::new(0x12a2_6b50_01);
+        let mut rng = Rng::new(0x0012_a26b_5001);
         let input_scales = new_buffer(device, WIDE_K * S50_GU_BLOCKS * 4);
         let scales: Vec<f32> = (0..WIDE_K * S50_GU_BLOCKS)
             .map(|_| 0.0005 + rng.next_f32() * 0.01)
