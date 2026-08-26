@@ -13979,10 +13979,11 @@ mod tests {
                         assert!(tools.iter().any(|tool| tool.name == "run_shell"));
                         ModelStep::Calls(vec![tc("read_file", json!({"path":"tic_tac_toe.py"}))])
                     }
-                    2 if !tools.is_empty() => ModelStep::Calls(vec![tc(
-                        "run_shell",
-                        json!({"command": "python3 -m py_compile tic_tac_toe.py"}),
-                    )]),
+                    2 if !tools.is_empty() => {
+                        let command = host_python_compile_command("tic_tac_toe.py")
+                            .expect("simple Python path must have a host compile command");
+                        ModelStep::Calls(vec![tc("run_shell", json!({"command": command}))])
+                    }
                     _ => {
                         assert!(tools.is_empty());
                         ModelStep::Text("Created and verified tic_tac_toe.py.".into())
@@ -13994,7 +13995,9 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        // This test runs a real Python compiler; allow for a cold launcher on a
+        // loaded Windows runner while retaining a finite liveness bound.
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(30)).unwrap();
         let source = concat!(
             "import tkinter as tk\n",
             "from tkinter import messagebox\n",
@@ -16587,7 +16590,9 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+        // Host-owned completion runs a real Python compiler after the read.
+        // A cold Windows launcher can exceed the generic 5-second test bound.
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(30))
             .unwrap()
             .with_shell_mode(ShellSandbox::Sandboxed);
         super::super::checkpoint::clear_for_workspace(sandbox.root());
