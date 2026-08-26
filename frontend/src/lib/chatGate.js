@@ -4,9 +4,11 @@ import {
   isCompatibilityNumericalVarianceRunnableForModel,
   isCompatibilitySupportedForModel,
   isCompatibilityVerifiedRunnableForModel,
+  isSupportedCapabilityStatus,
 } from './capabilities.js'
 import { isEmbeddingOnlyModel, modelTaskKind } from './modelCapabilities.js'
 import { isModelLoadedNow, isRunnableInCurrentRuntime, modelRuntimeIdMatches } from './modelState.js'
+import { GEMMA4_MINI2_WEBUI_PROFILE_ID } from './executionPlan.js'
 
 /* The backend's exact-artifact verdict for this model's GGUF, from
    `/api/models/local`. `classify_model_lane()` requires BOTH an implemented
@@ -108,14 +110,38 @@ function supportedLfm2Runtime(runtime) {
     && plan.decode_path === 'lfm2_metal_resident_decode'
 }
 
-function supportedCatalogGhostCuda(runtime, runtimeLane) {
+function supportedCatalogGhostCuda() {
+  // The v1 catalog marker does not bind the current sparse-shadow and cghost
+  // bytes. Preserve the runnable CUDA implementation, but keep frontend
+  // verification closed until a digest-bound install receipt exists.
+  return false
+}
+
+function supportedAppleM4MetalGhost(runtime, runtimeLane) {
+  const plan = runtime?.execution_plan
   return runtimeLane === 'ghost_moe'
     && runtime?.backend === 'gemma4-runtime'
-    && runtime?.gemma4_ghost_catalog_managed === true
-    && runtime?.gemma4_ghost_backend === 'cuda'
+    && plan?.operating_system === 'macos'
+    && plan?.architecture === 'aarch64'
+    && plan?.cpu_model === 'Apple M4'
+    && plan?.support_level === 'supported_exact_row_smoke'
+    && plan?.selected_backend === 'gemma4_ghost_moe_metal_runtime'
+    && plan?.prefill_path === 'gemma4_ghost_moe_metal_prefill'
+    && plan?.decode_path === 'gemma4_ghost_moe_metal_speculative_decode'
+    && runtime?.gemma4_ghost_backend === 'metal'
+    && runtime?.gemma4_ghost_execution_mode === 'full_common_metal'
+    && runtime?.gemma4_ghost_common_metal_active === true
+    && runtime?.gemma4_ghost_experts_metal_active === true
+    && runtime?.gemma4_ghost_head_metal_active === true
     && runtime?.gemma4_ghost_common_gpu_active === true
     && runtime?.gemma4_ghost_experts_gpu_active === true
     && runtime?.gemma4_ghost_head_gpu_active === true
+    && runtime?.gemma4_mtp_assistant_loaded === true
+    && runtime?.gemma4_mtp_full_q4_active === true
+    && runtime?.gemma4_ghost_exact_expert_policy_active === true
+    && runtime?.gemma4_ghost_runtime_profile === GEMMA4_MINI2_WEBUI_PROFILE_ID
+    && Number.isSafeInteger(runtime?.gemma4_ghost_common_metal_context_capacity)
+    && runtime.gemma4_ghost_common_metal_context_capacity >= 1024
 }
 
 function runtimeLaneHint(hint, laneScopedRow, runtimeLane) {
@@ -171,12 +197,16 @@ export function getChatGateState(capabilities, model, runtime) {
       }
     : discoveredHint
   // Support evidence is lane-scoped. Gemma 4 26B is green only for distributed
-  // serve or the durable catalog-managed Windows CUDA Ghost pair with every GPU
-  // component live. LFM2 is green only for the two receipted runnable lanes,
-  // with an execution plan whose host scope and live path are both verified.
+  // serve or the exact Apple M4 full-Metal/MTP shape below. The catalog CUDA
+  // implementation stays runnable but unverified until its install receipt
+  // cryptographically binds both prepared artifacts. LFM2 is green only for
+  // the two receipted runnable lanes.
+  const appleM4MetalGhostEligible = gemmaLaneScopedRow
+    && supportedAppleM4MetalGhost(runtime, runtimeLane)
   const gemmaRuntimeLaneEligible = !gemmaLaneScopedRow
     || runtimeLane === 'distributed'
     || supportedCatalogGhostCuda(runtime, runtimeLane)
+    || appleM4MetalGhostEligible
   const lfm2RuntimeLaneEligible = !lfm2LaneScopedRow || supportedLfm2Runtime(runtime)
   const runtimeLaneEligible = gemmaRuntimeLaneEligible && lfm2RuntimeLaneEligible
   // Once /api/models/local supplies a lane verdict, it owns artifact identity.
@@ -185,9 +215,21 @@ export function getChatGateState(capabilities, model, runtime) {
   // lane scope is an additional gate: a supported exact row cannot promote an
   // ad-hoc or partially accelerated Ghost run.
   const hasBackendLaneVerdict = Boolean(model?.lane_class)
+  // The M4 hot target is intentionally outside the catalog scan, so it has no
+  // `/api/models/local` lane verdict. Admit that one direct-load shape only from
+  // the conjunction of real Q4_0 header metadata, the exact 26B row identity,
+  // the supported capability row, the complete live Metal/MTP attestation, and
+  // the reconciled execution-plan verdict. That verdict is minted server-side
+  // only after the prepared target hash and exact Mini2 host envelope match.
+  // An explicit backend lane verdict still owns identity and is never overridden.
+  const appleM4MetalGhostAttestsArtifact = !hasBackendLaneVerdict
+    && appleM4MetalGhostEligible
+    && normalizedIdentity(model?.quant) === 'q4_0'
+    && isSupportedCapabilityStatus(scopedTarget?.status)
   const artifactSupported = hasBackendLaneVerdict
     ? backendMarksSupportedRow(model)
-    : !lfm2LaneScopedRow && isCompatibilitySupportedForModel(capabilities, model)
+    : appleM4MetalGhostAttestsArtifact
+      || (!lfm2LaneScopedRow && isCompatibilitySupportedForModel(capabilities, model))
   const contractSupported = Boolean(!embeddingOnly && runtimeLaneEligible && artifactSupported)
   const exactRowVerifiedRunnable = Boolean(
     !embeddingOnly

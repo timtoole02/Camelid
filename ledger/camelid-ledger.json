@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "e1e2ad2c",
+    "source_head": "b0fd1f3b",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -48,7 +48,7 @@
       {
         "id": "Q4_0 (QAT rows)",
         "status": "supported_named_exact_rows_only",
-        "notes": "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either two-Mac distributed serve or the catalog-managed Windows CUDA Ghost-MoE lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization)."
+        "notes": "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through two-Mac distributed serve or the exact macOS aarch64 Apple M4 full-Metal Ghost-MoE/MTP lane whose reconciled execution plan attests the prepared target hash, Mini2 host envelope, immutable serving-profile receipt, and every required live component. The catalog-managed Windows CUDA implementation retains its evidence but is unverified until a digest-bound install receipt revalidates both prepared artifacts; partial Metal shapes and other Apple hosts remain experimental. The Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization)."
       },
       {
         "id": "TQ2_0",
@@ -1093,7 +1093,8 @@
         "id": "gemma4_26b_a4b_it_q4_0",
         "family": "gemma4_a4b_moe_decoder",
         "quantization": "Q4_0",
-        "gguf_filename": "gemma-4-26B_q4_0-it.gguf"
+        "gguf_filename": "gemma-4-26B_q4_0-it.hot.gguf",
+        "sha256": "66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d"
       },
       "contract": {
         "id": "gemma4_26b_a4b_it_q4_0",
@@ -1101,18 +1102,18 @@
         "family": "gemma4_a4b_moe_decoder",
         "quantization": "Q4_0",
         "status": "supported_exact_row_smoke",
-        "support_scope": "exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only",
+        "support_scope": "exact_row_distributed_or_apple_m4_full_metal_ghost_moe_smoke_only",
         "full_support_status": "blocked_pending_normalized_full_support",
-        "full_support_blockers": "the 13.4GB full row is not laptop-VRAM-resident and requires either two-node distributed serving or the catalog-prepared Windows CUDA Ghost-MoE lane; the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, cross-platform Ghost promotion, normalized performance/RSS gate, or durable current-head refresh exists yet",
+        "full_support_blockers": "the 13.4GB full row is not laptop-VRAM-resident, so current single-node support is restricted to the exact macOS aarch64 Apple M4 full-Metal Ghost-MoE/MTP shape; the catalog-prepared Windows CUDA implementation has retained performance/correctness evidence but its v1 marker does not cryptographically bind the current sparse-shadow and cghost bytes, so frontend promotion is withheld pending a digest-bound install receipt; the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, broader Apple-host or cross-platform Ghost promotion, or normalized performance/RSS gate exists yet",
         "metadata_parses": "validated_including_moe_expert_count_router_and_dual_ffn_norms",
         "tokenizer_works": "validated_for_gemma4_spm_with_forced_bos_workaround",
         "tensors_load": "validated_mmap_wire_backed_q4_0_experts_q6_k_head_layer_range_shards",
-        "generation_runs": "distributed_two_node_api_chat_completions_and_sse_smoke_plus_windows_cuda_ghost_moe_serve",
+        "generation_runs": "distributed_two_node_api_chat_completions_and_sse_smoke_plus_windows_cuda_ghost_moe_serve_plus_apple_m4_full_metal_mtp_short_chat_and_frozen_48_token_smoke",
         "parity_audited": "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node_and_windows_cuda_ghost_dp4a_matches_cpu_oracle",
         "performance_measured": "windows_rtx_3060_laptop_256_token_ghost_decode_12_29_tok_s_sustained_14_73_tok_s_fastest_8_token_window",
-        "frontend_load_path_verified": "catalog_managed_ghost_pair_auto_detected_by_models_load_plus_distributed_runtime_flag",
-        "frontend_readiness_gate": "green for distributed serve, or for the exact catalog-managed Ghost pair when health reports ghost_moe with CUDA common, routed experts, and head active; CPU, Metal, and ad-hoc Ghost runs remain experimental",
-        "tested_context": "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
+        "frontend_load_path_verified": "distributed_runtime_flag_plus_direct_hot_pair_current_api_webui_smoke_admitted_only_by_target_and_full_cghost_hashes_host_exact_policy_immutable_profile_and_reconciled_apple_m4_full_metal_mtp_execution_plan; catalog_cuda_v1_marker_held_until_digest_bound_install_receipt",
+        "frontend_readiness_gate": "green for distributed serve; the catalog-managed Windows CUDA implementation remains runnable/evidenced but is not green because its v1 marker does not cryptographically bind the current sparse-shadow and cghost bytes; or green for the exact macOS aarch64 Apple M4 Ghost lane only when health reports gemma4_serve_lane=ghost_moe, backend=gemma4-runtime, gemma4_ghost_backend=metal, gemma4_ghost_execution_mode=full_common_metal, common/experts/head Metal active, common/experts/head GPU active, gemma4_ghost_exact_expert_policy_active=true, gemma4_ghost_common_metal_context_capacity>=1024, gemma4_ghost_runtime_profile=mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1, gemma4_mtp_assistant_loaded=true, gemma4_mtp_full_q4_active=true, and execution_plan reports support_level=supported_exact_row_smoke, selected_backend=gemma4_ghost_moe_metal_runtime, prefill_path=gemma4_ghost_moe_metal_prefill, and decode_path=gemma4_ghost_moe_metal_speculative_decode. That reconciled support level is fail-closed on the exact prepared target sha256, the complete 12,899,030,749-byte cghost sha256 b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757 captured from its serving mapping, the immutable runtime-profile receipt, and the Mini2 Mac16,10 / Apple M4 / macOS 26.5.x envelope. CPU, CUDA without a digest-bound install receipt, dropped-expert policy, missing or neighboring runtime profiles, undersized context, other hosts, wrong bytes, hybrid/partial Metal, and other ad-hoc Ghost shapes remain experimental",
+        "tested_context": "distributed_and_catalog_windows_cuda_short_smokes_plus_exact_apple_m4_frozen_prompt_to_position_152_and_current_short_api_sse_webui_smoke_no_bounded_context_pack",
         "chat_template_renderer": "gemma4_marker",
         "chat_template_shape_pack": "not_promoted",
         "chat_template_shape_pack_id": "not_selected",
@@ -1134,9 +1135,14 @@
         "latest_checked_bucket": "windows_cuda_ghost_moe_256_token_decode",
         "latest_checked_result": "pass",
         "latest_checked_output": "12.29 tok/s sustained; token sequence preserved",
-        "evidence": "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve. The supported single-node claim covers this row only, and only through this catalog-managed Windows CUDA Ghost lane; ad-hoc, CPU, and Metal Ghost runs remain experimental. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
-        "next_step": "commit a normalized browser/API evidence bundle and bounded-context ladder for Windows Ghost-MoE, then validate the same prepared-artifact flow on additional NVIDIA memory tiers before widening the scope"
-      }
+        "evidence": "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve; that evidence is retained, but current frontend promotion is withheld because the v1 durable marker does not cryptographically revalidate both prepared artifacts. The exact direct-load macOS profile is anchored by qa/perf/gemma4-mtp-bandwidth-2026-08-21/h69-final-result-2026-08-25.md (frozen 48/48 target sequence on Mac16,10 under the 1,408-slot profile) and qa/evidence-bundles/gemma4-26b-a4b-m4-metal-webui-20260825/manifest.json (current API/SSE/WebUI and fail-closed health gate). It is admitted only when live health proves backend=gemma4-runtime, ghost_moe, metal/full_common_metal, all common/expert/head Metal and backend-neutral GPU components active, exact non-dropping expert policy, the immutable mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1 runtime-profile receipt, the evidenced 1,024-position allocation, and the full-Q4 MTP assistant, while the reconciled execution plan reports supported_exact_row_smoke plus gemma4_ghost_moe_metal_runtime / gemma4_ghost_moe_metal_prefill / gemma4_ghost_moe_metal_speculative_decode. The backend grants that plan verdict only for prepared target sha256 66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d and the complete 12,899,030,749-byte cghost sha256 b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757 captured from the same opened mapping used for routed expert reads, on the Mac16,10 / Apple M4 / macOS 26.5.x host envelope. This does not promote other Apple hardware, CUDA without a digest-bound install receipt, missing or neighboring runtime profiles, dropped-expert or undersized-context configurations, CPU or hybrid/partial Metal, neighboring files/quants, or other ad-hoc Ghost shapes. This support applies to this row only. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
+        "next_step": "add bounded-context ladders and normalized performance/RSS evidence for the exact Apple M4 lane; add and validate a digest-bound sparse-shadow+cghost install receipt before restoring Windows CUDA frontend promotion; then validate prepared-artifact flows on additional hardware before widening either scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/gemma4-26b-a4b-m4-metal-webui-20260825/manifest.json"
+        }
+      ]
     },
     {
       "identity": {

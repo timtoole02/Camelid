@@ -33,6 +33,11 @@ assert.deepEqual(executionRuntimeFields({ execution_plan: healthExecutionPlan, b
   gemma4_ghost_common_metal_active: null,
   gemma4_ghost_experts_metal_active: null,
   gemma4_ghost_head_metal_active: null,
+  gemma4_mtp_assistant_loaded: null,
+  gemma4_mtp_full_q4_active: null,
+  gemma4_ghost_exact_expert_policy_active: null,
+  gemma4_ghost_common_metal_context_capacity: null,
+  gemma4_ghost_runtime_profile: null,
   gemma4_ghost_backend: null,
   gemma4_ghost_common_gpu_active: null,
   gemma4_ghost_experts_gpu_active: null,
@@ -46,6 +51,11 @@ assert.deepEqual(executionRuntimeFields(null), {
   gemma4_ghost_common_metal_active: null,
   gemma4_ghost_experts_metal_active: null,
   gemma4_ghost_head_metal_active: null,
+  gemma4_mtp_assistant_loaded: null,
+  gemma4_mtp_full_q4_active: null,
+  gemma4_ghost_exact_expert_policy_active: null,
+  gemma4_ghost_common_metal_context_capacity: null,
+  gemma4_ghost_runtime_profile: null,
   gemma4_ghost_backend: null,
   gemma4_ghost_common_gpu_active: null,
   gemma4_ghost_experts_gpu_active: null,
@@ -483,6 +493,7 @@ const {
   applyGemma4ChatTokenFloor,
   applyGemma4GhostChatTokenCap,
   BITNET_B1_58_DEFAULT_CHAT_MAX_TOKENS,
+  effectiveChatContextLength,
   GEMMA4_GHOST_WEBUI_MAX_TOKENS,
   hasExplicitMaxTokensSetting,
   isBitNetB158ChatModel,
@@ -496,11 +507,47 @@ const {
   assert.equal(applyGemma4ChatTokenFloor(3, 'gemma4_decoder'), 8, 'Gemma 4 chat should raise only undersized budgets to the visible-output floor')
   assert.equal(applyGemma4ChatTokenFloor(2048, 'gemma4_decoder'), 2048, 'Gemma 4 chat should preserve a configured budget already above the floor')
   assert.equal(applyGemma4ChatTokenFloor(3, 'llama_bpe_decoder'), 3, 'the Gemma 4 floor must not widen another model family\'s configured budget')
-  assert.equal(applyGemma4GhostChatTokenCap(8192, 'ghost_moe'), GEMMA4_GHOST_WEBUI_MAX_TOKENS, 'Ghost-MoE should cap the global 8K default below its 4K Metal common context')
+  assert.equal(applyGemma4GhostChatTokenCap(8192, 'ghost_moe'), GEMMA4_GHOST_WEBUI_MAX_TOKENS, 'Ghost-MoE should retain its conservative fallback cap when constructed capacity is unavailable')
   assert.equal(applyGemma4GhostChatTokenCap(256, 'ghost_moe'), 256, 'Ghost-MoE should preserve a smaller user-selected budget')
+  assert.equal(
+    applyGemma4GhostChatTokenCap(512, 'ghost_moe', { contextCapacity: 1024, promptTokens: 900 }),
+    124,
+    'Ghost-MoE should reserve the open Metal position required by speculative verification',
+  )
+  assert.equal(
+    applyGemma4GhostChatTokenCap(512, 'ghost_moe', { contextCapacity: 256 }),
+    256,
+    'a constructed Metal capacity below the fallback ceiling must still bound a reply before a prompt estimate exists',
+  )
+  assert.equal(
+    applyGemma4GhostChatTokenCap(512, 'ghost_moe', { contextCapacity: '1024', promptTokens: 900 }),
+    512,
+    'malformed health capacity must fail closed to the existing Ghost fallback rather than be trusted',
+  )
   assert.equal(applyGemma4GhostChatTokenCap(8192, 'distributed'), 8192, 'the Ghost cap must not shrink distributed Gemma 4')
+  assert.equal(
+    applyGemma4GhostChatTokenCap(8192, 'distributed', { contextCapacity: 1024, promptTokens: 900 }),
+    8192,
+    'Ghost health must not shrink the distributed lane',
+  )
   assert.equal(applyGemma4GhostChatTokenCap(8192, 'local'), 8192, 'the Ghost cap must not shrink another local Gemma lane')
   assert.equal(applyGemma4GhostChatTokenCap(8192, ''), 8192, 'the global default must remain unchanged without an explicit Ghost lane')
+  const trainingContextModel = { meta: { n_ctx_train: 262144 } }
+  assert.equal(
+    effectiveChatContextLength(trainingContextModel, 'ghost_moe', 1024),
+    1024,
+    'the active Ghost Metal allocation must outrank descriptive training-context metadata at send time',
+  )
+  assert.equal(
+    effectiveChatContextLength(trainingContextModel, 'distributed', 1024),
+    262144,
+    'the Metal allocation must not replace context metadata on distributed Gemma 4',
+  )
+  assert.equal(
+    effectiveChatContextLength(trainingContextModel, 'ghost_moe', '1024'),
+    262144,
+    'a malformed health capacity must not become a send-time context claim',
+  )
   assert.equal(
     isBitNetB158ChatModel(
       { id: 'downloaded-model' },
@@ -557,7 +604,8 @@ const {
   const clamped = validateSendBudget({ promptTokens: 60, maxTokens: 50, contextLength: 64 })
   assert.equal(clamped.level, 'notice', 'over-limit but room-remaining must be a non-blocking notice (backend clamps)')
   assert.notEqual(clamped.level, 'error', 'send must not be blocked when the response can be auto-limited to fit')
-  // A prompt that already fills the whole context leaves no room — the one genuine error.
+  // Every lane needs one open position; seeded speculative verification may
+  // forward the terminal chunk even when scalar decode could reuse logits.
   const noRoom = validateSendBudget({ promptTokens: 64, maxTokens: 50, contextLength: 64 })
   assert.equal(noRoom.level, 'error', 'a prompt that fills the context has no room to generate and must error')
   // 3B row mirrors the anchored raw-decode ladder (all five buckets validated on the
@@ -575,6 +623,9 @@ assert.match(rlcSource, /Memory estimate not available/, 'missing memory data re
 assert.match(rlcSource, /estimated/, 'the future readout contract keeps the estimated label in source')
 assert.doesNotMatch(rlcSource, /navigator\.deviceMemory|performance\.memory/, 'no client-side memory guessing')
 assert.match(chatWorkspaceSource, /validateSendBudget/, 'the composer must validate prompt+max_tokens against the real context rule at send time')
+assert.match(chatWorkspaceSource, /const ghostMetalContextCapacity = gemma4GhostRuntimeContextCapacity\([\s\S]*gemma4_ghost_common_metal_context_capacity/, 'the composer must validate the constructed Ghost Metal allocation before using it')
+assert.match(chatWorkspaceSource, /effectiveChatContextLength\([\s\S]*ghostMetalContextCapacity/, 'the composer must prefer the constructed Ghost Metal allocation over training-context metadata')
+assert.match(dashboardHookSource, /contextCapacity:\s*runtime\?\.gemma4_ghost_common_metal_context_capacity,[\s\S]*promptTokens:\s*promptTokenEstimate/, 'the request budget must include constructed Ghost context headroom before sending')
 
 /* ---- Display pacing honesty bounds (Phase 8B) ---- */
 const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../src/lib/streamPacing.js')

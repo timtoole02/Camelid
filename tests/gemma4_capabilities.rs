@@ -84,6 +84,7 @@ async fn gemma4_rows_scope_stays_exact_row_and_text_only() {
                 // Catalog-managed Ghost-MoE installs (c652dc62) added this row
                 // scope; still exact-row + smoke-bounded wording, no family claim.
                 || scope == "exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only"
+                || scope == "exact_row_distributed_or_apple_m4_full_metal_ghost_moe_smoke_only"
                 || scope == "active_validation_only"
                 || scope.starts_with("blocked"),
             "{id}: scope must stay exact-row bounded, got {scope}"

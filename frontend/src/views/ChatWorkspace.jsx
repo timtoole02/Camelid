@@ -3,7 +3,7 @@ import { getChatGateState } from '../lib/chatGate'
 import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
 import { formatModelLabel } from '../lib/formatters'
 import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
-import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget } from '../lib/responseLimits'
+import { applyGemma4GhostChatTokenCap, effectiveChatContextLength, gemma4GhostRuntimeContextCapacity, getConfiguredMaxTokens, isBitNetB158ChatModel, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
@@ -505,9 +505,9 @@ export default function ChatWorkspace({
   }
 
   /* Send-time budget check: the response limit is an upper bound the backend
-     clamps to the context's remaining room, so an overshoot is a non-blocking
-     notice — only a prompt that fills the whole context is a hard error. Prompt
-     size is a client estimate, labeled as such. */
+     clamps to the constructed context's remaining room, so an overshoot is a
+     non-blocking notice. A prompt that fills that allocation is rejected because
+     speculative verification needs an open position. Prompt size is a client estimate. */
   const estimatedPromptTokens = useMemo(() => {
     const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
     const text = `${history} ${composer}`
@@ -515,15 +515,27 @@ export default function ChatWorkspace({
     return Math.max(1, Math.round(Math.max(pieces.length, text.length / 4)))
   }, [visibleMessages, composer])
   const configuredMaxTokens = getConfiguredMaxTokens(selectedModelId)
+  const ghostMetalContextCapacity = gemma4GhostRuntimeContextCapacity(
+    runtime?.gemma4_serve_lane,
+    runtime?.gemma4_ghost_common_metal_context_capacity,
+  )
   const effectiveMaxTokens = applyGemma4GhostChatTokenCap(
     configuredMaxTokens,
     runtime?.gemma4_serve_lane,
+    {
+      contextCapacity: ghostMetalContextCapacity,
+      promptTokens: estimatedPromptTokens,
+    },
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
   const sendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
-    contextLength: modelContextLength(selectedModel),
+    contextLength: effectiveChatContextLength(
+      selectedModel,
+      runtime?.gemma4_serve_lane,
+      ghostMetalContextCapacity,
+    ),
   })
 
   /* Folded fine print: everything that used to stack under the composer now
@@ -531,7 +543,11 @@ export default function ChatWorkspace({
      their own line while active. */
   const statusDetail = [
     canChat ? 'Enter sends. Shift+Enter starts a new line.' : sendDisabledReason,
-    ghostBudgetCapped ? `Replies from this model are capped at ${effectiveMaxTokens.toLocaleString()} tokens to keep memory usage stable.` : '',
+    ghostBudgetCapped
+      ? ghostMetalContextCapacity
+        ? `Replies from this model are capped at ${effectiveMaxTokens.toLocaleString()} tokens to fit the constructed Metal context.`
+        : `Replies from this model are capped at ${effectiveMaxTokens.toLocaleString()} tokens on the Ghost serving lane.`
+      : '',
     'Camelid runs the loaded model locally. Verify important output.',
   ].filter(Boolean).join(' ')
 

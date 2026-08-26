@@ -271,6 +271,80 @@ try {
     ['saved-a', 'saved-b'],
     'resident aliases must claim saved rows one-to-one instead of collapsing onto the first filename match',
   )
+
+  // The prepared Gemma hot pair is commonly started directly from the CLI, so
+  // it has no persisted browser record and no /api/models/local lane verdict.
+  // Prove the normal dashboard merge still produces a runnable model whose
+  // real Q4_0 header metadata can be checked by the exact live runtime gate.
+  const directGemmaRuntime = {
+    api_base: readyRuntime.api_base,
+    status: 'online',
+    loaded_now: true,
+    generation_ready: true,
+    active_model_id: '26B_dequant_it_hf',
+    model_family: 'gemma4',
+    backend: 'gemma4-runtime',
+    gemma4_serve_lane: 'ghost_moe',
+    gemma4_ghost_catalog_managed: false,
+    gemma4_ghost_backend: 'metal',
+    gemma4_ghost_execution_mode: 'full_common_metal',
+    gemma4_ghost_common_metal_active: true,
+    gemma4_ghost_experts_metal_active: true,
+    gemma4_ghost_head_metal_active: true,
+    gemma4_ghost_common_gpu_active: true,
+    gemma4_ghost_experts_gpu_active: true,
+    gemma4_ghost_head_gpu_active: true,
+    gemma4_mtp_assistant_loaded: true,
+    gemma4_mtp_full_q4_active: true,
+    gemma4_ghost_exact_expert_policy_active: true,
+    gemma4_ghost_common_metal_context_capacity: 1024,
+    gemma4_ghost_runtime_profile: 'mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1',
+    execution_plan: {
+      operating_system: 'macos',
+      architecture: 'aarch64',
+      cpu_model: 'Apple M4',
+      support_level: 'supported_exact_row_smoke',
+      selected_backend: 'gemma4_ghost_moe_metal_runtime',
+      prefill_path: 'gemma4_ghost_moe_metal_prefill',
+      decode_path: 'gemma4_ghost_moe_metal_speculative_decode',
+    },
+  }
+  const [directGemmaModel] = mergeModelLists({
+    modelItems: [{
+      id: '26B_dequant_it_hf',
+      name: '26B_dequant_it_hf',
+      meta: { architecture: 'gemma4', n_ctx_train: 262144 },
+    }],
+    health: directGemmaRuntime,
+    currentModel: {
+      path: '/models/gemma-4-26B_q4_0-it.hot.gguf',
+      gguf: { metadata: { 'general.file_type': 2 } },
+    },
+    localModels: [],
+    apiBase: readyRuntime.api_base,
+    localFacts: new Map(),
+  })
+  assert.equal(directGemmaModel?.runtime_model_name, '26B_dequant_it_hf', 'a CLI-started active model must survive the dashboard merge without a saved local record')
+  assert.equal(directGemmaModel?.model_path, '/models/gemma-4-26B_q4_0-it.hot.gguf', 'the direct-start row must retain the inspected active GGUF path')
+  assert.equal(directGemmaModel?.quant, 'Q4_0', 'the direct-start row must retain real GGUF file-type evidence')
+  assert.equal(directGemmaModel?.meta?.n_ctx_train, 262144, 'training-context metadata remains descriptive even when runtime context is smaller')
+  const directGemmaCapabilities = {
+    ...capabilities,
+    model_compatibility: [
+      ...capabilities.model_compatibility,
+      {
+        id: 'gemma4_26b_a4b_it_q4_0',
+        family: 'gemma4_a4b_moe_decoder',
+        quantization: 'Q4_0',
+        status: 'supported_exact_row_smoke',
+      support_scope: 'exact_row_distributed_or_apple_m4_full_metal_ghost_moe_smoke_only',
+      },
+    ],
+  }
+  const directGemmaGate = getChatGateState(directGemmaCapabilities, directGemmaModel, directGemmaRuntime)
+  assert.equal(directGemmaGate.contractSupported, true, 'the merged direct-start hot pair must reach the exact hash/host-reconciled Metal gate')
+  assert.equal(directGemmaGate.chatMode, 'supported', 'the merged direct-start hot pair must not be relabeled unverified')
+
   const embeddingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: { id: 'embedding-chat', title: 'Embedding', messages: [] },
     selectedModel: embeddingModel,

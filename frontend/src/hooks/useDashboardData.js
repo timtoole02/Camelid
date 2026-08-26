@@ -1197,6 +1197,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
           sendGate.hint?.target?.family,
         ),
         runtime?.gemma4_serve_lane,
+        {
+          contextCapacity: runtime?.gemma4_ghost_common_metal_context_capacity,
+          promptTokens: promptTokenEstimate,
+        },
       )
       // The generic BitNet runnable is a greedy lane. Its experimental status
       // must not cause the browser to advertise Prism's sampling controls that

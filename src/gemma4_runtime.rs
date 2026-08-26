@@ -2132,13 +2132,175 @@ const GHOST_METAL_RETAINED_COLD_H40_HOT_PROFILE: [usize; 30] = [
 /// watchdog ceilings while retaining its per-layer weighting. Keeping the
 /// literal frozen prevents a merely same-total profile from silently changing
 /// the I/O and physical-footprint contract.
-#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS: usize = 1_408;
-#[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE: [usize; 30] = [
     60, 64, 45, 43, 40, 41, 44, 42, 47, 46, 40, 41, 44, 46, 42, 50, 40, 39, 46, 47, 41, 46, 45, 43,
     46, 56, 59, 56, 58, 51,
 ];
+
+/// Immutable identifier for the exact no-watchdog interactive Mini2 profile
+/// promoted by the current API/WebUI evidence bundle. Changing any runtime
+/// shape or named scheduling selector requires a new identifier and evidence.
+pub const GEMMA4_MINI2_WEBUI_PROFILE_ID: &str =
+    "mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1";
+
+/// Exact expert payload paired with the prepared target above. The profile
+/// receipt is minted only after hashing the complete bytes through the same
+/// read-only mapping that serves expert records; sampled source-identity
+/// islands alone are insufficient for a verified serving claim.
+const GEMMA4_MINI2_CGHOST_SHA256: &str =
+    "b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4CghostArtifactReceipt {
+    pub logical_bytes: u64,
+    pub sha256: String,
+}
+
+pub(crate) fn gemma4_mini2_cghost_artifact_admitted(receipt: &Gemma4CghostArtifactReceipt) -> bool {
+    receipt.logical_bytes == crate::ghost_install::GEMMA4_26B_GHOST_CGHOST_BYTES
+        && receipt
+            .sha256
+            .eq_ignore_ascii_case(GEMMA4_MINI2_CGHOST_SHA256)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Gemma4Mini2WebuiProfileFacts {
+    hot_slots_per_layer: Vec<usize>,
+    hybrid_mapped: bool,
+    cpu_fallback_forbidden: bool,
+    common_context_capacity: Option<usize>,
+    zero_host_cache: bool,
+    tied_head_loaded: bool,
+    mtp_loaded: bool,
+    mtp_full_q4: bool,
+    exact_expert_policy: bool,
+    cghost_artifact: Option<Gemma4CghostArtifactReceipt>,
+    exact_environment: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_mini2_webui_profile_admitted(facts: &Gemma4Mini2WebuiProfileFacts) -> bool {
+    ghost_metal_live_sequential_mini2_hot_profile_admitted(&facts.hot_slots_per_layer)
+        && facts.hybrid_mapped
+        && facts.cpu_fallback_forbidden
+        && facts.common_context_capacity == Some(1_024)
+        && facts.zero_host_cache
+        && facts.tied_head_loaded
+        && facts.mtp_loaded
+        && facts.mtp_full_q4
+        && facts.exact_expert_policy
+        && facts
+            .cghost_artifact
+            .as_ref()
+            .is_some_and(gemma4_mini2_cghost_artifact_admitted)
+        && facts.exact_environment
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_cghost_artifact_receipt(ghost: &GhostFile) -> Result<Gemma4CghostArtifactReceipt> {
+    const HASH_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+    let Some(mapping) = ghost.wire_mapping() else {
+        return Err(BackendError::InvalidModelMetadata(
+            "exact Gemma 4 cghost receipt requires a retained read-only mapping".into(),
+        ));
+    };
+    let file_len = mapping.file_len();
+    let mut hasher = Sha256::new();
+    let mut offset = 0u64;
+    while offset < file_len {
+        let len = usize::try_from((file_len - offset).min(HASH_CHUNK_BYTES as u64))
+            .expect("hash chunk is bounded by usize");
+        hasher.update(mapping.bytes(offset, len)?);
+        offset += len as u64;
+    }
+    Ok(Gemma4CghostArtifactReceipt {
+        logical_bytes: file_len,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mini2_webui_environment_matches() -> bool {
+    let exact = |name: &str, expected: &str| std::env::var(name).as_deref() == Ok(expected);
+    let exact_pairs = [
+        ("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0"),
+        ("CAMELID_GEMMA4_GHOST_METAL", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_SLOTS", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_TURBO", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_COMMON", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_CONTEXT", "1024"),
+        ("CAMELID_GEMMA4_KV_INIT", "192"),
+        ("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT", "0"),
+        ("CAMELID_GEMMA4_GHOST_READ_THREADS", "8"),
+        ("CAMELID_GEMMA4_GHOST_CACHE_MIB", "0"),
+        ("CAMELID_GEMMA4_GHOST_STRICT_CACHE", "false"),
+        (
+            "CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS",
+            "104,112,92,88,92,80,80,80,80,80,76,76,80,84,80,84,84,88,88,84,84,84,84,88,84,92,96,100,104,112",
+        ),
+        (GHOST_METAL_DEMAND_LOAD_ONLY_ENV, "1"),
+        (GHOST_METAL_FILE_MAPPED_EXPERTS_ENV, "1"),
+        (GHOST_METAL_HYBRID_HOT_SLOTS_ENV, "32"),
+        (
+            GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV,
+            "60,64,45,43,40,41,44,42,47,46,40,41,44,46,42,50,40,39,46,47,41,46,45,43,46,56,59,56,58,51",
+        ),
+        (GHOST_METAL_HYBRID_HOT_PROFILE_FREE_ENV, "1"),
+        (GHOST_METAL_DECODE_PROMOTION_ENV, "0"),
+        ("CAMELID_GEMMA4_SLOT_PIN", "0"),
+        ("CAMELID_GEMMA4_GHOST_METAL_HOT_PIN", "0"),
+        ("CAMELID_GEMMA4_VICTIM_CACHE", "0"),
+        ("CAMELID_GEMMA4_VICTIM_MB", "0"),
+        ("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS", "0"),
+        ("CAMELID_GEMMA4_CHAINED_PREDICT", "0"),
+        ("CAMELID_SPEC_DECODE", "off"),
+        ("CAMELID_GEMMA4_SPEC_K1_LANE", "chained"),
+        ("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "15"),
+        ("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS", "15"),
+        (GEMMA4_MTP_ADAPTIVE_WIDTH_ENV, "1"),
+        ("CAMELID_GEMMA4_MTP_DEVICE_CHAIN", "1"),
+        (GEMMA4_MTP_FULL_Q4_ENV, "1"),
+        (GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP_ENV, "1"),
+        (GEMMA4_MTP_LOAD_WARMUP_ENV, "1"),
+        (GEMMA4_MTP_BOUNDARY_ARBITRATION_ENV, "1"),
+        ("CAMELID_GEMMA4_DENSE_K8_GENERIC", "1"),
+        ("CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT", "1"),
+        ("CAMELID_GEMMA4_MOE_MMA_K16", "1"),
+        ("CAMELID_GEMMA4_MTP_BF16_PRODUCER_FUSION", "1"),
+        ("CAMELID_GEMMA4_MTP_BF16_LATTICE_LOADS", "1"),
+        (GHOST_METAL_HYBRID_DEMAND_PROMOTION_ENV, "1"),
+        (GHOST_METAL_HYBRID_HOT_COLD_OVERLAP_ENV, "1"),
+        (GHOST_METAL_HOT_COLD_OVERLAP_PUBLISH_ENV, "0"),
+        (GHOST_METAL_HOT_COLD_SINGLE_DOWN_ENV, "1"),
+        (GHOST_METAL_DIRECT_STAGE_READ_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_PREDICT_PROBE_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_STAGE_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_FAST_PREDICT_ENV, "1"),
+        (GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_ENV, "1"),
+        (GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV, "1"),
+        (GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL_ENV, "1"),
+    ];
+    let no_neighboring_selectors = std::env::vars_os().all(|(name, _)| {
+        let name = name.to_string_lossy();
+        let profile_scoped = name.starts_with("CAMELID_GEMMA4_")
+            || name.starts_with("CAMELID_SPEC_")
+            || name.starts_with("CAMELID_GHOST_");
+        !profile_scoped
+            || name == "CAMELID_GEMMA4_MTP_ASSISTANT_PATH"
+            || name == "CAMELID_GEMMA4_GHOST_CGHOST"
+            || exact_pairs.iter().any(|(allowed, _)| name == *allowed)
+    });
+    exact_pairs
+        .iter()
+        .all(|(name, expected)| exact(name, expected))
+        && std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
+            .is_some_and(|path| !path.is_empty())
+        && std::env::var_os("CAMELID_GEMMA4_GHOST_CGHOST").is_some_and(|path| !path.is_empty())
+        && no_neighboring_selectors
+}
 
 #[cfg(any(target_os = "macos", test))]
 fn ghost_metal_live_sequential_mini2_hot_profile_admitted(profile: &[usize]) -> bool {
@@ -2248,6 +2410,12 @@ const GHOST_METAL_EXACT_RESIDENCY_TRACE_ENV: &str =
 #[cfg(target_os = "macos")]
 const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF";
+/// Default-off H71 subordinate policy: when the prompt route union does not
+/// fill a layer's fixed footprint, retain deterministically ranked identities
+/// that already occupy that layer. The parent H71 selector remains mandatory.
+#[cfg(target_os = "macos")]
+const GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL";
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP: usize = 8;
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16: usize = 16;
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_CAP16_EXTRA_RECORDS: usize =
@@ -2488,6 +2656,19 @@ fn ghost_metal_prompt_ranked_hot_handoff_from(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+    prompt_ranked_enabled: bool,
+    resident_fill_enabled: bool,
+) -> bool {
+    prompt_ranked_enabled && resident_fill_enabled
+}
+
 #[cfg(target_os = "macos")]
 fn ghost_metal_prompt_ranked_hot_handoff_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2498,6 +2679,23 @@ fn ghost_metal_prompt_ranked_hot_handoff_enabled() -> bool {
                 .as_deref(),
         )
     })
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_prompt_ranked_hot_handoff_resident_fill_enabled(
+    prompt_ranked_enabled: bool,
+) -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(
+        prompt_ranked_enabled,
+        *FLAG.get_or_init(|| {
+            ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(
+                std::env::var(GHOST_METAL_PROMPT_RANKED_HOT_HANDOFF_RESIDENT_FILL_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        }),
+    )
 }
 
 /// Stable, fail-closed candidate construction. Earlier sources have strict
@@ -2543,16 +2741,22 @@ fn deterministic_sparse_decay_candidates(scores: &[f32], top_n: usize) -> Vec<us
 
 /// Choose exactly the fixed physical footprint from identities observed in
 /// the current prompt. Scores are maintained by `record_layer_routes`; stable
-/// expert-ID ties make the handoff deterministic. No decode route or output is
-/// available when this function runs.
+/// expert-ID ties make the handoff deterministic. The legacy path fails closed
+/// when any prompt layer is underfilled. A caller that explicitly supplies
+/// resident identities may use them, ranked by the same score/ID order, solely
+/// to preserve the fixed footprint without introducing another read. No decode
+/// route or output is available when this function runs.
 #[cfg(any(target_os = "macos", test))]
 fn prompt_ranked_hot_handoff_routes(
     prompt_unions: &[[u64; 2]],
     prompt_scores: &[Vec<f32>],
+    resident_experts: Option<&[Vec<usize>]>,
     capacities: &[usize],
 ) -> Option<Vec<Vec<usize>>> {
     if prompt_unions.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS
         || prompt_scores.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS
+        || resident_experts
+            .is_some_and(|residents| residents.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS)
         || !ghost_metal_live_sequential_mini2_hot_profile_admitted(capacities)
     {
         return None;
@@ -2561,22 +2765,70 @@ fn prompt_ranked_hot_handoff_routes(
         .iter()
         .zip(prompt_scores)
         .zip(capacities)
-        .map(|((union, scores), &capacity)| {
+        .enumerate()
+        .map(|(layer_idx, ((union, scores), &capacity))| {
             if scores.len() != 128 || scores.iter().any(|score| !score.is_finite()) {
                 return None;
             }
             let mut ranked = (0..128)
                 .filter(|&expert| (union[expert / 64] & (1u64 << (expert % 64))) != 0)
                 .collect::<Vec<_>>();
-            if ranked.len() < capacity {
-                return None;
-            }
             ranked
                 .sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b)));
+            if ranked.len() < capacity {
+                let residents = resident_experts?.get(layer_idx)?;
+                let mut resident_seen = [false; 128];
+                for &expert in residents {
+                    if expert >= 128 || resident_seen[expert] {
+                        return None;
+                    }
+                    resident_seen[expert] = true;
+                }
+                let mut selected = [false; 128];
+                for &expert in &ranked {
+                    selected[expert] = true;
+                }
+                let mut resident_padding = residents
+                    .iter()
+                    .copied()
+                    .filter(|&expert| !selected[expert])
+                    .collect::<Vec<_>>();
+                resident_padding.sort_unstable_by(|&a, &b| {
+                    scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b))
+                });
+                let missing = capacity - ranked.len();
+                if resident_padding.len() < missing {
+                    return None;
+                }
+                ranked.extend(resident_padding.into_iter().take(missing));
+            }
             ranked.truncate(capacity);
             Some(ranked)
         })
         .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prompt_ranked_hot_handoff_receipt_labels(
+    admitted: bool,
+    resident_fill_enabled: bool,
+) -> (&'static str, &'static str) {
+    if !admitted {
+        (
+            "baseline-interval-union-or-latest-route",
+            "expert-id-asc-or-route-order",
+        )
+    } else if resident_fill_enabled {
+        (
+            "current-prompt-exact-route-union-resident-padding-enabled",
+            "prompt-decay-score-desc-then-resident-score-desc-expert-id-asc",
+        )
+    } else {
+        (
+            "current-prompt-exact-route-union",
+            "decay-score-desc-expert-id-asc",
+        )
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3274,13 +3526,39 @@ fn ghost_metal_chained_prediction_allowed(
     k_tokens: usize,
     exact_repeat: bool,
     prediction_forced: bool,
+    allow_dropped_experts: bool,
 ) -> bool {
-    let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     !demand_load_only
         && !suppress_prediction
         && k_tokens > 1
-        && (exact_repeat || prediction_forced || allow_drop)
+        && (exact_repeat || prediction_forced || allow_dropped_experts)
+}
+
+/// Construction-time policy for the only Ghost-Metal escape hatch that can
+/// intentionally omit a selected expert. Keep parsing separate from the live
+/// environment so both the support receipt and every decode decision use the
+/// same immutable value for the lifetime of the loaded runtime.
+#[cfg(any(target_os = "macos", test))]
+fn ghost_allow_dropped_experts_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_allow_dropped_experts_from_environment() -> bool {
+    ghost_allow_dropped_experts_from(
+        std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_exact_expert_policy_admitted(
+    ghost_moe_active: bool,
+    metal_experts_active: bool,
+    allow_dropped_experts: bool,
+) -> bool {
+    ghost_moe_active && metal_experts_active && !allow_dropped_experts
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -4010,6 +4288,10 @@ struct GhostMetalExpertRuntime {
     engine: crate::metal::Gemma4Q4ExpertMetal,
     layers: Vec<GhostMetalExpertLayer>,
     fused_fast: bool,
+    /// Immutable construction-time capture of the explicit lossy expert
+    /// escape hatch. Runtime routing never re-reads process environment, so a
+    /// later mutation cannot invalidate the policy reported to health/API.
+    allow_dropped_experts: bool,
     /// Latched at construction so a later environment mutation cannot turn a
     /// bounded or mapped correctness refusal into CPU fallback.
     cpu_fallback_forbidden: bool,
@@ -7411,7 +7693,7 @@ fn ghost_metal_stats_enabled() -> bool {
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GhostMetalSequenceMode {
     Idle,
@@ -7420,6 +7702,38 @@ enum GhostMetalSequenceMode {
     /// chunks. Decode may switch to Metal only after an atomic cache import.
     HybridPrefill,
     Metal,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4MtpRequestAdmission {
+    CpuPinned,
+    MetalReady,
+    RefuseGpuChanged,
+    RefuseTargetState,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_mtp_request_lane(
+    mode: Option<GhostMetalSequenceMode>,
+    gpu_enabled: bool,
+    target_kv_len: Option<usize>,
+    expected_kv_len: usize,
+) -> Gemma4MtpRequestAdmission {
+    match mode {
+        None | Some(GhostMetalSequenceMode::Cpu) => Gemma4MtpRequestAdmission::CpuPinned,
+        Some(GhostMetalSequenceMode::Metal) if !gpu_enabled => {
+            Gemma4MtpRequestAdmission::RefuseGpuChanged
+        }
+        Some(GhostMetalSequenceMode::Metal) if target_kv_len == Some(expected_kv_len) => {
+            Gemma4MtpRequestAdmission::MetalReady
+        }
+        Some(GhostMetalSequenceMode::Metal)
+        | Some(GhostMetalSequenceMode::Idle)
+        | Some(GhostMetalSequenceMode::HybridPrefill) => {
+            Gemma4MtpRequestAdmission::RefuseTargetState
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7448,6 +7762,10 @@ fn select_ghost_prefill_plan(
         _ if chunk_eligible && prompt_len > 1 => GhostPrefillPlan::CpuChunk,
         _ => GhostPrefillPlan::ScalarCpu,
     }
+}
+
+fn ghost_prefill_requires_hybrid_finish(plan: GhostPrefillPlan) -> bool {
+    plan == GhostPrefillPlan::HybridChunk
 }
 
 /// A generation request owns the persistent common-core KV state. Resetting it
@@ -7737,6 +8055,7 @@ impl GhostMetalExpertRuntime {
             engine,
             layers,
             fused_fast,
+            allow_dropped_experts: ghost_allow_dropped_experts_from_environment(),
             cpu_fallback_forbidden: bounded_record_failclose,
             common: None,
             sequence_mode: GhostMetalSequenceMode::Idle,
@@ -8067,6 +8386,7 @@ impl GhostMetalExpertRuntime {
             engine,
             layers,
             fused_fast,
+            allow_dropped_experts: ghost_allow_dropped_experts_from_environment(),
             cpu_fallback_forbidden: true,
             common: None,
             sequence_mode: GhostMetalSequenceMode::Idle,
@@ -8477,6 +8797,8 @@ impl GhostMetalExpertRuntime {
             })
             .collect();
         let prompt_ranked_requested = ghost_metal_prompt_ranked_hot_handoff_enabled();
+        let prompt_ranked_resident_fill_enabled =
+            ghost_metal_prompt_ranked_hot_handoff_resident_fill_enabled(prompt_ranked_requested);
         let capacities = self
             .layers
             .iter()
@@ -8488,9 +8810,22 @@ impl GhostMetalExpertRuntime {
         self.prompt_ranked_handoff_armed = false;
         let prompt_ranked_routes = prompt_ranked_shape_admitted
             .then(|| {
+                let resident_experts = prompt_ranked_resident_fill_enabled.then(|| {
+                    self.layers
+                        .iter()
+                        .map(|layer| {
+                            (0..128)
+                                .filter(|&expert| {
+                                    layer.directory.lookup_resident_slot(expert).is_some()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                });
                 prompt_ranked_hot_handoff_routes(
                     &self.prompt_ranked_route_union,
                     &self.prompt_ranked_route_scores,
+                    resident_experts.as_deref(),
                     &capacities,
                 )
             })
@@ -8534,9 +8869,9 @@ impl GhostMetalExpertRuntime {
             .collect::<Vec<_>>();
         let occupied_total = installed_routes.iter().map(Vec::len).sum::<usize>();
         // This is the terminal promotion belonging to the prompt interval,
-        // merely delayed to the explicit handoff barrier. Prompt ranking only
-        // bounds and reorders identities from that already-recorded union; it
-        // never introduces a decode-derived or external profile identity.
+        // merely delayed to the explicit handoff barrier. Prompt ranking owns
+        // selection; the subordinate opt-in may retain already-resident
+        // identities solely to pad an underfilled layer without another read.
         if let Some(common) = self.common.as_mut() {
             use std::sync::atomic::Ordering::Relaxed;
             common.last_chained_ledger.nvme_ms = counters.nvme_us.load(Relaxed) as f64 / 1_000.0;
@@ -8554,17 +8889,10 @@ impl GhostMetalExpertRuntime {
         );
 
         if prompt_ranked_requested {
-            let (receipt_source, receipt_ranking) = if prompt_ranked_admitted {
-                (
-                    "current-prompt-exact-route-union",
-                    "decay-score-desc-expert-id-asc",
-                )
-            } else {
-                (
-                    "baseline-interval-union-or-latest-route",
-                    "expert-id-asc-or-route-order",
-                )
-            };
+            let (receipt_source, receipt_ranking) = prompt_ranked_hot_handoff_receipt_labels(
+                prompt_ranked_admitted,
+                prompt_ranked_resident_fill_enabled,
+            );
             let selected_masks = routes
                 .iter()
                 .enumerate()
@@ -8865,6 +9193,7 @@ impl GhostMetalExpertRuntime {
             k_tokens,
             exact_repeat,
             chained_predict_forced(),
+            self.allow_dropped_experts,
         );
         // The pre-router speculative fill wants a PREDICTION of what this layer
         // will route, and "every expert currently resident" is not one: under
@@ -9322,6 +9651,7 @@ impl GhostMetalExpertRuntime {
         };
         let ready_stage_buf_for_fill = ready_stage_buf.clone();
         let live_sequential_stage_for_fill = live_sequential_stage.clone();
+        let allow_dropped_experts = self.allow_dropped_experts;
         let layers_ref = &mut self.layers;
         let mut three_wave_pending: Option<CompactThreeWaveDemandPlan> = None;
         let mut slot_filler = ghost_cache.map(|cache| {
@@ -9701,9 +10031,7 @@ impl GhostMetalExpertRuntime {
                     return true;
                 }
 
-                let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
-                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                if allow_drop {
+                if allow_dropped_experts {
                     for e in 0..128 {
                         let s = layer.directory.resident_slot_table[e];
                         updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
@@ -12720,6 +13048,16 @@ pub struct Gemma4Runtime {
     /// never contend on that execution mutex.
     #[cfg(target_os = "macos")]
     mtp_assistant_health: Gemma4MtpAssistantHealth,
+    /// Immutable load-time receipt for the exact Mini2 WebUI profile. Live
+    /// accelerator switches remain separate health gates; this identifier can
+    /// never be minted by a merely similar ad-hoc Metal configuration.
+    #[cfg(target_os = "macos")]
+    ghost_webui_profile_receipt: Option<&'static str>,
+    /// Full-file identity captured from the same opened mapping used by the
+    /// expert reader. Reconciliation consumes this receipt independently of
+    /// the summarized serving-profile identifier.
+    #[cfg(target_os = "macos")]
+    ghost_cghost_artifact_receipt: Option<Gemma4CghostArtifactReceipt>,
     /// Non-zero only between an exact seeded prefill and the one generation
     /// call allowed to consume it. Every target-state mutation clears it.
     mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64,
@@ -13558,9 +13896,9 @@ fn exact_hybrid_telemetry_geometry(
     let layers = HYBRID_TELEMETRY_LAYERS as u64;
     let logical_total = layers.checked_mul(HYBRID_TELEMETRY_LOGICAL_PER_LAYER)?;
     // Schema v2 admits exactly the frozen aggregate-960 Hot32/profile family,
-    // runtime-only uniform Hot40, or runtime-only uniform Hot48. Mixed or
-    // uneven experiment totals intentionally fall back to the 960 expectation
-    // and refuse.
+    // the exact uneven 1,408-record Mini2 serving profile, and the runtime-only
+    // uniform Hot40/Hot48 experiments. Other mixed or uneven totals
+    // intentionally fall back to the 960 expectation and refuse.
     let uniform_hot40 = snapshot.per_layer.len() == HYBRID_TELEMETRY_LAYERS
         && snapshot
             .per_layer
@@ -13571,14 +13909,21 @@ fn exact_hybrid_telemetry_geometry(
             .per_layer
             .iter()
             .all(|layer| layer.anonymous_slot_capacity == HYBRID_TELEMETRY_HOT48_PER_LAYER);
-    let hot_per_layer = if uniform_hot40 {
-        HYBRID_TELEMETRY_HOT40_PER_LAYER
+    let exact_mini2_profile = snapshot.per_layer.len() == HYBRID_TELEMETRY_LAYERS
+        && snapshot
+            .per_layer
+            .iter()
+            .zip(GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE)
+            .all(|(layer, slots)| layer.anonymous_slot_capacity == slots as u64);
+    let hot_total = if uniform_hot40 {
+        layers.checked_mul(HYBRID_TELEMETRY_HOT40_PER_LAYER)?
     } else if uniform_hot48 {
-        HYBRID_TELEMETRY_HOT48_PER_LAYER
+        layers.checked_mul(HYBRID_TELEMETRY_HOT48_PER_LAYER)?
+    } else if exact_mini2_profile {
+        GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_SLOTS as u64
     } else {
-        HYBRID_TELEMETRY_HOT_PER_LAYER
+        layers.checked_mul(HYBRID_TELEMETRY_HOT_PER_LAYER)?
     };
-    let hot_total = layers.checked_mul(hot_per_layer)?;
     let hot_bytes = hot_total.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
     let mapped_span = logical_total.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
     if snapshot.layer_count != HYBRID_TELEMETRY_LAYERS as u32
@@ -14252,6 +14597,8 @@ fn mtp_scheduled_verify_width(
 
 #[cfg(any(target_os = "macos", test))]
 const MTP_ADAPTIVE_BASE_VERIFY_K: usize = 10;
+#[cfg(any(target_os = "macos", test))]
+const MTP_ADAPTIVE_MIN_VERIFY_K: usize = 4;
 
 #[cfg(any(target_os = "macos", test))]
 fn mtp_initial_verify_width(adaptive: bool, max_verify_k: usize) -> usize {
@@ -14276,8 +14623,23 @@ fn mtp_next_verify_width(
     if accepted_drafts == proposed_drafts {
         current_verify_k.saturating_add(1).min(max_verify_k)
     } else {
-        max_verify_k.min(MTP_ADAPTIVE_BASE_VERIFY_K)
+        let floor = max_verify_k.min(MTP_ADAPTIVE_MIN_VERIFY_K);
+        accepted_drafts
+            .min(proposed_drafts)
+            .saturating_add(2)
+            .max(floor)
+            .min(max_verify_k)
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mtp_spec_timing_enabled_value(value: Option<&str>) -> bool {
+    value.is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn mtp_spec_timing_enabled() -> bool {
+    mtp_spec_timing_enabled_value(std::env::var("CAMELID_GEMMA4_SPEC_TIMING").ok().as_deref())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -15108,7 +15470,18 @@ impl Gemma4Runtime {
             ))
         })?;
         let ghost = Arc::new(GhostFile::open_with_options(cghost, evict_page_cache)?);
-        Self::load_layer_range_impl(path, None, Some((ghost, budget_bytes)), None)
+        #[cfg(target_os = "macos")]
+        let cghost_artifact = gemma4_mini2_webui_environment_matches()
+            .then(|| gemma4_cghost_artifact_receipt(&ghost))
+            .transpose()?;
+        #[cfg(not(target_os = "macos"))]
+        let cghost_artifact = None;
+        Self::load_layer_range_impl(
+            path,
+            None,
+            Some((ghost, budget_bytes, cghost_artifact)),
+            None,
+        )
     }
 
     /// Construct and retain the exact Ghost target for an isolated residency
@@ -15171,7 +15544,7 @@ impl Gemma4Runtime {
         let runtime = Self::load_layer_range_impl(
             path,
             None,
-            Some((ghost, budget_bytes)),
+            Some((ghost, budget_bytes, None)),
             Some(&mut observer),
         )?;
         let target_mapping = observer.target_mapping.as_ref().cloned().ok_or_else(|| {
@@ -15472,7 +15845,7 @@ impl Gemma4Runtime {
     fn load_layer_range_impl(
         path: &Path,
         range: Option<std::ops::Range<usize>>,
-        ghost_moe: Option<(Arc<GhostFile>, usize)>,
+        ghost_moe: Option<(Arc<GhostFile>, usize, Option<Gemma4CghostArtifactReceipt>)>,
         mut load_observer: Option<&mut Gemma4GhostLoadObserver<'_>>,
     ) -> Result<Self> {
         let gguf = read_metadata(path)?;
@@ -15495,7 +15868,7 @@ impl Gemma4Runtime {
         })?;
         let binding = Gemma4Binding::bind(&gguf, &config)?;
         let validated_ghost_moe = match ghost_moe {
-            Some((ghost, budget_bytes)) => {
+            Some((ghost, budget_bytes, cghost_artifact)) => {
                 let moe = config.moe.as_ref().ok_or_else(|| {
                     BackendError::UnsupportedModelArchitecture(
                         "ghost MoE mode requires a Gemma 4 mixture-of-experts model".into(),
@@ -15520,7 +15893,7 @@ impl Gemma4Runtime {
                     )));
                 }
                 ghost.validate_moe_source_identity(path, &binding, moe.expert_count as usize)?;
-                Some((ghost, budget_bytes))
+                Some((ghost, budget_bytes, cghost_artifact))
             }
             None => None,
         };
@@ -15528,9 +15901,11 @@ impl Gemma4Runtime {
         // Only the observed load-only path defers the empty cache object until
         // after its target-mapping callback, making the phase boundary literal.
         let mut ghost_moe_cache = if load_observer.is_none() {
-            validated_ghost_moe.as_ref().map(|(ghost, budget_bytes)| {
-                Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
-            })
+            validated_ghost_moe
+                .as_ref()
+                .map(|(ghost, budget_bytes, _)| {
+                    Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
+                })
         } else {
             None
         };
@@ -15578,9 +15953,11 @@ impl Gemma4Runtime {
             observer.bind_target_mapping(Arc::clone(&mmap));
         }
         if ghost_moe_cache.is_none() {
-            ghost_moe_cache = validated_ghost_moe.as_ref().map(|(ghost, budget_bytes)| {
-                Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
-            });
+            ghost_moe_cache = validated_ghost_moe
+                .as_ref()
+                .map(|(ghost, budget_bytes, _)| {
+                    Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
+                });
         }
         if load_observer.is_none() && !ghost_metal_demand_load_only_from_env() {
             let mmap = mmap.clone();
@@ -16628,6 +17005,37 @@ impl Gemma4Runtime {
                 .as_ref()
                 .is_some_and(crate::metal::Gemma4MtpAssistantMetal::full_q4_enabled),
         };
+        #[cfg(target_os = "macos")]
+        let ghost_cghost_artifact_receipt = validated_ghost_moe
+            .as_ref()
+            .and_then(|(_, _, receipt)| receipt.clone());
+        #[cfg(target_os = "macos")]
+        let ghost_webui_profile_receipt = metal_q4_experts.lock().ok().and_then(|guard| {
+            let lane = guard.as_ref()?;
+            let facts = Gemma4Mini2WebuiProfileFacts {
+                hot_slots_per_layer: lane
+                    .layers
+                    .iter()
+                    .map(|layer| layer.slots.writable_slot_count())
+                    .collect(),
+                hybrid_mapped: lane.has_hybrid_mapped_backing(),
+                cpu_fallback_forbidden: lane.cpu_fallback_forbidden(),
+                common_context_capacity: lane
+                    .common
+                    .as_ref()
+                    .map(crate::metal::Gemma4GhostCommonMetal::max_positions),
+                zero_host_cache: ghost_moe_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.budget_bytes == 0),
+                tied_head_loaded: metal_q6k_head.is_some(),
+                mtp_loaded: mtp_assistant_health.loaded,
+                mtp_full_q4: mtp_assistant_health.full_q4_active,
+                exact_expert_policy: ghost_moe_cache.is_some() && !lane.allow_dropped_experts,
+                cghost_artifact: ghost_cghost_artifact_receipt.clone(),
+                exact_environment: gemma4_mini2_webui_environment_matches(),
+            };
+            gemma4_mini2_webui_profile_admitted(&facts).then_some(GEMMA4_MINI2_WEBUI_PROFILE_ID)
+        });
         let runtime = Self {
             tokenizer,
             first_layer: range.start,
@@ -16660,6 +17068,10 @@ impl Gemma4Runtime {
             mtp_assistant: std::sync::Mutex::new(mtp_assistant),
             #[cfg(target_os = "macos")]
             mtp_assistant_health,
+            #[cfg(target_os = "macos")]
+            ghost_webui_profile_receipt,
+            #[cfg(target_os = "macos")]
+            ghost_cghost_artifact_receipt,
             mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64::new(0),
             layers,
             config,
@@ -16780,6 +17192,89 @@ impl Gemma4Runtime {
         #[cfg(not(target_os = "macos"))]
         {
             Gemma4GhostMetalComponents::default()
+        }
+    }
+
+    /// Live dispatch eligibility for every Ghost-Metal component. This is the
+    /// same predicate used by prefill and decode, including the explicit
+    /// `CAMELID_GEMMA4_GHOST_METAL=0` opt-out, the runtime GPU switch, and
+    /// deterministic mode.
+    pub fn ghost_metal_acceleration_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            ghost_metal_acceleration_enabled()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Immutable identifier for the exact load-time Mini2 WebUI profile, or
+    /// `None` for every neighboring/ad-hoc Ghost configuration.
+    pub fn ghost_webui_profile_receipt(&self) -> Option<&'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.ghost_webui_profile_receipt
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Full expert-artifact identity captured at load from the same mapping
+    /// that backs routed reads. Only the exact environment pays this one-time
+    /// full-file hash; neighboring/ad-hoc lanes return `None`.
+    pub fn ghost_cghost_artifact_receipt(&self) -> Option<&Gemma4CghostArtifactReceipt> {
+        #[cfg(target_os = "macos")]
+        {
+            self.ghost_cghost_artifact_receipt.as_ref()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Whether this live Ghost-Metal expert runtime was constructed under the
+    /// exact fail-closed policy: a Ghost source is bound, the Metal expert lane
+    /// is still owned, and the dropped-expert escape hatch was not enabled.
+    /// This is a load-time policy receipt; it never re-reads process environment.
+    pub fn ghost_exact_expert_policy_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let metal = self.metal_q4_experts.lock().ok();
+            let lane = metal.as_deref().and_then(Option::as_ref);
+            ghost_exact_expert_policy_admitted(
+                self.ghost_moe_cache.is_some(),
+                lane.is_some(),
+                lane.is_some_and(|lane| lane.allow_dropped_experts),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Actual capacity of the currently owned, fully configured Ghost common
+    /// Metal core. The value comes from the constructed Metal object rather
+    /// than the mutable environment used to request its load-time allocation.
+    pub fn ghost_metal_context_capacity(&self) -> Option<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            let guard = self.metal_q4_experts.lock().ok()?;
+            guard
+                .as_ref()?
+                .common
+                .as_ref()
+                .filter(|common| common.moe_configured())
+                .map(crate::metal::Gemma4GhostCommonMetal::max_positions)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
         }
     }
 
@@ -18202,18 +18697,43 @@ impl Gemma4Runtime {
     }
 
     #[cfg(target_os = "macos")]
+    fn mtp_request_uses_metal(&self, expected_kv_len: usize) -> Result<bool> {
+        let guard = self.metal_q4_experts.lock().map_err(|_| {
+            BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
+        })?;
+        let mode = guard.as_ref().map(|lane| lane.sequence_mode);
+        let target_kv_len = guard
+            .as_ref()
+            .and_then(|lane| lane.common.as_ref())
+            .filter(|common| common.moe_configured())
+            .and_then(|common| common.with_mtp_target_kv(|view| view.logical_len()));
+        match classify_mtp_request_lane(
+            mode,
+            ghost_metal_acceleration_enabled(),
+            target_kv_len,
+            expected_kv_len,
+        ) {
+            Gemma4MtpRequestAdmission::CpuPinned => Ok(false),
+            Gemma4MtpRequestAdmission::MetalReady => Ok(true),
+            Gemma4MtpRequestAdmission::RefuseGpuChanged => {
+                Err(BackendError::RuntimeShapeMismatch(
+                    "Gemma 4 GPU acceleration changed after Metal prefill; retry so one KV lane is selected from position zero".into(),
+                ))
+            }
+            Gemma4MtpRequestAdmission::RefuseTargetState => {
+                Err(BackendError::RuntimeShapeMismatch(format!(
+                    "Gemma 4 MTP target state is not ready at the prompt boundary: mode={mode:?} target_kv_len={target_kv_len:?} expected={expected_kv_len}"
+                )))
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn require_mtp_target_kv_len(&self, expected: usize) -> Result<()> {
-        let actual = self
-            .with_mtp_target_kv_experiment(|view| view.logical_len())?
-            .ok_or_else(|| {
-                BackendError::InvalidModelMetadata(
-                    "Gemma 4 MTP requires the strict 26B Metal target shared-KV path".into(),
-                )
-            })?;
-        if actual != expected {
-            return Err(BackendError::RuntimeShapeMismatch(format!(
-                "Gemma 4 MTP target KV length is {actual}, expected {expected}"
-            )));
+        if !self.mtp_request_uses_metal(expected)? {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "Gemma 4 MTP cannot run on a request pinned to the CPU KV lane".into(),
+            ));
         }
         Ok(())
     }
@@ -18419,6 +18939,7 @@ impl Gemma4Runtime {
         let mut current_verify_k = mtp_initial_verify_width(adaptive_width, max_verify_k);
         let mut width_schedule_round_index = 0usize;
         let device_chain_requested = crate::metal::device_chain_requested_from_environment()?;
+        let spec_timing = mtp_spec_timing_enabled();
 
         let generation_started = std::time::Instant::now();
         if kc.len() != self.layers.len() || vc.len() != self.layers.len() {
@@ -19059,14 +19580,16 @@ impl Gemma4Runtime {
                 total_wall_us: mtp_us_saturating(round_started.elapsed().as_micros()),
             });
             let round = output.rounds.last().expect("round present");
-            eprintln!(
-                "[mtp round] #{round_index} wall={:.2}ms (assistant={:.2}ms, verifier={:.2}ms) accepted={}/{}",
-                round.total_wall_us as f64 / 1000.0,
-                assistant_wall_us as f64 / 1000.0,
-                verify_wall_us as f64 / 1000.0,
-                accepted_drafts,
-                round.verifier_k
-            );
+            if spec_timing {
+                eprintln!(
+                    "[mtp round] #{round_index} wall={:.2}ms (assistant={:.2}ms, verifier={:.2}ms) accepted={}/{}",
+                    round.total_wall_us as f64 / 1000.0,
+                    assistant_wall_us as f64 / 1000.0,
+                    verify_wall_us as f64 / 1000.0,
+                    accepted_drafts,
+                    round.verifier_k
+                );
+            }
             if let Some(cb) = on_round.as_deref_mut() {
                 cb(round);
             }
@@ -19222,7 +19745,7 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         let exact_residency_trace_requested = ghost_metal_exact_residency_trace_enabled();
         #[cfg(target_os = "macos")]
-        if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
+        if self.ghost_metal_q4_is_enabled() && self.supports_chunk_forward() {
             if let Some(head) = self.metal_q6k_head.as_ref() {
                 let kk = tokens.len();
                 let hidden = self.config.embedding_length as usize;
@@ -20059,10 +20582,10 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             ghost_metal_acceleration_enabled()
-                && self
-                    .metal_q4_experts
-                    .lock()
-                    .is_ok_and(|lane| lane.is_some())
+                && self.metal_q4_experts.lock().is_ok_and(|lane| {
+                    lane.as_ref()
+                        .is_some_and(|lane| lane.sequence_mode != GhostMetalSequenceMode::Cpu)
+                })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -22631,7 +23154,7 @@ impl Gemma4Runtime {
                 let mut rows = self.step_chunk_with_head(tokens, start_pos, kc, vc, false, None)?;
                 logits = rows.pop().expect("non-empty prefill chunk has logits");
             }
-            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
+            if ghost_prefill_requires_hybrid_finish(plan) {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
             }
             #[cfg(target_os = "macos")]
@@ -22812,7 +23335,7 @@ impl Gemma4Runtime {
             if should_cancel() {
                 return Ok(None);
             }
-            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
+            if ghost_prefill_requires_hybrid_finish(plan) {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
                 // Import is synchronous but can copy a large context. Observe a
                 // disconnect that arrived during it before starting decode; the
@@ -22982,6 +23505,7 @@ impl Gemma4Runtime {
         mut should_cancel: C,
         mut hybrid_telemetry_out: Option<&mut Option<Gemma4HybridTelemetry>>,
     ) -> Result<Gemma4GenerationOutcome> {
+        let _gpu_accel_generation = crate::cuda::gpu_accel_generation_guard();
         #[cfg(target_os = "macos")]
         let _ghost_common_request = self.lock_ghost_common_generation()?;
         #[cfg(target_os = "macos")]
@@ -23041,37 +23565,39 @@ impl Gemma4Runtime {
 
         #[cfg(target_os = "macos")]
         {
-            let mut guard = self.mtp_assistant.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(assistant) = guard.as_mut() {
-                // The experiment may fall back to its BF16 tied projection if
-                // Q4 packing failed at load. Generation remains available, but
-                // the strict receipt is omitted rather than mislabelling it.
-                if !assistant.q4_head_enabled() {
-                    hybrid_collector = None;
-                }
-                let mut stream_tokens = Vec::new();
-                let mut emit_committed = |round: &Gemma4MtpGenerationRound| {
-                    if let Some(collector) = hybrid_collector.as_mut() {
-                        collector.capture_round(
-                            Gemma4HybridRoundInput::from(round),
-                            self.routed_expert_residency_snapshot(),
-                        );
+            let mtp_request_uses_metal = self.mtp_request_uses_metal(prompt_tokens.len())?;
+            if mtp_request_uses_metal {
+                let mut guard = self.mtp_assistant.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(assistant) = guard.as_mut() {
+                    // The experiment may fall back to its BF16 tied projection if
+                    // Q4 packing failed at load. Generation remains available, but
+                    // the strict receipt is omitted rather than mislabelling it.
+                    if !assistant.q4_head_enabled() {
+                        hybrid_collector = None;
                     }
-                    if let Some(on_delta_fn) = on_delta.as_mut() {
-                        for &t in &round.committed_tokens {
-                            stream_tokens.push(t);
-                            if let Ok(full) = self.tokenizer.decode(&stream_tokens, true) {
-                                if let Some(delta) = full.strip_prefix(&emitted) {
-                                    if !delta.is_empty() {
-                                        on_delta_fn(delta);
-                                        emitted = full;
+                    let mut stream_tokens = Vec::new();
+                    let mut emit_committed = |round: &Gemma4MtpGenerationRound| {
+                        if let Some(collector) = hybrid_collector.as_mut() {
+                            collector.capture_round(
+                                Gemma4HybridRoundInput::from(round),
+                                self.routed_expert_residency_snapshot(),
+                            );
+                        }
+                        if let Some(on_delta_fn) = on_delta.as_mut() {
+                            for &t in &round.committed_tokens {
+                                stream_tokens.push(t);
+                                if let Ok(full) = self.tokenizer.decode(&stream_tokens, true) {
+                                    if let Some(delta) = full.strip_prefix(&emitted) {
+                                        if !delta.is_empty() {
+                                            on_delta_fn(delta);
+                                            emitted = full;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                };
-                let result = self
+                    };
+                    let result = self
                     .generate_mtp_assistant_experiment_cancellable_with_prefill_seed_and_boundary_hint(
                         assistant,
                         &mut kc,
@@ -23085,32 +23611,33 @@ impl Gemma4Runtime {
                         &mut (|| should_cancel()),
                         Some(&mut emit_committed),
                     )?;
-                #[allow(clippy::drop_non_drop)]
-                drop(emit_committed);
-                if result.aborted {
-                    return Ok(Gemma4GenerationOutcome::Cancelled {
-                        generated_tokens: result.generated_tokens.len(),
+                    #[allow(clippy::drop_non_drop)]
+                    drop(emit_committed);
+                    if result.aborted {
+                        return Ok(Gemma4GenerationOutcome::Cancelled {
+                            generated_tokens: result.generated_tokens.len(),
+                        });
+                    }
+                    let hybrid_telemetry = hybrid_collector.take().and_then(|collector| {
+                        collector.finish(
+                            self.routed_expert_residency_snapshot(),
+                            result.generated_tokens.len(),
+                            usize::from(result.terminal_unforwarded_target_token.is_some()),
+                        )
+                    });
+                    if let Some(output) = hybrid_telemetry_out.as_mut() {
+                        **output = hybrid_telemetry;
+                    }
+                    let text = if on_delta.is_some() {
+                        emitted
+                    } else {
+                        self.tokenizer.decode(&result.generated_tokens, true)?
+                    };
+                    return Ok(Gemma4GenerationOutcome::Complete {
+                        text,
+                        token_ids: result.generated_tokens,
                     });
                 }
-                let hybrid_telemetry = hybrid_collector.take().and_then(|collector| {
-                    collector.finish(
-                        self.routed_expert_residency_snapshot(),
-                        result.generated_tokens.len(),
-                        usize::from(result.terminal_unforwarded_target_token.is_some()),
-                    )
-                });
-                if let Some(output) = hybrid_telemetry_out.as_mut() {
-                    **output = hybrid_telemetry;
-                }
-                let text = if on_delta.is_some() {
-                    emitted
-                } else {
-                    self.tokenizer.decode(&result.generated_tokens, true)?
-                };
-                return Ok(Gemma4GenerationOutcome::Complete {
-                    text,
-                    token_ids: result.generated_tokens,
-                });
             }
         }
 
@@ -29137,6 +29664,67 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn mini2_webui_profile_receipt_fails_closed_on_every_runtime_dimension() {
+        let exact = Gemma4Mini2WebuiProfileFacts {
+            hot_slots_per_layer: GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE.to_vec(),
+            hybrid_mapped: true,
+            cpu_fallback_forbidden: true,
+            common_context_capacity: Some(1_024),
+            zero_host_cache: true,
+            tied_head_loaded: true,
+            mtp_loaded: true,
+            mtp_full_q4: true,
+            exact_expert_policy: true,
+            cghost_artifact: Some(Gemma4CghostArtifactReceipt {
+                logical_bytes: crate::ghost_install::GEMMA4_26B_GHOST_CGHOST_BYTES,
+                sha256: GEMMA4_MINI2_CGHOST_SHA256.into(),
+            }),
+            exact_environment: true,
+        };
+        assert!(gemma4_mini2_webui_profile_admitted(&exact));
+
+        let mut neighbors = Vec::new();
+        let mut wrong_slots = exact.clone();
+        wrong_slots.hot_slots_per_layer.swap(0, 1);
+        neighbors.push(wrong_slots);
+        for mutate in [
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.hybrid_mapped = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.cpu_fallback_forbidden = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.zero_host_cache = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.tied_head_loaded = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.mtp_loaded = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.mtp_full_q4 = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.exact_expert_policy = false,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.cghost_artifact = None,
+            |facts: &mut Gemma4Mini2WebuiProfileFacts| facts.exact_environment = false,
+        ] {
+            let mut neighbor = exact.clone();
+            mutate(&mut neighbor);
+            neighbors.push(neighbor);
+        }
+        let mut wrong_context = exact.clone();
+        wrong_context.common_context_capacity = Some(2_048);
+        neighbors.push(wrong_context);
+        let mut wrong_cghost_digest = exact.clone();
+        wrong_cghost_digest
+            .cghost_artifact
+            .as_mut()
+            .expect("exact fixture has cghost receipt")
+            .sha256 = "0".repeat(64);
+        neighbors.push(wrong_cghost_digest);
+        let mut wrong_cghost_size = exact.clone();
+        wrong_cghost_size
+            .cghost_artifact
+            .as_mut()
+            .expect("exact fixture has cghost receipt")
+            .logical_bytes += 1;
+        neighbors.push(wrong_cghost_size);
+        assert!(neighbors
+            .iter()
+            .all(|facts| !gemma4_mini2_webui_profile_admitted(facts)));
+    }
+
+    #[test]
     fn live_sequential_predict_probe_is_exact_positive_and_default_off() {
         assert!(!ghost_metal_live_sequential_predict_probe_from(None));
         assert!(ghost_metal_live_sequential_predict_probe_from(Some("1")));
@@ -29170,6 +29758,26 @@ mod mtp_target_seam_tests {
                 "unexpected prompt-ranked handoff admission for {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_ranked_resident_fill_is_exact_positive_default_off_and_subordinate() {
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(
+            None
+        ));
+        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(
+            Some("1")
+        ));
+        for value in ["", "0", "01", "true", "TRUE", " 1", "1 ", "2"] {
+            assert!(
+                !ghost_metal_prompt_ranked_hot_handoff_resident_fill_from(Some(value)),
+                "unexpected resident-fill admission for {value:?}"
+            );
+        }
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(false, false));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(false, true));
+        assert!(!ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(true, false));
+        assert!(ghost_metal_prompt_ranked_hot_handoff_resident_fill_admitted(true, true));
     }
 
     #[test]
@@ -29583,6 +30191,7 @@ mod mtp_target_seam_tests {
         let routes = prompt_ranked_hot_handoff_routes(
             &unions,
             &scores,
+            None,
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
         )
         .expect("exact H49 prompt ranking");
@@ -29593,23 +30202,100 @@ mod mtp_target_seam_tests {
 
         let mut wrong_capacity = GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE;
         wrong_capacity.swap(0, 1);
-        assert!(prompt_ranked_hot_handoff_routes(&unions, &scores, &wrong_capacity).is_none());
+        assert!(
+            prompt_ranked_hot_handoff_routes(&unions, &scores, None, &wrong_capacity).is_none()
+        );
         let mut nonfinite = scores.clone();
         nonfinite[4][9] = f32::NAN;
         assert!(prompt_ranked_hot_handoff_routes(
             &unions,
             &nonfinite,
+            None,
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
         )
         .is_none());
-        let mut underfilled = unions.clone();
+    }
+
+    #[test]
+    fn prompt_ranked_handoff_legacy_underfill_preserves_fail_closed_fallback() {
+        let mut underfilled = vec![[u64::MAX; 2]; 30];
         underfilled[0] = [0xff, 0];
+        let scores = vec![vec![0.0; 128]; 30];
         assert!(prompt_ranked_hot_handoff_routes(
             &underfilled,
             &scores,
+            None,
             &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
         )
         .is_none());
+    }
+
+    #[test]
+    fn prompt_ranked_handoff_resident_fill_pads_deterministically_and_fails_closed() {
+        let mut underfilled = vec![[u64::MAX; 2]; 30];
+        underfilled[0] = [0xff, 0];
+        let mut scores = vec![vec![0.0; 128]; 30];
+        for layer_scores in &mut scores {
+            layer_scores[100] = 3.0;
+            layer_scores[101] = 2.0;
+        }
+        let residents = vec![(0..128).collect::<Vec<_>>(); 30];
+        let padded = prompt_ranked_hot_handoff_routes(
+            &underfilled,
+            &scores,
+            Some(residents.as_slice()),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .expect("resident identities pad an underfilled prompt layer");
+        assert_eq!(
+            padded[0].len(),
+            GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE[0]
+        );
+        assert_eq!(padded[0][..8], [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(padded[0][8..10], [100, 101]);
+
+        let no_residents = vec![Vec::new(); 30];
+        assert!(prompt_ranked_hot_handoff_routes(
+            &underfilled,
+            &scores,
+            Some(no_residents.as_slice()),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .is_none());
+        let mut duplicate_resident = residents.clone();
+        duplicate_resident[0].push(0);
+        assert!(prompt_ranked_hot_handoff_routes(
+            &underfilled,
+            &scores,
+            Some(duplicate_resident.as_slice()),
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn prompt_ranked_handoff_receipt_labels_preserve_legacy_bytes_by_default() {
+        assert_eq!(
+            prompt_ranked_hot_handoff_receipt_labels(true, false),
+            (
+                "current-prompt-exact-route-union",
+                "decay-score-desc-expert-id-asc"
+            )
+        );
+        assert_eq!(
+            prompt_ranked_hot_handoff_receipt_labels(true, true),
+            (
+                "current-prompt-exact-route-union-resident-padding-enabled",
+                "prompt-decay-score-desc-then-resident-score-desc-expert-id-asc"
+            )
+        );
+        assert_eq!(
+            prompt_ranked_hot_handoff_receipt_labels(false, true),
+            (
+                "baseline-interval-union-or-latest-route",
+                "expert-id-asc-or-route-order"
+            )
+        );
     }
 
     #[test]
@@ -29899,6 +30585,25 @@ mod mtp_target_seam_tests {
             layer.anonymous_slot_capacity_bytes = hot_per_layer * HYBRID_TELEMETRY_STRIDE_BYTES;
             layer.physical_base_slot_budget = hot_per_layer;
             layer.physical_base_slot_budget_bytes = hot_per_layer * HYBRID_TELEMETRY_STRIDE_BYTES;
+        }
+    }
+
+    fn set_profiled_hybrid_hot_capacity(
+        snapshot: &mut Gemma4RoutedExpertResidencySnapshot,
+        profile: &[usize; HYBRID_TELEMETRY_LAYERS],
+    ) {
+        let hot_total = profile.iter().sum::<usize>() as u64;
+        let hot_bytes = hot_total * HYBRID_TELEMETRY_STRIDE_BYTES;
+        snapshot.anonymous_slot_capacity = hot_total;
+        snapshot.anonymous_slot_capacity_bytes = hot_bytes;
+        snapshot.physical_base_slot_budget = hot_total;
+        snapshot.physical_base_slot_budget_bytes = hot_bytes;
+        for (layer, &slots) in snapshot.per_layer.iter_mut().zip(profile) {
+            let slots = slots as u64;
+            layer.anonymous_slot_capacity = slots;
+            layer.anonymous_slot_capacity_bytes = slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+            layer.physical_base_slot_budget = slots;
+            layer.physical_base_slot_budget_bytes = slots * HYBRID_TELEMETRY_STRIDE_BYTES;
         }
     }
 
@@ -30192,6 +30897,129 @@ mod mtp_target_seam_tests {
         assert!(
             exact_hybrid_telemetry_geometry(&mixed_hot40).is_none(),
             "aggregate 1,200 is not sufficient: every layer must be exactly 40"
+        );
+    }
+
+    #[test]
+    fn hybrid_telemetry_schema_v2_whitelists_exact_mini2_profile_only() {
+        let mut mini2 = exact_hybrid_snapshot(10, None, 0, 0);
+        set_profiled_hybrid_hot_capacity(
+            &mut mini2,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        );
+        let geometry = exact_hybrid_telemetry_geometry(&mini2)
+            .expect("exact uneven Mini2 profile is receiptable");
+        assert_eq!(geometry.anonymous_hot_capacity_slots, 1_408);
+        assert_eq!(
+            geometry
+                .per_layer
+                .iter()
+                .map(|layer| layer.anonymous_hot_capacity_slots)
+                .collect::<Vec<_>>(),
+            GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+                .iter()
+                .map(|&slots| slots as u64)
+                .collect::<Vec<_>>()
+        );
+
+        let mut neighboring = mini2;
+        for (layer, delta) in [(0usize, -1i64), (1, 1)] {
+            let slots =
+                (neighboring.per_layer[layer].anonymous_slot_capacity as i64 + delta) as u64;
+            neighboring.per_layer[layer].anonymous_slot_capacity = slots;
+            neighboring.per_layer[layer].anonymous_slot_capacity_bytes =
+                slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+            neighboring.per_layer[layer].physical_base_slot_budget = slots;
+            neighboring.per_layer[layer].physical_base_slot_budget_bytes =
+                slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+        }
+        assert!(
+            exact_hybrid_telemetry_geometry(&neighboring).is_none(),
+            "a same-total neighboring 1,408-slot profile must fail closed"
+        );
+    }
+
+    #[test]
+    fn hybrid_telemetry_mini2_wide_round_requires_truthful_hot_mapped_partition() {
+        let make_snapshot = |all_hot: bool| {
+            let mut snapshot = exact_hybrid_snapshot(101, Some(10), 0, 0);
+            set_profiled_hybrid_hot_capacity(
+                &mut snapshot,
+                &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+            );
+            let mut hot_total = 0u32;
+            let mut mapped_total = 0u32;
+            for (layer, &capacity) in GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE
+                .iter()
+                .enumerate()
+            {
+                let hot = if all_hot { 64 } else { capacity.min(50) } as u16;
+                let mapped = 64u16.saturating_sub(hot);
+                snapshot.last_chained_unique_per_layer[layer] = 64;
+                snapshot.last_chained_hot_bound_per_layer[layer] = hot;
+                snapshot.last_chained_mapped_bound_per_layer[layer] = mapped;
+                hot_total = hot_total.saturating_add(u32::from(hot));
+                mapped_total = mapped_total.saturating_add(u32::from(mapped));
+            }
+            snapshot.last_chained_unique_experts_sum = 64 * HYBRID_TELEMETRY_LAYERS as u32;
+            snapshot.last_chained_unique_experts_max = 64;
+            snapshot.last_chained_hot_bound_records = hot_total;
+            snapshot.last_chained_mapped_bound_records = mapped_total;
+            snapshot.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+                route_lookups: 2_400,
+                hits: 1_800,
+                misses: 600,
+                ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+            };
+            snapshot.cumulative_chained_demand_loads = 14;
+            snapshot.cumulative_chained_demand_read_bytes = 14 * HYBRID_TELEMETRY_RECORD_BYTES;
+            snapshot
+        };
+        let round = Gemma4HybridRoundInput {
+            round_index: 0,
+            prefix_tokens_before: 34,
+            bootstrap: false,
+            remaining_budget_before: 128,
+            requested_k: 10,
+            proposed_k: 9,
+            verifier_k: 10,
+            budget_truncated: false,
+            accepted_drafts: 5,
+            useful_accepted_drafts: 5,
+            committed_tokens: vec![10, 11, 12, 13, 14, 15],
+            assistant_wall_us: 20_000,
+            assistant_gpu_us: 15_000,
+            verifier_wall_us: 70_000,
+            verifier_gpu_us: 50_000,
+            total_wall_us: 100_000,
+        };
+
+        let mut before = exact_hybrid_snapshot(100, None, 0, 0);
+        set_profiled_hybrid_hot_capacity(
+            &mut before,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        );
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact Mini2 baseline");
+        let partitioned = make_snapshot(false);
+        collector.capture_round(round.clone(), Some(partitioned.clone()));
+        assert!(
+            collector.finish(Some(partitioned), 6, 0).is_some(),
+            "a K10 composite table remains receiptable when hot and mapped records are separated"
+        );
+
+        let mut before = exact_hybrid_snapshot(100, None, 0, 0);
+        set_profiled_hybrid_hot_capacity(
+            &mut before,
+            &GHOST_METAL_LIVE_SEQUENTIAL_MINI2_HOT_PROFILE,
+        );
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact Mini2 baseline");
+        let all_hot = make_snapshot(true);
+        collector.capture_round(round, Some(all_hot.clone()));
+        assert!(
+            collector.finish(Some(all_hot), 6, 0).is_none(),
+            "misclassifying a 64-record union as all-hot must still fail the per-layer capacity gate"
         );
     }
 
@@ -30504,12 +31332,25 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
-    fn mtp_adaptive_width_resets_on_rejection_and_fixed_mode_does_not_move() {
+    fn mtp_adaptive_width_backs_off_from_acceptance_and_fixed_mode_does_not_move() {
         assert_eq!(mtp_initial_verify_width(false, 12), 12);
         assert_eq!(mtp_next_verify_width(false, 12, 12, 7, 3), 12);
         assert_eq!(mtp_initial_verify_width(true, 8), 8);
         assert_eq!(mtp_next_verify_width(true, 12, 11, 10, 10), 12);
-        assert_eq!(mtp_next_verify_width(true, 12, 12, 11, 7), 10);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 4), 6);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 3), 5);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 0), 4);
+        assert_eq!(mtp_next_verify_width(true, 15, 15, 14, 1), 4);
+        assert_eq!(mtp_next_verify_width(true, 12, 12, 11, 10), 12);
+        assert_eq!(mtp_next_verify_width(true, 3, 3, 2, 0), 3);
+    }
+
+    #[test]
+    fn mtp_round_timing_log_preserves_spec_timing_presence_semantics() {
+        assert!(!mtp_spec_timing_enabled_value(None));
+        assert!(mtp_spec_timing_enabled_value(Some("")));
+        assert!(mtp_spec_timing_enabled_value(Some("0")));
+        assert!(mtp_spec_timing_enabled_value(Some("1")));
     }
 
     #[test]
@@ -31928,7 +32769,9 @@ mod scalar_prefill_head_tests {
 
 #[cfg(test)]
 mod ghost_hybrid_prefill_plan_tests {
-    use super::{select_ghost_prefill_plan, GhostPrefillPlan};
+    use super::{
+        ghost_prefill_requires_hybrid_finish, select_ghost_prefill_plan, GhostPrefillPlan,
+    };
 
     #[test]
     fn multi_token_common_prefill_defaults_to_hybrid_but_has_a_scalar_kill_switch() {
@@ -31948,6 +32791,13 @@ mod ghost_hybrid_prefill_plan_tests {
             select_ghost_prefill_plan(true, true, 1, 8, Some(4096)),
             GhostPrefillPlan::ScalarMetal
         );
+        assert!(ghost_prefill_requires_hybrid_finish(
+            GhostPrefillPlan::HybridChunk
+        ));
+        assert!(
+            !ghost_prefill_requires_hybrid_finish(GhostPrefillPlan::ScalarMetal),
+            "one-token Metal prefill already owns KV and must not be reset through the CPU handoff"
+        );
         assert_eq!(
             select_ghost_prefill_plan(true, true, 4000, 4127, Some(4096)),
             GhostPrefillPlan::CpuChunk
@@ -31955,6 +32805,11 @@ mod ghost_hybrid_prefill_plan_tests {
         assert_eq!(
             select_ghost_prefill_plan(false, true, 1, 4127, Some(4096)),
             GhostPrefillPlan::ScalarCpu
+        );
+        assert_eq!(
+            select_ghost_prefill_plan(true, true, 32, 63, None),
+            GhostPrefillPlan::CpuChunk,
+            "a disabled GPU pins the request to CPU from position zero"
         );
     }
 }
@@ -31973,6 +32828,43 @@ mod ghost_moe_wire_tests {
         assert!(!ghost_metal_acceleration_allowed(false, false));
         assert!(!ghost_metal_acceleration_allowed(true, true));
         assert!(!ghost_metal_acceleration_allowed(true, false));
+    }
+
+    #[test]
+    fn mtp_request_lane_never_reenters_metal_after_cpu_prefill() {
+        use Gemma4MtpRequestAdmission::{
+            CpuPinned, MetalReady, RefuseGpuChanged, RefuseTargetState,
+        };
+
+        assert_eq!(classify_mtp_request_lane(None, true, None, 64), CpuPinned);
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Cpu), false, None, 64),
+            CpuPinned
+        );
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Cpu), true, Some(64), 64),
+            CpuPinned,
+            "turning the GPU on after CPU prefill cannot change the request lane"
+        );
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Metal), true, Some(64), 64),
+            MetalReady
+        );
+        assert_eq!(
+            classify_mtp_request_lane(Some(GhostMetalSequenceMode::Metal), false, Some(64), 64),
+            RefuseGpuChanged
+        );
+        for (mode, kv_len) in [
+            (GhostMetalSequenceMode::Metal, None),
+            (GhostMetalSequenceMode::Metal, Some(63)),
+            (GhostMetalSequenceMode::Idle, Some(64)),
+            (GhostMetalSequenceMode::HybridPrefill, Some(64)),
+        ] {
+            assert_eq!(
+                classify_mtp_request_lane(Some(mode), true, kv_len, 64),
+                RefuseTargetState
+            );
+        }
     }
 
     #[test]
@@ -32061,6 +32953,28 @@ mod ghost_moe_wire_tests {
         file.write_all(&cursor.to_le_bytes()).unwrap();
         drop(file);
         (dir, path)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cghost_full_artifact_receipt_detects_unsampled_padding_changes() {
+        let (_dir, path) = cache_fixture(1, 1);
+        let before_file = GhostFile::open(&path).expect("open cghost before mutation");
+        let before = gemma4_cghost_artifact_receipt(&before_file).expect("hash cghost mapping");
+        drop(before_file);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open cghost padding for mutation");
+        file.seek(SeekFrom::Start(32)).unwrap();
+        file.write_all(&[1]).unwrap();
+        drop(file);
+
+        let after_file = GhostFile::open(&path).expect("layout survives padding mutation");
+        let after = gemma4_cghost_artifact_receipt(&after_file).expect("rehash cghost mapping");
+        assert_eq!(before.logical_bytes, after.logical_bytes);
+        assert_ne!(before.sha256, after.sha256);
     }
 
     #[test]
@@ -33132,23 +34046,42 @@ mod ghost_moe_wire_tests {
     #[test]
     fn metal_demand_only_never_selects_all_layer_predicted_schedule() {
         assert!(ghost_metal_chained_prediction_allowed(
-            false, false, 8, true, false
+            false, false, 8, true, false, false
         ));
         assert!(ghost_metal_chained_prediction_allowed(
-            false, false, 8, false, true
+            false, false, 8, false, true, false
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            true, false, 8, true, true
+            true, false, 8, true, true, true
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            false, true, 8, true, true
+            false, true, 8, true, true, true
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            false, false, 1, true, true
+            false, false, 1, true, true, true
         ));
         assert!(!ghost_metal_chained_prediction_allowed(
-            false, false, 8, false, false
+            false, false, 8, false, false, false
         ));
+        assert!(ghost_metal_chained_prediction_allowed(
+            false, false, 8, false, false, true
+        ));
+    }
+
+    #[test]
+    fn dropped_expert_policy_is_exactly_parsed_and_requires_a_live_ghost_metal_lane() {
+        for admitted in ["1", "true", "TRUE", "True"] {
+            assert!(ghost_allow_dropped_experts_from(Some(admitted)));
+        }
+        for refused in ["", "0", "false", "yes", "on", "01", " 1", "1 "] {
+            assert!(!ghost_allow_dropped_experts_from(Some(refused)));
+        }
+        assert!(!ghost_allow_dropped_experts_from(None));
+
+        assert!(ghost_exact_expert_policy_admitted(true, true, false));
+        assert!(!ghost_exact_expert_policy_admitted(false, true, false));
+        assert!(!ghost_exact_expert_policy_admitted(true, false, false));
+        assert!(!ghost_exact_expert_policy_admitted(true, true, true));
     }
 
     #[cfg(target_os = "macos")]

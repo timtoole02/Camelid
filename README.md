@@ -122,7 +122,7 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Gemma 4 E2B-It** | `Q8_0` | `gemma4` | 5.0 GB | `gemma4_e2b` | `gemma-4-E2B-it-Q8_0.gguf` |
 | **Gemma 4 E4B-It** | `Q8_0` | `gemma4` | 8.2 GB | `gemma4_e4b` | `gemma-4-E4B-it-Q8_0.gguf` |
 | **Gemma 4 12B-It** — two-Mac distributed | `Q8_0` | `gemma4` | 12.7 GB | `gemma4_12b` | `gemma-4-12b-it-Q8_0.gguf` |
-| **Gemma 4 26B-A4B-It QAT** — two-Mac distributed MoE | `Q4_0` | `gemma4` | 14.4 GB | `gemma4_26b` | `gemma-4-26B_q4_0-it.gguf` |
+| **Gemma 4 26B-A4B-It QAT** — two-Mac distributed or exact Apple M4 Ghost-MoE/MTP | `Q4_0` | `gemma4` | 14.4 GB | `gemma4_26b` | `gemma-4-26B_q4_0-it.gguf` |
 | **Qwen3 0.6B** | `Q8_0` | `qwen3` | 0.6 GB | `qwen3_0_6b` | `Qwen3-0.6B-Q8_0.gguf` |
 | **Qwen3 1.7B** | `Q8_0` | `qwen3` | 1.8 GB | `qwen3_1_7b` | `Qwen3-1.7B-Q8_0.gguf` |
 | **Qwen3 4B** | `Q8_0` | `qwen3` | 4.3 GB | `qwen3_4b_q8` | `Qwen3-4B-Q8_0.gguf` |
@@ -146,7 +146,7 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Bonsai 27B** | `Q1_0` | `qwen35` | 3.8 GB | `bonsai_27b_q1` | `Bonsai-27B-Q1_0.gguf` |
 | **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
-The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Nine hash-pinned Phase 2 rows are **Runnable with disclosed reference-output variance**: LFM2.5 1.2B Thinking Q8_0, Gemma 3 4B-It Q8_0, Llama 3.1 8B Instruct Q8_0, Qwen 2.5 0.5B/1.5B Instruct Q8_0, Qwen 3.5 4B/9B Q8_0, DeepSeek R1 Distill Qwen 1.5B Q8_0, and Aya Expanse 8B Q4_K_M. They use the normal download-and-start path and may be used for local chat; one or more strict greedy token-ID probes differ from pinned llama.cpp, so the UI keeps an amber warning and withholds Verified/Supported, tools, and broader-context claims.
+The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane; their original full artifacts do not fit on a single 16 GB machine. The 26B row also has the separately bounded, prepared-artifact Apple M4 lane described below. Nine hash-pinned Phase 2 rows are **Runnable with disclosed reference-output variance**: LFM2.5 1.2B Thinking Q8_0, Gemma 3 4B-It Q8_0, Llama 3.1 8B Instruct Q8_0, Qwen 2.5 0.5B/1.5B Instruct Q8_0, Qwen 3.5 4B/9B Q8_0, DeepSeek R1 Distill Qwen 1.5B Q8_0, and Aya Expanse 8B Q4_K_M. They use the normal download-and-start path and may be used for local chat; one or more strict greedy token-ID probes differ from pinned llama.cpp, so the UI keeps an amber warning and withholds Verified/Supported, tools, and broader-context claims.
 
 Mistral Nemo Instruct 2407 Q4_K_M, Qwen3 14B Q4_K_M, and DeepSeek R1 0528 Qwen3 8B Q4_K_M are downloadable catalog rows, not supported rows. The pinned bring-up evidence records Mistral Nemo cross-backend divergence and a blocked external comparator, Qwen3 14B without an external oracle or chat/API proof, and DeepSeek cross-backend divergence plus a missing native R1 marker/tool renderer. None inherits support from its architecture or a smaller sibling.
 
@@ -158,12 +158,21 @@ BitNet.cpp's separately permuted TL files. Reference parity and bounded-context 
 embedding-vector receipts remain outstanding. See
 [the BitNet runtime notes](docs/architecture/BITNET.md).
 
-Experimental exception: the Gemma 4 26B MoE row can also run on a single 16 GB
-Apple-silicon Mac through the opt-in Ghost-MoE Metal lane, which repacks the routed experts into a
-paged `.cghost` artifact and keeps a bounded, persistent expert working set in unified memory
-(measured 17–20 tok/s steady-state decode on an M4). Replies on that lane are marked
-experimental with no parity guarantee. Setup, the recommended serve profile, and measured receipts
-live in [docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gemma-4-26b-a4b).
+Gemma 4 26B-A4B QAT now has two supported exact-row smoke lanes: the existing
+two-Mac distributed layer-sharding lane and one exact single-node Apple M4 / macOS
+26.5.x arm64 full-common Metal Ghost-MoE + full-Q4 MTP profile. The single-node
+claim is bound to prepared target SHA-256
+`66bfa72e759bfa8509634ec0589057df4283183ab4927635c110819690fe972d`, the full
+`.cghost` SHA-256
+`b3352d21b6c84abf2950f4551a9b47606f2cb003acde6e839118313c51aa3757`, runtime
+profile `mini2-h71r-h58-h60-h62-1408-ctx1024-mtp15-adaptive-v1`, and an exact
+1,024-position context allocation. Admission fails closed unless live health and
+the reconciled execution plan prove that complete profile. This does not claim a
+portable performance level or SLA, other Apple hardware, CPU or hybrid/partial
+Metal execution, or broader MTP support. Windows CUDA remains runnable but
+unverified pending a digest-bound prepared-artifact receipt; MTP is supported only
+inside the exact Apple M4 profile above. Setup and Ghost-MoE details live in
+[docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gemma-4-26b-a4b).
 
 The full catalog, exact hashes, supported execution paths, and claim boundaries live in:
 
