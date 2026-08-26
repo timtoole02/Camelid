@@ -16915,9 +16915,11 @@ mod tests {
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
         let mut driver = MockDriver {
             steps: vec![
+                // Keep delimiters balanced so the write-time truncation guard accepts
+                // the file and the host Python compiler owns the syntax diagnosis.
                 ModelStep::Calls(vec![tc(
                     "write_file",
-                    json!({"path": "game.py", "content": "def broken(:\n    pass\n"}),
+                    json!({"path": "game.py", "content": "def broken()\n    pass\n"}),
                 )]),
                 ModelStep::Text("Done with broken source.".into()),
                 ModelStep::Calls(vec![tc(
