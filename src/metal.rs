@@ -2384,17 +2384,19 @@ kernel void q6k_linear_simd(
 }
 
 // Multi-column siblings of the three `*_linear_simd` GEMVs for bounded
-// column windows (the speculative-verify rows): the same one-SIMD-group-per-
-// output-row decomposition, with the inner dot repeated per column while the
-// super-block bytes are cache-hot, and the ordered f32 tail replayed by one
-// lane per column. Weight bytes therefore stream from DRAM once per window,
-// instead of once per four-column tile of the single-thread-per-row
-// `*_linear_tiled` kernels (whose rows*ceil(k/4) total threads also cannot
-// occupy the GPU). Each column's output is bit-identical to the
-// corresponding single-token `*_linear_simd` dispatch: the per-unit integer
-// math, the four-lane shuffle combine, and the per-super-block f32 tail run
-// in the same order with no cross-column arithmetic. `n_tokens` must be
-// <= 32 (one tail lane per column); the host caps it far lower.
+// column windows (the speculative-verify rows): one threadgroup per output
+// row holding `n_tokens` SIMD groups, each of which runs the single-token
+// kernel's exact work for its own column. The columns' weight-byte reads
+// coincide within the threadgroup, so DRAM sees the row's super-blocks about
+// once per window while the per-column dot ALU runs in parallel across
+// simdgroups — unlike the single-thread-per-row `*_linear_tiled` kernels
+// (whose rows*ceil(k/4) total threads also cannot occupy the GPU), and
+// unlike a single-simdgroup column loop, whose serial per-column ALU keeps
+// the cost linear in k. Each column's output is bit-identical to the
+// corresponding single-token `*_linear_simd` dispatch: same lane partition,
+// same shuffle combine, same ordered f32 tail, and no cross-column
+// arithmetic. The host dispatches 32*n_tokens threads per threadgroup and
+// caps the window (threadgroup limits allow up to 32 columns).
 kernel void q4k_linear_simd_mc(
     device const float* input_scales [[buffer(0)]],
     device const char* input_quants [[buffer(1)]],
@@ -2405,56 +2407,54 @@ kernel void q4k_linear_simd_mc(
     constant uint& n_tokens [[buffer(6)]],
     threadgroup int* scratch [[threadgroup(0)]],
     uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]]
+    uint lane [[thread_index_in_simdgroup]],
+    uint t [[simdgroup_index_in_threadgroup]]
 ) {
-    if (row >= rows) return;
+    if (row >= rows || t >= n_tokens) return;
     const uint units = n_sb * 4;
     for (uint u0 = 0; u0 < units; u0 += 32) {
         const uint u = u0 + lane;
         const bool active = u < units;
         const uint sb = u >> 2;
         const uint g = u & 3u;
-        device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
-        uchar sc[8], mn[8];
+        int aux[8] = {0,0,0,0,0,0,0,0};
+        int sumi = 0;
         if (active) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
+            device const char* y = input_quants + t * n_sb * 256 + sb * 256;
+            uchar sc[8], mn[8];
             q4k_scale_min(block, sc, mn);
-        }
-        for (uint t = 0; t < n_tokens; ++t) {
-            int aux[8] = {0,0,0,0,0,0,0,0};
-            int sumi = 0;
-            if (active) {
-                device const char* y = input_quants + t * n_sb * 256 + sb * 256;
-                int sumlo = 0;
-                int sumhi = 0;
-                for (uint k = 0; k < 4; ++k) {
-                    for (uint l = 0; l < 8; ++l) {
-                        const uint p = k * 8 + l;
-                        const uint packed = uint(block[16 + g * 32 + p]);
-                        const int ylo = int(y[g * 64 + p]);
-                        const int yhi = int(y[g * 64 + 32 + p]);
-                        aux[l] += int(sc[2 * g]) * ylo * int(packed & 0x0fu);
-                        aux[l] += int(sc[2 * g + 1]) * yhi * int(packed >> 4);
-                        sumlo += ylo;
-                        sumhi += yhi;
-                    }
-                }
-                sumi = int(mn[2 * g]) * sumlo + int(mn[2 * g + 1]) * sumhi;
-            }
-            for (uint off = 2; off >= 1; off >>= 1) {
+            int sumlo = 0;
+            int sumhi = 0;
+            for (uint k = 0; k < 4; ++k) {
                 for (uint l = 0; l < 8; ++l) {
-                    aux[l] += simd_shuffle_down(aux[l], off);
+                    const uint p = k * 8 + l;
+                    const uint packed = uint(block[16 + g * 32 + p]);
+                    const int ylo = int(y[g * 64 + p]);
+                    const int yhi = int(y[g * 64 + 32 + p]);
+                    aux[l] += int(sc[2 * g]) * ylo * int(packed & 0x0fu);
+                    aux[l] += int(sc[2 * g + 1]) * yhi * int(packed >> 4);
+                    sumlo += ylo;
+                    sumhi += yhi;
                 }
-                sumi += simd_shuffle_down(sumi, off);
             }
-            if (active && g == 0) {
-                for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 9 + l] = aux[l];
-                scratch[(t * n_sb + sb) * 9 + 8] = sumi;
+            sumi = int(mn[2 * g]) * sumlo + int(mn[2 * g + 1]) * sumhi;
+        }
+        for (uint off = 2; off >= 1; off >>= 1) {
+            for (uint l = 0; l < 8; ++l) {
+                aux[l] += simd_shuffle_down(aux[l], off);
             }
+            sumi += simd_shuffle_down(sumi, off);
+        }
+        if (active && g == 0) {
+            for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 9 + l] = aux[l];
+            scratch[(t * n_sb + sb) * 9 + 8] = sumi;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane < n_tokens) {
-        const uint t = lane;
+    // No cross-simdgroup dependency: each simdgroup owns column t end to end,
+    // so simdgroup-local ordering suffices before the tail reads scratch.
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
         float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
         float sumf = 0.0f;
         for (uint sb = 0; sb < n_sb; ++sb) {
@@ -2482,61 +2482,57 @@ kernel void q5k_linear_simd_mc(
     constant uint& n_tokens [[buffer(6)]],
     threadgroup int* scratch [[threadgroup(0)]],
     uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]]
+    uint lane [[thread_index_in_simdgroup]],
+    uint t [[simdgroup_index_in_threadgroup]]
 ) {
-    if (row >= rows) return;
+    if (row >= rows || t >= n_tokens) return;
     const uint units = n_sb * 4;
     for (uint u0 = 0; u0 < units; u0 += 32) {
         const uint u = u0 + lane;
         const bool active = u < units;
         const uint sb = u >> 2;
         const uint g = u & 3u;
-        device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
-        uchar sc[8], mn[8];
+        int aux[8] = {0,0,0,0,0,0,0,0};
+        int sumi = 0;
         if (active) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
+            device const char* y = input_quants + t * n_sb * 256 + sb * 256;
+            uchar sc[8], mn[8];
             q4k_scale_min(block, sc, mn);
-        }
-        for (uint t = 0; t < n_tokens; ++t) {
-            int aux[8] = {0,0,0,0,0,0,0,0};
-            int sumi = 0;
-            if (active) {
-                device const char* y = input_quants + t * n_sb * 256 + sb * 256;
-                int sumlo = 0;
-                int sumhi = 0;
-                for (uint k = 0; k < 4; ++k) {
-                    for (uint l = 0; l < 8; ++l) {
-                        const uint p = k * 8 + l;
-                        const uint packed = uint(block[48 + g * 32 + p]);
-                        const uint high = uint(block[16 + p]);
-                        const int wlo = int(packed & 0x0fu)
-                            + (((high >> (2u * g)) & 1u) != 0u ? 16 : 0);
-                        const int whi = int(packed >> 4)
-                            + (((high >> (2u * g + 1u)) & 1u) != 0u ? 16 : 0);
-                        const int ylo = int(y[g * 64 + p]);
-                        const int yhi = int(y[g * 64 + 32 + p]);
-                        aux[l] += int(sc[2 * g]) * ylo * wlo;
-                        aux[l] += int(sc[2 * g + 1]) * yhi * whi;
-                        sumlo += ylo;
-                        sumhi += yhi;
-                    }
-                }
-                sumi = int(mn[2 * g]) * sumlo + int(mn[2 * g + 1]) * sumhi;
-            }
-            for (uint off = 2; off >= 1; off >>= 1) {
+            int sumlo = 0;
+            int sumhi = 0;
+            for (uint k = 0; k < 4; ++k) {
                 for (uint l = 0; l < 8; ++l) {
-                    aux[l] += simd_shuffle_down(aux[l], off);
+                    const uint p = k * 8 + l;
+                    const uint packed = uint(block[48 + g * 32 + p]);
+                    const uint high = uint(block[16 + p]);
+                    const int wlo = int(packed & 0x0fu)
+                        + (((high >> (2u * g)) & 1u) != 0u ? 16 : 0);
+                    const int whi = int(packed >> 4)
+                        + (((high >> (2u * g + 1u)) & 1u) != 0u ? 16 : 0);
+                    const int ylo = int(y[g * 64 + p]);
+                    const int yhi = int(y[g * 64 + 32 + p]);
+                    aux[l] += int(sc[2 * g]) * ylo * wlo;
+                    aux[l] += int(sc[2 * g + 1]) * yhi * whi;
+                    sumlo += ylo;
+                    sumhi += yhi;
                 }
-                sumi += simd_shuffle_down(sumi, off);
             }
-            if (active && g == 0) {
-                for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 9 + l] = aux[l];
-                scratch[(t * n_sb + sb) * 9 + 8] = sumi;
+            sumi = int(mn[2 * g]) * sumlo + int(mn[2 * g + 1]) * sumhi;
+        }
+        for (uint off = 2; off >= 1; off >>= 1) {
+            for (uint l = 0; l < 8; ++l) {
+                aux[l] += simd_shuffle_down(aux[l], off);
             }
+            sumi += simd_shuffle_down(sumi, off);
+        }
+        if (active && g == 0) {
+            for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 9 + l] = aux[l];
+            scratch[(t * n_sb + sb) * 9 + 8] = sumi;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane < n_tokens) {
-        const uint t = lane;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
         float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
         float sumf = 0.0f;
         for (uint sb = 0; sb < n_sb; ++sb) {
@@ -2564,58 +2560,56 @@ kernel void q6k_linear_simd_mc(
     constant uint& n_tokens [[buffer(6)]],
     threadgroup int* scratch [[threadgroup(0)]],
     uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]]
+    uint lane [[thread_index_in_simdgroup]],
+    uint t [[simdgroup_index_in_threadgroup]]
 ) {
-    if (row >= rows) return;
+    if (row >= rows || t >= n_tokens) return;
     const uint units = n_sb * 4;
     for (uint u0 = 0; u0 < units; u0 += 32) {
         const uint u = u0 + lane;
         const bool active = u < units;
         const uint sb = u >> 2;
         const uint quarter = u & 3u;
-        device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
-        const uint h = quarter >> 1;
-        const uint s = quarter & 1u;
-        const uint qlb = h * 64;
-        const uint qhb = 128 + h * 32;
-        const uint base = h * 128 + s * 16;
-        for (uint t = 0; t < n_tokens; ++t) {
-            int aux[8] = {0,0,0,0,0,0,0,0};
-            if (active) {
-                device const char* y = input_quants + t * n_sb * 256 + sb * 256;
-                device const char* scales = reinterpret_cast<device const char*>(block + 192);
-                const int s0 = int(scales[8 * h + s]);
-                const int s1 = int(scales[8 * h + s + 2]);
-                const int s2 = int(scales[8 * h + s + 4]);
-                const int s3 = int(scales[8 * h + s + 6]);
-                for (uint l = 0; l < 16; ++l) {
-                    const uint albyte = uint(block[qlb + s * 16 + l]);
-                    const uint ahbyte = uint(block[qlb + 32 + s * 16 + l]);
-                    const uint hbyte = uint(block[qhb + s * 16 + l]);
-                    const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
-                    const int a1 = int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
-                    const int a2 = int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
-                    const int a3 = int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
-                    const uint al = l & 7u;
-                    aux[al] += s0 * int(y[base + l]) * a0;
-                    aux[al] += s1 * int(y[base + l + 32]) * a1;
-                    aux[al] += s2 * int(y[base + l + 64]) * a2;
-                    aux[al] += s3 * int(y[base + l + 96]) * a3;
-                }
-            }
-            for (uint off = 2; off >= 1; off >>= 1) {
-                for (uint l = 0; l < 8; ++l) {
-                    aux[l] += simd_shuffle_down(aux[l], off);
-                }
-            }
-            if (active && quarter == 0) {
-                for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 8 + l] = aux[l];
+        int aux[8] = {0,0,0,0,0,0,0,0};
+        if (active) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
+            device const char* y = input_quants + t * n_sb * 256 + sb * 256;
+            const uint h = quarter >> 1;
+            const uint s = quarter & 1u;
+            const uint qlb = h * 64;
+            const uint qhb = 128 + h * 32;
+            const uint base = h * 128 + s * 16;
+            device const char* scales = reinterpret_cast<device const char*>(block + 192);
+            const int s0 = int(scales[8 * h + s]);
+            const int s1 = int(scales[8 * h + s + 2]);
+            const int s2 = int(scales[8 * h + s + 4]);
+            const int s3 = int(scales[8 * h + s + 6]);
+            for (uint l = 0; l < 16; ++l) {
+                const uint albyte = uint(block[qlb + s * 16 + l]);
+                const uint ahbyte = uint(block[qlb + 32 + s * 16 + l]);
+                const uint hbyte = uint(block[qhb + s * 16 + l]);
+                const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                const int a1 = int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
+                const int a2 = int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
+                const int a3 = int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
+                const uint al = l & 7u;
+                aux[al] += s0 * int(y[base + l]) * a0;
+                aux[al] += s1 * int(y[base + l + 32]) * a1;
+                aux[al] += s2 * int(y[base + l + 64]) * a2;
+                aux[al] += s3 * int(y[base + l + 96]) * a3;
             }
         }
+        for (uint off = 2; off >= 1; off >>= 1) {
+            for (uint l = 0; l < 8; ++l) {
+                aux[l] += simd_shuffle_down(aux[l], off);
+            }
+        }
+        if (active && quarter == 0) {
+            for (uint l = 0; l < 8; ++l) scratch[(t * n_sb + sb) * 8 + l] = aux[l];
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane < n_tokens) {
-        const uint t = lane;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
         float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
         for (uint sb = 0; sb < n_sb; ++sb) {
             device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
@@ -13786,8 +13780,10 @@ fn encode_resident_kquant_matmul_f32(
                 | ResidentWeightFormat::Q2_0G64
                 | ResidentWeightFormat::Q2_0G128 => unreachable!(),
             };
-        // The multi-column kernel keeps one scratch region per column.
+        // The multi-column kernel keeps one scratch region per column and
+        // one 32-lane simdgroup per column.
         let scratch_ints = scratch_ints_per_column * n_tokens;
+        let tg_threads = 32 * n_tokens;
         // `setThreadgroupMemoryLength:` requires a multiple of 16 bytes
         // (MTLDebugComputeCommandEncoder hard-asserts otherwise). `n_sb` is odd
         // or 2 mod 4 for plenty of real shapes — Llama-2-7B ffn_dim 11008 gives
@@ -13803,7 +13799,7 @@ fn encode_resident_kquant_matmul_f32(
                 depth: 1,
             },
             metal::MTLSize {
-                width: 32,
+                width: tg_threads as u64,
                 height: 1,
                 depth: 1,
             },
@@ -30374,7 +30370,7 @@ mod tests {
                         depth: 1,
                     },
                     metal::MTLSize {
-                        width: 32,
+                        width: (32 * k) as u64,
                         height: 1,
                         depth: 1,
                     },
