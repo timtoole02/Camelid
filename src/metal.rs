@@ -1924,14 +1924,9 @@ inline void q4k_scale_min(
     const uint kmask1 = 0x3f3f3f3fu;
     const uint kmask2 = 0x0f0f0f0fu;
     const uint kmask3 = 0x03030303u;
-    // Every caller derives `block` from a 144/176-byte stride off a 16-byte-
-    // aligned buffer, so block+4 is 4-byte aligned: direct little-endian uint
-    // loads (1 load each) replace the 4-byte-load + 6-op assembly of
-    // load_u32_le on this hot path.
-    device const uint* w32 = reinterpret_cast<device const uint*>(block + 4);
-    uint u0 = w32[0];
-    uint u1 = w32[1];
-    uint u2 = w32[2];
+    uint u0 = load_u32_le(block + 4);
+    uint u1 = load_u32_le(block + 8);
+    uint u2 = load_u32_le(block + 12);
     uint u3 = ((u2 >> 4) & kmask2) | (((u1 >> 6) & kmask3) << 4);
     const uint aux = u1 & kmask1;
     u1 = (u2 & kmask2) | (((u0 >> 6) & kmask3) << 4);
@@ -31504,6 +31499,35 @@ mod tests {
     /// added. Drives the pipelines raw (no env gates involved), sharing one
     /// Q8K staging between both paths via buffer offsets so the comparison
     /// isolates the GEMV kernels themselves.
+    /// Sentinel used by the K-quant identity tests: a GPU buffer whose kernel
+    /// never ran reads back as this value, so "the dispatch was starved off the
+    /// shared serial queue" reports itself instead of surfacing as a confusing
+    /// bit mismatch against untouched memory.
+    #[cfg(target_os = "macos")]
+    const KQUANT_TEST_SENTINEL: f32 = -1.0e30;
+
+    #[cfg(target_os = "macos")]
+    fn fill_buffer_sentinel(buffer: &Buffer, len: usize) {
+        let values = vec![KQUANT_TEST_SENTINEL; len];
+        write_buffer_f32(buffer, &values);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_no_sentinel(values: &[f32], what: &str, k: usize) {
+        let untouched = values
+            .iter()
+            .filter(|v| v.to_bits() == KQUANT_TEST_SENTINEL.to_bits())
+            .count();
+        assert_eq!(
+            untouched,
+            0,
+            "{what} k={k}: {untouched}/{} outputs were never written — the dispatch \
+             did not run (shared serial command queue starved?), so any comparison \
+             below would be against untouched memory, not a numerical result",
+            values.len()
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_kquant_mc_gemv_bit_identical() {
@@ -31619,44 +31643,54 @@ mod tests {
                     *p.add(2) = k as u32;
                 }
 
-                // Reference: k single-token simd dispatches via column offsets.
-                let mut reference = vec![0.0f32; k * rows];
-                for t in 0..k {
-                    let out_buf = device
-                        .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                // Reference: k single-token simd dispatches via column offsets,
+                // all in ONE command buffer. One buffer per dispatch would hold
+                // the shared serial queue for k round-trips and starve the other
+                // Metal tests in the binary, which then read untouched output
+                // and fail as a bogus bit mismatch (see the queue-occupancy note
+                // at metal_resident_window_start_beyond_512).
+                let ref_buf = device
+                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                fill_buffer_sentinel(&ref_buf, k * rows);
+                {
                     let cb = kernel.queue.new_command_buffer();
                     let e = cb.new_compute_command_encoder();
-                    e.set_compute_pipeline_state(single_pipeline);
-                    e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
-                    e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
-                    e.set_buffer(2, Some(&w_buf), 0);
-                    e.set_buffer(3, Some(&out_buf), 0);
-                    e.set_buffer(4, Some(&scalar), 0);
-                    e.set_buffer(5, Some(&scalar), 4);
-                    let tg_bytes =
-                        (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
-                    e.set_threadgroup_memory_length(0, tg_bytes as u64);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize {
-                            width: rows as u64,
-                            height: 1,
-                            depth: 1,
-                        },
-                        metal::MTLSize {
-                            width: 32,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
+                    for t in 0..k {
+                        e.set_compute_pipeline_state(single_pipeline);
+                        e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
+                        e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
+                        e.set_buffer(2, Some(&w_buf), 0);
+                        e.set_buffer(3, Some(&ref_buf), (t * rows * 4) as u64);
+                        e.set_buffer(4, Some(&scalar), 0);
+                        e.set_buffer(5, Some(&scalar), 4);
+                        let tg_bytes =
+                            (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
+                        e.set_threadgroup_memory_length(0, tg_bytes as u64);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: rows as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
                     e.end_encoding();
                     cb.commit();
                     cb.wait_until_completed();
-                    read_buffer_f32(&out_buf, &mut reference[t * rows..(t + 1) * rows]);
                 }
+                let mut reference = vec![0.0f32; k * rows];
+                read_buffer_f32(&ref_buf, &mut reference);
+                assert_no_sentinel(&reference, case.name, k);
 
                 // Candidate: one multi-column dispatch over the same staging.
                 let out_buf = device
                     .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                fill_buffer_sentinel(&out_buf, k * rows);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(mc_pipeline);
@@ -31687,6 +31721,7 @@ mod tests {
                 cb.wait_until_completed();
                 let mut batched = vec![0.0f32; k * rows];
                 read_buffer_f32(&out_buf, &mut batched);
+                assert_no_sentinel(&batched, case.name, k);
 
                 for t in 0..k {
                     for r in 0..rows {
@@ -31785,38 +31820,48 @@ mod tests {
                     *p.add(2) = k as u32;
                 }
 
-                let mut reference = vec![0.0f32; k * rows];
-                for t in 0..k {
-                    let out_buf = device
-                        .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                // ONE command buffer for all k reference dispatches. The
+                // MetalLinearKernel queue is a single shared serial queue, so a
+                // test that commits a buffer per dispatch starves every other
+                // Metal test in the binary — they read back untouched output and
+                // fail as a bogus "bit mismatch" (see the note on queue
+                // occupancy at metal_resident_window_start_beyond_512).
+                let ref_buf = device
+                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                fill_buffer_sentinel(&ref_buf, k * rows);
+                {
                     let cb = kernel.queue.new_command_buffer();
                     let e = cb.new_compute_command_encoder();
-                    e.set_compute_pipeline_state(&v2.q4k_single);
-                    e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
-                    e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
-                    e.set_buffer(2, Some(&w_buf), 0);
-                    e.set_buffer(3, Some(&out_buf), 0);
-                    e.set_buffer(4, Some(&scalar), 0);
-                    e.set_buffer(5, Some(&scalar), 4);
-                    let tg_bytes = (n_sb * 9 * 4).next_multiple_of(16);
-                    e.set_threadgroup_memory_length(0, tg_bytes as u64);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize {
-                            width: rows as u64,
-                            height: 1,
-                            depth: 1,
-                        },
-                        metal::MTLSize {
-                            width: 32,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
+                    for t in 0..k {
+                        e.set_compute_pipeline_state(&v2.q4k_single);
+                        e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
+                        e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
+                        e.set_buffer(2, Some(&w_buf), 0);
+                        e.set_buffer(3, Some(&ref_buf), (t * rows * 4) as u64);
+                        e.set_buffer(4, Some(&scalar), 0);
+                        e.set_buffer(5, Some(&scalar), 4);
+                        let tg_bytes = (n_sb * 9 * 4).next_multiple_of(16);
+                        e.set_threadgroup_memory_length(0, tg_bytes as u64);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: rows as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
                     e.end_encoding();
                     cb.commit();
                     cb.wait_until_completed();
-                    read_buffer_f32(&out_buf, &mut reference[t * rows..(t + 1) * rows]);
                 }
+                let mut reference = vec![0.0f32; k * rows];
+                read_buffer_f32(&ref_buf, &mut reference);
+                assert_no_sentinel(&reference, "q4k_v2 reference", k);
 
                 let out_buf = device
                     .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
@@ -32026,37 +32071,47 @@ mod tests {
                     *p.add(1) = rows as u32;
                     *p.add(2) = k as u32;
                 }
-                let mut reference = vec![0.0f32; k * rows];
-                for t in 0..k {
-                    let out_buf = device
-                        .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                // ONE command buffer for all k reference dispatches (shared
+                // serial queue — see the q4k sibling and the queue-occupancy
+                // note at metal_resident_window_start_beyond_512).
+                let ref_buf = device
+                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                fill_buffer_sentinel(&ref_buf, k * rows);
+                {
                     let cb = kernel.queue.new_command_buffer();
                     let e = cb.new_compute_command_encoder();
-                    e.set_compute_pipeline_state(&v2.q6k_single);
-                    e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
-                    e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
-                    e.set_buffer(2, Some(&w_buf), 0);
-                    e.set_buffer(3, Some(&out_buf), 0);
-                    e.set_buffer(4, Some(&scalar), 0);
-                    e.set_buffer(5, Some(&scalar), 4);
-                    e.set_threadgroup_memory_length(0, (n_sb * 8 * 4).next_multiple_of(16) as u64);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize {
-                            width: rows as u64,
-                            height: 1,
-                            depth: 1,
-                        },
-                        metal::MTLSize {
-                            width: 32,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
+                    for t in 0..k {
+                        e.set_compute_pipeline_state(&v2.q6k_single);
+                        e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
+                        e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
+                        e.set_buffer(2, Some(&w_buf), 0);
+                        e.set_buffer(3, Some(&ref_buf), (t * rows * 4) as u64);
+                        e.set_buffer(4, Some(&scalar), 0);
+                        e.set_buffer(5, Some(&scalar), 4);
+                        e.set_threadgroup_memory_length(
+                            0,
+                            (n_sb * 8 * 4).next_multiple_of(16) as u64,
+                        );
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: rows as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
                     e.end_encoding();
                     cb.commit();
                     cb.wait_until_completed();
-                    read_buffer_f32(&out_buf, &mut reference[t * rows..(t + 1) * rows]);
                 }
+                let mut reference = vec![0.0f32; k * rows];
+                read_buffer_f32(&ref_buf, &mut reference);
+                assert_no_sentinel(&reference, "q6k_v2 reference", k);
 
                 // Scalar mc_v2.
                 let out_buf = device
