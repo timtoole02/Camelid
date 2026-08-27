@@ -122,3 +122,52 @@ Two rules learned the hard way, both from the campaign's own red team:
   `CAMELID_METAL_NOCOPY=1` explicitly to match `bench-generate`.
 - No llama-arch 8B **K-quant** row is certified. Q4_K_M numbers for an 8B are
   measurements of an uncertified configuration and must say so.
+
+## Measured, 2026-08-27 (Llama-3-8B, Apple M4 16 GB, release, greedy)
+
+Raw records in `qa/speculative/receipts/`; the agentic prompts that produced them
+are alongside in `receipts/prompts/`.
+
+### M1 — plain decode baseline
+
+| config | decode | GB/token | effective | % of ~120 GB/s wall |
+| --- | --- | --- | --- | --- |
+| Q8_0 | 11.9–12.0 tok/s | 8.54 | 102 GB/s | 85% |
+| Q4_K_M | 11.2–11.5 tok/s | 4.92 | 56 GB/s | 47% |
+
+Q4_K_M reads 43% fewer bytes and decodes **slower**. Prefill is worse still:
+110 ms/prompt-token against Q8_0's 8.7, growing superlinearly (a 512-token
+prefill did not finish in 5.5 minutes — profiled as genuinely computing, GPU at
+100%, no restart events). The GGUF is clean (Q4_K/Q6_K/F32, all admitted), and
+Q8_0 reproduced the published 12.1 tok/s, so this is the K-quant lane itself.
+**Any Q4_K_M-target plan needs the K-quant kernels fixed first.**
+
+Q8_0 decode is flat to 465 tokens (11.87) and still 8.38 tok/s at 4137.
+
+### M2 — acceptance is not the bottleneck
+
+On a 4137-token agentic transcript the stock n-gram drafter reached **90.8%
+acceptance, 7.35 committed tokens per round** — the k=8 window is essentially
+saturated, drafting costs ~10 ms per generation, and output is lossless. End to
+end that bought only **1.11×**, because the round costs 694 ms.
+
+### The round
+
+A k-sweep at fixed depth fits `round = 13 ms fixed + 67.5 ms per verify row`,
+against an 85 ms plain decode step. Round cost is flat in depth (553 ms at 304
+tokens, 694 ms at 4137) and linear in k — so the per-row prefix-KV re-read is
+**not** the first thing to fix, and a shared-prefix verify attention is not the
+first move.
+
+`CAMELID_SPEC_VERIFY_TRACE` now reports encode vs gpu_busy: **encode 2–5 ms,
+gpu_busy 508–535 ms**. The round is not CPU-feed or dispatch-launch bound, which
+retires buffer pooling, dispatch batching and concurrent encoders as first moves.
+
+### Open
+
+The verify GEMV's activation panel (~112 GB/round at k=8 vs 7.97 GB of weights)
+predicted −50% from NR0 2→4; measured **−10%**. A single NR0=8 probe was no
+better than NR0=2 once normalized to its host's decode step. Working hypothesis:
+the kernel is **register-limited** (`yl[8][8]` is already 64 floats/thread), so
+raising NR0 trades panel traffic for occupancy. Next step is to confirm that
+directly — occupancy/spill for this pipeline — rather than sweep NR0 further.

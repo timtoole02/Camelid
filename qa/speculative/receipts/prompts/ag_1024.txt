@@ -1,0 +1,87 @@
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a coding agent in a Rust repository.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Speculative decoding never fires on streamed requests. Find why and fix it.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Reading src/inference/speculative.rs.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/speculative.rs"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+41	pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+42	
+43	/// Default drafted tokens per round for the draft-model drafter. Each draft
+44	/// token costs a sequential forward through the draft model, so the window
+45	/// stays shorter.
+46	pub const DEFAULT_MODEL_DRAFT_TOKENS: usize = 5;
+47	
+48	/// Count the longest accepted prefix: drafted tokens that equal the target's
+49	/// own greedy predictions position by position.
+50	pub fn accepted_draft_prefix(drafts: &[u32], target_predictions: &[u32]) -> usize {
+51	    drafts
+52	        .iter()
+53	        .zip(target_predictions.iter())
+54	        .take_while(|(draft, prediction)| draft == prediction)
+55	        .count()
+56	}
+57	
+58	/// Result of lossless speculative rejection sampling for a single verification round.
+59	#[derive(Debug, Clone, PartialEq, Eq)]
+60	pub struct SpeculativeRejectionResult {
+61	    /// Emitted tokens for this round: accepted prefix of draft tokens, followed by the
+62	    /// corrective or terminal bonus token from the target distribution.
+63	    pub emitted_tokens: Vec<u32>,
+64	    /// Number of draft tokens accepted before a rejection or full draft acceptance.
+65	    pub accepted_draft_count: usize,
+66	}
+67	
+68	/// Sample a token index from a discrete probability distribution given a uniform random value in [0, 1).
+69	pub fn sample_from_probs(probs: &[f32], uniform_r: f32) -> u32 {
+70	    let mut cumsum = 0.0f32;
+71	    let u = uniform_r.clamp(0.0, 0.9999999);
+72	    for (idx, &p) in probs.iter().enumerate() {
+73	        if p > 0.0 {
+74	            cumsum += p;
+75	            if cumsum > u {
+76	                return idx as u32;
+77	            }
+78	        }
+79	    }
+80	    // Fallback if sum of probabilities < 1 due to floating point rounding
+81	    probs
+82	        .iter()
+83	        .enumerate()
+84	        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+85	        .map(|(idx, _)| idx as u32)
+86	        .unwrap_or(0)
+87	}
+88	
+89	/// Deterministic random stream for one stochastic speculative-verification round.
+90	///
+91	/// Each committed token position owns a disjoint block of draws, so repeated runs with the same
+92	/// seed are reproducible even though a round may consume a variable number of random values.
+93	pub fn seeded_rejection_rng(seed: u64, committed_tokens: u64) -> impl FnMut() -> f32 {
+94	    let stream_base = committed_tokens.wrapping_mul(64);
+95	    let mut draw_index = 0u64;<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Applying the edit to src/inference/speculative.rs.
+<tool_call>{"name":"Edit","args":{"old_string":"41	pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+42	
+43	/// Default drafted tokens per round for the draft-model drafter. Each draft
+44	/// token costs a sequential forward through the draft model, so the window
+45	/// stays shorter.
+46	pub const DEFAULT_MODEL_DRAFT_TOKENS: usize = 5;
+47	
+48	/// Count the longest accepted prefix: drafted tokens that equal the target's"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Reading src/inference/spec_tree.rs.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/spec_tree.rs"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+101	    pub fn node_depth(&self) -> Vec<i32> {
+102	        self.depth.iter().map(|&d| d as i32).collect()
+103	    }
+104	
+105	    /// Per-node KV slot relative to `base` (the current KV position). Every
+106	    /// node gets a UNIQUE slot = `base + B<|start_header_id|>assistant<|end_header_id|>
+
