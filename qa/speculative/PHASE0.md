@@ -174,3 +174,66 @@ better than NR0=2 once normalized to its host's decode step. Working hypothesis:
 the kernel is **register-limited** (`yl[8][8]` is already 64 floats/thread), so
 raising NR0 trades panel traffic for occupancy. Next step is to confirm that
 directly — occupancy/spill for this pipeline — rather than sweep NR0 further.
+
+## v2 + MMA lane on the 8B — measured 2026-08-27
+
+Merged from `perf/metal-mc-gemv-spec-verify-session`. Arms selected only by env
+off one binary; raw records in `receipts/v2.jsonl` and `receipts/v2depth.jsonl`.
+
+Prefill and decode, Llama-3-8B, 556-token prompt, arms run back-to-back:
+
+| arm | prefill ms/tok | decode tok/s |
+| --- | --- | --- |
+| Q4_K_M v1 (default) | 121.23 | 10.02 |
+| Q4_K_M v2 | 49.35 | 12.68 |
+| Q4_K_M v2+MMA | **14.98** | 12.55 |
+| Q8_0 (control) | 4.82 | 10.77 |
+
+Verify round, 304-token prompt: v1 1099 ms -> v2 380 ms -> **v2+MMA 178 ms**.
+
+Three things this settles:
+
+- **Both reasons Phase 0 disqualified Q4_K_M are addressed.** Decode is +26%
+  over v1 and now beats Q8_0 by 17%; prefill is 8.1x faster than v1. The
+  prefill fix comes specifically from the MMA kernel (14.98 vs 49.35 without
+  it), because the multi-column lane serves batched prefill as well as verify.
+- **Q8_0 still prefills 3.1x faster** (4.82 vs 14.98 ms/tok), so the quant
+  choice is now a real trade, not a rout.
+- **The end-to-end speculative multiplier is NOT demonstrated.** The decode A/B
+  ran at 304 tokens where acceptance is only 28-36%, so speculation measured
+  1.00x. The round is 6.2x cheaper; converting that into tokens needs the 4k
+  prompt where acceptance is 91%. That sweep is written and unrun.
+
+### The v1 K-quant speculative lane is not lossless
+
+The v1 arm reported `lossless=false`, first divergence at generated token 58,
+while both v2 arms were clean. Investigation (three read-only agents):
+
+- **Routing confirmed.** With v2 off, multi-token dispatches go to
+  `q4k_linear_tiled` while single-token decode uses `q4k_linear_simd`
+  (src/metal.rs:14663-14671, 14829-14844), so a speculative verify and a plain
+  decode run different kernels.
+- **The kernels are algebraically identical** term for term — same buckets,
+  same accumulation order, same f32 tail. The cause is not source-level.
+- **It is compilation.** `LINEAR_ROW_SHADER`, holding both v1 kernels, is built
+  with default `CompileOptions::new()` — fast math ON (src/metal.rs:8865,8869) —
+  while `STRICT_Q8K_SHADER` (8873) and the whole v2 lane (14905) explicitly
+  disable it. Under fast math the optimizer may contract and re-associate
+  independently in two kernels with very different surrounding shape. The tree
+  already names this hazard in the v2 library's own comment (14901-14904).
+- **Nothing would have caught it.** No test compares tiled against simd; the
+  only test that dispatches tiled compares to a CPU oracle under a
+  length-scaled tolerance sized to absorb reordering, so it cannot detect a
+  GPU-vs-GPU bit split. `metal_spec_verify_bit_identical` uses Q8_0 wire blocks
+  only — the byte-exactness proof rests entirely on the Q8_0 lane.
+
+Unproven: that the two COMPILED kernels actually differ on this M4. The
+mechanism is compiler freedom, so it needs a GPU A/B. What is measured is that
+flipping `CAMELID_KQUANT_V2` — which touches only these pipelines — is the
+difference between `lossless=false` and `lossless=true`.
+
+### Measurement hygiene
+
+~4.5 h of continuous benchmarking downclocks this M4 (Q8_0 decode read 11.9
+in the morning and 10.8 in the afternoon). Compare arms only within one
+back-to-back set; treat absolutes across sessions as drifted.
