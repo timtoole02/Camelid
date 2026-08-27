@@ -96,9 +96,12 @@ is a 16 GB machine.
 
 Two rules learned the hard way, both from the campaign's own red team:
 
-- **Measure at depth.** A speculative round re-reads the prefix KV once per
-  verify row, so short-prompt multipliers do not survive to chat/agent context
-  lengths. Any headline must name the depth it was measured at.
+- **Measure at depth.** Any headline must name the depth it was measured at.
+  Acceptance in particular varies enormously with context length — 31% at 556
+  tokens, 91% at 4137 — because a training-free drafter can only propose what
+  the context already contains. (The round *cost* turned out to be flat in
+  depth on this engine; see the measured section. The per-row prefix-KV re-read
+  is real but is not the dominant term.)
 - **Never import an acceptance rate.** Published figures conflate
   accepted/drafted per round with conditional per-position probability — nearly
   a 2× spread in projected speedup — and cross CUDA→Metal and temp-0→real-traffic
