@@ -2204,7 +2204,7 @@ const GHOST_METAL_DIRECT_STAGE_READ_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DIRE
 /// exact router stays authoritative, promotion sources keep the established
 /// validated-payload reads, and prefill rounds remain excluded by
 /// `hybrid_terminal_promotion_allowed`. No other freeze consumer changes.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_CHAINED_TERMINAL_REFRESH_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_CHAINED_TERMINAL_REFRESH";
 #[cfg(any(target_os = "macos", test))]
@@ -2316,7 +2316,7 @@ const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_DUAL_READER_WORKERS: usize = 2;
 /// `..._STAGE_DUAL_READER=1` this selector is inert. The stage remains
 /// advisory-only — queued, late, failed, or absent records still fall through
 /// to the authoritative demand path, so reader count cannot change output.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_LIVE_SEQUENTIAL_STAGE_TRIPLE_READER";
 #[cfg(any(target_os = "macos", test))]
