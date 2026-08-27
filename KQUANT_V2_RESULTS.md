@@ -13,9 +13,13 @@ Every run emits 128 tokens; rates are the emitted-token rate.
 
 | arm | before | after | delta |
 | --- | --- | --- | --- |
-| plain greedy decode | 16.82 t/s | 21.13 t/s | +26% |
-| speculative, code (draft γ=6) | 13.27 t/s | 25.67 t/s | +93% |
-| verify cost per round (γ=6) | 289.7 ms | 103.4 ms | 2.8x cheaper |
+| plain greedy decode | 17.01 t/s | 20.15 t/s | +18% |
+| speculative, code (draft γ=6) | 13.20 t/s | 25.68 t/s | +95% |
+| verify cost per round (γ=6) | 290.1 ms | 104.5 ms | 2.8x cheaper |
+
+(Plain decode reaches 21.1–21.3 t/s on the later arms of the same run, i.e.
++24–25%; the 20.15 above is the arm measured back-to-back with its own
+`before`, so it is the conservative pairing.)
 
 The speculative row is apples-to-apples: both arms report **identical
 acceptance (70.3%) and identical mean accepted tokens/round (5.08)**, i.e.
@@ -23,7 +27,7 @@ the same token stream, so only the cost of producing it changed.
 
 Speculation flipped from losing to winning against this machine's own plain
 decode: S_sync 0.79 -> 1.21 (code), and the MMA lane isolated at fixed γ=8
-inside the same build is 14.55 -> 20.91 t/s (+44%).
+inside the same build is 14.60 -> 20.88 t/s (+43%).
 
 Every run in the matrix reports LOSSLESS: the speculative token stream
 equals that run's own plain greedy stream.
@@ -67,8 +71,14 @@ Two secondary findings, both from ablation:
   0.20 -> 0.375 ms/column. v2 walks super-blocks in chunks against a fixed
   scratch budget.
 - `q4k_scale_min` decoded three u32s a byte at a time; every caller strides
-  144/176 bytes off a 16-byte-aligned buffer, so aligned loads are valid.
-  This one is bit-identical to v1 and is the only change on the DEFAULT path.
+  144/176 bytes off a 16-byte-aligned buffer, so aligned loads are valid. The
+  v2 shader carries this as `q4k_scale_min_v2`. It was briefly applied to the
+  shared default-path helper too, then **reverted**: that helper is used by
+  the v1 Q4_K *and* Q5_K kernels, its isolated speedup was never measured
+  apart from the v2 lane, and while chasing the intermittent test failure
+  below it could not be ruled out. The default path is therefore byte-for-byte
+  identical to branch HEAD — this lane adds no risk to anything already
+  running.
 
 ## Exactness
 
@@ -126,6 +136,37 @@ differences are a degradation.
   division per unit and a threadgroup round-trip for the tail. Reverted.
 - **Simdgroup striping of the mc kernel** (already rejected upstream on the
   M3 at 56e5b06b) reproduced as a wash-to-regression here.
+
+## A pre-existing test bug found along the way
+
+`metal_kquant_mc_gemv_bit_identical` failed intermittently — ~38% of parallel
+`cargo test --lib metal::` runs (3 of 8), never once serially (0 of 6). It
+reproduced with the new v2 tests skipped entirely, so it predates this work.
+
+Root cause: the test stages activations for `max_k` columns and dispatches
+`k` in {2, 3, 8, 16}. 56e5b06b widened that k list to 16 — the whole point of
+that commit — but left `max_k = 8`. The k=16 case therefore ran both
+dispatches over staging sized for eight columns, and columns 8..15 read past
+the end of `scales_buf`/`quants_buf`. Metal buffers are page-backed, so those
+reads returned adjacent memory rather than faulting. Serially that memory is
+stable, both paths read the SAME garbage and agree, and the test passes —
+which is how it shipped green.
+
+Diagnosis came from a replay the test now performs on any mismatch: it
+re-runs BOTH dispatches into fresh buffers and reports whether the
+disagreement reproduces. Five captured instances all replayed clean (0 of
+2080 disagreements) *and* the replayed values differed from both originals —
+the inputs were changing, not the arithmetic. Every failure sat at k=16,
+column >= 8: exactly the out-of-staging range.
+
+No kernel was ever wrong, and the widened verify window is not implicated.
+What was wrong is that the k=16 bit-identity coverage 56e5b06b claimed had
+never been exercised on valid data. With `max_k = 16`: 12 of 12 parallel
+`metal::` runs green, 4 of 4 full `--lib` runs with no Metal failure.
+
+Two unrelated failures remain in `fabric::http` (TLS/CA tests). They
+reproduce standalone (`cargo test --lib fabric::http` -> 2 failed) and are
+untouched by this work.
 
 ## Measurement hygiene notes
 
