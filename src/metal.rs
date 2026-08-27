@@ -31540,7 +31540,16 @@ mod tests {
         let rows = 130usize; // prime-ish: exercises the row-guard tail
         let n_sb = 3usize; // odd super-block count: partial final lane wave
         let cols = n_sb * 256;
-        let max_k = 8usize;
+        // MUST cover the widest k dispatched below. 56e5b06b widened the k
+        // list to 16 but left this at 8, so the k=16 case dispatched over
+        // activation staging sized for 8 columns: columns 8..15 read past the
+        // end of `scales_buf`/`quants_buf`. Serially that out-of-bounds memory
+        // is stable, so both paths read the same garbage and the test passed;
+        // under parallel tests it shifted between the reference and the mc
+        // dispatch and the test failed as a bogus "bit mismatch" (~38% of
+        // parallel runs). The k=16 coverage that commit claimed was never
+        // actually exercised on valid data until this line was widened.
+        let max_k = 16usize;
 
         // Deterministic activations, one column per verify row.
         let mut y_flat = vec![0.0f32; max_k * cols];
@@ -31722,6 +31731,80 @@ mod tests {
                 let mut batched = vec![0.0f32; k * rows];
                 read_buffer_f32(&out_buf, &mut batched);
                 assert_no_sentinel(&batched, case.name, k);
+
+                // DIAGNOSTIC (see the flake note on this test): if the two
+                // paths disagree, immediately replay BOTH dispatches into fresh
+                // buffers and report whether the disagreement reproduces. A
+                // reproducible delta is a kernel bug; a delta that evaporates on
+                // replay is a scheduling/visibility artifact of the shared
+                // serial queue under parallel tests. Without this, a rare
+                // failure carries no evidence about which it was.
+                if let Some(bad) = (0..k * rows).find(|&i| batched[i].to_bits() != reference[i].to_bits()) {
+                    let replay_mc = device
+                        .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                    let replay_single = device
+                        .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                    fill_buffer_sentinel(&replay_mc, k * rows);
+                    fill_buffer_sentinel(&replay_single, k * rows);
+                    let cb = kernel.queue.new_command_buffer();
+                    let e = cb.new_compute_command_encoder();
+                    for t in 0..k {
+                        e.set_compute_pipeline_state(single_pipeline);
+                        e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
+                        e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
+                        e.set_buffer(2, Some(&w_buf), 0);
+                        e.set_buffer(3, Some(&replay_single), (t * rows * 4) as u64);
+                        e.set_buffer(4, Some(&scalar), 0);
+                        e.set_buffer(5, Some(&scalar), 4);
+                        e.set_threadgroup_memory_length(
+                            0,
+                            (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16) as u64,
+                        );
+                        e.dispatch_thread_groups(
+                            metal::MTLSize { width: rows as u64, height: 1, depth: 1 },
+                            metal::MTLSize { width: 32, height: 1, depth: 1 },
+                        );
+                    }
+                    e.set_compute_pipeline_state(mc_pipeline);
+                    e.set_buffer(0, Some(&scales_buf), 0);
+                    e.set_buffer(1, Some(&quants_buf), 0);
+                    e.set_buffer(2, Some(&w_buf), 0);
+                    e.set_buffer(3, Some(&replay_mc), 0);
+                    e.set_buffer(4, Some(&scalar), 0);
+                    e.set_buffer(5, Some(&scalar), 4);
+                    e.set_buffer(6, Some(&scalar), 8);
+                    e.set_threadgroup_memory_length(
+                        0,
+                        (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16) as u64,
+                    );
+                    e.dispatch_thread_groups(
+                        metal::MTLSize { width: rows as u64, height: 1, depth: 1 },
+                        metal::MTLSize { width: 32, height: 1, depth: 1 },
+                    );
+                    e.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    let mut rmc = vec![0.0f32; k * rows];
+                    let mut rsingle = vec![0.0f32; k * rows];
+                    read_buffer_f32(&replay_mc, &mut rmc);
+                    read_buffer_f32(&replay_single, &mut rsingle);
+                    let still_bad = (0..k * rows)
+                        .filter(|&i| rmc[i].to_bits() != rsingle[i].to_bits())
+                        .count();
+                    eprintln!(
+                        "[kquant-flake] {} k={k} first bad idx {bad} (col {}, row {}):                          original mc {} vs single {} | replay mc {} vs single {} |                          replay disagreements {}/{} -> {}",
+                        case.name,
+                        bad / rows,
+                        bad % rows,
+                        batched[bad],
+                        reference[bad],
+                        rmc[bad],
+                        rsingle[bad],
+                        still_bad,
+                        k * rows,
+                        if still_bad == 0 { "TRANSIENT (scheduling artifact)" } else { "REPRODUCIBLE (kernel bug)" }
+                    );
+                }
 
                 for t in 0..k {
                     for r in 0..rows {
