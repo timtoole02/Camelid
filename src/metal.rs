@@ -14674,7 +14674,13 @@ fn encode_resident_kquant_matmul_f32(
         e.set_buffer(5, Some(scalar), 4);
         e.set_buffer(6, Some(scalar), 8);
         dispatch_rows_simd(e, 1);
-    } else if kquant_mc_gemv_enabled() {
+    } else if kquant_mc_gemv_enabled() || v2.is_some() {
+        // The v2 lane always takes this arm for multi-token dispatches, gate or
+        // no gate: routing them to the v1 `*_linear_tiled` kernels instead would
+        // put PREFILL in v1's bit-universe while decode ran v2's, so one session
+        // would mix two roundings (measured: the emitted token stream diverges
+        // at token 33 between v2-alone and v2-with-the-mc-gate on one prompt).
+        // v2 mc/MMA keeps the whole lane on one set of bits.
         // Multi-column lane: keep the one-SIMD-group-per-row decomposition
         // and dot each cache-hot super-block against a bounded group of
         // columns, so weight bytes stream from DRAM once per group instead
