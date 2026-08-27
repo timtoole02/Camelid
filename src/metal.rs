@@ -2384,19 +2384,18 @@ kernel void q6k_linear_simd(
     }
 }
 
-// Multi-column, multi-simdgroup siblings of the three `*_linear_simd` GEMVs.
-// One threadgroup per output row; the row's super-blocks are dealt round-
-// robin to the threadgroup's simdgroups (four lanes per super-block, eight
-// super-blocks per 32-lane pass), and each simdgroup dots its super-blocks
-// against every column while the block bytes are register/cache-hot. The
-// integer partial of a (super-block, quarter, column) is exact wherever it
-// is computed, every 4-lane shuffle group stays intact, and the per-column
-// f32 tail is replayed sequentially over ALL super-blocks by a single lane —
-// so each column's output is bit-identical to the single-token
-// `*_linear_simd` dispatch, while the per-column serial span shrinks by the
-// simdgroup count. Valid for any thread count that is a multiple of 32
-// (idle simdgroups still reach the barrier) and any `n_tokens >= 1`; the
-// host dispatches up to four simdgroups and caps the column window.
+// Multi-column siblings of the three `*_linear_simd` GEMVs for bounded
+// column windows (the speculative-verify rows): the same one-SIMD-group-per-
+// output-row decomposition, with the inner dot repeated per column while the
+// super-block bytes are cache-hot, and the ordered f32 tail replayed by one
+// lane per column. Weight bytes therefore stream from DRAM once per window,
+// instead of once per four-column tile of the single-thread-per-row
+// `*_linear_tiled` kernels (whose rows*ceil(k/4) total threads also cannot
+// occupy the GPU). Each column's output is bit-identical to the
+// corresponding single-token `*_linear_simd` dispatch: the per-unit integer
+// math, the four-lane shuffle combine, and the per-super-block f32 tail run
+// in the same order with no cross-column arithmetic. `n_tokens` must be
+// <= 32 (one tail lane per column); the host caps it far lower.
 kernel void q4k_linear_simd_mc(
     device const float* input_scales [[buffer(0)]],
     device const char* input_quants [[buffer(1)]],
@@ -2407,17 +2406,15 @@ kernel void q4k_linear_simd_mc(
     constant uint& n_tokens [[buffer(6)]],
     threadgroup int* scratch [[threadgroup(0)]],
     uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint sgs [[simdgroups_per_threadgroup]]
+    uint lane [[thread_index_in_simdgroup]]
 ) {
     if (row >= rows) return;
-    const uint my_sbs = sg < n_sb ? (n_sb - sg + sgs - 1) / sgs : 0;
-    const uint g = lane & 3u;
-    for (uint p0 = 0; p0 < my_sbs; p0 += 8) {
-        const uint local_sb = p0 + (lane >> 2);
-        const bool active = local_sb < my_sbs;
-        const uint sb = sg + local_sb * sgs;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint g = u & 3u;
         device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
         uchar sc[8], mn[8];
         if (active) {
@@ -2457,25 +2454,22 @@ kernel void q4k_linear_simd_mc(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
-        for (uint t = sg; t < n_tokens; t += sgs) {
-            float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
-            float sumf = 0.0f;
-            for (uint sb = 0; sb < n_sb; ++sb) {
-                device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
-                const float dw = float(*reinterpret_cast<device const half*>(block));
-                const float dm = float(*reinterpret_cast<device const half*>(block + 2));
-                const float da = input_scales[t * n_sb + sb];
-                const float dd = dw * da;
-                for (uint l = 0; l < 8; ++l) {
-                    sums[l] += dd * float(scratch[(t * n_sb + sb) * 9 + l]);
-                }
-                sumf -= dm * da * float(scratch[(t * n_sb + sb) * 9 + 8]);
-            }
-            float main = 0.0f;
-            for (uint l = 0; l < 8; ++l) main += sums[l];
-            output[t * rows + row] = sumf + main;
+    if (lane < n_tokens) {
+        const uint t = lane;
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        float sumf = 0.0f;
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
+            const float dw = float(*reinterpret_cast<device const half*>(block));
+            const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+            const float da = input_scales[t * n_sb + sb];
+            const float dd = dw * da;
+            for (uint l = 0; l < 8; ++l) sums[l] += dd * float(scratch[(t * n_sb + sb) * 9 + l]);
+            sumf -= dm * da * float(scratch[(t * n_sb + sb) * 9 + 8]);
         }
+        float main = 0.0f;
+        for (uint l = 0; l < 8; ++l) main += sums[l];
+        output[t * rows + row] = sumf + main;
     }
 }
 
@@ -2489,17 +2483,15 @@ kernel void q5k_linear_simd_mc(
     constant uint& n_tokens [[buffer(6)]],
     threadgroup int* scratch [[threadgroup(0)]],
     uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint sgs [[simdgroups_per_threadgroup]]
+    uint lane [[thread_index_in_simdgroup]]
 ) {
     if (row >= rows) return;
-    const uint my_sbs = sg < n_sb ? (n_sb - sg + sgs - 1) / sgs : 0;
-    const uint g = lane & 3u;
-    for (uint p0 = 0; p0 < my_sbs; p0 += 8) {
-        const uint local_sb = p0 + (lane >> 2);
-        const bool active = local_sb < my_sbs;
-        const uint sb = sg + local_sb * sgs;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint g = u & 3u;
         device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
         uchar sc[8], mn[8];
         if (active) {
@@ -2544,25 +2536,22 @@ kernel void q5k_linear_simd_mc(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
-        for (uint t = sg; t < n_tokens; t += sgs) {
-            float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
-            float sumf = 0.0f;
-            for (uint sb = 0; sb < n_sb; ++sb) {
-                device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
-                const float dw = float(*reinterpret_cast<device const half*>(block));
-                const float dm = float(*reinterpret_cast<device const half*>(block + 2));
-                const float da = input_scales[t * n_sb + sb];
-                const float dd = dw * da;
-                for (uint l = 0; l < 8; ++l) {
-                    sums[l] += dd * float(scratch[(t * n_sb + sb) * 9 + l]);
-                }
-                sumf -= dm * da * float(scratch[(t * n_sb + sb) * 9 + 8]);
-            }
-            float main = 0.0f;
-            for (uint l = 0; l < 8; ++l) main += sums[l];
-            output[t * rows + row] = sumf + main;
+    if (lane < n_tokens) {
+        const uint t = lane;
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        float sumf = 0.0f;
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 176;
+            const float dw = float(*reinterpret_cast<device const half*>(block));
+            const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+            const float da = input_scales[t * n_sb + sb];
+            const float dd = dw * da;
+            for (uint l = 0; l < 8; ++l) sums[l] += dd * float(scratch[(t * n_sb + sb) * 9 + l]);
+            sumf -= dm * da * float(scratch[(t * n_sb + sb) * 9 + 8]);
         }
+        float main = 0.0f;
+        for (uint l = 0; l < 8; ++l) main += sums[l];
+        output[t * rows + row] = sumf + main;
     }
 }
 
@@ -2576,17 +2565,15 @@ kernel void q6k_linear_simd_mc(
     constant uint& n_tokens [[buffer(6)]],
     threadgroup int* scratch [[threadgroup(0)]],
     uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint sgs [[simdgroups_per_threadgroup]]
+    uint lane [[thread_index_in_simdgroup]]
 ) {
     if (row >= rows) return;
-    const uint my_sbs = sg < n_sb ? (n_sb - sg + sgs - 1) / sgs : 0;
-    const uint quarter = lane & 3u;
-    for (uint p0 = 0; p0 < my_sbs; p0 += 8) {
-        const uint local_sb = p0 + (lane >> 2);
-        const bool active = local_sb < my_sbs;
-        const uint sb = sg + local_sb * sgs;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint quarter = u & 3u;
         device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
         const uint h = quarter >> 1;
         const uint s = quarter & 1u;
@@ -2628,21 +2615,18 @@ kernel void q6k_linear_simd_mc(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
-        for (uint t = sg; t < n_tokens; t += sgs) {
-            float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
-            for (uint sb = 0; sb < n_sb; ++sb) {
-                device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
-                const float d = float(*reinterpret_cast<device const half*>(block + 208))
-                    * input_scales[t * n_sb + sb];
-                for (uint l = 0; l < 8; ++l) {
-                    sums[l] += d * float(scratch[(t * n_sb + sb) * 8 + l]);
-                }
-            }
-            float acc = 0.0f;
-            for (uint l = 0; l < 8; ++l) acc += sums[l];
-            output[t * rows + row] = acc;
+    if (lane < n_tokens) {
+        const uint t = lane;
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (row * n_sb + sb) * 210;
+            const float d = float(*reinterpret_cast<device const half*>(block + 208))
+                * input_scales[t * n_sb + sb];
+            for (uint l = 0; l < 8; ++l) sums[l] += d * float(scratch[(t * n_sb + sb) * 8 + l]);
         }
+        float acc = 0.0f;
+        for (uint l = 0; l < 8; ++l) acc += sums[l];
+        output[t * rows + row] = acc;
     }
 }
 
@@ -13778,9 +13762,7 @@ fn encode_resident_kquant_matmul_f32(
     // Llama-2-7B ffn_dim 11008 gives n_sb 43, Qwen3-4B hidden 2560 gives
     // n_sb 10 — so round the allocation up. The kernel only ever indexes the
     // first `scratch_ints` words.
-    let dispatch_rows_simd = |e: &metal::ComputeCommandEncoderRef,
-                              columns: usize,
-                              tg_threads: usize| {
+    let dispatch_rows_simd = |e: &metal::ComputeCommandEncoderRef, columns: usize| {
         let kq_tg_bytes = (scratch_ints_per_column * columns * 4).next_multiple_of(16);
         assert_threadgroup_fits(&k.device, kq_tg_bytes, "K-quant resident GEMV scratch");
         e.set_threadgroup_memory_length(0, kq_tg_bytes as u64);
@@ -13791,44 +13773,60 @@ fn encode_resident_kquant_matmul_f32(
                 depth: 1,
             },
             metal::MTLSize {
-                width: tg_threads as u64,
+                width: 32,
                 height: 1,
                 depth: 1,
             },
         );
     };
-    if kquant_mc_gemv_enabled() {
-        // Multi-column, multi-simdgroup lane (single-token decode included):
-        // one threadgroup per row, its simdgroups splitting the super-blocks
-        // round-robin, each cache-hot block dotted against every column of a
-        // bounded group. Weight bytes stream from DRAM once per group and
-        // the per-column serial span shrinks by the simdgroup count; every
-        // column stays bit-identical to the single-token GEMV. Wide batches
-        // (batched prefill) run as consecutive column groups.
-        let mc_pipeline = match weight.format {
-            ResidentWeightFormat::Q4K => &k.q4k_linear_simd_mc_pipeline,
-            ResidentWeightFormat::Q5K => &k.q5k_linear_simd_mc_pipeline,
-            ResidentWeightFormat::Q6K => &k.q6k_linear_simd_mc_pipeline,
+    if n_tokens == 1 {
+        let pipeline = match weight.format {
+            ResidentWeightFormat::Q4K => &k.q4k_linear_simd_pipeline,
+            ResidentWeightFormat::Q5K => &k.q5k_linear_simd_pipeline,
+            ResidentWeightFormat::Q6K => &k.q6k_linear_simd_pipeline,
             _ => unreachable!(),
         };
-        // Four simdgroups unless the pipeline's register budget caps the
-        // threadgroup lower; the kernel adapts to any multiple of 32.
-        let tg_threads =
-            ((mc_pipeline.max_total_threads_per_threadgroup() as usize / 32).clamp(1, 4)) * 32;
-        e.set_compute_pipeline_state(mc_pipeline);
+        e.set_compute_pipeline_state(pipeline);
+        e.set_buffer(0, Some(scales), 0);
+        e.set_buffer(1, Some(quants), 0);
+        e.set_buffer(2, Some(&weight.buffer), 0);
+        e.set_buffer(3, Some(out), 0);
+        e.set_buffer(4, Some(scalar), 0);
+        e.set_buffer(5, Some(scalar), 4);
+        e.set_buffer(6, Some(scalar), 8);
+        dispatch_rows_simd(e, 1);
+    } else if kquant_mc_gemv_enabled() {
+        // Multi-column lane: keep the one-SIMD-group-per-row decomposition
+        // and dot each cache-hot super-block against a bounded group of
+        // columns, so weight bytes stream from DRAM once per group instead
+        // of once per token. Wide batches (batched prefill) run as
+        // consecutive column groups through the same kernel; per-column
+        // results stay bit-identical to the single-token GEMV.
+        let (mc_pipeline, single_pipeline) = match weight.format {
+            ResidentWeightFormat::Q4K => {
+                (&k.q4k_linear_simd_mc_pipeline, &k.q4k_linear_simd_pipeline)
+            }
+            ResidentWeightFormat::Q5K => {
+                (&k.q5k_linear_simd_mc_pipeline, &k.q5k_linear_simd_pipeline)
+            }
+            ResidentWeightFormat::Q6K => {
+                (&k.q6k_linear_simd_mc_pipeline, &k.q6k_linear_simd_pipeline)
+            }
+            _ => unreachable!(),
+        };
         let mut t0 = 0usize;
         while t0 < n_tokens {
             let gn = (n_tokens - t0).min(KQUANT_MC_MAX_COLUMNS);
+            e.set_compute_pipeline_state(if gn == 1 { single_pipeline } else { mc_pipeline });
             e.set_buffer(0, Some(scales), (t0 * n_sb * 4) as u64);
             e.set_buffer(1, Some(quants), (t0 * input_width) as u64);
             e.set_buffer(2, Some(&weight.buffer), 0);
             e.set_buffer(3, Some(out), (t0 * rows * 4) as u64);
-            if t0 == 0 && gn == n_tokens {
-                // Single group: the caller scalar's column count already
-                // equals the group's.
+            if gn == 1 {
+                // The single-token kernel reads only n_sb/rows; the caller
+                // scalar already carries them.
                 e.set_buffer(4, Some(scalar), 0);
                 e.set_buffer(5, Some(scalar), 4);
-                e.set_buffer(6, Some(scalar), 8);
             } else {
                 // Per-group column count; pooled and returned via `keep`
                 // only after the command buffer completes.
@@ -13844,25 +13842,9 @@ fn encode_resident_kquant_matmul_f32(
                 e.set_buffer(6, Some(&group_scalar), 8);
                 keep.push(group_scalar);
             }
-            dispatch_rows_simd(e, gn, tg_threads);
+            dispatch_rows_simd(e, gn);
             t0 += gn;
         }
-    } else if n_tokens == 1 {
-        let pipeline = match weight.format {
-            ResidentWeightFormat::Q4K => &k.q4k_linear_simd_pipeline,
-            ResidentWeightFormat::Q5K => &k.q5k_linear_simd_pipeline,
-            ResidentWeightFormat::Q6K => &k.q6k_linear_simd_pipeline,
-            _ => unreachable!(),
-        };
-        e.set_compute_pipeline_state(pipeline);
-        e.set_buffer(0, Some(scales), 0);
-        e.set_buffer(1, Some(quants), 0);
-        e.set_buffer(2, Some(&weight.buffer), 0);
-        e.set_buffer(3, Some(out), 0);
-        e.set_buffer(4, Some(scalar), 0);
-        e.set_buffer(5, Some(scalar), 4);
-        e.set_buffer(6, Some(scalar), 8);
-        dispatch_rows_simd(e, 1, 32);
     } else {
         let pipeline = match weight.format {
             ResidentWeightFormat::Q4K => &k.q4k_linear_tiled_pipeline,
@@ -13882,13 +13864,11 @@ fn encode_resident_kquant_matmul_f32(
     }
 }
 
-/// Column-group size for the multi-column K-quant GEMV: matches the verify
-/// window cap (`MAX_VERIFY_K`), and one scratch region per column bounds the
-/// threadgroup memory (worst production shape, ffn_dim 11008 Q4K at 16
-/// columns: 43*9*16*4 = 24,768 bytes, inside the 32 KiB floor; the fit is
-/// still asserted per dispatch). Wider batches (batched prefill) run as
-/// consecutive groups of this size through the same kernel.
-const KQUANT_MC_MAX_COLUMNS: usize = 16;
+/// Column-group size for the multi-column K-quant GEMV: the verify window is
+/// at most 8 (`MAX_VERIFY_K`), and one scratch region per column bounds the
+/// threadgroup memory. Wider batches (batched prefill) run as consecutive
+/// groups of this size through the same kernel.
+const KQUANT_MC_MAX_COLUMNS: usize = 8;
 
 fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
@@ -26126,11 +26106,7 @@ impl ResidentDecodeState {
     }
 
     /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
-    /// Raised from 8 alongside the multi-column GEMV: the verify buffers are
-    /// sized dynamically from `k`, the attention rows stay exact per-row
-    /// kernels, and deeper draft windows are what make high-acceptance
-    /// (copy/extraction) workloads pay.
-    const MAX_VERIFY_K: usize = 16;
+    const MAX_VERIFY_K: usize = 8;
 
     #[allow(clippy::too_many_arguments)]
     fn verify_batch_inner(
@@ -30470,12 +30446,11 @@ mod tests {
         let device = &kernel.device;
 
         let rows = 130usize; // prime-ish: exercises the row-guard tail
-        let n_sb = 3usize; // odd super-block count: uneven simdgroup deal
+        let n_sb = 3usize; // odd super-block count: partial final lane wave
         let cols = n_sb * 256;
-        let max_k = 16usize;
+        let max_k = 8usize;
 
-        // Deterministic activations, one column per verify row. 16 columns —
-        // the raised MAX_VERIFY_K window.
+        // Deterministic activations, one column per verify row.
         let mut y_flat = vec![0.0f32; max_k * cols];
         for (i, y) in y_flat.iter_mut().enumerate() {
             let t = i / cols;
@@ -30567,9 +30542,7 @@ mod tests {
                 device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
-            for (k, mc_tg_threads) in
-                [(1usize, 128usize), (2, 32), (2, 128), (3, 64), (8, 128), (16, 128)]
-            {
+            for k in [2usize, 3, 8] {
                 let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
                 unsafe {
                     let p = scalar.contents() as *mut u32;
@@ -30636,7 +30609,7 @@ mod tests {
                         depth: 1,
                     },
                     metal::MTLSize {
-                        width: mc_tg_threads as u64,
+                        width: 32,
                         height: 1,
                         depth: 1,
                     },
@@ -30663,7 +30636,7 @@ mod tests {
                     }
                 }
                 eprintln!(
-                    "metal_kquant_mc_gemv_bit_identical: {} k={k} tg={mc_tg_threads} BIT-IDENTICAL ({rows} rows x {n_sb} super-blocks)",
+                    "metal_kquant_mc_gemv_bit_identical: {} k={k} BIT-IDENTICAL ({rows} rows x {n_sb} super-blocks)",
                     case.name
                 );
             }
