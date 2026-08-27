@@ -5815,7 +5815,7 @@ fn fill_hybrid_hot_slots(
 /// every prompt chunk only churns the bounded tier. Decode rounds normally
 /// promote at their terminal barrier; the hot/cold publication A/B may freeze
 /// all persistent updates. Prefill performs one explicit handoff seed instead.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn hybrid_terminal_promotion_allowed(
     round_ok: bool,
     hybrid_mapped: bool,
