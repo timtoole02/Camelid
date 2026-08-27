@@ -1505,7 +1505,16 @@ kernel void q8_0_block_linear_ksplit_f32y_wire_nsg8_verify(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     constexpr uint NSG = 8;
-    constexpr uint NR0 = 2;
+    // Verify owns MORE rows per threadgroup than the single-token GEMV does. The
+    // weight blocks are read once either way, but every threadgroup walks the
+    // WHOLE k-column activation panel, so that traffic scales as rows/NR0: at
+    // NR0=2 and k=8 an 8B round moves ~112 GB of activation against 7.97 GB of
+    // weights. Doubling to 4 halves it. NR0 is not part of this kernel's
+    // bit-exactness contract -- it only selects which rows a threadgroup owns;
+    // block ownership (ib = sg*NQ+ix, step NSG*NQ) and the two-stage
+    // simd_sum -> shmem -> simd_sum reduction are unchanged, so each column
+    // still equals the single-token GEMV bit for bit.
+    constexpr uint NR0 = 4;
     constexpr uint NQ = 8;
     constexpr uint MAX_T = 8; // verify columns processed per pass
     constexpr uint q8_block_bytes = 34;
@@ -13534,6 +13543,14 @@ fn encode_resident_kquant_matmul_f32(
     }
 }
 
+/// Output rows each threadgroup of the batched-column verify GEMV owns. MUST stay in
+/// step with `NR0` in `q8_0_block_linear_ksplit_f32y_wire_nsg8_verify`: it sizes both
+/// the dispatch grid and the `[row * 32 + ..]` threadgroup scratch. It is a pure
+/// work-partitioning knob -- the per-column arithmetic is untouched, which
+/// `metal_verify_gemv_batched_bit_identical` proves.
+#[cfg(target_os = "macos")]
+const VERIFY_GEMV_NR0: u64 = 4;
+
 /// Batched-column mirror of [`encode_q8_matmul_f32y`]'s production NSG=8 wire GEMV.
 /// Instead of dotting each weight block against one activation vector, it dots it
 /// against all `n_rows_in` activation columns (the speculative-verify rows) before
@@ -13572,10 +13589,12 @@ fn encode_q8_matmul_f32y_batched(
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
     e.set_buffer(6, Some(scalar), 8);
-    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    // Must track NR0 in the verify kernel: shmem is indexed [row * 32 + ...]
+    // for row < NR0, and each threadgroup now owns NR0 output rows.
+    e.set_threadgroup_memory_length(0, VERIFY_GEMV_NR0 * 32 * 4);
     e.dispatch_thread_groups(
         metal::MTLSize {
-            width: (rows as u64).div_ceil(2),
+            width: (rows as u64).div_ceil(VERIFY_GEMV_NR0),
             height: 1,
             depth: 1,
         },
@@ -16899,9 +16918,16 @@ fn encode_attention(
         }
         // Half-mirror reads halve the dominant KV traffic at depth; opt out with
         // CAMELID_METAL_ATTN_SPLITK_KV16=0 to keep the f32 split-K reads.
-        let use_mirrors = kv16_mirrors.is_some()
-            && !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
-                .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
+        // Cached like its five siblings (`splitk_attention_enabled`, `attn2_enabled`,
+        // ...): this sits inside the per-row attention encode, so a speculative
+        // round re-read it once per row per layer -- k*32 lookups, each taking the
+        // env lock and allocating a String, for a value that cannot change.
+        static SPLITK_KV16: OnceLock<bool> = OnceLock::new();
+        let splitk_kv16 = *SPLITK_KV16.get_or_init(|| {
+            !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
+                .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        });
+        let use_mirrors = kv16_mirrors.is_some() && splitk_kv16;
         if kvq8_enabled() {
             // Q8 primary: read the 34-byte-block cache directly. No mirrors exist on this
             // lane (cache_k16/cache_v16 are empty under a compressed primary), and none are
@@ -25956,6 +25982,13 @@ impl ResidentDecodeState {
 
         // ---- Encode the whole verify window into one serial compute encoder -------------
         let mut keep: Vec<Buffer> = Vec::new();
+        // Attribution, not decoration (same split the batch-prefill trace uses):
+        // `gpu_busy` vs wall separates "the kernels are slow" from "the CPU cannot
+        // feed the GPU". A verify round that costs 6-8x a single decode step while
+        // reading the weights only once has to be one or the other, and guessing
+        // wrong means optimizing the wrong half.
+        let verify_trace = std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some();
+        let encode_started = std::time::Instant::now();
         let cb = kern.queue.new_command_buffer();
         let e = cb.new_compute_command_encoder();
         let mut from_a = true;
@@ -26217,8 +26250,19 @@ impl ResidentDecodeState {
             );
         }
         e.end_encoding();
+        let encode_us = encode_started.elapsed().as_micros();
+        let commit_started = std::time::Instant::now();
         cb.commit();
         cb.wait_until_completed();
+        if verify_trace {
+            let wall_us = commit_started.elapsed().as_micros();
+            let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb.to_owned());
+            eprintln!(
+                "[metal-verify-phase] base={base_position} k={k} \
+                 encode={encode_us}us commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
+                 kernel_window={kernel_window_us}us"
+            );
+        }
         // Note: `filled` is intentionally NOT advanced — the host accept loop sets it.
         let preds: Vec<u32> = (0..k)
             .map(|i| unsafe { *(pred_buf.contents() as *const u32).add(i) })
