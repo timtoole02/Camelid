@@ -17109,12 +17109,108 @@ async fn preflight_generation(
     // runnable prompt without constructing (or claiming) a dense session.
     match preflight_runnable_chat_request(&state, &req).await {
         Ok(Some(summary)) => Json(summary).into_response(),
-        Ok(None) => match validate_generation_request(&state, req).await {
-            Ok(summary) => Json(summary).into_response(),
+        Ok(None) => match preflight_gemma4_chat_request(&state, &req).await {
+            Ok(Some(summary)) => Json(summary).into_response(),
+            Ok(None) => match validate_generation_request(&state, req).await {
+                Ok(summary) => Json(summary).into_response(),
+                Err(response) => response,
+            },
             Err(response) => response,
         },
         Err(response) => response,
     }
+}
+
+/// Tokenization-only preflight for the gemma4 serve lane.
+///
+/// Workspace counts its chat-shaped request here before trimming history. The
+/// dense validator renders through the generic template path, which does not
+/// carry the certified gemma4 tool-call context, so a tools-bearing request
+/// died with a template error instead of an exact count. Render EXACTLY what
+/// `/v1/chat/completions` will render — the same marker renderer, the same
+/// tools branch, the same fail-closed template gate — and count that prompt
+/// with the same runtime tokenizer. No generation session is constructed and
+/// no dense prompt-cache readiness is claimed.
+async fn preflight_gemma4_chat_request(
+    state: &AppState,
+    req: &GenerationSessionRequest,
+) -> std::result::Result<Option<GenerationSessionSummary>, Response> {
+    if req.messages.is_none() {
+        return Ok(None);
+    }
+    let Some((_, runtime)) = resolve_gemma4_runtime_for_model(state, &req.model).await? else {
+        return Ok(None);
+    };
+    let model_id = match req.model.as_deref() {
+        Some(id) => Some(id.to_string()),
+        None => state.active_model_id.read().await.clone(),
+    };
+    let Some(model_id) = model_id else {
+        return Ok(None);
+    };
+    if req.prompt.is_some() || req.camelid_prompt_token_ids.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "ambiguous_generation_input",
+            "gemma4 chat preflight accepts messages only; do not combine messages with prompt or camelid_prompt_token_ids"
+                .to_string(),
+            None,
+        ));
+    }
+    let messages = req
+        .messages
+        .as_deref()
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_generation_input",
+                "gemma4 chat preflight requires a non-empty messages array".to_string(),
+                Some("messages"),
+            )
+        })?;
+    validate_chat_messages(messages).map_err(|response| *response)?;
+
+    let tools = unwrap_runnable_tools(req.tools.clone().unwrap_or_default());
+    // Tools are certified per ROW: the loaded GGUF's embedded template must
+    // carry the tool-call branch, exactly as the serve lane enforces.
+    if !tools.is_empty() && !gemma4_template_has_tools_branch(runtime.chat_template().as_deref()) {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tools_unsupported",
+            "the gemma4 serve lane does not support tools: its chat template has no certified tool-call branch"
+                .to_string(),
+            Some("tools"),
+        ));
+    }
+    let forced_tool_name = runnable_forced_tool_name(req.tool_choice.as_ref(), &tools);
+    let thinking = req.camelid_enable_thinking.unwrap_or(false);
+    let prompt = if tools.is_empty() {
+        gemma4_chat_prompt(messages, thinking)
+    } else {
+        gemma4_chat_prompt_with_tools(messages, &tools, thinking, forced_tool_name.as_deref())
+    };
+    let prompt_token_count =
+        match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await {
+            Ok(count) => count,
+            Err(response) => return Err(response),
+        };
+    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096);
+
+    Ok(Some(GenerationSessionSummary {
+        id: format!(
+            "gen-{}-{}",
+            model_id,
+            state.generation_sessions.read().await.len() + 1
+        ),
+        object: "generation.session",
+        model: model_id,
+        prompt_token_count,
+        max_tokens,
+        state: "validated",
+        dense_session_ready: false,
+        next_step: "the exact gemma4 chat prompt fits; /v1/chat/completions renders and enforces the same certified template",
+    }))
 }
 
 /// Tokenization-only preflight for the runnable Ornith/qwen35 chat lane.
