@@ -49,7 +49,7 @@ impl MetalSampleRequest {
 // callers are `#[cfg(not(feature = "cuda"))]` — so on a cuda build (Windows default / Linux
 // --all-features) this is genuinely unused; allow it rather than trip clippy `-D dead_code`.
 #[allow(dead_code)]
-pub(super) const MAX_VERIFY_K: usize = 8;
+pub(super) const MAX_VERIFY_K: usize = 16;
 
 /// Whether `prepare_for_prompt_prefix_cache` may vouch for ANY session — the
 /// prompt-prefix-cache host-safety gate. Default ON except on hosts with 8 GiB

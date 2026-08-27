@@ -2804,7 +2804,7 @@ enum Command {
         /// Draft model GGUF for --drafter draft. Must share the target's token mapping.
         #[arg(long)]
         draft_model: Option<PathBuf>,
-        /// Drafted tokens per round (γ). Capped at MAX_VERIFY_K - 1 = 7 by the verify path.
+        /// Drafted tokens per round (γ). Capped at MAX_VERIFY_K - 1 = 15 by the verify path.
         #[arg(long)]
         draft_tokens: Option<usize>,
         /// Force the draft model onto the CPU forward path (Path 3 in SPEC_RECHECK). Default
@@ -6043,7 +6043,7 @@ fn ghost_spec_decode(
 ) -> anyhow::Result<()> {
     use camelid::inference::speculative::{accepted_draft_prefix, NGramDrafter};
 
-    let draft_len = draft_len.min(7); // verify-batch width cap (MAX_VERIFY_K - 1)
+    let draft_len = draft_len.min(15); // verify-batch width cap (MAX_VERIFY_K - 1)
     let drafter = NGramDrafter::default();
     let mut history: Vec<u32> = prompt_ids.to_vec();
     let is_stop = |t: u32| tokenizer.special.eos == Some(t) || tokenizer.special.eot == Some(t);

@@ -13868,7 +13868,10 @@ fn encode_resident_kquant_matmul_f32(
 /// at most 8 (`MAX_VERIFY_K`), and one scratch region per column bounds the
 /// threadgroup memory. Wider batches (batched prefill) run as consecutive
 /// groups of this size through the same kernel.
-const KQUANT_MC_MAX_COLUMNS: usize = 8;
+// 16, matching MAX_VERIFY_K: the mc kernel's per-column scratch and its
+// one-tail-lane-per-column both hold to 16 columns (worst production shape,
+// ffn_dim 11008 Q4K: 43*9*16*4 = 24,768 bytes, still asserted per dispatch).
+const KQUANT_MC_MAX_COLUMNS: usize = 16;
 
 fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
@@ -26106,7 +26109,11 @@ impl ResidentDecodeState {
     }
 
     /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
-    const MAX_VERIFY_K: usize = 8;
+    /// Raised from 8 alongside the multi-column GEMV: verify buffers are
+    /// sized dynamically from `k`, attention stays exact per-row kernels,
+    /// and deeper windows are what make high-acceptance (copy/extraction)
+    /// drafts pay.
+    const MAX_VERIFY_K: usize = 16;
 
     #[allow(clippy::too_many_arguments)]
     fn verify_batch_inner(
@@ -30346,7 +30353,7 @@ mod tests {
         write_buffer_u8(&w_buf, &weight_wire);
 
         // Deterministic activation columns (one per verify row), non-trivial + signed.
-        let max_k = 8usize;
+        let max_k = 16usize;
         let acts: Vec<Vec<f32>> = (0..max_k)
             .map(|t| {
                 (0..cols)
@@ -30542,7 +30549,7 @@ mod tests {
                 device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
-            for k in [2usize, 3, 8] {
+            for k in [2usize, 3, 8, 16] {
                 let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
                 unsafe {
                     let p = scalar.contents() as *mut u32;
