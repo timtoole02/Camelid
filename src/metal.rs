@@ -13377,6 +13377,7 @@ fn encode_resident_matmul_f32(
             encode_resident_kquant_matmul_f32(
                 e,
                 k,
+                keep,
                 y,
                 weight,
                 out,
@@ -13715,6 +13716,7 @@ fn try_prism_wire_matmul_flat(
 fn encode_resident_kquant_matmul_f32(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
     y: &Buffer,
     weight: &ResidentLinearWeight,
     out: &Buffer,
@@ -13740,60 +13742,27 @@ fn encode_resident_kquant_matmul_f32(
     e.set_buffer(4, Some(scalar), 8);
     dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
 
-    // Multi-column lane: for bounded column windows (the speculative-verify
-    // rows), keep the one-SIMD-group-per-row decomposition and dot each
-    // cache-hot super-block against every column, so weights stream from DRAM
-    // once per window. Per-column results are bit-identical to the
-    // single-token GEMV; the wide-batch tiled kernels remain the fallback.
-    let mc_columns =
-        (2..=KQUANT_MC_MAX_COLUMNS).contains(&n_tokens) && kquant_mc_gemv_enabled();
-    let pipeline = match (weight.format, n_tokens == 1, mc_columns) {
-        (ResidentWeightFormat::Q4K, true, _) => &k.q4k_linear_simd_pipeline,
-        (ResidentWeightFormat::Q5K, true, _) => &k.q5k_linear_simd_pipeline,
-        (ResidentWeightFormat::Q6K, true, _) => &k.q6k_linear_simd_pipeline,
-        (ResidentWeightFormat::Q4K, false, true) => &k.q4k_linear_simd_mc_pipeline,
-        (ResidentWeightFormat::Q5K, false, true) => &k.q5k_linear_simd_mc_pipeline,
-        (ResidentWeightFormat::Q6K, false, true) => &k.q6k_linear_simd_mc_pipeline,
-        (ResidentWeightFormat::Q4K, false, false) => &k.q4k_linear_tiled_pipeline,
-        (ResidentWeightFormat::Q5K, false, false) => &k.q5k_linear_tiled_pipeline,
-        (ResidentWeightFormat::Q6K, false, false) => &k.q6k_linear_tiled_pipeline,
-        (ResidentWeightFormat::Q8_0, _, _)
-        | (ResidentWeightFormat::DenseF32, _, _)
-        | (ResidentWeightFormat::DenseF16, _, _)
-        | (ResidentWeightFormat::DenseBF16, _, _)
-        | (ResidentWeightFormat::Q1_0, _, _)
-        | (ResidentWeightFormat::Q2_0G64, _, _)
-        | (ResidentWeightFormat::Q2_0G128, _, _) => unreachable!(),
-    };
-    e.set_compute_pipeline_state(pipeline);
-    e.set_buffer(0, Some(scales), 0);
-    e.set_buffer(1, Some(quants), 0);
-    e.set_buffer(2, Some(&weight.buffer), 0);
-    e.set_buffer(3, Some(out), 0);
-    e.set_buffer(4, Some(scalar), 0);
-    e.set_buffer(5, Some(scalar), 4);
-    e.set_buffer(6, Some(scalar), 8);
-    if n_tokens == 1 || mc_columns {
-        let scratch_ints_per_column = n_sb
-            * match weight.format {
-                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q5K => 9,
-                ResidentWeightFormat::Q6K => 8,
-                ResidentWeightFormat::Q8_0
-                | ResidentWeightFormat::DenseF32
-                | ResidentWeightFormat::DenseF16
-                | ResidentWeightFormat::DenseBF16
-                | ResidentWeightFormat::Q1_0
-                | ResidentWeightFormat::Q2_0G64
-                | ResidentWeightFormat::Q2_0G128 => unreachable!(),
-            };
-        // The multi-column kernel keeps one scratch region per column.
-        let scratch_ints = scratch_ints_per_column * n_tokens;
-        // `setThreadgroupMemoryLength:` requires a multiple of 16 bytes
-        // (MTLDebugComputeCommandEncoder hard-asserts otherwise). `n_sb` is odd
-        // or 2 mod 4 for plenty of real shapes — Llama-2-7B ffn_dim 11008 gives
-        // n_sb 43, Qwen3-4B hidden 2560 gives n_sb 10 — so round the allocation
-        // up. The kernel only ever indexes the first `scratch_ints` words.
-        let kq_tg_bytes = (scratch_ints * 4).next_multiple_of(16);
+    let scratch_ints_per_column = n_sb
+        * match weight.format {
+            ResidentWeightFormat::Q4K | ResidentWeightFormat::Q5K => 9,
+            ResidentWeightFormat::Q6K => 8,
+            ResidentWeightFormat::Q8_0
+            | ResidentWeightFormat::DenseF32
+            | ResidentWeightFormat::DenseF16
+            | ResidentWeightFormat::DenseBF16
+            | ResidentWeightFormat::Q1_0
+            | ResidentWeightFormat::Q2_0G64
+            | ResidentWeightFormat::Q2_0G128 => unreachable!(),
+        };
+    // One row-parallel threadgroup dispatch shared by the single-token GEMV
+    // and the multi-column groups. `setThreadgroupMemoryLength:` requires a
+    // multiple of 16 bytes (MTLDebugComputeCommandEncoder hard-asserts
+    // otherwise). `n_sb` is odd or 2 mod 4 for plenty of real shapes —
+    // Llama-2-7B ffn_dim 11008 gives n_sb 43, Qwen3-4B hidden 2560 gives
+    // n_sb 10 — so round the allocation up. The kernel only ever indexes the
+    // first `scratch_ints` words.
+    let dispatch_rows_simd = |e: &metal::ComputeCommandEncoderRef, columns: usize| {
+        let kq_tg_bytes = (scratch_ints_per_column * columns * 4).next_multiple_of(16);
         assert_threadgroup_fits(&k.device, kq_tg_bytes, "K-quant resident GEMV scratch");
         e.set_threadgroup_memory_length(0, kq_tg_bytes as u64);
         e.dispatch_thread_groups(
@@ -13808,15 +13777,96 @@ fn encode_resident_kquant_matmul_f32(
                 depth: 1,
             },
         );
+    };
+    if n_tokens == 1 {
+        let pipeline = match weight.format {
+            ResidentWeightFormat::Q4K => &k.q4k_linear_simd_pipeline,
+            ResidentWeightFormat::Q5K => &k.q5k_linear_simd_pipeline,
+            ResidentWeightFormat::Q6K => &k.q6k_linear_simd_pipeline,
+            _ => unreachable!(),
+        };
+        e.set_compute_pipeline_state(pipeline);
+        e.set_buffer(0, Some(scales), 0);
+        e.set_buffer(1, Some(quants), 0);
+        e.set_buffer(2, Some(&weight.buffer), 0);
+        e.set_buffer(3, Some(out), 0);
+        e.set_buffer(4, Some(scalar), 0);
+        e.set_buffer(5, Some(scalar), 4);
+        e.set_buffer(6, Some(scalar), 8);
+        dispatch_rows_simd(e, 1);
+    } else if kquant_mc_gemv_enabled() {
+        // Multi-column lane: keep the one-SIMD-group-per-row decomposition
+        // and dot each cache-hot super-block against a bounded group of
+        // columns, so weight bytes stream from DRAM once per group instead
+        // of once per token. Wide batches (batched prefill) run as
+        // consecutive column groups through the same kernel; per-column
+        // results stay bit-identical to the single-token GEMV.
+        let (mc_pipeline, single_pipeline) = match weight.format {
+            ResidentWeightFormat::Q4K => {
+                (&k.q4k_linear_simd_mc_pipeline, &k.q4k_linear_simd_pipeline)
+            }
+            ResidentWeightFormat::Q5K => {
+                (&k.q5k_linear_simd_mc_pipeline, &k.q5k_linear_simd_pipeline)
+            }
+            ResidentWeightFormat::Q6K => {
+                (&k.q6k_linear_simd_mc_pipeline, &k.q6k_linear_simd_pipeline)
+            }
+            _ => unreachable!(),
+        };
+        let mut t0 = 0usize;
+        while t0 < n_tokens {
+            let gn = (n_tokens - t0).min(KQUANT_MC_MAX_COLUMNS);
+            e.set_compute_pipeline_state(if gn == 1 { single_pipeline } else { mc_pipeline });
+            e.set_buffer(0, Some(scales), (t0 * n_sb * 4) as u64);
+            e.set_buffer(1, Some(quants), (t0 * input_width) as u64);
+            e.set_buffer(2, Some(&weight.buffer), 0);
+            e.set_buffer(3, Some(out), (t0 * rows * 4) as u64);
+            if gn == 1 {
+                // The single-token kernel reads only n_sb/rows; the caller
+                // scalar already carries them.
+                e.set_buffer(4, Some(scalar), 0);
+                e.set_buffer(5, Some(scalar), 4);
+            } else {
+                // Per-group column count; pooled and returned via `keep`
+                // only after the command buffer completes.
+                let group_scalar = pool_get(k, 16);
+                unsafe {
+                    let p = group_scalar.contents() as *mut u32;
+                    *p = n_sb as u32;
+                    *p.add(1) = rows as u32;
+                    *p.add(2) = gn as u32;
+                }
+                e.set_buffer(4, Some(&group_scalar), 0);
+                e.set_buffer(5, Some(&group_scalar), 4);
+                e.set_buffer(6, Some(&group_scalar), 8);
+                keep.push(group_scalar);
+            }
+            dispatch_rows_simd(e, gn);
+            t0 += gn;
+        }
     } else {
+        let pipeline = match weight.format {
+            ResidentWeightFormat::Q4K => &k.q4k_linear_tiled_pipeline,
+            ResidentWeightFormat::Q5K => &k.q5k_linear_tiled_pipeline,
+            ResidentWeightFormat::Q6K => &k.q6k_linear_tiled_pipeline,
+            _ => unreachable!(),
+        };
+        e.set_compute_pipeline_state(pipeline);
+        e.set_buffer(0, Some(scales), 0);
+        e.set_buffer(1, Some(quants), 0);
+        e.set_buffer(2, Some(&weight.buffer), 0);
+        e.set_buffer(3, Some(out), 0);
+        e.set_buffer(4, Some(scalar), 0);
+        e.set_buffer(5, Some(scalar), 4);
+        e.set_buffer(6, Some(scalar), 8);
         dispatch_1d(e, pipeline, rows * n_tokens.div_ceil(4));
     }
 }
 
-/// Column cap for the multi-column K-quant GEMV: the verify window is at most
-/// 8 (`MAX_VERIFY_K`); one tail lane per column bounds any caller at 32, and
-/// per-column threadgroup scratch grows linearly. Wider batches (prefill)
-/// stay on the tiled kernels.
+/// Column-group size for the multi-column K-quant GEMV: the verify window is
+/// at most 8 (`MAX_VERIFY_K`), and one scratch region per column bounds the
+/// threadgroup memory. Wider batches (batched prefill) run as consecutive
+/// groups of this size through the same kernel.
 const KQUANT_MC_MAX_COLUMNS: usize = 8;
 
 fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
@@ -23867,6 +23917,7 @@ impl ResidentDecodeState {
                     encode_resident_kquant_matmul_f32(
                         e,
                         k,
+                        &mut projection_keep,
                         y,
                         w,
                         out,
@@ -26106,10 +26157,11 @@ impl ResidentDecodeState {
         }
 
         // ---- Buffers (row-major [token][dim]; token = verify row) -----------------------
-        let nb = |bytes: usize| {
-            kern.device
-                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
-        };
+        // Pooled: a verify round was re-allocating ~20 shared buffers
+        // (several MB counting the k*vocab logits) on every call; the round
+        // is synchronous (committed and waited below), so everything is
+        // recycled after the host readbacks.
+        let nb = |bytes: usize| pool_get(kern, bytes.max(4) as u64);
         let act_a = nb(k * hidden * 4);
         let act_b = nb(k * hidden * 4);
         let mid = nb(k * hidden * 4);
@@ -26529,6 +26581,51 @@ impl ResidentDecodeState {
         } else {
             Vec::new()
         };
+        // The command buffer completed and every host readback above is
+        // done: return the round's scratch (activations, scalars, staging
+        // from the batched projections) to the pool.
+        keep.extend([
+            act_a,
+            act_b,
+            mid,
+            norm_buf,
+            q_buf,
+            k_buf,
+            v_buf,
+            ctx_buf,
+            o_buf,
+            gate_buf,
+            up_buf,
+            silu_buf,
+            down_buf,
+            fnorm_buf,
+            logits_buf,
+            pred_buf,
+            cos_buf,
+            sin_buf,
+            scores_buf,
+            rms_scalar,
+            q_gemv,
+            kv_gemv,
+            o_gemv,
+            gateup_gemv,
+            down_gemv,
+            out_gemv,
+            rope_q_scalar,
+            rope_k_scalar,
+            silu_n,
+            resid_n,
+            kv16_write,
+            argmax_count,
+            perhead_qk_scalar,
+            scatter_scalars,
+        ]);
+        keep.extend(attn_scalars);
+        if let Some(bb) = tree_base_buf {
+            keep.push(bb);
+        }
+        keep.extend(tree_tail_bufs);
+        pool_recycle(kern, keep);
         Some((preds, logits_out))
     }
 
