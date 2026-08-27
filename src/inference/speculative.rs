@@ -227,11 +227,13 @@ impl SpeculativeDrafter {
         }
     }
 
-    /// Draft-decode profiling: (resident GPU forward µs, resident steps, CPU-fallback steps).
-    /// Zero for the n-gram drafter (no model forward). Resets on read.
-    pub fn take_forward_stats(&mut self) -> (u128, u64, u64) {
+    /// Draft-decode profiling: (resident GPU forward µs, resident steps, CPU-fallback steps,
+    /// slowest resident step µs). Zero for the n-gram drafter (no model forward). Resets on
+    /// read. The max identifies a one-time stall (engine build, first-touch paging) that a
+    /// bare mean would smear across every step as a uniform-looking slowdown.
+    pub fn take_forward_stats(&mut self) -> (u128, u64, u64, u128) {
         match self {
-            Self::NGram(_) => (0, 0, 0),
+            Self::NGram(_) => (0, 0, 0, 0),
             Self::Model(drafter) => drafter.take_forward_stats(),
         }
     }
@@ -465,9 +467,19 @@ pub struct ModelDrafter {
     resident_forward_us: u128,
     resident_steps: u64,
     cpu_fallback_steps: u64,
+    /// Slowest single resident step (µs). A lazily-built engine pays its one-time cost
+    /// (weight upload, first-touch paging) inside ONE step; reporting the max alongside
+    /// the mean keeps that stall from masquerading as uniform per-step slowness.
+    resident_max_step_us: u128,
 }
 
 impl ModelDrafter {
+    /// NOTE for integrators: the TARGET session sharing this process must disable its
+    /// resident encode-ahead while a model drafter is active (see the bench's
+    /// `generate_run_speculative`). A target's pre-committed, still-gated encode-ahead
+    /// graph parks at the head of Metal's shared serial queue and stalls this drafter's
+    /// next command buffer for seconds; the target never consumes that graph in a
+    /// speculative loop anyway (its next GPU work is a batched verify).
     pub fn new(mut session: LlamaInferenceSession) -> Self {
         // Route the draft session's GPU resident engine to the dedicated drafter
         // cache so it coexists with the target's engine. Resident decode stays
@@ -477,6 +489,14 @@ impl ModelDrafter {
         // rather than reseeded. If the draft engine doesn't fit in VRAM it falls
         // back to the CPU path per token automatically.
         session.set_is_drafter(true);
+        // Metal analog of the CUDA coexistence reserve below: resolve + upload the draft
+        // model's resident weights NOW, at construction/configure time. Left lazy, the
+        // whole convert/upload/page-in cost (multi-second for a 1B draft) fires inside
+        // the FIRST draft() call — a mid-decode stall the per-step draft profile then
+        // smears into a uniform-looking slowdown. Lossless: this only populates the
+        // caches the first encode would populate anyway. No-op off macOS or when the
+        // resident lane is off for this session.
+        session.prewarm_resident_weights();
         // Register the draft's resident VRAM footprint so a target engine built AFTER this
         // (e.g. when the drafter is configured before the target's first decode) leaves room for
         // the draft to stay GPU-resident too. Only honored on a GPU where the target still fits
@@ -490,20 +510,23 @@ impl ModelDrafter {
             resident_forward_us: 0,
             resident_steps: 0,
             cpu_fallback_steps: 0,
+            resident_max_step_us: 0,
         }
     }
 
     /// Take and reset the draft-decode profiling counters: (summed resident GPU forward µs,
-    /// resident step count, CPU-fallback step count).
-    pub fn take_forward_stats(&mut self) -> (u128, u64, u64) {
+    /// resident step count, CPU-fallback step count, slowest resident step µs).
+    pub fn take_forward_stats(&mut self) -> (u128, u64, u64, u128) {
         let stats = (
             self.resident_forward_us,
             self.resident_steps,
             self.cpu_fallback_steps,
+            self.resident_max_step_us,
         );
         self.resident_forward_us = 0;
         self.resident_steps = 0;
         self.cpu_fallback_steps = 0;
+        self.resident_max_step_us = 0;
         stats
     }
 
@@ -557,11 +580,13 @@ impl ModelDrafter {
             Some((mut pred, us)) => {
                 self.resident_forward_us += us;
                 self.resident_steps += 1;
+                self.resident_max_step_us = self.resident_max_step_us.max(us);
                 for &tok in rest {
                     pred = match self.session.generate_next_token_greedy_resident(tok)? {
                         Some((id, us)) => {
                             self.resident_forward_us += us;
                             self.resident_steps += 1;
+                            self.resident_max_step_us = self.resident_max_step_us.max(us);
                             id
                         }
                         None => {
@@ -603,6 +628,7 @@ impl ModelDrafter {
                 Some((id, us)) => {
                     self.resident_forward_us += us;
                     self.resident_steps += 1;
+                    self.resident_max_step_us = self.resident_max_step_us.max(us);
                     id
                 }
                 None => {

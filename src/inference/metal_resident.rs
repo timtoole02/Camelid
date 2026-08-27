@@ -997,6 +997,63 @@ impl super::LlamaInferenceSession {
         }
     }
 
+    /// Resolve + upload this session's full resident weight set into the process-global
+    /// Metal cache and fault its pages in (`metal::prewarm_resident_weights_cache`).
+    ///
+    /// Built for the speculative DRAFT model: its engine otherwise resolves weights
+    /// lazily inside the FIRST `draft()` call, landing the whole convert/upload/page-in
+    /// cost (multi-second for a 1B draft) as a stall in the middle of the user-visible
+    /// decode — which the per-step draft profile then smears into a uniform-looking
+    /// slowdown. Calling this at drafter construction moves that one-time cost to
+    /// configure time, the same place the CUDA lane pays its coexistence reserve.
+    ///
+    /// Lossless and idempotent: it only populates the caches the first encode would
+    /// populate anyway. Returns false (warming nothing) when the resident Metal lane is
+    /// off or this session/model is ineligible for it — the lazy path is unchanged.
+    #[cfg(target_os = "macos")]
+    pub fn prewarm_resident_weights(&self) -> bool {
+        if !resident_decode_metal_enabled() || !self.resident_decode_eligible(true).unwrap_or(false)
+        {
+            return false;
+        }
+        let weights = &self.weights;
+        // A pipeline-sharded node owns a layer subrange with no logits stage; the
+        // single-node drafter this serves never shards, so skip rather than special-case.
+        if weights.layer_range.is_some() {
+            return false;
+        }
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|l| metal::ResidentLayerWeights {
+                attn_norm: &l.attention_norm.data,
+                ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
+                post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
+                q_weight_blocks: resident_weight_bytes(&l.attention_q),
+                k_weight_blocks: resident_weight_bytes(&l.attention_k),
+                v_weight_blocks: resident_weight_bytes(&l.attention_v),
+                o_weight_blocks: resident_weight_bytes(&l.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
+            })
+            .collect();
+        let output = resident_weight_bytes(weights.output_projection());
+        let embedding = resident_weight_bytes(&weights.token_embedding);
+        metal::prewarm_resident_weights_cache(&layer_views, Some(&output), Some(&embedding))
+    }
+
+    /// Non-macOS stub: there is no resident Metal engine to warm.
+    #[cfg(not(target_os = "macos"))]
+    pub fn prewarm_resident_weights(&self) -> bool {
+        false
+    }
+
     /// macOS speculative-verify seam: verify a batch of draft tokens against the resident
     /// Metal engine in ONE batched forward (`metal::ResidentDecodeState::verify_batch`,
     /// bit-identical to `k` single-token decodes) and return the accepted prefix (the longest

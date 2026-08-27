@@ -7738,6 +7738,15 @@ fn generate_run_speculative(
     // the server with CAMELID_SPEC_GPU on); resident decode is the default when a CUDA
     // device is present, so this is the natural state, asserted explicitly here.
     session.set_resident_paths_disabled(false);
+    // The TARGET must not pre-commit encode-ahead graphs in the speculative lane: its next
+    // GPU work after a single-token step is a batched VERIFY, never the pre-encoded
+    // single-token graph, so the pending graph is always stale waste — and worse, it sits
+    // COMMITTED-BUT-UNGATED at the head of Metal's shared serial queue, where a coexisting
+    // draft model's next command buffer queues behind it (measured: a multi-second stall on
+    // the drafter's first step after the target's TTFT). The drafter's own session keeps
+    // encode-ahead ON — its sequential greedy steps are exactly what the pipeline is for,
+    // and its pending graphs are pre-signaled (already draining), so they never clog.
+    session.set_resident_encode_ahead_enabled(false);
 
     let mut history: Vec<u32> = prompt_tokens.to_vec();
     let mut input: Vec<u32> = prompt_tokens.to_vec();
@@ -8329,7 +8338,7 @@ fn run_bench_speculative(
     // reserve) is established BEFORE any target build, so the target builds once under the
     // coexistence budget and the draft stays GPU-resident; the plain reference then reuses that
     // same resident target (so its tps is the coexistence-config target, flagged in the record).
-    let (plain, spec, (draft_fwd_us, draft_resident_steps, draft_cpu_steps)) = if spec_only {
+    let (plain, spec, draft_stats) = if spec_only {
         if warmup {
             eprintln!("[bench-speculative] warmup (unmeasured, spec-only)...");
             let mut w = build_drafter()?;
@@ -8412,6 +8421,7 @@ fn run_bench_speculative(
         let draft_stats = drafter.take_forward_stats();
         (plain, spec, draft_stats)
     };
+    let (draft_fwd_us, draft_resident_steps, draft_cpu_steps, draft_max_step_us) = draft_stats;
     let plain_decode_tokens = plain.generated.len().saturating_sub(1);
     let plain_tps = if plain.decode_ms > 0.0 && plain_decode_tokens > 0 {
         plain_decode_tokens as f64 / (plain.decode_ms / 1000.0)
@@ -8426,16 +8436,27 @@ fn run_bench_speculative(
     };
     // Draft-decode profiling: the GPU forward time of the draft steps vs the wall-clock draft
     // time tells whether the draft cost is in the forward kernels or in sync/overhead around them.
+    // Mean AND max/steady: a lazily-paid one-time cost (engine build, first-touch paging) lands
+    // in ONE step, and a bare mean smears it into what reads as uniform per-step slowness.
     if draft_resident_steps + draft_cpu_steps > 0 {
+        let steady_ms = if draft_resident_steps > 1 {
+            (draft_fwd_us.saturating_sub(draft_max_step_us)) as f64
+                / 1000.0
+                / (draft_resident_steps - 1) as f64
+        } else {
+            draft_fwd_us as f64 / 1000.0
+        };
         eprintln!(
-            "[draft-profile] resident steps {} ({:.1} ms/step GPU forward) | cpu-fallback steps {} | \
-             wall draft {:.1} ms total = {:.1} ms/step | GPU-forward fraction {:.0}%",
+            "[draft-profile] resident steps {} ({:.1} ms/step GPU forward; max {:.1} ms, steady {:.1} ms/step) | \
+             cpu-fallback steps {} | wall draft {:.1} ms total = {:.1} ms/step | GPU-forward fraction {:.0}%",
             draft_resident_steps,
             if draft_resident_steps > 0 {
                 draft_fwd_us as f64 / 1000.0 / draft_resident_steps as f64
             } else {
                 0.0
             },
+            draft_max_step_us as f64 / 1000.0,
+            steady_ms,
             draft_cpu_steps,
             spec.draft_us as f64 / 1000.0,
             if draft_resident_steps + draft_cpu_steps > 0 {

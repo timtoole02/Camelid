@@ -1,6 +1,7 @@
 #[cfg(target_os = "macos")]
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,
+    MTLResourceUsage,
 };
 
 #[cfg(target_os = "macos")]
@@ -14523,6 +14524,9 @@ fn encode_gemma4_attention(
         cache_k_buf,
         cache_v_buf,
         None,
+        // gemma keeps the f32 cache (kv16_write is pinned 0 above) — latched, not global.
+        false,
+        false,
         &scores_buf,
         &ctx_buf,
         &attn_scalar,
@@ -17207,6 +17211,15 @@ fn encode_attention(
     keys: &Buffer,
     values: &Buffer,
     kv16_mirrors: Option<(&Buffer, &Buffer)>,
+    // Primary KV format of the BOUND `keys`/`values` buffers, threaded from the caller
+    // (an engine's latched `self.kv16`/`self.kvq8`, or `false, false` for the family
+    // paths that always keep an f32 cache). Never re-read the process-global gates
+    // here: two resident engines with different formats coexist in one process (a
+    // K-quant target + a Q8_0 draft model), and the global answers for whichever
+    // engine was BUILT last, not for the one encoding now — a mismatch makes these
+    // kernels read the cache in the wrong element width and decode garbage.
+    kv16: bool,
+    kvq8: bool,
     scores: &Buffer,
     out: &Buffer,
     scalar: &Buffer,
@@ -17223,7 +17236,7 @@ fn encode_attention(
 ) {
     // Tiled kernel (4 simdgroups/head, online softmax, no scores buffer) when enabled and
     // the head geometry allows; otherwise the one-simdgroup-per-head fallback.
-    let v2 = (attn2_enabled() || kvq8_enabled()) && head_dim.is_multiple_of(32) && head_dim <= 128;
+    let v2 = (attn2_enabled() || kvq8) && head_dim.is_multiple_of(32) && head_dim <= 128;
     // Split-K flash decode for deeper contexts: the v2 kernel's one-threadgroup-per-head
     // grid leaves the GPU mostly idle while each simdgroup walks a long position range
     // serially, and GQA re-reads every K/V row once per query head. The split-K kernel
@@ -17235,7 +17248,7 @@ fn encode_attention(
     // stays excluded: it keeps no separate mirrors, and its primary IS the half cache the
     // f32 lane's mirrors provide, so there is nothing here to reuse for it yet.
     let splitk = v2
-        && !kv16_enabled()
+        && !kv16
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -17251,7 +17264,7 @@ fn encode_attention(
         let use_mirrors = kv16_mirrors.is_some()
             && !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
                 .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
-        if kvq8_enabled() {
+        if kvq8 {
             // Q8 primary: read the 34-byte-block cache directly. No mirrors exist on this
             // lane (cache_k16/cache_v16 are empty under a compressed primary), and none are
             // wanted -- the whole point is that the Q8 cache is 1.88x smaller than the f16
@@ -17326,7 +17339,7 @@ fn encode_attention(
     // Bit-identical three-dispatch encode of the f32 fallback kernel. Same arithmetic,
     // same order; the only difference is that the score and context phases are exposed
     // as independent threads instead of being folded onto n_heads simdgroups.
-    if !v2 && !kv16_enabled() && !kvq8_enabled() && attn_split3_enabled() {
+    if !v2 && !kv16 && !kvq8 && attn_split3_enabled() {
         let denom = pool_get(k, (n_heads * 4).max(4) as u64);
         let blocks = pool_get(k, 8);
         encode_attention_split3(
@@ -17350,7 +17363,7 @@ fn encode_attention(
         keep.push(blocks);
         return;
     }
-    let attn_pipeline = match (v2, kv16_enabled(), kvq8_enabled()) {
+    let attn_pipeline = match (v2, kv16, kvq8) {
         (true, _, true) => &k.attention_decode_v2_kvq8_pipeline,
         (true, true, false) => &k.attention_decode_v2_kv16_pipeline,
         (true, false, false) => &k.attention_decode_v2_pipeline,
@@ -17420,11 +17433,14 @@ fn encode_attention_tree(
     out_off: u64,
     base_buf: &Buffer,
     tail_slots_buf: &Buffer,
+    // Latched primary-KV format of the bound cache (see `encode_attention`): the
+    // caller's engine field, never the process-global gate.
+    kv16: bool,
 ) {
     let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
     let splitk = v2
-        && !kv16_enabled()
+        && !kv16
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -18100,6 +18116,8 @@ fn encode_attention_block(
         cache_k_buf,
         cache_v_buf,
         kv16_mirrors,
+        kv16,
+        kvq8,
         &scores_buf,
         &ctx_buf,
         &attn_scalar,
@@ -19563,6 +19581,9 @@ fn encode_qwen35_full_layer(
         cache_k,
         cache_v,
         None,
+        // qwen35 keeps the f32 cache (mirror_flag pinned 0 above) — latched, not global.
+        false,
+        false,
         &scores,
         &context,
         &attn_scalar,
@@ -20658,6 +20679,9 @@ impl Lfm2MetalDecode {
                             cache_k,
                             cache_v,
                             None,
+                            // f32 cache (mirror_flag pinned 0 above) — latched, not global.
+                            false,
+                            false,
                             &scores,
                             &context,
                             &attn_scalar,
@@ -21064,6 +21088,9 @@ fn encode_lfm2_attn_layer(
         cache_k,
         cache_v,
         None,
+        // lfm2 keeps the f32 cache (mirror_flag pinned 0 above) — latched, not global.
+        false,
+        false,
         &scores,
         &context,
         &attn_scalar,
@@ -21988,6 +22015,112 @@ fn resolve_resident_weight(
         buffer,
         q8_wire: physical_q8_wire,
     })
+}
+
+/// One volatile read per 4 KiB of the buffer (16 KiB pages on Apple Silicon; the 4 KiB
+/// stride stays correct if the page size ever shrinks), so file-backed pages are
+/// resident before a GPU kernel reads them.
+#[cfg(target_os = "macos")]
+fn touch_buffer_pages(buffer: &Buffer) {
+    let len = buffer.length() as usize;
+    let base = buffer.contents() as *const u8;
+    if base.is_null() || len == 0 {
+        return;
+    }
+    let mut sink = 0u8;
+    let mut offset = 0usize;
+    while offset < len {
+        unsafe { sink = sink.wrapping_add(std::ptr::read_volatile(base.add(offset))) };
+        offset += 4096;
+    }
+    unsafe { sink = sink.wrapping_add(std::ptr::read_volatile(base.add(len - 1))) };
+    std::hint::black_box(sink);
+}
+
+/// Warm the process-global resident weight cache for one model: resolve (convert +
+/// upload) every layer's seven resident matrices, plus the output projection and — in
+/// wire mode, where the sampling tail's gather can use it — the token-embedding
+/// blocks, then touch every resolved byte so file-backed NoCopy pages are faulted in
+/// before any kernel reads them.
+///
+/// The resident engines otherwise resolve weights lazily inside the first encoded
+/// graph, which lands the whole convert/upload/page-in cost (multi-second for a
+/// billion-parameter model) in the middle of the first decode step. A caller that
+/// knows it will decode soon — the speculative draft model at construction — calls
+/// this at configure time instead. Idempotent and lossless: it populates the same
+/// (pointer, length)-keyed caches `prepare_token` resolves from, so the first encode
+/// hits instead of uploading. Returns false when Metal is unavailable or any tensor
+/// fails to resolve (the lazy path then proceeds exactly as before).
+#[cfg(target_os = "macos")]
+pub fn prewarm_resident_weights_cache(
+    layers: &[ResidentLayerWeights],
+    output_projection: Option<&ResidentWeightBytes>,
+    token_embedding: Option<&ResidentWeightBytes>,
+) -> bool {
+    let Some(k) = metal_linear_kernel() else {
+        return false;
+    };
+    let wire = f32y_gemv_enabled() && wire_weights_enabled();
+    let mut resolved: Vec<ResidentLinearWeight> = Vec::with_capacity(layers.len() * 7 + 2);
+    {
+        let Ok(mut cache) = metal_linear_cache().lock() else {
+            return false;
+        };
+        for l in layers {
+            for w in [
+                &l.q_weight_blocks,
+                &l.k_weight_blocks,
+                &l.v_weight_blocks,
+                &l.o_weight_blocks,
+                &l.gate_weight_blocks,
+                &l.up_weight_blocks,
+                &l.down_weight_blocks,
+            ] {
+                match resolve_resident_weight(&mut cache, &k.device, w, wire) {
+                    Some(r) => resolved.push(r),
+                    None => return false,
+                }
+            }
+        }
+        if let Some(w) = output_projection {
+            match resolve_resident_weight(&mut cache, &k.device, w, wire) {
+                Some(r) => resolved.push(r),
+                None => return false,
+            }
+        }
+        // The sampling tail's embedding gather only exists in wire mode
+        // (`prepare_token` resolves `emb_buf` under the same condition) — outside it,
+        // resolving here would convert a large tensor nothing will read.
+        if wire {
+            if let Some(w) = token_embedding {
+                if let Some(r) = resolve_resident_weight(&mut cache, &k.device, w, wire) {
+                    resolved.push(r);
+                }
+            }
+        }
+    }
+    // A NoCopy buffer wraps the mmap'd GGUF pages directly, so resolving it uploads
+    // nothing — the first KERNEL read would take the page faults (observed as
+    // multi-second gaps inside the first command buffer). One read per page moves
+    // that cost here.
+    for r in &resolved {
+        touch_buffer_pages(&r.buffer);
+    }
+    // CPU touches fault pages into host RAM but do NOT wire them into the GPU's
+    // residency set — the first command buffer referencing the buffers still pays the
+    // wire-down at schedule time (measured: a 5-40 s commit→GPUStart gap on the
+    // drafter's first step, scaling with memory pressure, while its kernels ran in
+    // ~20 ms). One committed encoder pass that declares every buffer via use_resource
+    // makes the driver wire them here instead.
+    let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
+    for r in &resolved {
+        e.use_resource(&r.buffer, MTLResourceUsage::Read);
+    }
+    e.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    true
 }
 
 /// Geometry shared by the Qwen3-VL vision transformer and merger graph.
@@ -25746,6 +25879,8 @@ impl ResidentDecodeState {
                             } else {
                                 Some((&self.cache_k16[l], &self.cache_v16[l]))
                             },
+                            self.kv16,
+                            self.kvq8,
                             &scores_buf,
                             &ctx_buf,
                             &attn_scalars[class_base + i],
@@ -26432,6 +26567,8 @@ impl ResidentDecodeState {
                         } else {
                             Some((&self.cache_k16[l], &self.cache_v16[l]))
                         },
+                        self.kv16,
+                        self.kvq8,
                         &scores_buf,
                         &ctx_buf,
                         attn_scalar,
@@ -26461,6 +26598,7 @@ impl ResidentDecodeState {
                         (i * q_dim * 4) as u64,
                         tree_base_buf.as_ref().expect("tree base buffer present"),
                         &tree_tail_bufs[i],
+                        self.kv16,
                     ),
                 }
             }
