@@ -2,7 +2,7 @@
   "schema": "camelid.agent_eval/v1",
   "outcome": "FAIL",
   "model_id": "26B_dequant_it_hf",
-  "gguf": "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf",
+  "gguf": "<home>/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf",
   "gguf_bytes": 14439361440,
   "quantization": "Q4_0",
   "note": "battery complete",
@@ -38,5 +38,5 @@
   "host_loadavg_1m": 2.720703125,
   "timestamp_unix": 1787775978,
   "promotion_eligible": false,
-  "receipt_id": "ebb003aa7de34a477300de4223b846969e85afc9930be5d42176a3071c0e30cf"
+  "receipt_id": "b6ab17c6a82b1bb62accd45c6e1faa6861935ea50b1593cee1a26ead35273742"
 }

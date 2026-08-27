@@ -6618,7 +6618,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "windows_cuda_ghost_moe_256_token_decode",
                 latest_checked_result: "pass",
                 latest_checked_output: "12.29 tok/s sustained; token sequence preserved",
-                evidence: "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve. The supported single-node claim covers this row only, and only through this catalog-managed Windows CUDA Ghost lane; ad-hoc, CPU, and Metal Ghost runs remain experimental. TOOLS (2026-08-26): the gemma4 serve lane implements this row's GGUF-embedded tool-call template branch — <|tool>declaration blocks closing the system turn, <|tool_call>call:NAME{...} calls, and <|tool_response> results continuing the same open model turn — with the marker renderer locked byte-for-byte to the reference Jinja rendering of the file's OWN embedded template (template sha256 94899c0f...) by qa/gemma4/tool_template_shapes_v1.json and its in-src pack-lock test; the model's envelope lifts into structured OpenAI tool_calls, generation stops on the envelope terminator, and gemma4 rows whose embedded template lacks the branch keep the typed fail-closed 422. All three camelid.agent_eval/v1 battery cases (read_file/list_dir/write_file, plus a spontaneous update_plan) PASS in ONE run with a committed receipt (qa/agent-eval/gemma-4-26B_q4_0-it-1787782175-PASS.json, receipt 5dc1d6437a13c6b3) on the second-M4 rig's catalog-managed macOS ghost lane. tool_capable is earned ONLY by that receipt; tool-use quality beyond the battery, other gemma4 rows/quants, and tool-lane throughput are NOT claimed. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
+                evidence: "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve. The supported single-node claim covers this row only, and only through this catalog-managed Windows CUDA Ghost lane; ad-hoc, CPU, and Metal Ghost runs remain experimental. TOOLS (2026-08-26): the gemma4 serve lane implements this row's GGUF-embedded tool-call template branch — <|tool>declaration blocks closing the system turn, <|tool_call>call:NAME{...} calls, and <|tool_response> results continuing the same open model turn — with the marker renderer locked byte-for-byte to the reference Jinja rendering of the file's OWN embedded template (template sha256 94899c0f...) by qa/gemma4/tool_template_shapes_v1.json and its in-src pack-lock test; the model's envelope lifts into structured OpenAI tool_calls, generation stops on the envelope terminator, and gemma4 rows whose embedded template lacks the branch keep the typed fail-closed 422. All three camelid.agent_eval/v1 battery cases (read_file/list_dir/write_file, plus a spontaneous update_plan) PASS in ONE run with a committed receipt (qa/agent-eval/gemma-4-26B_q4_0-it-1787782175-PASS.json, receipt 6b004d0ec0fec158) on the second-M4 rig's catalog-managed macOS ghost lane. tool_capable is earned ONLY by that receipt; tool-use quality beyond the battery, other gemma4 rows/quants, and tool-lane throughput are NOT claimed. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
                 next_step: "commit a normalized browser/API evidence bundle and bounded-context ladder for Windows Ghost-MoE, then validate the same prepared-artifact flow on additional NVIDIA memory tiers before widening the scope",
             },
             ModelCompatibilityTarget {
@@ -9118,7 +9118,7 @@ fn gemma4_dictsort(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Vec<(&String, &serde_json::Value)> {
     let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-    entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    entries.sort_by_key(|entry| entry.0.to_lowercase());
     entries
 }
 
@@ -9643,7 +9643,7 @@ fn gemma4_chat_prompt_with_tools(
             // Reference dangling-call shape: the response marker is primed and
             // the model turn stays open.
             out.push_str(GEMMA4_TOOL_RESPONSE_START);
-        } else if !(responses_emitted && !has_content) {
+        } else if !responses_emitted || has_content {
             out.push_str(GEMMA4_TURN_END);
             out.push('\n');
         }
@@ -9702,8 +9702,8 @@ fn gemma4_scan_argument_value(text: &str) -> (serde_json::Value, usize) {
             None => (serde_json::Value::String(after.to_string()), text.len()),
         };
     }
-    if rest.starts_with('{') {
-        let (object, used) = gemma4_scan_argument_object(&rest[1..]);
+    if let Some(after) = rest.strip_prefix('{') {
+        let (object, used) = gemma4_scan_argument_object(after);
         return (serde_json::Value::Object(object), offset + 1 + used);
     }
     if rest.starts_with('[') {

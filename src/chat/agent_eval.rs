@@ -419,7 +419,7 @@ fn finish(
         "schema": "camelid.agent_eval/v1",
         "outcome": outcome.label(),
         "model_id": model_id,
-        "gguf": gguf.display().to_string(),
+        "gguf": redacted_path_display(gguf),
         "gguf_bytes": std::fs::metadata(gguf).map(|m| m.len()).ok(),
         "quantization": infer_quant(gguf),
         "note": note,
@@ -461,6 +461,23 @@ fn finish(
     // Machine-readable verdict on stdout.
     println!("{}", outcome.label());
     Ok(outcome.exit())
+}
+
+/// Receipt-safe path spelling: receipts are committed to the public repo, and
+/// the public-scrub CI gate rejects absolute home paths, so the home-directory
+/// prefix is recorded as `<home>` (the spelling the existing receipt corpus
+/// already uses). Non-home paths are recorded as-is.
+fn redacted_path_display(path: &std::path::Path) -> String {
+    let display = path.display().to_string();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| home.to_string_lossy().to_string());
+    if let Some(home) = home.filter(|home| !home.is_empty()) {
+        if let Some(rest) = display.strip_prefix(&home) {
+            return format!("<home>{rest}");
+        }
+    }
+    display
 }
 
 fn family_for(gguf: &std::path::Path) -> String {
@@ -506,6 +523,26 @@ fn infer_quant(gguf: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Receipts land in the public repo: the home prefix must record as
+    /// `<home>` (the corpus spelling the public-scrub gate accepts), while
+    /// non-home paths stay verbatim.
+    #[test]
+    fn receipt_path_redacts_the_home_prefix() {
+        let _guard = crate::test_support::env_lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/someone");
+        let home_path = std::path::Path::new("/home/someone/models/m.gguf");
+        let outside = std::path::Path::new("/srv/models/m.gguf");
+        let redacted = redacted_path_display(home_path);
+        let untouched = redacted_path_display(outside);
+        match prior {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(redacted, "<home>/models/m.gguf");
+        assert_eq!(untouched, "/srv/models/m.gguf");
+    }
 
     #[test]
     fn outcome_exit_codes_are_distinct() {
