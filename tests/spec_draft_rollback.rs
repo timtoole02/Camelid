@@ -71,7 +71,7 @@ fn draft_model_rollback_after_rejection_keeps_the_resident_engine_in_sync() {
     let gamma = 5;
     let first = drafter.draft(&prompt, gamma).expect("first draft round");
     assert_eq!(first.len(), gamma, "drafter should fill the window");
-    let (_, resident_steps, cpu_steps) = drafter.take_forward_stats();
+    let (_, resident_steps, cpu_steps, _) = drafter.take_forward_stats();
     let resident_lane = resident_steps > 0;
     eprintln!("round 1: drafts={first:?} resident_steps={resident_steps} cpu_steps={cpu_steps}");
     // A model WAS supplied, so the caller asked for the resident lane. Falling back to CPU is
@@ -113,7 +113,7 @@ fn draft_model_rollback_after_rejection_keeps_the_resident_engine_in_sync() {
     // Pre-fix this call panicked inside the resident reseed.
     let second = drafter.draft(&history, gamma).expect("second draft round");
     assert_eq!(second.len(), gamma, "drafter should fill the window again");
-    let (_, resident_steps_2, cpu_steps_2) = drafter.take_forward_stats();
+    let (_, resident_steps_2, cpu_steps_2, _) = drafter.take_forward_stats();
     eprintln!(
         "round 2: drafts={second:?} resident_steps={resident_steps_2} cpu_steps={cpu_steps_2}"
     );
@@ -137,7 +137,7 @@ fn draft_model_rollback_after_rejection_keeps_the_resident_engine_in_sync() {
     history.push(rejected);
     let third = drafter.draft(&history, gamma).expect("third draft round");
     assert_eq!(third.len(), gamma);
-    let (_, resident_steps_3, cpu_steps_3) = drafter.take_forward_stats();
+    let (_, resident_steps_3, cpu_steps_3, _) = drafter.take_forward_stats();
     eprintln!(
         "round 3: drafts={third:?} resident_steps={resident_steps_3} cpu_steps={cpu_steps_3}"
     );
