@@ -2077,6 +2077,21 @@ fn spec_gpu_enabled() -> bool {
     )
 }
 
+/// Streaming speculation opt-out (`CAMELID_SPEC_STREAM=0`), default ON.
+///
+/// Speculation as a whole is already opt-in server-wide via
+/// `CAMELID_SPEC_DECODE`; this is the narrower rollback lever. It turns the
+/// lane off for STREAMED requests only, restoring the pre-Fix-B behaviour
+/// exactly, while leaving speculation running for blocking requests. Kept
+/// because streaming is the path agent clients actually use, so a regression
+/// there needs a switch that does not also blind the blocking measurements.
+fn spec_stream_enabled() -> bool {
+    !matches!(
+        env::var("CAMELID_SPEC_STREAM").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
 fn spec_draft_tokens_from_env(default: usize) -> usize {
     env::var(SPEC_DRAFT_TOKENS_ENV)
         .ok()
@@ -17158,16 +17173,240 @@ fn mixtral_long_generation_is_blocked(
 /// plain resident lane, instead of failing every request. Lossless speculation
 /// only ever adds throughput, so dropping it costs correctness nothing.
 fn speculation_admissible(
-    _sampling: &SamplingConfig,
+    sampling: &SamplingConfig,
     collect_dense_diagnostics: bool,
     has_logit_diagnostics: bool,
     pipeline_sharded: bool,
     config: &LlamaModelConfig,
 ) -> bool {
-    !collect_dense_diagnostics
+    // Sampled requests decline speculation outright. Their verify has no GPU
+    // lane — the batched verifier returns argmax rows, not distributions — so a
+    // stochastic round takes `forward_sampling_verify_chunk`: a k-row CPU
+    // forward of the whole model plus a resident->CPU KV mirror-back, against a
+    // resident step it is trying to beat. Below near-perfect acceptance that is
+    // a net loss, and chat defaults are temperature>0, so leaving the lane
+    // reachable made "speculation enabled" a regression for ordinary traffic.
+    // The exact rejection sampler stays in the tree for the future GPU
+    // distribution verifier; this gate only stops the lane engaging today.
+    sampling == &SamplingConfig::default()
+        && !collect_dense_diagnostics
         && !has_logit_diagnostics
         && !pipeline_sharded
         && !crate::model::arch_has_windowed_attention(config)
+}
+
+/// What one attempted speculative round did.
+enum SpeculativeRound {
+    /// Nothing was committed — ineligible step, the latch is off, or the
+    /// drafter had no proposal. The caller runs its ordinary single-token step.
+    Declined,
+    /// The round committed at least one token: `generated` and `history` have
+    /// grown and `finish_reason` is current.
+    Committed,
+}
+
+/// One lossless speculative round: draft, verify in a single batched target
+/// forward, commit the accepted prefix.
+///
+/// Greedy requests accept the longest exact-match prefix, so the emitted stream
+/// is the target's own argmax either way — a drafter can only change how fast
+/// tokens arrive, never which ones. Sampling requests never reach here
+/// (`speculation_admissible` declines them); the exact rejection sampler below
+/// stays for the future GPU distribution verifier.
+///
+/// This is shared by all three decode loops — the non-streaming loop and both
+/// streaming jobs (cooperative and exclusive). Streaming used to skip
+/// speculation entirely, which meant the lane never fired for the streaming
+/// clients that make up real agent traffic; keeping one body is what stops that
+/// divergence coming back.
+#[allow(clippy::too_many_arguments)]
+fn run_speculative_round(
+    prepared: &mut PreparedGeneration,
+    sampler: &LlamaSampler,
+    input: &[u32],
+    eligible: bool,
+    generated: &mut Vec<u32>,
+    history: &mut Vec<u32>,
+    finish_reason: &mut &'static str,
+    forward_timings: &mut LlamaForwardTimings,
+) -> std::result::Result<SpeculativeRound, Box<Response>> {
+    // Engages only on a single-token continuation and never alongside a
+    // per-step logit consumer.
+    if !eligible || input.len() != 1 {
+        return Ok(SpeculativeRound::Declined);
+    }
+    let Some(spec) = prepared.speculative.as_mut() else {
+        return Ok(SpeculativeRound::Declined);
+    };
+    if !spec.latch.should_speculate() {
+        spec.latch.note_skip();
+        return Ok(SpeculativeRound::Declined);
+    }
+    let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
+    let context_room = prepared.session.remaining_context();
+    let drafts = if remaining > 0 && context_room > 0 {
+        let draft_budget = spec
+            .draft_tokens
+            .min(remaining.saturating_sub(1))
+            .min(context_room.saturating_sub(1));
+        spec.drafter
+            .draft(history.as_slice(), draft_budget)
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "speculative_draft_failed",
+                    err.to_string(),
+                    None,
+                ))
+            })?
+    } else {
+        Vec::new()
+    };
+    // No drafts (e.g. no n-gram match) -> the caller runs the plain
+    // single-token step; a one-token verify chunk would only add chunk-path
+    // overhead over the tuned decode step. This is an anchor miss, not a
+    // latch-directed skip or an acceptance measurement, so it must not advance
+    // the re-probe cooldown.
+    if drafts.is_empty() {
+        return Ok(SpeculativeRound::Declined);
+    }
+    // GPU speculative decode (CAMELID_SPEC_GPU=1): verify all drafts in one
+    // batched forward on the target's resident engine, which manages the KV
+    // itself (accept the longest matching prefix, advance position). Falls
+    // back to the CPU chunk verify when the engine isn't resident-ready.
+    // Lossless either way — the emitted tokens are the target's own greedy
+    // argmax given the accepted prefix.
+    let gpu_accepted = if matches!(sampler, LlamaSampler::Greedy) && spec_gpu_enabled() {
+        prepared
+            .session
+            .verify_drafts_gpu(input[0], &drafts)
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "speculative_verify_failed",
+                    err.to_string(),
+                    None,
+                ))
+            })?
+    } else {
+        None
+    };
+    let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
+        let accepted_count = (acc.len() as u64).saturating_sub(1);
+        spec.rounds += 1;
+        spec.drafted += drafts.len() as u64;
+        spec.accepted_drafts += accepted_count;
+        spec.latch.note_verified(accepted_count as u32);
+        acc
+    } else {
+        let base_position = prepared.session.kv_position();
+        let mut batch = Vec::with_capacity(1 + drafts.len());
+        batch.push(input[0]);
+        batch.extend_from_slice(&drafts);
+        let (round_emitted, accepted, round_timings) = match sampler {
+            LlamaSampler::Greedy => {
+                let (predictions, timings) = prepared
+                    .session
+                    .forward_greedy_verify_chunk(&batch)
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "speculative_verify_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?;
+                let accepted = accepted_draft_prefix(&drafts, &predictions);
+                (predictions[..=accepted].to_vec(), accepted, timings)
+            }
+            LlamaSampler::Sampling(sampling) => {
+                let (target_probabilities, timings) = prepared
+                    .session
+                    .forward_sampling_verify_chunk(&batch, sampling, history.as_slice())
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "speculative_verify_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?;
+                let vocab = target_probabilities
+                    .first()
+                    .map(Vec::len)
+                    .expect("verify batch is non-empty");
+                let mut draft_probabilities = Vec::with_capacity(drafts.len());
+                for &draft in &drafts {
+                    let mut probabilities = vec![0.0f32; vocab];
+                    let Some(probability) = probabilities.get_mut(draft as usize) else {
+                        return Err(Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "speculative_draft_failed",
+                            format!("draft token {draft} is outside vocabulary size {vocab}"),
+                            None,
+                        )));
+                    };
+                    *probability = 1.0;
+                    draft_probabilities.push(probabilities);
+                }
+                let draft_refs: Vec<&[f32]> =
+                    draft_probabilities.iter().map(Vec::as_slice).collect();
+                let target_refs: Vec<&[f32]> =
+                    target_probabilities.iter().map(Vec::as_slice).collect();
+                let rng = seeded_rejection_rng(sampling.seed.unwrap_or(0), history.len() as u64);
+                let result =
+                    speculative_rejection_sample(&drafts, &draft_refs, &target_refs, rng);
+                (result.emitted_tokens, result.accepted_draft_count, timings)
+            }
+        };
+        prepared
+            .session
+            .rollback_to_position(base_position + 1 + accepted)
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "speculative_rollback_failed",
+                    err.to_string(),
+                    None,
+                ))
+            })?;
+        spec.rounds += 1;
+        spec.drafted += drafts.len() as u64;
+        spec.accepted_drafts += accepted as u64;
+        spec.latch.note_verified(accepted as u32);
+        forward_timings.add_assign(&round_timings);
+        round_emitted
+    };
+    // A stop reason inside the accepted run truncates it: the tokens after the
+    // stop are verified but never emitted, exactly as a sequential run would
+    // have stopped there.
+    for &token in &emitted {
+        generated.push(token);
+        history.push(token);
+        prepared.engine_progress.record_progress(generated.len());
+        if prepared.tokenizer.special.eog.contains(&token) {
+            *finish_reason = "stop";
+            break;
+        }
+        if !prepared.stop_sequences.is_empty() {
+            let text = prepared
+                .tokenizer
+                .decode(generated.as_slice(), true)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "token_decode_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?;
+            if contains_stop_sequence(&text, &prepared.stop_sequences) {
+                *finish_reason = "stop";
+                break;
+            }
+        }
+    }
+    Ok(SpeculativeRound::Committed)
 }
 
 async fn prepare_generation(
@@ -18966,6 +19205,32 @@ fn consume_generation_step(
     Ok(())
 }
 
+/// One-line speculative acceptance summary for a finished generation.
+///
+/// Shared by the blocking loop and both streaming jobs. A lane that only
+/// reports itself on non-streaming requests is a lane nobody can measure on
+/// real traffic, which is the same blind spot that let streaming go without
+/// speculation at all; keeping one emitter is what stops it coming back.
+/// No-op when the request never had a drafter.
+fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
+    let Some(spec) = prepared.speculative.as_ref() else {
+        return;
+    };
+    let acceptance_pct = if spec.drafted == 0 {
+        0.0
+    } else {
+        spec.accepted_drafts as f64 * 100.0 / spec.drafted as f64
+    };
+    tracing::info!(
+        rounds = spec.rounds,
+        drafted = spec.drafted,
+        accepted_drafts = spec.accepted_drafts,
+        acceptance_pct,
+        generated,
+        "speculative decode summary"
+    );
+}
+
 fn generate_token_ids(
     mut prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedTokens, Box<Response>> {
@@ -19105,196 +19370,32 @@ fn generate_token_ids(
             LlamaSampler::Sampling(sampling)
         };
         // Lossless speculation: draft tokens and verify them in one batched target forward.
-        // Greedy requests accept the longest exact-match prefix. Sampling requests use exact
-        // rejection sampling with the deterministic drafter treated as a delta distribution,
-        // preserving the target distribution while requiring no hidden drafter probabilities.
-        // Engages only after the first step and never alongside per-step logit consumers.
-        if let Some(spec) = prepared.speculative.as_mut().filter(|_| {
-            input.len() == 1
-                && !collect_dense_for_step
-                && !collect_step_top_logits
-                && prepared.logprobs_top_n.is_none()
-                && grammar.is_none()
-                && !top_logits.is_empty()
-        }) {
-            if !spec.latch.should_speculate() {
-                spec.latch.note_skip();
-            } else {
-                let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
-                let context_room = prepared.session.remaining_context();
-                let drafts = if remaining > 0 && context_room > 0 {
-                    let draft_budget = spec
-                        .draft_tokens
-                        .min(remaining.saturating_sub(1))
-                        .min(context_room.saturating_sub(1));
-                    spec.drafter.draft(&history, draft_budget).map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "speculative_draft_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?
-                } else {
-                    Vec::new()
-                };
-                // No drafts (e.g. no n-gram match) -> fall through to the plain
-                // single-token step below; a one-token verify chunk would only
-                // add chunk-path overhead over the tuned decode step. This is an
-                // anchor miss, not a latch-directed skip or an acceptance
-                // measurement, so it must not advance the re-probe cooldown.
-                if !drafts.is_empty() {
-                    // GPU speculative decode (CAMELID_SPEC_GPU=1): verify all drafts in one
-                    // batched forward on the target's resident engine, which manages the KV
-                    // itself (accept the longest matching prefix, advance position). Falls
-                    // back to the CPU chunk verify when the engine isn't resident-ready.
-                    // Lossless either way — the emitted tokens are the target's own greedy
-                    // argmax given the accepted prefix.
-                    let gpu_accepted =
-                        if matches!(sampler, LlamaSampler::Greedy) && spec_gpu_enabled() {
-                            prepared
-                                .session
-                                .verify_drafts_gpu(input[0], &drafts)
-                                .map_err(|err| {
-                                    Box::new(api_error(
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        "speculative_verify_failed",
-                                        err.to_string(),
-                                        None,
-                                    ))
-                                })?
-                        } else {
-                            None
-                        };
-                    let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
-                        let accepted_count = (acc.len() as u64).saturating_sub(1);
-                        spec.rounds += 1;
-                        spec.drafted += drafts.len() as u64;
-                        spec.accepted_drafts += accepted_count;
-                        spec.latch.note_verified(accepted_count as u32);
-                        acc
-                    } else {
-                        let base_position = prepared.session.kv_position();
-                        let mut batch = Vec::with_capacity(1 + drafts.len());
-                        batch.push(input[0]);
-                        batch.extend_from_slice(&drafts);
-                        let (round_emitted, accepted, round_timings) = match &sampler {
-                            LlamaSampler::Greedy => {
-                                let (predictions, timings) = prepared
-                                    .session
-                                    .forward_greedy_verify_chunk(&batch)
-                                    .map_err(|err| {
-                                        Box::new(api_error(
-                                            StatusCode::SERVICE_UNAVAILABLE,
-                                            "speculative_verify_failed",
-                                            err.to_string(),
-                                            None,
-                                        ))
-                                    })?;
-                                let accepted = accepted_draft_prefix(&drafts, &predictions);
-                                (predictions[..=accepted].to_vec(), accepted, timings)
-                            }
-                            LlamaSampler::Sampling(sampling) => {
-                                let (target_probabilities, timings) = prepared
-                                    .session
-                                    .forward_sampling_verify_chunk(&batch, sampling, &history)
-                                    .map_err(|err| {
-                                        Box::new(api_error(
-                                            StatusCode::SERVICE_UNAVAILABLE,
-                                            "speculative_verify_failed",
-                                            err.to_string(),
-                                            None,
-                                        ))
-                                    })?;
-                                let vocab = target_probabilities
-                                    .first()
-                                    .map(Vec::len)
-                                    .expect("verify batch is non-empty");
-                                let mut draft_probabilities = Vec::with_capacity(drafts.len());
-                                for &draft in &drafts {
-                                    let mut probabilities = vec![0.0f32; vocab];
-                                    let Some(probability) = probabilities.get_mut(draft as usize)
-                                    else {
-                                        return Err(Box::new(api_error(
-                                            StatusCode::SERVICE_UNAVAILABLE,
-                                            "speculative_draft_failed",
-                                            format!(
-                                                "draft token {draft} is outside vocabulary size {vocab}"
-                                            ),
-                                            None,
-                                        )));
-                                    };
-                                    *probability = 1.0;
-                                    draft_probabilities.push(probabilities);
-                                }
-                                let draft_refs: Vec<&[f32]> =
-                                    draft_probabilities.iter().map(Vec::as_slice).collect();
-                                let target_refs: Vec<&[f32]> =
-                                    target_probabilities.iter().map(Vec::as_slice).collect();
-                                let rng = seeded_rejection_rng(
-                                    sampling.seed.unwrap_or(0),
-                                    history.len() as u64,
-                                );
-                                let result = speculative_rejection_sample(
-                                    &drafts,
-                                    &draft_refs,
-                                    &target_refs,
-                                    rng,
-                                );
-                                (result.emitted_tokens, result.accepted_draft_count, timings)
-                            }
-                        };
-                        prepared
-                            .session
-                            .rollback_to_position(base_position + 1 + accepted)
-                            .map_err(|err| {
-                                Box::new(api_error(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "speculative_rollback_failed",
-                                    err.to_string(),
-                                    None,
-                                ))
-                            })?;
-                        spec.rounds += 1;
-                        spec.drafted += drafts.len() as u64;
-                        spec.accepted_drafts += accepted as u64;
-                        spec.latch.note_verified(accepted as u32);
-                        forward_timings.add_assign(&round_timings);
-                        round_emitted
-                    };
-                    for &token in &emitted {
-                        generated.push(token);
-                        history.push(token);
-                        prepared.engine_progress.record_progress(generated.len());
-                        if prepared.tokenizer.special.eog.contains(&token) {
-                            finish_reason = "stop";
-                            break;
-                        }
-                        if !prepared.stop_sequences.is_empty() {
-                            let text =
-                                prepared.tokenizer.decode(&generated, true).map_err(|err| {
-                                    Box::new(api_error(
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        "token_decode_failed",
-                                        err.to_string(),
-                                        None,
-                                    ))
-                                })?;
-                            if contains_stop_sequence(&text, &prepared.stop_sequences) {
-                                finish_reason = "stop";
-                                break;
-                            }
-                        }
-                    }
-                    if finish_reason != "length" || generated.len() >= prepared.max_tokens as usize
-                    {
-                        break;
-                    }
-                    input.clear();
-                    input.push(*history.last().expect("history grows every round"));
-                    continue;
-                }
+        // Greedy requests accept the longest exact-match prefix, so the emitted stream stays
+        // the target's own argmax. Engages only after the first step and never alongside
+        // per-step logit consumers. `run_speculative_round` is shared with both streaming
+        // jobs so the lane cannot exist on one decode loop and not the others.
+        let spec_eligible = !collect_dense_for_step
+            && !collect_step_top_logits
+            && prepared.logprobs_top_n.is_none()
+            && grammar.is_none()
+            && !top_logits.is_empty();
+        let spec_round = run_speculative_round(
+            &mut prepared,
+            &sampler,
+            &input,
+            spec_eligible,
+            &mut generated,
+            &mut history,
+            &mut finish_reason,
+            &mut forward_timings,
+        )?;
+        if matches!(spec_round, SpeculativeRound::Committed) {
+            if finish_reason != "length" || generated.len() >= prepared.max_tokens as usize {
+                break;
             }
+            input.clear();
+            input.push(*history.last().expect("history grows every round"));
+            continue;
         }
         // LLGuidance computes the allowed-token set by walking its token trie.
         // Converting the compact bitset to the sampler's bool slice is linear,
@@ -19509,21 +19610,7 @@ fn generate_token_ids(
         input.push(step.next_token_id);
     }
 
-    if let Some(spec) = &prepared.speculative {
-        let acceptance_pct = if spec.drafted == 0 {
-            0.0
-        } else {
-            spec.accepted_drafts as f64 * 100.0 / spec.drafted as f64
-        };
-        tracing::info!(
-            rounds = spec.rounds,
-            drafted = spec.drafted,
-            accepted_drafts = spec.accepted_drafts,
-            acceptance_pct,
-            generated = generated.len(),
-            "speculative decode summary"
-        );
-    }
+    log_speculative_summary(&prepared, generated.len());
 
     prepared.timings.generate = generation_started.elapsed().as_millis();
     prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
@@ -20537,53 +20624,81 @@ fn run_stream_decode_job(
             });
             return;
         }
-        // Greedy single-token continuations with no per-step logit consumers
-        // ride the resident GPU-sampling fast lane inside the step.
-        let greedy_fast = input.len() == 1
-            && matches!(sampler, LlamaSampler::Greedy)
-            && !collect_dense_for_step
+        // Speculation first. A committed round appends its whole accepted run to
+        // `generated`; the delta below is a text diff of the entire decoded
+        // output, so the client simply receives one larger delta.
+        let spec_eligible = !collect_dense_for_step
+            && prepared.logprobs_top_n.is_none()
+            && prepared.constraint.is_none()
             && !top_logits.is_empty();
-        let step = match run_stream_step(
-            &mut prepared.session,
-            StreamStepRequest {
-                greedy_fast,
-                input: input.clone(),
-                sampler,
-                history: history.clone(),
-                collect_dense_diagnostics: collect_dense_for_step,
-            },
+        let spec_round = match run_speculative_round(
+            &mut prepared,
+            &sampler,
+            &input,
+            spec_eligible,
+            &mut generated,
+            &mut history,
+            &mut finish_reason,
+            &mut forward_timings,
         ) {
-            Ok(step) => step,
+            Ok(round) => round,
             Err(response) => {
                 let (code, message) = stream_error_parts(&response);
                 send(StreamDecodeEvent::Failed { code, message });
                 return;
             }
         };
-        if generated.is_empty() && !prepared.collect_dense_diagnostics && step.diagnostics.is_none()
-        {
-            store_prompt_prefix_cache(&mut prepared, &step);
-        }
-        if generated.is_empty() {
-            prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
-        }
-        forward_timings.add_assign(&step.timings);
-        sample += step.sample;
-        if let Err(response) = consume_generation_step(
-            &prepared,
-            step,
-            GenerationStepAccumulator {
-                generated: &mut generated,
-                history: &mut history,
-                top_logits: &mut top_logits,
-                output_projection: &mut output_projection,
-                dense: &mut dense,
-                finish_reason: &mut finish_reason,
-            },
-        ) {
-            let (code, message) = stream_error_parts(&response);
-            send(StreamDecodeEvent::Failed { code, message });
-            return;
+        if matches!(spec_round, SpeculativeRound::Declined) {
+            // Greedy single-token continuations with no per-step logit consumers
+            // ride the resident GPU-sampling fast lane inside the step.
+            let greedy_fast = input.len() == 1
+                && matches!(sampler, LlamaSampler::Greedy)
+                && !collect_dense_for_step
+                && !top_logits.is_empty();
+            let step = match run_stream_step(
+                &mut prepared.session,
+                StreamStepRequest {
+                    greedy_fast,
+                    input: input.clone(),
+                    sampler,
+                    history: history.clone(),
+                    collect_dense_diagnostics: collect_dense_for_step,
+                },
+            ) {
+                Ok(step) => step,
+                Err(response) => {
+                    let (code, message) = stream_error_parts(&response);
+                    send(StreamDecodeEvent::Failed { code, message });
+                    return;
+                }
+            };
+            if generated.is_empty()
+                && !prepared.collect_dense_diagnostics
+                && step.diagnostics.is_none()
+            {
+                store_prompt_prefix_cache(&mut prepared, &step);
+            }
+            if generated.is_empty() {
+                prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+            }
+            forward_timings.add_assign(&step.timings);
+            sample += step.sample;
+            if let Err(response) = consume_generation_step(
+                &prepared,
+                step,
+                GenerationStepAccumulator {
+                    generated: &mut generated,
+                    history: &mut history,
+                    top_logits: &mut top_logits,
+                    output_projection: &mut output_projection,
+                    dense: &mut dense,
+                    finish_reason: &mut finish_reason,
+                },
+            ) {
+                let (code, message) = stream_error_parts(&response);
+                send(StreamDecodeEvent::Failed { code, message });
+                return;
+            }
         }
 
         let mut text = match prepared.tokenizer.decode(&generated, true) {
@@ -20613,7 +20728,11 @@ fn run_stream_decode_job(
                 return;
             }
         }
-        if finish_reason != "length" {
+        // The loop counter is sized for one token per iteration, so a
+        // speculative round that commits several needs the explicit budget
+        // check the non-streaming loop already carries — otherwise the last
+        // iterations would keep decoding past max_tokens.
+        if finish_reason != "length" || generated.len() >= prepared.max_tokens as usize {
             break;
         }
         input.clear();
@@ -20656,6 +20775,7 @@ fn run_stream_decode_job(
             error: None,
         });
     }
+    log_speculative_summary(&prepared, generated.len());
     crate::gait::sentinel::mark_healthy();
     send(StreamDecodeEvent::Finished {
         finish_reason,
@@ -20666,8 +20786,13 @@ fn run_stream_decode_job(
 }
 
 /// Cooperative streaming state machine for continuous batching. Unlike
-/// `run_stream_decode_job`, one call to `step` performs at most one model token and then
+/// `run_stream_decode_job`, one call to `step` performs at most one model FORWARD and then
 /// yields ownership back to the engine scheduler.
+///
+/// A forward is either a plain single-token decode step or one speculative
+/// verify round, which commits its whole accepted run (1..=draft_tokens+1
+/// tokens) before yielding. Round-robin fairness is therefore per forward, not
+/// per token: a peer stream waits one chunked verify, not one token.
 struct CooperativeStreamDecodeJob {
     prepared: PreparedGeneration,
     events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
@@ -20788,6 +20913,7 @@ impl CooperativeStreamDecodeJob {
         if self.finished {
             return engine::StepOutcome::Complete;
         }
+        log_speculative_summary(&self.prepared, self.generated.len());
         self.prepared.timings.generate = self.generation_started.elapsed().as_millis();
         self.prepared.timings.generation =
             generation_phase_timings_from_forward(&self.forward_timings, self.sample);
@@ -20893,51 +21019,74 @@ impl CooperativeStreamDecodeJob {
         } else {
             LlamaSampler::Sampling(sampling)
         };
-        let greedy_fast = self.input.len() == 1
-            && matches!(sampler, LlamaSampler::Greedy)
-            && !collect_dense_for_step
+        // Speculation first. A committed round appends its whole accepted run to
+        // `generated`; the delta below is a text diff of the entire decoded
+        // output, so the client simply receives one larger delta.
+        let spec_eligible = !collect_dense_for_step
+            && self.prepared.logprobs_top_n.is_none()
+            && self.prepared.constraint.is_none()
             && !self.top_logits.is_empty();
-        let step = match run_stream_step(
-            &mut self.prepared.session,
-            StreamStepRequest {
-                greedy_fast,
-                input: self.input.clone(),
-                sampler,
-                history: self.history.clone(),
-                collect_dense_diagnostics: collect_dense_for_step,
-            },
+        let spec_round = match run_speculative_round(
+            &mut self.prepared,
+            &sampler,
+            &self.input,
+            spec_eligible,
+            &mut self.generated,
+            &mut self.history,
+            &mut self.finish_reason,
+            &mut self.forward_timings,
         ) {
-            Ok(step) => step,
+            Ok(round) => round,
             Err(response) => return self.fail(&response),
         };
-        if self.generated.is_empty()
-            && !self.prepared.collect_dense_diagnostics
-            && step.diagnostics.is_none()
-        {
-            store_prompt_prefix_cache(&mut self.prepared, &step);
+        if matches!(spec_round, SpeculativeRound::Declined) {
+            let greedy_fast = self.input.len() == 1
+                && matches!(sampler, LlamaSampler::Greedy)
+                && !collect_dense_for_step
+                && !self.top_logits.is_empty();
+            let step = match run_stream_step(
+                &mut self.prepared.session,
+                StreamStepRequest {
+                    greedy_fast,
+                    input: self.input.clone(),
+                    sampler,
+                    history: self.history.clone(),
+                    collect_dense_diagnostics: collect_dense_for_step,
+                },
+            ) {
+                Ok(step) => step,
+                Err(response) => return self.fail(&response),
+            };
+            if self.generated.is_empty()
+                && !self.prepared.collect_dense_diagnostics
+                && step.diagnostics.is_none()
+            {
+                store_prompt_prefix_cache(&mut self.prepared, &step);
+            }
+            if self.generated.is_empty() {
+                self.prepared.timings.prompt_evaluation =
+                    prompt_evaluation_timings_from_step(&step);
+            }
+            self.forward_timings.add_assign(&step.timings);
+            self.sample += step.sample;
+            if let Err(response) = consume_generation_step(
+                &self.prepared,
+                step,
+                GenerationStepAccumulator {
+                    generated: &mut self.generated,
+                    history: &mut self.history,
+                    top_logits: &mut self.top_logits,
+                    output_projection: &mut self.output_projection,
+                    dense: &mut self.dense,
+                    finish_reason: &mut self.finish_reason,
+                },
+            ) {
+                return self.fail(&response);
+            }
+            self.prepared
+                .engine_progress
+                .record_progress(self.generated.len());
         }
-        if self.generated.is_empty() {
-            self.prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
-        }
-        self.forward_timings.add_assign(&step.timings);
-        self.sample += step.sample;
-        if let Err(response) = consume_generation_step(
-            &self.prepared,
-            step,
-            GenerationStepAccumulator {
-                generated: &mut self.generated,
-                history: &mut self.history,
-                top_logits: &mut self.top_logits,
-                output_projection: &mut self.output_projection,
-                dense: &mut self.dense,
-                finish_reason: &mut self.finish_reason,
-            },
-        ) {
-            return self.fail(&response);
-        }
-        self.prepared
-            .engine_progress
-            .record_progress(self.generated.len());
 
         let mut text = match self.prepared.tokenizer.decode(&self.generated, true) {
             Ok(text) => text,
@@ -21006,11 +21155,23 @@ fn stream_completion(
     include_usage: bool,
     parse_stream_tool_calls: bool,
 ) -> Response {
-    // Speculation only runs in the non-streaming loop; streaming requests on
-    // a spec-enabled server keep the unchanged vanilla path (including the
-    // GPU-resident lanes the speculative pin would otherwise turn off).
-    prepared.speculative = None;
-    prepared.session.set_resident_paths_disabled(false);
+    // Streaming keeps whatever speculation `prepare_generation` admitted, and
+    // with it that call's resident-path decision. Forcing both off here meant a
+    // spec-enabled server never speculated for streaming clients — i.e. never
+    // for the agent traffic the lane exists to speed up. Both streaming jobs
+    // emit an accepted run through the same text-delta path a single token
+    // takes, so a committed round streams as one delta.
+    //
+    // `CAMELID_SPEC_STREAM=0` is the narrow rollback lever: it restores the
+    // previous streaming-only behaviour by dropping the drafter AND un-pinning
+    // the resident lanes. Both halves are required — the pin exists only to
+    // keep KV CPU-authoritative for a chunk verify that will now never run, so
+    // dropping the drafter alone would cost the GPU-resident lane and buy
+    // nothing.
+    if !spec_stream_enabled() {
+        prepared.speculative = None;
+        prepared.session.set_resident_paths_disabled(false);
+    }
     let model_id = prepared.model_id.clone();
     // Captured before the job so the streaming usage frame reports the exact
     // same prompt count as the non-streaming path (single source of truth).
@@ -29212,16 +29373,21 @@ mod tests {
             true,
             &tiny_config()
         ));
-        assert!(speculation_admissible(
-            &SamplingConfig {
-                temperature: 0.7,
-                ..SamplingConfig::default()
-            },
-            false,
-            false,
-            false,
-            &tiny_config()
-        ));
+        assert!(
+            !speculation_admissible(
+                &SamplingConfig {
+                    temperature: 0.7,
+                    ..SamplingConfig::default()
+                },
+                false,
+                false,
+                false,
+                &tiny_config()
+            ),
+            "a sampled request must decline speculation: its only verify lane is \
+             the CPU chunk verify plus a resident->CPU KV mirror-back, which \
+             costs more than the resident step it replaces"
+        );
     }
 
     /// Phase 3c triage: the gemma3 tool refusal is arch-keyed and lane-shared,

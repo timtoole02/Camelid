@@ -9701,13 +9701,71 @@ fn apply_spec_decode_env(
         // weights, but the Metal-resident plan deliberately keeps CPU-side weights file-backed
         // (the GPU owns the resident copy), so each verify round would pay a file-speed weight
         // pass — fall back to the validated CPU repack plan in that case only.
-        let spec_gpu = matches!(
-            std::env::var("CAMELID_SPEC_GPU").ok().as_deref(),
+        // A Metal host defaults to GPU verify. Leaving it unset used to select the
+        // CPU plan silently, so a spec-decode run on this host measured the repack
+        // path while reporting itself as speculative. An explicit CAMELID_SPEC_GPU
+        // still wins in both directions; the auto-arm only fills in the unset case,
+        // and only when there is actually a resident lane for the batched verify to
+        // run on (see `should_auto_arm_spec_gpu` for the full precondition list).
+        let spec_gpu_var = std::env::var("CAMELID_SPEC_GPU").ok();
+        // `var_os().is_none()` is this file's explicitly-set-vs-defaulted test
+        // (`apply_default_fast_stack`, `apply_serve_nocopy_default`): an explicit
+        // value, INCLUDING `0`, is the operator's call and is never overwritten.
+        let spec_gpu_set = std::env::var_os("CAMELID_SPEC_GPU").is_some();
+        let spec_gpu_truthy = matches!(
+            spec_gpu_var.as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
         );
+        // `apply_default_fast_stack` has already run (it is applied before the
+        // subcommand match), so this reads "1" unless the operator opted out or
+        // `apply_deterministic_mode` forced the whole Metal stack off.
+        let resident_decode_armed = std::env::var("CAMELID_METAL_RESIDENT_DECODE")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        let deterministic = std::env::var("CAMELID_DETERMINISTIC")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        // One probe, once, at startup; `log_acceleration_state` performs the same one
+        // moments later. False on every non-macOS build (the `detect_metal_device`
+        // stub), which is what keeps CPU-only and CUDA hosts on today's behavior.
+        let metal_device_available = detect_metal_device().available;
+        let spec_gpu = if should_auto_arm_spec_gpu(
+            spec_gpu_set,
+            resident_decode_armed,
+            deterministic,
+            metal_device_available,
+        ) {
+            std::env::set_var("CAMELID_SPEC_GPU", "1");
+            // Printed, not only traced: `RUST_LOG` is unset on a stock install, and this
+            // line decides which execution plan every request on this server takes.
+            eprintln!(
+                "[spec] Metal host: defaulting CAMELID_SPEC_GPU=1, so drafts are verified by \
+                 the batched GPU verify and the resident decode/prefill lanes stay on. Set \
+                 CAMELID_SPEC_GPU=0 to force the CPU verify plan instead."
+            );
+            tracing::info!(
+                "speculative decoding on a Metal host: defaulting CAMELID_SPEC_GPU=1 \
+                 (set CAMELID_SPEC_GPU=0 to force the CPU verify plan)"
+            );
+            true
+        } else {
+            spec_gpu_truthy
+        };
         if !spec_gpu {
             std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
             std::env::set_var("CAMELID_METAL_RESIDENT_PREFILL", "0");
+            // Printed, not only traced: this demotion is server-wide and expensive
+            // enough that no benchmark should be able to take it without seeing it.
+            // Only when there WAS a lane to lose.
+            if resident_decode_armed && metal_device_available {
+                eprintln!(
+                    "[spec] speculative decoding is running the CPU verify plan \
+                     (CAMELID_SPEC_GPU is set to a non-enabling value), so the Metal \
+                     resident decode and prefill lanes are now OFF for every request on \
+                     this server, not just speculative ones. Unset CAMELID_SPEC_GPU (or \
+                     set it to 1) to keep the resident lane."
+                );
+            }
             tracing::info!(
                 "speculative decoding enabled; selecting the CPU execution plan \
                  (Metal resident paths disabled server-wide)"
@@ -9725,6 +9783,43 @@ fn apply_spec_decode_env(
     if let Some(tokens) = spec_draft_tokens.filter(|tokens| *tokens > 0) {
         std::env::set_var("CAMELID_SPEC_DRAFT_TOKENS", tokens.to_string());
     }
+}
+
+/// Pure decision for the `CAMELID_SPEC_GPU` auto-arm in [`apply_spec_decode_env`].
+///
+/// Speculative decoding without GPU verify switches `CAMELID_METAL_RESIDENT_DECODE` and
+/// `CAMELID_METAL_RESIDENT_PREFILL` off SERVER-WIDE — for every request on the process, not
+/// just the speculative ones — because the CPU chunk verify needs materialized CPU-side
+/// blocks that the Metal-resident plan deliberately does not keep. Selecting that plan merely
+/// because a variable was UNSET meant `--spec-decode ngram` silently benchmarked the CPU plan
+/// on the exact host whose fast lane is being measured. A Metal host arms GPU verify instead,
+/// but only when every precondition holds:
+///
+/// * `spec_gpu_set` — an explicit `CAMELID_SPEC_GPU`, INCLUDING `0`, is the operator's call
+///   and is never overwritten in either direction. Same `var_os().is_none()` test
+///   `apply_default_fast_stack` and `apply_serve_nocopy_default` use.
+/// * `resident_decode_armed` — with `CAMELID_METAL_RESIDENT_DECODE=0` there is no resident
+///   engine for `verify_batch` to run on: `verify_drafts_metal` checks that same flag and
+///   returns `Ok(None)` every round, so arming the flag would advertise a lane that cannot
+///   engage. Keep today's CPU plan there.
+/// * `deterministic` — the deterministic lane fails every GPU gate closed by contract
+///   (DECISIONS.md §D9). It must never be handed a GPU verify arm, even a dormant one.
+/// * `metal_device_available` — no device, no resident lane. False on every non-macOS build
+///   (the `detect_metal_device` stub), which is what keeps CPU-only and CUDA hosts exactly as
+///   they are: their resident lane is gated per-request by `set_resident_paths_disabled`,
+///   not by these Metal variables.
+///
+/// Losslessness is not a factor in this decision. Both verify arms emit the target's own
+/// greedy argmax: `verify_batch` is bit-identical to `k` single-token decodes, and
+/// `verify_drafts_gpu` returns `Ok(None)` into the lossless CPU chunk verify whenever the
+/// engine is not materialized exactly at the current KV position.
+fn should_auto_arm_spec_gpu(
+    spec_gpu_set: bool,
+    resident_decode_armed: bool,
+    deterministic: bool,
+    metal_device_available: bool,
+) -> bool {
+    !spec_gpu_set && resident_decode_armed && !deterministic && metal_device_available
 }
 
 fn log_acceleration_state() {
@@ -11181,12 +11276,37 @@ mod tensor_dump_tests {
         assert!(should_default_serve_nocopy(false, true, true, true));
         // User set it either way (incl. an explicit =0): never override.
         assert!(!should_default_serve_nocopy(true, true, true, true));
-        // Speculative decoding turns resident decode off -> stay off (its CPU
-        // repack plan needs materialized blocks, not wire pages).
+        // Speculative decoding on the CPU verify plan (an explicit non-enabling
+        // CAMELID_SPEC_GPU) turns resident decode off -> stay off, since that plan
+        // needs materialized blocks, not wire pages. With GPU verify armed (the
+        // Metal default) resident stays on and this arm does fire.
         assert!(!should_default_serve_nocopy(false, false, true, true));
         // Any wire-stack component off -> the wire kernels can't consume pages.
         assert!(!should_default_serve_nocopy(false, true, false, true));
         assert!(!should_default_serve_nocopy(false, true, true, false));
+    }
+
+    /// Phase 0 FIX A. Asking for `--spec-decode ngram` on a Mac used to switch
+    /// `CAMELID_METAL_RESIDENT_DECODE`/`_PREFILL` off SERVER-WIDE just because
+    /// `CAMELID_SPEC_GPU` was unset, and said so only through a `tracing::info!` that a
+    /// stock install (no `RUST_LOG`) never prints — so every speculative measurement
+    /// silently timed the CPU repack plan. The auto-arm closes that, without ever
+    /// overriding an operator who has spoken.
+    #[test]
+    fn spec_gpu_auto_arms_on_metal_but_never_overrides_an_explicit_opt_out() {
+        // The regression: unset flag, stock fast stack, real Metal device.
+        assert!(should_auto_arm_spec_gpu(false, true, false, true));
+        // An explicit CAMELID_SPEC_GPU is the operator's call in BOTH directions --
+        // including `0`, which must keep selecting the CPU repack plan.
+        assert!(!should_auto_arm_spec_gpu(true, true, false, true));
+        // No resident decode lane to preserve: `verify_drafts_metal` would decline every
+        // round, so don't advertise GPU verify.
+        assert!(!should_auto_arm_spec_gpu(false, false, false, true));
+        // Deterministic mode fails every GPU gate closed by contract (DECISIONS.md D9).
+        assert!(!should_auto_arm_spec_gpu(false, true, true, true));
+        // No Metal device -> no resident lane. False on every non-macOS build, which is
+        // what keeps CPU-only and CUDA hosts byte-identical to today.
+        assert!(!should_auto_arm_spec_gpu(false, true, false, false));
     }
 
     #[test]
