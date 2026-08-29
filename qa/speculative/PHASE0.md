@@ -91,7 +91,7 @@ is a 16 GB machine.
 | --- | --- |
 | M1 | Plain 8B decode tok/s at 512 / 2k / 4k depth, plus a k=8 verify round cost. **Binds every absolute number the campaign quotes.** |
 | M2 | Suffix/n-gram tree drafting on real agent transcripts at ≥4k depth, with prose as the control. |
-| M3 | Acceptance for a pretrained EAGLE-3 head, measured on this machine. |
+| M3 | Acceptance for a pretrained EAGLE-3 head, measured on this machine. **Measured on CPU and resident.** |
 | M4 | Synthetic-acceptance round-cost grid: fixed-α replay drafter driving the real verify. |
 
 Two rules learned the hard way, both from the campaign's own red team:
@@ -287,10 +287,9 @@ it varied.
 
 - The v2 K-quant lane is ~1 ulp off v1, so it stays env-gated with no support
   claim. Promotion needs model-level parity receipts.
-- The v1 default K-quant speculative lane is NOT lossless (see above); the
-  likely fix is `set_fast_math_enabled(false)` on `LINEAR_ROW_SHADER`, unmeasured.
-- Trained MTP heads (EAGLE-3 sidecar) remain unbuilt. They are now a real lever
-  rather than a wrong one: the drafter caps A, and A caps the multiplier.
+- The matching Llama-3.2-3B EAGLE3 benchmark is implemented. Best resident
+  tuning (`gamma=3`) is **31.254 -> 42.541 tok/s (1.361x)** and lossless. It is
+  benchmark-only, not serving/native MTP; the final committed receipt is pending.
 
 ## The v1 K-quant losslessness bug: found, root-caused, fixed
 
@@ -385,3 +384,10 @@ worth recording for whoever picks it up: the CPU reference lane needs
 `CAMELID_LAZY_Q8_0_LINEAR=1` to match the fixture's own `no_repack` backend
 (otherwise it refuses at the 6.44 GB materialization cap), and the health
 endpoint is `/v1/health` with `generation_ready`, not `/api/health`.
+
+## Session 3 findings — Llama-3.2 3B EAGLE3 measured
+
+The matching benchmark is documented in
+[`EAGLE3_LLAMA32_3B.md`](EAGLE3_LLAMA32_3B.md). Its raw prompt is 46 tokens,
+generation is 96 tokens, and the final matrix ran 26 resident rounds and 0 CPU
+rounds.

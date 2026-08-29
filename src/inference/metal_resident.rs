@@ -215,6 +215,19 @@ impl super::LlamaInferenceSession {
     }
 
     pub(super) fn try_metal_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
+        Ok(self
+            .try_metal_resident_prefill_inner(token_ids, &[])?
+            .is_some())
+    }
+
+    /// Shared resident prefill builder. A successful result owns a live resident session at
+    /// `token_ids.len()` and carries requested pre-layer activation snapshots; `None` keeps the
+    /// ordinary lossless fallback contract.
+    fn try_metal_resident_prefill_inner(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
         // Two independent arming gates for two different batched prefills:
         //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
         //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
@@ -235,7 +248,7 @@ impl super::LlamaInferenceSession {
             || self.weights.layer_range.is_some()
             || !self.resident_decode_eligible(false)?
         {
-            return Ok(false);
+            return Ok(None);
         }
         let weights = Arc::clone(&self.weights);
         let dims = DenseLlamaDims::from_config(&self.config)?;
@@ -246,7 +259,7 @@ impl super::LlamaInferenceSession {
         let kv_cap = self.config.context_length as usize;
         let n = token_ids.len();
         if n >= kv_cap {
-            return Ok(false);
+            return Ok(None);
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
@@ -262,7 +275,7 @@ impl super::LlamaInferenceSession {
             weights.rope_freqs.as_ref(),
         )? {
             Some(t) => t,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         let (cos_all, sin_all, split_half_pairing) =
             (tables.cos, tables.sin, tables.split_half_pairing);
@@ -329,7 +342,7 @@ impl super::LlamaInferenceSession {
             schedule,
         ) {
             Some(s) => s,
-            None => return Ok(false),
+            None => return Ok(None),
         };
 
         let session_us = session_started.elapsed().as_micros();
@@ -370,7 +383,10 @@ impl super::LlamaInferenceSession {
 
         let embed_us = embed_started.elapsed().as_micros();
         let gpu_started = Instant::now();
-        let prefilled = if gemma3_batched {
+        let layer_inputs = if gemma3_batched {
+            if !capture_layer_ids.is_empty() {
+                return Ok(None);
+            }
             // Tier A: batched weight streaming, bit-identical to `n` token-by-token
             // resident forwards (gate G1). Attention stays per row — the windowed
             // attention-as-matmul kernel is Tier B.
@@ -387,21 +403,27 @@ impl super::LlamaInferenceSession {
                     scale,
                     metal::gemma3_batch_prefill_rows(),
                 )
-                .is_some()
+                .map(|_| Vec::new())
         } else {
-            session
-                .prefill_tokens(&embeddings.data, n, &layer_views, &cos_all, &sin_all, scale)
-                .is_some()
+            session.prefill_tokens_with_layer_inputs(
+                &embeddings.data,
+                n,
+                &layer_views,
+                &cos_all,
+                &sin_all,
+                scale,
+                capture_layer_ids,
+            )
         };
-        if !prefilled {
-            return Ok(false);
-        }
+        let Some(layer_inputs) = layer_inputs else {
+            return Ok(None);
+        };
         // G11, asserted rather than assumed: the resident decode's rebuild predicate is
         // `filled() != position`, and a short `filled` re-seeds from a CPU KV cache this
         // lane leaves hollow — which then declines at `history_materialized` and silently
         // drops the whole prompt onto a CPU path that fails closed for windowed archs.
         if session.filled() != n {
-            return Ok(false);
+            return Ok(None);
         }
         if time_edges {
             eprintln!(
@@ -416,7 +438,155 @@ impl super::LlamaInferenceSession {
         // GPU cache now holds positions 0..n; the resident decode continues this sequence.
         self.kv_cache.position = n;
         self.resident_decode = Some(session);
-        Ok(true)
+        Ok(Some(layer_inputs))
+    }
+
+    /// Resident prompt prefill that also returns the three (or any caller-selected) target
+    /// decoder layer inputs needed by a learned speculative head. The prompt prefix is streamed
+    /// once through the resident prefill; its final token is then executed by the byte-identical
+    /// one-row resident verifier to obtain both the missing activation row and the first greedy
+    /// prediction. On success the target's resident KV is live at the full prompt length.
+    #[cfg(target_os = "macos")]
+    pub fn forward_greedy_resident_prefill_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        // The batched capture prefill requires at least two rows, and the final prompt
+        // token is deliberately reserved for the one-row verifier bootstrap.
+        if token_ids.len() < 3 || !resident_decode_metal_enabled() {
+            return Ok(None);
+        }
+        // Check the logits-stage admission before mutating the session into GPU-authoritative
+        // prompt state. A decline after prefill would leave no lossless CPU fallback on this
+        // same session because the resident prompt KV intentionally has no host twin.
+        if !self.resident_decode_eligible(true)? {
+            return Ok(None);
+        }
+
+        let prefix_len = token_ids.len() - 1;
+        let Some(mut prefix_inputs) =
+            self.try_metal_resident_prefill_inner(&token_ids[..prefix_len], capture_layer_ids)?
+        else {
+            return Ok(None);
+        };
+
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let last_token = token_ids[prefix_len];
+        let mut embedding = weights
+            .token_embedding
+            .embedding_lookup(&[last_token], "token_embedding_resident_capture_last")?;
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for value in &mut embedding.data {
+                *value *= g.embed_scale;
+            }
+        }
+        let tables = match rope::resident_decode_rope_tables(
+            prefix_len,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(tables) => tables,
+            None => return Ok(None),
+        };
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|layer| metal::ResidentLayerWeights {
+                attn_norm: &layer.attention_norm.data,
+                ffn_norm: &layer.ffn_norm.data,
+                q_norm: layer.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: layer.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: layer
+                    .post_attention_norm
+                    .as_ref()
+                    .map(|t| t.data.as_slice()),
+                post_ffw_norm: layer.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
+                q_weight_blocks: resident_weight_bytes(&layer.attention_q),
+                k_weight_blocks: resident_weight_bytes(&layer.attention_k),
+                v_weight_blocks: resident_weight_bytes(&layer.attention_v),
+                o_weight_blocks: resident_weight_bytes(&layer.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&layer.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&layer.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&layer.ffn_down),
+            })
+            .collect();
+        let logits_stage = metal::LogitsStage {
+            final_norm: &weights.output_norm.data,
+            output_weight_blocks: resident_weight_bytes(weights.output_projection()),
+            vocab_size: dims.vocab_size,
+        };
+        let session = self
+            .resident_decode
+            .as_mut()
+            .expect("resident prompt session installed by successful prefill");
+        let Some((predictions, last_inputs)) = session.verify_batch_with_layer_inputs(
+            &embedding.data,
+            &tables.cos,
+            &tables.sin,
+            &layer_views,
+            &logits_stage,
+            prefix_len,
+            1,
+            scale,
+            capture_layer_ids,
+        ) else {
+            return Ok(None);
+        };
+        if prefix_inputs.len() != last_inputs.len() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "resident prompt capture count changed between prefix ({}) and final row ({})",
+                prefix_inputs.len(),
+                last_inputs.len()
+            )));
+        }
+        let mut layer_inputs = Vec::with_capacity(prefix_inputs.len());
+        for (slot, (mut prefix, last)) in prefix_inputs
+            .drain(..)
+            .zip(last_inputs.into_iter())
+            .enumerate()
+        {
+            let expected_prefix = prefix_len * dims.embedding_length;
+            if prefix.len() != expected_prefix || last.len() != dims.embedding_length {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "resident prompt layer-input capture {} has prefix/final sizes {}/{}, expected {}/{}",
+                    capture_layer_ids[slot],
+                    prefix.len(),
+                    last.len(),
+                    expected_prefix,
+                    dims.embedding_length
+                )));
+            }
+            prefix.extend_from_slice(&last);
+            layer_inputs.push(CpuTensor::from_f32(
+                format!("resident_prompt_layer_{}_input", capture_layer_ids[slot]),
+                vec![token_ids.len(), dims.embedding_length],
+                prefix,
+            )?);
+        }
+        session.set_filled(token_ids.len());
+        self.kv_cache.position = token_ids.len();
+        Ok(Some(LlamaGreedyVerifyCapture {
+            predictions,
+            layer_inputs,
+            timings: LlamaForwardTimings::default(),
+        }))
+    }
+
+    /// Non-macOS build: resident Metal prompt capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    pub fn forward_greedy_resident_prefill_with_layer_inputs(
+        &mut self,
+        _token_ids: &[u32],
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(None)
     }
 
     /// Make the CPU KV cache hold this sequence's real history before a CPU forward reads it.
@@ -1068,6 +1238,29 @@ impl super::LlamaInferenceSession {
         last_token: u32,
         drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
+        let Some(verified) = self.verify_drafts_metal_with_layer_inputs(last_token, drafts, &[])?
+        else {
+            return Ok(None);
+        };
+        let accepted = crate::inference::speculative::accepted_draft_prefix(
+            drafts,
+            &verified.predictions[..drafts.len()],
+        );
+        Ok(Some(verified.predictions[..=accepted].to_vec()))
+    }
+
+    /// EAGLE-3 target seam: the ordinary resident batch verify plus snapshots of selected
+    /// decoder-layer inputs. The target remains authoritative and this method applies the same
+    /// longest-prefix acceptance and resident-KV commit as [`Self::verify_drafts_metal`].
+    /// `predictions` retains all verify rows so callers can receipt acceptance independently;
+    /// only the accepted prefix plus bonus row advances the logical cache position.
+    #[cfg(target_os = "macos")]
+    pub fn verify_drafts_metal_with_layer_inputs(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         if drafts.is_empty() || self.resident_paths_disabled || !resident_decode_metal_enabled() {
             return Ok(None);
         }
@@ -1167,7 +1360,7 @@ impl super::LlamaInferenceSession {
             .resident_decode
             .as_mut()
             .expect("resident session present (readiness checked above)");
-        let predicted = match session.verify_batch(
+        let (predicted, raw_layer_inputs) = match session.verify_batch_with_layer_inputs(
             &embeddings.data,
             &cos_all,
             &sin_all,
@@ -1176,6 +1369,7 @@ impl super::LlamaInferenceSession {
             position,
             k,
             scale,
+            capture_layer_ids,
         ) {
             Some(p) => p,
             None => return Ok(None),
@@ -1197,7 +1391,22 @@ impl super::LlamaInferenceSession {
                 emitted.len()
             );
         }
-        Ok(Some(emitted))
+        let layer_inputs = raw_layer_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(slot, values)| {
+                CpuTensor::from_f32(
+                    format!("resident_verify_layer_{}_input", capture_layer_ids[slot]),
+                    vec![k, dims.embedding_length],
+                    values,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(LlamaGreedyVerifyCapture {
+            predictions: predicted,
+            layer_inputs,
+            timings: LlamaForwardTimings::default(),
+        }))
     }
 
     /// macOS speculative-verify seam (TREE variant): verify a draft TOKEN TREE against the
@@ -1372,6 +1581,18 @@ impl super::LlamaInferenceSession {
         _last_token: u32,
         _drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: Metal layer-input capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_drafts_metal_with_layer_inputs(
+        &mut self,
+        _last_token: u32,
+        _drafts: &[u32],
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(None)
     }
 

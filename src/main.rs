@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::Write,
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
@@ -2838,6 +2839,34 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Benchmark-only Llama 3.2 3B EAGLE-3 speculative decode. The learned head
+    /// and target verifier run on resident Metal, with target output authoritative.
+    /// This is learned EAGLE-3 speculation, not a native target MTP head.
+    BenchEagle3 {
+        /// Exact Llama-3.2-3B-Instruct target GGUF.
+        model: PathBuf,
+        /// Directory containing the pinned EAGLE-3 config.json and model.safetensors.
+        #[arg(long)]
+        eagle3: PathBuf,
+        /// Top-1 draft-chain length per verify round.
+        #[arg(long, default_value_t = 4)]
+        draft_tokens: usize,
+        /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Inline prompt text (used when --prompt-file is absent).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Workload label recorded in the JSON receipt.
+        #[arg(long, default_value = "unlabeled")]
+        workload: String,
+        /// Maximum generated tokens, including the first target anchor.
+        #[arg(long, default_value_t = 96)]
+        max_tokens: usize,
+        /// Override Rayon worker threads for the target verifier.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// EXPERIMENTAL ghost (layer-streaming) mode: execute a model one transformer block at
     /// a time, streaming each block's weights from a layer-contiguous `.cghost` file
     /// (see the `repack-ghost` tool) and holding only a one-layer working window plus the
@@ -5361,6 +5390,27 @@ async fn main() -> anyhow::Result<()> {
                 workload,
                 max_tokens,
                 warmup,
+                threads,
+            )?;
+        }
+        Command::BenchEagle3 {
+            model,
+            eagle3,
+            draft_tokens,
+            prompt_file,
+            prompt,
+            workload,
+            max_tokens,
+            threads,
+        } => {
+            run_bench_eagle3(
+                model,
+                eagle3,
+                draft_tokens,
+                prompt_file,
+                prompt,
+                workload,
+                max_tokens,
                 threads,
             )?;
         }
@@ -8578,6 +8628,506 @@ fn run_bench_speculative(
         record.cpu_verify_rounds,
         record.drafted,
         record.rounds,
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct Eagle3BenchRun {
+    generated: Vec<u32>,
+    drafted_token_ids: Vec<u32>,
+    ttft_ms: f64,
+    decode_ms: f64,
+    head_upload_ms: f64,
+    head_seed_ms: f64,
+    bootstrap_capture_ms: f64,
+    draft_us: u128,
+    verify_us: u128,
+    head_update_us: u128,
+    rounds: u64,
+    drafted: u64,
+    accepted_drafts: u64,
+    resident_verify_rounds: u64,
+    cpu_verify_rounds: u64,
+    resident_normal_steps: u64,
+}
+
+fn run_plain_resident_greedy(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+) -> anyhow::Result<Eagle3BenchRun> {
+    let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
+    // Populate the shared resident weight cache outside the measured decode span. This is a
+    // model-load cost, not a per-token cost, and the EAGLE run below reuses the same cache.
+    let _ = session.prewarm_resident_weights();
+    let ttft_started = Instant::now();
+    let first = session
+        .generate_next_token_with_history_diagnostics(
+            prompt_tokens,
+            LlamaSampler::Greedy,
+            prompt_tokens,
+            false,
+            None,
+        )?
+        .next_token_id;
+    let ttft_ms = ttft_started.elapsed().as_secs_f64() * 1000.0;
+    let mut generated = vec![first];
+    let mut resident_normal_steps = 0;
+    let decode_started = Instant::now();
+    while generated.len() < max_tokens && !tokenizer.special.eog.contains(generated.last().unwrap())
+    {
+        let anchor = *generated.last().expect("generated is seeded");
+        let next = match session.generate_next_token_greedy_resident(anchor)? {
+            Some((token, _)) => {
+                resident_normal_steps += 1;
+                token
+            }
+            None => anyhow::bail!(
+                "the Llama-3.2 3B target did not enter the resident Metal decode lane"
+            ),
+        };
+        generated.push(next);
+    }
+    Ok(Eagle3BenchRun {
+        generated,
+        ttft_ms,
+        decode_ms: decode_started.elapsed().as_secs_f64() * 1000.0,
+        resident_normal_steps,
+        ..Eagle3BenchRun::default()
+    })
+}
+
+fn run_eagle3_resident_greedy(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    draft_tokens: usize,
+    checkpoint: camelid::eagle3::Eagle3DraftModel,
+) -> anyhow::Result<Eagle3BenchRun> {
+    use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
+    use camelid::eagle3_runtime::Eagle3Drafter;
+
+    let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
+    let _ = session.prewarm_resident_weights();
+    // EAGLE alternates target and head command buffers on Metal's shared serial queue.
+    // Do not leave a pre-committed target graph waiting ahead of a head update.
+    session.set_resident_encode_ahead_enabled(false);
+    let ttft_started = Instant::now();
+    let prompt = session
+        .forward_greedy_resident_prefill_with_layer_inputs(
+            prompt_tokens,
+            &TARGET_LAYER_INPUT_IDS,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "resident Metal prompt prefill with EAGLE-3 activation capture is unavailable"
+            )
+        })?;
+    let first = *prompt
+        .predictions
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 target prompt produced no prediction"))?;
+    let ttft_ms = ttft_started.elapsed().as_secs_f64() * 1000.0;
+
+    let head_capacity = prompt_tokens
+        .len()
+        .checked_add(max_tokens)
+        .and_then(|n| n.checked_add(draft_tokens + 1))
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
+    let head_upload_started = Instant::now();
+    let mut drafter = Eagle3Drafter::new(checkpoint, head_capacity)?;
+    let head_upload_ms = head_upload_started.elapsed().as_secs_f64() * 1000.0;
+    let mut run = Eagle3BenchRun {
+        generated: vec![first],
+        ttft_ms,
+        bootstrap_capture_ms: ttft_ms,
+        head_upload_ms,
+        ..Eagle3BenchRun::default()
+    };
+    let seed_started = Instant::now();
+    drafter.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
+    run.head_seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+
+    let decode_started = Instant::now();
+    while run.generated.len() < max_tokens
+        && !tokenizer
+            .special
+            .eog
+            .contains(run.generated.last().expect("generated is seeded"))
+    {
+        let remaining = max_tokens - run.generated.len();
+        let context_room = session.remaining_context();
+        if context_room == 0 {
+            break;
+        }
+        let budget = draft_tokens
+            .min(remaining.saturating_sub(1))
+            .min(context_room.saturating_sub(1));
+
+        // A final single token has no successor to draft. Keep it on the resident target;
+        // no head update is needed once the requested output length is reached.
+        if budget == 0 {
+            let anchor = *run.generated.last().expect("generated is seeded");
+            let next = session
+                .generate_next_token_greedy_resident(anchor)?
+                .ok_or_else(|| anyhow::anyhow!("resident Metal target became unavailable"))?
+                .0;
+            run.resident_normal_steps += 1;
+            run.generated.push(next);
+            continue;
+        }
+
+        let draft_started = Instant::now();
+        let drafts = drafter.draft(weights, budget)?;
+        run.drafted_token_ids.extend_from_slice(&drafts);
+        run.draft_us += draft_started.elapsed().as_micros();
+        let anchor = *run.generated.last().expect("generated is seeded");
+        let verify_started = Instant::now();
+        let verified = session
+            .verify_drafts_metal_with_layer_inputs(anchor, &drafts, &TARGET_LAYER_INPUT_IDS)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "resident Metal EAGLE-3 verification became unavailable at position {}",
+                    session.kv_position()
+                )
+            })?;
+        run.verify_us += verify_started.elapsed().as_micros();
+
+        let accepted = accepted_draft_prefix(&drafts, &verified.predictions);
+        let emitted = verified.predictions[..=accepted].to_vec();
+        run.resident_verify_rounds += 1;
+        let update_started = Instant::now();
+        drafter.accept_authoritative(weights, &verified.layer_inputs, &emitted)?;
+        run.head_update_us += update_started.elapsed().as_micros();
+        anyhow::ensure!(
+            drafter.filled() == session.kv_position(),
+            "EAGLE-3/target cache watermarks diverged: head={} target={}",
+            drafter.filled(),
+            session.kv_position()
+        );
+
+        run.rounds += 1;
+        run.drafted += drafts.len() as u64;
+        run.accepted_drafts += accepted as u64;
+        for token in emitted {
+            if run.generated.len() >= max_tokens {
+                break;
+            }
+            run.generated.push(token);
+            if tokenizer.special.eog.contains(&token) {
+                break;
+            }
+        }
+    }
+    run.decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(run)
+}
+
+#[derive(Serialize)]
+struct BenchEagle3Record {
+    runtime: &'static str,
+    commit: String,
+    camelid_version: String,
+    binary_sha256: String,
+    workload: String,
+    prompt_sha256: String,
+    prompt_format: &'static str,
+    add_bos: bool,
+    add_eos: bool,
+    model: String,
+    model_sha256: String,
+    tokenizer_metadata_sha256: Option<String>,
+    eagle3: String,
+    eagle3_sha256: String,
+    eagle3_revision: &'static str,
+    quantization: String,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    draft_tokens: usize,
+    plain_generated_tokens: usize,
+    eagle3_generated_tokens: usize,
+    head_load_ms: f64,
+    head_upload_ms: f64,
+    head_seed_ms: f64,
+    bootstrap_capture_ms: f64,
+    plain_ttft_ms: f64,
+    plain_decode_ms: f64,
+    plain_tokens_per_second: f64,
+    eagle3_ttft_ms: f64,
+    eagle3_decode_ms: f64,
+    eagle3_tokens_per_second: f64,
+    plain_request_tokens_per_second: f64,
+    eagle3_warm_head_request_tokens_per_second: f64,
+    eagle3_head_cold_tokens_per_second: f64,
+    rounds: u64,
+    drafted: u64,
+    accepted_drafts: u64,
+    accept_rate: f64,
+    mean_emitted_tokens_per_round: f64,
+    draft_ms: f64,
+    verify_ms: f64,
+    head_update_ms: f64,
+    resident_verify_rounds: u64,
+    cpu_verify_rounds: u64,
+    resident_normal_steps: u64,
+    speedup: f64,
+    first_divergent_generated_token_index: i64,
+    lossless: bool,
+    plain_token_ids: Vec<u32>,
+    eagle3_token_ids: Vec<u32>,
+    eagle3_drafted_token_ids: Vec<u32>,
+    metal_device: Option<String>,
+    host_isa: String,
+    effective_env: BTreeMap<String, Option<String>>,
+    planner_env_updates: BTreeMap<String, Option<String>>,
+    execution_plan: camelid::execution_plan::ExecutionPlan,
+    peak_memory_bytes: u64,
+}
+
+fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
+    const KEYS: &[&str] = &[
+        "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
+        "CAMELID_METAL_LINEAR",
+        "CAMELID_METAL_Q8",
+        "CAMELID_METAL_RESIDENT_DECODE",
+        "CAMELID_METAL_RESIDENT_PREFILL",
+        "CAMELID_METAL_WIRE",
+        "CAMELID_METAL_WIRE_NSG8",
+        "CAMELID_METAL_F32Y",
+        "CAMELID_METAL_NOCOPY",
+        "CAMELID_METAL_KQUANT",
+        "CAMELID_KQUANT_V2",
+        "CAMELID_KQUANT_MMA",
+        "CAMELID_SPEC_TREE",
+    ];
+    KEYS.iter()
+        .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_eagle3(
+    model: PathBuf,
+    eagle3_dir: PathBuf,
+    draft_tokens: usize,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    workload: String,
+    max_tokens: usize,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    const PINNED_TARGET_SHA256: &str =
+        "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
+    const PINNED_EAGLE3_SHA256: &str =
+        "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
+    const PINNED_EAGLE3_REVISION: &str = "02d343789b502a3edfe351bdd4537a44affb98cd";
+    anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
+    anyhow::ensure!(
+        (1..=15).contains(&draft_tokens),
+        "--draft-tokens must be in 1..=15"
+    );
+    configure_rayon_threads(threads)?;
+    let prompt_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+
+    let model_sha256 = camelid::receipt::sha256_file_hex_cached(&model)
+        .map_err(|error| anyhow::anyhow!("hashing target {}: {error}", model.display()))?;
+    anyhow::ensure!(
+        model_sha256 == PINNED_TARGET_SHA256,
+        "the learned head is pinned to target SHA-256 {PINNED_TARGET_SHA256}, got {model_sha256}"
+    );
+    let eagle3_weights = eagle3_dir.join("model.safetensors");
+    let eagle3_sha256 = camelid::receipt::sha256_file_hex(&eagle3_weights).map_err(|error| {
+        anyhow::anyhow!("hashing EAGLE-3 checkpoint {}: {error}", eagle3_weights.display())
+    })?;
+    anyhow::ensure!(
+        eagle3_sha256 == PINNED_EAGLE3_SHA256,
+        "expected pinned EAGLE-3 SHA-256 {PINNED_EAGLE3_SHA256}, got {eagle3_sha256}"
+    );
+    let current_exe = std::env::current_exe()?;
+    let binary_sha256 = camelid::receipt::sha256_file_hex(&current_exe)
+        .map_err(|error| anyhow::anyhow!("hashing benchmark binary: {error}"))?;
+
+    let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let planner_env_updates = plan_outcome
+        .env_updates
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+        .collect();
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    anyhow::ensure!(
+        config.architecture == "llama"
+            && config.embedding_length == 3_072
+            && config.block_count == 28
+            && config.feed_forward_length == 8_192
+            && config.attention_head_count == 24
+            && config.attention_head_count_kv == 8
+            && config.vocab_size == Some(128_256),
+        "the pinned EAGLE-3 head requires the exact Llama-3.2-3B target geometry; got arch={} hidden={} layers={} ffn={} heads={}/{} vocab={:?}",
+        config.architecture,
+        config.embedding_length,
+        config.block_count,
+        config.feed_forward_length,
+        config.attention_head_count,
+        config.attention_head_count_kv,
+        config.vocab_size,
+    );
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    anyhow::ensure!(
+        prompt_token_ids.len() >= 3,
+        "resident EAGLE-3 capture requires at least three encoded prompt tokens, got {}",
+        prompt_token_ids.len()
+    );
+    anyhow::ensure!(
+        prompt_token_ids.len() + max_tokens <= config.context_length as usize,
+        "prompt plus generation exceeds target context"
+    );
+
+    eprintln!("[bench-eagle3] plain resident Metal target lane...");
+    let plain =
+        run_plain_resident_greedy(&config, &weights, &tokenizer, &prompt_token_ids, max_tokens)?;
+    eprintln!("[bench-eagle3] loading strict EAGLE-3 checkpoint...");
+    let head_load_started = Instant::now();
+    let checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3_dir)?;
+    let head_load_ms = head_load_started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[bench-eagle3] learned recurrent draft + resident target verify...");
+    let eagle = run_eagle3_resident_greedy(
+        &config,
+        &weights,
+        &tokenizer,
+        &prompt_token_ids,
+        max_tokens,
+        draft_tokens,
+        checkpoint,
+    )?;
+
+    let decode_tps = |run: &Eagle3BenchRun| {
+        let tokens = run.generated.len().saturating_sub(1);
+        if tokens == 0 || run.decode_ms <= 0.0 {
+            0.0
+        } else {
+            tokens as f64 / (run.decode_ms / 1000.0)
+        }
+    };
+    let plain_tps = decode_tps(&plain);
+    let eagle_tps = decode_tps(&eagle);
+    let lossless = plain.generated == eagle.generated;
+    let mut first_divergent = first_divergence(&plain.generated, &eagle.generated);
+    if !lossless && first_divergent < 0 {
+        first_divergent = plain.generated.len().min(eagle.generated.len()) as i64;
+    }
+    let accept_rate = if eagle.drafted == 0 {
+        0.0
+    } else {
+        eagle.accepted_drafts as f64 / eagle.drafted as f64
+    };
+    let mean_emitted = if eagle.rounds == 0 {
+        0.0
+    } else {
+        (eagle.accepted_drafts + eagle.rounds) as f64 / eagle.rounds as f64
+    };
+    let record = BenchEagle3Record {
+        runtime: "camelid-eagle3-resident-metal",
+        commit: benchmark_commit(),
+        camelid_version: camelid::receipt::camelid_version(),
+        binary_sha256,
+        workload,
+        prompt_sha256: camelid::receipt::sha256_hex(prompt_text.as_bytes()),
+        prompt_format: "raw_completion_bos_no_eos",
+        add_bos: true,
+        add_eos: false,
+        model: model.display().to_string(),
+        model_sha256,
+        tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
+        eagle3: eagle3_dir.display().to_string(),
+        eagle3_sha256,
+        eagle3_revision: PINNED_EAGLE3_REVISION,
+        quantization: camelid::receipt::quantization_label(&gguf),
+        prompt_tokens: prompt_token_ids.len(),
+        max_tokens,
+        draft_tokens,
+        plain_generated_tokens: plain.generated.len(),
+        eagle3_generated_tokens: eagle.generated.len(),
+        head_load_ms,
+        head_upload_ms: eagle.head_upload_ms,
+        head_seed_ms: eagle.head_seed_ms,
+        bootstrap_capture_ms: eagle.bootstrap_capture_ms,
+        plain_ttft_ms: plain.ttft_ms,
+        plain_decode_ms: plain.decode_ms,
+        plain_tokens_per_second: plain_tps,
+        eagle3_ttft_ms: eagle.ttft_ms,
+        eagle3_decode_ms: eagle.decode_ms,
+        eagle3_tokens_per_second: eagle_tps,
+        plain_request_tokens_per_second: plain.generated.len() as f64
+            / ((plain.ttft_ms + plain.decode_ms) / 1000.0),
+        eagle3_warm_head_request_tokens_per_second: eagle.generated.len() as f64
+            / ((eagle.ttft_ms + eagle.head_seed_ms + eagle.decode_ms) / 1000.0),
+        eagle3_head_cold_tokens_per_second: eagle.generated.len() as f64
+            / ((head_load_ms
+                + eagle.head_upload_ms
+                + eagle.ttft_ms
+                + eagle.head_seed_ms
+                + eagle.decode_ms)
+                / 1000.0),
+        rounds: eagle.rounds,
+        drafted: eagle.drafted,
+        accepted_drafts: eagle.accepted_drafts,
+        accept_rate,
+        mean_emitted_tokens_per_round: mean_emitted,
+        draft_ms: eagle.draft_us as f64 / 1000.0,
+        verify_ms: eagle.verify_us as f64 / 1000.0,
+        head_update_ms: eagle.head_update_us as f64 / 1000.0,
+        resident_verify_rounds: eagle.resident_verify_rounds,
+        cpu_verify_rounds: eagle.cpu_verify_rounds,
+        resident_normal_steps: eagle.resident_normal_steps,
+        speedup: if plain_tps > 0.0 {
+            eagle_tps / plain_tps
+        } else {
+            0.0
+        },
+        first_divergent_generated_token_index: first_divergent,
+        lossless,
+        plain_token_ids: plain.generated,
+        eagle3_token_ids: eagle.generated,
+        eagle3_drafted_token_ids: eagle.drafted_token_ids,
+        metal_device: camelid::metal::detect_metal_device().device_name,
+        host_isa: camelid::receipt::host_isa_marker(),
+        effective_env: eagle3_effective_env(),
+        planner_env_updates,
+        execution_plan: plan_outcome.plan,
+        peak_memory_bytes: peak_rss_bytes(),
+    };
+    println!("{}", serde_json::to_string(&record)?);
+    eprintln!(
+        "[bench-eagle3] γ={} accept {:.1}% emitted/round {:.2} | plain {:.2} → EAGLE-3 {:.2} tok/s ({:.2}x) | {}",
+        record.draft_tokens,
+        100.0 * record.accept_rate,
+        record.mean_emitted_tokens_per_round,
+        record.plain_tokens_per_second,
+        record.eagle3_tokens_per_second,
+        record.speedup,
+        if record.lossless { "LOSSLESS ✓" } else { "DIVERGED" },
+    );
+    anyhow::ensure!(
+        record.lossless,
+        "EAGLE-3 output diverged from the resident plain target at generated token {}",
+        record.first_divergent_generated_token_index
     );
     Ok(())
 }

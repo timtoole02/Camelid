@@ -1,6 +1,6 @@
 # Handoff — speculative decoding campaign
 
-Branch `campaign/mtp-3x`, 30 commits ahead of `origin/main` (b8951e24). **Unpushed.**
+Branch `campaign/mtp-3x`. **Unpushed.**
 Worktree `/Volumes/Untitled/Camelid-3x`. Nothing here is on by default.
 
 ## The result
@@ -68,14 +68,29 @@ qwen35: rank 70, 8.4-19.3 nats). **Remaining for promotion:** bounded-context 51
 pack, API/WebUI load receipts, and sign-off on the proposed gate (top-10 set
 equality, max |delta| <= 0.15 nats).
 
-**MTP / EAGLE-3 — JUSTIFIED, NOT BUILT.** Suffix drafting hits **0% acceptance**
-on creative writing and on 60-unrelated-words, where speculation becomes a
-0.80-0.91x *loss*. That prose gap is what a trained head fills. Artifacts are
-downloaded and validated: `eagle3-llama31-8b.safetensors` (MIT, 15 tensors,
-`fc [4096,12288]` 3-tap fusion, 32k draft vocab + d2t/t2d) and both 3.1 GGUFs.
-Two risks before funding it: the head is trained for Llama-3.**1** (not the 3.0
-row we measure), and `max_position_embeddings: 2048` while everything we care
-about is at 4137 tokens.
+**Llama 3.2 3B EAGLE-3 — BENCHMARK BUILT; NOT NATIVE MTP OR SERVING
+INTEGRATION.** The learned EAGLE-3 benchmark is pinned to the exact target
+`Llama-3.2-3B-Instruct-Q4_K_M.gguf` (sha256
+`6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff`,
+2,019,377,696 bytes) and the matching Thoughtworks EAGLE3 head at revision
+`02d343789b502a3edfe351bdd4537a44affb98cd` (`model.safetensors` sha256
+`c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf`,
+486,297,280 bytes). It captures resident target taps `[2, 14, 25]`, keeps both
+the learned head and target resident on Metal, and enforces losslessness and
+head/target cache-watermark gates.
+
+The tuning sweep's best result was gamma 3: **31.254 -> 42.541 tok/s = 1.361x**,
+with **87.18% offered-draft acceptance**, **3.615 emitted tokens/round**, and
+**26 resident / 0 CPU verify rounds**, using a raw 46-token BOS/no-EOS prompt
+and 96 generated tokens. This receipt came from a dirty pre-commit binary
+(sha256 `203b...`), so the final committed rerun is still pending. For comparison,
+the same-target suffix 4k baseline is **21.107 -> 42.400 tok/s = 2.009x**. The
+exact matching head declares training sequence length **1024**; it does not
+declare a runtime cap. The old Llama 3.1 / 2048 account was about a different
+artifact and must not be carried forward. This remains a benchmark-only EAGLE-3
+path, not a native MTP implementation and not integrated into serving. Full
+method and receipts:
+[`qa/speculative/EAGLE3_LLAMA32_3B.md`](qa/speculative/EAGLE3_LLAMA32_3B.md).
 
 ## Next lever for speed
 

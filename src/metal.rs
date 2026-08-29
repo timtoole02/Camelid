@@ -197,6 +197,7 @@ struct MetalLinearKernel {
     rms_norm_pipeline: ComputePipelineState,
     rms_norm_per_head_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
+    copy_f32_pipeline: ComputePipelineState,
     multiply_pipeline: ComputePipelineState,
     dense_f16_linear_pipeline: ComputePipelineState,
     dense_bf16_linear_pipeline: ComputePipelineState,
@@ -4576,6 +4577,18 @@ kernel void residual_add_f32(
     output[gid] = a[gid] + b[gid];
 }
 
+// Snapshot a resident activation before its ping-pong buffer is overwritten by a later
+// decoder layer. Used by learned speculative heads that consume target layer inputs.
+kernel void copy_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    output[gid] = input[gid];
+}
+
 kernel void multiply_f32(
     device const float* a [[buffer(0)]],
     device const float* b [[buffer(1)]],
@@ -8897,6 +8910,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let residual_add_pipeline = device
                 .new_compute_pipeline_state_with_function(&residual_add_function)
                 .ok()?;
+            let copy_f32_function = elementwise_library.get_function("copy_f32", None).ok()?;
+            let copy_f32_pipeline = device
+                .new_compute_pipeline_state_with_function(&copy_f32_function)
+                .ok()?;
             let multiply_function = elementwise_library
                 .get_function("multiply_f32", None)
                 .ok()?;
@@ -9673,6 +9690,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_pipeline,
                 rms_norm_per_head_pipeline,
                 residual_add_pipeline,
+                copy_f32_pipeline,
                 multiply_pipeline,
                 dense_f16_linear_pipeline,
                 dense_bf16_linear_pipeline,
@@ -18164,6 +18182,22 @@ fn encode_binary(
 }
 
 #[cfg(target_os = "macos")]
+fn encode_copy_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    output: &Buffer,
+    n_buf: &Buffer,
+    n: usize,
+) {
+    e.set_compute_pipeline_state(&k.copy_f32_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(output), 0);
+    e.set_buffer(2, Some(n_buf), 0);
+    dispatch_1d(e, &k.copy_f32_pipeline, n);
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_rope(
     e: &metal::ComputeCommandEncoderRef,
@@ -23727,6 +23761,1241 @@ fn assert_threadgroup_fits(device: &metal::DeviceRef, bytes: usize, label: &str)
     );
 }
 
+// ---- EAGLE-3 draft head ---------------------------------------------------------------
+//
+// This is deliberately a small, self-contained Metal engine rather than a second
+// `ResidentDecodeState`.  An EAGLE-3 head is not a Llama model with fewer layers: its
+// attention projections consume `[token_embedding_norm || fused_target_features_norm]`
+// (2H), while the residual stream is only the fused target/recurrent state (H).  Trying to
+// force that shape through the ordinary resident layer descriptor is both awkward and very
+// easy to get subtly wrong.
+
+pub const EAGLE3_HIDDEN: usize = 3_072;
+pub const EAGLE3_AUX_WIDTH: usize = 3 * EAGLE3_HIDDEN;
+pub const EAGLE3_ATTN_INPUT: usize = 2 * EAGLE3_HIDDEN;
+pub const EAGLE3_FFN: usize = 8_192;
+pub const EAGLE3_HEADS: usize = 24;
+pub const EAGLE3_KV_HEADS: usize = 8;
+pub const EAGLE3_HEAD_DIM: usize = 128;
+pub const EAGLE3_DRAFT_VOCAB: usize = 32_000;
+pub const EAGLE3_TARGET_VOCAB: usize = 128_256;
+pub const EAGLE3_ROPE_THETA: f32 = 500_000.0;
+pub const EAGLE3_RMS_EPS: f32 = 1.0e-5;
+
+/// Borrowed view of the 15-tensor
+/// `thoughtworks/Llama-3.2-3B-Instruct-Eagle3` checkpoint.
+///
+/// Matrix bytes are unmodified little-endian BF16 safetensor payloads in row-major
+/// `[output, input]` order.  Norms are widened to f32 by the checkpoint loader.  `d2t`
+/// stores the checkpoint's *offset* representation: target token for draft row `i` is
+/// `i + d2t[i]`, not `d2t[i]` itself.
+#[derive(Clone, Copy)]
+pub struct Eagle3MetalWeights<'a> {
+    pub fc_bf16: &'a [u8],
+    pub q_proj_bf16: &'a [u8],
+    pub k_proj_bf16: &'a [u8],
+    pub v_proj_bf16: &'a [u8],
+    pub o_proj_bf16: &'a [u8],
+    pub gate_proj_bf16: &'a [u8],
+    pub up_proj_bf16: &'a [u8],
+    pub down_proj_bf16: &'a [u8],
+    pub lm_head_bf16: &'a [u8],
+    pub input_layernorm: &'a [f32],
+    pub hidden_norm: &'a [f32],
+    pub post_attention_layernorm: &'a [f32],
+    pub output_norm: &'a [f32],
+    pub d2t_offsets: &'a [i32],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Eagle3MetalOutput {
+    /// Row in the compact 32k draft vocabulary selected by the draft head.
+    pub draft_token: u32,
+    /// Full 128,256-token Llama vocabulary id after applying the d2t offset.
+    pub target_token: u32,
+    /// Raw decoder output before the final RMSNorm.  This is the recurrent state used by
+    /// the next speculative EAGLE step; applying `fc` to it would be incorrect.
+    pub raw_hidden: Vec<f32>,
+}
+
+fn eagle3_bf16_bytes(rows: usize, cols: usize) -> Option<usize> {
+    rows.checked_mul(cols)?
+        .checked_mul(std::mem::size_of::<u16>())
+}
+
+fn eagle3_validate_weights(
+    weights: &Eagle3MetalWeights<'_>,
+    max_positions: usize,
+) -> std::result::Result<(), String> {
+    // Attention kernels carry the per-KV-head stride (`max_positions * head_dim`) in a
+    // u32 scalar.  Bound that product here instead of silently truncating it later.
+    let max_positions_for_stride = u32::MAX as usize / EAGLE3_HEAD_DIM;
+    if max_positions == 0 || max_positions > max_positions_for_stride {
+        return Err(format!(
+            "EAGLE-3 max_positions must be in 1..={}, got {max_positions}",
+            max_positions_for_stride
+        ));
+    }
+    let matrices = [
+        (
+            "fc.weight",
+            weights.fc_bf16.len(),
+            EAGLE3_HIDDEN,
+            EAGLE3_AUX_WIDTH,
+        ),
+        (
+            "midlayer.self_attn.q_proj.weight",
+            weights.q_proj_bf16.len(),
+            EAGLE3_HIDDEN,
+            EAGLE3_ATTN_INPUT,
+        ),
+        (
+            "midlayer.self_attn.k_proj.weight",
+            weights.k_proj_bf16.len(),
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+            EAGLE3_ATTN_INPUT,
+        ),
+        (
+            "midlayer.self_attn.v_proj.weight",
+            weights.v_proj_bf16.len(),
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+            EAGLE3_ATTN_INPUT,
+        ),
+        (
+            "midlayer.self_attn.o_proj.weight",
+            weights.o_proj_bf16.len(),
+            EAGLE3_HIDDEN,
+            EAGLE3_HIDDEN,
+        ),
+        (
+            "midlayer.mlp.gate_proj.weight",
+            weights.gate_proj_bf16.len(),
+            EAGLE3_FFN,
+            EAGLE3_HIDDEN,
+        ),
+        (
+            "midlayer.mlp.up_proj.weight",
+            weights.up_proj_bf16.len(),
+            EAGLE3_FFN,
+            EAGLE3_HIDDEN,
+        ),
+        (
+            "midlayer.mlp.down_proj.weight",
+            weights.down_proj_bf16.len(),
+            EAGLE3_HIDDEN,
+            EAGLE3_FFN,
+        ),
+        (
+            "lm_head.weight",
+            weights.lm_head_bf16.len(),
+            EAGLE3_DRAFT_VOCAB,
+            EAGLE3_HIDDEN,
+        ),
+    ];
+    for (name, got, rows, cols) in matrices {
+        let expected = eagle3_bf16_bytes(rows, cols)
+            .ok_or_else(|| format!("EAGLE-3 {name} byte size overflow"))?;
+        if got != expected {
+            return Err(format!(
+                "EAGLE-3 {name} has {got} bytes, expected {expected} for [{rows}, {cols}] BF16"
+            ));
+        }
+    }
+    for (name, got) in [
+        (
+            "midlayer.input_layernorm.weight",
+            weights.input_layernorm.len(),
+        ),
+        ("midlayer.hidden_norm.weight", weights.hidden_norm.len()),
+        (
+            "midlayer.post_attention_layernorm.weight",
+            weights.post_attention_layernorm.len(),
+        ),
+        ("norm.weight", weights.output_norm.len()),
+    ] {
+        if got != EAGLE3_HIDDEN {
+            return Err(format!(
+                "EAGLE-3 {name} has {got} values, expected {EAGLE3_HIDDEN}"
+            ));
+        }
+    }
+    if weights.d2t_offsets.len() != EAGLE3_DRAFT_VOCAB {
+        return Err(format!(
+            "EAGLE-3 d2t has {} entries, expected {EAGLE3_DRAFT_VOCAB}",
+            weights.d2t_offsets.len()
+        ));
+    }
+    let mut previous = None;
+    for (draft, &offset) in weights.d2t_offsets.iter().enumerate() {
+        let target = i64::try_from(draft)
+            .ok()
+            .and_then(|draft| draft.checked_add(i64::from(offset)))
+            .ok_or_else(|| format!("EAGLE-3 d2t overflow at draft row {draft}"))?;
+        if !(0..EAGLE3_TARGET_VOCAB as i64).contains(&target) {
+            return Err(format!(
+                "EAGLE-3 d2t row {draft} maps outside target vocab: {draft} + {offset} = {target}"
+            ));
+        }
+        if previous.is_some_and(|p| target <= p) {
+            return Err(format!(
+                "EAGLE-3 d2t mappings must be strictly increasing; row {draft} maps to {target}"
+            ));
+        }
+        previous = Some(target);
+    }
+    Ok(())
+}
+
+fn eagle3_map_draft_token(
+    draft_token: u32,
+    d2t_offsets: &[i32],
+) -> std::result::Result<u32, String> {
+    let draft = draft_token as usize;
+    let &offset = d2t_offsets
+        .get(draft)
+        .ok_or_else(|| format!("EAGLE-3 draft token {draft_token} is outside d2t"))?;
+    let target = i64::from(draft_token) + i64::from(offset);
+    if !(0..EAGLE3_TARGET_VOCAB as i64).contains(&target) {
+        return Err(format!(
+            "EAGLE-3 d2t row {draft_token} maps outside target vocab: {target}"
+        ));
+    }
+    Ok(target as u32)
+}
+
+fn eagle3_validate_batch_shape(
+    token_embedding_values: usize,
+    g_state_values: usize,
+    start_position: usize,
+    filled: usize,
+    max_positions: usize,
+) -> std::result::Result<usize, String> {
+    if token_embedding_values != g_state_values
+        || !token_embedding_values.is_multiple_of(EAGLE3_HIDDEN)
+    {
+        return Err(format!(
+            "EAGLE-3 batch expected equally-sized [rows, {EAGLE3_HIDDEN}] embeddings/g, got {token_embedding_values}/{g_state_values}"
+        ));
+    }
+    if start_position != filled {
+        return Err(format!(
+            "EAGLE-3 batch start {start_position} does not match KV watermark {filled}"
+        ));
+    }
+    let rows = token_embedding_values / EAGLE3_HIDDEN;
+    if start_position
+        .checked_add(rows)
+        .is_none_or(|end| end > max_positions)
+    {
+        return Err(format!(
+            "EAGLE-3 batch {start_position}..{} exceeds cache capacity {max_positions}",
+            start_position.saturating_add(rows),
+        ));
+    }
+    Ok(rows)
+}
+
+fn eagle3_rope_tables(position: usize) -> (Vec<f32>, Vec<f32>) {
+    let half = EAGLE3_HEAD_DIM / 2;
+    let mut cos = Vec::with_capacity(half);
+    let mut sin = Vec::with_capacity(half);
+    for pair in 0..half {
+        let frequency = 1.0 / EAGLE3_ROPE_THETA.powf(2.0 * pair as f32 / EAGLE3_HEAD_DIM as f32);
+        let (s, c) = (position as f32 * frequency).sin_cos();
+        cos.push(c);
+        sin.push(s);
+    }
+    (cos, sin)
+}
+
+#[cfg(target_os = "macos")]
+pub struct Eagle3MetalState {
+    fc: ResidentLinearWeight,
+    q_proj: ResidentLinearWeight,
+    k_proj: ResidentLinearWeight,
+    v_proj: ResidentLinearWeight,
+    o_proj: ResidentLinearWeight,
+    gate_proj: ResidentLinearWeight,
+    up_proj: ResidentLinearWeight,
+    down_proj: ResidentLinearWeight,
+    lm_head: ResidentLinearWeight,
+    input_layernorm: Buffer,
+    hidden_norm: Buffer,
+    post_attention_layernorm: Buffer,
+    output_norm: Buffer,
+    d2t_offsets: Vec<i32>,
+    cache_k: Buffer,
+    cache_v: Buffer,
+    max_positions: usize,
+    filled: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_upload_bf16(k: &MetalLinearKernel, bytes: &[u8]) -> ResidentLinearWeight {
+    let buffer = k
+        .device
+        .new_buffer(bytes.len() as u64, MTLResourceOptions::StorageModeShared);
+    write_buffer_u8(&buffer, bytes);
+    ResidentLinearWeight {
+        format: ResidentWeightFormat::DenseBF16,
+        buffer,
+        q8_wire: false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_upload_f32(k: &MetalLinearKernel, values: &[f32]) -> Buffer {
+    let buffer = k.device.new_buffer(
+        std::mem::size_of_val(values) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    write_buffer_f32(&buffer, values);
+    buffer
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_zero_buffer(k: &MetalLinearKernel, bytes: usize) -> Buffer {
+    let buffer = k
+        .device
+        .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+    unsafe { std::ptr::write_bytes(buffer.contents() as *mut u8, 0, bytes.max(4)) };
+    buffer
+}
+
+#[cfg(target_os = "macos")]
+fn encode_eagle3_rms_norm(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    weight: &Buffer,
+    output: &Buffer,
+    output_offset: u64,
+    scalar: &Buffer,
+) {
+    e.set_compute_pipeline_state(&k.rms_norm_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(output), output_offset);
+    e.set_buffer(3, Some(scalar), 0);
+    e.set_buffer(4, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+impl Eagle3MetalState {
+    /// Upload one fixed-geometry Llama-3.2-3B EAGLE-3 head and allocate its private
+    /// one-layer F16 KV cache.  The target model's token embedding remains external: it is
+    /// quantization/model specific and is intentionally not duplicated in the checkpoint.
+    pub fn new(
+        weights: Eagle3MetalWeights<'_>,
+        max_positions: usize,
+    ) -> std::result::Result<Self, String> {
+        eagle3_validate_weights(&weights, max_positions)?;
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let cache_values = EAGLE3_KV_HEADS
+            .checked_mul(max_positions)
+            .and_then(|n| n.checked_mul(EAGLE3_HEAD_DIM))
+            .ok_or_else(|| "EAGLE-3 KV cache size overflow".to_string())?;
+        let cache_bytes = cache_values
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| "EAGLE-3 KV cache byte size overflow".to_string())?;
+        if cache_bytes as u64 > k.device.max_buffer_length() {
+            return Err(format!(
+                "EAGLE-3 one-sided KV allocation {cache_bytes} exceeds Metal maxBufferLength {}",
+                k.device.max_buffer_length()
+            ));
+        }
+        Ok(Self {
+            fc: eagle3_upload_bf16(k, weights.fc_bf16),
+            q_proj: eagle3_upload_bf16(k, weights.q_proj_bf16),
+            k_proj: eagle3_upload_bf16(k, weights.k_proj_bf16),
+            v_proj: eagle3_upload_bf16(k, weights.v_proj_bf16),
+            o_proj: eagle3_upload_bf16(k, weights.o_proj_bf16),
+            gate_proj: eagle3_upload_bf16(k, weights.gate_proj_bf16),
+            up_proj: eagle3_upload_bf16(k, weights.up_proj_bf16),
+            down_proj: eagle3_upload_bf16(k, weights.down_proj_bf16),
+            lm_head: eagle3_upload_bf16(k, weights.lm_head_bf16),
+            input_layernorm: eagle3_upload_f32(k, weights.input_layernorm),
+            hidden_norm: eagle3_upload_f32(k, weights.hidden_norm),
+            post_attention_layernorm: eagle3_upload_f32(k, weights.post_attention_layernorm),
+            output_norm: eagle3_upload_f32(k, weights.output_norm),
+            d2t_offsets: weights.d2t_offsets.to_vec(),
+            cache_k: eagle3_zero_buffer(k, cache_bytes),
+            cache_v: eagle3_zero_buffer(k, cache_bytes),
+            max_positions,
+            filled: 0,
+        })
+    }
+
+    pub fn max_positions(&self) -> usize {
+        self.max_positions
+    }
+
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    /// Forget every draft-cache row.  Physical bytes need not be cleared: every future read
+    /// is bounded by `filled`, and each newly admitted row overwrites its own slot first.
+    pub fn reset(&mut self) {
+        self.filled = 0;
+    }
+
+    /// Drop an ephemeral/rejected suffix.  As with the target resident cache, rollback is a
+    /// watermark operation; stale tail bytes cannot be observed and are overwritten on reuse.
+    pub fn rollback_to_position(&mut self, position: usize) -> std::result::Result<(), String> {
+        if position > self.filled {
+            return Err(format!(
+                "EAGLE-3 cannot roll KV forward from {} to {position}",
+                self.filled
+            ));
+        }
+        self.filled = position;
+        Ok(())
+    }
+
+    /// Project target captures `[rows, 3H]` through `fc.weight` into `[rows, H]`.
+    /// Captures must be concatenated post-layer outputs in the trained order [1, 13, 24].
+    pub fn fuse_features(&self, features: &[f32]) -> std::result::Result<Vec<f32>, String> {
+        if features.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !features.len().is_multiple_of(EAGLE3_AUX_WIDTH) {
+            return Err(format!(
+                "EAGLE-3 feature fusion expected [rows, {EAGLE3_AUX_WIDTH}], got {} values",
+                features.len()
+            ));
+        }
+        let rows = features.len() / EAGLE3_AUX_WIDTH;
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let input = pool_get(k, std::mem::size_of_val(features) as u64);
+        let output = pool_get(k, (rows * EAGLE3_HIDDEN * 4) as u64);
+        let scalar = pool_get(k, 12);
+        write_buffer_f32(&input, features);
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = Vec::new();
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &input,
+            &self.fc,
+            &output,
+            &scalar,
+            EAGLE3_AUX_WIDTH,
+            EAGLE3_HIDDEN,
+            rows,
+        );
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let mut fused = vec![0.0f32; rows * EAGLE3_HIDDEN];
+        read_buffer_f32(&output, &mut fused);
+        keep.extend([input, output, scalar]);
+        pool_recycle(k, keep);
+        Ok(fused)
+    }
+
+    /// Append the exact K/V state for an authoritative row without computing an output that
+    /// the caller will discard.  K/V depend only on the normalized token embedding and `g`;
+    /// Q, attention, the MLP, and the language-model head cannot affect a future row's cache.
+    fn append_kv_only(
+        &mut self,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+    ) -> std::result::Result<(), String> {
+        if token_embedding.len() != EAGLE3_HIDDEN || g.len() != EAGLE3_HIDDEN {
+            return Err(format!(
+                "EAGLE-3 KV append expected embedding/g widths {EAGLE3_HIDDEN}, got {}/{}",
+                token_embedding.len(),
+                g.len()
+            ));
+        }
+        if position != self.filled {
+            return Err(format!(
+                "EAGLE-3 KV append position {position} does not match KV watermark {}",
+                self.filled
+            ));
+        }
+        if position >= self.max_positions {
+            return Err(format!(
+                "EAGLE-3 position {position} exceeds cache capacity {}",
+                self.max_positions
+            ));
+        }
+
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
+        let f32b = |n: usize| nb(n * std::mem::size_of::<f32>());
+        let embedding = f32b(EAGLE3_HIDDEN);
+        let g_buf = f32b(EAGLE3_HIDDEN);
+        write_buffer_f32(&embedding, token_embedding);
+        write_buffer_f32(&g_buf, g);
+
+        let combined = f32b(EAGLE3_ATTN_INPUT);
+        let key = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
+        let value = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
+        let rms_scalar = nb(8);
+        let kv_scalar = nb(12);
+        let k_rope_scalar = nb(16);
+        let scatter_scalar = nb(16);
+        let (cos, sin) = eagle3_rope_tables(position);
+        let cos_buf = f32b(cos.len());
+        let sin_buf = f32b(sin.len());
+        write_buffer_f32(&cos_buf, &cos);
+        write_buffer_f32(&sin_buf, &sin);
+
+        unsafe {
+            let rms = rms_scalar.contents() as *mut u8;
+            *(rms as *mut u32) = EAGLE3_HIDDEN as u32;
+            *(rms.add(4) as *mut f32) = EAGLE3_RMS_EPS;
+            let mm = kv_scalar.contents() as *mut u32;
+            *mm = EAGLE3_ATTN_INPUT as u32;
+            *mm.add(1) = (EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM) as u32;
+            *mm.add(2) = 1;
+            let rope = k_rope_scalar.contents() as *mut u32;
+            *rope = EAGLE3_KV_HEADS as u32;
+            *rope.add(1) = EAGLE3_HEAD_DIM as u32;
+            *rope.add(2) = (EAGLE3_HEAD_DIM / 2) as u32;
+            *rope.add(3) = 1; // raw HF/JAX weights use split-half rotate_half
+            let scatter = scatter_scalar.contents() as *mut u32;
+            *scatter = EAGLE3_HEAD_DIM as u32;
+            *scatter.add(1) = self.max_positions as u32;
+            *scatter.add(2) = position as u32;
+            *scatter.add(3) = (EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM) as u32;
+        }
+
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = Vec::new();
+
+        // Match `forward_token` byte-for-byte through the K/V scatter.  The cache is F16,
+        // so later attention observes exactly the same half-rounded values in either lane.
+        encode_eagle3_rms_norm(
+            e,
+            k,
+            &embedding,
+            &self.input_layernorm,
+            &combined,
+            0,
+            &rms_scalar,
+        );
+        encode_eagle3_rms_norm(
+            e,
+            k,
+            &g_buf,
+            &self.hidden_norm,
+            &combined,
+            (EAGLE3_HIDDEN * 4) as u64,
+            &rms_scalar,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &combined,
+            &self.k_proj,
+            &key,
+            &kv_scalar,
+            EAGLE3_ATTN_INPUT,
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+            1,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &combined,
+            &self.v_proj,
+            &value,
+            &kv_scalar,
+            EAGLE3_ATTN_INPUT,
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+            1,
+        );
+        encode_rope(
+            e,
+            k,
+            &key,
+            &cos_buf,
+            &sin_buf,
+            &k_rope_scalar,
+            EAGLE3_KV_HEADS,
+            EAGLE3_HEAD_DIM / 2,
+            0,
+            0,
+        );
+        e.set_compute_pipeline_state(&k.kv_scatter_kv16_pipeline);
+        e.set_buffer(0, Some(&key), 0);
+        e.set_buffer(1, Some(&value), 0);
+        e.set_buffer(2, Some(&self.cache_k), 0);
+        e.set_buffer(3, Some(&self.cache_v), 0);
+        e.set_buffer(4, Some(&scatter_scalar), 0);
+        e.set_buffer(5, Some(&scatter_scalar), 4);
+        e.set_buffer(6, Some(&scatter_scalar), 8);
+        e.set_buffer(7, Some(&scatter_scalar), 12);
+        dispatch_1d(
+            e,
+            &k.kv_scatter_kv16_pipeline,
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+        );
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        keep.extend([
+            embedding,
+            g_buf,
+            combined,
+            key,
+            value,
+            rms_scalar,
+            kv_scalar,
+            k_rope_scalar,
+            scatter_scalar,
+            cos_buf,
+            sin_buf,
+        ]);
+        pool_recycle(k, keep);
+        self.filled = position + 1;
+        Ok(())
+    }
+
+    /// Append one EAGLE cell at exactly the current cache watermark.
+    ///
+    /// `g` is either an FC-projected authoritative target feature (stable-cache extension)
+    /// or the previous call's raw hidden (ephemeral recursive drafting).  The caller controls
+    /// that distinction; this primitive intentionally does not apply `fc` a second time.
+    pub fn forward_token(
+        &mut self,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        if token_embedding.len() != EAGLE3_HIDDEN || g.len() != EAGLE3_HIDDEN {
+            return Err(format!(
+                "EAGLE-3 forward expected embedding/g widths {EAGLE3_HIDDEN}, got {}/{}",
+                token_embedding.len(),
+                g.len()
+            ));
+        }
+        if position != self.filled {
+            return Err(format!(
+                "EAGLE-3 forward position {position} does not match KV watermark {}; rollback first",
+                self.filled
+            ));
+        }
+        if position >= self.max_positions {
+            return Err(format!(
+                "EAGLE-3 position {position} exceeds cache capacity {}",
+                self.max_positions
+            ));
+        }
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
+        let f32b = |n: usize| nb(n * std::mem::size_of::<f32>());
+        let embedding = f32b(EAGLE3_HIDDEN);
+        let g_buf = f32b(EAGLE3_HIDDEN);
+        write_buffer_f32(&embedding, token_embedding);
+        write_buffer_f32(&g_buf, g);
+
+        let combined = f32b(EAGLE3_ATTN_INPUT);
+        let query = f32b(EAGLE3_HIDDEN);
+        let key = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
+        let value = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
+        let context = f32b(EAGLE3_HIDDEN);
+        let attention_out = f32b(EAGLE3_HIDDEN);
+        let attention_residual = f32b(EAGLE3_HIDDEN);
+        let post_norm = f32b(EAGLE3_HIDDEN);
+        let gate = f32b(EAGLE3_FFN);
+        let up = f32b(EAGLE3_FFN);
+        let activated = f32b(EAGLE3_FFN);
+        let down = f32b(EAGLE3_HIDDEN);
+        let raw_hidden = f32b(EAGLE3_HIDDEN);
+        let output_normed = f32b(EAGLE3_HIDDEN);
+        let logits = f32b(EAGLE3_DRAFT_VOCAB);
+        let selected = nb(4);
+
+        let rms_scalar = nb(8);
+        let q_scalar = nb(12);
+        let kv_scalar = nb(12);
+        let o_scalar = nb(12);
+        let gate_up_scalar = nb(12);
+        let down_scalar = nb(12);
+        let head_scalar = nb(12);
+        let residual_n = nb(4);
+        let silu_n = nb(4);
+        let vocab_n = nb(4);
+        let q_rope_scalar = nb(16);
+        let k_rope_scalar = nb(16);
+        let scatter_scalar = nb(16);
+        let attention_scalar = nb(32);
+        let position_count = position + 1;
+        let scores = f32b(EAGLE3_HEADS * position_count);
+        let (cos, sin) = eagle3_rope_tables(position);
+        let cos_buf = f32b(cos.len());
+        let sin_buf = f32b(sin.len());
+        write_buffer_f32(&cos_buf, &cos);
+        write_buffer_f32(&sin_buf, &sin);
+
+        unsafe {
+            let rms = rms_scalar.contents() as *mut u8;
+            *(rms as *mut u32) = EAGLE3_HIDDEN as u32;
+            *(rms.add(4) as *mut f32) = EAGLE3_RMS_EPS;
+            let set_mm = |scalar: &Buffer, input: usize, rows: usize| {
+                let p = scalar.contents() as *mut u32;
+                *p = input as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = 1;
+            };
+            set_mm(&q_scalar, EAGLE3_ATTN_INPUT, EAGLE3_HIDDEN);
+            set_mm(
+                &kv_scalar,
+                EAGLE3_ATTN_INPUT,
+                EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+            );
+            set_mm(&o_scalar, EAGLE3_HIDDEN, EAGLE3_HIDDEN);
+            set_mm(&gate_up_scalar, EAGLE3_HIDDEN, EAGLE3_FFN);
+            set_mm(&down_scalar, EAGLE3_FFN, EAGLE3_HIDDEN);
+            set_mm(&head_scalar, EAGLE3_HIDDEN, EAGLE3_DRAFT_VOCAB);
+            *(residual_n.contents() as *mut u32) = EAGLE3_HIDDEN as u32;
+            *(silu_n.contents() as *mut u32) = EAGLE3_FFN as u32;
+            *(vocab_n.contents() as *mut u32) = EAGLE3_DRAFT_VOCAB as u32;
+            let set_rope = |scalar: &Buffer, heads: usize| {
+                let p = scalar.contents() as *mut u32;
+                *p = heads as u32;
+                *p.add(1) = EAGLE3_HEAD_DIM as u32;
+                *p.add(2) = (EAGLE3_HEAD_DIM / 2) as u32;
+                *p.add(3) = 1; // raw HF/JAX weights use split-half rotate_half
+            };
+            set_rope(&q_rope_scalar, EAGLE3_HEADS);
+            set_rope(&k_rope_scalar, EAGLE3_KV_HEADS);
+            let scatter = scatter_scalar.contents() as *mut u32;
+            *scatter = EAGLE3_HEAD_DIM as u32;
+            *scatter.add(1) = self.max_positions as u32;
+            *scatter.add(2) = position as u32;
+            *scatter.add(3) = (EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM) as u32;
+            let attn = attention_scalar.contents() as *mut u8;
+            *(attn as *mut u32) = EAGLE3_HEADS as u32;
+            *(attn.add(4) as *mut u32) = EAGLE3_HEAD_DIM as u32;
+            *(attn.add(8) as *mut u32) = position_count as u32;
+            *(attn.add(12) as *mut u32) = (EAGLE3_HEADS / EAGLE3_KV_HEADS) as u32;
+            *(attn.add(16) as *mut f32) = 1.0 / (EAGLE3_HEAD_DIM as f32).sqrt();
+            *(attn.add(20) as *mut u32) = EAGLE3_HEAD_DIM as u32;
+            *(attn.add(24) as *mut u32) = (self.max_positions * EAGLE3_HEAD_DIM) as u32;
+            *(attn.add(28) as *mut u32) = 0;
+        }
+
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = Vec::new();
+
+        // EAGLE order is [normalized token embedding || normalized g].
+        encode_eagle3_rms_norm(
+            e,
+            k,
+            &embedding,
+            &self.input_layernorm,
+            &combined,
+            0,
+            &rms_scalar,
+        );
+        encode_eagle3_rms_norm(
+            e,
+            k,
+            &g_buf,
+            &self.hidden_norm,
+            &combined,
+            (EAGLE3_HIDDEN * 4) as u64,
+            &rms_scalar,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &combined,
+            &self.q_proj,
+            &query,
+            &q_scalar,
+            EAGLE3_ATTN_INPUT,
+            EAGLE3_HIDDEN,
+            1,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &combined,
+            &self.k_proj,
+            &key,
+            &kv_scalar,
+            EAGLE3_ATTN_INPUT,
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+            1,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &combined,
+            &self.v_proj,
+            &value,
+            &kv_scalar,
+            EAGLE3_ATTN_INPUT,
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+            1,
+        );
+        encode_rope(
+            e,
+            k,
+            &query,
+            &cos_buf,
+            &sin_buf,
+            &q_rope_scalar,
+            EAGLE3_HEADS,
+            EAGLE3_HEAD_DIM / 2,
+            0,
+            0,
+        );
+        encode_rope(
+            e,
+            k,
+            &key,
+            &cos_buf,
+            &sin_buf,
+            &k_rope_scalar,
+            EAGLE3_KV_HEADS,
+            EAGLE3_HEAD_DIM / 2,
+            0,
+            0,
+        );
+        e.set_compute_pipeline_state(&k.kv_scatter_kv16_pipeline);
+        e.set_buffer(0, Some(&key), 0);
+        e.set_buffer(1, Some(&value), 0);
+        e.set_buffer(2, Some(&self.cache_k), 0);
+        e.set_buffer(3, Some(&self.cache_v), 0);
+        e.set_buffer(4, Some(&scatter_scalar), 0);
+        e.set_buffer(5, Some(&scatter_scalar), 4);
+        e.set_buffer(6, Some(&scatter_scalar), 8);
+        e.set_buffer(7, Some(&scatter_scalar), 12);
+        dispatch_1d(
+            e,
+            &k.kv_scatter_kv16_pipeline,
+            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+        );
+        encode_attention(
+            e,
+            k,
+            &mut keep,
+            &query,
+            &self.cache_k,
+            &self.cache_v,
+            None,
+            true,
+            false,
+            &scores,
+            &context,
+            &attention_scalar,
+            EAGLE3_HEADS,
+            EAGLE3_KV_HEADS,
+            EAGLE3_HEAD_DIM,
+            position_count,
+            0,
+            0,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &context,
+            &self.o_proj,
+            &attention_out,
+            &o_scalar,
+            EAGLE3_HIDDEN,
+            EAGLE3_HIDDEN,
+            1,
+        );
+        encode_binary(
+            e,
+            &k.residual_add_pipeline,
+            &g_buf,
+            &attention_out,
+            &attention_residual,
+            &residual_n,
+            EAGLE3_HIDDEN,
+        );
+        encode_rms_norm_f32(
+            e,
+            k,
+            &attention_residual,
+            &self.post_attention_layernorm,
+            &post_norm,
+            &rms_scalar,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &post_norm,
+            &self.gate_proj,
+            &gate,
+            &gate_up_scalar,
+            EAGLE3_HIDDEN,
+            EAGLE3_FFN,
+            1,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &post_norm,
+            &self.up_proj,
+            &up,
+            &gate_up_scalar,
+            EAGLE3_HIDDEN,
+            EAGLE3_FFN,
+            1,
+        );
+        encode_binary(
+            e,
+            &k.silu_mul_pipeline,
+            &gate,
+            &up,
+            &activated,
+            &silu_n,
+            EAGLE3_FFN,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &activated,
+            &self.down_proj,
+            &down,
+            &down_scalar,
+            EAGLE3_FFN,
+            EAGLE3_HIDDEN,
+            1,
+        );
+        encode_binary(
+            e,
+            &k.residual_add_pipeline,
+            &attention_residual,
+            &down,
+            &raw_hidden,
+            &residual_n,
+            EAGLE3_HIDDEN,
+        );
+        encode_rms_norm_f32(
+            e,
+            k,
+            &raw_hidden,
+            &self.output_norm,
+            &output_normed,
+            &rms_scalar,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &output_normed,
+            &self.lm_head,
+            &logits,
+            &head_scalar,
+            EAGLE3_HIDDEN,
+            EAGLE3_DRAFT_VOCAB,
+            1,
+        );
+        e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+        e.set_buffer(0, Some(&logits), 0);
+        e.set_buffer(1, Some(&selected), 0);
+        e.set_buffer(2, Some(&vocab_n), 0);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 1024,
+                height: 1,
+                depth: 1,
+            },
+        );
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let draft_token = unsafe { *(selected.contents() as *const u32) };
+        let target_token = eagle3_map_draft_token(draft_token, &self.d2t_offsets);
+        let mut raw_hidden_out = vec![0.0f32; EAGLE3_HIDDEN];
+        read_buffer_f32(&raw_hidden, &mut raw_hidden_out);
+
+        keep.extend([
+            embedding,
+            g_buf,
+            combined,
+            query,
+            key,
+            value,
+            context,
+            attention_out,
+            attention_residual,
+            post_norm,
+            gate,
+            up,
+            activated,
+            down,
+            raw_hidden,
+            output_normed,
+            logits,
+            selected,
+            rms_scalar,
+            q_scalar,
+            kv_scalar,
+            o_scalar,
+            gate_up_scalar,
+            down_scalar,
+            head_scalar,
+            residual_n,
+            silu_n,
+            vocab_n,
+            q_rope_scalar,
+            k_rope_scalar,
+            scatter_scalar,
+            attention_scalar,
+            scores,
+            cos_buf,
+            sin_buf,
+        ]);
+        pool_recycle(k, keep);
+        let target_token = target_token?;
+        self.filled = position + 1;
+        Ok(Eagle3MetalOutput {
+            draft_token,
+            target_token,
+            raw_hidden: raw_hidden_out,
+        })
+    }
+
+    /// Correctness-first multi-row extension.  Each row is a true autoregressive cell, so
+    /// the implementation deliberately calls the single-token primitive rather than using
+    /// a non-causal dense batch.  A future fused prefill may preserve this exact API.
+    pub fn forward_batch(
+        &mut self,
+        token_embeddings: &[f32],
+        g_states: &[f32],
+        start_position: usize,
+    ) -> std::result::Result<Vec<Eagle3MetalOutput>, String> {
+        let rows = eagle3_validate_batch_shape(
+            token_embeddings.len(),
+            g_states.len(),
+            start_position,
+            self.filled,
+            self.max_positions,
+        )?;
+        let rollback = self.filled;
+        let mut outputs = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let start = row * EAGLE3_HIDDEN;
+            match self.forward_token(
+                &token_embeddings[start..start + EAGLE3_HIDDEN],
+                &g_states[start..start + EAGLE3_HIDDEN],
+                start_position + row,
+            ) {
+                Ok(output) => outputs.push(output),
+                Err(error) => {
+                    self.filled = rollback;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// Extend an authoritative multi-row prefix while producing only its last decoder output.
+    /// Intermediate outputs are unobservable: their exact K/V rows are sufficient for the
+    /// final autoregressive cell and all future cells.  `forward_batch` remains available to
+    /// callers that need every row's output.
+    pub fn forward_batch_last_output(
+        &mut self,
+        token_embeddings: &[f32],
+        g_states: &[f32],
+        start_position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        let rows = eagle3_validate_batch_shape(
+            token_embeddings.len(),
+            g_states.len(),
+            start_position,
+            self.filled,
+            self.max_positions,
+        )?;
+        if rows == 0 {
+            return Err("EAGLE-3 last-output batch requires at least one row".to_string());
+        }
+
+        let rollback = self.filled;
+        for row in 0..rows - 1 {
+            let start = row * EAGLE3_HIDDEN;
+            if let Err(error) = self.append_kv_only(
+                &token_embeddings[start..start + EAGLE3_HIDDEN],
+                &g_states[start..start + EAGLE3_HIDDEN],
+                start_position + row,
+            ) {
+                self.filled = rollback;
+                return Err(error);
+            }
+        }
+        let start = (rows - 1) * EAGLE3_HIDDEN;
+        match self.forward_token(
+            &token_embeddings[start..start + EAGLE3_HIDDEN],
+            &g_states[start..start + EAGLE3_HIDDEN],
+            start_position + rows - 1,
+        ) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                self.filled = rollback;
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct Eagle3MetalState;
+
+#[cfg(not(target_os = "macos"))]
+impl Eagle3MetalState {
+    pub fn new(
+        weights: Eagle3MetalWeights<'_>,
+        max_positions: usize,
+    ) -> std::result::Result<Self, String> {
+        eagle3_validate_weights(&weights, max_positions)?;
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn max_positions(&self) -> usize {
+        0
+    }
+
+    pub fn filled(&self) -> usize {
+        0
+    }
+
+    pub fn reset(&mut self) {}
+
+    pub fn rollback_to_position(&mut self, _position: usize) -> std::result::Result<(), String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn fuse_features(&self, _features: &[f32]) -> std::result::Result<Vec<f32>, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn forward_token(
+        &mut self,
+        _token_embedding: &[f32],
+        _g: &[f32],
+        _position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn forward_batch(
+        &mut self,
+        _token_embeddings: &[f32],
+        _g_states: &[f32],
+        _start_position: usize,
+    ) -> std::result::Result<Vec<Eagle3MetalOutput>, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn forward_batch_last_output(
+        &mut self,
+        _token_embeddings: &[f32],
+        _g_states: &[f32],
+        _start_position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+}
+
+#[cfg(test)]
+mod eagle3_metal_contract_tests {
+    use super::*;
+
+    #[test]
+    fn d2t_is_an_offset_not_a_direct_target_id() {
+        let offsets = [0, 0, 1, 3];
+        assert_eq!(eagle3_map_draft_token(0, &offsets).unwrap(), 0);
+        assert_eq!(eagle3_map_draft_token(2, &offsets).unwrap(), 3);
+        assert_eq!(eagle3_map_draft_token(3, &offsets).unwrap(), 6);
+        assert!(eagle3_map_draft_token(4, &offsets).is_err());
+    }
+
+    #[test]
+    fn eagle3_rope_is_plain_split_half_theta_500k() {
+        let (cos0, sin0) = eagle3_rope_tables(0);
+        assert_eq!(cos0, vec![1.0; EAGLE3_HEAD_DIM / 2]);
+        assert_eq!(sin0, vec![0.0; EAGLE3_HEAD_DIM / 2]);
+        let (cos1, sin1) = eagle3_rope_tables(1);
+        assert!((cos1[0] - 1.0f32.cos()).abs() < 1.0e-6);
+        assert!((sin1[0] - 1.0f32.sin()).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn checkpoint_shape_validation_fails_before_metal_allocation() {
+        let weights = Eagle3MetalWeights {
+            fc_bf16: &[],
+            q_proj_bf16: &[],
+            k_proj_bf16: &[],
+            v_proj_bf16: &[],
+            o_proj_bf16: &[],
+            gate_proj_bf16: &[],
+            up_proj_bf16: &[],
+            down_proj_bf16: &[],
+            lm_head_bf16: &[],
+            input_layernorm: &[],
+            hidden_norm: &[],
+            post_attention_layernorm: &[],
+            output_norm: &[],
+            d2t_offsets: &[],
+        };
+        let error = eagle3_validate_weights(&weights, 2_048).unwrap_err();
+        assert!(error.contains("fc.weight"), "{error}");
+        assert!(eagle3_validate_weights(&weights, 0)
+            .unwrap_err()
+            .contains("max_positions"));
+    }
+
+    #[test]
+    fn authoritative_batch_shape_validation_is_shared_by_both_lanes() {
+        assert_eq!(
+            eagle3_validate_batch_shape(2 * EAGLE3_HIDDEN, 2 * EAGLE3_HIDDEN, 7, 7, 9,).unwrap(),
+            2
+        );
+        assert_eq!(eagle3_validate_batch_shape(0, 0, 9, 9, 9).unwrap(), 0);
+        assert!(eagle3_validate_batch_shape(EAGLE3_HIDDEN, 0, 0, 0, 1).is_err());
+        assert!(eagle3_validate_batch_shape(EAGLE3_HIDDEN, EAGLE3_HIDDEN, 1, 0, 2).is_err());
+        assert!(
+            eagle3_validate_batch_shape(2 * EAGLE3_HIDDEN, 2 * EAGLE3_HIDDEN, 1, 1, 2,).is_err()
+        );
+    }
+}
+
 /// A resident decode session that owns the on-GPU KV cache (per layer, sized to
 /// `max_positions`) and the reused hidden ping-pong buffers. A multi-token greedy decode runs
 /// each token in ONE command buffer with the KV cache persisting on the GPU across tokens --
@@ -24699,11 +25968,71 @@ impl ResidentDecodeState {
         sin_all: &[f32],
         scale: f32,
     ) -> Option<()> {
+        self.prefill_tokens_inner(
+            embeddings,
+            n_tokens,
+            layers,
+            cos_all,
+            sin_all,
+            scale,
+            &[],
+        )
+        .map(|_| ())
+    }
+
+    /// Resident prompt prefill with snapshots of selected target decoder layer inputs.
+    ///
+    /// Each returned capture is row-major `[n_tokens, hidden]`, in the exact order of the
+    /// strictly-increasing `capture_layer_ids`. This shares the ordinary prefill's KV and
+    /// abbreviated-last-layer contract; callers that need logits should prefill the prompt
+    /// prefix and pass its final token through [`Self::verify_batch_with_layer_inputs`].
+    /// Capture mode currently fails closed when the all-Q8 half-activation prefill lane is
+    /// selected. K-quant models use this function's f32 activation lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_with_layer_inputs(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        layers: &[ResidentLayerWeights],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        scale: f32,
+        capture_layer_ids: &[usize],
+    ) -> Option<Vec<Vec<f32>>> {
+        self.prefill_tokens_inner(
+            embeddings,
+            n_tokens,
+            layers,
+            cos_all,
+            sin_all,
+            scale,
+            capture_layer_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_tokens_inner(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        layers: &[ResidentLayerWeights],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        scale: f32,
+        capture_layer_ids: &[usize],
+    ) -> Option<Vec<Vec<f32>>> {
         if n_tokens == 0
             || !wire_weights_enabled()
             || !self.head_dim.is_multiple_of(32)
             || self.head_dim > 128
             || embeddings.len() != n_tokens * self.hidden
+            || layers.len() != self.n_layers
+            || capture_layer_ids
+                .last()
+                .is_some_and(|&layer_id| layer_id >= self.n_layers)
+            || capture_layer_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || self.filled != 0
             || !self.ensure_capacity(n_tokens)
         {
@@ -24826,9 +26155,16 @@ impl ResidentDecodeState {
         // Q8 needs a per-32-element-block amax and the fused kernel runs one thread per
         // RoPE pair. The convert is now guarded on `!use_h16` to match.
         let use_h16 = use_attn_mm && half_rope * 2 == self.head_dim;
+        if use_h16 && !capture_layer_ids.is_empty() {
+            return None;
+        }
         let es = if use_h16 { 2 } else { 4 }; // element size of the activation stream
         let seq = nb(n_tokens * self.hidden * es);
         let seq_out = nb(n_tokens * self.hidden * es);
+        let capture_bufs: Vec<Buffer> = capture_layer_ids
+            .iter()
+            .map(|_| nb(n_tokens * self.hidden * 4))
+            .collect();
         let normf = nb(n_tokens * self.hidden * 4);
         let q_buf = nb(n_tokens * q_dim * es);
         let k_buf = nb(n_tokens * kv_dim * es);
@@ -25243,6 +26579,16 @@ impl ResidentDecodeState {
         }
         let (cur, nxt) = (&seq, &seq_out);
         for (i, layer) in layers.iter().enumerate() {
+            if let Ok(capture_slot) = capture_layer_ids.binary_search(&i) {
+                encode_copy_f32(
+                    &e,
+                    k,
+                    cur,
+                    &capture_bufs[capture_slot],
+                    &n_elems,
+                    n_tokens * self.hidden,
+                );
+            }
             // The resident prefill exists to fill the KV cache: the caller discards the
             // hidden stream and the last prompt token re-runs through the resident
             // single-token path. So the final layer only needs norm -> K/V GEMMs ->
@@ -25973,8 +27319,16 @@ impl ResidentDecodeState {
                 eprintln!("[prefill-trace]   {label}: {}ms", us / 1000);
             }
         }
+        let layer_inputs: Vec<Vec<f32>> = capture_bufs
+            .iter()
+            .map(|capture| {
+                let mut out = vec![0.0f32; n_tokens * self.hidden];
+                read_buffer_f32(capture, &mut out);
+                out
+            })
+            .collect();
         self.filled = n_tokens;
-        Some(())
+        Some(layer_inputs)
     }
 
     /// Long-prompt TTFT campaign, Tier A — **batched weight streaming, BIT-IDENTICAL
@@ -27197,8 +28551,46 @@ impl ResidentDecodeState {
             scale,
             false,
             None,
+            &[],
         )
-        .map(|(preds, _)| preds)
+        .map(|(preds, _, _)| preds)
+    }
+
+    /// Resident speculative verify with snapshots of selected target decoder layer inputs.
+    ///
+    /// Each returned capture is row-major `[k, hidden]`, and capture order exactly matches
+    /// `capture_layer_ids`. A layer input is the residual stream immediately before that
+    /// zero-based decoder layer executes (so layer 2 is the output after layers 0 and 1).
+    /// Requested ids must be strictly increasing and in range. The snapshots are copied by
+    /// Metal inside the same command buffer as verification, before the resident ping-pong
+    /// activation is overwritten; only the completed snapshots are read back to the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_with_layer_inputs(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+        capture_layer_ids: &[usize],
+    ) -> Option<(Vec<u32>, Vec<Vec<f32>>)> {
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            k,
+            scale,
+            false,
+            None,
+            capture_layer_ids,
+        )
+        .map(|(preds, _, layer_inputs)| (preds, layer_inputs))
     }
 
     /// `verify_batch` that also reads back the `k * vocab` pre-argmax logits (the byte-exact
@@ -27228,7 +28620,9 @@ impl ResidentDecodeState {
             scale,
             true,
             None,
+            &[],
         )
+        .map(|(preds, logits, _)| (preds, logits))
     }
 
     /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
@@ -27251,7 +28645,8 @@ impl ResidentDecodeState {
         scale: f32,
         read_logits: bool,
         tree: Option<&TreeAttn>,
-    ) -> Option<(Vec<u32>, Vec<f32>)> {
+        capture_layer_ids: &[usize],
+    ) -> Option<(Vec<u32>, Vec<f32>, Vec<Vec<f32>>)> {
         // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
         // The tree path widens the node cap to TREE_MAX_NODES (a tree of N nodes has at most
         // depth N-1); the linear path keeps the MAX_VERIFY_K window. `None`-tree callers see
@@ -27262,6 +28657,15 @@ impl ResidentDecodeState {
             Self::MAX_VERIFY_K
         };
         if !(1..=k_cap).contains(&k) {
+            return None;
+        }
+        if capture_layer_ids
+            .last()
+            .is_some_and(|&layer_id| layer_id >= self.n_layers)
+            || capture_layer_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
             return None;
         }
         if (self.kv16 || self.kvq8) && tree.is_some() {
@@ -27445,6 +28849,10 @@ impl ResidentDecodeState {
         let pred_buf = nb(k * 4);
         let cos_buf = nb(cos_all.len() * 4);
         let sin_buf = nb(sin_all.len() * 4);
+        let capture_bufs: Vec<Buffer> = capture_layer_ids
+            .iter()
+            .map(|_| nb(k * hidden * 4))
+            .collect();
         // Attention scores scratch (only read by the non-v2 fallback kernel); size to the
         // deepest row's position_count = base+k.
         let scores_buf = nb(n_heads * (base_position + k) * 4);
@@ -27588,6 +28996,16 @@ impl ResidentDecodeState {
             } else {
                 (&act_b, &act_a)
             };
+            if let Ok(capture_slot) = capture_layer_ids.binary_search(&l) {
+                encode_copy_f32(
+                    e,
+                    kern,
+                    cur,
+                    &capture_bufs[capture_slot],
+                    &resid_n,
+                    k * hidden,
+                );
+            }
             let w = &resident[l];
             // --- Attention block ---
             // 1. input RMSNorm (batched, byte-exact vs single rms_norm_f32 per row)
@@ -27871,6 +29289,14 @@ impl ResidentDecodeState {
         } else {
             Vec::new()
         };
+        let layer_inputs: Vec<Vec<f32>> = capture_bufs
+            .iter()
+            .map(|capture| {
+                let mut out = vec![0.0f32; k * hidden];
+                read_buffer_f32(capture, &mut out);
+                out
+            })
+            .collect();
         // The command buffer completed and every host readback above is
         // done: return the round's scratch (activations, scalars, staging
         // from the batched projections) to the pool.
@@ -27915,8 +29341,9 @@ impl ResidentDecodeState {
             keep.push(bb);
         }
         keep.extend(tree_tail_bufs);
+        keep.extend(capture_bufs);
         pool_recycle(kern, keep);
-        Some((preds, logits_out))
+        Some((preds, logits_out, layer_inputs))
     }
 
     /// WIN2METAL Phase 4 — TREE speculative verify. Batched forward over the `n` BFS-ordered
@@ -27960,8 +29387,9 @@ impl ResidentDecodeState {
             scale,
             false,
             Some(&tree),
+            &[],
         )
-        .map(|(preds, _)| preds)
+        .map(|(preds, _, _)| preds)
     }
 
     /// `verify_batch_tree` that also reads back the `n * vocab` pre-argmax logits (the gate
@@ -27994,7 +29422,9 @@ impl ResidentDecodeState {
             scale,
             true,
             Some(&tree),
+            &[],
         )
+        .map(|(preds, logits, _)| (preds, logits))
     }
 
     /// Build the per-node `TreeAttn` descriptor from the ancestor bitset. For node `i`, scan
@@ -28837,6 +30267,20 @@ impl ResidentDecodeState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_with_layer_inputs(
+        &mut self,
+        _embeddings: &[f32],
+        _n_tokens: usize,
+        _layers: &[ResidentLayerWeights],
+        _cos_all: &[f32],
+        _sin_all: &[f32],
+        _scale: f32,
+        _capture_layer_ids: &[usize],
+    ) -> Option<Vec<Vec<f32>>> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn prefill_tokens_windowed(
         &mut self,
         _embeddings: &[f32],
@@ -29288,6 +30732,159 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_copy_f32_preserves_resident_activation_bits() {
+        use super::*;
+
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal pipelines");
+        let values: Vec<f32> = (0..513)
+            .map(|i| match i % 7 {
+                0 => 0.0,
+                1 => -0.0,
+                _ => ((i as f32) - 257.0) * 0.03125,
+            })
+            .collect();
+        let input = kernel.device.new_buffer(
+            std::mem::size_of_val(values.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let output = kernel.device.new_buffer(
+            std::mem::size_of_val(values.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let count = kernel
+            .device
+            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        write_buffer_f32(&input, &values);
+        unsafe {
+            *(count.contents() as *mut u32) = values.len() as u32;
+        }
+
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        encode_copy_f32(encoder, kernel, &input, &output, &count, values.len());
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let mut copied = vec![0.0f32; values.len()];
+        read_buffer_f32(&output, &mut copied);
+        for (i, (&actual, &expected)) in copied.iter().zip(&values).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "copy element {i}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_prefill_captures_requested_layer_inputs() {
+        use super::*;
+
+        if !detect_metal_device().available {
+            return;
+        }
+        if !wire_weights_enabled() {
+            eprintln!(
+                "SKIP metal_kquant_prefill_captures_requested_layer_inputs: run with \
+                 CAMELID_METAL_WIRE=1"
+            );
+            return;
+        }
+
+        let n_layers = 2usize;
+        let n_heads = 8usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 32usize;
+        let hidden = 256usize;
+        let ffn = 256usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let tokens = 3usize;
+        let q4_zeros = |rows: usize, cols: usize| {
+            assert!(cols.is_multiple_of(256));
+            vec![0u8; rows * (cols / 256) * ResidentWeightFormat::Q4K.wire_bytes_per_block()]
+        };
+        let square = q4_zeros(hidden, hidden);
+        let kv = q4_zeros(kv_dim, hidden);
+        let norm = vec![1.0f32; hidden];
+        fn q4(bytes: &[u8]) -> ResidentWeightBytes<'_> {
+            ResidentWeightBytes::KQuantBytes {
+                format: ResidentWeightFormat::Q4K,
+                bytes,
+            }
+        }
+        let layers: Vec<ResidentLayerWeights<'_>> = (0..n_layers)
+            .map(|_| ResidentLayerWeights {
+                attn_norm: &norm,
+                ffn_norm: &norm,
+                q_norm: None,
+                k_norm: None,
+                post_attn_norm: None,
+                post_ffw_norm: None,
+                ffn_geglu: false,
+                q_weight_blocks: q4(&square),
+                k_weight_blocks: q4(&kv),
+                v_weight_blocks: q4(&kv),
+                o_weight_blocks: q4(&square),
+                gate_weight_blocks: q4(&square),
+                up_weight_blocks: q4(&square),
+                down_weight_blocks: q4(&square),
+            })
+            .collect();
+        assert_eq!(q_dim, hidden);
+        assert_eq!(ffn, hidden);
+
+        let embeddings: Vec<f32> = (0..tokens * hidden)
+            .map(|i| ((i % 251) as f32 - 125.0) * 0.0078125 + 0.125)
+            .collect();
+        let cos_all = vec![1.0f32; tokens * (head_dim / 2)];
+        let sin_all = vec![0.0f32; cos_all.len()];
+        let mut session = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn,
+            16,
+            16,
+            1.0e-5,
+            false,
+            None,
+        )
+        .expect("resident session");
+        let captures = session
+            .prefill_tokens_with_layer_inputs(
+                &embeddings,
+                tokens,
+                &layers,
+                &cos_all,
+                &sin_all,
+                1.0 / (head_dim as f32).sqrt(),
+                &[0, 1],
+            )
+            .expect("K-quant f32 prefill capture");
+        assert_eq!(session.filled(), tokens);
+        assert_eq!(captures.len(), 2);
+        for (tap, capture) in captures.iter().enumerate() {
+            assert_eq!(capture.len(), embeddings.len());
+            for (i, (&actual, &expected)) in capture.iter().zip(&embeddings).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "tap {tap} element {i}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn bitnet_i2_s_cleanroom_modes_execute_on_metal() {
@@ -43690,6 +45287,51 @@ mod tests {
                 })
                 .collect();
 
+            // Independent oracle for the input to target layer 1: run only layer 0
+            // token-by-token from the same seeded cache. Its final residual stream is
+            // exactly the two-layer model's pre-layer-1 input.
+            let mut layer1_ref_session = ResidentDecodeState::new(
+                1,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                max_positions,
+                cap,
+                eps,
+                false,
+                None,
+            )
+            .unwrap();
+            let layer0_k = synth_kv(base, 0, false);
+            let layer0_v = synth_kv(base, 0, true);
+            assert!(layer1_ref_session.seed_layer(0, &layer0_k, &layer0_v, base));
+            layer1_ref_session.set_filled(base);
+            let mut ref_layer1_inputs = Vec::with_capacity(k * hidden);
+            for i in 0..k {
+                let out = layer1_ref_session
+                    .forward_token(
+                        &emb_all[i * hidden..(i + 1) * hidden],
+                        &weights[..1],
+                        &cos_all[i * half..(i + 1) * half],
+                        &sin_all[i * half..(i + 1) * half],
+                        None,
+                        base + i,
+                        scale,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .expect("single-layer capture oracle");
+                match out {
+                    ResidentTokenOut::Data(hidden) => ref_layer1_inputs.extend(hidden),
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            }
+
             // Candidate: verify_batch on the identically-seeded session.
             let mut cand_session = mk_session();
             let stage = make_stage();
@@ -43700,6 +45342,47 @@ mod tests {
                 .expect("verify_batch eligible");
             assert_eq!(preds.len(), k);
             assert_eq!(cand_logits.len(), k * vocab);
+
+            // Capture candidate: predictions must be unchanged, layer 0 must snapshot the
+            // input embeddings exactly, and layer 1 must equal the independent one-layer
+            // token-by-token oracle above.
+            let mut capture_session = mk_session();
+            let stage = make_stage();
+            let (capture_preds, captures) = capture_session
+                .verify_batch_with_layer_inputs(
+                    &emb_all,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    base,
+                    k,
+                    scale,
+                    &[0, 1],
+                )
+                .expect("verify capture eligible");
+            assert_eq!(capture_preds, preds);
+            assert_eq!(captures.len(), 2);
+            assert_eq!(captures[0].len(), k * hidden);
+            assert_eq!(captures[1].len(), k * hidden);
+            for (i, (&actual, &expected)) in captures[0].iter().zip(&emb_all).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "base={base} layer-0 capture element {i}: {actual} != {expected}"
+                );
+            }
+            for (i, (&actual, &expected)) in captures[1]
+                .iter()
+                .zip(&ref_layer1_inputs)
+                .enumerate()
+            {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "base={base} layer-1 capture element {i}: {actual} != {expected}"
+                );
+            }
 
             // Hard gate: exact u32 bit identity for every row/element + argmax id equality.
             for i in 0..k {
