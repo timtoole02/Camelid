@@ -13857,6 +13857,9 @@ struct Gemma4Q6KHeadInner {
     q8k_scales: Buffer,
     q8k_quants: Buffer,
     logits: Buffer,
+    /// Lazily allocated width-eight scratch for the experimental speculative
+    /// head. The default ordered-logit lane pays no extra allocation.
+    batch: Option<Gemma4Q6KBatchScratch>,
     matmul_scalar: Buffer,
     output_norm: Vec<f32>,
     eps: f32,
@@ -13866,6 +13869,16 @@ struct Gemma4Q6KHeadInner {
     /// The dense Gemma lane pins the parity-preserving ordered kernel even when
     /// an unrelated Ghost-MoE benchmark has enabled its reassociated turbo path.
     allow_turbo: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct Gemma4Q6KBatchScratch {
+    scales: Buffer,
+    quants: Buffer,
+    permuted: Buffer,
+    logits: Buffer,
+    argmax_ids: Buffer,
+    argmax_vals: Buffer,
 }
 
 #[cfg(target_os = "macos")]
@@ -14013,6 +14026,7 @@ impl Gemma4Q6KHead {
                 q8k_scales,
                 q8k_quants,
                 logits,
+                batch: None,
                 matmul_scalar,
                 output_norm: output_norm.to_vec(),
                 eps,
@@ -14105,6 +14119,144 @@ impl Gemma4Q6KHead {
         }
         Some(output)
     }
+
+    /// Project K final-hidden rows and return only their greedy ids.  K=1 and
+    /// K>1 bind the same strict SPEC50 kernel family, so the normal step and the
+    /// verifier live in one arithmetic universe.  This API is deliberately
+    /// separate from [`Self::forward`]: the established ordered full-logit path
+    /// remains the default until whole-model token parity admits this lane.
+    pub(crate) fn forward_argmax_spec50_batch(&self, hidden_rows: &[f32]) -> Option<Vec<u32>> {
+        let mut state = self.inner.lock().ok()?;
+        if state.hidden == 0 || !hidden_rows.len().is_multiple_of(state.hidden) {
+            return None;
+        }
+        let columns = hidden_rows.len() / state.hidden;
+        if !matches!(columns, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let n_superblocks = state.hidden / 256;
+        let mut scales = Vec::with_capacity(columns * n_superblocks);
+        let mut quants = Vec::with_capacity(columns * state.hidden);
+        for hidden in hidden_rows.chunks_exact(state.hidden) {
+            let normalized =
+                crate::gemma4_runtime::rms_norm(hidden, Some(&state.output_norm), state.eps);
+            let q8 = crate::inference::quantize_q8_k_blocks(&normalized);
+            if q8.len() != n_superblocks {
+                return None;
+            }
+            for block in &q8 {
+                scales.push(block.d);
+                quants.extend_from_slice(&block.qs);
+            }
+        }
+        let kernels = spec50_head::spec50_head_kernels()?;
+        if state.batch.is_none() {
+            let shared = |bytes: usize| {
+                kernels.device.new_buffer(
+                    bytes.max(4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            state.batch = Some(Gemma4Q6KBatchScratch {
+                scales: shared(8 * n_superblocks * std::mem::size_of::<f32>()),
+                quants: shared(8 * state.hidden),
+                permuted: shared(spec50_head::spec50_activation_scratch_bytes(8, state.hidden)),
+                logits: shared(8 * state.vocab * std::mem::size_of::<f32>()),
+                argmax_ids: shared(8 * std::mem::size_of::<u32>()),
+                argmax_vals: shared(8 * std::mem::size_of::<f32>()),
+            });
+        }
+        let batch = state.batch.as_ref()?;
+        write_buffer_f32(&batch.scales, &scales);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                quants.as_ptr(),
+                batch.quants.contents().cast::<i8>(),
+                quants.len(),
+            );
+        }
+
+        let command_buffer = kernels.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        if !spec50_head::encode_q6k_spec50_batch(
+            encoder,
+            kernels,
+            &batch.scales,
+            &batch.quants,
+            &batch.permuted,
+            &state.weight,
+            state.weight_offset as u64,
+            &batch.logits,
+            n_superblocks,
+            state.vocab,
+            columns,
+            state.hidden,
+            state.softcap,
+        ) {
+            encoder.end_encoding();
+            return None;
+        }
+        spec50_head::encode_q6k_spec50_argmax(
+            encoder,
+            kernels,
+            &batch.logits,
+            &batch.argmax_ids,
+            &batch.argmax_vals,
+            state.vocab,
+            columns,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+
+        let mut ids = vec![0u32; columns];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                batch.argmax_ids.contents().cast::<u32>(),
+                ids.as_mut_ptr(),
+                columns,
+            );
+        }
+        Some(ids)
+    }
+
+    /// Borrow one vocab row of the file-backed Q6_K table without allocating or
+    /// copying it.  The callback is deliberately scoped under the head mutex:
+    /// callers may encode work that retains the Metal buffer, but the borrowed
+    /// Rust reference and the row offset cannot escape or race a head dispatch.
+    ///
+    /// This is the target-embedding seam used by the Gemma 4 12B MTP assistant.
+    /// `row_bytes` is `hidden / 256 * 210` (3,150 bytes for the 3,840-wide
+    /// target), and `row_offset` is relative to the beginning of `buffer`.
+    pub(crate) fn with_selected_row_device<R>(
+        &self,
+        token: u32,
+        callback: impl FnOnce(&metal::BufferRef, u64, u64) -> R,
+    ) -> Option<R> {
+        const Q6K_VALUES: usize = 256;
+        const Q6K_WIRE: usize = 210;
+
+        let state = self.inner.lock().ok()?;
+        let token = token as usize;
+        if token >= state.vocab {
+            return None;
+        }
+        let row_bytes = state
+            .hidden
+            .checked_div(Q6K_VALUES)?
+            .checked_mul(Q6K_WIRE)?;
+        let row_offset = state
+            .weight_offset
+            .checked_add(token.checked_mul(row_bytes)?)?;
+        let row_end = row_offset.checked_add(row_bytes)?;
+        if row_end > state.weight.length() as usize {
+            return None;
+        }
+        Some(callback(&state.weight, row_offset as u64, row_bytes as u64))
+    }
 }
 
 /// A resident gemma4 model ready to decode: all weights (layers + tied `token_embd`)
@@ -14127,6 +14279,101 @@ struct Gemma4PliResident {
     pli: Buffer,
     ple_total: usize,
     ple_dim: usize,
+}
+
+/// Reusable width-eight scratch for the dense Gemma 4 12B verifier.  The large
+/// Q4 term slab is private GPU memory; everything read back or populated by the
+/// host stays in coherent shared storage.  No model weights are duplicated.
+#[cfg(target_os = "macos")]
+struct Gemma4Dense12bVerifierScratch {
+    act_a: Buffer,
+    act_b: Buffer,
+    mid: Buffer,
+    norm: Buffer,
+    q_raw: Buffer,
+    k_raw: Buffer,
+    v_raw: Buffer,
+    q_normed: Buffer,
+    k_normed: Buffer,
+    v_normed: Buffer,
+    context: Buffer,
+    projection: Buffer,
+    post: Buffer,
+    gate: Buffer,
+    up: Buffer,
+    activation: Buffer,
+    down: Buffer,
+    input_scales: Buffer,
+    input_quants: Buffer,
+    context_scales: Buffer,
+    context_quants: Buffer,
+    activation_scales: Buffer,
+    activation_quants: Buffer,
+    q4_terms: Buffer,
+    scores: Buffer,
+    denom: Buffer,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Dense12bVerifierScratch {
+    const MAX_K: usize = 8;
+    const HIDDEN: usize = 3_840;
+    const FFN: usize = 15_360;
+    const MAX_Q: usize = 16 * 512;
+    const MAX_KV: usize = 8 * 256;
+
+    fn new(kernel: &MetalLinearKernel, max_positions: usize) -> Option<Self> {
+        let shared = |elements: usize, element_bytes: usize| {
+            kernel
+                .device
+                .new_buffer(
+                    elements.checked_mul(element_bytes)? as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .into()
+        };
+        let f32s = |elements: usize| shared(elements, std::mem::size_of::<f32>());
+        let bytes = |elements: usize| shared(elements, 1);
+        let k = Self::MAX_K;
+        let hidden_blocks = Self::HIDDEN / 32;
+        let context_blocks = Self::MAX_Q / 32;
+        let activation_blocks = Self::FFN / 32;
+        let term_bytes =
+            gemma4_q4_column_term_slab_bytes(Self::FFN, hidden_blocks, Self::MAX_K)?.max(
+                gemma4_q4_column_term_slab_bytes(Self::HIDDEN, activation_blocks, Self::MAX_K)?,
+            );
+        let q4_terms = kernel
+            .device
+            .new_buffer(term_bytes as u64, MTLResourceOptions::StorageModePrivate);
+        Some(Self {
+            act_a: f32s(k * Self::HIDDEN)?,
+            act_b: f32s(k * Self::HIDDEN)?,
+            mid: f32s(k * Self::HIDDEN)?,
+            norm: f32s(k * Self::HIDDEN)?,
+            q_raw: f32s(k * Self::MAX_Q)?,
+            k_raw: f32s(k * Self::MAX_KV)?,
+            v_raw: f32s(k * Self::MAX_KV)?,
+            q_normed: f32s(k * Self::MAX_Q)?,
+            k_normed: f32s(k * Self::MAX_KV)?,
+            v_normed: f32s(k * Self::MAX_KV)?,
+            context: f32s(k * Self::MAX_Q)?,
+            projection: f32s(k * Self::HIDDEN)?,
+            post: f32s(k * Self::HIDDEN)?,
+            gate: f32s(k * Self::FFN)?,
+            up: f32s(k * Self::FFN)?,
+            activation: f32s(k * Self::FFN)?,
+            down: f32s(k * Self::HIDDEN)?,
+            input_scales: f32s(k * hidden_blocks)?,
+            input_quants: bytes(k * Self::HIDDEN)?,
+            context_scales: f32s(k * context_blocks)?,
+            context_quants: bytes(k * Self::MAX_Q)?,
+            activation_scales: f32s(k * activation_blocks)?,
+            activation_quants: bytes(k * Self::FFN)?,
+            q4_terms,
+            scores: f32s(16usize.checked_mul(max_positions)?)?,
+            denom: f32s(16)?,
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -14159,6 +14406,27 @@ pub struct Gemma4ResidentModel {
     eps: f32,
     max_positions: usize,
     scale: f32,
+    /// Lazily allocated only when the opt-in 12B K<=8 verifier is exercised.
+    dense12b_verifier: Mutex<Option<Gemma4Dense12bVerifierScratch>>,
+}
+
+/// A scoped, zero-copy view of one resident Gemma 4 target KV cache.
+///
+/// The physical layout is f32 `[kv_head][max_positions][head_dim]`.  The view
+/// borrows the model-owned Metal buffers and therefore cannot outlive the
+/// closure passed to [`Gemma4ResidentModel::with_kv_device_views`].  Logical
+/// sequence length is intentionally not part of the physical view; the caller
+/// supplies it separately so rejected speculative tail slots remain invisible.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4ResidentKvDeviceView<'a> {
+    pub(crate) source_layer: usize,
+    pub(crate) key: &'a metal::BufferRef,
+    pub(crate) value: &'a metal::BufferRef,
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: u64,
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) max_positions: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -14252,6 +14520,7 @@ impl Gemma4ResidentModel {
             eps,
             max_positions,
             scale,
+            dense12b_verifier: Mutex::new(None),
         })
     }
 
@@ -14294,6 +14563,685 @@ impl Gemma4ResidentModel {
             ple_dim,
         });
         true
+    }
+
+    /// Borrow selected target KV caches without staging them through the CPU.
+    /// Every requested layer must own a cache; validation is completed before
+    /// the callback runs, so a refusal has no side effect.  The serving runtime
+    /// serializes this callback with target forwards on the same Metal queue.
+    pub(crate) fn with_kv_device_views<R>(
+        &self,
+        source_layers: &[usize],
+        callback: impl FnOnce(&[Gemma4ResidentKvDeviceView<'_>]) -> R,
+    ) -> Option<R> {
+        if source_layers.is_empty() {
+            return None;
+        }
+        let mut views = Vec::with_capacity(source_layers.len());
+        for &source_layer in source_layers {
+            let layer = self.layers.get(source_layer)?;
+            let (key, value) = self.caches.get(source_layer)?.as_ref()?;
+            let elements = layer
+                .n_kv_heads
+                .checked_mul(self.max_positions)?
+                .checked_mul(layer.head_dim)?;
+            let byte_len = elements.checked_mul(std::mem::size_of::<f32>())? as u64;
+            if key.length() != byte_len || value.length() != byte_len {
+                return None;
+            }
+            views.push(Gemma4ResidentKvDeviceView {
+                source_layer,
+                key,
+                value,
+                byte_offset: 0,
+                byte_len,
+                kv_heads: layer.n_kv_heads,
+                head_dim: layer.head_dim,
+                max_positions: self.max_positions,
+            });
+        }
+        Some(callback(&views))
+    }
+
+    /// Exact dense Gemma 4 12B verifier foundation for K=1/2/4/8 consecutive
+    /// rows.  Q4 projections share each weight traversal across the K Q8_0
+    /// columns; row-wise QK norm, RoPE, f32 KV scatter, split-three attention,
+    /// sandwich norms, GeGLU and residuals retain the K=1 dispatch arithmetic.
+    ///
+    /// The method intentionally stops before the tied Q6_K head and returns
+    /// row-major `[K][3840]` final hidden states.  It does not own logical
+    /// sequence state: all candidate KV slots are physically materialized, and
+    /// the caller commits a prefix by advancing only its logical length.  A
+    /// rejected tail is harmless because every attention row is bounded by its
+    /// explicit `position_count`, and the next call overwrites those slots.
+    ///
+    /// This path is fail-closed to the exact 48-layer dense QAT geometry.  It is
+    /// additive and is never selected by [`Self::forward_token_hidden`].
+    pub(crate) fn verify_consecutive_hidden_ordered_q4(
+        &self,
+        h0_rows: &[f32],
+        inputs_by_row: &[Vec<Gemma4TokenLayerInput>],
+        base_position: usize,
+    ) -> Option<Vec<f32>> {
+        const LAYERS: usize = 48;
+        const HIDDEN: usize = 3_840;
+        const FFN: usize = 15_360;
+        const HEADS: usize = 16;
+        const SLIDING_HEAD_DIM: usize = 256;
+        const GLOBAL_HEAD_DIM: usize = 512;
+        const SLIDING_KV_HEADS: usize = 8;
+        const GLOBAL_KV_HEADS: usize = 1;
+        const SLIDING_WINDOW: usize = 1_024;
+
+        let columns = inputs_by_row.len();
+        if !matches!(columns, 1 | 2 | 4 | 8)
+            || self.layers.len() != LAYERS
+            || self.hidden != HIDDEN
+            || h0_rows.len() != columns.checked_mul(HIDDEN)?
+            || base_position.checked_add(columns)? > self.max_positions
+            || self.ple.iter().any(Option::is_some)
+            || self.ple_bufs.iter().any(Option::is_some)
+            || self.pli_res.is_some()
+            || self.owns_kv.iter().any(|&owns| !owns)
+            || self
+                .kv_source
+                .iter()
+                .enumerate()
+                .any(|(layer, &source)| source != layer)
+            || !self.scale.is_finite()
+            || self.scale.to_bits() != 1.0f32.to_bits()
+        {
+            return None;
+        }
+
+        let q4_bytes = |rows: usize, input: usize| -> Option<u64> {
+            Some(rows.checked_mul(input.checked_div(32)?)?.checked_mul(18)? as u64)
+        };
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let sliding = layer_idx % 6 != 5;
+            let (head_dim, kv_heads) = if sliding {
+                (SLIDING_HEAD_DIM, SLIDING_KV_HEADS)
+            } else {
+                (GLOBAL_HEAD_DIM, GLOBAL_KV_HEADS)
+            };
+            let q_dim = HEADS * head_dim;
+            let kv_dim = kv_heads * head_dim;
+            if layer.fmt != GemmaWireFmt::Q4_0
+                || layer.n_heads != HEADS
+                || layer.n_kv_heads != kv_heads
+                || layer.head_dim != head_dim
+                || layer.ffn_dim != FFN
+                || layer.attn_norm.len() != HIDDEN
+                || layer.q_norm.len() != head_dim
+                || layer.k_norm.len() != head_dim
+                || layer.post_attn_norm.len() != HIDDEN
+                || layer.ffn_norm.len() != HIDDEN
+                || layer.post_ffw_norm.len() != HIDDEN
+                || sliding != layer.v_w.is_some()
+                || layer.q_w.length() < q4_bytes(q_dim, HIDDEN)?
+                || layer.k_w.length() < q4_bytes(kv_dim, HIDDEN)?
+                || layer
+                    .v_w
+                    .as_ref()
+                    .is_some_and(|weight| weight.length() < q4_bytes(kv_dim, HIDDEN).unwrap())
+                || layer.o_w.length() < q4_bytes(HIDDEN, q_dim)?
+                || layer.gate_w.length() < q4_bytes(FFN, HIDDEN)?
+                || layer.up_w.length() < q4_bytes(FFN, HIDDEN)?
+                || layer.down_w.length() < q4_bytes(HIDDEN, FFN)?
+                || !layer.eps.is_finite()
+                || layer.eps <= 0.0
+                || layer.eps.to_bits() != self.eps.to_bits()
+                || !self.layer_scales[layer_idx].is_finite()
+            {
+                return None;
+            }
+        }
+        for (row, inputs) in inputs_by_row.iter().enumerate() {
+            if inputs.len() != LAYERS {
+                return None;
+            }
+            let position = base_position + row;
+            let filled = position + 1;
+            for (layer_idx, input) in inputs.iter().enumerate() {
+                let sliding = layer_idx % 6 != 5;
+                let head_dim = if sliding {
+                    SLIDING_HEAD_DIM
+                } else {
+                    GLOBAL_HEAD_DIM
+                };
+                let expected_window_start = if sliding {
+                    filled.saturating_sub(SLIDING_WINDOW)
+                } else {
+                    0
+                };
+                if input.cos_t.len() != head_dim / 2
+                    || input.sin_t.len() != head_dim / 2
+                    || !input.pli.is_empty()
+                    || input.window_start != expected_window_start
+                    || input
+                        .cos_t
+                        .iter()
+                        .chain(&input.sin_t)
+                        .any(|value| !value.is_finite())
+                {
+                    return None;
+                }
+            }
+        }
+
+        let kernel = metal_linear_kernel()?;
+        let mut scratch_guard = self.dense12b_verifier.lock().ok()?;
+        if scratch_guard.is_none() {
+            *scratch_guard = Some(Gemma4Dense12bVerifierScratch::new(
+                kernel,
+                self.max_positions,
+            )?);
+        }
+        let scratch = scratch_guard.as_ref()?;
+        write_buffer_f32(&scratch.act_a, h0_rows);
+
+        let shared = |bytes: usize| {
+            kernel
+                .device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let upload_f32 = |values: &[f32]| {
+            let buffer = shared(std::mem::size_of_val(values));
+            write_buffer_f32(&buffer, values);
+            buffer
+        };
+        let u32_arg = |value: usize| {
+            let buffer = shared(4);
+            unsafe {
+                *buffer.contents().cast::<u32>() = value as u32;
+            }
+            buffer
+        };
+        let hidden_blocks = HIDDEN / 32;
+        let activation_blocks = FFN / 32;
+        let input_block_count = u32_arg(columns * hidden_blocks);
+        let activation_block_count = u32_arg(columns * activation_blocks);
+        let hidden_count = u32_arg(columns * HIDDEN);
+        let activation_count = u32_arg(columns * FFN);
+        let kv16_write = u32_arg(0);
+        let rms_scalar = shared(8);
+        unsafe {
+            let args = rms_scalar.contents().cast::<u8>();
+            *args.cast::<u32>() = HIDDEN as u32;
+            *args.add(4).cast::<f32>() = self.eps;
+        }
+
+        let started = std::time::Instant::now();
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let mut keep = vec![
+            input_block_count,
+            activation_block_count,
+            hidden_count,
+            activation_count,
+            kv16_write,
+            rms_scalar,
+        ];
+        let mut from_a = true;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let sliding = layer_idx % 6 != 5;
+            let q_dim = HEADS * layer.head_dim;
+            let kv_dim = layer.n_kv_heads * layer.head_dim;
+            let context_blocks = q_dim / 32;
+            let (current, next) = if from_a {
+                (&scratch.act_a, &scratch.act_b)
+            } else {
+                (&scratch.act_b, &scratch.act_a)
+            };
+
+            let attn_norm = upload_f32(&layer.attn_norm);
+            let q_norm = upload_f32(&layer.q_norm);
+            let k_norm = upload_f32(&layer.k_norm);
+            let post_attn_norm = upload_f32(&layer.post_attn_norm);
+            let ffn_norm = upload_f32(&layer.ffn_norm);
+            let post_ffw_norm = upload_f32(&layer.post_ffw_norm);
+            keep.extend([
+                attn_norm.to_owned(),
+                q_norm.to_owned(),
+                k_norm.to_owned(),
+                post_attn_norm.to_owned(),
+                ffn_norm.to_owned(),
+                post_ffw_norm.to_owned(),
+            ]);
+
+            // Attention input norm and one shared Q8_0 activation panel.
+            encode_rms_norm_batch(
+                kernel,
+                encoder,
+                current,
+                &attn_norm,
+                &scratch.norm,
+                &keep[5],
+                columns,
+            );
+            encode_quantize(
+                encoder,
+                kernel,
+                &scratch.norm,
+                &scratch.input_scales,
+                &scratch.input_quants,
+                &keep[0],
+                columns * hidden_blocks,
+            );
+            if !encode_gemma4_q4_0_q8_ordered_columns(
+                encoder,
+                kernel,
+                &scratch.input_scales,
+                &scratch.input_quants,
+                &layer.q_w,
+                0,
+                &scratch.q_raw,
+                Some(&scratch.q4_terms),
+                q_dim,
+                hidden_blocks,
+                columns,
+            ) || !encode_gemma4_q4_0_q8_ordered_columns(
+                encoder,
+                kernel,
+                &scratch.input_scales,
+                &scratch.input_quants,
+                &layer.k_w,
+                0,
+                &scratch.k_raw,
+                Some(&scratch.q4_terms),
+                kv_dim,
+                hidden_blocks,
+                columns,
+            ) {
+                encoder.end_encoding();
+                return None;
+            }
+            if let Some(value_weight) = layer.v_w.as_ref() {
+                if !encode_gemma4_q4_0_q8_ordered_columns(
+                    encoder,
+                    kernel,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    value_weight,
+                    0,
+                    &scratch.v_raw,
+                    Some(&scratch.q4_terms),
+                    kv_dim,
+                    hidden_blocks,
+                    columns,
+                ) {
+                    encoder.end_encoding();
+                    return None;
+                }
+            }
+
+            let q_head_args = shared(12);
+            let k_head_args = shared(12);
+            let v_head_args = shared(12);
+            for (buffer, use_weight) in [
+                (&q_head_args, 1u32),
+                (&k_head_args, 1u32),
+                (&v_head_args, 0u32),
+            ] {
+                unsafe {
+                    let args = buffer.contents().cast::<u8>();
+                    *args.cast::<u32>() = layer.head_dim as u32;
+                    *args.add(4).cast::<f32>() = layer.eps;
+                    *args.add(8).cast::<u32>() = use_weight;
+                }
+            }
+            let rope_q_args = shared(16);
+            let rope_k_args = shared(16);
+            for (buffer, heads) in [(&rope_q_args, HEADS), (&rope_k_args, layer.n_kv_heads)] {
+                unsafe {
+                    let args = buffer.contents().cast::<u32>();
+                    *args = heads as u32;
+                    *args.add(1) = layer.head_dim as u32;
+                    *args.add(2) = (layer.head_dim / 2) as u32;
+                    *args.add(3) = 1;
+                }
+            }
+            let mut cos_all = Vec::with_capacity(columns * layer.head_dim / 2);
+            let mut sin_all = Vec::with_capacity(columns * layer.head_dim / 2);
+            for inputs in inputs_by_row {
+                cos_all.extend_from_slice(&inputs[layer_idx].cos_t);
+                sin_all.extend_from_slice(&inputs[layer_idx].sin_t);
+            }
+            let cos = upload_f32(&cos_all);
+            let sin = upload_f32(&sin_all);
+            keep.extend([
+                q_head_args.to_owned(),
+                k_head_args.to_owned(),
+                v_head_args.to_owned(),
+                rope_q_args.to_owned(),
+                rope_k_args.to_owned(),
+                cos.to_owned(),
+                sin.to_owned(),
+            ]);
+
+            for row in 0..columns {
+                let q_offset = (row * q_dim * 4) as u64;
+                let kv_offset = (row * kv_dim * 4) as u64;
+                encode_rms_norm_per_head(
+                    encoder,
+                    kernel,
+                    &scratch.q_raw,
+                    &q_norm,
+                    &scratch.q_normed,
+                    &q_head_args,
+                    HEADS,
+                    q_offset,
+                );
+                encode_rms_norm_per_head(
+                    encoder,
+                    kernel,
+                    &scratch.k_raw,
+                    &k_norm,
+                    &scratch.k_normed,
+                    &k_head_args,
+                    layer.n_kv_heads,
+                    kv_offset,
+                );
+                encode_rms_norm_per_head(
+                    encoder,
+                    kernel,
+                    layer
+                        .v_w
+                        .as_ref()
+                        .map_or(&scratch.k_raw, |_| &scratch.v_raw),
+                    &q_norm,
+                    &scratch.v_normed,
+                    &v_head_args,
+                    layer.n_kv_heads,
+                    kv_offset,
+                );
+                let table_offset = (row * (layer.head_dim / 2) * 4) as u64;
+                encode_rope(
+                    encoder,
+                    kernel,
+                    &scratch.q_normed,
+                    &cos,
+                    &sin,
+                    &rope_q_args,
+                    HEADS,
+                    layer.head_dim / 2,
+                    q_offset,
+                    table_offset,
+                );
+                encode_rope(
+                    encoder,
+                    kernel,
+                    &scratch.k_normed,
+                    &cos,
+                    &sin,
+                    &rope_k_args,
+                    layer.n_kv_heads,
+                    layer.head_dim / 2,
+                    kv_offset,
+                    table_offset,
+                );
+            }
+
+            let (cache_k, cache_v) = self.caches[layer_idx].as_ref()?;
+            for row in 0..columns {
+                let position = base_position + row;
+                let scatter_args = shared(16);
+                unsafe {
+                    let args = scatter_args.contents().cast::<u32>();
+                    *args = layer.head_dim as u32;
+                    *args.add(1) = self.max_positions as u32;
+                    *args.add(2) = position as u32;
+                    *args.add(3) = kv_dim as u32;
+                }
+                encoder.set_compute_pipeline_state(&kernel.kv_scatter_pipeline);
+                encoder.set_buffer(0, Some(&scratch.k_normed), (row * kv_dim * 4) as u64);
+                encoder.set_buffer(1, Some(&scratch.v_normed), (row * kv_dim * 4) as u64);
+                encoder.set_buffer(2, Some(cache_k), 0);
+                encoder.set_buffer(3, Some(cache_v), 0);
+                encoder.set_buffer(4, Some(&scatter_args), 0);
+                encoder.set_buffer(5, Some(&scatter_args), 4);
+                encoder.set_buffer(6, Some(&scatter_args), 8);
+                encoder.set_buffer(7, Some(&scatter_args), 12);
+                encoder.set_buffer(8, Some(&scatter_args), 0);
+                encoder.set_buffer(9, Some(&scatter_args), 0);
+                encoder.set_buffer(10, Some(&keep[4]), 0);
+                dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
+                keep.push(scatter_args);
+            }
+
+            // Every row keeps its own immutable scalar blocks.  Reusing one
+            // host-visible argument buffer would make all queued dispatches see
+            // the last row's position at execution time.
+            for row in 0..columns {
+                let position = base_position + row;
+                let filled = position + 1;
+                let window_start = if sliding {
+                    filled.saturating_sub(SLIDING_WINDOW)
+                } else {
+                    0
+                };
+                let position_count = filled - window_start;
+                let attention_args = shared(32);
+                unsafe {
+                    let args = attention_args.contents().cast::<u8>();
+                    *args.cast::<u32>() = HEADS as u32;
+                    *args.add(4).cast::<u32>() = layer.head_dim as u32;
+                    *args.add(8).cast::<u32>() = position_count as u32;
+                    *args.add(12).cast::<u32>() = (HEADS / layer.n_kv_heads) as u32;
+                    *args.add(16).cast::<f32>() = 1.0;
+                    *args.add(20).cast::<u32>() = layer.head_dim as u32;
+                    *args.add(24).cast::<u32>() = (self.max_positions * layer.head_dim) as u32;
+                    *args.add(28).cast::<u32>() = (window_start * layer.head_dim) as u32;
+                }
+                let attention_blocks = shared(8);
+                encode_attention_split3(
+                    encoder,
+                    kernel,
+                    &scratch.q_normed,
+                    cache_k,
+                    cache_v,
+                    &scratch.scores,
+                    &scratch.denom,
+                    &scratch.context,
+                    &attention_args,
+                    &attention_blocks,
+                    HEADS,
+                    layer.head_dim,
+                    position_count,
+                    (row * q_dim * 4) as u64,
+                    (row * q_dim * 4) as u64,
+                );
+                keep.extend([attention_args, attention_blocks]);
+            }
+
+            let context_block_count = u32_arg(columns * context_blocks);
+            encode_quantize(
+                encoder,
+                kernel,
+                &scratch.context,
+                &scratch.context_scales,
+                &scratch.context_quants,
+                &context_block_count,
+                columns * context_blocks,
+            );
+            if !encode_gemma4_q4_0_q8_ordered_columns(
+                encoder,
+                kernel,
+                &scratch.context_scales,
+                &scratch.context_quants,
+                &layer.o_w,
+                0,
+                &scratch.projection,
+                Some(&scratch.q4_terms),
+                HIDDEN,
+                context_blocks,
+                columns,
+            ) {
+                encoder.end_encoding();
+                return None;
+            }
+            encode_rms_norm_batch(
+                kernel,
+                encoder,
+                &scratch.projection,
+                &post_attn_norm,
+                &scratch.post,
+                &keep[5],
+                columns,
+            );
+            encode_binary(
+                encoder,
+                &kernel.residual_add_pipeline,
+                current,
+                &scratch.post,
+                &scratch.mid,
+                &keep[2],
+                columns * HIDDEN,
+            );
+            keep.push(context_block_count);
+
+            // Dense FFN: norm -> Q4 gate/up -> GeGLU -> Q4 down -> sandwich
+            // norm -> residual, all K rows in the same ordered-Q4 universe.
+            encode_rms_norm_batch(
+                kernel,
+                encoder,
+                &scratch.mid,
+                &ffn_norm,
+                &scratch.norm,
+                &keep[5],
+                columns,
+            );
+            encode_quantize(
+                encoder,
+                kernel,
+                &scratch.norm,
+                &scratch.input_scales,
+                &scratch.input_quants,
+                &keep[0],
+                columns * hidden_blocks,
+            );
+            if !encode_gemma4_q4_0_q8_ordered_columns(
+                encoder,
+                kernel,
+                &scratch.input_scales,
+                &scratch.input_quants,
+                &layer.gate_w,
+                0,
+                &scratch.gate,
+                Some(&scratch.q4_terms),
+                FFN,
+                hidden_blocks,
+                columns,
+            ) || !encode_gemma4_q4_0_q8_ordered_columns(
+                encoder,
+                kernel,
+                &scratch.input_scales,
+                &scratch.input_quants,
+                &layer.up_w,
+                0,
+                &scratch.up,
+                Some(&scratch.q4_terms),
+                FFN,
+                hidden_blocks,
+                columns,
+            ) {
+                encoder.end_encoding();
+                return None;
+            }
+            encode_binary(
+                encoder,
+                &kernel.gelu_mul_pipeline,
+                &scratch.gate,
+                &scratch.up,
+                &scratch.activation,
+                &keep[3],
+                columns * FFN,
+            );
+            encode_quantize(
+                encoder,
+                kernel,
+                &scratch.activation,
+                &scratch.activation_scales,
+                &scratch.activation_quants,
+                &keep[1],
+                columns * activation_blocks,
+            );
+            if !encode_gemma4_q4_0_q8_ordered_columns(
+                encoder,
+                kernel,
+                &scratch.activation_scales,
+                &scratch.activation_quants,
+                &layer.down_w,
+                0,
+                &scratch.down,
+                Some(&scratch.q4_terms),
+                HIDDEN,
+                activation_blocks,
+                columns,
+            ) {
+                encoder.end_encoding();
+                return None;
+            }
+            encode_rms_norm_batch(
+                kernel,
+                encoder,
+                &scratch.down,
+                &post_ffw_norm,
+                &scratch.post,
+                &keep[5],
+                columns,
+            );
+            encode_binary(
+                encoder,
+                &kernel.residual_add_pipeline,
+                &scratch.mid,
+                &scratch.post,
+                next,
+                &keep[2],
+                columns * HIDDEN,
+            );
+            if self.layer_scales[layer_idx].to_bits() != 1.0f32.to_bits() {
+                let scale_args = shared(8);
+                unsafe {
+                    let args = scale_args.contents().cast::<u8>();
+                    *args.cast::<u32>() = (columns * HIDDEN) as u32;
+                    *args.add(4).cast::<f32>() = self.layer_scales[layer_idx];
+                }
+                encode_scale_f32(encoder, kernel, next, next, &scale_args, columns * HIDDEN);
+                keep.push(scale_args);
+            }
+            from_a = !from_a;
+        }
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        if std::env::var("CAMELID_GEMMA4_VERIFY_TRACE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&command_buffer.to_owned());
+            eprintln!(
+                "[gemma4-12b-verify] base={} K={} wall={}us gpu={}us kernel={}us",
+                base_position,
+                columns,
+                started.elapsed().as_micros(),
+                gpu_us,
+                kernel_us,
+            );
+        }
+        let final_buffer = if from_a {
+            &scratch.act_a
+        } else {
+            &scratch.act_b
+        };
+        let mut hidden = vec![0.0f32; columns * HIDDEN];
+        read_buffer_f32(final_buffer, &mut hidden);
+        drop(keep);
+        Some(hidden)
     }
 
     /// Decode one token at absolute `position`: writes `h0` (the position's scaled

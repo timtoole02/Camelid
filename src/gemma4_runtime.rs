@@ -6478,6 +6478,95 @@ pub struct Gemma4GpuRuntime {
     output_norm: Vec<f32>,
     vocab: usize,
     eps: f32,
+    /// Independent logical cursor for the opt-in ordered-Q4 verifier universe.
+    /// The established logits path never reads or mutates it.
+    verifier_state: std::sync::Mutex<Gemma4DenseVerifierState>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4PendingVerifierBatch {
+    ticket: u64,
+    start_position: usize,
+    width: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct Gemma4DenseVerifierState {
+    logical_len: usize,
+    next_ticket: u64,
+    pending: Option<Gemma4PendingVerifierBatch>,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4DenseVerifierState {
+    fn record_completed_batch(&mut self, start_position: usize, width: usize) -> Option<u64> {
+        if self.pending.is_some()
+            || self.logical_len != start_position
+            || !matches!(width, 1 | 2 | 4 | 8)
+        {
+            return None;
+        }
+        let ticket = self.next_ticket.max(1);
+        self.next_ticket = ticket.wrapping_add(1).max(1);
+        self.pending = Some(Gemma4PendingVerifierBatch {
+            ticket,
+            start_position,
+            width,
+        });
+        Some(ticket)
+    }
+
+    fn resolve_prefix(&mut self, ticket: u64, accepted_rows: usize) -> Option<usize> {
+        let pending = self.pending?;
+        if pending.ticket != ticket || accepted_rows > pending.width {
+            return None;
+        }
+        self.logical_len = pending.start_position.checked_add(accepted_rows)?;
+        self.pending = None;
+        Some(self.logical_len)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod dense_verifier_state_tests {
+    use super::Gemma4DenseVerifierState;
+
+    #[test]
+    fn rejected_tail_is_only_a_logical_cursor_change() {
+        let mut state = Gemma4DenseVerifierState {
+            logical_len: 128,
+            next_ticket: 7,
+            pending: None,
+        };
+        let ticket = state.record_completed_batch(128, 8).expect("K8 ticket");
+        assert_eq!(ticket, 7);
+        assert_eq!(state.logical_len, 128, "tentative rows stay invisible");
+        assert!(state.resolve_prefix(ticket + 1, 4).is_none());
+        assert!(state.pending.is_some(), "wrong ticket cannot consume pending state");
+        assert_eq!(state.resolve_prefix(ticket, 3), Some(131));
+        assert!(state.pending.is_none());
+
+        let rollback = state.record_completed_batch(131, 4).expect("K4 ticket");
+        assert_eq!(state.resolve_prefix(rollback, 0), Some(131));
+        assert!(state.record_completed_batch(132, 1).is_none());
+        assert!(state.record_completed_batch(131, 3).is_none());
+    }
+}
+
+/// Tentative target verification result.  Its K cache rows are physically
+/// present but remain logically invisible until [`Gemma4GpuRuntime::commit_verifier_prefix`]
+/// resolves this ticket.  `greedy_ids[row]` is the target prediction after
+/// consuming candidate `row`; `final_hidden[row]` is the corresponding 3,840
+/// value decoder state consumed by the MTP recurrence.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct Gemma4DenseVerifierBatch {
+    pub ticket: u64,
+    pub start_position: usize,
+    pub greedy_ids: Vec<u32>,
+    pub final_hidden: Vec<Vec<f32>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -6750,11 +6839,234 @@ impl Gemma4GpuRuntime {
             output_norm,
             vocab,
             eps,
+            verifier_state: std::sync::Mutex::new(Gemma4DenseVerifierState {
+                logical_len: 0,
+                next_ticket: 1,
+                pending: None,
+            }),
         })
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    /// Reset only the experimental verifier cursor.  Physical target cache
+    /// bytes are retained and overwritten from position zero on the next K=1
+    /// build step; the established generation lane is unaffected.
+    pub fn reset_dense_verifier_sequence(&self) -> Result<()> {
+        let mut state = self.verifier_state.lock().map_err(|_| {
+            BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
+        })?;
+        state.logical_len = 0;
+        state.pending = None;
+        Ok(())
+    }
+
+    pub fn dense_verifier_logical_len(&self) -> Result<usize> {
+        self.verifier_state
+            .lock()
+            .map(|state| state.logical_len)
+            .map_err(|_| {
+                BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
+            })
+    }
+
+    fn dense_verifier_row_inputs(
+        &self,
+        token: u32,
+        position: usize,
+    ) -> Result<(Vec<f32>, Vec<crate::metal::Gemma4TokenLayerInput>)> {
+        if self.hidden != 3_840
+            || self.n_layers != 48
+            || self.ple_dim != 0
+            || self.per_layer_token_embd.is_some()
+        {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "ordered-Q4 verifier admits only the dense Gemma 4 12B row".into(),
+            ));
+        }
+        let hidden = self.hidden;
+        let h0: Vec<f32> = self
+            .token_embd
+            .dequantize_elements(token as usize * hidden, hidden)?
+            .iter()
+            .map(|value| value * (hidden as f32).sqrt())
+            .collect();
+        let filled = position.checked_add(1).ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture("verifier position overflow".into())
+        })?;
+        let sliding_window = self.g.sliding_window as usize;
+        let mut inputs = Vec::with_capacity(self.n_layers);
+        for layer in 0..self.n_layers {
+            let head_dim = self.g.head_dim_at(layer) as usize;
+            let theta = self.g.rope_freq_base_at(layer);
+            let half = head_dim / 2;
+            let factors = if self.g.is_sliding_layer(layer) {
+                None
+            } else {
+                self.rope_factors.as_deref()
+            };
+            let (mut cos_t, mut sin_t) = (vec![0.0f32; half], vec![0.0f32; half]);
+            for pair in 0..half {
+                let mut frequency = theta.powf(-(2.0 * pair as f32) / head_dim as f32);
+                if let Some(factors) = factors {
+                    frequency /= factors[pair];
+                }
+                let (sin, cos) = (position as f32 * frequency).sin_cos();
+                cos_t[pair] = cos;
+                sin_t[pair] = sin;
+            }
+            inputs.push(crate::metal::Gemma4TokenLayerInput {
+                cos_t,
+                sin_t,
+                pli: Vec::new(),
+                window_start: if self.g.is_sliding_layer(layer) {
+                    filled.saturating_sub(sliding_window)
+                } else {
+                    0
+                },
+            });
+        }
+        Ok((h0, inputs))
+    }
+
+    /// Materialize K=1/2/4/8 target rows in the strict ordered-Q4 verifier
+    /// universe and project all final states through the matching SPEC50 Q6_K
+    /// head.  No logical cursor is advanced yet; the caller must commit an
+    /// accepted prefix (including zero) with the returned ticket.
+    pub fn verify_consecutive_greedy(
+        &self,
+        candidate_tokens: &[u32],
+        start_position: usize,
+    ) -> Result<Gemma4DenseVerifierBatch> {
+        let width = candidate_tokens.len();
+        if !matches!(width, 1 | 2 | 4 | 8) || !self.head_on_cpu {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "dense verifier requires K=1/2/4/8 and a Q6_K tied head".into(),
+            ));
+        }
+        let head = self.q6k_gpu_head.as_ref().ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture(
+                "SPEC50 verifier head unavailable (ordered Q6_K mapping was not admitted)".into(),
+            )
+        })?;
+        let mut state = self.verifier_state.lock().map_err(|_| {
+            BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
+        })?;
+        if state.pending.is_some() || state.logical_len != start_position {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "verifier cursor mismatch: logical_len={}, requested_start={}, pending={}",
+                state.logical_len,
+                start_position,
+                state.pending.is_some(),
+            )));
+        }
+
+        let mut h0_rows = Vec::with_capacity(width * self.hidden);
+        let mut inputs_by_row = Vec::with_capacity(width);
+        for (row, &token) in candidate_tokens.iter().enumerate() {
+            let (h0, inputs) = self.dense_verifier_row_inputs(token, start_position + row)?;
+            h0_rows.extend_from_slice(&h0);
+            inputs_by_row.push(inputs);
+        }
+        let hidden_flat = self
+            .model
+            .verify_consecutive_hidden_ordered_q4(&h0_rows, &inputs_by_row, start_position)
+            .ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture(
+                    "ordered-Q4 K-wide target verifier refused the model or dispatch".into(),
+                )
+            })?;
+        let greedy_ids = head
+            .forward_argmax_spec50_batch(&hidden_flat)
+            .ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture(
+                    "SPEC50 K-wide Q6_K target head failed".into(),
+                )
+            })?;
+        if greedy_ids.len() != width || hidden_flat.len() != width * self.hidden {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "verifier returned an invalid row count".into(),
+            ));
+        }
+        let final_hidden = hidden_flat
+            .chunks_exact(self.hidden)
+            .map(<[f32]>::to_vec)
+            .collect();
+        let ticket = state
+            .record_completed_batch(start_position, width)
+            .ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture(
+                    "verifier cursor changed while the target batch was executing".into(),
+                )
+            })?;
+        Ok(Gemma4DenseVerifierBatch {
+            ticket,
+            start_position,
+            greedy_ids,
+            final_hidden,
+        })
+    }
+
+    /// Resolve a tentative verifier batch.  `accepted_rows` may be zero through
+    /// K.  Only this logical cursor changes; rejected physical KV tail rows are
+    /// ignored and will be overwritten by the next target call.
+    pub fn commit_verifier_prefix(&self, ticket: u64, accepted_rows: usize) -> Result<usize> {
+        let mut state = self.verifier_state.lock().map_err(|_| {
+            BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
+        })?;
+        let pending = state.pending.ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture("no pending verifier batch".into())
+        })?;
+        if pending.ticket != ticket || accepted_rows > pending.width {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "verifier commit mismatch: ticket={ticket}, accepted={accepted_rows}, pending={pending:?}",
+            )));
+        }
+        state.resolve_prefix(ticket, accepted_rows).ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture(
+                "verifier prefix resolution overflowed or lost its ticket".into(),
+            )
+        })
+    }
+
+    pub fn rollback_verifier_batch(&self, ticket: u64) -> Result<usize> {
+        self.commit_verifier_prefix(ticket, 0)
+    }
+
+    /// Build one authoritative normal step in the same arithmetic universe as
+    /// K-wide verification, then commit that single row immediately.
+    pub fn forward_greedy_ordered_q4(
+        &self,
+        token: u32,
+        position: usize,
+    ) -> Result<(u32, Vec<f32>)> {
+        let batch = self.verify_consecutive_greedy(&[token], position)?;
+        let next = batch.greedy_ids[0];
+        let hidden = batch.final_hidden[0].clone();
+        self.commit_verifier_prefix(batch.ticket, 1)?;
+        Ok((next, hidden))
+    }
+
+    /// Scoped no-copy target embedding row for the MTP assistant.
+    pub(crate) fn with_q6k_embedding_row_device<R>(
+        &self,
+        token: u32,
+        callback: impl FnOnce(&metal::BufferRef, u64, u64) -> R,
+    ) -> Option<R> {
+        self.q6k_gpu_head
+            .as_ref()?
+            .with_selected_row_device(token, callback)
+    }
+
+    /// Scoped f32 target KV views (notably layers 46 and 47 for MTP-12).
+    pub(crate) fn with_target_kv_device_views<R>(
+        &self,
+        source_layers: &[usize],
+        callback: impl FnOnce(&[crate::metal::Gemma4ResidentKvDeviceView<'_>]) -> R,
+    ) -> Option<R> {
+        self.model.with_kv_device_views(source_layers, callback)
     }
 
     fn project_q6k_logits_cpu(&self, hidden: &[f32]) -> Vec<f32> {
