@@ -6478,8 +6478,9 @@ pub struct Gemma4GpuRuntime {
     output_norm: Vec<f32>,
     vocab: usize,
     eps: f32,
-    /// Independent logical cursor for the opt-in ordered-Q4 verifier universe.
-    /// The established logits path never reads or mutates it.
+    /// Owns the arithmetic lane for the shared resident KV cache as well as the
+    /// ordered verifier's logical cursor.  One sequence may use either the
+    /// established path or the ordered-Q4 verifier, never both.
     verifier_state: std::sync::Mutex<Gemma4DenseVerifierState>,
 }
 
@@ -6492,8 +6493,18 @@ struct Gemma4PendingVerifierBatch {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Gemma4DenseSequenceLane {
+    #[default]
+    Unclaimed,
+    Established,
+    OrderedVerifier,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct Gemma4DenseVerifierState {
+    lane: Gemma4DenseSequenceLane,
     logical_len: usize,
     next_ticket: u64,
     pending: Option<Gemma4PendingVerifierBatch>,
@@ -6501,8 +6512,54 @@ struct Gemma4DenseVerifierState {
 
 #[cfg(target_os = "macos")]
 impl Gemma4DenseVerifierState {
+    fn claim_established(&mut self, position: usize) -> bool {
+        match self.lane {
+            Gemma4DenseSequenceLane::Unclaimed
+                if position == 0 && self.logical_len == 0 && self.pending.is_none() =>
+            {
+                self.lane = Gemma4DenseSequenceLane::Established;
+                true
+            }
+            Gemma4DenseSequenceLane::Established if position == self.logical_len => true,
+            Gemma4DenseSequenceLane::Unclaimed | Gemma4DenseSequenceLane::OrderedVerifier => false,
+            Gemma4DenseSequenceLane::Established => false,
+        }
+    }
+
+    fn complete_established(&mut self, position: usize) -> bool {
+        if self.lane != Gemma4DenseSequenceLane::Established || self.logical_len != position {
+            return false;
+        }
+        let Some(next) = position.checked_add(1) else {
+            return false;
+        };
+        self.logical_len = next;
+        true
+    }
+
+    fn claim_ordered_verifier(&mut self, start_position: usize) -> bool {
+        match self.lane {
+            Gemma4DenseSequenceLane::Unclaimed
+                if start_position == 0 && self.logical_len == 0 && self.pending.is_none() =>
+            {
+                self.lane = Gemma4DenseSequenceLane::OrderedVerifier;
+                true
+            }
+            Gemma4DenseSequenceLane::OrderedVerifier => true,
+            Gemma4DenseSequenceLane::Unclaimed | Gemma4DenseSequenceLane::Established => false,
+        }
+    }
+
+    fn reset_new_sequence(&mut self) {
+        self.lane = Gemma4DenseSequenceLane::Unclaimed;
+        self.logical_len = 0;
+        self.pending = None;
+        self.next_ticket = self.next_ticket.max(1);
+    }
+
     fn record_completed_batch(&mut self, start_position: usize, width: usize) -> Option<u64> {
-        if self.pending.is_some()
+        if self.lane != Gemma4DenseSequenceLane::OrderedVerifier
+            || self.pending.is_some()
             || self.logical_len != start_position
             || !matches!(width, 1 | 2 | 4 | 8)
         {
@@ -6518,12 +6575,12 @@ impl Gemma4DenseVerifierState {
         Some(ticket)
     }
 
-    fn resolve_prefix(&mut self, ticket: u64, accepted_rows: usize) -> Option<usize> {
+    fn resolve_prefix(&mut self, ticket: u64, consumed_input_rows: usize) -> Option<usize> {
         let pending = self.pending?;
-        if pending.ticket != ticket || accepted_rows > pending.width {
+        if pending.ticket != ticket || consumed_input_rows > pending.width {
             return None;
         }
-        self.logical_len = pending.start_position.checked_add(accepted_rows)?;
+        self.logical_len = pending.start_position.checked_add(consumed_input_rows)?;
         self.pending = None;
         Some(self.logical_len)
     }
@@ -6531,11 +6588,12 @@ impl Gemma4DenseVerifierState {
 
 #[cfg(all(test, target_os = "macos"))]
 mod dense_verifier_state_tests {
-    use super::Gemma4DenseVerifierState;
+    use super::{Gemma4DenseSequenceLane, Gemma4DenseVerifierState};
 
     #[test]
     fn rejected_tail_is_only_a_logical_cursor_change() {
         let mut state = Gemma4DenseVerifierState {
+            lane: Gemma4DenseSequenceLane::OrderedVerifier,
             logical_len: 128,
             next_ticket: 7,
             pending: None,
@@ -6544,7 +6602,10 @@ mod dense_verifier_state_tests {
         assert_eq!(ticket, 7);
         assert_eq!(state.logical_len, 128, "tentative rows stay invisible");
         assert!(state.resolve_prefix(ticket + 1, 4).is_none());
-        assert!(state.pending.is_some(), "wrong ticket cannot consume pending state");
+        assert!(
+            state.pending.is_some(),
+            "wrong ticket cannot consume pending state"
+        );
         assert_eq!(state.resolve_prefix(ticket, 3), Some(131));
         assert!(state.pending.is_none());
 
@@ -6552,6 +6613,59 @@ mod dense_verifier_state_tests {
         assert_eq!(state.resolve_prefix(rollback, 0), Some(131));
         assert!(state.record_completed_batch(132, 1).is_none());
         assert!(state.record_completed_batch(131, 3).is_none());
+    }
+
+    #[test]
+    fn shared_cache_lane_cannot_mix_established_and_ordered_arithmetic() {
+        let mut established = Gemma4DenseVerifierState::default();
+        assert!(
+            !established.claim_established(4),
+            "a fresh cache must start at zero"
+        );
+        assert!(established.claim_established(0));
+        assert!(
+            !established.claim_established(1),
+            "completion advances the established cursor"
+        );
+        assert!(established.complete_established(0));
+        assert!(established.claim_established(1));
+        assert!(!established.claim_established(2));
+        assert!(established.complete_established(1));
+        assert!(established.claim_established(2));
+        assert!(!established.claim_ordered_verifier(2));
+        established.reset_new_sequence();
+        assert!(established.claim_ordered_verifier(0));
+
+        let mut ordered = Gemma4DenseVerifierState::default();
+        assert!(
+            !ordered.claim_ordered_verifier(3),
+            "prompt adoption is forbidden"
+        );
+        assert!(ordered.claim_ordered_verifier(0));
+        assert!(!ordered.claim_established(0));
+        let ticket = ordered.record_completed_batch(0, 1).expect("ordered K1");
+        assert_eq!(ordered.resolve_prefix(ticket, 1), Some(1));
+        assert!(ordered.claim_ordered_verifier(1));
+    }
+
+    #[test]
+    fn speculative_commit_counts_consumed_input_rows_including_anchor() {
+        let mut state = Gemma4DenseVerifierState::default();
+        assert!(state.claim_ordered_verifier(0));
+
+        // [anchor, d1, d2, d3]: an immediate d1 mismatch still consumed the
+        // anchor, so ordinary rejection commits one input row rather than zero.
+        let immediate_mismatch = state.record_completed_batch(0, 4).expect("K4 ticket");
+        assert_eq!(state.resolve_prefix(immediate_mismatch, 1), Some(1));
+
+        // Accepting two drafts consumes anchor+d1+d2 = three input rows. The
+        // target's bonus prediction is an output, not another forwarded row.
+        let two_drafts = state.record_completed_batch(1, 4).expect("next K4 ticket");
+        assert_eq!(state.resolve_prefix(two_drafts, 3), Some(4));
+
+        // Zero is reserved for abandoning/retrying the target work itself.
+        let aborted = state.record_completed_batch(4, 2).expect("abort ticket");
+        assert_eq!(state.resolve_prefix(aborted, 0), Some(4));
     }
 }
 
@@ -6567,6 +6681,33 @@ pub struct Gemma4DenseVerifierBatch {
     pub start_position: usize,
     pub greedy_ids: Vec<u32>,
     pub final_hidden: Vec<Vec<f32>>,
+}
+
+/// Ordered-Q4 prompt replay receipt. `first_greedy_id` is the first generated
+/// output after the complete prompt; `pending_target_hidden` is the final prompt
+/// row that seeds the MTP recurrence without recomputing or adopting a cache
+/// from a different arithmetic lane.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct Gemma4OrderedQ4Prefill {
+    pub prompt_token_count: usize,
+    pub first_greedy_id: u32,
+    pub pending_target_hidden: Vec<f32>,
+    pub prefill_us: u128,
+}
+
+/// K=1 qualification output with prompt and decode wall time kept separate.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct Gemma4OrderedQ4Generation {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+    pub prompt_token_count: usize,
+    pub prefill_us: u128,
+    /// Number of post-prompt target forwards measured by `decode_us`. The first
+    /// output is already produced by the last prefill row and is not counted.
+    pub decode_forward_count: usize,
+    pub decode_us: u128,
 }
 
 #[cfg(target_os = "macos")]
@@ -6840,6 +6981,7 @@ impl Gemma4GpuRuntime {
             vocab,
             eps,
             verifier_state: std::sync::Mutex::new(Gemma4DenseVerifierState {
+                lane: Gemma4DenseSequenceLane::Unclaimed,
                 logical_len: 0,
                 next_ticket: 1,
                 pending: None,
@@ -6851,25 +6993,33 @@ impl Gemma4GpuRuntime {
         &self.tokenizer
     }
 
-    /// Reset only the experimental verifier cursor.  Physical target cache
-    /// bytes are retained and overwritten from position zero on the next K=1
-    /// build step; the established generation lane is unaffected.
+    /// Begin a genuinely new sequence and release ownership of the shared
+    /// resident KV cache arithmetic lane.  Physical bytes are retained, but
+    /// the next established or ordered call must start at position zero and
+    /// overwrites every cache row before it becomes visible.
+    ///
+    /// This is the only supported way to switch between established decode and
+    /// ordered verification. It must not be called to fall back inside a live
+    /// sequence, because the two paths intentionally use different projection
+    /// arithmetic.
     pub fn reset_dense_verifier_sequence(&self) -> Result<()> {
         let mut state = self.verifier_state.lock().map_err(|_| {
             BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
         })?;
-        state.logical_len = 0;
-        state.pending = None;
+        state.reset_new_sequence();
         Ok(())
     }
 
     pub fn dense_verifier_logical_len(&self) -> Result<usize> {
-        self.verifier_state
-            .lock()
-            .map(|state| state.logical_len)
-            .map_err(|_| {
-                BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
-            })
+        let state = self.verifier_state.lock().map_err(|_| {
+            BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
+        })?;
+        if state.lane == Gemma4DenseSequenceLane::Established {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "shared target KV cache is in the established arithmetic lane".into(),
+            ));
+        }
+        Ok(state.logical_len)
     }
 
     fn dense_verifier_row_inputs(
@@ -6934,7 +7084,8 @@ impl Gemma4GpuRuntime {
     /// Materialize K=1/2/4/8 target rows in the strict ordered-Q4 verifier
     /// universe and project all final states through the matching SPEC50 Q6_K
     /// head.  No logical cursor is advanced yet; the caller must commit an
-    /// accepted prefix (including zero) with the returned ticket.
+    /// consumed input-row prefix with the returned ticket. Zero means the whole
+    /// target call is being abandoned/retried, not an ordinary draft mismatch.
     pub fn verify_consecutive_greedy(
         &self,
         candidate_tokens: &[u32],
@@ -6954,6 +7105,12 @@ impl Gemma4GpuRuntime {
         let mut state = self.verifier_state.lock().map_err(|_| {
             BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
         })?;
+        if !state.claim_ordered_verifier(start_position) {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "shared target KV cache is owned by {:?}; ordered verification must claim a new sequence at position zero",
+                state.lane,
+            )));
+        }
         if state.pending.is_some() || state.logical_len != start_position {
             return Err(BackendError::UnsupportedModelArchitecture(format!(
                 "verifier cursor mismatch: logical_len={}, requested_start={}, pending={}",
@@ -7009,28 +7166,40 @@ impl Gemma4GpuRuntime {
         })
     }
 
-    /// Resolve a tentative verifier batch.  `accepted_rows` may be zero through
-    /// K.  Only this logical cursor changes; rejected physical KV tail rows are
-    /// ignored and will be overwritten by the next target call.
-    pub fn commit_verifier_prefix(&self, ticket: u64, accepted_rows: usize) -> Result<usize> {
+    /// Resolve a tentative verifier batch. `consumed_input_rows` counts target
+    /// input rows physically accepted into the prefix, not accepted draft
+    /// tokens or emitted outputs. For `[anchor, d1, ...]`, an immediate draft
+    /// mismatch commits 1 (the anchor), accepting `m` drafts commits `1 + m`,
+    /// and accepting every represented draft commits K; a bonus prediction is
+    /// not a forwarded row. Zero is reserved for abort/retry via
+    /// [`Self::rollback_verifier_batch`].
+    ///
+    /// Only the logical cursor changes; rejected physical KV tail rows are
+    /// ignored and overwritten by the next ordered target call.
+    pub fn commit_verifier_prefix(&self, ticket: u64, consumed_input_rows: usize) -> Result<usize> {
         let mut state = self.verifier_state.lock().map_err(|_| {
             BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
         })?;
         let pending = state.pending.ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("no pending verifier batch".into())
         })?;
-        if pending.ticket != ticket || accepted_rows > pending.width {
+        if pending.ticket != ticket || consumed_input_rows > pending.width {
             return Err(BackendError::UnsupportedModelArchitecture(format!(
-                "verifier commit mismatch: ticket={ticket}, accepted={accepted_rows}, pending={pending:?}",
+                "verifier commit mismatch: ticket={ticket}, consumed_inputs={consumed_input_rows}, pending={pending:?}",
             )));
         }
-        state.resolve_prefix(ticket, accepted_rows).ok_or_else(|| {
-            BackendError::UnsupportedModelArchitecture(
-                "verifier prefix resolution overflowed or lost its ticket".into(),
-            )
-        })
+        state
+            .resolve_prefix(ticket, consumed_input_rows)
+            .ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture(
+                    "verifier prefix resolution overflowed or lost its ticket".into(),
+                )
+            })
     }
 
+    /// Abandon an entire target batch without consuming even its anchor row.
+    /// Ordinary speculative rejection should instead commit the consumed
+    /// anchor/draft prefix with [`Self::commit_verifier_prefix`].
     pub fn rollback_verifier_batch(&self, ticket: u64) -> Result<usize> {
         self.commit_verifier_prefix(ticket, 0)
     }
@@ -7047,6 +7216,106 @@ impl Gemma4GpuRuntime {
         let hidden = batch.final_hidden[0].clone();
         self.commit_verifier_prefix(batch.ticket, 1)?;
         Ok((next, hidden))
+    }
+
+    /// Start a new ordered-Q4 sequence and replay the exact tokenizer prompt
+    /// (`encode(prompt, true, true)`) from position zero through authoritative
+    /// K=1 steps. Every prompt input row is committed. The final prompt
+    /// prediction is the first output token; the matching final hidden row is
+    /// returned for the first MTP recurrence.
+    pub fn prefill_ordered_q4(&self, prompt: &str) -> Result<Gemma4OrderedQ4Prefill> {
+        let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
+        if prompt_tokens.is_empty() {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "ordered-Q4 prompt encoding produced no input rows".into(),
+            ));
+        }
+        self.reset_dense_verifier_sequence()?;
+        let started = std::time::Instant::now();
+        let mut first_greedy_id = 0u32;
+        let mut pending_target_hidden = Vec::new();
+        for (position, &token) in prompt_tokens.iter().enumerate() {
+            (first_greedy_id, pending_target_hidden) =
+                self.forward_greedy_ordered_q4(token, position)?;
+        }
+        Ok(Gemma4OrderedQ4Prefill {
+            prompt_token_count: prompt_tokens.len(),
+            first_greedy_id,
+            pending_target_hidden,
+            prefill_us: started.elapsed().as_micros(),
+        })
+    }
+
+    /// K=1 ordered qualification runner. Stops use the complete Gemma stop set
+    /// (metadata EOS/EOT/EOM plus recognized turn markers); a stop prediction is
+    /// neither emitted nor forwarded. Prompt and decode timing are reported
+    /// separately so generated-token throughput never includes prefill wall.
+    pub fn generate_greedy_ordered_q4(
+        &self,
+        prompt: &str,
+        max_new: usize,
+    ) -> Result<Gemma4OrderedQ4Generation> {
+        let prefill = self.prefill_ordered_q4(prompt)?;
+        let stop_ids = gemma4_stop_token_ids(&self.tokenizer);
+        let decode_started = std::time::Instant::now();
+        let mut next = prefill.first_greedy_id;
+        let mut generated = Vec::with_capacity(max_new);
+        let mut position = prefill.prompt_token_count;
+        let mut decode_forward_count = 0usize;
+        for generated_index in 0..max_new {
+            if stop_ids.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            if generated_index + 1 < max_new {
+                (next, _) = self.forward_greedy_ordered_q4(next, position)?;
+                position += 1;
+                decode_forward_count += 1;
+            }
+        }
+        let decode_us = decode_started.elapsed().as_micros();
+        let text = self.tokenizer.decode(&generated, true)?;
+        Ok(Gemma4OrderedQ4Generation {
+            text,
+            token_ids: generated,
+            prompt_token_count: prefill.prompt_token_count,
+            prefill_us: prefill.prefill_us,
+            decode_forward_count,
+            decode_us,
+        })
+    }
+
+    /// Run the established full-logit lane and ordered K=1 lane on fresh
+    /// sequences, failing at the first greedy-id divergence. This is the
+    /// mandatory whole-target admission gate for SPEC50; component-level kernel
+    /// parity alone is not sufficient.
+    pub fn qualify_ordered_q4_k1(
+        &self,
+        prompt: &str,
+        max_new: usize,
+    ) -> Result<Gemma4OrderedQ4Generation> {
+        self.reset_dense_verifier_sequence()?;
+        let (_, established) = self.generate_greedy(prompt, max_new)?;
+        let ordered = self.generate_greedy_ordered_q4(prompt, max_new)?;
+        if established != ordered.token_ids {
+            let mismatch = established
+                .iter()
+                .zip(&ordered.token_ids)
+                .position(|(left, right)| left != right)
+                .unwrap_or_else(|| established.len().min(ordered.token_ids.len()));
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "ordered-Q4 K1 qualification diverged at output {mismatch}: established={:?}, ordered={:?}",
+                established.get(mismatch),
+                ordered.token_ids.get(mismatch),
+            )));
+        }
+        Ok(ordered)
+    }
+
+    /// Complete model-specific stop set used by both established and ordered
+    /// generation.
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        gemma4_stop_token_ids(&self.tokenizer)
     }
 
     /// Scoped no-copy target embedding row for the MTP assistant.
@@ -7080,6 +7349,17 @@ impl Gemma4GpuRuntime {
 
     /// Run one token's forward on the GPU and return the next-token logits.
     fn forward(&self, token: u32, position: usize) -> Result<Vec<f32>> {
+        let mut sequence = self.verifier_state.lock().map_err(|_| {
+            BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
+        })?;
+        if !sequence.claim_established(position) {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "established target row refused: lane={:?}, cursor={}, requested_position={}; reset only at a new-sequence boundary",
+                sequence.lane,
+                sequence.logical_len,
+                position,
+            )));
+        }
         let t_prep = std::time::Instant::now();
         let hidden = self.hidden;
         let ple_dim = self.ple_dim;
@@ -7181,6 +7461,12 @@ impl Gemma4GpuRuntime {
             );
             FWD_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        if !sequence.complete_established(position) {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "established target cursor changed while the GPU row was executing".into(),
+            ));
+        }
+        drop(sequence);
         Ok(logits)
     }
 
