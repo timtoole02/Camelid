@@ -4528,6 +4528,363 @@ kernel void q6k_linear_mma_mc_v2(
 }
 "#;
 
+// Direct-f32 K-quant GEMV lane, ported from llama.cpp's current Metal
+// N_R0=2/N_SG=2 kernels. This is intentionally a separate arithmetic universe
+// from the Q8_K-activation v2 lane above.
+#[cfg(target_os = "macos")]
+const KQUANT_V3_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void q4k_linear_f32_v3(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+    constexpr uint rows_per_sg = 2;
+    constexpr uint simdgroups = 2;
+
+    const uint first_row = (group * simdgroups + uint(sg)) * rows_per_sg;
+    if (first_row >= rows) return;
+
+    const short ix = lane / 8;
+    const short it = lane % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    float sumf[rows_per_sg] = {0.0f, 0.0f};
+    float yl[16];
+    float yh[16];
+    ushort sc16[4];
+    thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+
+    for (uint ib = uint(ix); ib < n_sb; ib += 4) {
+        device const float* y4 = input + ib * 256 + 64 * uint(iq) + 8 * uint(ir);
+        float4 sumy = float4(0.0f);
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+            const uint row = first_row + uint(rr);
+            if (row >= rows) break;
+            device const uchar* block = weight_blocks + (row * n_sb + ib) * 144;
+            device const ushort* sc = reinterpret_cast<device const ushort*>(block + 4) + iq;
+            device const ushort* q1 = reinterpret_cast<device const ushort*>(block + 16)
+                                      + 16 * iq + 4 * ir;
+            device const ushort* q2 = q1 + 32;
+            device const half* dh = reinterpret_cast<device const half*>(block);
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[rr] += float(dh[0]) * (
+                    (acc1[0] + (1.0f/256.0f) * acc1[1]) * float(sc8[0])
+                  + (acc1[2] + (1.0f/256.0f) * acc1[3]) * float(sc8[1]) * (1.0f/16.0f)
+                  + (acc2[0] + (1.0f/256.0f) * acc2[1]) * float(sc8[4])
+                  + (acc2[2] + (1.0f/256.0f) * acc2[3]) * float(sc8[5]) * (1.0f/16.0f))
+                - float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3])
+                  + sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+    }
+
+    for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+        const uint row = first_row + uint(rr);
+        if (row < rows) {
+            const float total = simd_sum(sumf[rr]);
+            if (lane == 0) output[row] = total;
+        }
+    }
+}
+
+kernel void q4k_linear_f32_mc_v3(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+    constexpr uint rows_per_sg = 2;
+    constexpr uint simdgroups = 2;
+    constexpr uint max_tokens = 8;
+
+    const uint first_row = (group * simdgroups + uint(sg)) * rows_per_sg;
+    if (first_row >= rows) return;
+
+    const short ix = lane / 8;
+    const short it = lane % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    float sumf[max_tokens][rows_per_sg];
+    for (uint t = 0; t < n_tokens; ++t) {
+        sumf[t][0] = 0.0f;
+        sumf[t][1] = 0.0f;
+    }
+
+    for (uint ib = uint(ix); ib < n_sb; ib += 4) {
+        for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+            const uint row = first_row + uint(rr);
+            if (row >= rows) break;
+            device const uchar* block = weight_blocks + (row * n_sb + ib) * 144;
+            device const ushort* sc = reinterpret_cast<device const ushort*>(block + 4) + iq;
+            device const ushort* q1 = reinterpret_cast<device const ushort*>(block + 16)
+                                      + 16 * iq + 4 * ir;
+            device const ushort* q2 = q1 + 32;
+            ushort sc16[4];
+            thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            const ushort4 q1v = ushort4(q1[0], q1[1], q1[2], q1[3]);
+            const ushort4 q2v = ushort4(q2[0], q2[1], q2[2], q2[3]);
+            const float dw = float(*reinterpret_cast<device const half*>(block));
+            const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+
+            for (uint t = 0; t < n_tokens; ++t) {
+                device const float* y4 = input + t * n_sb * 256 + ib * 256
+                                         + 64 * uint(iq) + 8 * uint(ir);
+                float yl[16];
+                float yh[16];
+                float4 sumy = float4(0.0f);
+                for (short i = 0; i < 8; ++i) {
+                    yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                    yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                    yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                    yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+                }
+
+                float4 acc1 = float4(0.0f);
+                float4 acc2 = float4(0.0f);
+                for (short i = 0; i < 4; ++i) {
+                    acc1[0] += yl[2*i + 0] * float(q1v[i] & 0x000F);
+                    acc1[1] += yl[2*i + 1] * float(q1v[i] & 0x0F00);
+                    acc1[2] += yl[2*i + 8] * float(q1v[i] & 0x00F0);
+                    acc1[3] += yl[2*i + 9] * float(q1v[i] & 0xF000);
+                    acc2[0] += yh[2*i + 0] * float(q2v[i] & 0x000F);
+                    acc2[1] += yh[2*i + 1] * float(q2v[i] & 0x0F00);
+                    acc2[2] += yh[2*i + 8] * float(q2v[i] & 0x00F0);
+                    acc2[3] += yh[2*i + 9] * float(q2v[i] & 0xF000);
+                }
+
+                sumf[t][rr] += dw * (
+                        (acc1[0] + (1.0f/256.0f) * acc1[1]) * float(sc8[0])
+                      + (acc1[2] + (1.0f/256.0f) * acc1[3]) * float(sc8[1]) * (1.0f/16.0f)
+                      + (acc2[0] + (1.0f/256.0f) * acc2[1]) * float(sc8[4])
+                      + (acc2[2] + (1.0f/256.0f) * acc2[3]) * float(sc8[5]) * (1.0f/16.0f))
+                    - dm * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3])
+                          + sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+            }
+        }
+    }
+
+    for (uint t = 0; t < n_tokens; ++t) {
+        for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+            const uint row = first_row + uint(rr);
+            if (row < rows) {
+                const float total = simd_sum(sumf[t][rr]);
+                if (lane == 0) output[t * rows + row] = total;
+            }
+        }
+    }
+}
+
+kernel void q6k_linear_f32_v3(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uchar kmask1 = 0x03;
+    constexpr uchar kmask2 = 0x0C;
+    constexpr uchar kmask3 = 0x30;
+    constexpr uchar kmask4 = 0xC0;
+    constexpr uint rows_per_sg = 2;
+    constexpr uint simdgroups = 2;
+
+    const uint first_row = (group * simdgroups + uint(sg)) * rows_per_sg;
+    if (first_row >= rows) return;
+
+    const short tid = lane / 2;
+    const short ix = lane % 2;
+    const short ip = tid / 8;
+    const short il = tid % 8;
+    const short l0 = 4 * il;
+    const short is = 8 * ip + l0 / 16;
+    const uint y_offset = 128 * uint(ip) + uint(l0);
+    const uint q_offset_l = 64 * uint(ip) + uint(l0);
+    const uint q_offset_h = 32 * uint(ip) + uint(l0);
+
+    float sumf[rows_per_sg] = {0.0f, 0.0f};
+    float yl[16];
+
+    for (uint ib = uint(ix); ib < n_sb; ib += 2) {
+        device const float* y = input + ib * 256 + y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+
+        for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+            const uint row = first_row + uint(rr);
+            if (row >= rows) break;
+            device const uchar* block = weight_blocks + (row * n_sb + ib) * 210;
+            device const uchar* q1 = block + q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = block + 128 + q_offset_h;
+            device const char* sc = reinterpret_cast<device const char*>(block + 192) + is;
+            const float d = float(*reinterpret_cast<device const half*>(block + 208));
+
+            float4 sums = float4(0.0f);
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l + 0] * float(int((q1[l] & 0x0F) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * float(int((q2[l] & 0x0F) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * float(int((q1[l] >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * float(int((q2[l] >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+            sumf[rr] += d * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+                           + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+        }
+    }
+
+    for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+        const uint row = first_row + uint(rr);
+        if (row < rows) {
+            const float total = simd_sum(sumf[rr]);
+            if (lane == 0) output[row] = total;
+        }
+    }
+}
+
+kernel void q6k_linear_f32_mc_v3(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uchar kmask1 = 0x03;
+    constexpr uchar kmask2 = 0x0C;
+    constexpr uchar kmask3 = 0x30;
+    constexpr uchar kmask4 = 0xC0;
+    constexpr uint rows_per_sg = 2;
+    constexpr uint simdgroups = 2;
+    constexpr uint max_tokens = 8;
+
+    const uint first_row = (group * simdgroups + uint(sg)) * rows_per_sg;
+    if (first_row >= rows) return;
+
+    const short tid = lane / 2;
+    const short ix = lane % 2;
+    const short ip = tid / 8;
+    const short il = tid % 8;
+    const short l0 = 4 * il;
+    const short is = 8 * ip + l0 / 16;
+    const uint y_offset = 128 * uint(ip) + uint(l0);
+    const uint q_offset_l = 64 * uint(ip) + uint(l0);
+    const uint q_offset_h = 32 * uint(ip) + uint(l0);
+
+    float sumf[max_tokens][rows_per_sg];
+    for (uint t = 0; t < n_tokens; ++t) {
+        sumf[t][0] = 0.0f;
+        sumf[t][1] = 0.0f;
+    }
+
+    for (uint ib = uint(ix); ib < n_sb; ib += 2) {
+        for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+            const uint row = first_row + uint(rr);
+            if (row >= rows) break;
+            device const uchar* block = weight_blocks + (row * n_sb + ib) * 210;
+            device const uchar* q1 = block + q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = block + 128 + q_offset_h;
+            device const char* sc = reinterpret_cast<device const char*>(block + 192) + is;
+            const uchar4 q1v = uchar4(q1[0], q1[1], q1[2], q1[3]);
+            const uchar4 q2v = uchar4(q2[0], q2[1], q2[2], q2[3]);
+            const uchar4 qhv = uchar4(qh[0], qh[1], qh[2], qh[3]);
+            const char4 scv = char4(sc[0], sc[2], sc[4], sc[6]);
+            const float d = float(*reinterpret_cast<device const half*>(block + 208));
+
+            for (uint t = 0; t < n_tokens; ++t) {
+                device const float* y = input + t * n_sb * 256 + ib * 256 + y_offset;
+                float yl[16];
+                for (short l = 0; l < 4; ++l) {
+                    yl[4*l + 0] = y[l +  0];
+                    yl[4*l + 1] = y[l + 32];
+                    yl[4*l + 2] = y[l + 64];
+                    yl[4*l + 3] = y[l + 96];
+                }
+
+                float4 sums = float4(0.0f);
+                for (short l = 0; l < 4; ++l) {
+                    sums[0] += yl[4*l + 0] * float(int((q1v[l] & 0x0F) | ((qhv[l] & kmask1) << 4)) - 32);
+                    sums[1] += yl[4*l + 1] * float(int((q2v[l] & 0x0F) | ((qhv[l] & kmask2) << 2)) - 32);
+                    sums[2] += yl[4*l + 2] * float(int((q1v[l] >> 4) | ((qhv[l] & kmask3) << 0)) - 32);
+                    sums[3] += yl[4*l + 3] * float(int((q2v[l] >> 4) | ((qhv[l] & kmask4) >> 2)) - 32);
+                }
+                sumf[t][rr] += d * (sums[0] * float(scv[0]) + sums[1] * float(scv[1])
+                                   + sums[2] * float(scv[2]) + sums[3] * float(scv[3]));
+            }
+        }
+    }
+
+    for (uint t = 0; t < n_tokens; ++t) {
+        for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+            const uint row = first_row + uint(rr);
+            if (row < rows) {
+                const float total = simd_sum(sumf[t][rr]);
+                if (lane == 0) output[t * rows + row] = total;
+            }
+        }
+    }
+}
+"#;
+
 // Elementwise / norm building blocks for a GPU-resident forward pass. Each mirrors
 // the CPU reference exactly (rms_norm: x / sqrt(mean(x^2) + eps) * w; silu_mul:
 // (g / (1 + e^-g)) * u; residual: a + b) and is parity-checked in tests.
@@ -14617,6 +14974,63 @@ fn encode_resident_kquant_matmul_f32(
         *p.add(1) = rows as u32;
         *p.add(2) = n_tokens as u32;
     }
+    // The v3 lane consumes the graph's f32 activations directly. Keep it to
+    // decode/verify-sized windows: long prompt prefill remains on the existing
+    // quantized batched path, while each <=16-column v3 group is bit-identical
+    // to repeated v3 single-token dispatches.
+    let v3 = if kquant_v3_enabled()
+        && n_tokens <= 2 * KQUANT_V3_MAX_COLUMNS
+        && matches!(
+            weight.format,
+            ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+        )
+    {
+        kquant_v3_kernels()
+    } else {
+        None
+    };
+    if let Some(v3) = v3 {
+        let (single, mc) = match weight.format {
+            ResidentWeightFormat::Q4K => (&v3.q4k_single, &v3.q4k_mc),
+            ResidentWeightFormat::Q6K => (&v3.q6k_single, &v3.q6k_mc),
+            _ => unreachable!(),
+        };
+        let mut t0 = 0usize;
+        while t0 < n_tokens {
+            let gn = (n_tokens - t0).min(KQUANT_V3_MAX_COLUMNS);
+            let group_scalar = pool_get(k, 16);
+            unsafe {
+                let p = group_scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = gn as u32;
+            }
+            e.set_compute_pipeline_state(if gn == 1 { single } else { mc });
+            e.set_buffer(0, Some(y), (t0 * input_width * 4) as u64);
+            e.set_buffer(2, Some(&weight.buffer), 0);
+            e.set_buffer(3, Some(out), (t0 * rows * 4) as u64);
+            e.set_buffer(4, Some(&group_scalar), 0);
+            e.set_buffer(5, Some(&group_scalar), 4);
+            if gn > 1 {
+                e.set_buffer(6, Some(&group_scalar), 8);
+            }
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: rows.div_ceil(4) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            keep.push(group_scalar);
+            t0 += gn;
+        }
+        return;
+    }
     e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
     e.set_buffer(0, Some(y), 0);
     e.set_buffer(1, Some(scales), 0);
@@ -14896,6 +15310,9 @@ const VERIFY_GEMV_NR0: u64 = 4;
 // one-tail-lane-per-column both hold to 16 columns (worst production shape,
 // ffn_dim 11008 Q4K: 43*9*16*4 = 24,768 bytes, still asserted per dispatch).
 const KQUANT_MC_MAX_COLUMNS: usize = 16;
+/// Register-bounded column count in the direct-f32 v3 kernels. Wider bounded
+/// windows are emitted as consecutive independent groups by the host.
+const KQUANT_V3_MAX_COLUMNS: usize = 8;
 
 fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
@@ -14908,6 +15325,61 @@ fn kquant_mc_gemv_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         kquant_mc_gemv_from(std::env::var("CAMELID_KQUANT_MC_GEMV").ok().as_deref())
+    })
+}
+
+/// Pipelines for the direct-f32 v3 Q4_K/Q6_K lane. Unlike v2 this follows the
+/// llama.cpp two-rows-per-SIMDgroup arithmetic; single and multi-column results
+/// form their own bit universe.
+#[cfg(target_os = "macos")]
+struct KquantV3Kernels {
+    q4k_single: ComputePipelineState,
+    q4k_mc: ComputePipelineState,
+    q6k_single: ComputePipelineState,
+    q6k_mc: ComputePipelineState,
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v3_kernels() -> Option<&'static KquantV3Kernels> {
+    static KERNELS: OnceLock<Option<KquantV3Kernels>> = OnceLock::new();
+    KERNELS
+        .get_or_init(|| {
+            let kern = metal_linear_kernel()?;
+            let options = CompileOptions::new();
+            // The mc kernel caches wire values in registers, so strict math is
+            // the proof boundary that keeps its per-column f32 fold identical
+            // to the single kernel. Microbenchmarks show no single-token loss.
+            options.set_fast_math_enabled(false);
+            let library = kern
+                .device
+                .new_library_with_source(KQUANT_V3_SHADER, &options)
+                .map_err(|err| eprintln!("[metal] KQUANT_V3_SHADER compile failed: {err}"))
+                .ok()?;
+            let pipeline = |name: &str| -> Option<ComputePipelineState> {
+                let function = library.get_function(name, None).ok()?;
+                kern.device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()
+            };
+            Some(KquantV3Kernels {
+                q4k_single: pipeline("q4k_linear_f32_v3")?,
+                q4k_mc: pipeline("q4k_linear_f32_mc_v3")?,
+                q6k_single: pipeline("q6k_linear_f32_v3")?,
+                q6k_mc: pipeline("q6k_linear_f32_mc_v3")?,
+            })
+        })
+        .as_ref()
+}
+
+/// Opt-in direct-f32 K-quant lane. Kept independent of v2 so certification and
+/// A/B runs can pin either arithmetic universe for the whole process.
+fn kquant_v3_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CAMELID_KQUANT_V3").ok().as_deref(),
+            Some("1")
+        )
     })
 }
 

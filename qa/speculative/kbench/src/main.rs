@@ -42,6 +42,14 @@ fn extract_v2_shader() -> String {
     src[s..e].to_string()
 }
 
+fn extract_v3_shader() -> String {
+    let src = std::fs::read_to_string(metal_source()).expect("read metal.rs");
+    let start_tag = "const KQUANT_V3_SHADER: &str = r#\"";
+    let s = src.find(start_tag).expect("v3 shader start") + start_tag.len();
+    let e = src[s..].find("\"#;").expect("v3 shader end") + s;
+    src[s..e].to_string()
+}
+
 /// The pristine branch-HEAD shader: the certified reference the edited kernels
 /// must stay bit-identical to.
 fn extract_ref_shader() -> String {
@@ -97,6 +105,7 @@ fn main() {
 
     let is_mma = which == "q4kmma" || which == "q6kmma";
     let is_mma_q6 = which == "q6kmma";
+    let is_v3 = which.ends_with("v3");
     let is_v2 = which.ends_with("v2") || is_mma;
     let case = match which {
         "q4k" => Case {
@@ -163,6 +172,22 @@ fn main() {
             mc: "q6k_linear_simd_mc_v2",
             tiled: "q6k_linear_tiled",
         },
+        "q4kv3" => Case {
+            name: "q4kv3",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_f32_v3",
+            mc: "q4k_linear_f32_mc_v3",
+            tiled: "q4k_linear_tiled",
+        },
+        "q6kv3" => Case {
+            name: "q6kv3",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_f32_v3",
+            mc: "q6k_linear_f32_mc_v3",
+            tiled: "q6k_linear_tiled",
+        },
         other => panic!("unknown case {other}"),
     };
     let v2_lib = if is_v2 {
@@ -172,6 +197,17 @@ fn main() {
             device
                 .new_library_with_source(&extract_v2_shader(), &strict)
                 .expect("v2 shader compiles"),
+        )
+    } else {
+        None
+    };
+    let v3_lib = if is_v3 {
+        let v3_options = CompileOptions::new();
+        v3_options.set_fast_math_enabled(false);
+        Some(
+            device
+                .new_library_with_source(&extract_v3_shader(), &v3_options)
+                .expect("v3 shader compiles"),
         )
     } else {
         None
@@ -192,14 +228,32 @@ fn main() {
             .new_compute_pipeline_state_with_function(&f)
             .expect(name)
     };
-    let (single, mc) = if is_v2 {
+    let (single, mc) = if is_v3 {
+        let f_single = v3_lib
+            .as_ref()
+            .unwrap()
+            .get_function(case.single, None)
+            .expect(case.single);
+        let f_mc = v3_lib
+            .as_ref()
+            .unwrap()
+            .get_function(case.mc, None)
+            .expect(case.mc);
+        let p_single = device
+            .new_compute_pipeline_state_with_function(&f_single)
+            .expect(case.single);
+        let p_mc = device
+            .new_compute_pipeline_state_with_function(&f_mc)
+            .expect(case.mc);
+        (p_single, p_mc)
+    } else if is_v2 {
         (v2_pipe(case.single), v2_pipe(case.mc))
     } else {
         (pipe(case.single), pipe(case.mc))
     };
     // v2 is its own bit-universe: the contract is single_v2 == mc_v2 (checked
     // below), not equality with the HEAD kernel.
-    let ref_single = if is_v2 {
+    let ref_single = if is_v2 || is_v3 {
         single.clone()
     } else {
         let f = ref_lib.get_function(case.single, None).expect("ref single");
@@ -308,8 +362,8 @@ fn main() {
     // --- Reference: k single-token dispatches into out_single ------------------
     // Returns amortized ms for ONE set of k dispatches.
     // v2 single: 32 threads (one simdgroup) covering Q4K_V2_ROWS_PER_SG rows.
-    let single_tg: u64 = 32;
-    let rows_per_tg: usize = 1;
+    let single_tg: u64 = if is_v3 { 64 } else { 32 };
+    let rows_per_tg: usize = if is_v3 { 4 } else { 1 };
     let run_single_k = |k: usize, timed_iters: usize| -> f64 {
         let scalar = scalar_for(1);
         let tg_bytes =
@@ -321,18 +375,18 @@ fn main() {
             for _rep in 0..REPS {
                 for t in 0..k {
                     e.set_compute_pipeline_state(&single);
-                    e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
-                    e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
+                    if is_v3 {
+                        e.set_buffer(0, Some(&y_buf), (t * cols * 4) as u64);
+                    } else {
+                        e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
+                        e.set_buffer(1, Some(&quants_buf), (t * cols) as u64);
+                    }
                     e.set_buffer(2, Some(&w_buf), 0);
                     e.set_buffer(3, Some(&out_single), (t * rows * 4) as u64);
                     e.set_buffer(4, Some(&scalar), 0);
                     e.set_buffer(5, Some(&scalar), 4);
-                    e.set_threadgroup_memory_length(0, tg_bytes);
-                    if rows_per_tg > 1 {
-                        e.set_threadgroup_memory_length(
-                            1,
-                            ((rows_per_tg * 9 * 4).next_multiple_of(16)) as u64,
-                        );
+                    if tg_bytes > 0 {
+                        e.set_threadgroup_memory_length(0, tg_bytes);
                     }
                     e.dispatch_thread_groups(
                         MTLSize {
@@ -474,7 +528,7 @@ fn main() {
     let mc_tg: u64 = std::env::var("KBENCH_MC_TG")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(if is_v3 { 64 } else { 32 });
     let run_mc_scalar = |k: usize, timed_iters: usize| -> f64 {
         let scalar = scalar_for(k);
         let scratch_sb = if is_v2 {
@@ -490,17 +544,27 @@ fn main() {
             let e = cb.new_compute_command_encoder();
             for _rep in 0..REPS {
                 e.set_compute_pipeline_state(&mc);
-                e.set_buffer(0, Some(&scales_buf), 0);
-                e.set_buffer(1, Some(&quants_buf), 0);
+                if is_v3 {
+                    e.set_buffer(0, Some(&y_buf), 0);
+                } else {
+                    e.set_buffer(0, Some(&scales_buf), 0);
+                    e.set_buffer(1, Some(&quants_buf), 0);
+                }
                 e.set_buffer(2, Some(&w_buf), 0);
                 e.set_buffer(3, Some(&out_mc), 0);
                 e.set_buffer(4, Some(&scalar), 0);
                 e.set_buffer(5, Some(&scalar), 4);
                 e.set_buffer(6, Some(&scalar), 8);
-                e.set_threadgroup_memory_length(0, tg_bytes);
+                if tg_bytes > 0 {
+                    e.set_threadgroup_memory_length(0, tg_bytes);
+                }
                 e.dispatch_thread_groups(
                     MTLSize {
-                        width: rows as u64,
+                        width: if is_v3 {
+                            (rows as u64).div_ceil(4)
+                        } else {
+                            rows as u64
+                        },
                         height: 1,
                         depth: 1,
                     },
@@ -570,7 +634,7 @@ fn main() {
     // Bit-identity: edited single(k dispatches) vs the HEAD oracle, k = 16 covers all columns.
     // v2 is its own bit-universe AND its own dispatch geometry, so the HEAD-oracle
     // dispatch does not apply there; single_v2 vs mc_v2 below is the real contract.
-    if !skip_check && !is_v2 {
+    if !skip_check && !is_v2 && !is_v3 {
         let k = max_k;
         run_ref(k);
         run_single_k(k, 1);
@@ -599,7 +663,8 @@ fn main() {
     }
     if !skip_check {
         let debug = std::env::var("KBENCH_MMA_DEBUG").is_ok();
-        for k in 2..=max_k {
+        let max_check_k = if is_v3 { 8 } else { max_k };
+        for k in 2..=max_check_k {
             run_single_k(k, 1);
             run_mc(k, 1);
             let a = unsafe {
@@ -646,8 +711,8 @@ fn main() {
             }
         }
         println!(
-            "{} rows={} n_sb={} bit-identity PASS (k=2..=16)",
-            case.name, rows, n_sb
+            "{} rows={} n_sb={} bit-identity PASS (k=2..={})",
+            case.name, rows, n_sb, max_check_k
         );
     } else {
         println!(
@@ -744,7 +809,12 @@ kernel void probe128(device const uint4* w [[buffer(0)]], device float* out [[bu
         t1,
         weight_bytes / (t1 / 1000.0) / 1e9
     );
-    for k in [2usize, 4, 6, 8, 12, 16] {
+    let perf_ks: &[usize] = if is_v3 {
+        &[2, 4, 6, 8]
+    } else {
+        &[2, 4, 6, 8, 12, 16]
+    };
+    for &k in perf_ks {
         let tk = run_mc(k, iters);
         let tks = run_single_k(k, iters.min(10));
         println!(
