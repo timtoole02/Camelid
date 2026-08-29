@@ -24313,6 +24313,100 @@ fn eagle3_bf16_bytes(rows: usize, cols: usize) -> Option<usize> {
         .checked_mul(std::mem::size_of::<u16>())
 }
 
+/// Experimental draft-only language-model head policy.  The target model remains the
+/// authority for every emitted token, so either approximation can change proposal quality
+/// but cannot change the final greedy stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Eagle3LmHeadPlan {
+    rows: usize,
+    q8: bool,
+}
+
+fn eagle3_parse_env_bool(name: &str, value: Option<&str>) -> std::result::Result<bool, String> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => Err(format!(
+            "EAGLE-3 {name} must be a boolean, got {value:?}"
+        )),
+    }
+}
+
+fn eagle3_lm_head_plan_from(
+    rows: Option<&str>,
+    q8: Option<&str>,
+) -> std::result::Result<Eagle3LmHeadPlan, String> {
+    let rows = match rows.map(str::trim) {
+        None | Some("") => EAGLE3_DRAFT_VOCAB,
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            format!("EAGLE-3 CAMELID_EAGLE3_LM_HEAD_ROWS must be an integer, got {value:?}")
+        })?,
+    };
+    if !(1..=EAGLE3_DRAFT_VOCAB).contains(&rows) {
+        return Err(format!(
+            "EAGLE-3 CAMELID_EAGLE3_LM_HEAD_ROWS must be in 1..={EAGLE3_DRAFT_VOCAB}, got {rows}"
+        ));
+    }
+    Ok(Eagle3LmHeadPlan {
+        rows,
+        q8: eagle3_parse_env_bool("CAMELID_EAGLE3_LM_HEAD_Q8", q8)?,
+    })
+}
+
+fn eagle3_lm_head_plan() -> std::result::Result<Eagle3LmHeadPlan, String> {
+    let rows = std::env::var("CAMELID_EAGLE3_LM_HEAD_ROWS").ok();
+    let q8 = std::env::var("CAMELID_EAGLE3_LM_HEAD_Q8").ok();
+    eagle3_lm_head_plan_from(rows.as_deref(), q8.as_deref())
+}
+
+/// Quantize row-major BF16 weights to GGUF's compact 34-byte Q8_0 wire blocks.  This is
+/// intentionally a load-time transform: the resident decode kernel can then read 8.5 bits
+/// per weight instead of BF16's 16, without an activation or weight staging copy per token.
+fn eagle3_bf16_to_q8_wire(
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    if cols == 0 || !cols.is_multiple_of(32) {
+        return Err(format!(
+            "EAGLE-3 Q8 head input width must be a nonzero multiple of 32, got {cols}"
+        ));
+    }
+    let expected = eagle3_bf16_bytes(rows, cols)
+        .ok_or_else(|| "EAGLE-3 Q8 head BF16 size overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "EAGLE-3 Q8 head got {} BF16 bytes, expected {expected} for [{rows}, {cols}]",
+            bytes.len()
+        ));
+    }
+    let blocks = rows
+        .checked_mul(cols / 32)
+        .ok_or_else(|| "EAGLE-3 Q8 head block count overflow".to_string())?;
+    let wire_bytes = blocks
+        .checked_mul(34)
+        .ok_or_else(|| "EAGLE-3 Q8 head byte size overflow".to_string())?;
+    let mut wire = Vec::new();
+    wire.try_reserve_exact(wire_bytes)
+        .map_err(|error| format!("could not allocate {wire_bytes} EAGLE-3 Q8 bytes: {error}"))?;
+
+    let mut decoded_row = vec![0.0f32; cols];
+    let row_bytes = cols * std::mem::size_of::<u16>();
+    for source_row in bytes.chunks_exact(row_bytes) {
+        for (value, pair) in decoded_row.iter_mut().zip(source_row.chunks_exact(2)) {
+            let bits = u16::from_le_bytes([pair[0], pair[1]]);
+            *value = f32::from_bits(u32::from(bits) << 16);
+        }
+        for block in crate::inference::quantize_q8_0_blocks(&decoded_row) {
+            wire.extend_from_slice(&crate::tensor::f32_to_f16_bits(block.scale).to_le_bytes());
+            wire.extend(block.quants.into_iter().map(|value| value as u8));
+        }
+    }
+    debug_assert_eq!(wire.len(), wire_bytes);
+    Ok(wire)
+}
+
 fn eagle3_validate_weights(
     weights: &Eagle3MetalWeights<'_>,
     max_positions: usize,
@@ -24549,6 +24643,7 @@ pub struct Eagle3MetalState {
     up_proj: ResidentLinearWeight,
     down_proj: ResidentLinearWeight,
     lm_head: ResidentLinearWeight,
+    lm_head_rows: usize,
     input_layernorm: Buffer,
     hidden_norm: Buffer,
     post_attention_layernorm: Buffer,
@@ -24571,6 +24666,32 @@ fn eagle3_upload_bf16(k: &MetalLinearKernel, bytes: &[u8]) -> ResidentLinearWeig
         buffer,
         q8_wire: false,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_upload_q8_wire(
+    k: &MetalLinearKernel,
+    bf16: &[u8],
+    rows: usize,
+    cols: usize,
+) -> std::result::Result<ResidentLinearWeight, String> {
+    let wire = eagle3_bf16_to_q8_wire(bf16, rows, cols)?;
+    if wire.len() as u64 > k.device.max_buffer_length() {
+        return Err(format!(
+            "EAGLE-3 Q8 head allocation {} exceeds Metal maxBufferLength {}",
+            wire.len(),
+            k.device.max_buffer_length()
+        ));
+    }
+    let buffer = k
+        .device
+        .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+    write_buffer_u8(&buffer, &wire);
+    Ok(ResidentLinearWeight {
+        format: ResidentWeightFormat::Q8_0,
+        buffer,
+        q8_wire: true,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -24646,6 +24767,15 @@ impl Eagle3MetalState {
                 k.device.max_buffer_length()
             ));
         }
+        let lm_head_plan = eagle3_lm_head_plan()?;
+        let lm_head_bytes = eagle3_bf16_bytes(lm_head_plan.rows, EAGLE3_HIDDEN)
+            .ok_or_else(|| "EAGLE-3 language-model head byte size overflow".to_string())?;
+        let lm_head_bf16 = &weights.lm_head_bf16[..lm_head_bytes];
+        let lm_head = if lm_head_plan.q8 {
+            eagle3_upload_q8_wire(k, lm_head_bf16, lm_head_plan.rows, EAGLE3_HIDDEN)?
+        } else {
+            eagle3_upload_bf16(k, lm_head_bf16)
+        };
         Ok(Self {
             fc: eagle3_upload_bf16(k, weights.fc_bf16),
             q_proj: eagle3_upload_bf16(k, weights.q_proj_bf16),
@@ -24655,7 +24785,8 @@ impl Eagle3MetalState {
             gate_proj: eagle3_upload_bf16(k, weights.gate_proj_bf16),
             up_proj: eagle3_upload_bf16(k, weights.up_proj_bf16),
             down_proj: eagle3_upload_bf16(k, weights.down_proj_bf16),
-            lm_head: eagle3_upload_bf16(k, weights.lm_head_bf16),
+            lm_head,
+            lm_head_rows: lm_head_plan.rows,
             input_layernorm: eagle3_upload_f32(k, weights.input_layernorm),
             hidden_norm: eagle3_upload_f32(k, weights.hidden_norm),
             post_attention_layernorm: eagle3_upload_f32(k, weights.post_attention_layernorm),
@@ -24956,7 +25087,7 @@ impl Eagle3MetalState {
         let down = f32b(EAGLE3_HIDDEN);
         let raw_hidden = f32b(EAGLE3_HIDDEN);
         let output_normed = f32b(EAGLE3_HIDDEN);
-        let logits = f32b(EAGLE3_DRAFT_VOCAB);
+        let logits = f32b(self.lm_head_rows);
         let selected = nb(4);
 
         let rms_scalar = nb(8);
@@ -25000,10 +25131,10 @@ impl Eagle3MetalState {
             set_mm(&o_scalar, EAGLE3_HIDDEN, EAGLE3_HIDDEN);
             set_mm(&gate_up_scalar, EAGLE3_HIDDEN, EAGLE3_FFN);
             set_mm(&down_scalar, EAGLE3_FFN, EAGLE3_HIDDEN);
-            set_mm(&head_scalar, EAGLE3_HIDDEN, EAGLE3_DRAFT_VOCAB);
+            set_mm(&head_scalar, EAGLE3_HIDDEN, self.lm_head_rows);
             *(residual_n.contents() as *mut u32) = EAGLE3_HIDDEN as u32;
             *(silu_n.contents() as *mut u32) = EAGLE3_FFN as u32;
-            *(vocab_n.contents() as *mut u32) = EAGLE3_DRAFT_VOCAB as u32;
+            *(vocab_n.contents() as *mut u32) = self.lm_head_rows as u32;
             let set_rope = |scalar: &Buffer, heads: usize| {
                 let p = scalar.contents() as *mut u32;
                 *p = heads as u32;
@@ -25246,7 +25377,7 @@ impl Eagle3MetalState {
             &logits,
             &head_scalar,
             EAGLE3_HIDDEN,
-            EAGLE3_DRAFT_VOCAB,
+            self.lm_head_rows,
             1,
         );
         e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
@@ -25272,7 +25403,7 @@ impl Eagle3MetalState {
         let draft_token = unsafe { *(selected.contents() as *const u32) };
         let target_token = eagle3_map_draft_token(draft_token, &self.d2t_offsets);
         let draft_logits = unsafe {
-            std::slice::from_raw_parts(logits.contents() as *const f32, EAGLE3_DRAFT_VOCAB)
+            std::slice::from_raw_parts(logits.contents() as *const f32, self.lm_head_rows)
         };
         let top_candidates = eagle3_rank_top_candidates(draft_logits, &self.d2t_offsets);
         let mut raw_hidden_out = vec![0.0f32; EAGLE3_HIDDEN];
@@ -25517,6 +25648,66 @@ mod eagle3_metal_contract_tests {
                 .collect::<Vec<_>>(),
             (0..EAGLE3_TOP_K_CANDIDATES as u32).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn eagle3_lm_head_plan_is_default_off_and_fail_closed() {
+        assert_eq!(
+            eagle3_lm_head_plan_from(None, None).unwrap(),
+            Eagle3LmHeadPlan {
+                rows: EAGLE3_DRAFT_VOCAB,
+                q8: false,
+            }
+        );
+        assert_eq!(
+            eagle3_lm_head_plan_from(Some("16000"), Some("yes")).unwrap(),
+            Eagle3LmHeadPlan {
+                rows: 16_000,
+                q8: true,
+            }
+        );
+        assert!(eagle3_lm_head_plan_from(Some("0"), None).is_err());
+        assert!(eagle3_lm_head_plan_from(Some("32001"), None).is_err());
+        assert!(eagle3_lm_head_plan_from(Some("sixteen-thousand"), None).is_err());
+        assert!(eagle3_lm_head_plan_from(None, Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn eagle3_q8_head_transform_matches_the_runtime_quantizer() {
+        let values: Vec<f32> = (0..64)
+            .map(|index| (index as f32 - 31.0) / 8.0)
+            .collect();
+        let bf16: Vec<u8> = values
+            .iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let widened: Vec<f32> = bf16
+            .chunks_exact(2)
+            .map(|pair| {
+                let bits = u16::from_le_bytes([pair[0], pair[1]]);
+                f32::from_bits(u32::from(bits) << 16)
+            })
+            .collect();
+        let expected = crate::inference::quantize_q8_0_blocks(&widened);
+        let wire = eagle3_bf16_to_q8_wire(&bf16, 2, 32).unwrap();
+        assert_eq!(wire.len(), 2 * 34);
+        for (encoded, block) in wire.chunks_exact(34).zip(expected) {
+            assert_eq!(
+                &encoded[..2],
+                &crate::tensor::f32_to_f16_bits(block.scale).to_le_bytes()
+            );
+            assert_eq!(
+                &encoded[2..],
+                block
+                    .quants
+                    .iter()
+                    .map(|value| *value as u8)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(eagle3_bf16_to_q8_wire(&bf16, 1, 64).is_ok());
+        assert!(eagle3_bf16_to_q8_wire(&bf16, 2, 31).is_err());
+        assert!(eagle3_bf16_to_q8_wire(&bf16[..bf16.len() - 2], 2, 32).is_err());
     }
 
     #[test]
