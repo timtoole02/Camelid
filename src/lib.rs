@@ -24,6 +24,8 @@ pub mod fit;
 pub mod fit_dims;
 pub mod gait;
 pub mod gemma4_distributed;
+#[cfg(target_os = "macos")]
+pub(crate) mod gemma4_attention_metal;
 pub mod gemma4_mtp;
 pub mod gemma4_mtp_cuda;
 pub mod gemma4_runtime;
