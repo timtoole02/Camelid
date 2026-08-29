@@ -2470,6 +2470,22 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
     },
+    /// Qualify and time the strict K<=8 ordered-Q4 Gemma 4 target verifier.
+    /// This is a developer harness: it first requires whole-output K=1 parity
+    /// with the established GPU lane, then teacher-forces one fixed sequence
+    /// through each requested width and requires every target prediction to
+    /// equal the ordered K=1 result.
+    Gemma4VerifyGpu {
+        path: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 96)]
+        max_tokens: usize,
+        /// Verifier row widths. Only 1,2,4,8 are admitted; each timed batch is
+        /// full-width so rows/s cannot be inflated by a scalar tail.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
+        widths: Vec<usize>,
+    },
     /// Chat with a DiffusionGemma model: render the chat template, run the
     /// bit-exact multi-canvas block-autoregressive denoise loop, detokenize.
     /// CPU-only and slow (each denoise step is a full bidirectional forward);
@@ -4977,6 +4993,186 @@ async fn main() -> anyhow::Result<()> {
                 let _ = (&path, &prompt, max_tokens);
                 return Err(camelid::BackendError::UnsupportedModelArchitecture(
                     "gemma4 GPU runtime requires macOS/Metal".into(),
+                )
+                .into());
+            }
+        }
+        Command::Gemma4VerifyGpu {
+            path,
+            prompt,
+            max_tokens,
+            mut widths,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                widths.sort_unstable();
+                widths.dedup();
+                if widths.is_empty() || widths.iter().any(|width| !matches!(width, 1 | 2 | 4 | 8))
+                {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 ordered verifier widths must be a non-empty subset of 1,2,4,8; got {widths:?}"
+                    ))
+                    .into());
+                }
+                if !widths.contains(&1) {
+                    widths.insert(0, 1);
+                }
+                let max_width = *widths.last().expect("non-empty verifier widths");
+                // UTF-8 bytes are a conservative upper bound for the tokenizer's
+                // byte-fallback pieces. The exact token count is checked after load.
+                let max_positions = 512.max(
+                    prompt
+                        .len()
+                        .saturating_add(max_tokens)
+                        .saturating_add(max_width)
+                        .saturating_add(8),
+                );
+                eprintln!(
+                    "[gemma4-verify] loading {} with KV capacity {max_positions}...",
+                    path.display()
+                );
+                let load_started = std::time::Instant::now();
+                let runtime =
+                    camelid::gemma4_runtime::Gemma4GpuRuntime::load(&path, max_positions)?;
+                let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?;
+                let required_positions = prompt_tokens
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(max_width);
+                if required_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 verifier needs {required_positions} KV positions for prompt={} + max_new={max_tokens} + K={max_width}, but capacity is {max_positions}",
+                        prompt_tokens.len(),
+                    ))
+                    .into());
+                }
+                let load_us = load_started.elapsed().as_micros();
+
+                eprintln!(
+                    "[gemma4-verify] whole-target established-vs-ordered K1 qualification..."
+                );
+                let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
+                let qualification_decode_tok_s = if qualification.decode_us == 0 {
+                    0.0
+                } else {
+                    qualification.token_ids.len() as f64 * 1_000_000.0
+                        / qualification.decode_us as f64
+                };
+                eprintln!(
+                    "[gemma4-verify] K1 IDs exact: {} outputs; ordered prefill {:.3}s, decode {:.3}s ({qualification_decode_tok_s:.3} tok/s)",
+                    qualification.token_ids.len(),
+                    qualification.prefill_us as f64 / 1_000_000.0,
+                    qualification.decode_us as f64 / 1_000_000.0,
+                );
+
+                let mut teacher_tokens = prompt_tokens.clone();
+                teacher_tokens.extend_from_slice(&qualification.token_ids);
+                let timed_rows = teacher_tokens.len() / max_width * max_width;
+                if timed_rows == 0 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 verifier sequence has {} rows, fewer than K={max_width}",
+                        teacher_tokens.len(),
+                    ))
+                    .into());
+                }
+                teacher_tokens.truncate(timed_rows);
+
+                let run_width = |width: usize, tokens: &[u32]| -> anyhow::Result<(Vec<u32>, u128)> {
+                    if !tokens.len().is_multiple_of(width) {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "teacher-forced row count {} is not divisible by K={width}",
+                            tokens.len(),
+                        ))
+                        .into());
+                    }
+                    runtime.reset_dense_verifier_sequence()?;
+                    let started = std::time::Instant::now();
+                    let mut predictions = Vec::with_capacity(tokens.len());
+                    let mut position = 0usize;
+                    for chunk in tokens.chunks_exact(width) {
+                        let batch = runtime.verify_consecutive_greedy(chunk, position)?;
+                        predictions.extend_from_slice(&batch.greedy_ids);
+                        position = runtime.commit_verifier_prefix(batch.ticket, width)?;
+                    }
+                    Ok((predictions, started.elapsed().as_micros()))
+                };
+
+                // Allocate scratch, compile lazy pipelines, and touch every target
+                // weight before each timed width. Reset makes the warm row invisible.
+                let _ = run_width(1, &teacher_tokens[..1])?;
+                let (reference, reference_us) = run_width(1, &teacher_tokens)?;
+                let reference_rows_per_s = timed_rows as f64 * 1_000_000.0 / reference_us as f64;
+                let mut runs = Vec::with_capacity(widths.len());
+                runs.push(serde_json::json!({
+                    "width": 1,
+                    "batches": timed_rows,
+                    "wall_us": reference_us,
+                    "target_rows_per_s": reference_rows_per_s,
+                    "speedup_vs_k1": 1.0,
+                    "first_divergence_vs_k1": -1,
+                    "exact": true
+                }));
+
+                let mut exact_all = true;
+                for &width in widths.iter().filter(|&&width| width != 1) {
+                    let _ = run_width(width, &teacher_tokens[..width])?;
+                    let (predictions, wall_us) = run_width(width, &teacher_tokens)?;
+                    let first_divergence = reference
+                        .iter()
+                        .zip(&predictions)
+                        .position(|(left, right)| left != right);
+                    let exact = first_divergence.is_none() && predictions.len() == reference.len();
+                    exact_all &= exact;
+                    let rows_per_s = timed_rows as f64 * 1_000_000.0 / wall_us as f64;
+                    let speedup = reference_us as f64 / wall_us as f64;
+                    eprintln!(
+                        "[gemma4-verify] K={width}: {rows_per_s:.3} target rows/s, {speedup:.3}x K1, exact={exact}"
+                    );
+                    runs.push(serde_json::json!({
+                        "width": width,
+                        "batches": timed_rows / width,
+                        "wall_us": wall_us,
+                        "target_rows_per_s": rows_per_s,
+                        "speedup_vs_k1": speedup,
+                        "first_divergence_vs_k1": first_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "exact": exact
+                    }));
+                }
+
+                let receipt = serde_json::json!({
+                    "schema": "camelid.gemma4_ordered_q4_target_sweep.v1",
+                    "model_path": path,
+                    "prompt": prompt,
+                    "prompt_tokens": prompt_tokens.len(),
+                    "generated_tokens": qualification.token_ids.len(),
+                    "candidate_rows_available": prompt_tokens.len() + qualification.token_ids.len(),
+                    "timed_rows": timed_rows,
+                    "max_positions": max_positions,
+                    "load_us": load_us,
+                    "ordered_k1_qualification": {
+                        "exact_vs_established": true,
+                        "prefill_us": qualification.prefill_us,
+                        "decode_us": qualification.decode_us,
+                        "decode_output_tok_s": qualification_decode_tok_s,
+                        "token_ids": qualification.token_ids
+                    },
+                    "runs": runs,
+                    "exact_all_widths": exact_all,
+                    "timing_scope": "Warm target-only teacher-forced verifier wall; full-width batches; prompt/assistant excluded"
+                });
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+                if !exact_all {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 K-wide verifier diverged from ordered K1".into(),
+                    )
+                    .into());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (&path, &prompt, max_tokens, &widths);
+                return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                    "gemma4 ordered verifier requires macOS/Metal".into(),
                 )
                 .into());
             }
