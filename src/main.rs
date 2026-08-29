@@ -9349,6 +9349,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_METAL_RESIDENT_DECODE",
         "CAMELID_METAL_RESIDENT_PREFILL",
         "CAMELID_METAL_ATTN2",
+        "CAMELID_METAL_ATTN_BATCH_K",
         "CAMELID_METAL_KV_DTYPE",
         "CAMELID_METAL_WIRE",
         "CAMELID_METAL_WIRE_NSG8",
