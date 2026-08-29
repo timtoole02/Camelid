@@ -89,6 +89,62 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn bench_eagle3_dynamic_tree_flags_are_optional_and_deterministic() {
+        on_cli_test_stack(|| {
+            let defaults =
+                Cli::try_parse_from(["camelid", "bench-eagle3", "target.gguf", "--eagle3", "head"])
+                    .expect("parse EAGLE-3 linear defaults");
+            match defaults.command {
+                Some(Command::BenchEagle3 {
+                    draft_tokens,
+                    tree_nodes,
+                    tree_topk,
+                    tree_expansions,
+                    ..
+                }) => {
+                    assert_eq!(draft_tokens, 4);
+                    assert_eq!(tree_nodes, None);
+                    assert_eq!(tree_topk, 4);
+                    assert_eq!(tree_expansions, 4);
+                }
+                other => panic!("expected BenchEagle3, got {other:?}"),
+            }
+
+            let tree = Cli::try_parse_from([
+                "camelid",
+                "bench-eagle3",
+                "target.gguf",
+                "--eagle3",
+                "head",
+                "--draft-tokens",
+                "7",
+                "--tree-nodes",
+                "12",
+                "--tree-topk",
+                "8",
+                "--tree-expansions",
+                "5",
+            ])
+            .expect("parse EAGLE-3 dynamic tree flags");
+            match tree.command {
+                Some(Command::BenchEagle3 {
+                    draft_tokens,
+                    tree_nodes,
+                    tree_topk,
+                    tree_expansions,
+                    ..
+                }) => {
+                    assert_eq!(draft_tokens, 7);
+                    assert_eq!(tree_nodes, Some(12));
+                    assert_eq!(tree_topk, 8);
+                    assert_eq!(tree_expansions, 5);
+                }
+                other => panic!("expected BenchEagle3, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn inspect_source_accepts_a_hugging_face_directory() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from(["camelid", "inspect-source", "hf-model"])
@@ -2851,6 +2907,16 @@ enum Command {
         /// Top-1 draft-chain length per verify round.
         #[arg(long, default_value_t = 4)]
         draft_tokens: usize,
+        /// Enable dynamic EAGLE tree verification with this node budget (including the root).
+        /// Omit to preserve the existing top-1 linear-chain path.
+        #[arg(long)]
+        tree_nodes: Option<usize>,
+        /// Retained draft-head alternatives per expanded tree parent (1..=8).
+        #[arg(long, default_value_t = 4)]
+        tree_topk: usize,
+        /// Learned-head parent expansions per tree round, including the root expansion.
+        #[arg(long, default_value_t = 4)]
+        tree_expansions: usize,
         /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
@@ -5401,6 +5467,9 @@ async fn main() -> anyhow::Result<()> {
             model,
             eagle3,
             draft_tokens,
+            tree_nodes,
+            tree_topk,
+            tree_expansions,
             prompt_file,
             prompt,
             chat,
@@ -5412,6 +5481,9 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 eagle3,
                 draft_tokens,
+                tree_nodes,
+                tree_topk,
+                tree_expansions,
                 prompt_file,
                 prompt,
                 chat,
@@ -8725,6 +8797,7 @@ struct Eagle3BenchRun {
     rounds: u64,
     drafted: u64,
     accepted_drafts: u64,
+    verify_nodes: u64,
     resident_verify_rounds: u64,
     cpu_verify_rounds: u64,
     resident_normal_steps: u64,
@@ -8785,10 +8858,13 @@ fn run_eagle3_resident_greedy(
     prompt_tokens: &[u32],
     max_tokens: usize,
     draft_tokens: usize,
+    tree_nodes: Option<usize>,
+    tree_topk: usize,
+    tree_expansions: usize,
     checkpoint: camelid::eagle3::Eagle3DraftModel,
 ) -> anyhow::Result<Eagle3BenchRun> {
     use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
-    use camelid::eagle3_runtime::Eagle3Drafter;
+    use camelid::eagle3_runtime::{Eagle3Drafter, Eagle3DynamicFrontierConfig};
 
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
     let _ = session.prewarm_resident_weights();
@@ -8797,10 +8873,7 @@ fn run_eagle3_resident_greedy(
     session.set_resident_encode_ahead_enabled(false);
     let ttft_started = Instant::now();
     let prompt = session
-        .forward_greedy_resident_prefill_with_layer_inputs(
-            prompt_tokens,
-            &TARGET_LAYER_INPUT_IDS,
-        )?
+        .forward_greedy_resident_prefill_with_layer_inputs(prompt_tokens, &TARGET_LAYER_INPUT_IDS)?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "resident Metal prompt prefill with EAGLE-3 activation capture is unavailable"
@@ -8830,6 +8903,15 @@ fn run_eagle3_resident_greedy(
     let seed_started = Instant::now();
     drafter.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
     run.head_seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+    let tree_lattice_nodes = tree_nodes
+        .map(|node_budget| {
+            tree_topk
+                .checked_mul(tree_expansions)
+                .and_then(|nodes| nodes.checked_add(1))
+                .map(|explored| explored.max(node_budget))
+                .ok_or_else(|| anyhow::anyhow!("EAGLE-3 dynamic lattice budget overflow"))
+        })
+        .transpose()?;
 
     let decode_started = Instant::now();
     while run.generated.len() < max_tokens
@@ -8860,28 +8942,99 @@ fn run_eagle3_resident_greedy(
             continue;
         }
 
-        let draft_started = Instant::now();
-        let drafts = drafter.draft(weights, budget)?;
-        run.drafted_token_ids.extend_from_slice(&drafts);
-        run.draft_us += draft_started.elapsed().as_micros();
         let anchor = *run.generated.last().expect("generated is seeded");
-        let verify_started = Instant::now();
-        let verified = session
-            .verify_drafts_metal_with_layer_inputs(anchor, &drafts, &TARGET_LAYER_INPUT_IDS)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "resident Metal EAGLE-3 verification became unavailable at position {}",
-                    session.kv_position()
-                )
-            })?;
-        run.verify_us += verify_started.elapsed().as_micros();
+        let target_before = session.kv_position();
+        let (emitted, offered, verify_nodes) = if let Some(node_budget) = tree_nodes {
+            let round_node_budget = node_budget.min(context_room);
+            let draft_started = Instant::now();
+            let frontier = drafter.draft_dynamic_frontier(
+                weights,
+                anchor,
+                Eagle3DynamicFrontierConfig {
+                    max_verify_nodes: round_node_budget,
+                    max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                    max_depth: budget,
+                    candidates_per_parent: tree_topk,
+                    max_head_expansions: tree_expansions,
+                },
+            )?;
+            let forest = frontier.finish()?;
+            let actual_nodes = forest.scored.tree.nodes();
+            anyhow::ensure!(
+                (2..=round_node_budget).contains(&actual_nodes),
+                "dynamic EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+            );
+            run.drafted_token_ids
+                .extend_from_slice(&forest.scored.tree.tokens[1..]);
+            run.draft_us += draft_started.elapsed().as_micros();
 
-        let accepted = accepted_draft_prefix(&drafts, &verified.predictions);
-        let emitted = verified.predictions[..=accepted].to_vec();
+            let verify_started = Instant::now();
+            let verified = session
+                .verify_tree_metal_with_layer_inputs(
+                    &forest.scored.tree,
+                    &TARGET_LAYER_INPUT_IDS,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resident Metal EAGLE-3 tree verification became unavailable at position {target_before}"
+                    )
+                })?;
+            run.verify_us += verify_started.elapsed().as_micros();
+            anyhow::ensure!(
+                verified.predictions.len() == actual_nodes,
+                "EAGLE-3 tree target returned {} predictions for {actual_nodes} rows",
+                verified.predictions.len()
+            );
+            let acceptance = forest.accept_target_predictions(&verified.predictions)?;
+            anyhow::ensure!(
+                acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
+                "EAGLE-3 tree emitted/capture path lengths diverged: {}/{}",
+                acceptance.emitted_tokens.len(),
+                acceptance.capture_rows.len()
+            );
+            let update_started = Instant::now();
+            drafter.accept_authoritative_forest(weights, &verified.layer_inputs, &acceptance)?;
+            run.head_update_us += update_started.elapsed().as_micros();
+            (
+                acceptance.emitted_tokens,
+                actual_nodes.saturating_sub(1),
+                actual_nodes,
+            )
+        } else {
+            // Existing top-1 chain path: kept independent of every dynamic-tree option.
+            let draft_started = Instant::now();
+            let drafts = drafter.draft(weights, budget)?;
+            run.drafted_token_ids.extend_from_slice(&drafts);
+            run.draft_us += draft_started.elapsed().as_micros();
+            let verify_started = Instant::now();
+            let verified = session
+                .verify_drafts_metal_with_layer_inputs(
+                    anchor,
+                    &drafts,
+                    &TARGET_LAYER_INPUT_IDS,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resident Metal EAGLE-3 verification became unavailable at position {target_before}"
+                    )
+                })?;
+            run.verify_us += verify_started.elapsed().as_micros();
+            let accepted = accepted_draft_prefix(&drafts, &verified.predictions);
+            let emitted = verified.predictions[..=accepted].to_vec();
+            let update_started = Instant::now();
+            drafter.accept_authoritative(weights, &verified.layer_inputs, &emitted)?;
+            run.head_update_us += update_started.elapsed().as_micros();
+            let offered = drafts.len();
+            (emitted, offered, offered + 1)
+        };
+
+        anyhow::ensure!(
+            session.kv_position() == target_before + emitted.len(),
+            "EAGLE-3 target watermark advanced {} rows for {} emitted tokens",
+            session.kv_position().saturating_sub(target_before),
+            emitted.len()
+        );
         run.resident_verify_rounds += 1;
-        let update_started = Instant::now();
-        drafter.accept_authoritative(weights, &verified.layer_inputs, &emitted)?;
-        run.head_update_us += update_started.elapsed().as_micros();
         anyhow::ensure!(
             drafter.filled() == session.kv_position(),
             "EAGLE-3/target cache watermarks diverged: head={} target={}",
@@ -8890,8 +9043,9 @@ fn run_eagle3_resident_greedy(
         );
 
         run.rounds += 1;
-        run.drafted += drafts.len() as u64;
-        run.accepted_drafts += accepted as u64;
+        run.drafted += offered as u64;
+        run.accepted_drafts += emitted.len().saturating_sub(1) as u64;
+        run.verify_nodes += verify_nodes as u64;
         for token in emitted {
             if run.generated.len() >= max_tokens {
                 break;
@@ -8903,6 +9057,13 @@ fn run_eagle3_resident_greedy(
         }
     }
     run.decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+    anyhow::ensure!(
+        run.cpu_verify_rounds == 0 && run.resident_verify_rounds == run.rounds,
+        "EAGLE-3 benchmark left the resident verifier: resident={} cpu={} rounds={}",
+        run.resident_verify_rounds,
+        run.cpu_verify_rounds,
+        run.rounds
+    );
 
     Ok(run)
 }
@@ -8930,6 +9091,10 @@ struct BenchEagle3Record {
     prompt_tokens: usize,
     max_tokens: usize,
     draft_tokens: usize,
+    draft_mode: &'static str,
+    tree_node_budget: Option<usize>,
+    tree_topk: Option<usize>,
+    tree_expansions: Option<usize>,
     plain_generated_tokens: usize,
     eagle3_generated_tokens: usize,
     head_load_ms: f64,
@@ -8950,6 +9115,7 @@ struct BenchEagle3Record {
     accepted_drafts: u64,
     accept_rate: f64,
     mean_emitted_tokens_per_round: f64,
+    mean_verify_nodes_per_round: f64,
     draft_ms: f64,
     verify_ms: f64,
     head_update_ms: f64,
@@ -8979,12 +9145,16 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_METAL_Q8",
         "CAMELID_METAL_RESIDENT_DECODE",
         "CAMELID_METAL_RESIDENT_PREFILL",
+        "CAMELID_METAL_ATTN2",
+        "CAMELID_METAL_KV_DTYPE",
         "CAMELID_METAL_WIRE",
         "CAMELID_METAL_WIRE_NSG8",
         "CAMELID_METAL_F32Y",
         "CAMELID_METAL_NOCOPY",
         "CAMELID_METAL_KQUANT",
         "CAMELID_KQUANT_V2",
+        "CAMELID_KQUANT_V3",
+        "CAMELID_KQUANT_V4",
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
     ];
@@ -8998,6 +9168,9 @@ fn run_bench_eagle3(
     model: PathBuf,
     eagle3_dir: PathBuf,
     draft_tokens: usize,
+    tree_nodes: Option<usize>,
+    tree_topk: usize,
+    tree_expansions: usize,
     prompt_file: Option<PathBuf>,
     prompt: Option<String>,
     chat: bool,
@@ -9015,6 +9188,23 @@ fn run_bench_eagle3(
         (1..=15).contains(&draft_tokens),
         "--draft-tokens must be in 1..=15"
     );
+    if let Some(nodes) = tree_nodes {
+        anyhow::ensure!(
+            (2..=camelid::inference::spec_tree::TREE_MAX_NODES).contains(&nodes),
+            "--tree-nodes must be in 2..={}",
+            camelid::inference::spec_tree::TREE_MAX_NODES
+        );
+    }
+    anyhow::ensure!(
+        (1..=camelid::metal::EAGLE3_TOP_K_CANDIDATES).contains(&tree_topk),
+        "--tree-topk must be in 1..={}",
+        camelid::metal::EAGLE3_TOP_K_CANDIDATES
+    );
+    anyhow::ensure!(
+        (1..=camelid::inference::spec_tree::TREE_MAX_NODES).contains(&tree_expansions),
+        "--tree-expansions must be in 1..={} (including the root)",
+        camelid::inference::spec_tree::TREE_MAX_NODES
+    );
     configure_rayon_threads(threads)?;
     let input_text = match (&prompt_file, &prompt) {
         (Some(path), _) => std::fs::read_to_string(path)?,
@@ -9030,7 +9220,10 @@ fn run_bench_eagle3(
     );
     let eagle3_weights = eagle3_dir.join("model.safetensors");
     let eagle3_sha256 = camelid::receipt::sha256_file_hex(&eagle3_weights).map_err(|error| {
-        anyhow::anyhow!("hashing EAGLE-3 checkpoint {}: {error}", eagle3_weights.display())
+        anyhow::anyhow!(
+            "hashing EAGLE-3 checkpoint {}: {error}",
+            eagle3_weights.display()
+        )
     })?;
     anyhow::ensure!(
         eagle3_sha256 == PINNED_EAGLE3_SHA256,
@@ -9082,12 +9275,7 @@ fn run_bench_eagle3(
             parse_special,
         )
     } else {
-        (
-            input_text.clone(),
-            "raw_completion_bos_no_eos",
-            true,
-            false,
-        )
+        (input_text.clone(), "raw_completion_bos_no_eos", true, false)
     };
     let prompt_token_ids = tokenizer.encode(&prompt_text, add_special, parse_special)?;
     anyhow::ensure!(
@@ -9115,6 +9303,9 @@ fn run_bench_eagle3(
         &prompt_token_ids,
         max_tokens,
         draft_tokens,
+        tree_nodes,
+        tree_topk,
+        tree_expansions,
         checkpoint,
     )?;
 
@@ -9143,6 +9334,11 @@ fn run_bench_eagle3(
     } else {
         (eagle.accepted_drafts + eagle.rounds) as f64 / eagle.rounds as f64
     };
+    let mean_verify_nodes = if eagle.rounds == 0 {
+        0.0
+    } else {
+        eagle.verify_nodes as f64 / eagle.rounds as f64
+    };
     let record = BenchEagle3Record {
         runtime: "camelid-eagle3-resident-metal",
         commit: benchmark_commit(),
@@ -9165,6 +9361,14 @@ fn run_bench_eagle3(
         prompt_tokens: prompt_token_ids.len(),
         max_tokens,
         draft_tokens,
+        draft_mode: if tree_nodes.is_some() {
+            "dynamic_tree"
+        } else {
+            "linear_top1"
+        },
+        tree_node_budget: tree_nodes,
+        tree_topk: tree_nodes.map(|_| tree_topk),
+        tree_expansions: tree_nodes.map(|_| tree_expansions),
         plain_generated_tokens: plain.generated.len(),
         eagle3_generated_tokens: eagle.generated.len(),
         head_load_ms,
@@ -9193,6 +9397,7 @@ fn run_bench_eagle3(
         accepted_drafts: eagle.accepted_drafts,
         accept_rate,
         mean_emitted_tokens_per_round: mean_emitted,
+        mean_verify_nodes_per_round: mean_verify_nodes,
         draft_ms: eagle.draft_us as f64 / 1000.0,
         verify_ms: eagle.verify_us as f64 / 1000.0,
         head_update_ms: eagle.head_update_us as f64 / 1000.0,
@@ -9218,8 +9423,10 @@ fn run_bench_eagle3(
     };
     println!("{}", serde_json::to_string(&record)?);
     eprintln!(
-        "[bench-eagle3] γ={} accept {:.1}% emitted/round {:.2} | plain {:.2} → EAGLE-3 {:.2} tok/s ({:.2}x) | {}",
+        "[bench-eagle3] mode={} γ={} nodes/round {:.2} accept {:.1}% emitted/round {:.2} | plain {:.2} → EAGLE-3 {:.2} tok/s ({:.2}x) | {}",
+        record.draft_mode,
         record.draft_tokens,
+        record.mean_verify_nodes_per_round,
         100.0 * record.accept_rate,
         record.mean_emitted_tokens_per_round,
         record.plain_tokens_per_second,
