@@ -195,30 +195,34 @@ The head is functionally working on served chat and its 59.32% first-draft
 acceptance is close to the head README's held-out first-position figure, but
 the current linear top-1 runtime is not economically working there: gamma 1 is
 the least-bad arm and remains a 15% regression. A representative chat speedup
-needs a top-k/tree EAGLE implementation, a materially cheaper head, or an
-acceptance-aware admission policy; the raw-prompt win must not be presented as
-served-chat throughput.
+needs a top-k/tree EAGLE implementation; the raw-prompt win must not be
+presented as served-chat throughput. This conclusion is stronger than a generic
+optimization hunch: the gamma-1 row spent 3,641.969 ms versus 3,099.581 ms
+plain, of which 372.146 ms was head update and only 0.061 ms was recorded draft
+submission. Even deleting both costs would reach only about 29.05 tok/s, still
+below 30.65 plain. Admission can cap a loss, but only a wider accepted tree can
+amortize the remaining verify cost enough to create a win.
 
 ## Context checks
 
-At 556 prompt tokens on the committed agentic/code prompt, raw gamma-3 EAGLE
-measured `30.454 -> 26.632 tok/s` (`0.875x`) with 44.17% acceptance. This row is
-from source `7187a071` and binary SHA-256
-`ef7948190548bba4dc3b910663a4edc91e32dc54fc21bb8f76f34a8017892440`, not the
-later chat-mode binary. The suffix drafter observed `30.442 -> 27.789 tok/s`
-(`0.913x`) with 19.67% offered-draft acceptance; that older suffix receipt did
-not carry enough provenance for promotion and is being superseded by the
-enriched receipt schema. Both observed streams were lossless and used resident
-verification only.
+The final context rows share source `758b565f`, binary SHA-256
+`616b3094b242d3bdf4c2f55ca68312d86e96f88223433fc58b86e24523c728cc`,
+the exact target, prompt bytes, host, generation length, and embedded execution
+provenance. At 556 prompt tokens, raw gamma-3 EAGLE measured
+`30.403 -> 26.649 tok/s` (`0.877x`) with 44.17% acceptance, while suffix gamma 7
+measured `30.449 -> 27.873 tok/s` (`0.915x`) with 19.67% offered-draft
+acceptance. Both exactly matched their paired 96-token plain streams and used
+resident verification only. The older `7187a071` EAGLE row is retained as
+history and measured the same acceptance and `0.875x`.
 
-At the original 4,137-token agentic prompt, the clean committed gamma-3 EAGLE
-run measured `22.392 -> 23.499 tok/s` (`1.049x`), 55.14% acceptance, 2.639
-emitted tokens per round, and 36 resident / 0 CPU rounds. An earlier tuning
-binary measured `23.618 -> 23.975 tok/s` (`1.015x`) at the same acceptance, and
-gamma 5 was worse at `0.974x`. This is outside the head's `T=1024` training
-distribution (not outside a declared runtime cap) and is labelled as
-extrapolation. At that depth, context-matching suffix drafting is substantially
-stronger.
+At the original 4,137-token agentic prompt, the same provenance build measured
+gamma-3 EAGLE at `24.077 -> 23.014 tok/s` (`0.956x`), 55.14% acceptance, 2.639
+emitted tokens per round, and 36 resident / 0 CPU rounds. Earlier binaries put
+the same deterministic-acceptance workload at `1.015x` and `1.049x`, so the
+defensible conclusion is break-even within run-level throughput variation, not
+a stable speedup. This is outside the head's `T=1024` training distribution
+(not outside a declared runtime cap) and is labelled as extrapolation. At that
+depth, context-matching suffix drafting is substantially stronger.
 
 ## Reproduction
 
@@ -230,26 +234,30 @@ can be overridden with `MODEL`, `EAGLE3`, and `OUT_DIR`.
 
 ## Suffix comparison at depth
 
-A clean-command same-target suffix observation used source commit `9626148a`,
-the 4,137-token agentic prompt, 96 generated tokens, and suffix gamma 7. It
-measured **`24.707 -> 43.540 tok/s` (`1.762x`)**, accepted 66 of 78 offered
-drafts (`84.615%`), emitted 6.50 tokens per round, used 12 resident and 0 CPU
-verify rounds, and reported lossless. Its legacy receipt schema did not embed
-the binary/model/prompt hashes or token-id arrays, so it is not yet the promoted
-same-build comparison. `bench-speculative` now records those fields; the
-enriched rerun supersedes this observation before the docs are finalized.
+The canonical suffix row is the same `758b565f` provenance build and exact 4k
+prompt as the EAGLE row above. At gamma 7 it measured
+**`22.015 -> 43.910 tok/s` (`1.995x`)**, accepted 66 of 78 offered drafts
+(`84.615%`), emitted 6.50 tokens per round, used 12 resident and 0 CPU verify
+rounds, and exactly matched all 96 plain token ids. Its enriched receipt embeds
+the binary/model/prompt/tokenizer hashes, prompt format, full plain/spec token
+arrays, Metal device, host ISA, effective environment, planner updates, and
+execution plan.
 
-The earlier `commit="unknown"` suffix row measured `21.107 -> 42.400 tok/s`
-(`2.009x`). Neither legacy depth result is directly comparable to the 38- or
-46-token prose sweeps.
+The suffix and EAGLE commands have separate paired plain arms, so their small
+plain-rate difference is run noise; compare their speculative throughput and
+within-command ratios. Older suffix observations agreed on the absolute depth
+result but are superseded for provenance. No depth row is directly comparable
+to the 38- or 46-token prose sweeps.
 
 ## Conclusion
 
 The exact learned EAGLE-3 head is loaded, resident, recurrent, and losslessly
 verified. It exceeds plain decode on one exact raw completion (`1.354x`) and is
-a small win at the 4k extrapolation point (`1.049x`), but it regresses on the
-served-chat sweep (`0.851x` best) and the 556-token code context (`0.875x`).
+a run-variable near-break-even at the 4k extrapolation point (`0.956x` on the
+canonical same-build row), and it regresses on the
+served-chat sweep (`0.851x` best) and the 556-token code context (`0.877x`).
 So the implementation is functionally working; broad MTP-style acceleration is
-not finished. The next justified engineering step is top-k/tree EAGLE or a
-cheaper/adaptively admitted head. This remains learned EAGLE-3 rather than a
-native target MTP head, and it is not wired into serving.
+not finished. The next justified engineering step is bounded top-k/tree EAGLE;
+cheaper head updates alone cannot recover the measured chat deficit. This
+remains learned EAGLE-3 rather than a native target MTP head, and it is not
+wired into serving.

@@ -96,15 +96,16 @@ rose from 36.830 to 41.536 tok/s.
 Do not generalize that raw row. The new `--chat` mode uses the same no-tools
 renderer as `/v1/chat/completions`; its best arm is gamma 1 at
 **30.649 -> 26.085 tok/s = 0.851x**, despite a plausible 59.32% first-draft
-acceptance. At 556 code-context tokens gamma 3 is `0.875x`. On the clean final
-binary at the original 4,137-token agentic depth, gamma 3 is a small win
-(**22.392 -> 23.499 tok/s = 1.049x**, 55.14% acceptance), while suffix gamma 7
-in a clean-command observation reached **24.707 -> 43.540 tok/s = 1.762x** with
-84.62% acceptance. Both observed streams were lossless and fully resident; the
-suffix row's legacy receipt schema is being superseded by an enriched rerun
-before promotion. So EAGLE is functionally correct and can win, but the current
-linear top-1 head is not a broad chat accelerator; top-k tree EAGLE, a cheaper
-head, or acceptance-aware admission is the next lever.
+acceptance. On the final provenance build (`758b565f`, binary SHA-256
+`616b3094b242d3bdf4c2f55ca68312d86e96f88223433fc58b86e24523c728cc`),
+the 556-token code context measured EAGLE `0.877x` and suffix `0.915x`. At the
+original 4,137-token depth, linear gamma-3 EAGLE is effectively break-even to a
+small loss (**24.077 -> 23.014 tok/s = 0.956x**, 55.14% acceptance), while
+suffix gamma 7 reaches **22.015 -> 43.910 tok/s = 1.995x** with 84.62%
+acceptance. All four streams are lossless and fully resident, with full
+binary/model/prompt/token-array provenance. So EAGLE is functionally correct
+and can win on the exact short raw completion, but linear top-1 is not a broad
+chat accelerator; bounded top-k tree EAGLE is the next credible speed lever.
 
 The exact matching head declares training sequence length **1024**; it does not
 declare a runtime cap. The old Llama 3.1 / 2048 account was about a different

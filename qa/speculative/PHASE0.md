@@ -290,9 +290,9 @@ it varied.
 - The matching Llama-3.2-3B EAGLE3 benchmark is implemented. The committed raw
   gamma-3 row is **30.681 -> 41.536 tok/s (1.354x)** and lossless, but served
   chat is a regression (**0.851x** best). It is benchmark-only, not
-  serving/native MTP. At 4,137 tokens, clean EAGLE is `1.049x`; a suffix run
-  observed `1.762x`, with its enriched promotion receipt pending. Broad
-  learned-head acceleration needs top-k/tree or a cheaper head.
+  serving/native MTP. On the same provenance build at 4,137 tokens, EAGLE is
+  `0.956x` while suffix is `1.995x`; both are lossless and fully resident. Broad
+  learned-head acceleration needs bounded top-k/tree EAGLE.
 
 ## The v1 K-quant losslessness bug: found, root-caused, fixed
 
