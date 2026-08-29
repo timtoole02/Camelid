@@ -11,6 +11,19 @@ EAGLE3=${EAGLE3:-$HOME/models/Llama-3.2-3B-Instruct-Eagle3}
 PROMPT_FILE=${PROMPT_FILE:-$ROOT/qa/speculative/harness/prompts/eagle3_prose.txt}
 OUT_DIR=${OUT_DIR:-$HOME/camelid-overnight/receipts}
 MAX_TOKENS=${MAX_TOKENS:-96}
+CHAT=${CHAT:-0}
+
+# Command substitution deliberately removes the file's terminal newline. The
+# committed tuning prompt was measured without one; that one byte changes the
+# continuation and therefore the learned-head acceptance distribution.
+PROMPT=$(<"$PROMPT_FILE")
+if [[ "$CHAT" == 1 ]]; then
+  PROMPT_MODE=chat
+  CHAT_ARGS=(--chat)
+else
+  PROMPT_MODE=raw
+  CHAT_ARGS=()
+fi
 
 if (($# == 0)); then
   GAMMAS=(1 2 3 4 5 6)
@@ -20,7 +33,7 @@ fi
 
 mkdir -p "$OUT_DIR"
 for gamma in "${GAMMAS[@]}"; do
-  workload="llama32-3b-q4km-eagle3-resident-gamma${gamma}-prose${MAX_TOKENS}"
+  workload="llama32-3b-q4km-eagle3-resident-${PROMPT_MODE}-gamma${gamma}-prose${MAX_TOKENS}"
   json="$OUT_DIR/$workload.jsonl"
   stderr="$OUT_DIR/$workload.stderr"
   env \
@@ -39,7 +52,8 @@ for gamma in "${GAMMAS[@]}"; do
     "$BIN" bench-eagle3 "$MODEL" \
       --eagle3 "$EAGLE3" \
       --draft-tokens "$gamma" \
-      --prompt-file "$PROMPT_FILE" \
+      --prompt "$PROMPT" \
+      "${CHAT_ARGS[@]}" \
       --max-tokens "$MAX_TOKENS" \
       --workload "$workload" \
       >"$json" 2>"$stderr"

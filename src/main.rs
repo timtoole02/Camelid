@@ -2857,6 +2857,10 @@ enum Command {
         /// Inline prompt text (used when --prompt-file is absent).
         #[arg(long)]
         prompt: Option<String>,
+        /// Render the supplied text as one user turn through the same no-tools
+        /// chat-template path used by /v1/chat/completions.
+        #[arg(long, default_value_t = false)]
+        chat: bool,
         /// Workload label recorded in the JSON receipt.
         #[arg(long, default_value = "unlabeled")]
         workload: String,
@@ -5399,6 +5403,7 @@ async fn main() -> anyhow::Result<()> {
             draft_tokens,
             prompt_file,
             prompt,
+            chat,
             workload,
             max_tokens,
             threads,
@@ -5409,6 +5414,7 @@ async fn main() -> anyhow::Result<()> {
                 draft_tokens,
                 prompt_file,
                 prompt,
+                chat,
                 workload,
                 max_tokens,
                 threads,
@@ -8836,10 +8842,12 @@ struct BenchEagle3Record {
     camelid_version: String,
     binary_sha256: String,
     workload: String,
+    input_sha256: String,
     prompt_sha256: String,
     prompt_format: &'static str,
     add_bos: bool,
     add_eos: bool,
+    parse_special: bool,
     model: String,
     model_sha256: String,
     tokenizer_metadata_sha256: Option<String>,
@@ -8918,6 +8926,7 @@ fn run_bench_eagle3(
     draft_tokens: usize,
     prompt_file: Option<PathBuf>,
     prompt: Option<String>,
+    chat: bool,
     workload: String,
     max_tokens: usize,
     threads: Option<usize>,
@@ -8933,7 +8942,7 @@ fn run_bench_eagle3(
         "--draft-tokens must be in 1..=15"
     );
     configure_rayon_threads(threads)?;
-    let prompt_text = match (&prompt_file, &prompt) {
+    let input_text = match (&prompt_file, &prompt) {
         (Some(path), _) => std::fs::read_to_string(path)?,
         (None, Some(text)) => text.clone(),
         (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
@@ -8988,7 +8997,25 @@ fn run_bench_eagle3(
     let store = TensorStore::open(&model, &gguf);
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
-    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    let (prompt_text, prompt_format, add_special, parse_special) = if chat {
+        let (rendered, add_special, parse_special) =
+            camelid::api::render_single_user_chat_prompt_for_benchmark(&input_text, &tokenizer)
+                .map_err(|error| anyhow::anyhow!("rendering benchmark chat prompt: {error}"))?;
+        (
+            rendered,
+            "served_single_user_chat_template",
+            add_special,
+            parse_special,
+        )
+    } else {
+        (
+            input_text.clone(),
+            "raw_completion_bos_no_eos",
+            true,
+            false,
+        )
+    };
+    let prompt_token_ids = tokenizer.encode(&prompt_text, add_special, parse_special)?;
     anyhow::ensure!(
         prompt_token_ids.len() >= 3,
         "resident EAGLE-3 capture requires at least three encoded prompt tokens, got {}",
@@ -9048,10 +9075,12 @@ fn run_bench_eagle3(
         camelid_version: camelid::receipt::camelid_version(),
         binary_sha256,
         workload,
+        input_sha256: camelid::receipt::sha256_hex(input_text.as_bytes()),
         prompt_sha256: camelid::receipt::sha256_hex(prompt_text.as_bytes()),
-        prompt_format: "raw_completion_bos_no_eos",
-        add_bos: true,
+        prompt_format,
+        add_bos: add_special,
         add_eos: false,
+        parse_special,
         model: model.display().to_string(),
         model_sha256,
         tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),

@@ -21531,6 +21531,25 @@ struct RenderedPrompt {
     parse_special: bool,
 }
 
+/// Render one user turn through the same no-tools prompt path used by
+/// `/v1/chat/completions`. Offline learned-drafter benchmarks use this narrow
+/// wrapper so their prompt token ids are comparable to served chat traffic.
+pub fn render_single_user_chat_prompt_for_benchmark(
+    user: &str,
+    tokenizer: &Tokenizer,
+) -> std::result::Result<(String, bool, bool), String> {
+    let messages = [ChatMessage {
+        role: "user".to_string(),
+        content: user.to_string(),
+        image_urls: Vec::new(),
+        unsupported_content_parts: Vec::new(),
+    }];
+    let rendered =
+        render_chat_prompt_for_tokenization_for_model_result(&messages, tokenizer, None, false)
+            .map_err(|error| error.to_string())?;
+    Ok((rendered.text, rendered.add_special, rendered.parse_special))
+}
+
 const SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES: usize = 5_493;
 const SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256: &str =
     "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e";
