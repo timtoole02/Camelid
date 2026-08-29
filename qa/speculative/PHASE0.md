@@ -287,9 +287,12 @@ it varied.
 
 - The v2 K-quant lane is ~1 ulp off v1, so it stays env-gated with no support
   claim. Promotion needs model-level parity receipts.
-- The matching Llama-3.2-3B EAGLE3 benchmark is implemented. Best resident
-  tuning (`gamma=3`) is **31.254 -> 42.541 tok/s (1.361x)** and lossless. It is
-  benchmark-only, not serving/native MTP; the final committed receipt is pending.
+- The matching Llama-3.2-3B EAGLE3 benchmark is implemented. The committed raw
+  gamma-3 row is **30.681 -> 41.536 tok/s (1.354x)** and lossless, but served
+  chat is a regression (**0.851x** best). It is benchmark-only, not
+  serving/native MTP. At 4,137 tokens, clean EAGLE is `1.049x`; a suffix run
+  observed `1.762x`, with its enriched promotion receipt pending. Broad
+  learned-head acceleration needs top-k/tree or a cheaper head.
 
 ## The v1 K-quant losslessness bug: found, root-caused, fixed
 
@@ -388,6 +391,9 @@ endpoint is `/v1/health` with `generation_ready`, not `/api/health`.
 ## Session 3 findings — Llama-3.2 3B EAGLE3 measured
 
 The matching benchmark is documented in
-[`EAGLE3_LLAMA32_3B.md`](EAGLE3_LLAMA32_3B.md). Its raw prompt is 46 tokens,
-generation is 96 tokens, and the final matrix ran 26 resident rounds and 0 CPU
-rounds.
+[`EAGLE3_LLAMA32_3B.md`](EAGLE3_LLAMA32_3B.md). Its winning raw prompt is 46
+tokens, generation is 96 tokens, and gamma 3 ran 26 resident rounds and 0 CPU
+rounds. The new served-chat sweep is also fully resident and lossless, but its
+best arm is `30.649 -> 26.085 tok/s` (`0.851x`) at gamma 1. That distinction is
+the current boundary: the recurrent learned head works; linear top-1 EAGLE is
+not yet a general chat-speed path.

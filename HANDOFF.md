@@ -1,7 +1,9 @@
 # Handoff — speculative decoding campaign
 
 Branch `campaign/mtp-3x`. **Unpushed.**
-Worktree `/Volumes/Untitled/Camelid-3x`. Nothing here is on by default.
+Worktree `/Volumes/Untitled/Camelid-3x`. The EAGLE benchmark and experimental
+v2/MMA K-quant lanes remain opt-in. Phase 0's SPEC_GPU helper does auto-arm on
+eligible Metal speculative requests unless explicitly disabled.
 
 ## The result
 
@@ -16,8 +18,10 @@ each row differs from the one above by a single change.
 | **+ kv16 split-K attention** | **13.51** | **30.68** | **215 ms** |
 
 **7.13 -> 30.68 tok/s = 4.30x.** Speculation went from a 0.66x *regression* to
-2.27x. Plain decode alone went **1.89x**, which lands for any K-quant workload at
-depth whether it speculates or not. All arms `lossless=true`.
+2.27x. Plain decode alone went **1.89x** on this exact 8B model, prompt, and
+machine. The routing fix structurally applies to K-quant decode whether it
+speculates or not, but that measured factor is not a cross-model claim. All arms
+`lossless=true`.
 
 ## How to reproduce
 
@@ -53,7 +57,8 @@ Narrative and method: `qa/speculative/PHASE0.md`.
 
 ## State of each thread
 
-**Speed — DONE and safe.** Committed, receipted, gated.
+**Exact measured speed lane — DONE.** Committed, receipted, and gated; no broad
+support claim follows from the single-model result.
 
 **v1 K-quant losslessness — FIXED.** The default lane emitted a different token
 stream than its own plain decode, deterministically at index 58 (5/5 both ways on
@@ -79,13 +84,29 @@ INTEGRATION.** The learned EAGLE-3 benchmark is pinned to the exact target
 the learned head and target resident on Metal, and enforces losslessness and
 head/target cache-watermark gates.
 
-The tuning sweep's best result was gamma 3: **31.254 -> 42.541 tok/s = 1.361x**,
-with **87.18% offered-draft acceptance**, **3.615 emitted tokens/round**, and
-**26 resident / 0 CPU verify rounds**, using a raw 46-token BOS/no-EOS prompt
-and 96 generated tokens. This receipt came from a dirty pre-commit binary
-(sha256 `203b...`), so the final committed rerun is still pending. For comparison,
-the same-target suffix 4k baseline is **21.107 -> 42.400 tok/s = 2.009x**. The
-exact matching head declares training sequence length **1024**; it does not
+The final committed raw-prompt result at gamma 3 is
+**30.681 -> 41.536 tok/s = 1.354x**, with **87.18% offered-draft acceptance**,
+**3.615 emitted tokens/round**, and **26 resident / 0 CPU verify rounds** over
+96 generated tokens. Source is `9626148a`; the deployed binary is sha256
+`dac2fb1cc83b2c63f2926b082ba8a6639c3da1804fa493523f26f024fd2be411`.
+The K/V-only authoritative-row optimization passed a full A/B: its draft ids,
+EAGLE ids, and plain ids exactly match the full-compute control, while throughput
+rose from 36.830 to 41.536 tok/s.
+
+Do not generalize that raw row. The new `--chat` mode uses the same no-tools
+renderer as `/v1/chat/completions`; its best arm is gamma 1 at
+**30.649 -> 26.085 tok/s = 0.851x**, despite a plausible 59.32% first-draft
+acceptance. At 556 code-context tokens gamma 3 is `0.875x`. On the clean final
+binary at the original 4,137-token agentic depth, gamma 3 is a small win
+(**22.392 -> 23.499 tok/s = 1.049x**, 55.14% acceptance), while suffix gamma 7
+in a clean-command observation reached **24.707 -> 43.540 tok/s = 1.762x** with
+84.62% acceptance. Both observed streams were lossless and fully resident; the
+suffix row's legacy receipt schema is being superseded by an enriched rerun
+before promotion. So EAGLE is functionally correct and can win, but the current
+linear top-1 head is not a broad chat accelerator; top-k tree EAGLE, a cheaper
+head, or acceptance-aware admission is the next lever.
+
+The exact matching head declares training sequence length **1024**; it does not
 declare a runtime cap. The old Llama 3.1 / 2048 account was about a different
 artifact and must not be carried forward. This remains a benchmark-only EAGLE-3
 path, not a native MTP implementation and not integrated into serving. Full

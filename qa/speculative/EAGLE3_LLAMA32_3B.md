@@ -8,10 +8,11 @@ model authoritatively verify every proposed token. It is **not** a native MTP
 head in the target model, is not wired into serving, is not enabled by default,
 and does not widen Camelid's supported-model claims.
 
-The resident results below are tuning measurements from a dirty, precommit
-binary. They establish that the lane can be lossless and faster on this one
-prompt, but they are not a release or promotion receipt. **A final rerun from a
-committed binary, with repository-owned receipts, is still pending.**
+The original gamma sweep below is retained as tuning history. The promoted
+receipts were rerun from committed source on mini2 and pin the source commit,
+binary, target, head, tokenizer metadata, effective prompt bytes, execution
+plan, Metal device, acceleration flags, generated token ids, and draft token
+ids. This is still benchmark evidence, not a release or support promotion.
 
 ## Exact artifacts
 
@@ -139,32 +140,116 @@ worktree's HEAD. The source receipts are named
 | 5 | 31.225 | 38.934 | 1.247x | 55.65% | 3.760 | 25 / 0 | yes |
 | 6 | 31.229 | 37.059 | 1.187x | 46.62% | 3.760 | 25 / 0 | yes |
 
-Gamma 3 is the current tuning winner: `31.254 -> 42.541 tok/s`, or `1.361x`.
+Gamma 3 was the tuning winner: `31.254 -> 42.541 tok/s`, or `1.361x`.
 Its aggregate timing fields are 259.536 ms drafting, 1,743.795 ms verifying,
 and 196.892 ms updating the head over 26 resident verify rounds; it also used
 one resident normal step for the final no-successor case. The paired streams
-were identical. This row is promising, but the **final committed receipt is
-pending**.
+were identical.
 
-## Suffix baseline at depth
+## Committed raw-prompt result and head-cache A/B
 
-A legacy same-target suffix-drafter receipt used a 4,137-token agentic prompt,
-96 generated tokens, and suffix gamma 7. It measured
-`21.1072 -> 42.4001 tok/s` (`2.0088x`), accepted 66 of 78 offered drafts
-(`84.615%`), emitted 6.50 tokens per round, used 12 resident and 0 CPU verify
-rounds, and was lossless.
+The final no-terminal-newline raw prompt was rerun from source commit
+`9626148a149f2e3cace675df1b3ae145d897cf4b` with binary SHA-256
+`dac2fb1cc83b2c63f2926b082ba8a6639c3da1804fa493523f26f024fd2be411`.
+The exact input/rendered-prompt SHA-256 is
+`ab0316e833f5891f3f9b7f537540c3879743350369be10cb2524d315a4599c08`.
+It measured **30.681 -> 41.536 tok/s (`1.354x`)** at gamma 3, with 87.18%
+offered-draft acceptance, 3.615 emitted tokens per round, 26 resident / 0 CPU
+verify rounds, and an identical 96-token target stream.
 
-That result is useful as a depth baseline only. It is **not directly comparable**
-to the 38- or 46-token learned-head prose sweeps: it uses a different drafter,
-prompt, context depth, and measurement provenance. The legacy receipt records
-`commit="unknown"` and no binary hash, so it cannot support a final same-binary
-comparison or a claim that suffix and EAGLE-3 were fairly ranked here.
+The final benchmark also ran the authoritative-row optimization against its
+full-compute control. Both modes produced exactly the same complete draft-token
+array, EAGLE output array, and plain output array. The control measured 36.830
+tok/s (`1.201x`); skipping unused Q/attention/FFN/lm-head work on intermediate
+authoritative rows measured 41.536 tok/s (`1.354x`). This closes the functional
+A/B for the K/V-only head-cache update, while leaving an external golden
+head-logit oracle as follow-up.
+
+One byte matters here. Reading the committed prose file literally includes its
+terminal newline and changes the continuation: on that prompt variant the same
+gamma-3 lane measured `30.723 -> 26.825 tok/s` (`0.873x`) with 43.09%
+acceptance, still lossless. The harness therefore removes terminal newlines
+before invoking the exact no-newline tuning prompt. The promoted prose/chat
+receipts record effective prompt hashes, and the latest schema also records the
+raw input hash. The 1.354x row is real and reproducible, but it is not a
+distributional claim.
+
+## Served-chat prompt sweep
+
+`--chat` renders the supplied text through the same no-tools single-user path
+used by `/v1/chat/completions`, then tokenizes the rendered control markers with
+special-token parsing. The resulting prompt is 55 tokens. All six arms below
+come from the final committed binary, use 96 generated tokens, run every verify
+round on resident Metal, use zero CPU fallback, and exactly match plain greedy.
+
+| gamma | Plain tok/s | EAGLE-3 tok/s | Ratio | Offered acceptance | Emitted/round | Resident / CPU rounds |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **1** | **30.649** | **26.085** | **0.851x** | **59.32%** | **1.593** | **59 / 0** |
+| 2 | 30.641 | 21.288 | 0.695x | 40.78% | 1.808 | 52 / 0 |
+| 3 | 30.650 | 24.606 | 0.803x | 36.84% | 2.089 | 45 / 0 |
+| 4 | 30.594 | 23.588 | 0.771x | 29.07% | 2.136 | 44 / 0 |
+| 5 | 30.559 | 23.281 | 0.762x | 25.62% | 2.238 | 42 / 0 |
+| 6 | 30.548 | 22.057 | 0.722x | 21.49% | 2.238 | 42 / 0 |
+
+The head is functionally working on served chat and its 59.32% first-draft
+acceptance is close to the head README's held-out first-position figure, but
+the current linear top-1 runtime is not economically working there: gamma 1 is
+the least-bad arm and remains a 15% regression. A representative chat speedup
+needs a top-k/tree EAGLE implementation, a materially cheaper head, or an
+acceptance-aware admission policy; the raw-prompt win must not be presented as
+served-chat throughput.
+
+## Context checks
+
+At 556 prompt tokens on the committed agentic/code prompt, raw gamma-3 EAGLE
+measured `30.454 -> 26.632 tok/s` (`0.875x`) with 44.17% acceptance. This row is
+from source `7187a071` and binary SHA-256
+`ef7948190548bba4dc3b910663a4edc91e32dc54fc21bb8f76f34a8017892440`, not the
+later chat-mode binary. The suffix drafter observed `30.442 -> 27.789 tok/s`
+(`0.913x`) with 19.67% offered-draft acceptance; that older suffix receipt did
+not carry enough provenance for promotion and is being superseded by the
+enriched receipt schema. Both observed streams were lossless and used resident
+verification only.
+
+At the original 4,137-token agentic prompt, the clean committed gamma-3 EAGLE
+run measured `22.392 -> 23.499 tok/s` (`1.049x`), 55.14% acceptance, 2.639
+emitted tokens per round, and 36 resident / 0 CPU rounds. An earlier tuning
+binary measured `23.618 -> 23.975 tok/s` (`1.015x`) at the same acceptance, and
+gamma 5 was worse at `0.974x`. This is outside the head's `T=1024` training
+distribution (not outside a declared runtime cap) and is labelled as
+extrapolation. At that depth, context-matching suffix drafting is substantially
+stronger.
+
+## Reproduction
+
+`qa/speculative/harness/run_eagle3.sh` runs the pinned resident sweep and fails
+if the token streams diverge, resident verification does not engage, or any CPU
+fallback occurs. `CHAT=1` selects served-chat rendering; the default is the
+exact raw tuning prompt shape. The exact target/head paths and output directory
+can be overridden with `MODEL`, `EAGLE3`, and `OUT_DIR`.
+
+## Suffix comparison at depth
+
+A clean-command same-target suffix observation used source commit `9626148a`,
+the 4,137-token agentic prompt, 96 generated tokens, and suffix gamma 7. It
+measured **`24.707 -> 43.540 tok/s` (`1.762x`)**, accepted 66 of 78 offered
+drafts (`84.615%`), emitted 6.50 tokens per round, used 12 resident and 0 CPU
+verify rounds, and reported lossless. Its legacy receipt schema did not embed
+the binary/model/prompt hashes or token-id arrays, so it is not yet the promoted
+same-build comparison. `bench-speculative` now records those fields; the
+enriched rerun supersedes this observation before the docs are finalized.
+
+The earlier `commit="unknown"` suffix row measured `21.107 -> 42.400 tok/s`
+(`2.009x`). Neither legacy depth result is directly comparable to the 38- or
+46-token prose sweeps.
 
 ## Conclusion
 
-The exact learned EAGLE-3 head can preserve the target's greedy output and, with
-resident target verification, exceeded the paired plain target on this prompt.
-The best current tuning point is gamma 3. The result remains bounded to the
-exact artifacts and benchmark command above until a clean committed build is
-rerun and its durable receipts are checked in; it is not native target MTP and
-not a serving result.
+The exact learned EAGLE-3 head is loaded, resident, recurrent, and losslessly
+verified. It exceeds plain decode on one exact raw completion (`1.354x`) and is
+a small win at the 4k extrapolation point (`1.049x`), but it regresses on the
+served-chat sweep (`0.851x` best) and the 556-token code context (`0.875x`).
+So the implementation is functionally working; broad MTP-style acceleration is
+not finished. The next justified engineering step is top-k/tree EAGLE or a
+cheaper/adaptively admitted head. This remains learned EAGLE-3 rather than a
+native target MTP head, and it is not wired into serving.
