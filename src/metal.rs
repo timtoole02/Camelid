@@ -20530,7 +20530,7 @@ fn encode_attention_splitk_kv16_batch(
 ) -> bool {
     let rows = position_counts.len();
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-    if !(2..=8).contains(&rows)
+    if !(2..=16).contains(&rows)
         || !attn2_enabled()
         || !splitk_attention_enabled()
         || !head_dim.is_multiple_of(32)
@@ -31425,7 +31425,7 @@ impl ResidentDecodeState {
                 dispatch_1d(e, scatter_pipeline, scatter_units);
             }
             // 6. attention. The opt-in F16 split-K batch emits one row-dimensional
-            //    partial dispatch plus one row-dimensional merge for k<=8. Every row keeps
+            //    partial dispatch plus one row-dimensional merge for k<=16. Every row keeps
             //    the exact split count and tree tail slots its row-wise encode used. Any
             //    ineligible shape or storage mode falls through to the unchanged per-row path.
             let omit_attention = verify_ablate("attn");
@@ -36520,12 +36520,8 @@ mod tests {
         let n_heads = 6usize;
         let n_kv_heads = 2usize;
         let head_dim = 128usize;
-        let max_positions = 144usize;
-        let rows = 8usize;
+        let max_positions = 160usize;
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let query: Vec<f32> = (0..rows * n_heads * head_dim)
-            .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
-            .collect();
         let keys: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
             .map(|i| ((i * 13 % 31) as f32 - 15.0) * 0.03125)
             .collect();
@@ -36533,75 +36529,90 @@ mod tests {
             .map(|i| ((i * 19 % 37) as f32 - 18.0) * 0.03125)
             .collect();
 
-        let assert_case = |label: &str,
-                           position_counts: &[usize],
-                           tree: Option<(usize, &[Vec<u32>])>| {
-            for direct in [false, true] {
-                let (rowwise, _, _) = try_attention_splitk_kv16_rows_for_test(
-                    &query,
-                    &keys,
-                    &values,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_positions,
-                    position_counts,
-                    scale,
-                    tree,
-                    false,
-                    direct,
-                    1,
-                )
-                .expect("row-wise split-K attention");
-                let (batched, _, _) = try_attention_splitk_kv16_rows_for_test(
-                    &query,
-                    &keys,
-                    &values,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_positions,
-                    position_counts,
-                    scale,
-                    tree,
-                    true,
-                    direct,
-                    1,
-                )
-                .expect("row-dimensional split-K attention");
-                assert_eq!(rowwise.len(), batched.len());
-                for (i, (&expected, &actual)) in rowwise.iter().zip(&batched).enumerate() {
-                    assert_eq!(
-                        actual.to_bits(),
-                        expected.to_bits(),
-                        "{label} direct={direct} element {i}: batch={actual} ({:#010x}) != row={expected} ({:#010x})",
-                        actual.to_bits(),
-                        expected.to_bits(),
-                    );
+        for rows in [8usize, 16] {
+            let query: Vec<f32> = (0..rows * n_heads * head_dim)
+                .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
+                .collect();
+            let assert_case = |label: &str,
+                               position_counts: &[usize],
+                               tree: Option<(usize, &[Vec<u32>])>| {
+                for direct in [false, true] {
+                    let (rowwise, _, _) = try_attention_splitk_kv16_rows_for_test(
+                        &query,
+                        &keys,
+                        &values,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_positions,
+                        position_counts,
+                        scale,
+                        tree,
+                        false,
+                        direct,
+                        1,
+                    )
+                    .expect("row-wise split-K attention");
+                    let (batched, _, _) = try_attention_splitk_kv16_rows_for_test(
+                        &query,
+                        &keys,
+                        &values,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_positions,
+                        position_counts,
+                        scale,
+                        tree,
+                        true,
+                        direct,
+                        1,
+                    )
+                    .expect("row-dimensional split-K attention");
+                    assert_eq!(rowwise.len(), batched.len());
+                    for (i, (&expected, &actual)) in rowwise.iter().zip(&batched).enumerate() {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "{label} direct={direct} element {i}: batch={actual} ({:#010x}) != row={expected} ({:#010x})",
+                            actual.to_bits(),
+                            expected.to_bits(),
+                        );
+                    }
                 }
-            }
-        };
+            };
 
-        // pc=128 uses two splits and pc=129 uses three: this proves the batch retains
-        // per-row split boundaries instead of silently adopting the deepest row's partition.
-        let linear_pc: Vec<usize> = (128..128 + rows).collect();
-        assert_case("linear", &linear_pc, None);
+            // pc=128 uses two splits and pc=129 uses three: this proves the batch retains
+            // per-row split boundaries instead of silently adopting the deepest row's partition.
+            let linear_pc: Vec<usize> = (128..128 + rows).collect();
+            assert_case(&format!("linear-k{rows}"), &linear_pc, None);
 
-        // BFS rows: 0 -> {1,2}; 1 -> 3; 2 -> {4,5}; 5 -> {6,7}.  Each list is
-        // prefix-external and includes self, exactly as TreeAttn presents it.
-        let base = 130usize;
-        let tail_slots = vec![
-            vec![130],
-            vec![130, 131],
-            vec![130, 132],
-            vec![130, 131, 133],
-            vec![130, 132, 134],
-            vec![130, 132, 135],
-            vec![130, 132, 135, 136],
-            vec![130, 132, 135, 137],
-        ];
-        let tree_pc: Vec<usize> = tail_slots.iter().map(|slots| base + slots.len()).collect();
-        assert_case("branching-tree", &tree_pc, Some((base, &tail_slots)));
+            // A stable BFS forest with two-way branches through all sixteen rows. Each
+            // prefix-external tail includes the row itself, exactly as TreeAttn presents it.
+            let base = 130usize;
+            let parents = [0usize, 0, 0, 1, 2, 2, 5, 5, 3, 3, 4, 4, 6, 6, 7, 7];
+            let tail_slots: Vec<Vec<u32>> = (0..rows)
+                .map(|node| {
+                    let mut path = vec![(base + node) as u32];
+                    let mut cursor = node;
+                    while cursor != 0 {
+                        cursor = parents[cursor];
+                        path.push((base + cursor) as u32);
+                    }
+                    path.reverse();
+                    path
+                })
+                .collect();
+            let tree_pc: Vec<usize> = tail_slots
+                .iter()
+                .map(|slots| base + slots.len())
+                .collect();
+            assert_case(
+                &format!("branching-tree-k{rows}"),
+                &tree_pc,
+                Some((base, &tail_slots)),
+            );
+        }
     }
 
     /// Production-shape lower bound for the host-loop collapse: 28 Llama-3.2-3B

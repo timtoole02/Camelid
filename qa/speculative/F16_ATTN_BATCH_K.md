@@ -14,7 +14,7 @@ CAMELID_METAL_ATTN_BATCH_K=1
 ```
 
 Eligibility is deliberately narrow: F16 primary or F16 mirrors, split-K, every
-row at `position_count >= 128`, and `2 <= k <= 8`. Every other shape takes the
+row at `position_count >= 128`, and `2 <= k <= 16`. Every other shape takes the
 unchanged row-wise path.
 
 ## Exactness
@@ -31,8 +31,8 @@ Focused kernel A/B:
 cargo test --lib metal_attention_splitk_kv16_batch_matches_rowwise_linear_and_tree -- --nocapture
 ```
 
-Result: PASS, bit-for-bit, for linear and branching-tree layouts through both
-the staged and head-dim-128 direct kernels.
+Result: PASS, bit-for-bit, at both k=8 and k=16 for linear and branching-tree
+layouts through both the staged and head-dim-128 direct kernels.
 
 Full F16-primary verifier proof:
 
