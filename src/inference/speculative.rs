@@ -214,6 +214,17 @@ pub fn speculative_rejection_sample<R: FnMut() -> f32>(
 pub enum SpeculativeDrafter {
     NGram(NGramDrafter),
     Model(Box<ModelDrafter>),
+    /// Suffix-decoding drafting flattened to a CHAIN.
+    ///
+    /// The suffix drafter fills the window where the n-gram drafter cannot:
+    /// measured on a 4137-token agentic transcript it proposes 6.92 tokens of a
+    /// 7-wide window against n-gram's 3.09, for A=7.33 vs 3.78 at the same ~90%
+    /// acceptance. But it was only reachable through the TREE verify, which
+    /// costs 2770 ms/round against the batched chain verify's 388 ms — turning
+    /// the better drafter into a 0.33x regression. Taking the tree's deepest
+    /// path as a flat chain keeps the drafting quality and returns the round to
+    /// the batched-column verify the chain lane already uses.
+    Suffix(Box<crate::inference::suffix_decoding::SuffixDecodingDrafter>),
 }
 
 impl SpeculativeDrafter {
@@ -224,6 +235,32 @@ impl SpeculativeDrafter {
         match self {
             Self::NGram(drafter) => Ok(drafter.draft(history, max_tokens)),
             Self::Model(drafter) => drafter.draft(history, max_tokens),
+            Self::Suffix(drafter) => {
+                use crate::inference::spec_tree::TreeDrafter;
+                let Some(&anchor) = history.last() else {
+                    return Ok(Vec::new());
+                };
+                if max_tokens == 0 {
+                    return Ok(Vec::new());
+                }
+                // Node budget = anchor + max_tokens, depth budget = max_tokens:
+                // a chain of `max_tokens` edges is exactly what the linear
+                // verify window holds.
+                let tree = drafter.draft_tree(history, anchor, max_tokens + 1, max_tokens);
+                // Deepest node = longest proposal. `path_to` walks parents from
+                // it back to the root, so dropping the root leaves the chain in
+                // emission order.
+                let Some(deepest) = (0..tree.tokens.len()).max_by_key(|&i| tree.depth[i]) else {
+                    return Ok(Vec::new());
+                };
+                let path = tree.path_to(deepest);
+                Ok(path
+                    .into_iter()
+                    .skip(1)
+                    .map(|i| tree.tokens[i])
+                    .take(max_tokens)
+                    .collect())
+            }
         }
     }
 
@@ -233,7 +270,7 @@ impl SpeculativeDrafter {
     /// bare mean would smear across every step as a uniform-looking slowdown.
     pub fn take_forward_stats(&mut self) -> (u128, u64, u64, u128) {
         match self {
-            Self::NGram(_) => (0, 0, 0, 0),
+            Self::NGram(_) | Self::Suffix(_) => (0, 0, 0, 0),
             Self::Model(drafter) => drafter.take_forward_stats(),
         }
     }

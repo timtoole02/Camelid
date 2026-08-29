@@ -2055,12 +2055,16 @@ struct PreparedGeneration {
 enum SpecDecodeMode {
     NGram,
     DraftModel,
+    /// Suffix-decoding drafting, flattened to a chain so it rides the batched
+    /// column verify rather than the (much more expensive) tree verify.
+    Suffix,
 }
 
 fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
     match env::var(SPEC_DECODE_ENV) {
         Ok(value) if value.eq_ignore_ascii_case("ngram") => Some(SpecDecodeMode::NGram),
         Ok(value) if value.eq_ignore_ascii_case("draft") => Some(SpecDecodeMode::DraftModel),
+        Ok(value) if value.eq_ignore_ascii_case("suffix") => Some(SpecDecodeMode::Suffix),
         _ => None,
     }
 }
@@ -17887,6 +17891,16 @@ async fn prepare_generation(
         {
             None
         }
+        Some(SpecDecodeMode::Suffix) => Some(PreparedSpeculative {
+            drafter: SpeculativeDrafter::Suffix(Box::new(
+                crate::inference::suffix_decoding::SuffixDecodingDrafter::default(),
+            )),
+            draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
+            latch: SpecLatch::default(),
+            rounds: 0,
+            drafted: 0,
+            accepted_drafts: 0,
+        }),
         Some(SpecDecodeMode::NGram) => Some(PreparedSpeculative {
             drafter: SpeculativeDrafter::NGram(NGramDrafter::new(
                 spec_ngram_min_from_env(),

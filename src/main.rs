@@ -8321,13 +8321,21 @@ fn run_bench_speculative(
     let build_drafter = || -> anyhow::Result<SpeculativeDrafter> {
         match drafter_kind.as_str() {
             "ngram" => Ok(SpeculativeDrafter::NGram(NGramDrafter::default())),
+            // Suffix drafting flattened to a chain: fills the verify window the
+            // n-gram drafter leaves mostly empty, without paying the tree
+            // verify's per-round cost.
+            "suffix" => Ok(SpeculativeDrafter::Suffix(Box::new(
+                camelid::inference::suffix_decoding::SuffixDecodingDrafter::default(),
+            ))),
             "draft" => {
                 let path = draft_model.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--drafter draft requires --draft-model <gguf>")
                 })?;
                 load_model_drafter(path, &tokenizer, cpu_draft, threads)
             }
-            other => anyhow::bail!("unknown --drafter {other:?}; expected \"ngram\" or \"draft\""),
+            other => anyhow::bail!(
+                "unknown --drafter {other:?}; expected \"ngram\", \"suffix\" or \"draft\""
+            ),
         }
     };
 

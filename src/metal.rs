@@ -14845,6 +14845,23 @@ fn encode_resident_kquant_matmul_f32(
     }
 }
 
+/// MEASUREMENT ONLY. `CAMELID_VERIFY_ABLATE=<stage>` omits one per-row stage of
+/// the verify round so its share of the round's wall time can be attributed by
+/// difference. The round then computes GARBAGE -- outputs are meaningless and
+/// `lossless` will be false. It exists because the round costs ~70 ms per verify
+/// column while the prefix KV it re-reads is only ~5 ms of that, so the cost is
+/// somewhere else and guessing has been expensive. Never set this in anything
+/// but a timing run.
+/// Stages: `rope`, `scatter`, `attn`, `argmax`, `qknorm`.
+#[cfg(target_os = "macos")]
+fn verify_ablate(stage: &str) -> bool {
+    static ABLATE: OnceLock<Option<String>> = OnceLock::new();
+    ABLATE
+        .get_or_init(|| std::env::var("CAMELID_VERIFY_ABLATE").ok())
+        .as_deref()
+        .is_some_and(|v| v.split(',').any(|s| s.trim() == stage))
+}
+
 /// Output rows each threadgroup of the batched-column verify GEMV owns. MUST stay in
 /// step with `NR0` in `q8_0_block_linear_ksplit_f32y_wire_nsg8_verify`: it sizes both
 /// the dispatch grid and the `[row * 32 + ..]` threadgroup scratch. It is a pure
@@ -18325,8 +18342,17 @@ fn encode_attention(
     // no longer has to forfeit split-K the way a kv16 primary still does. kv16-primary
     // stays excluded: it keeps no separate mirrors, and its primary IS the half cache the
     // f32 lane's mirrors provide, so there is nothing here to reuse for it yet.
+    // A kv16 PRIMARY is admitted too. `kv_scatter_kv16` writes
+    //   dst = (h * max_positions + write_position) * head_dim + d
+    // with `half(src)` -- byte-for-byte the layout and the values
+    // `kv_scatter_f32` writes into the f16 mirrors at the same `dst`. The
+    // split-K kv16 kernels therefore read a primary exactly as they read a
+    // mirror; excluding kv16 sent every K-quant model to the v2 kernel, whose
+    // own doc says it "leaves the GPU mostly idle while each simdgroup walks a
+    // long position range serially, and GQA re-reads every K/V row once per
+    // query head". Measured: attention was 52.8 ms of the 78.4 ms each verify
+    // column cost on an 8B Q4_K_M at 4k depth -- ~10x its own KV bandwidth.
     let splitk = v2
-        && !kv16
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -18355,6 +18381,17 @@ fn encode_attention(
             // wanted -- the whole point is that the Q8 cache is 1.88x smaller than the f16
             // mirrors this path reads on the f32 lane.
             e.set_compute_pipeline_state(&k.attention_decode_splitk_kvq8_pipeline);
+            e.set_buffer(0, Some(query), query_off);
+            e.set_buffer(1, Some(keys), 0);
+            e.set_buffer(2, Some(values), 0);
+        } else if kv16 {
+            // f16 primary: no mirrors exist, and none are needed -- the primary
+            // is already the half cache these kernels want.
+            if head_dim == 128 {
+                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_pipeline);
+            } else {
+                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
+            }
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
@@ -18524,6 +18561,10 @@ fn encode_attention_tree(
 ) {
     let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
+    // kv16 PRIMARY stays excluded HERE, unlike the linear path: this dispatch
+    // unconditionally unwraps `kv16_mirrors`, and a kv16 primary keeps none, so
+    // admitting it would panic. The tree lane is not on the measured path
+    // (its round costs ~4.5x the chain's), so it keeps today's behaviour.
     let splitk = v2
         && !kv16
         && splitk_attention_enabled()
@@ -27563,7 +27604,7 @@ impl ResidentDecodeState {
             );
             // 3. per-head Q/K-norm (Qwen3) — per row, in place
             if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
-                for i in 0..k {
+                for i in (0..k).take_while(|_| !verify_ablate("qknorm")) {
                     encode_rms_norm_per_head(
                         e,
                         kern,
@@ -27587,7 +27628,7 @@ impl ResidentDecodeState {
                 }
             }
             // 4. RoPE — per row (position base+i; cos/sin position-major, stride half_rope)
-            for i in 0..k {
+            for i in (0..k).take_while(|_| !verify_ablate("rope")) {
                 encode_rope(
                     e,
                     kern,
@@ -27615,7 +27656,7 @@ impl ResidentDecodeState {
             }
             // 5. K/V scatter — per row into slot base+i, dual-writing the f16 mirrors the
             //    split-K decode attention reads (ALL k before any attention reads).
-            for i in 0..k {
+            for i in (0..k).take_while(|_| !verify_ablate("scatter")) {
                 let scatter_pipeline = if self.kvq8 {
                     &kern.kv_scatter_kvq8_pipeline
                 } else if self.kv16 {
@@ -27649,7 +27690,11 @@ impl ResidentDecodeState {
             //    dispatches the unchanged `encode_attention` (pc = base+i+1); the tree path
             //    dispatches the slot-indirected `encode_attention_tree` (pc = base+tail_count)
             //    with this node's ancestor draft slots.
-            for (i, attn_scalar) in attn_scalars.iter().enumerate() {
+            for (i, attn_scalar) in attn_scalars
+                .iter()
+                .enumerate()
+                .take_while(|_| !verify_ablate("attn"))
+            {
                 match tree {
                     None => encode_attention(
                         e,
@@ -27783,7 +27828,7 @@ impl ResidentDecodeState {
             vocab,
             k,
         );
-        for i in 0..k {
+        for i in (0..k).take_while(|_| !verify_ablate("argmax")) {
             e.set_compute_pipeline_state(&kern.argmax_f32_greedy_pipeline);
             e.set_buffer(0, Some(&logits_buf), (i * vocab * 4) as u64);
             e.set_buffer(1, Some(&pred_buf), (i * 4) as u64);
@@ -43679,8 +43724,13 @@ mod tests {
             }
             eprintln!(
                 "metal_spec_verify_bit_identical: base={base} k={k} BIT-IDENTICAL \
-                 (split_k_engaged={})",
-                splitk_attention_enabled() && attn2_enabled()
+                 (split_k_engaged={}, kv_format={:?})",
+                splitk_attention_enabled() && attn2_enabled(),
+                // Report the PRIMARY KV format, not just the env gates: no test
+                // in this file sets kv16, so a run on an F32 primary proves
+                // nothing about the kv16 split-K path. Printing it is what makes
+                // a CAMELID_METAL_KV_DTYPE=f16 arm auditable rather than assumed.
+                resident_kv_format()
             );
         };
 
