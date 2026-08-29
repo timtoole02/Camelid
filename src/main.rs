@@ -195,6 +195,42 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn gemma4_mtp12_gpu_parses_exact_assistant_and_target_widths() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "gemma4-mtp12-gpu",
+                "target.gguf",
+                "--assistant",
+                "assistant/model.safetensors",
+                "--max-tokens",
+                "96",
+                "--widths",
+                "2,4,8",
+            ])
+            .expect("parse Gemma 4 MTP12 Metal harness");
+            match cli.command {
+                Some(Command::Gemma4Mtp12Gpu {
+                    path,
+                    assistant,
+                    max_tokens,
+                    widths,
+                    ..
+                }) => {
+                    assert_eq!(path, PathBuf::from("target.gguf"));
+                    assert_eq!(
+                        assistant,
+                        PathBuf::from("assistant/model.safetensors")
+                    );
+                    assert_eq!(max_tokens, 96);
+                    assert_eq!(widths, vec![2, 4, 8]);
+                }
+                other => panic!("expected Gemma4Mtp12Gpu, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn inspect_prefix_requires_the_declared_artifact_length() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from([
@@ -2469,6 +2505,23 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
+    },
+    /// Qualify and benchmark lossless Gemma 4 12B MTP speculative decode on
+    /// Metal. The exact official assistant drafts 1/3/7 tokens for target
+    /// verifier widths 2/4/8; every run must reproduce ordered K1 token IDs.
+    Gemma4Mtp12Gpu {
+        path: PathBuf,
+        /// Exact official 12B assistant `model.safetensors` file.
+        #[arg(long)]
+        assistant: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 96)]
+        max_tokens: usize,
+        /// Target verifier widths. The anchor row is included, so these map to
+        /// assistant draft counts 1/3/7.
+        #[arg(long, value_delimiter = ',', default_value = "2,4,8")]
+        widths: Vec<usize>,
     },
     /// Qualify and time the strict K<=8 ordered-Q4 Gemma 4 target verifier.
     /// This is a developer harness: it first requires whole-output K=1 parity
@@ -4993,6 +5046,247 @@ async fn main() -> anyhow::Result<()> {
                 let _ = (&path, &prompt, max_tokens);
                 return Err(camelid::BackendError::UnsupportedModelArchitecture(
                     "gemma4 GPU runtime requires macOS/Metal".into(),
+                )
+                .into());
+            }
+        }
+        Command::Gemma4Mtp12Gpu {
+            path,
+            assistant,
+            prompt,
+            max_tokens,
+            mut widths,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                widths.sort_unstable();
+                widths.dedup();
+                if widths.is_empty() || widths.iter().any(|width| !matches!(width, 2 | 4 | 8)) {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 verifier widths must be a non-empty subset of 2,4,8; got {widths:?}"
+                    ))
+                    .into());
+                }
+                if max_tokens == 0 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 MTP12 qualification requires max_tokens > 0".into(),
+                    )
+                    .into());
+                }
+                for forbidden_env in [
+                    "CAMELID_GEMMA4_DENSE_ORDERED_Q4",
+                    "CAMELID_GEMMA4_VERIFY_TRACE",
+                    "CAMELID_GEMMA4_METAL_HEAD_TIMING",
+                    "CAMELID_GEMMA4_GPU_TIMING",
+                ] {
+                    if std::env::var(forbidden_env)
+                        .ok()
+                        .as_deref()
+                        .is_some_and(|value| {
+                            value == "1" || value.eq_ignore_ascii_case("true")
+                        })
+                    {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "Gemma 4 MTP12 benchmark requires {forbidden_env} to be unset"
+                        ))
+                        .into());
+                    }
+                }
+
+                let max_positions = 512usize;
+                let conservative_positions = prompt
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(8);
+                if conservative_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 benchmark is capped at {max_positions} KV rows; UTF-8-byte upper bound is {conservative_positions}"
+                    ))
+                    .into());
+                }
+                let model_bytes = std::fs::metadata(&path)?.len();
+                let assistant_bytes = std::fs::metadata(&assistant)?.len();
+
+                eprintln!(
+                    "[gemma4-mtp12] loading target {} with KV capacity {max_positions}...",
+                    path.display()
+                );
+                let load_started = std::time::Instant::now();
+                let runtime =
+                    camelid::gemma4_runtime::Gemma4GpuRuntime::load(&path, max_positions)?;
+                let target_load_us = load_started.elapsed().as_micros();
+                eprintln!("[gemma4-mtp12] admitting exact target SHA-256...");
+                let target_identity_us = runtime.admit_mtp12_target_identity()?;
+                let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?;
+                let required_positions = prompt_tokens
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(8);
+                if required_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 needs {required_positions} KV positions, capacity is {max_positions}"
+                    ))
+                    .into());
+                }
+
+                eprintln!(
+                    "[gemma4-mtp12] qualifying established vs ordered K1 target output..."
+                );
+                let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
+                if qualification.token_ids.len() < 8 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 benchmark needs at least 8 qualified outputs; got {}",
+                        qualification.token_ids.len(),
+                    ))
+                    .into());
+                }
+                let qualification_decode_forwards_per_s = if qualification.decode_us == 0 {
+                    0.0
+                } else {
+                    qualification.decode_forward_count as f64 * 1_000_000.0
+                        / qualification.decode_us as f64
+                };
+
+                eprintln!(
+                    "[gemma4-mtp12] loading exact assistant {}...",
+                    assistant.display()
+                );
+                let assistant_load_started = std::time::Instant::now();
+                let mut drafter =
+                    camelid::metal::Gemma4Mtp12AssistantMetal::load(&assistant)?;
+                let assistant_load_us = assistant_load_started.elapsed().as_micros();
+                let mut runs = Vec::with_capacity(widths.len());
+                let mut exact_all = true;
+
+                for width in widths.iter().copied() {
+                    eprintln!(
+                        "[gemma4-mtp12] lossless decode W={width} / drafts={}...",
+                        width - 1
+                    );
+                    let wall_started = std::time::Instant::now();
+                    let generation = runtime.generate_greedy_mtp12_ordered_q4(
+                        &mut drafter,
+                        &prompt,
+                        max_tokens,
+                        width,
+                    )?;
+                    let generation_wall_us = wall_started.elapsed().as_micros();
+                    let first_id_divergence = qualification
+                        .token_ids
+                        .iter()
+                        .zip(&generation.token_ids)
+                        .position(|(left, right)| left != right)
+                        .or_else(|| {
+                            (qualification.token_ids.len() != generation.token_ids.len()).then_some(
+                                qualification
+                                    .token_ids
+                                    .len()
+                                    .min(generation.token_ids.len()),
+                            )
+                        });
+                    let ids_exact = first_id_divergence.is_none()
+                        && generation.token_ids.len() == qualification.token_ids.len();
+                    let text_exact = generation.text == qualification.text;
+                    let exact = ids_exact && text_exact;
+                    exact_all &= exact;
+                    let decode_outputs = generation.token_ids.len().saturating_sub(1);
+                    let decode_output_tok_s = if generation.stats.decode_us == 0 {
+                        0.0
+                    } else {
+                        decode_outputs as f64 * 1_000_000.0
+                            / generation.stats.decode_us as f64
+                    };
+                    let end_to_end_tok_s = if generation_wall_us == 0 {
+                        0.0
+                    } else {
+                        generation.token_ids.len() as f64 * 1_000_000.0
+                            / generation_wall_us as f64
+                    };
+                    let qualified_generation_us = generation_wall_us
+                        .saturating_sub(generation.stats.target_identity_us);
+                    let qualified_end_to_end_tok_s = if qualified_generation_us == 0 {
+                        0.0
+                    } else {
+                        generation.token_ids.len() as f64 * 1_000_000.0
+                            / qualified_generation_us as f64
+                    };
+                    eprintln!(
+                        "[gemma4-mtp12] W={width}: {decode_output_tok_s:.3} decode tok/s, alpha={:.3}, accepted={}/{}, exact={exact}",
+                        generation.stats.alpha(),
+                        generation.stats.accepted_drafts,
+                        generation.stats.drafted,
+                    );
+                    runs.push(serde_json::json!({
+                        "configured_verify_width": width,
+                        "cold_generation_wall_us": generation_wall_us,
+                        "qualified_generation_wall_us": qualified_generation_us,
+                        "decode_output_count": decode_outputs,
+                        "decode_output_tok_s": decode_output_tok_s,
+                        "cold_end_to_end_output_tok_s": end_to_end_tok_s,
+                        "qualified_end_to_end_output_tok_s": qualified_end_to_end_tok_s,
+                        "first_id_divergence_vs_ordered_k1": first_id_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "ids_exact": ids_exact,
+                        "text_exact": text_exact,
+                        "exact": exact,
+                        "target_model_sha256": generation.target_model_sha256,
+                        "assistant_model_sha256": generation.assistant_model_sha256,
+                        "assistant_source_path": generation.assistant_source_path,
+                        "assistant_resident_ledger": generation.assistant_resident_ledger,
+                        "stats": generation.stats,
+                        "token_ids": generation.token_ids,
+                        "text": generation.text
+                    }));
+                }
+
+                let receipt = serde_json::json!({
+                    "schema": "camelid.gemma4_mtp12_metal_lossless_sweep.v1",
+                    "camelid_version": VERSION,
+                    "source_commit": option_env!("CAMELID_GIT_COMMIT"),
+                    "model_path": path,
+                    "model_bytes": model_bytes,
+                    "assistant_path": assistant,
+                    "assistant_bytes": assistant_bytes,
+                    "prompt": prompt,
+                    "prompt_tokens": prompt_tokens.len(),
+                    "max_tokens": max_tokens,
+                    "max_positions": max_positions,
+                    "target_load_us": target_load_us,
+                    "target_identity_us": target_identity_us,
+                    "assistant_load_us": assistant_load_us,
+                    "environment": {
+                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
+                        "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
+                        "CAMELID_GEMMA4_DENSE_ORDERED_Q4": std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok(),
+                        "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
+                        "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
+                        "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
+                    },
+                    "ordered_k1_qualification": {
+                        "exact_vs_established": true,
+                        "prefill_us": qualification.prefill_us,
+                        "decode_us": qualification.decode_us,
+                        "decode_forward_count": qualification.decode_forward_count,
+                        "decode_target_forwards_per_s": qualification_decode_forwards_per_s,
+                        "token_ids": qualification.token_ids,
+                        "text": qualification.text
+                    },
+                    "runs": runs,
+                    "exact_all_widths": exact_all,
+                    "timing_scope": "Qualified generation wall includes ordered prompt replay plus lossless decode; decode_output_tok_s excludes prompt and first output produced by prefill; one-time target identity hash and assistant load are separately accounted"
+                });
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+                if !exact_all {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 MTP12 output diverged from qualified ordered K1".into(),
+                    )
+                    .into());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (&path, &assistant, &prompt, max_tokens, &widths);
+                return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                    "Gemma 4 MTP12 Metal runtime requires macOS".into(),
                 )
                 .into());
             }
