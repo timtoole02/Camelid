@@ -14974,12 +14974,13 @@ fn encode_resident_kquant_matmul_f32(
         *p.add(1) = rows as u32;
         *p.add(2) = n_tokens as u32;
     }
-    // The v3 lane consumes the graph's f32 activations directly. Keep it to
-    // decode/verify-sized windows: long prompt prefill remains on the existing
-    // quantized batched path, while each <=16-column v3 group is bit-identical
-    // to repeated v3 single-token dispatches.
+    // The v3 lane consumes the graph's f32 activations directly. Keep it to the
+    // production verifier's eight-column window: prompt prefill is chunked at
+    // 16 rows on the measured Llama path, and admitting that shape here turns
+    // every prompt chunk into sixteen direct GEMVs. Each admitted v3 window is
+    // bit-identical to repeated v3 single-token dispatches.
     let v3 = if kquant_v3_enabled()
-        && n_tokens <= 2 * KQUANT_V3_MAX_COLUMNS
+        && n_tokens <= KQUANT_V3_MAX_COLUMNS
         && matches!(
             weight.format,
             ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
