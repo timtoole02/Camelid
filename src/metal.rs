@@ -281,6 +281,7 @@ struct MetalLinearKernel {
     // WIN2METAL Phase 4 — TREE-verify attention clones (slot-indirected draft tail).
     attention_decode_f32_tree_pipeline: ComputePipelineState,
     attention_decode_v2_tree_pipeline: ComputePipelineState,
+    attention_decode_v2_kv16_tree_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_tree_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_tree_pipeline: ComputePipelineState,
     embed_row_gather_q8_wire_pipeline: ComputePipelineState,
@@ -8492,6 +8493,98 @@ kernel void attention_decode_v2_tree(
     }
 }
 
+// f16-primary tree twin of attention_decode_v2_kv16. This is deliberately a
+// separate kernel rather than reusing attention_decode_v2_tree: the cache's
+// position/head strides are expressed in elements in both cases, but an f16
+// primary has two-byte elements. Binding it to the float tree kernel therefore
+// advances twice as far through the cache and is memory-unsafe, not merely a
+// precision mismatch. Apart from the half loads and slot indirection, the
+// arithmetic and reduction order are byte-for-byte the linear kv16 kernel's.
+kernel void attention_decode_v2_kv16_tree(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const uint* tail_slots [[buffer(14)]],
+    constant uint& base [[buffer(15)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint MAX_DPL = 4;
+    if (head >= n_heads) return;
+    const uint dpl = head_dim / 32;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
+
+    float q[MAX_DPL];
+    for (uint i = 0; i < dpl; ++i) {
+        q[i] = query[q_base + lane + i * 32] * scale;
+    }
+
+    float m = -INFINITY;
+    float l = 0.0;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint p = sg; p < position_count; p += NSG) {
+        const uint slot = (p < base) ? p : tail_slots[p - base];
+        device const half* kr = keys + kv_base + slot * position_stride;
+        float s = 0.0;
+        for (uint i = 0; i < dpl; ++i) {
+            s += q[i] * float(kr[lane + i * 32]);
+        }
+        s = simd_sum(s);
+        float m_new = max(m, s);
+        float w = exp(s - m_new);
+        float corr = exp(m - m_new);
+        device const half* vr = values + kv_base + slot * position_stride;
+        for (uint i = 0; i < dpl; ++i) {
+            acc[i] = acc[i] * corr + w * float(vr[lane + i * 32]);
+        }
+        l = l * corr + w;
+        m = m_new;
+    }
+
+    threadgroup float sh_m[NSG];
+    threadgroup float sh_l[NSG];
+    threadgroup float sh_acc[NSG * 128];
+    if (lane == 0) {
+        sh_m[sg] = m;
+        sh_l[sg] = l;
+    }
+    for (uint i = 0; i < dpl; ++i) {
+        sh_acc[sg * 128 + lane + i * 32] = acc[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float m_tot = max(max(sh_m[0], sh_m[1]), max(sh_m[2], sh_m[3]));
+        float l_tot = 0.0;
+        float w[NSG];
+        for (uint i = 0; i < NSG; ++i) {
+            w[i] = exp(sh_m[i] - m_tot);
+            l_tot += sh_l[i] * w[i];
+        }
+        float inv = 1.0 / l_tot;
+        for (uint i = 0; i < dpl; ++i) {
+            uint d = lane + i * 32;
+            float o = 0.0;
+            for (uint g2 = 0; g2 < NSG; ++g2) {
+                o += sh_acc[g2 * 128 + d] * w[g2];
+            }
+            output[q_base + d] = o * inv;
+        }
+    }
+}
+
 // Tree clone of attention_decode_splitk_kv16 (the staged depth path, head_dim != 128).
 // The original's local `base` (a K/V byte offset) is renamed `koff` to free the name
 // for the prefix-length param.
@@ -9675,6 +9768,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_decode_v2_tree_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_v2_tree_function)
                 .ok()?;
+            let attention_decode_v2_kv16_tree_function = elementwise_library
+                .get_function("attention_decode_v2_kv16_tree", None)
+                .ok()?;
+            let attention_decode_v2_kv16_tree_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &attention_decode_v2_kv16_tree_function,
+                )
+                .ok()?;
             let attention_decode_splitk_kv16_tree_function = elementwise_library
                 .get_function("attention_decode_splitk_kv16_tree", None)
                 .ok()?;
@@ -10123,6 +10224,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_merge_pipeline,
                 attention_decode_f32_tree_pipeline,
                 attention_decode_v2_tree_pipeline,
+                attention_decode_v2_kv16_tree_pipeline,
                 attention_decode_splitk_kv16_tree_pipeline,
                 attention_decode_splitk_kv16_direct_tree_pipeline,
                 embed_row_gather_q8_wire_pipeline,
@@ -19030,6 +19132,13 @@ fn encode_attention(
     );
 }
 
+#[cfg(all(test, target_os = "macos"))]
+static TREE_KV16_V2_ENCODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(test, target_os = "macos"))]
+static TREE_KV16_SPLITK_ENCODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// WIN2METAL Phase 4 — tree twin of `encode_attention`. Routes (v2 / split-K kv16 /
 /// split-K kv16 direct / f32) EXACTLY like `encode_attention` at the same `position_count`,
 /// but dispatches the `*_tree` pipelines and binds the per-node `tail_slots` buffer at
@@ -19038,9 +19147,9 @@ fn encode_attention(
 /// `encode_attention`.
 ///
 /// `tail_slots_buf` holds this node's ancestor draft cache slots (increasing, length
-/// `position_count - base`); `base_buf` holds `base` as a single u32. The split-K branch is
-/// mirror-only (the f32 split-K opt-out kernel is not cloned): it always reads the f16
-/// mirrors when present, matching the linear path under the default (mirror) config.
+/// `position_count - base`); `base_buf` holds `base` as a single u32. Split-K binds an f16
+/// primary directly, or the f32 primary's f16 mirrors. Below the split threshold an f16
+/// primary uses its type-correct v2 tree twin; it must never be bound to the f32 tree kernel.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention_tree(
@@ -19068,12 +19177,7 @@ fn encode_attention_tree(
 ) {
     let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-    // kv16 PRIMARY stays excluded HERE, unlike the linear path: this dispatch
-    // unconditionally unwraps `kv16_mirrors`, and a kv16 primary keeps none, so
-    // admitting it would panic. The tree lane is not on the measured path
-    // (its round costs ~4.5x the chain's), so it keeps today's behaviour.
     let splitk = v2
-        && !kv16
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -19084,10 +19188,18 @@ fn encode_attention_tree(
         unsafe {
             *(splits_scalar.contents() as *mut u32) = n_splits as u32;
         }
-        // Tree split-K is mirror-only: read the f16 mirrors whenever present (the f32
-        // split-K kernel has no tree clone). Under the default config the linear path
-        // also reads the mirrors, so the two stay byte-identical.
-        let (mk, mv) = kv16_mirrors.expect("tree split-K requires f16 mirrors");
+        // A primary f16 cache has exactly the same element layout as the f32 lane's f16
+        // mirrors. Select the bound cache, not the process-global format: resident engines
+        // with different formats can coexist in one process.
+        let (mk, mv) = if kv16 {
+            (keys, values)
+        } else {
+            kv16_mirrors.expect("f32 tree split-K requires f16 mirrors")
+        };
+        #[cfg(test)]
+        if kv16 {
+            TREE_KV16_SPLITK_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if head_dim == 128 {
             e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_tree_pipeline);
         } else {
@@ -19143,7 +19255,11 @@ fn encode_attention_tree(
         return;
     }
     // Non-split path: v2 tiled (no scores buffer) or the f32 one-simdgroup fallback.
-    let attn_pipeline = if v2 {
+    let attn_pipeline = if v2 && kv16 {
+        #[cfg(test)]
+        TREE_KV16_V2_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        &k.attention_decode_v2_kv16_tree_pipeline
+    } else if v2 {
         &k.attention_decode_v2_tree_pipeline
     } else {
         &k.attention_decode_f32_tree_pipeline
@@ -29507,18 +29623,21 @@ impl ResidentDecodeState {
         {
             return None;
         }
-        if (self.kv16 || self.kvq8) && tree.is_some() {
-            return None; // tree kernels do not yet carry compressed-primary non-split twins
+        if self.kvq8 && tree.is_some() {
+            return None; // Q8-primary tree kernels are not implemented; fail closed.
         }
-        // The tree split-K attention (encode_attention_tree) is mirror-only — there is no f32
-        // split-K *tree* kernel. The CAMELID_METAL_ATTN_SPLITK_KV16=0 opt-out forces forward_token
-        // and the LINEAR verify (encode_attention) onto the f32 split-K reads, so a tree verify
-        // reading the f16 mirrors instead would diverge from plain greedy (NOT lossless). Fail
-        // closed to the lossless single-token/CPU fallback rather than emit a non-lossless tree
-        // verify. The linear path honors the env in encode_attention, so it is unaffected and
-        // stays byte-exact; only the tree lane needs this guard. (Mirror predicate matches the
-        // `use_mirrors` test in encode_attention.)
+        if self.kv16 && tree.is_some() && !attn2_enabled() {
+            // The f16 tree path has a v2 twin and split-K twins. With v2 disabled,
+            // linear decode uses attention_decode_kv16 (v1), whose exact reduction order
+            // has no slot-indirected clone. Do not silently bind half storage as float.
+            return None;
+        }
+        // An f32 primary's tree split-K clone is mirror-only: there is no f32 split-K tree
+        // kernel. If mirror reads are explicitly disabled, fail closed because the linear lane
+        // reads f32 and would otherwise use different attention inputs. An f16 primary binds its
+        // primary directly, so the mirror opt-out is irrelevant to that format.
         if tree.is_some()
+            && !self.kv16
             && std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
                 .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
         {
@@ -29984,7 +30103,11 @@ impl ResidentDecodeState {
                         &q_buf,
                         &self.cache_k[l],
                         &self.cache_v[l],
-                        Some((&self.cache_k16[l], &self.cache_v16[l])),
+                        if self.kv16 {
+                            None
+                        } else {
+                            Some((&self.cache_k16[l], &self.cache_v16[l]))
+                        },
                         &scores_buf,
                         &ctx_buf,
                         attn_scalar,
@@ -46731,18 +46854,28 @@ mod tests {
                 ref_argmax[r] = best_i;
             }
 
-            // (a) Compacted accepted-path KV == the linear decode's KV, byte-for-byte, in both
-            //     the f32 caches and the f16 mirrors.
+            // (a) Compacted accepted-path KV == the linear decode's KV, byte-for-byte. An
+            //     f32 primary checks both its primary and f16 mirror; an f16 primary checks
+            //     its half cache directly (compressed primaries deliberately keep no mirror).
             let read_row =
-                |s: &ResidentDecodeState, kbuf: bool, f16: bool, l: usize, slot: usize| {
+                |s: &ResidentDecodeState, kbuf: bool, mirror: bool, l: usize, slot: usize| {
                     let mut k_out = vec![0u32; n_kv * head_dim];
                     unsafe {
-                        if f16 {
+                        if mirror {
                             let buf = if kbuf {
                                 &s.cache_k16[l]
                             } else {
                                 &s.cache_v16[l]
                             };
+                            let p = buf.contents() as *const u16;
+                            for h in 0..n_kv {
+                                let off = (h * max_positions + slot) * head_dim;
+                                for d in 0..head_dim {
+                                    k_out[h * head_dim + d] = *p.add(off + d) as u32;
+                                }
+                            }
+                        } else if s.kv16 {
+                            let buf = if kbuf { &s.cache_k[l] } else { &s.cache_v[l] };
                             let p = buf.contents() as *const u16;
                             for h in 0..n_kv {
                                 let off = (h * max_positions + slot) * head_dim;
@@ -46767,13 +46900,18 @@ mod tests {
                 for r in 0..path.len() {
                     let slot = base + r;
                     for kbuf in [true, false] {
-                        for f16 in [false, true] {
-                            let a = read_row(&tree_session, kbuf, f16, l, slot);
-                            let b = read_row(&ref_session, kbuf, f16, l, slot);
+                        let mirrors: &[_] = if tree_session.kv16 {
+                            &[false]
+                        } else {
+                            &[false, true]
+                        };
+                        for &mirror in mirrors {
+                            let a = read_row(&tree_session, kbuf, mirror, l, slot);
+                            let b = read_row(&ref_session, kbuf, mirror, l, slot);
                             assert_eq!(
                                 a, b,
                                 "BRANCH base={base} layer {l} slot {slot} (rank {r}) \
-                                 kbuf={kbuf} f16={f16}: compacted KV != linear-decode KV"
+                                 kbuf={kbuf} mirror={mirror}: compacted KV != linear-decode KV"
                             );
                         }
                     }
@@ -46796,6 +46934,53 @@ mod tests {
             );
         };
         branching(126);
+    }
+
+    /// Explicit opt-in proof lane for the f16-primary tree verifier. Unlike the broad
+    /// parity test above, this test is ignored by default and fails (rather than silently
+    /// skipping) unless every required production gate and the f16 primary are active.
+    /// Run with `CAMELID_METAL_KV_DTYPE=f16 CAMELID_METAL_F32Y=1
+    /// CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 CAMELID_METAL_ATTN2=1
+    /// cargo test --release --lib metal_tree_verify_kv16_primary_path_runs -- --ignored
+    /// --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit f16-primary Metal proof lane; requires environment gates"]
+    fn metal_tree_verify_kv16_primary_path_runs() {
+        assert!(detect_metal_device().available, "Metal device required");
+        assert_eq!(
+            resident_kv_format(),
+            ResidentKvFormat::F16,
+            "set CAMELID_METAL_KV_DTYPE=f16 before this test process starts"
+        );
+        assert!(f32y_gemv_enabled(), "CAMELID_METAL_F32Y=1 required");
+        assert!(wire_weights_enabled(), "CAMELID_METAL_WIRE=1 required");
+        assert!(
+            wire_nsg8_enabled(),
+            "CAMELID_METAL_WIRE_NSG8=1 required"
+        );
+        assert!(attn2_enabled(), "CAMELID_METAL_ATTN2=1 required");
+        assert!(
+            splitk_attention_enabled(),
+            "CAMELID_METAL_ATTN_SPLITK must not be disabled"
+        );
+        TREE_KV16_V2_ENCODES.store(0, std::sync::atomic::Ordering::Relaxed);
+        TREE_KV16_SPLITK_ENCODES.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        metal_tree_verify_bit_identical();
+
+        let v2 = TREE_KV16_V2_ENCODES.load(std::sync::atomic::Ordering::Relaxed);
+        let splitk = TREE_KV16_SPLITK_ENCODES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(v2 > 0, "f16-primary v2 tree kernel was never encoded");
+        assert!(
+            splitk > 0,
+            "f16-primary split-K tree kernel was never encoded"
+        );
+        eprintln!(
+            "metal_tree_verify_kv16_primary_path_runs: PASS v2_encodes={v2} \
+             splitk_encodes={splitk} kv_format={:?}",
+            resident_kv_format()
+        );
     }
 
     #[cfg(target_os = "macos")]
