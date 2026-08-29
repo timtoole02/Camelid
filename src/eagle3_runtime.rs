@@ -156,6 +156,55 @@ impl Eagle3DynamicFrontierConfig {
     }
 }
 
+/// Minimal cache movement needed to materialize `next_path` from an already-resident
+/// ephemeral `current_path`. Paths are stable lattice-node ids in root-first order.
+///
+/// The EAGLE cache watermark counts only non-root rows: the root distribution is the stable
+/// authoritative seed, while every path element after it consumes one private head-cache row.
+/// Keeping this arithmetic in a pure helper makes the cursor optimization independently
+/// testable and keeps cache mutation out of the probability scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Eagle3PathTransition {
+    /// Number of root-first path nodes shared by both paths, including the root.
+    shared_nodes: usize,
+    /// Number of already-materialized non-root rows that survive rollback.
+    retained_rows: usize,
+    /// First index in the next root-first path that must be replayed.
+    replay_from: usize,
+}
+
+fn eagle3_path_transition(
+    current_path: &[usize],
+    next_path: &[usize],
+) -> Result<Eagle3PathTransition> {
+    if current_path.is_empty() || next_path.is_empty() {
+        return Err(invalid(
+            "EAGLE-3 dynamic cursor paths must contain their root",
+        ));
+    }
+    if current_path[0] != next_path[0] {
+        return Err(invalid(format!(
+            "EAGLE-3 dynamic cursor changed roots from {} to {}",
+            current_path[0], next_path[0]
+        )));
+    }
+    let shared_nodes = current_path
+        .iter()
+        .zip(next_path)
+        .take_while(|(left, right)| left == right)
+        .count();
+    // Equal roots guarantee at least one shared node. Keep the checked form so a future
+    // representation change cannot turn a subtraction into an underflow.
+    let retained_rows = shared_nodes
+        .checked_sub(1)
+        .ok_or_else(|| invalid("EAGLE-3 dynamic cursor paths share no root"))?;
+    Ok(Eagle3PathTransition {
+        shared_nodes,
+        retained_rows,
+        replay_from: shared_nodes,
+    })
+}
+
 /// Deterministic host scheduler for a budgeted EAGLE candidate lattice.
 ///
 /// The scheduler owns no model state.  [`Self::next_parent`] names the globally strongest
@@ -172,6 +221,9 @@ pub struct Eagle3DynamicFrontier {
     /// root is already represented by `Eagle3Drafter::stable_seed` and therefore has no entry.
     recurrent_g: Vec<Option<Vec<f32>>>,
     head_expansions: usize,
+    /// Successful non-root `forward_token` calls used to materialize this lattice. The root
+    /// distribution comes from `stable_seed` and therefore costs no call here.
+    materialized_head_forwards: usize,
 }
 
 /// One measured target-verifier cost point.  Units are arbitrary but must be consistent across
@@ -202,6 +254,7 @@ impl Eagle3DynamicFrontier {
             expanded: vec![false],
             recurrent_g: vec![None],
             head_expansions: 0,
+            materialized_head_forwards: 0,
         })
     }
 
@@ -215,6 +268,10 @@ impl Eagle3DynamicFrontier {
 
     pub fn head_expansions(&self) -> usize {
         self.head_expansions
+    }
+
+    pub fn materialized_head_forwards(&self) -> usize {
+        self.materialized_head_forwards
     }
 
     /// Globally strongest parent still worth expanding.
@@ -591,13 +648,14 @@ impl Eagle3Drafter {
         self.head.filled()
     }
 
-    /// Explore a budgeted dynamic frontier by replaying each selected branch from the stable
-    /// EAGLE cache watermark.
+    /// Explore a budgeted dynamic frontier while retaining the longest common prefix between
+    /// consecutively selected branches in the ephemeral EAGLE cache.
     ///
     /// No whole-cache snapshots are needed: `Eagle3DynamicFrontier` retains the raw recurrent
     /// `g` input for every candidate, while this method rolls the one-layer KV watermark back
-    /// and deterministically replays the root-to-parent token path.  The learned head therefore
-    /// conditions every expansion on its real branch, not on a top-1 surrogate spine.
+    /// only to the branches' longest common prefix and deterministically replays the divergent
+    /// suffix.  The learned head therefore conditions every expansion on its real branch, not
+    /// on a top-1 surrogate spine, without paying triangular replay cost for a confident spine.
     ///
     /// Every observation carries the all-evaluated-row log-sum-exp produced beside its Metal
     /// logits. Reduced-row heads fail closed inside `record_expansion`; no callback can
@@ -616,18 +674,45 @@ impl Eagle3Drafter {
         let mut frontier = Eagle3DynamicFrontier::new(anchor, config)?;
         frontier.record_expansion(0, &stable_seed)?;
 
-        while let Some(parent) = frontier.next_parent() {
-            // Root was consumed from `stable_seed` above. Every subsequent parent has a
-            // concrete token path that starts one row beyond the authoritative watermark.
-            if parent == 0 {
-                return Err(invalid(
-                    "EAGLE-3 dynamic frontier scheduled its root more than once",
-                ));
-            }
-            let path = frontier.source_path_to(parent)?;
-            let expansion = (|| -> Result<Eagle3MetalOutput> {
+        // Lattice root zero is represented by `stable_seed`, not a private cache row. Each
+        // successful non-root materialization below extends this cursor by exactly one row per
+        // path node. Regardless of success, the outer cleanup restores the authoritative
+        // watermark before returning.
+        let mut cursor_path = vec![0usize];
+        let materialization = (|| -> Result<Eagle3DynamicFrontier> {
+            while let Some(parent) = frontier.next_parent() {
+                // Root was consumed from `stable_seed` above. Every subsequent parent has a
+                // concrete token path that starts one row beyond the authoritative watermark.
+                if parent == 0 {
+                    return Err(invalid(
+                        "EAGLE-3 dynamic frontier scheduled its root more than once",
+                    ));
+                }
+                let path = frontier.source_path_to(parent)?;
+                let transition = eagle3_path_transition(&cursor_path, &path)?;
+                debug_assert_eq!(transition.shared_nodes, transition.replay_from);
+                if transition.replay_from >= path.len() {
+                    return Err(invalid(format!(
+                        "EAGLE-3 dynamic frontier scheduled already-materialized parent {parent}"
+                    )));
+                }
+
+                let expected_cursor_filled = stable
+                    .checked_add(cursor_path.len().saturating_sub(1))
+                    .ok_or_else(|| invalid("EAGLE-3 dynamic cursor watermark overflow"))?;
+                if self.head.filled() != expected_cursor_filled {
+                    return Err(invalid(format!(
+                        "EAGLE-3 dynamic cursor expected head watermark {expected_cursor_filled}, got {}",
+                        self.head.filled()
+                    )));
+                }
+                let retained_filled = stable
+                    .checked_add(transition.retained_rows)
+                    .ok_or_else(|| invalid("EAGLE-3 dynamic retained watermark overflow"))?;
+                metal(self.head.rollback_to_position(retained_filled))?;
+
                 let mut selected_output = None;
-                for &source in path.iter().skip(1) {
+                for &source in &path[transition.replay_from..] {
                     let token = frontier.lattice.nodes()[source].token;
                     let recurrent = frontier.recurrent_g(source)?.to_vec();
                     let embedding = target_weights
@@ -638,22 +723,40 @@ impl Eagle3Drafter {
                         &recurrent,
                         self.head.filled(),
                     ))?;
+                    frontier.materialized_head_forwards += 1;
                     if source == parent {
                         selected_output = Some(output);
                     }
                 }
-                selected_output.ok_or_else(|| {
+                let output = selected_output.ok_or_else(|| {
                     invalid(format!(
                         "EAGLE-3 dynamic frontier path did not materialize parent {parent}"
                     ))
-                })
-            })();
-            let rollback = metal(self.head.rollback_to_position(stable));
-            let output = expansion?;
-            rollback?;
-            frontier.record_expansion(parent, &output)?;
+                })?;
+                let expected_path_filled = stable
+                    .checked_add(path.len().saturating_sub(1))
+                    .ok_or_else(|| invalid("EAGLE-3 dynamic path watermark overflow"))?;
+                if self.head.filled() != expected_path_filled {
+                    return Err(invalid(format!(
+                        "EAGLE-3 dynamic path expected head watermark {expected_path_filled}, got {}",
+                        self.head.filled()
+                    )));
+                }
+                cursor_path = path;
+                frontier.record_expansion(parent, &output)?;
+            }
+            Ok(frontier)
+        })();
+        let rollback = metal(self.head.rollback_to_position(stable));
+        match (materialization, rollback) {
+            // Preserve the primary materialization error, matching the previous error behavior;
+            // the rollback was nevertheless attempted before this match.
+            (Err(error), _) => Err(error),
+            (Ok(frontier), rollback) => {
+                rollback?;
+                Ok(frontier)
+            }
         }
-        Ok(frontier)
     }
 
     /// Seed the stable draft cache from every authoritative prompt row. At head position
@@ -871,6 +974,42 @@ mod tests {
             capture("high", 2, 0.0),
         ];
         assert!(interleave_target_layer_inputs(&captures).is_err());
+    }
+
+    #[test]
+    fn dynamic_cursor_reuses_a_confident_spine_without_triangular_replay() {
+        let paths: [&[usize]; 4] = [&[0], &[0, 1], &[0, 1, 3], &[0, 1, 3, 7]];
+        let mut cursor_forwards = 0;
+        for (depth, pair) in paths.windows(2).enumerate() {
+            let transition = eagle3_path_transition(pair[0], pair[1]).unwrap();
+            assert_eq!(transition.shared_nodes, depth + 1);
+            assert_eq!(transition.retained_rows, depth);
+            assert_eq!(transition.replay_from, depth + 1);
+            cursor_forwards += pair[1].len() - transition.replay_from;
+        }
+        let stable_replay_forwards: usize = paths[1..].iter().map(|path| path.len() - 1).sum();
+        assert_eq!(cursor_forwards, 3);
+        assert_eq!(stable_replay_forwards, 6);
+    }
+
+    #[test]
+    fn dynamic_cursor_rolls_back_to_lcp_and_replays_only_divergent_suffix() {
+        let branch = [0, 1, 3, 7];
+        let cousin = [0, 1, 4, 9];
+        let transition = eagle3_path_transition(&branch, &cousin).unwrap();
+        assert_eq!(transition.shared_nodes, 2);
+        assert_eq!(transition.retained_rows, 1);
+        assert_eq!(transition.replay_from, 2);
+        assert_eq!(&cousin[transition.replay_from..], &[4, 9]);
+
+        let sibling = [0, 2];
+        let transition = eagle3_path_transition(&cousin, &sibling).unwrap();
+        assert_eq!(transition.retained_rows, 0);
+        assert_eq!(&sibling[transition.replay_from..], &[2]);
+
+        assert!(eagle3_path_transition(&[], &[0]).is_err());
+        assert!(eagle3_path_transition(&[0], &[]).is_err());
+        assert!(eagle3_path_transition(&[0, 1], &[9, 1]).is_err());
     }
 
     #[test]
