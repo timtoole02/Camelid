@@ -1,6 +1,6 @@
 # Handoff — speculative decoding campaign
 
-Branch `campaign/mtp-3x`, 28 commits ahead of `origin/main` (b8951e24). **Unpushed.**
+Branch `campaign/mtp-3x`, 30 commits ahead of `origin/main` (b8951e24). **Unpushed.**
 Worktree `/Volumes/Untitled/Camelid-3x`. Nothing here is on by default.
 
 ## The result
@@ -87,12 +87,24 @@ math-free weight-stream probe reaching only 89 GB/s at these shapes — so rough
 1.6x is unclaimed in the decode kernel itself. Use
 `CAMELID_VERIFY_ABLATE=<stage>` (measurement-only, outputs garbage) to attribute.
 
+**2026-08-29 mini2 follow-up:** the obvious store/barrier/reload removal was a
+real microbenchmark win (Q4 -6.7%, Q6 -28.0%) but failed the warmed 4k lossless
+gate at output token 0 or 11, including after stronger barriers and after
+isolating Q4. It was fully reverted. Half-staging Q6 regressed; paired packed
+loads were noise. Do not repeat the direct-fragment route from the synthetic
+result alone. The now-preserved live benchmark is in `qa/speculative/kbench/`;
+full receipts and the rejection analysis are in
+`qa/speculative/KQUANT_MMA_OVERNIGHT.md`.
+
 ## Traps worth knowing
 
 - `metal_spec_verify_bit_identical` **skips silently** unless the fast-stack
   gates are armed, and no test in the tree sets kv16 — so it can go green without
   touching the K-quant path. It now prints `kv_format`; run it with
   `CAMELID_METAL_KV_DTYPE=f16` to exercise the primary. Filters go AFTER `--`.
+- A K-quant micro/unit identity pass is still not a promotion gate. The direct
+  fragment candidate passed both but diverged only in the warmed 4137-token
+  model run. Require two warmed 96-token exact runs after those fast gates.
 - The tree verify is ~350 ms/verify-column vs the chain's 27 and is NOT worth
   chasing: admitting kv16 there changed nothing (352 vs 349). Its cost is
   structural. `encode_attention_tree` must KEEP its `!kv16` guard — that dispatch
