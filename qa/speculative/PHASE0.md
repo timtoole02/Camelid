@@ -291,3 +291,37 @@ it varied.
   likely fix is `set_fast_math_enabled(false)` on `LINEAR_ROW_SHADER`, unmeasured.
 - Trained MTP heads (EAGLE-3 sidecar) remain unbuilt. They are now a real lever
   rather than a wrong one: the drafter caps A, and A caps the multiplier.
+
+## The v1 K-quant losslessness bug: found, root-caused, fixed
+
+The default K-quant speculative lane emitted a **different token stream than its
+own plain greedy decode**. Reproduced deterministically, same binary, one env
+flag apart (`receipts/m2_repro_lossless.jsonl`):
+
+| arm | lossless | divergence@ | runs |
+| --- | --- | --- | --- |
+| pre-change attention path (`CAMELID_METAL_ATTN_SPLITK=0`) | **false** | 58 | **5/5** |
+| split-K attention (this branch) | **true** | — | **5/5** |
+
+**The kv16 split-K admission fixed it.** Same one-condition edit as the 4.30x
+speedup.
+
+Two corrections worth keeping, because both cost real time:
+
+- **It was never intermittent.** An early reading called it that, on the
+  strength of one `false` at 304 tokens and one `true` at 4137. It reproduces
+  5/5 at an identical divergence index; it only stopped reproducing because the
+  binary being retested already contained the fix. One observation per arm is
+  not evidence of intermittency.
+- **The mechanism was NOT the GEMV.** The standing theory was that
+  `q4k_linear_tiled` and `q4k_linear_simd` diverge under fast math, since their
+  shared library compiles with it on while the v2 lane disables it. That
+  analysis was detailed, well-evidenced, and about the wrong kernel: routing
+  multi-token dispatches through the mc GEMV instead of tiled changed
+  losslessness **not at all** (both true 4/4), while the attention path flips it
+  every time (`receipts/m2_lossless_ab.jsonl`).
+
+The mc-lane investigation still paid for itself: it is 1.4-2.0x cheaper per
+verify round on the v1 lane (743 -> 539 ms at 256 tokens, 1063 -> 541 at 512),
+using a kernel that already carries a passing bit-identity test. Defaulting
+`CAMELID_KQUANT_MC_GEMV` on is justified on that alone.
