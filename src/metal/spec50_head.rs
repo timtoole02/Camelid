@@ -913,14 +913,19 @@ SPEC50_BATCH_ENTRY(6)
 SPEC50_BATCH_ENTRY(7)
 SPEC50_BATCH_ENTRY(8)
 
-// Per-candidate-row argmax with the same semantics as `argmax_f32_greedy`:
-// a strictly-greater scan (so the first maximum in a thread's ascending stride
-// wins) folded by a tree that breaks ties toward the lower index, i.e. the
-// lowest index among all maxima. It reads the SOFTCAPPED logits the projection
-// wrote. Softcap (tanh(x/c)*c) is monotonic, so it cannot reorder two distinct
-// logits; it is applied first anyway because saturation can map two distinct
-// pre-cap values onto one post-cap float, and the reference pipeline's argmax
-// sees that collapsed tie too.
+// Per-candidate-row argmax with the established dense Gemma GPU semantics:
+// Rust's `Iterator::max_by(|a, b| a.1.total_cmp(b.1))` keeps the later item on
+// equality, so the HIGHEST vocabulary id wins an exact tie.  The signed key
+// transform below is the one used by `f32::total_cmp`; retaining it also makes
+// signed zero deterministic instead of treating +0 and -0 as interchangeable.
+// It reads the SOFTCAPPED logits the projection wrote. Softcap can collapse
+// distinct pre-cap values onto one float, which makes the tie rule observable.
+inline int spec50_total_order_key(float value) {
+    int key = as_type<int>(value);
+    key ^= int(uint(key >> 31) >> 1);
+    return key;
+}
+
 kernel void q6k_spec50_argmax_rows(
     device const float* logits [[buffer(0)]],
     device uint* out_id [[buffer(1)]],
@@ -935,11 +940,15 @@ kernel void q6k_spec50_argmax_rows(
     device const float* base = logits + ulong(row) * ulong(count);
     float best = -INFINITY;
     uint best_i = 0xffffffffu;
+    int best_key = spec50_total_order_key(best);
     for (uint i = tid; i < count; i += tg_size) {
         const float v = base[i];
-        if (v > best) {
+        const int key = spec50_total_order_key(v);
+        if (best_i == 0xffffffffu || key > best_key ||
+            (key == best_key && i > best_i)) {
             best = v;
             best_i = i;
+            best_key = key;
         }
     }
     sh_val[tid] = best;
@@ -949,7 +958,11 @@ kernel void q6k_spec50_argmax_rows(
         if (tid < s) {
             const float ov = sh_val[tid + s];
             const uint oi = sh_idx[tid + s];
-            if (ov > sh_val[tid] || (ov == sh_val[tid] && oi < sh_idx[tid])) {
+            const int other_key = spec50_total_order_key(ov);
+            const int this_key = spec50_total_order_key(sh_val[tid]);
+            if (oi != 0xffffffffu &&
+                (sh_idx[tid] == 0xffffffffu || other_key > this_key ||
+                 (other_key == this_key && oi > sh_idx[tid]))) {
                 sh_val[tid] = ov;
                 sh_idx[tid] = oi;
             }
@@ -1722,10 +1735,10 @@ mod tests {
         eprintln!("[spec50] per-token batch independence holds for K=1..=8");
     }
 
-    /// Per-row argmax must equal a CPU first-maximum scan of the same softcapped
-    /// logits (lowest index wins ties).
+    /// Per-row argmax must equal the established dense Gemma GPU selector over
+    /// the same softcapped logits (`max_by(total_cmp)`, highest id on ties).
     #[test]
-    fn spec50_argmax_matches_cpu_first_maximum() {
+    fn spec50_argmax_matches_established_total_cmp_maximum() {
         let refs = reference_kernels();
         let kernels = spec50_head_kernels().expect("spec50 pipelines");
         let mut rng = Rng(0x0bad_c0de_dead_beef);
@@ -1768,14 +1781,12 @@ mod tests {
         }
         for t in 0..k {
             let row = &logits[t * rows..(t + 1) * rows];
-            let mut best = f32::NEG_INFINITY;
-            let mut best_i = 0usize;
-            for (i, &v) in row.iter().enumerate() {
-                if v > best {
-                    best = v;
-                    best_i = i;
-                }
-            }
+            let (best_i, best) = row
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("non-empty logits row");
             assert_eq!(got_ids[t] as usize, best_i, "argmax id mismatch at token {t}");
             assert_eq!(
                 got_vals[t].to_bits(),
@@ -1783,8 +1794,8 @@ mod tests {
                 "argmax value mismatch at token {t}"
             );
         }
-        // Force an exact tie at a higher index than an equal earlier one and
-        // confirm the lower index still wins.
+        // Softcap saturation can create exact ties.  Match Iterator::max_by by
+        // selecting the later (higher vocabulary) id.
         let mut tied = logits[..rows].to_vec();
         tied[7] = 1.0e30;
         tied[9] = 1.0e30;
@@ -1797,8 +1808,26 @@ mod tests {
         cb.commit();
         cb.wait_until_completed();
         let tie_id = unsafe { *(ids.contents() as *const u32) };
-        assert_eq!(tie_id, 7, "tie must resolve to the lowest index");
-        eprintln!("[spec50] per-row argmax matches CPU first-maximum, ties to lowest index");
+        assert_eq!(tie_id, 9, "exact ties must resolve to the highest index");
+
+        // `total_cmp` distinguishes signed zero: +0 sorts above -0 even when
+        // the -0 occurs at a later index.  This catches a tempting but wrong
+        // numeric `>=` implementation of the established selector.
+        let mut signed_zero = vec![-1.0f32; rows];
+        signed_zero[7] = 0.0;
+        signed_zero[9] = -0.0;
+        write_buffer_f32(&tie_buf, &signed_zero);
+        let cb = refs.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        encode_q6k_spec50_argmax(e, kernels, &tie_buf, &ids, &vals, rows, 1);
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let zero_id = unsafe { *(ids.contents() as *const u32) };
+        assert_eq!(zero_id, 7, "+0 must sort above a later -0");
+        eprintln!(
+            "[spec50] per-row argmax matches established total_cmp; exact ties select highest id"
+        );
     }
 
     /// Geometry sweep: rows-per-simdgroup x weight-decode shape, on the real
