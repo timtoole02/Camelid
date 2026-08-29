@@ -26,6 +26,8 @@ use crate::tokenizer::Tokenizer;
 use crate::wire_mmap::GgufWireMmap;
 use crate::{BackendError, Result};
 use rayon::prelude::*;
+#[cfg(target_os = "macos")]
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -6482,6 +6484,12 @@ pub struct Gemma4GpuRuntime {
     /// ordered verifier's logical cursor.  One sequence may use either the
     /// established path or the ordered-Q4 verifier, never both.
     verifier_state: std::sync::Mutex<Gemma4DenseVerifierState>,
+    /// Lazy, process-local admission of the exact target bytes backing this
+    /// runtime.  Hashing the retained read-only mmap (rather than reopening its
+    /// source path) pins the identity check to the same inode/pages used by the
+    /// no-copy Q6_K table.  `OnceLock` serializes the first check and caches both
+    /// success and failure, so speculative rounds never rehash the 6.5 GiB file.
+    mtp12_target_identity: std::sync::OnceLock<std::result::Result<(), String>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -6673,7 +6681,9 @@ mod dense_verifier_state_tests {
 /// present but remain logically invisible until [`Gemma4GpuRuntime::commit_verifier_prefix`]
 /// resolves this ticket.  `greedy_ids[row]` is the target prediction after
 /// consuming candidate `row`; `final_hidden[row]` is the corresponding 3,840
-/// value decoder state consumed by the MTP recurrence.
+/// value raw post-layer decoder state.  The MTP recurrence consumes the target
+/// output-RMS-normalized form; runtime composition applies that normalization
+/// exactly once immediately before entering the assistant.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub struct Gemma4DenseVerifierBatch {
@@ -6684,15 +6694,16 @@ pub struct Gemma4DenseVerifierBatch {
 }
 
 /// Ordered-Q4 prompt replay receipt. `first_greedy_id` is the first generated
-/// output after the complete prompt; `pending_target_hidden` is the final prompt
-/// row that seeds the MTP recurrence without recomputing or adopting a cache
-/// from a different arithmetic lane.
+/// output after the complete prompt; `pending_target_raw_hidden` is the final
+/// prompt's raw post-layer row.  It seeds the MTP recurrence only after the
+/// runtime applies the target output RMS norm, without recomputing or adopting
+/// a cache from a different arithmetic lane.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub struct Gemma4OrderedQ4Prefill {
     pub prompt_token_count: usize,
     pub first_greedy_id: u32,
-    pub pending_target_hidden: Vec<f32>,
+    pub pending_target_raw_hidden: Vec<f32>,
     pub prefill_us: u128,
 }
 
@@ -6708,6 +6719,409 @@ pub struct Gemma4OrderedQ4Generation {
     /// output is already produced by the last prefill row and is not counted.
     pub decode_forward_count: usize,
     pub decode_us: u128,
+}
+
+/// One target-authoritative Metal speculative round.  Every field needed to
+/// audit acceptance, cache commit, stop handling, and the assistant/target wall
+/// split is retained; rejected draft-tail KV rows remain physically present but
+/// are absent from `committed_input_rows`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Gemma4Mtp12MetalRoundReceipt {
+    /// Target KV position at which `anchor_token` is tentatively forwarded.
+    pub position: usize,
+    pub anchor_token: u32,
+    pub configured_verify_width: usize,
+    /// Actual target width after adapting to the remaining output budget.
+    pub verifier_width: usize,
+    pub budget_truncated: bool,
+    pub drafts: Vec<u32>,
+    /// Target argmax after every row in `[anchor, drafts..]`.
+    pub target_greedy_ids: Vec<u32>,
+    /// Agreed, non-stop drafts emitted after the anchor.
+    pub accepted_drafts: usize,
+    /// Anchor plus agreed non-stop draft rows made logically visible.
+    pub committed_input_rows: usize,
+    pub emitted_token_ids: Vec<u32>,
+    pub mismatch_draft_index: Option<usize>,
+    /// Target-authoritative stop, never emitted or committed as an input row.
+    pub stop_token: Option<u32>,
+    /// Next target bonus when it is non-stop; it has not yet been forwarded.
+    pub next_anchor_token: Option<u32>,
+    /// Complete checked-call wall, including exact target hidden normalization.
+    pub assistant_call_us: u128,
+    pub assistant_timing: Gemma4Mtp12MetalChainTimingReceipt,
+    pub assistant_ledger: Gemma4Mtp12MetalChainLedgerReceipt,
+    pub target_verify_us: u128,
+}
+
+/// JSON-stable copy of the assistant chain timing (the Metal module keeps its
+/// execution type serialization-agnostic).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Gemma4Mtp12MetalChainTimingReceipt {
+    pub cpu_prepare_us: u128,
+    pub encode_us: u128,
+    pub wait_us: u128,
+    pub gpu_us: u128,
+    pub kernel_us: u128,
+    pub wall_us: u128,
+}
+
+#[cfg(target_os = "macos")]
+impl From<crate::metal::Gemma4Mtp12ChainTiming> for Gemma4Mtp12MetalChainTimingReceipt {
+    fn from(value: crate::metal::Gemma4Mtp12ChainTiming) -> Self {
+        Self {
+            cpu_prepare_us: value.cpu_prepare_us,
+            encode_us: value.encode_us,
+            wait_us: value.wait_us,
+            gpu_us: value.gpu_us,
+            kernel_us: value.kernel_us,
+            wall_us: value.wall_us,
+        }
+    }
+}
+
+/// JSON-stable copy of one resident draft-chain byte/dispatch ledger.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Gemma4Mtp12MetalChainLedgerReceipt {
+    pub draft_k: u32,
+    pub command_buffers: u32,
+    pub command_buffer_waits: u32,
+    pub target_q6k_table_alias_bytes: u64,
+    pub target_kv_alias_bytes: u64,
+    pub assistant_matrix_read_bytes: u64,
+    pub target_kv_read_bytes: u64,
+    pub dynamic_attention_scratch_bytes: u64,
+    pub resident_chain_state_bytes: u64,
+    pub initial_hidden_upload_bytes: u64,
+    pub readback_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl From<crate::metal::Gemma4Mtp12ChainLedger> for Gemma4Mtp12MetalChainLedgerReceipt {
+    fn from(value: crate::metal::Gemma4Mtp12ChainLedger) -> Self {
+        Self {
+            draft_k: value.draft_k,
+            command_buffers: value.command_buffers,
+            command_buffer_waits: value.command_buffer_waits,
+            target_q6k_table_alias_bytes: value.target_q6k_table_alias_bytes,
+            target_kv_alias_bytes: value.target_kv_alias_bytes,
+            assistant_matrix_read_bytes: value.assistant_matrix_read_bytes,
+            target_kv_read_bytes: value.target_kv_read_bytes,
+            dynamic_attention_scratch_bytes: value.dynamic_attention_scratch_bytes,
+            resident_chain_state_bytes: value.resident_chain_state_bytes,
+            initial_hidden_upload_bytes: value.initial_hidden_upload_bytes,
+            readback_bytes: value.readback_bytes,
+        }
+    }
+}
+
+/// JSON-stable resident assistant admission/load ledger.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Gemma4Mtp12MetalResidentLedgerReceipt {
+    pub source_file_bytes: u64,
+    pub source_sha256_verified: bool,
+    pub source_mapping_retained: bool,
+    pub packed_q4_matrix_bytes: u64,
+    pub decoded_norm_bytes: u64,
+    pub fixed_scratch_bytes: u64,
+    pub quantize_us: u128,
+    pub hash_us: u128,
+    pub pipeline_compile_us: u128,
+    pub load_wall_us: u128,
+}
+
+#[cfg(target_os = "macos")]
+impl From<crate::metal::Gemma4Mtp12ResidentLedger> for Gemma4Mtp12MetalResidentLedgerReceipt {
+    fn from(value: crate::metal::Gemma4Mtp12ResidentLedger) -> Self {
+        Self {
+            source_file_bytes: value.source_file_bytes,
+            source_sha256_verified: value.source_sha256_verified,
+            source_mapping_retained: value.source_mapping_retained,
+            packed_q4_matrix_bytes: value.packed_q4_matrix_bytes,
+            decoded_norm_bytes: value.decoded_norm_bytes,
+            fixed_scratch_bytes: value.fixed_scratch_bytes,
+            quantize_us: value.quantize_us,
+            hash_us: value.hash_us,
+            pipeline_compile_us: value.pipeline_compile_us,
+            load_wall_us: value.load_wall_us,
+        }
+    }
+}
+
+/// Aggregate evidence for one exact Gemma 4 12B MTP12 Metal generation.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Gemma4Mtp12MetalStats {
+    pub configured_verify_width: usize,
+    pub rounds: u64,
+    pub drafted: u64,
+    pub accepted_drafts: u64,
+    /// Total non-stop output ids, including the first id predicted by prefill.
+    /// Decode-forward throughput therefore uses `(emitted_tokens - 1) / decode_us`.
+    pub emitted_tokens: u64,
+    pub committed_input_rows: u64,
+    pub target_verify_rows: u64,
+    /// One-time SHA gate wall.  A previously admitted runtime reports only the
+    /// inexpensive cached lookup here.
+    pub target_identity_us: u128,
+    pub prefill_us: u128,
+    pub decode_us: u128,
+    /// Complete checked assistant-call wall, including target final norm.
+    pub assistant_us: u128,
+    pub assistant_gpu_us: u128,
+    pub assistant_kernel_us: u128,
+    pub target_verify_us: u128,
+    pub budget_tail_rounds: u64,
+    pub terminal_stop_token: Option<u32>,
+    pub trace: Vec<Gemma4Mtp12MetalRoundReceipt>,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Mtp12MetalStats {
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.drafted == 0 {
+            0.0
+        } else {
+            self.accepted_drafts as f64 / self.drafted as f64
+        }
+    }
+
+    pub fn alpha(&self) -> f64 {
+        if self.rounds == 0 {
+            0.0
+        } else {
+            self.accepted_drafts as f64 / self.rounds as f64
+        }
+    }
+
+    pub fn emitted_per_target_verify(&self) -> f64 {
+        if self.rounds == 0 {
+            0.0
+        } else {
+            // Each committed speculative input row corresponds to one emitted
+            // non-stop output in that round.  Unlike `emitted_tokens`, this
+            // excludes a final budget-tail anchor emitted without a verifier.
+            self.committed_input_rows as f64 / self.rounds as f64
+        }
+    }
+
+    pub fn decode_tokens_per_second(&self) -> f64 {
+        if self.decode_us == 0 {
+            0.0
+        } else {
+            self.emitted_tokens.saturating_sub(1) as f64 * 1_000_000.0
+                / self.decode_us as f64
+        }
+    }
+}
+
+/// User-facing generation plus the pinned artifact identities and resident
+/// assistant load ledger needed to reproduce its performance receipt.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Gemma4Mtp12MetalGeneration {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+    pub prompt_token_count: usize,
+    pub target_model_sha256: &'static str,
+    pub assistant_model_sha256: &'static str,
+    pub assistant_source_path: std::path::PathBuf,
+    pub assistant_resident_ledger: Gemma4Mtp12MetalResidentLedgerReceipt,
+    pub stats: Gemma4Mtp12MetalStats,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4Mtp12AcceptanceDecision {
+    accepted_drafts: usize,
+    committed_input_rows: usize,
+    mismatch_draft_index: Option<usize>,
+    stop_token: Option<u32>,
+    next_anchor_token: Option<u32>,
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp12_tail_verify_width(
+    configured: usize,
+    remaining_including_anchor: usize,
+) -> Option<usize> {
+    // Equivalent to `width <= remaining_after_anchor + 1`: this caller's
+    // budget includes the already-predicted anchor as candidate row zero.
+    [8usize, 4, 2]
+        .into_iter()
+        .find(|&width| width <= configured && width <= remaining_including_anchor)
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp12_acceptance_decision(
+    drafts: &[u32],
+    target_greedy_ids: &[u32],
+    stop_ids: &[u32],
+) -> Option<Gemma4Mtp12AcceptanceDecision> {
+    if target_greedy_ids.len() != drafts.len().checked_add(1)? {
+        return None;
+    }
+    for (index, (&draft, &target)) in drafts.iter().zip(target_greedy_ids).enumerate() {
+        if draft != target {
+            let stop_token = stop_ids.contains(&target).then_some(target);
+            return Some(Gemma4Mtp12AcceptanceDecision {
+                accepted_drafts: index,
+                committed_input_rows: 1 + index,
+                mismatch_draft_index: Some(index),
+                stop_token,
+                next_anchor_token: stop_token.is_none().then_some(target),
+            });
+        }
+        // A target-agreed stop is an output boundary, not another input row:
+        // commit the anchor and preceding drafts but exclude this stop row.
+        if stop_ids.contains(&draft) {
+            return Some(Gemma4Mtp12AcceptanceDecision {
+                accepted_drafts: index,
+                committed_input_rows: 1 + index,
+                mismatch_draft_index: None,
+                stop_token: Some(draft),
+                next_anchor_token: None,
+            });
+        }
+    }
+    let bonus = target_greedy_ids[drafts.len()];
+    let stop_token = stop_ids.contains(&bonus).then_some(bonus);
+    Some(Gemma4Mtp12AcceptanceDecision {
+        accepted_drafts: drafts.len(),
+        committed_input_rows: 1 + drafts.len(),
+        mismatch_draft_index: None,
+        stop_token,
+        next_anchor_token: stop_token.is_none().then_some(bonus),
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod gemma4_mtp12_metal_generation_tests {
+    use super::{
+        gemma4_mtp12_acceptance_decision, gemma4_mtp12_tail_verify_width,
+        Gemma4Mtp12AcceptanceDecision, Gemma4Mtp12MetalStats,
+    };
+
+    #[test]
+    fn tail_width_counts_the_anchor_in_the_remaining_budget() {
+        assert_eq!(gemma4_mtp12_tail_verify_width(8, 9), Some(8));
+        assert_eq!(gemma4_mtp12_tail_verify_width(8, 7), Some(4));
+        assert_eq!(gemma4_mtp12_tail_verify_width(8, 3), Some(2));
+        assert_eq!(gemma4_mtp12_tail_verify_width(8, 1), None);
+        assert_eq!(gemma4_mtp12_tail_verify_width(4, 8), Some(4));
+        assert_eq!(gemma4_mtp12_tail_verify_width(2, 8), Some(2));
+    }
+
+    #[test]
+    fn mismatch_commit_includes_anchor_and_only_the_agreed_prefix() {
+        let drafts = [10, 11, 12];
+        let immediate = gemma4_mtp12_acceptance_decision(
+            &drafts,
+            &[20, 21, 22, 23],
+            &[99],
+        )
+        .expect("valid target rows");
+        assert_eq!(
+            immediate,
+            Gemma4Mtp12AcceptanceDecision {
+                accepted_drafts: 0,
+                committed_input_rows: 1,
+                mismatch_draft_index: Some(0),
+                stop_token: None,
+                next_anchor_token: Some(20),
+            }
+        );
+
+        let two = gemma4_mtp12_acceptance_decision(
+            &drafts,
+            &[10, 11, 20, 23],
+            &[99],
+        )
+        .expect("valid target rows");
+        assert_eq!(two.accepted_drafts, 2);
+        assert_eq!(two.committed_input_rows, 3);
+        assert_eq!(two.mismatch_draft_index, Some(2));
+        assert_eq!(two.next_anchor_token, Some(20));
+    }
+
+    #[test]
+    fn all_accepted_commits_every_candidate_and_uses_final_bonus() {
+        let decision = gemma4_mtp12_acceptance_decision(
+            &[10, 11, 12],
+            &[10, 11, 12, 42],
+            &[99],
+        )
+        .expect("valid target rows");
+        assert_eq!(decision.accepted_drafts, 3);
+        assert_eq!(decision.committed_input_rows, 4);
+        assert_eq!(decision.mismatch_draft_index, None);
+        assert_eq!(decision.stop_token, None);
+        assert_eq!(decision.next_anchor_token, Some(42));
+    }
+
+    #[test]
+    fn target_agreed_stop_is_neither_accepted_output_nor_committed_input() {
+        let decision = gemma4_mtp12_acceptance_decision(
+            &[10, 99, 12],
+            &[10, 99, 12, 42],
+            &[99],
+        )
+        .expect("valid target rows");
+        assert_eq!(decision.accepted_drafts, 1);
+        assert_eq!(decision.committed_input_rows, 2);
+        assert_eq!(decision.mismatch_draft_index, None);
+        assert_eq!(decision.stop_token, Some(99));
+        assert_eq!(decision.next_anchor_token, None);
+    }
+
+    #[test]
+    fn target_stop_on_mismatch_or_bonus_terminates_without_forwarding_it() {
+        let mismatch = gemma4_mtp12_acceptance_decision(
+            &[10, 11, 12],
+            &[10, 99, 12, 42],
+            &[99],
+        )
+        .expect("valid target rows");
+        assert_eq!(mismatch.accepted_drafts, 1);
+        assert_eq!(mismatch.committed_input_rows, 2);
+        assert_eq!(mismatch.mismatch_draft_index, Some(1));
+        assert_eq!(mismatch.stop_token, Some(99));
+        assert_eq!(mismatch.next_anchor_token, None);
+
+        let bonus = gemma4_mtp12_acceptance_decision(
+            &[10, 11, 12],
+            &[10, 11, 12, 99],
+            &[99],
+        )
+        .expect("valid target rows");
+        assert_eq!(bonus.accepted_drafts, 3);
+        assert_eq!(bonus.committed_input_rows, 4);
+        assert_eq!(bonus.stop_token, Some(99));
+        assert_eq!(bonus.next_anchor_token, None);
+    }
+
+    #[test]
+    fn malformed_target_row_count_fails_closed() {
+        assert!(gemma4_mtp12_acceptance_decision(&[10, 11, 12], &[10, 11, 12], &[])
+            .is_none());
+    }
+
+    #[test]
+    fn rate_helpers_exclude_the_prefill_id_and_unverified_budget_tail_anchor() {
+        let stats = Gemma4Mtp12MetalStats {
+            rounds: 2,
+            emitted_tokens: 6,
+            committed_input_rows: 5,
+            decode_us: 100_000,
+            ..Gemma4Mtp12MetalStats::default()
+        };
+        assert_eq!(stats.decode_tokens_per_second(), 50.0);
+        assert_eq!(stats.emitted_per_target_verify(), 2.5);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -6986,6 +7400,7 @@ impl Gemma4GpuRuntime {
                 next_ticket: 1,
                 pending: None,
             }),
+            mtp12_target_identity: std::sync::OnceLock::new(),
         })
     }
 
@@ -7233,15 +7648,15 @@ impl Gemma4GpuRuntime {
         self.reset_dense_verifier_sequence()?;
         let started = std::time::Instant::now();
         let mut first_greedy_id = 0u32;
-        let mut pending_target_hidden = Vec::new();
+        let mut pending_target_raw_hidden = Vec::new();
         for (position, &token) in prompt_tokens.iter().enumerate() {
-            (first_greedy_id, pending_target_hidden) =
+            (first_greedy_id, pending_target_raw_hidden) =
                 self.forward_greedy_ordered_q4(token, position)?;
         }
         Ok(Gemma4OrderedQ4Prefill {
             prompt_token_count: prompt_tokens.len(),
             first_greedy_id,
-            pending_target_hidden,
+            pending_target_raw_hidden,
             prefill_us: started.elapsed().as_micros(),
         })
     }
@@ -7310,6 +7725,382 @@ impl Gemma4GpuRuntime {
             )));
         }
         Ok(ordered)
+    }
+
+    /// Admit the exact target bytes backing this runtime for the official 12B
+    /// MTP assistant.  The hash is computed over the retained read-only mmap,
+    /// never by reopening a potentially replaced source path, and the result is
+    /// cached (including failure) for the lifetime of the runtime.
+    fn require_mtp12_target_identity(&self) -> Result<()> {
+        let admission = self.mtp12_target_identity.get_or_init(|| {
+            let file_len = usize::try_from(self._mmap.file_len()).map_err(|_| {
+                format!(
+                    "target file length {} cannot be represented on this host",
+                    self._mmap.file_len()
+                )
+            })?;
+            let bytes = self
+                ._mmap
+                .bytes(0, file_len)
+                .map_err(|error| format!("target mmap could not be hashed: {error}"))?;
+            let mut hasher = Sha256::new();
+            for chunk in bytes.chunks(8 * 1_024 * 1_024) {
+                hasher.update(chunk);
+            }
+            let actual = format!("{:x}", hasher.finalize());
+            if actual != crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256 {
+                return Err(format!(
+                    "loaded target {} has SHA-256 {actual}, expected {}",
+                    self._mmap.path().display(),
+                    crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
+                ));
+            }
+            Ok(())
+        });
+        match admission {
+            Ok(()) => Ok(()),
+            Err(detail) => Err(BackendError::UnsupportedModelArchitecture(format!(
+                "Gemma 4 12B MTP target identity refused: {detail}"
+            ))),
+        }
+    }
+
+    /// Run (or retrieve) the exact 12B target SHA admission and return its wall
+    /// time.  Callers may invoke this before loading the ~846 MB assistant so
+    /// the first 6.98 GB sequential hash does not overlap peak resident pressure.
+    /// Every assistant proposal still repeats the cached check defensively.
+    pub fn admit_mtp12_target_identity(&self) -> Result<u128> {
+        let started = std::time::Instant::now();
+        self.require_mtp12_target_identity()?;
+        Ok(started.elapsed().as_micros())
+    }
+
+    /// Propose 1..=8 MTP12 drafts against the exact ordered target prefix.
+    ///
+    /// This is the only runtime bridge into the resident assistant.  It holds
+    /// the target sequence-state mutex across the complete synchronous Metal
+    /// call, requires an ordered cache with no unresolved target batch, and
+    /// requires `position == logical_len`.  The loaded target mmap must match
+    /// the pinned 12B QAT SHA before its scoped Q6_K table is aliased.  Target
+    /// layer 46/47 cache views and the table alias are nested callbacks, so no
+    /// borrowed Metal buffer can escape.
+    ///
+    /// `pending_target_raw_hidden` is the raw post-layer state associated with
+    /// the last committed target row.  The target's exact weighted output RMS
+    /// norm is applied once here; the assistant keeps all later recurrent rows
+    /// resident and must not receive this raw state directly.
+    pub fn propose_mtp12_chain_ordered_q4(
+        &self,
+        assistant: &mut crate::metal::Gemma4Mtp12AssistantMetal,
+        anchor_token: u32,
+        pending_target_raw_hidden: &[f32],
+        position: usize,
+        draft_k: usize,
+    ) -> Result<crate::metal::Gemma4Mtp12ChainProposal> {
+        self.require_mtp12_target_identity()?;
+        if pending_target_raw_hidden.len() != self.hidden
+            || pending_target_raw_hidden.iter().any(|value| !value.is_finite())
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP raw target hidden has width {} (expected {}) or non-finite values",
+                pending_target_raw_hidden.len(),
+                self.hidden,
+            )));
+        }
+        if !(1..=8).contains(&draft_k) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP draft width is {draft_k}, expected 1..=8"
+            )));
+        }
+        let normalized_hidden = rms_norm(
+            pending_target_raw_hidden,
+            Some(&self.output_norm),
+            self.eps,
+        );
+        if normalized_hidden.iter().any(|value| !value.is_finite()) {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "Gemma 4 MTP normalized target hidden contains non-finite values".into(),
+            ));
+        }
+
+        let sequence = self.verifier_state.lock().map_err(|_| {
+            BackendError::UnsupportedModelArchitecture("verifier state poisoned".into())
+        })?;
+        if sequence.lane != Gemma4DenseSequenceLane::OrderedVerifier
+            || sequence.pending.is_some()
+            || sequence.logical_len != position
+        {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "MTP assistant requires an ordered committed target prefix: lane={:?}, logical_len={}, requested_position={position}, pending={}",
+                sequence.lane,
+                sequence.logical_len,
+                sequence.pending.is_some(),
+            )));
+        }
+
+        let head = self.q6k_gpu_head.as_ref().ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture(
+                "MTP assistant requires the strict mapped Q6_K target head".into(),
+            )
+        })?;
+        let kv_scoped = head
+            .with_full_table_device(
+                crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
+                |target_table| {
+                    self.model.with_kv_device_views(
+                        &[
+                            crate::metal::GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
+                            crate::metal::GEMMA4_12B_MTP_FULL_HOST_LAYER,
+                        ],
+                        |views| {
+                            if views.len() != 2
+                                || views[0].source_layer
+                                    != crate::metal::GEMMA4_12B_MTP_SLIDING_HOST_LAYER
+                                || views[1].source_layer
+                                    != crate::metal::GEMMA4_12B_MTP_FULL_HOST_LAYER
+                            {
+                                return Err(BackendError::UnsupportedModelArchitecture(
+                                    "MTP target KV callback did not return exact source layers 46/47"
+                                        .into(),
+                                ));
+                            }
+                            let sliding_view = &views[0];
+                            let sliding = crate::metal::Gemma4Mtp12DeviceKv {
+                                key: crate::metal::Gemma4Mtp12MetalBufferView {
+                                    buffer: sliding_view.key,
+                                    byte_offset: sliding_view.byte_offset,
+                                    byte_len: sliding_view.byte_len,
+                                },
+                                value: crate::metal::Gemma4Mtp12MetalBufferView {
+                                    buffer: sliding_view.value,
+                                    byte_offset: sliding_view.byte_offset,
+                                    byte_len: sliding_view.byte_len,
+                                },
+                                source_layer: sliding_view.source_layer,
+                                kv_heads: sliding_view.kv_heads,
+                                head_dim: sliding_view.head_dim,
+                                max_positions: sliding_view.max_positions,
+                            };
+                            let full_view = &views[1];
+                            let full = crate::metal::Gemma4Mtp12DeviceKv {
+                                key: crate::metal::Gemma4Mtp12MetalBufferView {
+                                    buffer: full_view.key,
+                                    byte_offset: full_view.byte_offset,
+                                    byte_len: full_view.byte_len,
+                                },
+                                value: crate::metal::Gemma4Mtp12MetalBufferView {
+                                    buffer: full_view.value,
+                                    byte_offset: full_view.byte_offset,
+                                    byte_len: full_view.byte_len,
+                                },
+                                source_layer: full_view.source_layer,
+                                kv_heads: full_view.kv_heads,
+                                head_dim: full_view.head_dim,
+                                max_positions: full_view.max_positions,
+                            };
+                            assistant.propose_chain_from_cpu_hidden(
+                                anchor_token,
+                                &normalized_hidden,
+                                target_table,
+                                sliding,
+                                full,
+                                position,
+                                position,
+                                draft_k,
+                            )
+                        },
+                    )
+                },
+            )
+            .ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture(
+                    "MTP target Q6_K full-table scope refused pinned identity or geometry".into(),
+                )
+            })?;
+        let proposal = kv_scoped.ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture(
+                "MTP target could not expose resident KV source layers 46/47".into(),
+            )
+        })?;
+        // Keep `sequence` alive through the complete synchronous assistant wait;
+        // dropping it earlier would permit the target prefix to change while the
+        // assistant is reading its borrowed KV buffers.
+        drop(sequence);
+        proposal
+    }
+
+    /// Lossless greedy MTP12 generation for strict target verifier widths
+    /// 2/4/8 (assistant draft counts 1/3/7).  Near the output budget the width
+    /// steps down through the same admitted set; a final single-token budget is
+    /// satisfied by the already-predicted anchor without forwarding it.
+    ///
+    /// The target remains authoritative at every position.  An immediate
+    /// mismatch commits one anchor row, accepting `m` drafts commits `1 + m`
+    /// rows, and an all-accepted round commits all K candidate rows.  Stop ids
+    /// are never emitted or committed as input rows, including a stop proposed
+    /// by the assistant and confirmed by the target.
+    pub fn generate_greedy_mtp12_ordered_q4(
+        &self,
+        assistant: &mut crate::metal::Gemma4Mtp12AssistantMetal,
+        prompt: &str,
+        max_new: usize,
+        verify_width: usize,
+    ) -> Result<Gemma4Mtp12MetalGeneration> {
+        if !matches!(verify_width, 2 | 4 | 8) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP target verify width is {verify_width}, expected 2, 4, or 8"
+            )));
+        }
+
+        let target_identity_us = self.admit_mtp12_target_identity()?;
+        let prefill = self.prefill_ordered_q4(prompt)?;
+        let stop_ids = gemma4_stop_token_ids(&self.tokenizer);
+        let mut stats = Gemma4Mtp12MetalStats {
+            configured_verify_width: verify_width,
+            target_identity_us,
+            prefill_us: prefill.prefill_us,
+            ..Gemma4Mtp12MetalStats::default()
+        };
+        let mut generated = Vec::with_capacity(max_new);
+        let mut anchor_token = prefill.first_greedy_id;
+        let mut pending_target_raw_hidden = prefill.pending_target_raw_hidden;
+        let mut position = prefill.prompt_token_count;
+        let decode_started = std::time::Instant::now();
+
+        while generated.len() < max_new {
+            if stop_ids.contains(&anchor_token) {
+                stats.terminal_stop_token = Some(anchor_token);
+                break;
+            }
+            let remaining = max_new - generated.len();
+            let Some(round_width) = gemma4_mtp12_tail_verify_width(verify_width, remaining) else {
+                // `anchor_token` is already the target's exact next output.  At
+                // a one-token budget tail there is no reason to forward it.
+                generated.push(anchor_token);
+                break;
+            };
+            let draft_k = round_width - 1;
+            let assistant_started = std::time::Instant::now();
+            let draft_proposal = self.propose_mtp12_chain_ordered_q4(
+                assistant,
+                anchor_token,
+                &pending_target_raw_hidden,
+                position,
+                draft_k,
+            )?;
+            let assistant_call_us = assistant_started.elapsed().as_micros();
+            if draft_proposal.tokens.len() != draft_k {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "MTP assistant returned {} drafts for requested K={draft_k}",
+                    draft_proposal.tokens.len()
+                )));
+            }
+
+            let mut candidates = Vec::with_capacity(round_width);
+            candidates.push(anchor_token);
+            candidates.extend_from_slice(&draft_proposal.tokens);
+            let verify_started = std::time::Instant::now();
+            let target_batch = self.verify_consecutive_greedy(&candidates, position)?;
+            let target_verify_us = verify_started.elapsed().as_micros();
+            let decision = gemma4_mtp12_acceptance_decision(
+                &draft_proposal.tokens,
+                &target_batch.greedy_ids,
+                &stop_ids,
+            )
+            .ok_or_else(|| {
+                // The verifier contract guarantees K predictions, but leave no
+                // pending ticket behind if a future implementation violates it.
+                let _ = self.rollback_verifier_batch(target_batch.ticket);
+                BackendError::RuntimeShapeMismatch(format!(
+                    "MTP target returned {} predictions for {} drafts",
+                    target_batch.greedy_ids.len(),
+                    draft_proposal.tokens.len()
+                ))
+            })?;
+            let hidden_index = decision.committed_input_rows - 1;
+            let next_raw_hidden = target_batch.final_hidden.get(hidden_index).cloned();
+            let committed_position = self.commit_verifier_prefix(
+                target_batch.ticket,
+                decision.committed_input_rows,
+            )?;
+
+            let mut emitted_token_ids = Vec::with_capacity(1 + decision.accepted_drafts);
+            emitted_token_ids.push(anchor_token);
+            emitted_token_ids
+                .extend_from_slice(&draft_proposal.tokens[..decision.accepted_drafts]);
+            if generated.len() + emitted_token_ids.len() > max_new {
+                return Err(BackendError::RuntimeShapeMismatch(
+                    "MTP adaptive verifier emitted past the requested output budget".into(),
+                ));
+            }
+            generated.extend_from_slice(&emitted_token_ids);
+
+            stats.rounds += 1;
+            stats.drafted += draft_k as u64;
+            stats.accepted_drafts += decision.accepted_drafts as u64;
+            stats.committed_input_rows += decision.committed_input_rows as u64;
+            stats.target_verify_rows += round_width as u64;
+            stats.assistant_us = stats.assistant_us.saturating_add(assistant_call_us);
+            stats.assistant_gpu_us = stats
+                .assistant_gpu_us
+                .saturating_add(draft_proposal.timing.gpu_us);
+            stats.assistant_kernel_us = stats
+                .assistant_kernel_us
+                .saturating_add(draft_proposal.timing.kernel_us);
+            stats.target_verify_us = stats.target_verify_us.saturating_add(target_verify_us);
+            let budget_truncated = round_width != verify_width;
+            if budget_truncated {
+                stats.budget_tail_rounds += 1;
+            }
+            stats.trace.push(Gemma4Mtp12MetalRoundReceipt {
+                position,
+                anchor_token,
+                configured_verify_width: verify_width,
+                verifier_width: round_width,
+                budget_truncated,
+                drafts: draft_proposal.tokens.clone(),
+                target_greedy_ids: target_batch.greedy_ids.clone(),
+                accepted_drafts: decision.accepted_drafts,
+                committed_input_rows: decision.committed_input_rows,
+                emitted_token_ids,
+                mismatch_draft_index: decision.mismatch_draft_index,
+                stop_token: decision.stop_token,
+                next_anchor_token: decision.next_anchor_token,
+                assistant_call_us,
+                assistant_timing: draft_proposal.timing.into(),
+                assistant_ledger: draft_proposal.ledger.into(),
+                target_verify_us,
+            });
+
+            if let Some(stop) = decision.stop_token {
+                stats.terminal_stop_token = Some(stop);
+                break;
+            }
+            anchor_token = decision.next_anchor_token.ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "MTP acceptance produced neither a next anchor nor a stop".into(),
+                )
+            })?;
+            pending_target_raw_hidden = next_raw_hidden.ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "MTP target omitted the raw hidden row for the committed prefix".into(),
+                )
+            })?;
+            position = committed_position;
+        }
+        stats.decode_us = decode_started.elapsed().as_micros();
+        stats.emitted_tokens = generated.len() as u64;
+        let text = self.tokenizer.decode(&generated, true)?;
+        Ok(Gemma4Mtp12MetalGeneration {
+            text,
+            token_ids: generated,
+            prompt_token_count: prefill.prompt_token_count,
+            target_model_sha256: crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
+            assistant_model_sha256: crate::metal::GEMMA4_12B_MTP_ASSISTANT_SHA256,
+            assistant_source_path: assistant.source_path().to_path_buf(),
+            assistant_resident_ledger: assistant.resident_ledger().into(),
+            stats,
+        })
     }
 
     /// Complete model-specific stop set used by both established and ordered
