@@ -23781,6 +23781,10 @@ pub const EAGLE3_DRAFT_VOCAB: usize = 32_000;
 pub const EAGLE3_TARGET_VOCAB: usize = 128_256;
 pub const EAGLE3_ROPE_THETA: f32 = 500_000.0;
 pub const EAGLE3_RMS_EPS: f32 = 1.0e-5;
+/// Number of ranked draft-head alternatives retained for telemetry and future tree drafting.
+/// Keeping this fixed and small bounds the host scan's output without changing the existing
+/// single-token forward API or its GPU-selected top-1 result.
+pub const EAGLE3_TOP_K_CANDIDATES: usize = 8;
 
 /// Borrowed view of the 15-tensor
 /// `thoughtworks/Llama-3.2-3B-Instruct-Eagle3` checkpoint.
@@ -23808,11 +23812,25 @@ pub struct Eagle3MetalWeights<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Eagle3DraftCandidate {
+    /// Row in the compact 32k draft vocabulary.
+    pub draft_token: u32,
+    /// Full 128,256-token Llama vocabulary id after applying the d2t offset.
+    pub target_token: u32,
+    /// Raw draft-head logit, before any softmax or temperature scaling.
+    pub logit: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Eagle3MetalOutput {
     /// Row in the compact 32k draft vocabulary selected by the draft head.
     pub draft_token: u32,
     /// Full 128,256-token Llama vocabulary id after applying the d2t offset.
     pub target_token: u32,
+    /// Highest-logit draft alternatives, ordered by descending logit and then ascending
+    /// draft-vocabulary id.  `draft_token`/`target_token` above remain the independently
+    /// GPU-selected greedy result, preserving the existing top-1 behavior.
+    pub top_candidates: Vec<Eagle3DraftCandidate>,
     /// Raw decoder output before the final RMSNorm.  This is the recurrent state used by
     /// the next speculative EAGLE step; applying `fc` to it would be incorrect.
     pub raw_hidden: Vec<f32>,
@@ -23961,6 +23979,46 @@ fn eagle3_map_draft_token(
         ));
     }
     Ok(target as u32)
+}
+
+fn eagle3_rank_top_candidates(
+    logits: &[f32],
+    d2t_offsets: &[i32],
+) -> std::result::Result<Vec<Eagle3DraftCandidate>, String> {
+    let limit = EAGLE3_TOP_K_CANDIDATES.min(logits.len());
+    let mut ranked = Vec::with_capacity(limit);
+    for (draft, &logit) in logits.iter().enumerate() {
+        // Match the resident greedy kernel's contract: NaNs are not candidates.
+        if logit.is_nan() {
+            continue;
+        }
+        let draft_token =
+            u32::try_from(draft).map_err(|_| format!("EAGLE-3 draft row {draft} exceeds u32"))?;
+        let insert_at = ranked.iter().position(|candidate: &Eagle3DraftCandidate| {
+            logit > candidate.logit
+                || (logit == candidate.logit && draft_token < candidate.draft_token)
+        });
+        if let Some(insert_at) = insert_at {
+            if insert_at < limit {
+                ranked.insert(
+                    insert_at,
+                    Eagle3DraftCandidate {
+                        draft_token,
+                        target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
+                        logit,
+                    },
+                );
+                ranked.truncate(limit);
+            }
+        } else if ranked.len() < limit {
+            ranked.push(Eagle3DraftCandidate {
+                draft_token,
+                target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
+                logit,
+            });
+        }
+    }
+    Ok(ranked)
 }
 
 fn eagle3_validate_batch_shape(
@@ -24741,6 +24799,10 @@ impl Eagle3MetalState {
 
         let draft_token = unsafe { *(selected.contents() as *const u32) };
         let target_token = eagle3_map_draft_token(draft_token, &self.d2t_offsets);
+        let draft_logits = unsafe {
+            std::slice::from_raw_parts(logits.contents() as *const f32, EAGLE3_DRAFT_VOCAB)
+        };
+        let top_candidates = eagle3_rank_top_candidates(draft_logits, &self.d2t_offsets);
         let mut raw_hidden_out = vec![0.0f32; EAGLE3_HIDDEN];
         read_buffer_f32(&raw_hidden, &mut raw_hidden_out);
 
@@ -24783,10 +24845,12 @@ impl Eagle3MetalState {
         ]);
         pool_recycle(k, keep);
         let target_token = target_token?;
+        let top_candidates = top_candidates?;
         self.filled = position + 1;
         Ok(Eagle3MetalOutput {
             draft_token,
             target_token,
+            top_candidates,
             raw_hidden: raw_hidden_out,
         })
     }
@@ -24944,6 +25008,43 @@ mod eagle3_metal_contract_tests {
         assert_eq!(eagle3_map_draft_token(2, &offsets).unwrap(), 3);
         assert_eq!(eagle3_map_draft_token(3, &offsets).unwrap(), 6);
         assert!(eagle3_map_draft_token(4, &offsets).is_err());
+    }
+
+    #[test]
+    fn eagle3_top_candidates_are_bounded_ranked_and_tie_deterministic() {
+        let logits = [
+            1.0,
+            5.0,
+            5.0,
+            f32::NAN,
+            f32::NEG_INFINITY,
+            5.0,
+            f32::INFINITY,
+            f32::INFINITY,
+            3.0,
+            4.0,
+        ];
+        let offsets = [0; 10];
+        let ranked = eagle3_rank_top_candidates(&logits, &offsets).unwrap();
+        assert_eq!(ranked.len(), EAGLE3_TOP_K_CANDIDATES);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.draft_token)
+                .collect::<Vec<_>>(),
+            vec![6, 7, 1, 2, 5, 9, 8, 0]
+        );
+        assert!(ranked.iter().all(|candidate| {
+            candidate.target_token == candidate.draft_token && !candidate.logit.is_nan()
+        }));
+
+        let tied = eagle3_rank_top_candidates(&[2.0; 10], &offsets).unwrap();
+        assert_eq!(
+            tied.iter()
+                .map(|candidate| candidate.draft_token)
+                .collect::<Vec<_>>(),
+            (0..EAGLE3_TOP_K_CANDIDATES as u32).collect::<Vec<_>>()
+        );
     }
 
     #[test]
