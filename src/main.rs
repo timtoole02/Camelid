@@ -8847,6 +8847,10 @@ struct Eagle3BenchRun {
     suffix_rounds: u64,
     suffix_offered: u64,
     suffix_emitted_tokens: u64,
+    suffix_head_catchups: u64,
+    suffix_head_catchup_rows: u64,
+    suffix_head_discarded_rows: u64,
+    suffix_head_buffer_us: u128,
     dynamic_tree_rounds: u64,
     dynamic_tree_offered: u64,
     dynamic_tree_emitted_tokens: u64,
@@ -8940,7 +8944,9 @@ fn run_eagle3_resident_greedy(
     checkpoint: camelid::eagle3::Eagle3DraftModel,
 ) -> anyhow::Result<Eagle3BenchRun> {
     use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
-    use camelid::eagle3_runtime::{Eagle3Drafter, Eagle3DynamicFrontierConfig};
+    use camelid::eagle3_runtime::{
+        Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig,
+    };
     use camelid::inference::spec_tree::TreeDrafter;
     use camelid::inference::suffix_decoding::SuffixDecodingDrafter;
 
@@ -8991,6 +8997,7 @@ fn run_eagle3_resident_greedy(
         })
         .transpose()?;
     let mut suffix_drafter = suffix_first.then(SuffixDecodingDrafter::default);
+    let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
     let mut suffix_history = suffix_first.then(|| {
         let mut history = Vec::with_capacity(prompt_tokens.len() + max_tokens);
         history.extend_from_slice(prompt_tokens);
@@ -9070,15 +9077,33 @@ fn run_eagle3_resident_greedy(
                 );
                 let accepted = accepted_draft_prefix(&suffix_drafts, &verified.predictions);
                 let emitted = verified.predictions[..=accepted].to_vec();
-                let update_started = Instant::now();
-                drafter.accept_authoritative(weights, &verified.layer_inputs, &emitted)?;
-                run.head_update_us += update_started.elapsed().as_micros();
+                // Suffix proposals do not read the learned head. Keep the authoritative
+                // token/capture pairs in order, but defer all EAGLE work until a dynamic-tree
+                // round actually needs a current stable seed. An all-suffix completion never
+                // pays this update at all.
+                let buffer_started = Instant::now();
+                pending_suffix_head.push(&verified.layer_inputs, &emitted)?;
+                run.suffix_head_buffer_us += buffer_started.elapsed().as_micros();
                 let offered = suffix_drafts.len();
                 run.suffix_rounds += 1;
                 run.suffix_offered += offered as u64;
                 run.suffix_emitted_tokens += emitted.len() as u64;
                 (emitted, offered, offered + 1)
             } else {
+                if !pending_suffix_head.is_empty() {
+                    let update_started = Instant::now();
+                    let catchup_rows =
+                        drafter.accept_authoritative_catchup(weights, &mut pending_suffix_head)?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+                    run.suffix_head_catchups += 1;
+                    run.suffix_head_catchup_rows += catchup_rows as u64;
+                }
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position(),
+                    "EAGLE-3 catch-up did not reach target watermark: head={} target={}",
+                    drafter.filled(),
+                    session.kv_position()
+                );
                 let draft_started = Instant::now();
                 let frontier = drafter.draft_dynamic_frontier(
                     weights,
@@ -9178,10 +9203,12 @@ fn run_eagle3_resident_greedy(
             emitted.len()
         );
         run.resident_verify_rounds += 1;
+        let effective_head_filled = pending_suffix_head.effective_filled(drafter.filled())?;
         anyhow::ensure!(
-            drafter.filled() == session.kv_position(),
-            "EAGLE-3/target cache watermarks diverged: head={} target={}",
+            effective_head_filled == session.kv_position(),
+            "EAGLE-3/target cache watermarks diverged: materialized_head={} pending_head={} target={}",
             drafter.filled(),
+            pending_suffix_head.pending_rows(),
             session.kv_position()
         );
 
@@ -9203,6 +9230,9 @@ fn run_eagle3_resident_greedy(
             history.extend_from_slice(&run.generated[generated_before..]);
         }
     }
+    // Once generation has stopped, no consumer can observe the learned head again. Deliberately
+    // drop a final suffix-only streak instead of paying a useless catch-up in the epilogue.
+    run.suffix_head_discarded_rows = pending_suffix_head.pending_rows() as u64;
     run.decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
     anyhow::ensure!(
         run.cpu_verify_rounds == 0 && run.resident_verify_rounds == run.rounds,
@@ -9272,6 +9302,14 @@ struct BenchEagle3Record {
     suffix_offered: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suffix_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_catchups: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_catchup_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_discarded_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_buffer_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dynamic_tree_rounds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9588,6 +9626,10 @@ fn run_bench_eagle3(
         suffix_rounds: suffix_first.then_some(eagle.suffix_rounds),
         suffix_offered: suffix_first.then_some(eagle.suffix_offered),
         suffix_emitted_tokens: suffix_first.then_some(eagle.suffix_emitted_tokens),
+        suffix_head_catchups: suffix_first.then_some(eagle.suffix_head_catchups),
+        suffix_head_catchup_rows: suffix_first.then_some(eagle.suffix_head_catchup_rows),
+        suffix_head_discarded_rows: suffix_first.then_some(eagle.suffix_head_discarded_rows),
+        suffix_head_buffer_ms: suffix_first.then_some(eagle.suffix_head_buffer_us as f64 / 1000.0),
         dynamic_tree_rounds: suffix_first.then_some(eagle.dynamic_tree_rounds),
         dynamic_tree_offered: suffix_first.then_some(eagle.dynamic_tree_offered),
         dynamic_tree_emitted_tokens: suffix_first.then_some(eagle.dynamic_tree_emitted_tokens),

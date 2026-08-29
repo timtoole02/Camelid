@@ -57,6 +57,73 @@ pub fn interleave_target_layer_inputs(captures: &[CpuTensor]) -> Result<Vec<f32>
     Ok(features)
 }
 
+/// Target-authoritative rows accepted while drafting does not depend on the EAGLE head.
+///
+/// A suffix drafter can verify several rounds without consulting `stable_seed`.  Updating the
+/// learned head after every such round is wasted work: all intermediate decoder outputs are
+/// unobservable, while the target captures and emitted tokens are sufficient to reconstruct the
+/// exact one-layer K/V history later.  This buffer keeps those pairs in sequence order until a
+/// learned-head draft is actually needed.
+///
+/// The memory bound is small for the intended benchmark lane: one pending row is three target
+/// layer inputs (`3 * HIDDEN_SIZE * sizeof(f32)`, 36 KiB for Llama-3.2 3B) plus one token id.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Eagle3AuthoritativeCatchup {
+    emitted: Vec<u32>,
+    interleaved_features: Vec<f32>,
+}
+
+impl Eagle3AuthoritativeCatchup {
+    pub fn is_empty(&self) -> bool {
+        self.emitted.is_empty()
+    }
+
+    pub fn pending_rows(&self) -> usize {
+        self.emitted.len()
+    }
+
+    /// The target watermark represented by the materialized head prefix plus these pending rows.
+    pub fn effective_filled(&self, materialized_filled: usize) -> Result<usize> {
+        materialized_filled
+            .checked_add(self.pending_rows())
+            .ok_or_else(|| invalid("EAGLE-3 deferred authoritative watermark overflow"))
+    }
+
+    /// Retain only the authoritative capture prefix paired with `emitted`.
+    ///
+    /// Linear target verification may return additional capture rows for rejected draft tokens;
+    /// those rows must never enter the stable learned-head cache.  Validation is transactional:
+    /// an invalid round leaves every previously queued row intact.
+    pub fn push(&mut self, captures: &[CpuTensor], emitted: &[u32]) -> Result<()> {
+        if emitted.is_empty() {
+            return Err(invalid(
+                "an EAGLE-3 deferred authoritative round must emit at least one token",
+            ));
+        }
+        let features = interleave_target_layer_inputs(captures)?;
+        let rows = features.len() / EAGLE3_AUX_WIDTH;
+        if emitted.len() > rows {
+            return Err(invalid(format!(
+                "EAGLE-3 deferred verify emitted {} tokens but captured only {rows} target rows",
+                emitted.len()
+            )));
+        }
+        let admitted_values = emitted
+            .len()
+            .checked_mul(EAGLE3_AUX_WIDTH)
+            .ok_or_else(|| invalid("EAGLE-3 deferred feature length overflow"))?;
+        self.emitted.extend_from_slice(emitted);
+        self.interleaved_features
+            .extend_from_slice(&features[..admitted_values]);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.emitted.clear();
+        self.interleaved_features.clear();
+    }
+}
+
 /// A log-sum-exp reduction over every row in the compact EAGLE draft vocabulary.
 ///
 /// This deliberately has a distinct type instead of accepting a bare `f32` at the dynamic-tree
@@ -616,6 +683,43 @@ impl Eagle3Drafter {
         )
     }
 
+    fn accept_authoritative_features(
+        &mut self,
+        target_weights: &LlamaLoadedWeights,
+        features: &[f32],
+        emitted: &[u32],
+    ) -> Result<()> {
+        if emitted.is_empty() {
+            return Err(invalid(
+                "an EAGLE-3 verify round must emit at least one token",
+            ));
+        }
+        if !features.len().is_multiple_of(EAGLE3_AUX_WIDTH) {
+            return Err(invalid(format!(
+                "EAGLE-3 authoritative features have {} values, not a multiple of {EAGLE3_AUX_WIDTH}",
+                features.len()
+            )));
+        }
+        let rows = features.len() / EAGLE3_AUX_WIDTH;
+        if emitted.len() > rows {
+            return Err(invalid(format!(
+                "EAGLE-3 verify emitted {} tokens but captured only {rows} target rows",
+                emitted.len()
+            )));
+        }
+        let fused = metal(
+            self.head
+                .fuse_features(&features[..emitted.len() * EAGLE3_AUX_WIDTH]),
+        )?;
+        let embeddings = target_weights
+            .token_embedding
+            .embedding_lookup(emitted, "eagle3_authoritative_next_token_embeddings")?;
+        let start = self.head.filled();
+        let output = self.forward_authoritative_last_output(&embeddings.data, &fused, start)?;
+        self.stable_seed = Some(output);
+        Ok(())
+    }
+
     /// Upload the validated head to Metal. The large host checkpoint buffers are released
     /// before this returns; `Eagle3MetalState` owns its uploaded copies.
     pub fn new(model: Eagle3DraftModel, max_positions: usize) -> Result<Self> {
@@ -846,30 +950,33 @@ impl Eagle3Drafter {
         captures: &[CpuTensor],
         emitted: &[u32],
     ) -> Result<()> {
-        if emitted.is_empty() {
-            return Err(invalid(
-                "an EAGLE-3 verify round must emit at least one token",
-            ));
-        }
         let features = interleave_target_layer_inputs(captures)?;
-        let rows = features.len() / EAGLE3_AUX_WIDTH;
-        if emitted.len() > rows {
-            return Err(invalid(format!(
-                "EAGLE-3 verify emitted {} tokens but captured only {rows} target rows",
-                emitted.len()
-            )));
+        self.accept_authoritative_features(target_weights, &features, emitted)
+    }
+
+    /// Materialize all deferred target-authoritative rows and refresh `stable_seed` once.
+    ///
+    /// `forward_batch_last_output` appends K/V-only cells for every intermediate row and runs
+    /// the complete EAGLE cell only for the newest row. This is exactly the state repeated
+    /// authoritative updates would leave: K/V are byte-identical through their F16 scatter,
+    /// and no intermediate head output feeds a target-authoritative successor. The buffer is
+    /// cleared only after success, so callers can fail closed without losing accepted history.
+    pub fn accept_authoritative_catchup(
+        &mut self,
+        target_weights: &LlamaLoadedWeights,
+        pending: &mut Eagle3AuthoritativeCatchup,
+    ) -> Result<usize> {
+        let rows = pending.pending_rows();
+        if rows == 0 {
+            return Ok(0);
         }
-        let fused = metal(
-            self.head
-                .fuse_features(&features[..emitted.len() * EAGLE3_AUX_WIDTH]),
+        self.accept_authoritative_features(
+            target_weights,
+            &pending.interleaved_features,
+            &pending.emitted,
         )?;
-        let embeddings = target_weights
-            .token_embedding
-            .embedding_lookup(emitted, "eagle3_authoritative_next_token_embeddings")?;
-        let start = self.head.filled();
-        let output = self.forward_authoritative_last_output(&embeddings.data, &fused, start)?;
-        self.stable_seed = Some(output);
-        Ok(())
+        pending.clear();
+        Ok(rows)
     }
 
     /// Commit a target-accepted forest path to the stable EAGLE cache.
@@ -902,6 +1009,53 @@ mod tests {
             .map(|index| base + index as f32)
             .collect();
         CpuTensor::from_f32(name, vec![rows, HIDDEN_SIZE], data).unwrap()
+    }
+
+    #[test]
+    fn authoritative_catchup_keeps_only_each_emitted_capture_prefix_in_order() {
+        let first = vec![
+            capture("first_low", 3, 1.0),
+            capture("first_middle", 3, 10_000.0),
+            capture("first_high", 3, 20_000.0),
+        ];
+        let second = vec![
+            capture("second_low", 2, 30_000.0),
+            capture("second_middle", 2, 40_000.0),
+            capture("second_high", 2, 50_000.0),
+        ];
+        let first_features = interleave_target_layer_inputs(&first).unwrap();
+        let second_features = interleave_target_layer_inputs(&second).unwrap();
+
+        let mut pending = Eagle3AuthoritativeCatchup::default();
+        pending.push(&first, &[101, 102]).unwrap();
+        pending.push(&second, &[103]).unwrap();
+
+        let mut expected = first_features[..2 * EAGLE3_AUX_WIDTH].to_vec();
+        expected.extend_from_slice(&second_features[..EAGLE3_AUX_WIDTH]);
+        assert_eq!(pending.emitted, vec![101, 102, 103]);
+        assert_eq!(pending.interleaved_features, expected);
+        assert_eq!(pending.pending_rows(), 3);
+        assert_eq!(pending.effective_filled(17).unwrap(), 20);
+    }
+
+    #[test]
+    fn authoritative_catchup_rejects_invalid_rounds_transactionally() {
+        let one_row = vec![
+            capture("low", 1, 1.0),
+            capture("middle", 1, 10_000.0),
+            capture("high", 1, 20_000.0),
+        ];
+        let mut pending = Eagle3AuthoritativeCatchup::default();
+        pending.push(&one_row, &[7]).unwrap();
+        let before = pending.clone();
+
+        assert!(pending.push(&one_row, &[8, 9]).is_err());
+        assert_eq!(pending, before);
+        assert!(pending.push(&one_row, &[]).is_err());
+        assert_eq!(pending, before);
+        assert!(pending.push(&one_row[..2], &[8]).is_err());
+        assert_eq!(pending, before);
+        assert!(pending.effective_filled(usize::MAX).is_err());
     }
 
     fn output(candidates: &[(u32, f32)], hidden_marker: f32) -> Eagle3MetalOutput {
