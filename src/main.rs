@@ -5005,6 +5005,18 @@ async fn main() -> anyhow::Result<()> {
         } => {
             #[cfg(target_os = "macos")]
             {
+                let established_ordered_env = std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4")
+                    .ok();
+                if established_ordered_env
+                    .as_deref()
+                    .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "gemma4 verifier qualification requires the production established baseline; unset CAMELID_GEMMA4_DENSE_ORDERED_Q4"
+                            .into(),
+                    )
+                    .into());
+                }
                 widths.sort_unstable();
                 widths.dedup();
                 if widths.is_empty() || widths.iter().any(|width| !matches!(width, 1 | 2 | 4 | 8))
@@ -5019,14 +5031,22 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let max_width = *widths.last().expect("non-empty verifier widths");
                 // UTF-8 bytes are a conservative upper bound for the tokenizer's
-                // byte-fallback pieces. The exact token count is checked after load.
-                let max_positions = 512.max(
-                    prompt
-                        .len()
-                        .saturating_add(max_tokens)
-                        .saturating_add(max_width)
-                        .saturating_add(8),
-                );
+                // byte-fallback pieces. Keep this Mini2 harness deliberately
+                // short-context: never turn a long raw prompt into an accidental
+                // multi-GiB KV allocation on a 16 GB machine.
+                let max_positions = 512usize;
+                let conservative_positions = prompt
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(max_width);
+                if conservative_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "gemma4 verifier is capped at {max_positions} KV rows; UTF-8-byte upper bound is {conservative_positions}"
+                    ))
+                    .into());
+                }
+                let model_bytes = std::fs::metadata(&path)?.len();
+                let model_sha256 = camelid::receipt::sha256_file_hex_cached(&path)?;
                 eprintln!(
                     "[gemma4-verify] loading {} with KV capacity {max_positions}...",
                     path.display()
@@ -5055,7 +5075,7 @@ async fn main() -> anyhow::Result<()> {
                 let qualification_decode_tok_s = if qualification.decode_us == 0 {
                     0.0
                 } else {
-                    qualification.token_ids.len() as f64 * 1_000_000.0
+                    qualification.decode_forward_count as f64 * 1_000_000.0
                         / qualification.decode_us as f64
                 };
                 eprintln!(
@@ -5065,19 +5085,19 @@ async fn main() -> anyhow::Result<()> {
                     qualification.decode_us as f64 / 1_000_000.0,
                 );
 
-                let mut teacher_tokens = prompt_tokens.clone();
-                teacher_tokens.extend_from_slice(&qualification.token_ids);
-                let timed_rows = teacher_tokens.len() / max_width * max_width;
+                let timed_rows = qualification.token_ids.len() / max_width * max_width;
                 if timed_rows == 0 {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 verifier sequence has {} rows, fewer than K={max_width}",
-                        teacher_tokens.len(),
+                        "Gemma 4 verifier generated sequence has {} rows, fewer than K={max_width}",
+                        qualification.token_ids.len(),
                     ))
                     .into());
                 }
-                teacher_tokens.truncate(timed_rows);
+                let teacher_tokens = &qualification.token_ids[..timed_rows];
 
-                let run_width = |width: usize, tokens: &[u32]| -> anyhow::Result<(Vec<u32>, u128)> {
+                let run_width = |width: usize,
+                                 tokens: &[u32]|
+                 -> anyhow::Result<(Vec<u32>, Vec<u32>, u128)> {
                     if !tokens.len().is_multiple_of(width) {
                         return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
                             "teacher-forced row count {} is not divisible by K={width}",
@@ -5085,22 +5105,179 @@ async fn main() -> anyhow::Result<()> {
                         ))
                         .into());
                     }
-                    runtime.reset_dense_verifier_sequence()?;
+                    // Replay the prompt into this width's fresh ordered cache
+                    // outside the clock. Only post-prompt candidate rows are
+                    // part of the target-verifier throughput receipt.
+                    let prefill = runtime.prefill_ordered_q4(&prompt)?;
+                    if prefill.first_greedy_id != tokens[0] {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "ordered prefill predicted {}, but the qualified teacher trajectory starts with {}",
+                            prefill.first_greedy_id, tokens[0],
+                        ))
+                        .into());
+                    }
                     let started = std::time::Instant::now();
                     let mut predictions = Vec::with_capacity(tokens.len());
-                    let mut position = 0usize;
+                    let mut hidden_bits =
+                        Vec::with_capacity(tokens.len().saturating_mul(3_840));
+                    let mut position = prefill.prompt_token_count;
                     for chunk in tokens.chunks_exact(width) {
                         let batch = runtime.verify_consecutive_greedy(chunk, position)?;
                         predictions.extend_from_slice(&batch.greedy_ids);
+                        hidden_bits.extend(
+                            batch
+                                .final_hidden
+                                .iter()
+                                .flatten()
+                                .map(|value| value.to_bits()),
+                        );
                         position = runtime.commit_verifier_prefix(batch.ticket, width)?;
                     }
-                    Ok((predictions, started.elapsed().as_micros()))
+                    Ok((predictions, hidden_bits, started.elapsed().as_micros()))
                 };
+
+                // Exercise the transactional invariant used by real speculative
+                // decode, not merely the full-commit throughput path. K8 writes
+                // eight physical cache rows; committing 1/3/7 must leave every
+                // rejected row invisible and overwritable at the logical cursor.
+                if qualification.token_ids.len() < 8 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 rejected-tail gate requires at least eight qualified output tokens"
+                            .into(),
+                    )
+                    .into());
+                }
+                let tail_a = &qualification.token_ids[..8];
+                let stop_ids = runtime.stop_token_ids();
+                let mut candidate_pool: Vec<u32> = prompt_tokens
+                    .iter()
+                    .chain(&qualification.token_ids)
+                    .copied()
+                    .filter(|token| !stop_ids.contains(token))
+                    .collect();
+                candidate_pool.sort_unstable();
+                candidate_pool.dedup();
+                if candidate_pool.len() < 2 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 rejected-tail gate needs two distinct non-stop candidate tokens"
+                            .into(),
+                    )
+                    .into());
+                }
+                let mut rejected_tail_runs = Vec::with_capacity(3);
+                for committed in [1usize, 3, 7] {
+                    let overlap = 8 - committed;
+                    let mut tail_b = Vec::with_capacity(8);
+                    for row in 0..8 {
+                        let stale = (row < overlap).then_some(tail_a[committed + row]);
+                        let replacement = candidate_pool
+                            .iter()
+                            .copied()
+                            .find(|token| Some(*token) != stale)
+                            .expect("two-token pool always has a non-stale replacement");
+                        tail_b.push(replacement);
+                    }
+
+                    let experiment_prefill = runtime.prefill_ordered_q4(&prompt)?;
+                    if experiment_prefill.first_greedy_id != tail_a[0] {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "rejected-tail experiment prefill predicted {}, expected {}",
+                            experiment_prefill.first_greedy_id, tail_a[0],
+                        ))
+                        .into());
+                    }
+                    let start = experiment_prefill.prompt_token_count;
+                    let a_batch = runtime.verify_consecutive_greedy(tail_a, start)?;
+                    let a_ids = a_batch.greedy_ids.clone();
+                    let a_hidden_bits: Vec<u32> = a_batch
+                        .final_hidden
+                        .iter()
+                        .take(committed)
+                        .flatten()
+                        .map(|value| value.to_bits())
+                        .collect();
+                    runtime.commit_verifier_prefix(a_batch.ticket, committed)?;
+                    let b_batch = runtime.verify_consecutive_greedy(&tail_b, start + committed)?;
+                    let b_ids = b_batch.greedy_ids.clone();
+                    let b_hidden_bits: Vec<u32> = b_batch
+                        .final_hidden
+                        .iter()
+                        .flatten()
+                        .map(|value| value.to_bits())
+                        .collect();
+                    runtime.commit_verifier_prefix(b_batch.ticket, 8)?;
+
+                    let reference_prefill = runtime.prefill_ordered_q4(&prompt)?;
+                    if reference_prefill.first_greedy_id != tail_a[0] {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                            "rejected-tail reference prefill left the qualified trajectory".into(),
+                        )
+                        .into());
+                    }
+                    let mut reference_ids = Vec::with_capacity(committed + 8);
+                    let mut reference_hidden_bits =
+                        Vec::with_capacity((committed + 8).saturating_mul(3_840));
+                    let mut reference_position = reference_prefill.prompt_token_count;
+                    for &token in tail_a[..committed].iter().chain(&tail_b) {
+                        let (prediction, hidden) =
+                            runtime.forward_greedy_ordered_q4(token, reference_position)?;
+                        reference_ids.push(prediction);
+                        reference_hidden_bits.extend(hidden.iter().map(|value| value.to_bits()));
+                        reference_position += 1;
+                    }
+
+                    let mut experiment_ids = a_ids[..committed].to_vec();
+                    experiment_ids.extend_from_slice(&b_ids);
+                    let mut experiment_hidden_bits = a_hidden_bits;
+                    experiment_hidden_bits.extend_from_slice(&b_hidden_bits);
+                    let first_id_divergence = experiment_ids
+                        .iter()
+                        .zip(&reference_ids)
+                        .position(|(left, right)| left != right);
+                    let first_hidden_divergence = experiment_hidden_bits
+                        .iter()
+                        .zip(&reference_hidden_bits)
+                        .position(|(left, right)| left != right);
+                    let ids_exact = first_id_divergence.is_none()
+                        && experiment_ids.len() == reference_ids.len();
+                    let hidden_bit_exact = first_hidden_divergence.is_none()
+                        && experiment_hidden_bits.len() == reference_hidden_bits.len();
+                    if !ids_exact || !hidden_bit_exact {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "Gemma 4 rejected-tail K8/commit-{committed} gate diverged: id={first_id_divergence:?}, hidden_scalar={first_hidden_divergence:?}"
+                        ))
+                        .into());
+                    }
+                    rejected_tail_runs.push(serde_json::json!({
+                        "physical_width": 8,
+                        "committed_prefix": committed,
+                        "rejected_rows_overwritten": overlap,
+                        "overwrite_tokens": tail_b,
+                        "first_id_divergence_vs_fresh_k1": -1,
+                        "first_hidden_scalar_divergence_vs_fresh_k1": -1,
+                        "ids_exact": true,
+                        "hidden_bit_exact": true,
+                        "exact": true
+                    }));
+                }
 
                 // Allocate scratch, compile lazy pipelines, and touch every target
                 // weight before each timed width. Reset makes the warm row invisible.
                 let _ = run_width(1, &teacher_tokens[..1])?;
-                let (reference, reference_us) = run_width(1, &teacher_tokens)?;
+                let (reference, reference_hidden_bits, reference_us) =
+                    run_width(1, teacher_tokens)?;
+                if let Some(divergence) = reference
+                    .iter()
+                    .take(timed_rows.saturating_sub(1))
+                    .zip(teacher_tokens.iter().skip(1))
+                    .position(|(prediction, teacher)| prediction != teacher)
+                {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "ordered K1 teacher trajectory diverged after decode row {divergence}: predicted={} teacher={}",
+                        reference[divergence], teacher_tokens[divergence + 1],
+                    ))
+                    .into());
+                }
                 let reference_rows_per_s = timed_rows as f64 * 1_000_000.0 / reference_us as f64;
                 let mut runs = Vec::with_capacity(widths.len());
                 runs.push(serde_json::json!({
@@ -5109,24 +5286,36 @@ async fn main() -> anyhow::Result<()> {
                     "wall_us": reference_us,
                     "target_rows_per_s": reference_rows_per_s,
                     "speedup_vs_k1": 1.0,
-                    "first_divergence_vs_k1": -1,
+                    "first_id_divergence_vs_k1": -1,
+                    "first_hidden_scalar_divergence_vs_k1": -1,
+                    "ids_exact": true,
+                    "hidden_bit_exact": true,
                     "exact": true
                 }));
 
                 let mut exact_all = true;
                 for &width in widths.iter().filter(|&&width| width != 1) {
                     let _ = run_width(width, &teacher_tokens[..width])?;
-                    let (predictions, wall_us) = run_width(width, &teacher_tokens)?;
-                    let first_divergence = reference
+                    let (predictions, hidden_bits, wall_us) =
+                        run_width(width, teacher_tokens)?;
+                    let first_id_divergence = reference
                         .iter()
                         .zip(&predictions)
                         .position(|(left, right)| left != right);
-                    let exact = first_divergence.is_none() && predictions.len() == reference.len();
+                    let ids_exact = first_id_divergence.is_none()
+                        && predictions.len() == reference.len();
+                    let first_hidden_divergence = reference_hidden_bits
+                        .iter()
+                        .zip(&hidden_bits)
+                        .position(|(left, right)| left != right);
+                    let hidden_bit_exact = first_hidden_divergence.is_none()
+                        && hidden_bits.len() == reference_hidden_bits.len();
+                    let exact = ids_exact && hidden_bit_exact;
                     exact_all &= exact;
                     let rows_per_s = timed_rows as f64 * 1_000_000.0 / wall_us as f64;
                     let speedup = reference_us as f64 / wall_us as f64;
                     eprintln!(
-                        "[gemma4-verify] K={width}: {rows_per_s:.3} target rows/s, {speedup:.3}x K1, exact={exact}"
+                        "[gemma4-verify] K={width}: {rows_per_s:.3} target rows/s, {speedup:.3}x K1, ids_exact={ids_exact}, hidden_bit_exact={hidden_bit_exact}"
                     );
                     runs.push(serde_json::json!({
                         "width": width,
@@ -5134,7 +5323,10 @@ async fn main() -> anyhow::Result<()> {
                         "wall_us": wall_us,
                         "target_rows_per_s": rows_per_s,
                         "speedup_vs_k1": speedup,
-                        "first_divergence_vs_k1": first_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "first_id_divergence_vs_k1": first_id_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "first_hidden_scalar_divergence_vs_k1": first_hidden_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "ids_exact": ids_exact,
+                        "hidden_bit_exact": hidden_bit_exact,
                         "exact": exact
                     }));
                 }
@@ -5142,23 +5334,37 @@ async fn main() -> anyhow::Result<()> {
                 let receipt = serde_json::json!({
                     "schema": "camelid.gemma4_ordered_q4_target_sweep.v1",
                     "model_path": path,
+                    "model_bytes": model_bytes,
+                    "model_sha256": model_sha256,
+                    "camelid_version": VERSION,
+                    "source_commit": option_env!("CAMELID_GIT_COMMIT"),
                     "prompt": prompt,
                     "prompt_tokens": prompt_tokens.len(),
                     "generated_tokens": qualification.token_ids.len(),
-                    "candidate_rows_available": prompt_tokens.len() + qualification.token_ids.len(),
+                    "candidate_rows_available": qualification.token_ids.len(),
                     "timed_rows": timed_rows,
                     "max_positions": max_positions,
                     "load_us": load_us,
+                    "environment": {
+                        "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
+                        "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
+                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok()
+                    },
                     "ordered_k1_qualification": {
                         "exact_vs_established": true,
                         "prefill_us": qualification.prefill_us,
                         "decode_us": qualification.decode_us,
+                        "decode_forward_count": qualification.decode_forward_count,
                         "decode_output_tok_s": qualification_decode_tok_s,
                         "token_ids": qualification.token_ids
                     },
                     "runs": runs,
+                    "rejected_tail_overwrite_gate": {
+                        "exact_all_commit_prefixes": true,
+                        "runs": rejected_tail_runs
+                    },
                     "exact_all_widths": exact_all,
-                    "timing_scope": "Warm target-only teacher-forced verifier wall; full-width batches; prompt/assistant excluded"
+                    "timing_scope": "Warm target-only teacher-forced decode-row verifier wall; full-width batches; prompt replay/assistant excluded"
                 });
                 println!("{}", serde_json::to_string_pretty(&receipt)?);
                 if !exact_all {
