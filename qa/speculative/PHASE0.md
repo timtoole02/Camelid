@@ -325,3 +325,63 @@ The mc-lane investigation still paid for itself: it is 1.4-2.0x cheaper per
 verify round on the v1 lane (743 -> 539 ms at 256 tokens, 1063 -> 541 at 512),
 using a kernel that already carries a passing bit-identity test. Defaulting
 `CAMELID_KQUANT_MC_GEMV` on is justified on that alone.
+
+## Session 2 findings — MTP justified, tree lane dead, 3.1 not promotable
+
+### MTP is justified, on prose specifically
+The suffix drafter reaches A=7.33 (91.6%) on agentic text and A=7.42 (91.7%) on
+repo-documentation prose — so an early read said "prose does not collapse" and
+the trained-head case was weak. That read was wrong: doc prose is repetitive in
+exactly the way that flatters context-matching. Against the prompts this repo
+ships flagged `spec_friendly: false` (`receipts/m2_hard.jsonl`):
+
+| prompt | A | acceptance | multiplier |
+| --- | --- | --- | --- |
+| adversarial (60 unrelated words) | 1.00 | **0.0%** | **0.91x** |
+| creative writing | 1.00 | **0.0%** | **0.87x** |
+| normal chat | 1.36 | 6.0% | **0.80x** |
+
+Zero acceptance, and speculation is a NET LOSS. A training-free drafter cannot
+propose a token the context does not contain. That gap is what a trained head
+fills, and it is the justification for the EAGLE-3 work — not raising an
+acceptance number that is already 91% on agentic text.
+
+Note the lane is a regression on this traffic even with the SpecLatch active.
+Admission should probably learn from acceptance history, not just latch off
+after a run of misses.
+
+### The attention fix, re-attributed
+After the kv16 split-K admission, ablation puts attention at **1.9 ms per verify
+column, down from 52.8** — 67% of the round to 7%. Nothing else measurable:
+rope, K/V scatter and argmax all show no share. The remaining ~25 ms/col is
+inside the K-quant MMA GEMV itself, which is the next lever.
+Width is now roughly neutral (k=7 30.61 tok/s, k=15 30.29) where wider used to
+lose badly. Q8_0 on the fixed lane is far behind Q4_K_M (11.88 vs 30.61).
+
+### The tree lane is a dead end here
+Tree verify costs ~350 ms per verify column against the chain's 27 — 13x — and
+it carries the highest acceptance measured anywhere (A=12.57 at k=15), so it
+looked like the biggest remaining win. It is not, and the reason is not
+attention: admitting kv16 primaries to the tree split-K path (the same edit that
+gave the linear path its 2.9x) changed the cost **not at all** (352 vs 349
+ms/col). Reverted — zero benefit, and a k=15 prose arm reported `lossless=false`
+that could not be cleanly attributed. Whatever makes the tree path expensive is
+in its own dispatch structure, unmeasured.
+
+### Llama-3.1-8B is not promotable yet
+The pinned parity probe still fails (`receipts/m2_probe.jsonl`), on the exact
+artifact the fixture names (sha256 verified):
+
+| prompt | oracle | camelid | match |
+| --- | --- | --- | --- |
+| Hello | `, I am a ` | `, I am interested in` | **no** |
+| The capital of France is | ` a city of romance,` | same | yes |
+| Once upon a time | `, in a small village` | same | yes |
+
+Divergence at generated index 3, exactly where the 2026-08-11 fixture put it.
+Better than recorded (that run tested one prompt, 0/1; this is 2/3) but still a
+failure, so promotion needs a numerics root-cause, not receipts. Two obstacles
+worth recording for whoever picks it up: the CPU reference lane needs
+`CAMELID_LAZY_Q8_0_LINEAR=1` to match the fixture's own `no_repack` backend
+(otherwise it refuses at the 6.44 GB materialization cap), and the health
+endpoint is `/v1/health` with `generation_ready`, not `/api/health`.
