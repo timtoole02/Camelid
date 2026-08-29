@@ -3,7 +3,7 @@
 // production shapes. Also cross-checks the mc kernel against k single-token
 // dispatches bit-for-bit, so a kernel edit that breaks exactness fails HERE first.
 //
-// Usage: kbench [q4k|q5k|q6k|q4kv2|q6kv2|q4kmma|q6kmma|q4kv4|q6kv4]
+// Usage: kbench [q4k|q5k|q6k|q4kv2|q6kv2|q4kmma|q6kmma|q4kv4|q6kv4|q4kv4w|q6kv4w]
 //               [--rows N] [--nsb N] [--iters N]
 use metal::*;
 use std::cell::Cell;
@@ -104,9 +104,10 @@ fn main() {
         .new_library_with_source(&extract_ref_shader(), &options)
         .expect("ref shader compiles");
 
-    let is_v4 = which.ends_with("v4");
+    let is_v4_wide = which == "q4kv4w" || which == "q6kv4w";
+    let is_v4 = which.ends_with("v4") || is_v4_wide;
     let is_mma = which == "q4kmma" || which == "q6kmma" || is_v4;
-    let is_mma_q6 = which == "q6kmma" || which == "q6kv4";
+    let is_mma_q6 = which == "q6kmma" || which == "q6kv4" || which == "q6kv4w";
     let is_v3 = which.ends_with("v3");
     let is_v2 = which.ends_with("v2") || is_mma;
     let case = match which {
@@ -172,6 +173,22 @@ fn main() {
             scratch_ints_per_sb: 0,
             single: "q6k_linear_mma_combined_v4",
             mc: "q6k_linear_mma_combined_v4",
+            tiled: "q6k_linear_tiled",
+        },
+        "q4kv4w" => Case {
+            name: "q4kv4w",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_v4",
+            mc: "q4k_linear_mma_combined_w16_v4",
+            tiled: "q4k_linear_tiled",
+        },
+        "q6kv4w" => Case {
+            name: "q6kv4w",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_v4",
+            mc: "q6k_linear_mma_combined_w16_v4",
             tiled: "q6k_linear_tiled",
         },
         "q5kv2" => Case {
@@ -454,7 +471,7 @@ fn main() {
     };
     let run_mma = |k: usize, timed_iters: usize| -> f64 {
         let (stage_y, stage_ysums, y_half, ysums) = mma_aux.as_ref().unwrap();
-        let k_pad = (k + 7) & !7;
+        let k_pad = if is_v4_wide { 16 } else { (k + 7) & !7 };
         let scalar = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
         unsafe {
             let p = scalar.contents() as *mut u32;
@@ -529,7 +546,7 @@ fn main() {
                         depth: 1,
                     },
                     MTLSize {
-                        width: 32,
+                        width: if is_v4_wide { 64 } else { 32 },
                         height: 1,
                         depth: 1,
                     },
@@ -558,7 +575,7 @@ fn main() {
     // requested column.  That makes the v4 single==multi contract independent
     // of every older scalar arithmetic universe.
     let run_v4_singles = |k: usize, timed_iters: usize| -> f64 {
-        assert!(is_v4 && k <= 8);
+        assert!(is_v4 && k <= if is_v4_wide { 16 } else { 8 });
         let (stage_y, stage_ysums, y_staged, ysums) = mma_aux.as_ref().unwrap();
         let scalar = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
         unsafe {
@@ -617,7 +634,7 @@ fn main() {
                             },
                         );
                     }
-                    e.set_compute_pipeline_state(&mc);
+                    e.set_compute_pipeline_state(&single);
                     e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
                     e.set_buffer(2, Some(&w_buf), 0);
                     e.set_buffer(3, Some(&out_single), (t * rows * 4) as u64);
@@ -791,7 +808,11 @@ fn main() {
     }
     if !skip_check {
         let debug = std::env::var("KBENCH_MMA_DEBUG").is_ok();
-        let max_check_k = if is_v3 || is_v4 { 8 } else { max_k };
+        let max_check_k = if is_v3 || (is_v4 && !is_v4_wide) {
+            8
+        } else {
+            max_k
+        };
         for k in 2..=max_check_k {
             if is_v4 {
                 run_v4_singles(k, 1);
@@ -847,11 +868,13 @@ fn main() {
             case.name, rows, n_sb, max_check_k
         );
         if is_v4 {
-            assert_eq!(case.single, case.mc, "v4 must use one pipeline name");
+            if !is_v4_wide {
+                assert_eq!(case.single, case.mc, "narrow v4 must use one pipeline name");
+            }
             assert!(v4_single_dispatches.get() > 0);
             assert!(v4_multi_dispatches.get() > 0);
             println!(
-                "{} structural SAME-PIPELINE PASS (n_tokens=1 dispatches={}, n_tokens=2..8 dispatches={})",
+                "{} structural V4-UNIVERSE PASS (n_tokens=1 dispatches={}, multi dispatches={})",
                 case.name,
                 v4_single_dispatches.get(),
                 v4_multi_dispatches.get()
@@ -956,7 +979,9 @@ kernel void probe128(device const uint4* w [[buffer(0)]], device float* out [[bu
         t1,
         weight_bytes / (t1 / 1000.0) / 1e9
     );
-    let perf_ks: &[usize] = if is_v3 || is_v4 {
+    let perf_ks: &[usize] = if is_v4_wide {
+        &[8, 16]
+    } else if is_v3 || is_v4 {
         &[2, 4, 6, 8]
     } else {
         &[2, 4, 6, 8, 12, 16]

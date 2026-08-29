@@ -9,15 +9,20 @@ CAMELID_KQUANT_V4=1
 ```
 
 The gate has precedence over v2/v3 for Q4_K and Q6_K decode/verify windows
-with `n_tokens <= 8`. Wider prefill stays on the established path. The kbench
-micro cases select `q4kv4` / `q6kv4` directly and therefore do not read the
-production environment variable.
+with `n_tokens <= 16`. Widths 1 through 8 retain the original one-SIMDgroup
+kernel and 8-column staging. Widths 9 through 16 select a two-SIMDgroup kernel
+with 16-column staging; the simdgroups share one decoded weight tile and each
+owns an independent N=8 output tile. Wider prefill stays on the established
+path. The kbench micro cases select `q4kv4` / `q6kv4` (narrow) or `q4kv4w` /
+`q6kv4w` (wide) directly and therefore do not read the production environment
+variable.
 
-V4 uses one zero-padded 8-column matrix kernel for both `n_tokens=1` and
-`n_tokens=2..8`. The preserved harness dispatches that same pipeline once per
-column as its single-token oracle, then once for the full window. It asserts
-every output word and records both dispatch counters; Q4 and Q6 pass for every
-width 2 through 8.
+The preserved harness dispatches the original V4 pipeline once per column as
+its oracle, then dispatches the wide pipeline once for the full window. It
+asserts every output word and records both dispatch counters; Q4 and Q6 pass
+for every width 2 through 16. Thus widening does not introduce a third
+arithmetic universe: each wide output column is bit-identical to the original
+V4 kernel.
 
 ## Arithmetic boundary
 
@@ -47,7 +52,28 @@ cargo run --release -- q4kv4 --rows 8192 --nsb 12 --iters 10
 cargo run --release -- q4kv4 --rows 3072 --nsb 32 --iters 10
 cargo run --release -- q6kv4 --rows 3072 --nsb 32 --iters 10
 cargo run --release -- q6kv4 --rows 128256 --nsb 12 --iters 5
+cargo run --release -- q4kv4w --rows 8192 --nsb 12 --iters 5
+cargo run --release -- q4kv4w --rows 3072 --nsb 32 --iters 5
+cargo run --release -- q6kv4w --rows 128256 --nsb 12 --iters 5
 ```
+
+## Width-16 receipt
+
+The two-tile kernel preserves every V4 output bit for `k=2..=16`. Best local
+M4 timings from the width-16 experiment were:
+
+| Format / shape | wide k=8 | wide k=16 | k16 / wide-k8 | narrow k=8 |
+| --- | ---: | ---: | ---: | ---: |
+| Q4 up, 8192 x 3072 | 0.364 ms | 0.521 ms | 1.43x | 0.450 ms |
+| Q4 down, 3072 x 8192 | 0.387 ms | 0.502 ms | 1.30x | 0.339 ms |
+| Q6 head, 128256 x 3072 | 5.007 ms | 7.440 ms | 1.49x | 4.710 ms |
+
+These rows were captured under varying GPU bandwidth, so ratios within each
+wide run are more meaningful than cross-run absolute deltas. Production keeps
+the narrow path for `k<=8`, avoiding any decode or eight-column regression.
+Replacing the post-matrix threadgroup barrier with a same-SIMDgroup barrier
+reduced the Q6-head k16 result to 7.360 ms in a later run. A cooperative
+64-thread weight decode regressed to 11.059 ms and was rejected.
 
 An exact-f32 Q6 combined-chain precursor reached only 8.21 ms on the head. A
 row-coalesced / skewed-threadgroup remap reached 8.38 ms and was reverted. The

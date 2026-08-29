@@ -4746,6 +4746,266 @@ kernel void q6k_linear_mma_combined_v4(
         if (rr < rows && t < n_tokens) output[t * rows + rr] = accum[cell];
     }
 }
+
+// Width-16 V4 lane. Two simdgroups share one decoded weight tile and each
+// owns an independent N=8 combined-chain accumulator. The per-column MMA and
+// f32 fold order is unchanged from the narrow V4 kernels above.
+kernel void q4k_linear_mma_combined_w16_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    device const half* ysums [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint k_pad = 16;
+    const uint c0 = sg * 8;
+    const bool active = c0 < n_tokens;
+
+    threadgroup half stage_a[256 * 8];
+    threadgroup half mn_a[8 * 16];
+    threadgroup float c_stage[2 * 64];
+    threadgroup float min_stage[2 * 64];
+
+    float accum[2] = {0.0f, 0.0f};
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        if (sg == 0) {
+            const uint r = lane & 7u;
+            const uint g = lane >> 3;
+            const uint rr = r0 + r;
+            if (rr < rows) {
+                device const uchar* block = weight_blocks + (rr * n_sb + sb) * 144;
+                uchar sc[8], mn[8];
+                q4k_scale_min_v2(block, sc, mn);
+                device const uint4* wq =
+                    reinterpret_cast<device const uint4*>(block + 16 + g * 32);
+                const uint4 wv[2] = {wq[0], wq[1]};
+                const half slo = half(int(sc[2 * g]));
+                const half shi = half(int(sc[2 * g + 1]));
+                for (uint h = 0; h < 2; ++h) {
+                    for (uint c = 0; c < 4; ++c) {
+                        const uint w = wv[h][c];
+                        for (uint j = 0; j < 4; ++j) {
+                            const uint pl = (h * 4 + c) * 4 + j;
+                            const uint byte = (w >> (8 * j)) & 0xffu;
+                            stage_a[(g * 64 + pl) * 8 + r] =
+                                slo * half(int(byte & 0x0fu));
+                            stage_a[(g * 64 + 32 + pl) * 8 + r] =
+                                shi * half(int(byte >> 4));
+                        }
+                    }
+                }
+                if (g < 2) {
+                    for (uint i = 0; i < 8; ++i) {
+                        const uint j16 = g * 8 + i;
+                        mn_a[r * 16 + j16] =
+                            half(int(mn[((j16 >> 2) * 2) + ((j16 >> 1) & 1u)]));
+                    }
+                }
+            } else {
+                for (uint pl = 0; pl < 64; ++pl) {
+                    stage_a[(g * 64 + pl) * 8 + r] = half(0.0f);
+                }
+                if (g < 2) {
+                    for (uint i = 0; i < 8; ++i) {
+                        mn_a[r * 16 + g * 8 + i] = half(0.0f);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active) {
+            simdgroup_float8x8 c_main =
+                make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint kk = 0; kk < 32; ++kk) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+                simdgroup_half8x8 b;
+                simdgroup_load(
+                    b, y_half + (sb * 256 + kk * 8) * k_pad + c0, k_pad
+                );
+                simdgroup_multiply_accumulate(c_main, a, b, c_main);
+            }
+            simdgroup_float8x8 c_min =
+                make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint m = 0; m < 2; ++m) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, mn_a + m * 8, 16);
+                simdgroup_half8x8 b;
+                simdgroup_load(
+                    b, ysums + (sb * 16 + m * 8) * k_pad + c0, k_pad
+                );
+                simdgroup_multiply_accumulate(c_min, a, b, c_min);
+            }
+            simdgroup_store(c_main, c_stage + sg * 64, 8);
+            simdgroup_store(c_min, min_stage + sg * 64, 8);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active) {
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint idx = lane * 2 + cell;
+                const uint cr = idx >> 3;
+                const uint ct = idx & 7u;
+                const uint out_row = r0 + cr;
+                const uint t = c0 + ct;
+                if (out_row < rows && t < n_tokens) {
+                    device const uchar* block =
+                        weight_blocks + (out_row * n_sb + sb) * 144;
+                    const float dw = float(*reinterpret_cast<device const half*>(block));
+                    const float dm =
+                        float(*reinterpret_cast<device const half*>(block + 2));
+                    const float da = input_scales[t * n_sb + sb];
+                    accum[cell] += (dw * da) * c_stage[sg * 64 + cr * 8 + ct]
+                                 - (dm * da) * min_stage[sg * 64 + cr * 8 + ct];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active) {
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint r = idx >> 3;
+            const uint t = c0 + (idx & 7u);
+            const uint rr = r0 + r;
+            if (rr < rows && t < n_tokens) output[t * rows + rr] = accum[cell];
+        }
+    }
+}
+
+kernel void q6k_linear_mma_combined_w16_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint k_pad = 16;
+    const uint c0 = sg * 8;
+    const bool active = c0 < n_tokens;
+
+    threadgroup half stage_a[256 * 8];
+    threadgroup float c_stage[2 * 64];
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        if (sg == 0) {
+            const uint r = lane & 7u;
+            const uint q = lane >> 3;
+            const uint h = q >> 1;
+            const uint s = q & 1u;
+            const uint rr = r0 + r;
+            const uint base = h * 128 + s * 16;
+            if (rr < rows) {
+                device const uchar* block = weight_blocks + (rr * n_sb + sb) * 210;
+                device const char* scales =
+                    reinterpret_cast<device const char*>(block + 192);
+                const int s0 = int(scales[8 * h + s]);
+                const int s1 = int(scales[8 * h + s + 2]);
+                const int s2 = int(scales[8 * h + s + 4]);
+                const int s3 = int(scales[8 * h + s + 6]);
+                device const ushort* wl =
+                    reinterpret_cast<device const ushort*>(block + h * 64 + s * 16);
+                device const ushort* wh = reinterpret_cast<device const ushort*>(
+                    block + h * 64 + 32 + s * 16
+                );
+                device const ushort* wq = reinterpret_cast<device const ushort*>(
+                    block + 128 + h * 32 + s * 16
+                );
+                for (uint l = 0; l < 16; ++l) {
+                    const uint albyte =
+                        (uint(wl[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                    const uint ahbyte =
+                        (uint(wh[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                    const uint hbyte =
+                        (uint(wq[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                    const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                    const int a1 =
+                        int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
+                    const int a2 =
+                        int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
+                    const int a3 =
+                        int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
+                    stage_a[(base + l) * 8 + r] = half(s0 * a0);
+                    stage_a[(base + l + 32) * 8 + r] = half(s1 * a1);
+                    stage_a[(base + l + 64) * 8 + r] = half(s2 * a2);
+                    stage_a[(base + l + 96) * 8 + r] = half(s3 * a3);
+                }
+            } else {
+                for (uint l = 0; l < 16; ++l) {
+                    stage_a[(base + l) * 8 + r] = half(0.0f);
+                    stage_a[(base + l + 32) * 8 + r] = half(0.0f);
+                    stage_a[(base + l + 64) * 8 + r] = half(0.0f);
+                    stage_a[(base + l + 96) * 8 + r] = half(0.0f);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active) {
+            simdgroup_float8x8 c_main =
+                make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint kk = 0; kk < 32; ++kk) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+                simdgroup_half8x8 b;
+                simdgroup_load(
+                    b, y_half + (sb * 256 + kk * 8) * k_pad + c0, k_pad
+                );
+                simdgroup_multiply_accumulate(c_main, a, b, c_main);
+            }
+            simdgroup_store(c_main, c_stage + sg * 64, 8);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active) {
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint idx = lane * 2 + cell;
+                const uint cr = idx >> 3;
+                const uint ct = idx & 7u;
+                const uint out_row = r0 + cr;
+                const uint t = c0 + ct;
+                if (out_row < rows && t < n_tokens) {
+                    device const uchar* block =
+                        weight_blocks + (out_row * n_sb + sb) * 210;
+                    const float dw =
+                        float(*reinterpret_cast<device const half*>(block + 208));
+                    const float da = input_scales[t * n_sb + sb];
+                    accum[cell] +=
+                        (dw * da) * c_stage[sg * 64 + cr * 8 + ct];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active) {
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint r = idx >> 3;
+            const uint t = c0 + (idx & 7u);
+            const uint rr = r0 + r;
+            if (rr < rows && t < n_tokens) output[t * rows + rr] = accum[cell];
+        }
+    }
+}
 "#;
 
 // Direct-f32 K-quant GEMV lane, ported from llama.cpp's current Metal
@@ -15585,19 +15845,18 @@ fn encode_resident_kquant_matmul_f32(
         *p.add(1) = rows as u32;
         *p.add(2) = n_tokens as u32;
     }
-    // v4 has precedence for the complete decode/verify window. It deliberately
-    // uses the same 8-column-padded matrix pipeline at k=1 and k=2..8; wider
-    // prefill remains on the established lanes below.
+    // v4 has precedence for the complete decode/verify window. Widths 1..=8
+    // retain the original one-SIMDgroup pipeline; widths 9..=16 use two N=8
+    // tiles in one threadgroup and share the decoded weight tile.
     // Resolve the runtime-compiled pipelines before suppressing v3. If shader
     // construction failed, fall through to the established lane instead of
     // silently treating the request as a working v4 dispatch.
     let v4 = if kquant_v4_enabled()
-        && n_tokens <= 8
+        && n_tokens <= KQUANT_V4_MAX_COLUMNS
         && matches!(
             weight.format,
             ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
-        )
-    {
+        ) {
         kquant_v2_kernels()
     } else {
         None
@@ -15670,72 +15929,79 @@ fn encode_resident_kquant_matmul_f32(
     dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
 
     if let Some(v4) = v4 {
-            trace_kquant_v4_dispatch(weight.format, n_tokens, rows);
-            const K_PAD: usize = 8;
-            let is_q6k = matches!(weight.format, ResidentWeightFormat::Q6K);
-            // Both v4 formats stage quantized activations as half: every Q8_K
-            // code is exactly representable. Q6's intentional rounding happens
-            // only when its row-dependent dequantized weights enter half A.
-            let y_stage = pool_get(k, (input_width * K_PAD * 2) as u64);
-            let v4_scalar = pool_get(k, 24);
-            unsafe {
-                let p = v4_scalar.contents() as *mut u32;
-                *p = n_sb as u32; //             @0
-                *p.add(1) = rows as u32; //      @4
-                *p.add(2) = n_tokens as u32; //  @8
-                *p.add(3) = input_width as u32; // @12
-                *p.add(4) = K_PAD as u32; //     @16
-            }
-            e.set_compute_pipeline_state(&v4.q4k_mma_stage_y);
+        trace_kquant_v4_dispatch(weight.format, n_tokens, rows);
+        let k_pad = if n_tokens <= 8 { 8 } else { 16 };
+        let wide = n_tokens > 8;
+        let is_q6k = matches!(weight.format, ResidentWeightFormat::Q6K);
+        // Both v4 formats stage quantized activations as half: every Q8_K
+        // code is exactly representable. Q6's intentional rounding happens
+        // only when its row-dependent dequantized weights enter half A.
+        let y_stage = pool_get(k, (input_width * k_pad * 2) as u64);
+        let v4_scalar = pool_get(k, 24);
+        unsafe {
+            let p = v4_scalar.contents() as *mut u32;
+            *p = n_sb as u32; //             @0
+            *p.add(1) = rows as u32; //      @4
+            *p.add(2) = n_tokens as u32; //  @8
+            *p.add(3) = input_width as u32; // @12
+            *p.add(4) = k_pad as u32; //     @16
+        }
+        e.set_compute_pipeline_state(&v4.q4k_mma_stage_y);
+        e.set_buffer(0, Some(quants), 0);
+        e.set_buffer(1, Some(&y_stage), 0);
+        e.set_buffer(2, Some(&v4_scalar), 12);
+        e.set_buffer(3, Some(&v4_scalar), 8);
+        e.set_buffer(4, Some(&v4_scalar), 16);
+        dispatch_1d(e, &v4.q4k_mma_stage_y, input_width * k_pad);
+
+        let ysums = if is_q6k {
+            None
+        } else {
+            let ysums = pool_get(k, (n_sb * 16 * k_pad * 2) as u64);
+            e.set_compute_pipeline_state(&v4.q4k_mma_stage_ysums);
             e.set_buffer(0, Some(quants), 0);
-            e.set_buffer(1, Some(&y_stage), 0);
-            e.set_buffer(2, Some(&v4_scalar), 12);
+            e.set_buffer(1, Some(&ysums), 0);
+            e.set_buffer(2, Some(&v4_scalar), 0);
             e.set_buffer(3, Some(&v4_scalar), 8);
             e.set_buffer(4, Some(&v4_scalar), 16);
-            dispatch_1d(e, &v4.q4k_mma_stage_y, input_width * K_PAD);
+            dispatch_1d(e, &v4.q4k_mma_stage_ysums, n_sb * 16 * k_pad);
+            Some(ysums)
+        };
 
-            let ysums = if is_q6k {
-                None
-            } else {
-                let ysums = pool_get(k, (n_sb * 16 * K_PAD * 2) as u64);
-                e.set_compute_pipeline_state(&v4.q4k_mma_stage_ysums);
-                e.set_buffer(0, Some(quants), 0);
-                e.set_buffer(1, Some(&ysums), 0);
-                e.set_buffer(2, Some(&v4_scalar), 0);
-                e.set_buffer(3, Some(&v4_scalar), 8);
-                e.set_buffer(4, Some(&v4_scalar), 16);
-                dispatch_1d(e, &v4.q4k_mma_stage_ysums, n_sb * 16 * K_PAD);
-                Some(ysums)
-            };
-
-            e.set_compute_pipeline_state(if is_q6k { &v4.q6k_v4 } else { &v4.q4k_v4 });
-            e.set_buffer(0, Some(scales), 0);
-            e.set_buffer(2, Some(&weight.buffer), 0);
-            e.set_buffer(3, Some(out), 0);
-            e.set_buffer(4, Some(&v4_scalar), 0);
-            e.set_buffer(5, Some(&v4_scalar), 4);
-            e.set_buffer(6, Some(&v4_scalar), 8);
-            e.set_buffer(7, Some(&y_stage), 0);
-            if let Some(ysums) = ysums.as_ref() {
-                e.set_buffer(8, Some(ysums), 0);
-            }
-            e.dispatch_thread_groups(
-                metal::MTLSize {
-                    width: rows.div_ceil(8) as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                metal::MTLSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            keep.push(y_stage);
-            if let Some(ysums) = ysums {
-                keep.push(ysums);
-            }
-            keep.push(v4_scalar);
+        let v4_pipeline = match (is_q6k, wide) {
+            (false, false) => &v4.q4k_v4,
+            (false, true) => &v4.q4k_v4_w16,
+            (true, false) => &v4.q6k_v4,
+            (true, true) => &v4.q6k_v4_w16,
+        };
+        e.set_compute_pipeline_state(v4_pipeline);
+        e.set_buffer(0, Some(scales), 0);
+        e.set_buffer(2, Some(&weight.buffer), 0);
+        e.set_buffer(3, Some(out), 0);
+        e.set_buffer(4, Some(&v4_scalar), 0);
+        e.set_buffer(5, Some(&v4_scalar), 4);
+        e.set_buffer(6, Some(&v4_scalar), 8);
+        e.set_buffer(7, Some(&y_stage), 0);
+        if let Some(ysums) = ysums.as_ref() {
+            e.set_buffer(8, Some(ysums), 0);
+        }
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: rows.div_ceil(8) as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: if wide { 64 } else { 32 },
+                height: 1,
+                depth: 1,
+            },
+        );
+        keep.push(y_stage);
+        if let Some(ysums) = ysums {
+            keep.push(ysums);
+        }
+        keep.push(v4_scalar);
         return;
     }
 
@@ -16013,6 +16279,8 @@ const KQUANT_MC_MAX_COLUMNS: usize = 16;
 /// Register-bounded column count in the direct-f32 v3 kernels. Wider bounded
 /// windows are emitted as consecutive independent groups by the host.
 const KQUANT_V3_MAX_COLUMNS: usize = 8;
+/// Combined-chain V4 supports one or two independent N=8 matrix tiles.
+const KQUANT_V4_MAX_COLUMNS: usize = 16;
 
 fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
@@ -16096,7 +16364,9 @@ struct KquantV2Kernels {
     q6k_mma: ComputePipelineState,
     q6k_mma_stage_y: ComputePipelineState,
     q4k_v4: ComputePipelineState,
+    q4k_v4_w16: ComputePipelineState,
     q6k_v4: ComputePipelineState,
+    q6k_v4_w16: ComputePipelineState,
 }
 
 /// Lazily compile the v2 library on first use. A compile failure disables only
@@ -16134,7 +16404,9 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q6k_mma: pipeline("q6k_linear_mma_mc_v2")?,
                 q6k_mma_stage_y: pipeline("q6k_mma_stage_y_f32")?,
                 q4k_v4: pipeline("q4k_linear_mma_combined_v4")?,
+                q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
+                q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
         })
         .as_ref()
@@ -16159,10 +16431,11 @@ fn kquant_v2_enabled() -> bool {
 }
 
 /// Experimental combined-chain matrix lane. One zero-padded 8-column kernel
-/// serves both decode (`n_tokens=1`) and verify (`2..=8`), so their outputs
-/// cannot drift through different arithmetic implementations. Q4's half
-/// operands are exact integers; Q6 intentionally rounds the largest `scale*q`
-/// integers to half and therefore forms a new, uncertified model universe.
+/// serves decode and widths through eight; widths 9..=16 use two independent
+/// N=8 accumulators that preserve the same per-column operation sequence while
+/// sharing weight decode. Q4's half operands are exact integers; Q6
+/// intentionally rounds the largest `scale*q` integers to half and therefore
+/// forms a new, uncertified model universe.
 fn kquant_v4_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
