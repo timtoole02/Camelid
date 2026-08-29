@@ -16448,7 +16448,7 @@ fn kquant_v4_enabled() -> bool {
 
 /// One-shot production dispatch proof for the experimental v4 lane. The trace
 /// is completely dormant unless explicitly requested, then prints the first
-/// Q4/Q6 single/multi encode observed by this process. This closes the gap
+/// Q4/Q6 single/narrow/wide encode observed by this process. This closes the gap
 /// between direct shader micros and the real Rust model route without putting
 /// an atomic or an environment lookup on every normal encode.
 #[cfg(target_os = "macos")]
@@ -16458,11 +16458,13 @@ fn trace_kquant_v4_dispatch(format: ResidentWeightFormat, n_tokens: usize, rows:
     if !*TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()) {
         return;
     }
-    let (bit, label) = match (format, n_tokens == 1) {
-        (ResidentWeightFormat::Q4K, true) => (1, "q4-single"),
-        (ResidentWeightFormat::Q4K, false) => (2, "q4-multi"),
-        (ResidentWeightFormat::Q6K, true) => (4, "q6-single"),
-        (ResidentWeightFormat::Q6K, false) => (8, "q6-multi"),
+    let (bit, label) = match (format, n_tokens) {
+        (ResidentWeightFormat::Q4K, 1) => (1, "q4-single"),
+        (ResidentWeightFormat::Q4K, 2..=8) => (2, "q4-multi"),
+        (ResidentWeightFormat::Q4K, 9..=16) => (4, "q4-wide"),
+        (ResidentWeightFormat::Q6K, 1) => (8, "q6-single"),
+        (ResidentWeightFormat::Q6K, 2..=8) => (16, "q6-multi"),
+        (ResidentWeightFormat::Q6K, 9..=16) => (32, "q6-wide"),
         _ => return,
     };
     let previous = SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
