@@ -179,6 +179,13 @@ pub(crate) struct MetalLinearKernel {
     q4_0_q8_ordered_columns_k4_pipeline: Option<ComputePipelineState>,
     q4_0_q8_ordered_columns_k8_pipeline: Option<ComputePipelineState>,
     q4_0_q8_ordered_columns_fold_pipeline: Option<ComputePipelineState>,
+    /// Slab-free strict multi-column siblings. One 32-lane threadgroup owns an
+    /// output row, decodes every Q4_0 block once for all K columns, and keeps
+    /// the exact per-column block terms in dynamic threadgroup memory until
+    /// lane zero performs the established increasing-block f32 fold.
+    q4_0_q8_ordered_columns_tg_k2_pipeline: Option<ComputePipelineState>,
+    q4_0_q8_ordered_columns_tg_k4_pipeline: Option<ComputePipelineState>,
+    q4_0_q8_ordered_columns_tg_k8_pipeline: Option<ComputePipelineState>,
     /// Fixed-geometry Gemma 4 26B routed-expert lane. These three strict
     /// pipelines consume caller-owned, persistent expert slot slabs: no weight
     /// buffer is allocated or copied on the token hot path.
@@ -3197,6 +3204,88 @@ kernel void q4_0_q8_ordered_columns_fold(
     }
     output[ulong(column) * rows + row] = acc;
 }
+
+// Slab-free strict K-column verifier. One 32-lane SIMD threadgroup owns one
+// output row. Every lane visits disjoint increasing Q4_0 blocks, decoding each
+// weight block once and evaluating all K activation columns while the decoded
+// nibbles are live. Exact two-step block terms are retained in threadgroup
+// memory as [K][blocks_per_row]. After the barrier lane zero replays each
+// column's terms in increasing block order, exactly matching the K=1 comparator.
+inline void q4_0_q8_ordered_columns_tg_impl(
+    device const float* input_scales,
+    device const char* input_quants,
+    device const uchar* weight_bytes,
+    device float* output,
+    uint blocks_per_row,
+    uint rows,
+    uint columns,
+    threadgroup float* block_terms,
+    uint row,
+    uint lane
+) {
+    if (row >= rows) return;
+    const ulong weight_block0 = ulong(row) * blocks_per_row;
+
+    for (uint b = lane; b < blocks_per_row; b += 32u) {
+        device const uchar* block =
+            weight_bytes + (weight_block0 + b) * 18ul;
+        const float weight_scale =
+            float(*reinterpret_cast<device const half*>(block));
+        int isums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (uint j = 0; j < 16; ++j) {
+            const uint packed = uint(block[2 + j]);
+            const int lo = int(packed & 0x0fu) - 8;
+            const int hi = int(packed >> 4) - 8;
+            for (uint column = 0; column < columns; ++column) {
+                const ulong input_quant0 =
+                    (ulong(column) * blocks_per_row + b) * 32ul;
+                isums[column] += lo * int(input_quants[input_quant0 + j]);
+                isums[column] +=
+                    hi * int(input_quants[input_quant0 + j + 16u]);
+            }
+        }
+        for (uint column = 0; column < columns; ++column) {
+            const ulong input_block = ulong(column) * blocks_per_row + b;
+            block_terms[ulong(column) * blocks_per_row + b] =
+                (float(isums[column]) * weight_scale) *
+                input_scales[input_block];
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        for (uint column = 0; column < columns; ++column) {
+            float acc = 0.0f;
+            const ulong term0 = ulong(column) * blocks_per_row;
+            for (uint b = 0; b < blocks_per_row; ++b) {
+                acc = acc + block_terms[term0 + b];
+            }
+            output[ulong(column) * rows + row] = acc;
+        }
+    }
+}
+
+#define DEFINE_Q4_ORDERED_COLUMNS_TG(NAME, COLUMNS)                         \
+kernel void NAME(                                                           \
+    device const float* input_scales [[buffer(0)]],                         \
+    device const char* input_quants [[buffer(1)]],                          \
+    device const uchar* weight_bytes [[buffer(2)]],                         \
+    device float* output [[buffer(3)]],                                     \
+    constant uint& blocks_per_row [[buffer(4)]],                            \
+    constant uint& rows [[buffer(5)]],                                      \
+    threadgroup float* block_terms [[threadgroup(0)]],                      \
+    uint row [[threadgroup_position_in_grid]],                              \
+    uint lane [[thread_index_in_simdgroup]]                                 \
+) {                                                                         \
+    q4_0_q8_ordered_columns_tg_impl(                                        \
+        input_scales, input_quants, weight_bytes, output, blocks_per_row,   \
+        rows, COLUMNS, block_terms, row, lane);                             \
+}
+
+DEFINE_Q4_ORDERED_COLUMNS_TG(q4_0_q8_ordered_columns_tg_k2, 2u)
+DEFINE_Q4_ORDERED_COLUMNS_TG(q4_0_q8_ordered_columns_tg_k4, 4u)
+DEFINE_Q4_ORDERED_COLUMNS_TG(q4_0_q8_ordered_columns_tg_k8, 8u)
+#undef DEFINE_Q4_ORDERED_COLUMNS_TG
 
 // Production Ghost-MoE geometry for Gemma 4 26B. The .cghost v2 record stores
 // gate||up first, then down. Each mutable slot starts on a 16 KiB boundary so a
@@ -10870,6 +10959,30 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let q4_0_q8_ordered_columns_tg_k2_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_tg_k2", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q4_0_q8_ordered_columns_tg_k4_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_tg_k4", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q4_0_q8_ordered_columns_tg_k8_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_tg_k8", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let gemma4_q4_expert_gate_up_geglu_function = strict_q8k_library
                 .get_function("gemma4_q4_expert_gate_up_geglu", None)
                 .ok()?;
@@ -11061,6 +11174,9 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4_0_q8_ordered_columns_k4_pipeline,
                 q4_0_q8_ordered_columns_k8_pipeline,
                 q4_0_q8_ordered_columns_fold_pipeline,
+                q4_0_q8_ordered_columns_tg_k2_pipeline,
+                q4_0_q8_ordered_columns_tg_k4_pipeline,
+                q4_0_q8_ordered_columns_tg_k8_pipeline,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
                 gemma4_q4_expert_gate_up_geglu_simd_pipeline,
                 gemma4_q4_expert_gate_up_split_pipeline,
@@ -12386,6 +12502,74 @@ pub(crate) fn gemma4_q4_column_term_slab_bytes(
         .checked_mul(std::mem::size_of::<f32>())
 }
 
+/// Dynamic threadgroup-memory requirement for the slab-free strict verifier.
+/// One output-row threadgroup retains exactly one f32 block term for every
+/// `(column, input block)`. Only K=2/4/8 is admitted; K=1 remains on the
+/// established ordered comparator and unsupported widths fail closed.
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_q4_column_threadgroup_bytes(
+    blocks_per_row: usize,
+    columns: usize,
+) -> Option<usize> {
+    if blocks_per_row == 0 || !matches!(columns, 2 | 4 | 8) {
+        return None;
+    }
+    columns
+        .checked_mul(blocks_per_row)?
+        .checked_mul(std::mem::size_of::<f32>())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gemma4Q4DirectThreadgroupMode {
+    Off,
+    Qualified,
+    Force,
+}
+
+/// Opt-in policy for the slab-free verifier kernel. `1`, `true`, or `auto`
+/// selects only Mini2-measured winners; `force`/`all` is a diagnostic override
+/// for whole-graph A/B measurements. An admission miss always falls back to the
+/// established global-slab encoder.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_direct_threadgroup_mode() -> Gemma4Q4DirectThreadgroupMode {
+    static MODE: std::sync::OnceLock<Gemma4Q4DirectThreadgroupMode> =
+        std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let Ok(value) = std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG") else {
+            return Gemma4Q4DirectThreadgroupMode::Off;
+        };
+        if value.eq_ignore_ascii_case("force") || value.eq_ignore_ascii_case("all") {
+            Gemma4Q4DirectThreadgroupMode::Force
+        } else if value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("auto")
+        {
+            Gemma4Q4DirectThreadgroupMode::Qualified
+        } else {
+            Gemma4Q4DirectThreadgroupMode::Off
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_q4_direct_threadgroup_selected(
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    match gemma4_q4_direct_threadgroup_mode() {
+        Gemma4Q4DirectThreadgroupMode::Off => false,
+        Gemma4Q4DirectThreadgroupMode::Force => matches!(columns, 2 | 4 | 8),
+        // Base-M4 medians: this gate/up contraction was 1.55x at K=2 and
+        // 2.05x at K=4 versus the slab; every measured K=8/direct-down case
+        // lost, so auto mode deliberately refuses them.
+        Gemma4Q4DirectThreadgroupMode::Qualified => {
+            rows == 15_360 && blocks_per_row == 120 && matches!(columns, 2 | 4)
+        }
+    }
+}
+
 /// Batched Q4_0 expert projection against CPU-quantized Q8_0 activations.
 ///
 /// This is the disk-paged Ghost-MoE bridge: one selected expert's wire matrix
@@ -12510,10 +12694,33 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns(
     weight_wire: &[u8],
     rows: usize,
 ) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_columns_impl(inputs, weight_wire, rows, false)
+}
+
+/// Explicit slab-free sibling of [`try_gemma4_q4_0_matmul_q8_columns`].
+/// Kept separate so production verifier selection remains benchmark-gated.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_threadgroup(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_columns_impl(inputs, weight_wire, rows, true)
+}
+
+#[cfg(target_os = "macos")]
+fn try_gemma4_q4_0_matmul_q8_columns_impl(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+    threadgroup_direct: bool,
+) -> Option<Vec<Vec<f32>>> {
     const WIRE: usize = 18;
     let blocks_per_row = inputs.first()?.len();
     let columns = inputs.len();
     if !matches!(columns, 1 | 2 | 4 | 8)
+        || (threadgroup_direct && columns == 1)
         || rows == 0
         || blocks_per_row == 0
         || rows > u32::MAX as usize
@@ -12526,7 +12733,12 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns(
     let input_blocks = columns.checked_mul(blocks_per_row)?;
     let quant_count = input_blocks.checked_mul(32)?;
     let output_count = columns.checked_mul(rows)?;
-    let term_bytes = gemma4_q4_column_term_slab_bytes(rows, blocks_per_row, columns)?;
+    let term_bytes = if threadgroup_direct {
+        gemma4_q4_column_threadgroup_bytes(blocks_per_row, columns)?;
+        0
+    } else {
+        gemma4_q4_column_term_slab_bytes(rows, blocks_per_row, columns)?
+    };
 
     let mut scales = Vec::with_capacity(input_blocks);
     let mut quants = Vec::with_capacity(quant_count);
@@ -12564,19 +12776,35 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns(
 
     let command_buffer = kernel.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
-    if !encode_gemma4_q4_0_q8_ordered_columns(
-        encoder,
-        kernel,
-        &scales_buf,
-        &quants_buf,
-        &weight_buf,
-        0,
-        &output_buf,
-        terms_buf.as_ref(),
-        rows,
-        blocks_per_row,
-        columns,
-    ) {
+    let encoded = if threadgroup_direct {
+        encode_gemma4_q4_0_q8_ordered_columns_threadgroup(
+            encoder,
+            kernel,
+            &scales_buf,
+            &quants_buf,
+            &weight_buf,
+            0,
+            &output_buf,
+            rows,
+            blocks_per_row,
+            columns,
+        )
+    } else {
+        encode_gemma4_q4_0_q8_ordered_columns(
+            encoder,
+            kernel,
+            &scales_buf,
+            &quants_buf,
+            &weight_buf,
+            0,
+            &output_buf,
+            terms_buf.as_ref(),
+            rows,
+            blocks_per_row,
+            columns,
+        )
+    };
+    if !encoded {
         encoder.end_encoding();
         return None;
     }
@@ -18049,11 +18277,13 @@ fn encode_gemma4_q4_0_matmul(
 /// Input scales are column-major `[K][blocks_per_row]`; input quants are
 /// `[K][blocks_per_row][32]`; output is `[K][rows]`. `weight` contains row-major
 /// 18-byte Q4_0 blocks beginning at `weight_offset`. K=1 uses the established
-/// ordered comparator and accepts `terms=None`. K=2/4/8 require `terms` with at
-/// least [`gemma4_q4_column_term_slab_bytes`] bytes; a private reusable buffer
-/// is sufficient. The call only encodes commands--the caller owns encoder end,
-/// commit, wait, and buffer lifetimes. Any unsupported/undersized shape refuses
-/// without dispatching or touching counters.
+/// ordered comparator and accepts `terms=None`. K=2/4/8 normally require
+/// `terms` with at least [`gemma4_q4_column_term_slab_bytes`] bytes; a private
+/// reusable buffer is sufficient. `CAMELID_GEMMA4_Q4_DIRECT_TG=1` selects only
+/// measured-winning slab-free shapes, while `force` selects it for all K>1
+/// diagnostic A/B runs. The call only encodes commands--the caller owns encoder
+/// end, commit, wait, and buffer lifetimes. Any unsupported/undersized shape
+/// refuses without dispatching or touching counters.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
@@ -18127,6 +18357,23 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
         return true;
     }
 
+    if gemma4_q4_direct_threadgroup_selected(rows, blocks_per_row, columns)
+        && encode_gemma4_q4_0_q8_ordered_columns_threadgroup(
+            encoder,
+            kernel,
+            input_scales,
+            input_quants,
+            weight,
+            weight_offset,
+            output,
+            rows,
+            blocks_per_row,
+            columns,
+        )
+    {
+        return true;
+    }
+
     let candidate = match columns {
         2 => kernel.q4_0_q8_ordered_columns_k2_pipeline.as_ref(),
         4 => kernel.q4_0_q8_ordered_columns_k4_pipeline.as_ref(),
@@ -18178,6 +18425,91 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
     encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
     encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
     dispatch_1d(encoder, fold_pipeline, rows * columns);
+    true
+}
+
+/// Encode one slab-free exact K-column Q4_0 x Q8_0 projection.
+///
+/// The buffer layouts and arithmetic contract match
+/// [`encode_gemma4_q4_0_q8_ordered_columns`], but K=2/4/8 uses one 32-lane
+/// threadgroup per output row and dynamic threadgroup memory instead of the
+/// global term slab plus fold dispatch. This remains an explicit sibling: the
+/// established global-slab encoder is unchanged and available as fallback.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_threadgroup(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if rows > u32::MAX as usize || blocks_per_row > u32::MAX as usize {
+        return false;
+    }
+    let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
+        return false;
+    };
+    let Some(scale_bytes) = input_blocks.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(quant_bytes) = input_blocks.checked_mul(32) else {
+        return false;
+    };
+    let Some(weight_bytes) = rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(18))
+    else {
+        return false;
+    };
+    let Some(output_bytes) = rows
+        .checked_mul(columns)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(weight_end) = weight_offset.checked_add(weight_bytes as u64) else {
+        return false;
+    };
+    let Some(threadgroup_bytes) = gemma4_q4_column_threadgroup_bytes(blocks_per_row, columns)
+    else {
+        return false;
+    };
+    if input_scales.length() < scale_bytes as u64
+        || input_quants.length() < quant_bytes as u64
+        || weight.length() < weight_end
+        || output.length() < output_bytes as u64
+        || !threadgroup_alloc_fits(&kernel.device, threadgroup_bytes)
+    {
+        return false;
+    }
+
+    let candidate = match columns {
+        2 => kernel.q4_0_q8_ordered_columns_tg_k2_pipeline.as_ref(),
+        4 => kernel.q4_0_q8_ordered_columns_tg_k4_pipeline.as_ref(),
+        8 => kernel.q4_0_q8_ordered_columns_tg_k8_pipeline.as_ref(),
+        _ => return false,
+    };
+    let Some(pipeline) = admitted_32_lane_pipeline(candidate) else {
+        return false;
+    };
+    let blocks_u32 = blocks_per_row as u32;
+    let rows_u32 = rows as u32;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(1, Some(input_quants), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+    encoder.set_threadgroup_memory_length(0, threadgroup_bytes as u64);
+    dispatch_one_simdgroup_per_row(encoder, rows);
+    record_gemma4_q4_column_dispatch(columns);
     true
 }
 
@@ -39297,6 +39629,19 @@ mod tests {
                 "strict Q4_0 column pipeline K={width} must admit one 32-lane SIMD group"
             );
         }
+        for (width, pipeline) in [
+            (
+                2usize,
+                kernel.q4_0_q8_ordered_columns_tg_k2_pipeline.as_ref(),
+            ),
+            (4, kernel.q4_0_q8_ordered_columns_tg_k4_pipeline.as_ref()),
+            (8, kernel.q4_0_q8_ordered_columns_tg_k8_pipeline.as_ref()),
+        ] {
+            assert!(
+                admitted_32_lane_pipeline(pipeline).is_some(),
+                "strict direct-threadgroup Q4_0 column pipeline K={width} must admit one 32-lane SIMD group"
+            );
+        }
         assert!(kernel.q4_0_q8_ordered_columns_fold_pipeline.is_some());
         assert_eq!(
             gemma4_q4_column_term_slab_bytes(15_360, 120, 8),
@@ -39309,6 +39654,13 @@ mod tests {
         );
         assert_eq!(gemma4_q4_column_term_slab_bytes(15_360, 120, 1), Some(0));
         assert_eq!(gemma4_q4_column_term_slab_bytes(15_360, 120, 3), None);
+        assert_eq!(gemma4_q4_column_threadgroup_bytes(120, 2), Some(960));
+        assert_eq!(gemma4_q4_column_threadgroup_bytes(120, 4), Some(1_920));
+        assert_eq!(gemma4_q4_column_threadgroup_bytes(120, 8), Some(3_840));
+        assert_eq!(gemma4_q4_column_threadgroup_bytes(480, 8), Some(15_360));
+        assert!(threadgroup_alloc_fits(&kernel.device, 15_360));
+        assert_eq!(gemma4_q4_column_threadgroup_bytes(480, 1), None);
+        assert_eq!(gemma4_q4_column_threadgroup_bytes(480, 3), None);
 
         let half_scales = [
             0x0000u16, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3555, 0x3c00, 0xbc00, 0x7bff, 0xfbff,
@@ -39407,6 +39759,22 @@ mod tests {
                         );
                     }
                 }
+
+                if columns > 1 {
+                    let direct = try_gemma4_q4_0_matmul_q8_columns_threadgroup(&refs, &wire, rows)
+                        .unwrap_or_else(|| {
+                            panic!("direct-threadgroup Q4_0 columns: {label} K={columns}")
+                        });
+                    for column in 0..columns {
+                        for row in 0..rows {
+                            assert_eq!(
+                                direct[column][row].to_bits(),
+                                got[column][row].to_bits(),
+                                "direct-vs-slab shape={label} K={columns} column={column} row={row}"
+                            );
+                        }
+                    }
+                }
             }
 
             let unsupported_refs: Vec<&[Q8_0Block]> =
@@ -39479,7 +39847,10 @@ mod tests {
             write_buffer_u8(&quants_buf, &quants);
             write_buffer_u8(&weight_buf, &wire);
 
-            for columns in [1usize, 2, 4, 8] {
+            for columns in [2usize, 4, 8] {
+                eprintln!(
+                    "gemma4-q4-columns begin shape={label} K={columns} rows={rows} blocks_per_row={blocks_per_row}"
+                );
                 unsafe {
                     let p = scalar.contents() as *mut u32;
                     *p = blocks_per_row as u32;
@@ -39490,14 +39861,13 @@ mod tests {
                 let reference_buf = kernel
                     .device
                     .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
-                let candidate_buf = kernel
+                let slab_buf = kernel
                     .device
                     .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
-                let term_bytes = if columns == 1 {
-                    std::mem::size_of::<f32>()
-                } else {
-                    columns * rows * blocks_per_row * std::mem::size_of::<f32>()
-                };
+                let direct_buf = kernel
+                    .device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+                let term_bytes = columns * rows * blocks_per_row * std::mem::size_of::<f32>();
                 let terms_buf = kernel
                     .device
                     .new_buffer(term_bytes as u64, MTLResourceOptions::StorageModePrivate);
@@ -39519,7 +39889,7 @@ mod tests {
                     cb.wait_until_completed();
                     command_buffer_gpu_times_us(&cb.to_owned()).0
                 };
-                let run_candidate = || -> u128 {
+                let run_slab = || -> u128 {
                     let cb = kernel.queue.new_command_buffer();
                     let encoder = cb.new_compute_command_encoder();
                     assert!(encode_gemma4_q4_0_q8_ordered_columns(
@@ -39529,7 +39899,7 @@ mod tests {
                         &quants_buf,
                         &weight_buf,
                         0,
-                        &candidate_buf,
+                        &slab_buf,
                         Some(&terms_buf),
                         rows,
                         blocks_per_row,
@@ -39540,38 +39910,96 @@ mod tests {
                     cb.wait_until_completed();
                     command_buffer_gpu_times_us(&cb.to_owned()).0
                 };
+                let run_direct = || -> u128 {
+                    let cb = kernel.queue.new_command_buffer();
+                    let encoder = cb.new_compute_command_encoder();
+                    let encoded = encode_gemma4_q4_0_q8_ordered_columns_threadgroup(
+                        encoder,
+                        kernel,
+                        &scales_buf,
+                        &quants_buf,
+                        &weight_buf,
+                        0,
+                        &direct_buf,
+                        rows,
+                        blocks_per_row,
+                        columns,
+                    );
+                    if !encoded {
+                        encoder.end_encoding();
+                        panic!(
+                            "direct threadgroup encoder rejected shape={label} K={columns} rows={rows} blocks_per_row={blocks_per_row}"
+                        );
+                    }
+                    encoder.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    command_buffer_gpu_times_us(&cb.to_owned()).0
+                };
 
-                // One untimed warmup populates caches and also supplies the
+                // Two untimed warmups populate caches and also supply the
                 // full-shape bitwise gate before timestamps are reported.
-                run_reference();
-                run_candidate();
+                for _ in 0..2 {
+                    run_reference();
+                    run_slab();
+                    run_direct();
+                }
                 let mut reference = vec![0.0f32; columns * rows];
-                let mut candidate = vec![0.0f32; columns * rows];
+                let mut slab = vec![0.0f32; columns * rows];
+                let mut direct = vec![0.0f32; columns * rows];
                 read_buffer_f32(&reference_buf, &mut reference);
-                read_buffer_f32(&candidate_buf, &mut candidate);
-                for (index, (&actual, &expected)) in candidate.iter().zip(&reference).enumerate() {
+                read_buffer_f32(&slab_buf, &mut slab);
+                read_buffer_f32(&direct_buf, &mut direct);
+                for (index, ((&slab_value, &direct_value), &expected)) in slab
+                    .iter()
+                    .zip(&direct)
+                    .zip(&reference)
+                    .enumerate()
+                {
                     assert_eq!(
-                        actual.to_bits(),
+                        slab_value.to_bits(),
                         expected.to_bits(),
-                        "full shape={label} K={columns} flat-output={index}"
+                        "slab full shape={label} K={columns} flat-output={index}"
+                    );
+                    assert_eq!(
+                        direct_value.to_bits(),
+                        expected.to_bits(),
+                        "direct full shape={label} K={columns} flat-output={index}"
                     );
                 }
 
-                let mut reference_us = [0u128; 3];
-                let mut candidate_us = [0u128; 3];
-                for repeat in 0..3 {
+                let mut reference_us = [0u128; 7];
+                let mut slab_us = [0u128; 7];
+                let mut direct_us = [0u128; 7];
+                for repeat in 0..7 {
                     reference_us[repeat] = run_reference();
-                    candidate_us[repeat] = run_candidate();
+                    if repeat % 2 == 0 {
+                        slab_us[repeat] = run_slab();
+                        direct_us[repeat] = run_direct();
+                    } else {
+                        direct_us[repeat] = run_direct();
+                        slab_us[repeat] = run_slab();
+                    }
                 }
                 reference_us.sort_unstable();
-                candidate_us.sort_unstable();
-                let speedup = reference_us[1] as f64 / candidate_us[1] as f64;
+                slab_us.sort_unstable();
+                direct_us.sort_unstable();
+                let slab_speedup = reference_us[3] as f64 / slab_us[3] as f64;
+                let direct_vs_slab = slab_us[3] as f64 / direct_us[3] as f64;
+                let threadgroup_bytes =
+                    gemma4_q4_column_threadgroup_bytes(blocks_per_row, columns).unwrap();
                 eprintln!(
                     "gemma4-q4-columns shape={label} K={columns} reference_gpu_us={} \
-                     shared_gpu_us={} speedup={speedup:.3}x wire_bytes={}",
-                    reference_us[1],
-                    candidate_us[1],
-                    wire.len()
+                     slab_gpu_us={} direct_tg_gpu_us={} slab_vs_reference={slab_speedup:.3}x \
+                     direct_vs_slab={direct_vs_slab:.3}x wire_bytes={} term_slab_bytes={} \
+                     threadgroup_bytes={} device_threadgroup_max={}",
+                    reference_us[3],
+                    slab_us[3],
+                    direct_us[3],
+                    wire.len(),
+                    term_bytes,
+                    threadgroup_bytes,
+                    kernel.device.max_threadgroup_memory_length(),
                 );
             }
         }

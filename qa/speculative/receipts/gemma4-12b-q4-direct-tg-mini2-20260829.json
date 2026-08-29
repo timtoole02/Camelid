@@ -1,0 +1,79 @@
+{
+  "schema": "camelid.gemma4.q4-direct-threadgroup.v1",
+  "date": "2026-08-29",
+  "base_commit": "e6c14bfe720350de61cb1269b3b021678602b1ff",
+  "hardware": {
+    "model": "Mac mini",
+    "model_identifier": "Mac16,10",
+    "chip": "Apple M4",
+    "cpu_cores": 10,
+    "memory_gib": 16,
+    "metal": "Metal 4",
+    "max_threadgroup_memory_bytes": 32768
+  },
+  "arithmetic_contract": {
+    "fast_math": false,
+    "q4_wire_bytes_per_block": 18,
+    "simd_lanes_per_output_row": 32,
+    "term_layout": "threadgroup[K][blocks_per_row] f32",
+    "fold": "lane 0, column-major, increasing block order",
+    "largest_admitted_threadgroup_bytes": 15360
+  },
+  "exactness": {
+    "status": "pass",
+    "adversarial_blocks_per_row": [1, 31, 32, 33, 120, 480],
+    "columns": [2, 4, 8],
+    "values": "signed zero, f32 minimum normal, small values, large values, extreme i8 quants, f16 subnormal/normal/extreme scales, packed-nibble patterns",
+    "production_shapes": [
+      "3840-to-4096",
+      "3840-to-8192",
+      "3840-to-2048",
+      "3840-to-512",
+      "3840-to-15360",
+      "15360-to-3840",
+      "4096-to-3840"
+    ],
+    "oracle": "to_bits equality: direct threadgroup == global slab == established ordered K1"
+  },
+  "benchmark": {
+    "metric": "Metal command-buffer GPU busy window, median of 7, microseconds",
+    "warmups": 2,
+    "command": "cargo test --lib metal_gemma4_q4_0_q8_columns_full_12b_shape_receipt -- --ignored --nocapture",
+    "measurements": [
+      {"shape":"3840-to-4096","k":2,"repeated_k1_us":426,"slab_us":397,"direct_tg_us":432,"direct_vs_slab":0.919,"threadgroup_bytes":960},
+      {"shape":"3840-to-4096","k":4,"repeated_k1_us":884,"slab_us":862,"direct_tg_us":841,"direct_vs_slab":1.025,"threadgroup_bytes":1920},
+      {"shape":"3840-to-4096","k":8,"repeated_k1_us":1615,"slab_us":1653,"direct_tg_us":2997,"direct_vs_slab":0.552,"threadgroup_bytes":3840},
+      {"shape":"3840-to-8192","k":2,"repeated_k1_us":1023,"slab_us":999,"direct_tg_us":1096,"direct_vs_slab":0.911,"threadgroup_bytes":960},
+      {"shape":"3840-to-8192","k":4,"repeated_k1_us":1734,"slab_us":1658,"direct_tg_us":1871,"direct_vs_slab":0.886,"threadgroup_bytes":1920},
+      {"shape":"3840-to-8192","k":8,"repeated_k1_us":2493,"slab_us":3037,"direct_tg_us":5499,"direct_vs_slab":0.552,"threadgroup_bytes":3840},
+      {"shape":"3840-to-2048","k":2,"repeated_k1_us":168,"slab_us":152,"direct_tg_us":175,"direct_vs_slab":0.869,"threadgroup_bytes":960},
+      {"shape":"3840-to-2048","k":4,"repeated_k1_us":315,"slab_us":304,"direct_tg_us":346,"direct_vs_slab":0.879,"threadgroup_bytes":1920},
+      {"shape":"3840-to-2048","k":8,"repeated_k1_us":606,"slab_us":683,"direct_tg_us":799,"direct_vs_slab":0.855,"threadgroup_bytes":3840},
+      {"shape":"3840-to-512","k":2,"repeated_k1_us":59,"slab_us":49,"direct_tg_us":54,"direct_vs_slab":0.907,"threadgroup_bytes":960},
+      {"shape":"3840-to-512","k":4,"repeated_k1_us":98,"slab_us":77,"direct_tg_us":98,"direct_vs_slab":0.786,"threadgroup_bytes":1920},
+      {"shape":"3840-to-512","k":8,"repeated_k1_us":165,"slab_us":152,"direct_tg_us":234,"direct_vs_slab":0.650,"threadgroup_bytes":3840},
+      {"shape":"3840-to-15360","k":2,"repeated_k1_us":1764,"slab_us":2726,"direct_tg_us":1754,"direct_vs_slab":1.554,"threadgroup_bytes":960},
+      {"shape":"3840-to-15360","k":4,"repeated_k1_us":2522,"slab_us":5638,"direct_tg_us":2755,"direct_vs_slab":2.046,"threadgroup_bytes":1920},
+      {"shape":"3840-to-15360","k":8,"repeated_k1_us":3775,"slab_us":5968,"direct_tg_us":7336,"direct_vs_slab":0.814,"threadgroup_bytes":3840},
+      {"shape":"15360-to-3840","k":2,"repeated_k1_us":1269,"slab_us":1208,"direct_tg_us":1433,"direct_vs_slab":0.843,"threadgroup_bytes":3840},
+      {"shape":"15360-to-3840","k":4,"repeated_k1_us":2041,"slab_us":1965,"direct_tg_us":6629,"direct_vs_slab":0.296,"threadgroup_bytes":7680},
+      {"shape":"15360-to-3840","k":8,"repeated_k1_us":3727,"slab_us":7837,"direct_tg_us":21166,"direct_vs_slab":0.370,"threadgroup_bytes":15360},
+      {"shape":"4096-to-3840","k":2,"repeated_k1_us":351,"slab_us":255,"direct_tg_us":279,"direct_vs_slab":0.914,"threadgroup_bytes":1024},
+      {"shape":"4096-to-3840","k":4,"repeated_k1_us":511,"slab_us":527,"direct_tg_us":546,"direct_vs_slab":0.965,"threadgroup_bytes":2048},
+      {"shape":"4096-to-3840","k":8,"repeated_k1_us":1002,"slab_us":1123,"direct_tg_us":1362,"direct_vs_slab":0.825,"threadgroup_bytes":4096}
+    ],
+    "unweighted_one_of_each_shape_k_aggregate": {
+      "blanket_direct_geomean_vs_slab": 0.8107,
+      "blanket_direct_sum_ratio_vs_slab": 0.6459,
+      "qualified_hybrid_geomean_vs_slab": 1.0566,
+      "qualified_hybrid_sum_ratio_vs_slab": 1.1154,
+      "note": "This is a microbenchmark aggregate, not a whole-model throughput prediction."
+    }
+  },
+  "selection": {
+    "default": "global slab",
+    "CAMELID_GEMMA4_Q4_DIRECT_TG=1": "direct threadgroup only for rows=15360, blocks_per_row=120, K=2 or K=4; slab fallback elsewhere",
+    "CAMELID_GEMMA4_Q4_DIRECT_TG=force": "diagnostic direct threadgroup for every admitted K=2/4/8 shape; slab fallback on admission failure",
+    "integration_recommendation": "Use qualified mode for whole-target A/B. Do not enable blanket direct mode for production, especially K=8 or 15360-to-3840."
+  }
+}
