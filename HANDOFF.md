@@ -5,7 +5,53 @@ Worktree `/Volumes/Untitled/Camelid-3x`. The EAGLE benchmark and experimental
 v2/MMA K-quant lanes remain opt-in. Phase 0's SPEC_GPU helper does auto-arm on
 eligible Metal speculative requests unless explicitly disabled.
 
-## The result
+## Latest result: Llama 3.2 3B on mini2
+
+The 100 tok/s stretch target was cleared, then doubled:
+
+| workload | context | tok/s | acceptance | verdict |
+| --- | ---: | ---: | ---: | --- |
+| recurring four-token structure, width 16 (3-run mean) | 115 | **201.67** | 100% | lossless |
+| same structure, width 16 + packed attention | 1,819 | **161.58** | 100% | lossless |
+| favorable raw, linear learned EAGLE | 46 | **56.09** | 82.72% | lossless |
+| mixed JSONL suffix + learned-tree fallback | 485 | **52.88** | 36.36% offered | lossless |
+| agentic learned-tree pack | 1,078 | **42.47** | 29.91% offered | lossless |
+
+The 201/161 rows are an honestly labelled recurrence ceiling, not general chat:
+the model-free suffix lane emits 15.83 target-verified tokens per round. The
+short result is stable across three runs (`201.62..201.70`) with identical
+plain/spec streams. The 1,819-token run traced every verifier layer through the
+new row-dimensional attention path and reproduced its pre-batch plain/spec/draft
+arrays exactly.
+
+The three changes are lazy EAGLE-head maintenance across suffix streaks
+(`b59a1596`), packed F16 verifier attention (`794c6a55`, extended to k=16 by
+`ee33ea68`), and a two-SIMDgroup V4 K-quant width-16 kernel (`8201475d`). Width
+16 was not a learned-tree win in the unpromoted notebook control (37.31 tok/s);
+keep the receipted N8/K4/X4 fallback and use N16 only for high-confidence suffix
+chains.
+
+The 201.67 ceiling and raw/mixed/agentic rows use source `aeeacfa1`, version
+`v0.6.1-308-gaeeacfa1`, binary sha256
+`e509fc61d602a7a467ffe44b0b0d97d3dc1e779034b2f37e2a4566566cd990a0`.
+The deepest 1,819-token row uses source `ee33ea68`, version
+`v0.6.1-309-gee33ea68`, sha256
+`9e34084423e16c212746dc9666a151c860ed378a650825494bf81d06efa6bb4d`.
+Safety behavior introduced by `a7f8db6d` prohibits wide V4 in the standard
+resident Llama prefill path exercised by this benchmark, and k=16 packed
+attention fails closed above position 2,048. The prefill guard is not a global
+claim about unrelated windowed or architecture-specific surfaces.
+
+The first 4k width-16 stress attempt produced no receipt; mini2 subsequently
+reported `This system is locked` to SSH, consistent with a reboot/local-login
+lock. Do not rerun it. Locally unlock and inspect mini2 first, then copy the new
+receipts from `~/camelid-overnight/receipts/`. Full method, hashes, receipt names,
+and scope: `qa/speculative/LLAMA32_3B_MINI2_WILD.md`.
+
+This is a learned EAGLE sidecar plus model-free suffix decoding, **not native
+MTP**. No usable pinned Llama-3.2-3B native MTP/Medusa weights were found.
+
+## Original 8B result
 
 Llama-3-8B **Q4_K_M**, 4137-token agentic prompt, one machine (mini2), one prompt;
 each row differs from the one above by a single change.
@@ -73,8 +119,9 @@ qwen35: rank 70, 8.4-19.3 nats). **Remaining for promotion:** bounded-context 51
 pack, API/WebUI load receipts, and sign-off on the proposed gate (top-10 set
 equality, max |delta| <= 0.15 nats).
 
-**Llama 3.2 3B EAGLE-3 — BENCHMARK BUILT; NOT NATIVE MTP OR SERVING
-INTEGRATION.** The learned EAGLE-3 benchmark is pinned to the exact target
+**Historical Llama 3.2 3B EAGLE-3 baseline — superseded by the latest result
+above; still not native MTP or serving integration.** The learned EAGLE-3
+benchmark is pinned to the exact target
 `Llama-3.2-3B-Instruct-Q4_K_M.gguf` (sha256
 `6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff`,
 2,019,377,696 bytes) and the matching Thoughtworks EAGLE3 head at revision
@@ -84,7 +131,7 @@ INTEGRATION.** The learned EAGLE-3 benchmark is pinned to the exact target
 the learned head and target resident on Metal, and enforces losslessness and
 head/target cache-watermark gates.
 
-The final committed raw-prompt result at gamma 3 is
+The pre-tree/raw-prompt baseline at gamma 3 was
 **30.681 -> 41.536 tok/s = 1.354x**, with **87.18% offered-draft acceptance**,
 **3.615 emitted tokens/round**, and **26 resident / 0 CPU verify rounds** over
 96 generated tokens. Source is `9626148a`; the deployed binary is sha256
@@ -105,7 +152,8 @@ suffix gamma 7 reaches **22.015 -> 43.910 tok/s = 1.995x** with 84.62%
 acceptance. All four streams are lossless and fully resident, with full
 binary/model/prompt/token-array provenance. So EAGLE is functionally correct
 and can win on the exact short raw completion, but linear top-1 is not a broad
-chat accelerator; bounded top-k tree EAGLE is the next credible speed lever.
+chat accelerator. That result motivated the dynamic-tree, lazy-head, packed
+attention, and width-16 campaign summarized at the top of this handoff.
 
 The exact matching head declares training sequence length **1024**; it does not
 declare a runtime cap. The old Llama 3.1 / 2048 account was about a different
@@ -115,6 +163,21 @@ method and receipts:
 [`qa/speculative/EAGLE3_LLAMA32_3B.md`](qa/speculative/EAGLE3_LLAMA32_3B.md).
 
 ## Next lever for speed
+
+For the 3B hybrid, the remaining general-output limiter is acceptance, not
+verifier width. The unpromoted N16 notebook control emitted only 3.80
+tokens/round and fell to 37.31 tok/s; N8/K4/X4 is the receipted fallback. A
+genuinely better matching head or
+native target MTP weights are needed to lift ordinary chat. For recurrence,
+decode is already 201.67 tok/s short / 161.58 at 1,819 tokens; prompt prefill,
+not decode, dominates request throughput at depth.
+
+Plain V4 decode is still roughly 22 tok/s because the structurally identical
+single-token path pads to eight columns. The established V3 plain lane is around
+41.5 tok/s. A faster V4-compatible single-token kernel is the clean next kernel
+lever, but it must preserve the V4 arithmetic universe used by wide verification.
+
+The following attribution is the earlier 8B campaign context:
 
 Re-attribution after the fix: attention is now **1.9 ms/verify-column, down from
 52.8**; rope, scatter and argmax measure zero. The remaining ~25 ms/col is inside
@@ -136,18 +199,23 @@ full receipts and the rejection analysis are in
 ## Traps worth knowing
 
 - `metal_spec_verify_bit_identical` **skips silently** unless the fast-stack
-  gates are armed, and no test in the tree sets kv16 — so it can go green without
-  touching the K-quant path. It now prints `kv_format`; run it with
-  `CAMELID_METAL_KV_DTYPE=f16` to exercise the primary. Filters go AFTER `--`.
+  gates are armed, so it can go green without touching the intended K-quant
+  path. It now prints `kv_format`; run it with `CAMELID_METAL_KV_DTYPE=f16`,
+  and use `metal_tree_verify_kv16_primary_path_runs` for the full primary/tree
+  and packed-attention counters. Filters go AFTER `--`.
 - A K-quant micro/unit identity pass is still not a promotion gate. The direct
   fragment candidate passed both but diverged only in the warmed 4137-token
   model run. Require two warmed 96-token exact runs after those fast gates.
-- The tree verify is ~350 ms/verify-column vs the chain's 27 and is NOT worth
-  chasing: admitting kv16 there changed nothing (352 vs 349). Its cost is
-  structural. `encode_attention_tree` must KEEP its `!kv16` guard — that dispatch
-  unwraps the mirrors and panics on a primary.
+- The old “tree verify is structurally dead; keep `!kv16`” conclusion is now
+  obsolete. `5edd26a6` safely admits F16 primaries, and `794c6a55` batches
+  row-dimensional split-K attention. Linear and branching trees pass staged and
+  direct bit-identity tests; the full primary proof reports the batch counters.
+  Keep the new path opt-in with `CAMELID_METAL_ATTN_BATCH_K=1` until promotion.
+- Width-16 packed attention is fail-closed above position 2,048. The first 4k
+  stress attempt produced no receipt and left mini2 at its local-login lock.
+  Unlock and inspect the machine before any deeper rerun.
 - macOS ships **openrsync**: it silently no-op'd large transfers here, twice,
-  including with `--checksum`. Use `tar | ssh`, and verify with md5/size.
+  including with `--checksum`. Use `tar | ssh`, and verify with SHA-256 and size.
 - mini2's Thunderbolt link-local address **rotates**; resolve `bridge0` fresh
   each session. Over WiFi it is 1 MB/s vs 400 MB/s over TB.
 - The CPU reference lane needs `CAMELID_LAZY_Q8_0_LINEAR=1` for an 8B Q8_0 or it

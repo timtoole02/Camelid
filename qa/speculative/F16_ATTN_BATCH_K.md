@@ -21,7 +21,7 @@ Widths 9 through 16 currently fail closed above position 2,048. The k=16 path
 has full exactness and a 1,819-token model receipt, but the first 4k stress run
 ended without a receipt and left mini2 at its local-login lock. Until that run
 is root-caused, the deeper shape is not admitted; k<=8 retains its independent
-4k proof and existing eligibility.
+4k attention-only identity/performance probe and existing eligibility.
 
 ## Exactness
 

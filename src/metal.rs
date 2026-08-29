@@ -20515,6 +20515,11 @@ fn encode_attention_tree(
 /// list. The MSL twins execute the row-wise flash and merge loops in the same order, so
 /// collapsing the host encode loop cannot change accepted target bits.
 #[cfg(target_os = "macos")]
+fn attention_splitk_kv16_wide_depth_allowed(position_counts: &[usize]) -> bool {
+    position_counts.len() <= 8 || position_counts.iter().all(|&pc| pc <= 2048)
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention_splitk_kv16_batch(
     e: &metal::ComputeCommandEncoderRef,
@@ -20540,7 +20545,7 @@ fn encode_attention_splitk_kv16_batch(
         || head_dim > 128
         || !(1..=4).contains(&group)
         || position_counts.iter().any(|&pc| pc < 128)
-        || (rows > 8 && position_counts.iter().any(|&pc| pc > 2048))
+        || !attention_splitk_kv16_wide_depth_allowed(position_counts)
         || tree.is_some_and(|t| {
             t.tail_slots.len() != rows
                 || position_counts
@@ -36514,6 +36519,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_splitk_kv16_wide_depth_gate_has_exact_boundaries() {
+        assert!(attention_splitk_kv16_wide_depth_allowed(&[4_137; 8]));
+        assert!(attention_splitk_kv16_wide_depth_allowed(&[2_048; 9]));
+        assert!(!attention_splitk_kv16_wide_depth_allowed(&[
+            2_048, 2_048, 2_048, 2_048, 2_048, 2_048, 2_048, 2_048, 2_049,
+        ]));
+        assert!(attention_splitk_kv16_wide_depth_allowed(&[2_048; 16]));
+        assert!(!attention_splitk_kv16_wide_depth_allowed(&[2_049; 16]));
     }
 
     #[cfg(target_os = "macos")]

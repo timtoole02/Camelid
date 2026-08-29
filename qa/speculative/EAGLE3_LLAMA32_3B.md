@@ -1,10 +1,27 @@
 # Llama 3.2 3B EAGLE-3 benchmark
 
+## 2026-08-29 wide-hybrid follow-up
+
+This document preserves the original linear-head campaign and its promotion
+boundary. The later suffix-first, dynamic-tree, lazy-head, row-batched
+attention, and width-16 verifier campaign is recorded in
+`qa/speculative/LLAMA32_3B_MINI2_WILD.md`.
+
+That follow-up measured a stable **201.67 tok/s** mean on a 115-token exact
+recurrence and **161.58 tok/s** at 1,819 prompt tokens, both at 100% suffix
+acceptance. Those are deliberately labelled recurrence ceilings, not general
+chat. The measured learned or mixed lanes reached **42.47-56.09 tok/s** and
+remain benchmark-only. All claimed rows matched their paired target-authoritative
+plain stream exactly. The implementation is still EAGLE-3 plus model-free
+suffix drafting, not native MTP, and is not wired into serving.
+
 ## Status and claim boundary
 
 This is a benchmark-only implementation of a learned EAGLE-3 sidecar for one
-exact Llama 3.2 3B target. It drafts a linear top-1 chain, then lets the target
-model authoritatively verify every proposed token. It is **not** a native MTP
+exact Llama 3.2 3B target. The original campaign below drafts a linear top-1
+chain; the follow-up adds bounded dynamic trees and suffix-first chains. In all
+cases the target model authoritatively verifies every proposed token. It is
+**not** a native MTP
 head in the target model, is not wired into serving, is not enabled by default,
 and does not widen Camelid's supported-model claims.
 
@@ -60,9 +77,11 @@ learned head on Metal. Recursive draft rows are ephemeral; only target-verified
 rows extend the stable head cache, and every round checks that the target and
 head cache watermarks still agree.
 
-The benchmark is greedy and linear top-1 only. `gamma` (`--draft-tokens`) is the
-maximum number of draft tokens proposed for one target verify round; it is a
-runtime tuning knob, not part of the checkpoint architecture.
+The original benchmark mode is greedy and linear top-1. `gamma`
+(`--draft-tokens`) is the maximum number of draft tokens proposed for one target
+verify round; it is a runtime tuning knob, not part of the checkpoint
+architecture. The later follow-up reuses the same greedy verification contract
+with a bounded dynamic tree and an independent suffix-first lane.
 
 ## What the head README says about training
 
@@ -251,13 +270,18 @@ to the 38- or 46-token prose sweeps.
 
 ## Conclusion
 
+This conclusion describes the original linear-head campaign. See the
+wide-hybrid follow-up at the top of this document for the later dynamic-tree and
+suffix-first results.
+
 The exact learned EAGLE-3 head is loaded, resident, recurrent, and losslessly
 verified. It exceeds plain decode on one exact raw completion (`1.354x`) and is
 a run-variable near-break-even at the 4k extrapolation point (`0.956x` on the
 canonical same-build row), and it regresses on the
 served-chat sweep (`0.851x` best) and the 556-token code context (`0.877x`).
-So the implementation is functionally working; broad MTP-style acceleration is
-not finished. The next justified engineering step is bounded top-k/tree EAGLE;
-cheaper head updates alone cannot recover the measured chat deficit. This
+So the original implementation was functionally working, while broad MTP-style
+acceleration was not finished. That result justified the bounded top-k/tree
+EAGLE step now measured in the follow-up; cheaper head updates alone could not
+recover the measured chat deficit. This
 remains learned EAGLE-3 rather than a native target MTP head, and it is not
 wired into serving.
