@@ -13,9 +13,10 @@ mod gemma4_mtp12;
 #[cfg(target_os = "macos")]
 pub use gemma4_mtp12::{
     validate_gemma4_12b_shared_kv_schedule, Gemma4Mtp12AssistantMetal, Gemma4Mtp12CpuKv,
-    Gemma4Mtp12Proposal, Gemma4Mtp12ProposalTiming, Gemma4Mtp12ResidentLedger,
+    Gemma4Mtp12DeviceKv, Gemma4Mtp12MetalBufferView, Gemma4Mtp12Proposal,
+    Gemma4Mtp12ProposalTiming, Gemma4Mtp12Q6KEmbeddingRow, Gemma4Mtp12ResidentLedger,
     GEMMA4_12B_MTP_ASSISTANT_SHA256, GEMMA4_12B_MTP_FULL_HOST_LAYER,
-    GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
+    GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES, GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
 };
 
 #[cfg(target_os = "macos")]

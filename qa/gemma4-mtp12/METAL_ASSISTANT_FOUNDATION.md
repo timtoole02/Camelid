@@ -46,6 +46,33 @@ an oracle while adding scoped no-copy target embedding/KV views and a token-only
 readback. The target-authoritative verifier and rollback/acceptance logic remain
 separate work.
 
+## Device-fed K=1 boundary
+
+`Gemma4Mtp12AssistantMetal::propose_k1_device` is the scoped no-copy companion
+to the CPU oracle. It still returns full logits and recurrent hidden for parity,
+but it does not upload CPU embedding or KV vectors.
+
+- `Gemma4Mtp12Q6KEmbeddingRow` is one selected 3,150-byte Q6_K row for hidden
+  width 3,840. The view may alias the existing full 825,753,600-byte no-copy
+  target table. Its checked byte offset is added inside the shader, so a row at
+  offset `2 mod 4` remains legal; no 3,150-byte staging copy is made. Metal
+  dequantizes the row, multiplies by `sqrt(3840)`, and applies the same BF16 RNE
+  boundary as `propose_k1` before pre-projection.
+- Sliding KV must identify target layer 46 and provide native-f32 key/value
+  views in `[8][max_positions][256]` order.
+- Full KV must identify target layer 47 and provide native-f32 key/value views
+  in `[1][max_positions][512]` order.
+- Both KV capacities must match. `logical_position` is the proposed position
+  and the materialized target-prefix length, admitted only in
+  `1..max_positions`.
+- Every buffer's Metal registry ID, view offset/alignment, exact byte length,
+  backing-buffer bound, source layer, and geometry are validated before any
+  assistant scratch is changed.
+
+The pending normalized target hidden remains the only 3,840-float CPU input in
+this K=1 seam. No target runtime, verifier, CLI, acceptance, rollback, or K>1
+path is wired here.
+
 ## Tests
 
 ```sh
@@ -56,4 +83,8 @@ cargo test --lib metal::gemma4_mtp12::tests -- --nocapture
 The focused suite pins the artifact geometry/SHA, derives layers 46/47 from the
 official target schedule, validates the complete tensor table and 23-matrix Q4
 layout, checks canonical signed-max Q4 packing, checks proportional full RoPE,
-and compiles every production MTP12 Metal pipeline.
+and compiles every production MTP12 Metal pipeline. A sparse synthetic full
+assistant additionally compares CPU-fed and device-fed K=1 token, every logit
+bit, recurrent-hidden bits, and the gathered/scaled embedding bits. Separate
+synthetic view tests prove device, bounds, geometry, and logical-position
+refusals fail closed.
