@@ -11,7 +11,9 @@ use crate::inference::spec_tree::{
     TREE_MAX_NODES,
 };
 use crate::inference::LlamaLoadedWeights;
-use crate::metal::{Eagle3MetalOutput, Eagle3MetalState, Eagle3MetalWeights, EAGLE3_AUX_WIDTH};
+use crate::metal::{
+    Eagle3MetalOutput, Eagle3MetalState, Eagle3MetalWeights, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
+};
 use crate::tensor::CpuTensor;
 
 fn invalid(message: impl Into<String>) -> BackendError {
@@ -60,13 +62,21 @@ pub fn interleave_target_layer_inputs(captures: &[CpuTensor]) -> Result<Vec<f32>
 /// This deliberately has a distinct type instead of accepting a bare `f32` at the dynamic-tree
 /// seam.  A reduction over only `Eagle3MetalOutput::top_candidates` is not interchangeable: it
 /// would redistribute all omitted probability mass over the retained branches and bias the
-/// global frontier toward wide parents.  The current Metal output does not expose this value
-/// yet; its logits buffer is the one authoritative place a future reduction must compute it.
+/// global frontier toward wide parents.  Construction from [`Eagle3MetalOutput`] also verifies
+/// that an experimental reduced-row head did not silently omit part of the vocabulary. A full
+/// 32k Q8 head remains valid because approximation changes draft quality, not probability mass.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Eagle3FullVocabularyLogsumexp(f32);
 
 impl Eagle3FullVocabularyLogsumexp {
-    pub fn new(value: f32) -> Result<Self> {
+    pub fn from_output(output: &Eagle3MetalOutput) -> Result<Self> {
+        if output.evaluated_vocab_rows != EAGLE3_DRAFT_VOCAB {
+            return Err(invalid(format!(
+                "EAGLE-3 dynamic frontier requires all {EAGLE3_DRAFT_VOCAB} draft rows, but the head evaluated {}",
+                output.evaluated_vocab_rows
+            )));
+        }
+        let value = output.evaluated_vocab_logsumexp;
         if !value.is_finite() {
             return Err(invalid(format!(
                 "EAGLE-3 full-vocabulary logsumexp must be finite, got {value}"
@@ -77,6 +87,14 @@ impl Eagle3FullVocabularyLogsumexp {
 
     pub fn get(self) -> f32 {
         self.0
+    }
+}
+
+impl TryFrom<&Eagle3MetalOutput> for Eagle3FullVocabularyLogsumexp {
+    type Error = BackendError;
+
+    fn try_from(output: &Eagle3MetalOutput) -> Result<Self> {
+        Self::from_output(output)
     }
 }
 
@@ -271,7 +289,6 @@ impl Eagle3DynamicFrontier {
         &mut self,
         parent: usize,
         output: &Eagle3MetalOutput,
-        normalizer: Eagle3FullVocabularyLogsumexp,
     ) -> Result<Vec<usize>> {
         let expected = self.next_parent().ok_or_else(|| {
             invalid("EAGLE-3 dynamic frontier has no remaining scheduled expansion")
@@ -329,6 +346,7 @@ impl Eagle3DynamicFrontier {
             .iter()
             .map(|candidate| (candidate.target_token, candidate.logit))
             .collect();
+        let normalizer = Eagle3FullVocabularyLogsumexp::from_output(output)?;
         let scores = normalize_draft_top_logits(&top_logits, normalizer.get())
             .map_err(|message| invalid(format!("EAGLE-3 dynamic frontier: {message}")))?;
         let children = self
@@ -581,28 +599,22 @@ impl Eagle3Drafter {
     /// and deterministically replays the root-to-parent token path.  The learned head therefore
     /// conditions every expansion on its real branch, not on a top-1 surrogate spine.
     ///
-    /// `full_vocab_logsumexp` is intentionally explicit.  The current Metal result exposes
-    /// top-k raw logits but not the all-32k reduction, so production must leave this path gated
-    /// until the result carries that scalar.  Computing the callback from top-k alone is
-    /// mathematically invalid and would over-admit wide branches.
-    pub fn draft_dynamic_frontier<F>(
+    /// Every observation carries the all-evaluated-row log-sum-exp produced beside its Metal
+    /// logits. Reduced-row heads fail closed inside `record_expansion`; no callback can
+    /// accidentally substitute a top-k-only normalizer.
+    pub fn draft_dynamic_frontier(
         &mut self,
         target_weights: &LlamaLoadedWeights,
         anchor: u32,
         config: Eagle3DynamicFrontierConfig,
-        mut full_vocab_logsumexp: F,
-    ) -> Result<Eagle3DynamicFrontier>
-    where
-        F: FnMut(&Eagle3MetalOutput) -> Result<Eagle3FullVocabularyLogsumexp>,
-    {
+    ) -> Result<Eagle3DynamicFrontier> {
         let stable_seed = self
             .stable_seed
             .clone()
             .ok_or_else(|| invalid("EAGLE-3 must be seeded before dynamic drafting"))?;
         let stable = self.head.filled();
         let mut frontier = Eagle3DynamicFrontier::new(anchor, config)?;
-        let root_normalizer = full_vocab_logsumexp(&stable_seed)?;
-        frontier.record_expansion(0, &stable_seed, root_normalizer)?;
+        frontier.record_expansion(0, &stable_seed)?;
 
         while let Some(parent) = frontier.next_parent() {
             // Root was consumed from `stable_seed` above. Every subsequent parent has a
@@ -639,8 +651,7 @@ impl Eagle3Drafter {
             let rollback = metal(self.head.rollback_to_position(stable));
             let output = expansion?;
             rollback?;
-            let normalizer = full_vocab_logsumexp(&output)?;
-            frontier.record_expansion(parent, &output, normalizer)?;
+            frontier.record_expansion(parent, &output)?;
         }
         Ok(frontier)
     }
@@ -809,6 +820,8 @@ mod tests {
                 .map(|candidate| candidate.target_token)
                 .unwrap_or(0),
             top_candidates,
+            evaluated_vocab_rows: EAGLE3_DRAFT_VOCAB,
+            evaluated_vocab_logsumexp: 0.0,
             raw_hidden: vec![hidden_marker; HIDDEN_SIZE],
         }
     }
@@ -864,20 +877,12 @@ mod tests {
     fn dynamic_frontier_schedules_global_probability_and_keeps_omitted_mass() {
         let mut frontier = Eagle3DynamicFrontier::new(10, frontier_config(5, 7, 3)).unwrap();
         let root = output(&[(11, 0.50), (12, 0.30)], 1.0);
-        let root_children = frontier
-            .record_expansion(0, &root, Eagle3FullVocabularyLogsumexp::new(0.0).unwrap())
-            .unwrap();
+        let root_children = frontier.record_expansion(0, &root).unwrap();
         assert_eq!(root_children, vec![1, 2]);
         assert_eq!(frontier.next_parent(), Some(1));
 
         let under_11 = output(&[(13, 0.50), (14, 0.40)], 2.0);
-        frontier
-            .record_expansion(
-                1,
-                &under_11,
-                Eagle3FullVocabularyLogsumexp::new(0.0).unwrap(),
-            )
-            .unwrap();
+        frontier.record_expansion(1, &under_11).unwrap();
         // Node 12 has path mass .30, ahead of the new .25 and .20 descendants of node 11.
         assert_eq!(frontier.next_parent(), Some(2));
         assert_eq!(frontier.source_path_to(4).unwrap(), vec![0, 1, 4]);
@@ -889,13 +894,7 @@ mod tests {
             < 1.0e-6));
 
         let under_12 = output(&[(15, 0.50), (16, 0.25)], 3.0);
-        frontier
-            .record_expansion(
-                2,
-                &under_12,
-                Eagle3FullVocabularyLogsumexp::new(0.0).unwrap(),
-            )
-            .unwrap();
+        frontier.record_expansion(2, &under_12).unwrap();
         let forest = frontier.finish().unwrap();
         assert_eq!(forest.scored.tree.tokens, vec![10, 11, 12, 13, 14]);
         assert_eq!(forest.scored.tree.parent, vec![-1, 0, 0, 1, 1]);
@@ -924,7 +923,6 @@ mod tests {
                     ],
                     1.0,
                 ),
-                Eagle3FullVocabularyLogsumexp::new(0.0).unwrap(),
             )
             .unwrap();
         frontier
@@ -943,7 +941,6 @@ mod tests {
                     ],
                     2.0,
                 ),
-                Eagle3FullVocabularyLogsumexp::new(0.0).unwrap(),
             )
             .unwrap();
         let selected = frontier
@@ -989,7 +986,6 @@ mod tests {
                     ],
                     1.0,
                 ),
-                Eagle3FullVocabularyLogsumexp::new(0.0).unwrap(),
             )
             .unwrap();
         let selected = frontier
@@ -1020,18 +1016,10 @@ mod tests {
     fn forest_acceptance_is_target_authoritative_and_gathers_only_its_path() {
         let mut frontier = Eagle3DynamicFrontier::new(10, frontier_config(4, 4, 2)).unwrap();
         frontier
-            .record_expansion(
-                0,
-                &output(&[(11, 0.60), (12, 0.40)], 1.0),
-                Eagle3FullVocabularyLogsumexp::new(0.0).unwrap(),
-            )
+            .record_expansion(0, &output(&[(11, 0.60), (12, 0.40)], 1.0))
             .unwrap();
         frontier
-            .record_expansion(
-                1,
-                &output(&[(13, 0.90)], 2.0),
-                Eagle3FullVocabularyLogsumexp::new(0.0).unwrap(),
-            )
+            .record_expansion(1, &output(&[(13, 0.90)], 2.0))
             .unwrap();
         let forest = frontier.finish().unwrap();
         assert_eq!(forest.scored.tree.tokens, vec![10, 11, 12, 13]);
@@ -1055,8 +1043,19 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_frontier_rejects_nonfinite_full_vocab_normalizer() {
-        assert!(Eagle3FullVocabularyLogsumexp::new(f32::NAN).is_err());
-        assert!(Eagle3FullVocabularyLogsumexp::new(f32::INFINITY).is_err());
+    fn dynamic_frontier_rejects_reduced_or_nonfinite_vocabulary_normalizers() {
+        let mut reduced = output(&[(11, 0.60), (12, 0.40)], 1.0);
+        reduced.evaluated_vocab_rows = EAGLE3_DRAFT_VOCAB / 2;
+        assert!(Eagle3FullVocabularyLogsumexp::from_output(&reduced).is_err());
+        let mut frontier = Eagle3DynamicFrontier::new(10, frontier_config(4, 4, 1)).unwrap();
+        assert!(frontier.record_expansion(0, &reduced).is_err());
+        assert_eq!(frontier.lattice().nodes().len(), 1);
+        assert_eq!(frontier.head_expansions(), 0);
+
+        let mut nonfinite = output(&[(11, 0.60), (12, 0.40)], 1.0);
+        nonfinite.evaluated_vocab_logsumexp = f32::NAN;
+        assert!(Eagle3FullVocabularyLogsumexp::from_output(&nonfinite).is_err());
+        nonfinite.evaluated_vocab_logsumexp = f32::INFINITY;
+        assert!(Eagle3FullVocabularyLogsumexp::from_output(&nonfinite).is_err());
     }
 }

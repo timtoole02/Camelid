@@ -1422,6 +1422,32 @@ impl super::LlamaInferenceSession {
         &mut self,
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, &[])?
+            .map(|(emitted, _capture)| emitted))
+    }
+
+    /// EAGLE-3 tree target seam: the ordinary target-authoritative tree verify plus snapshots
+    /// of selected decoder-layer inputs in BFS verifier-row order. The target's longest greedy
+    /// path is accepted and compacted before this returns, exactly as in [`Self::verify_tree_metal`].
+    /// The caller must gather only that accepted path before updating the learned head.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, capture_layer_ids)?
+            .map(|(_emitted, capture)| capture))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_tree_metal_inner(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<(Vec<u32>, LlamaGreedyVerifyCapture)>> {
         use spec_tree::TREE_MAX_NODES;
         if self.resident_paths_disabled || !resident_decode_metal_enabled() {
             return Ok(None);
@@ -1526,21 +1552,43 @@ impl super::LlamaInferenceSession {
             .resident_decode
             .as_mut()
             .expect("resident session present (readiness checked above)");
-        let predicted = match session.verify_batch_tree(
-            &embeddings.data,
-            &cos_all,
-            &sin_all,
-            &layer_views,
-            &logits_stage,
-            &node_kvslot,
-            &ancestor_bits,
-            words,
-            position,
-            n,
-            scale,
-        ) {
-            Some(p) => p,
-            None => return Ok(None),
+        // Keep the existing no-capture entry point byte-for-byte on its original Metal API.
+        // Only the new EAGLE seam asks verify_batch_inner to retain layer-input buffers.
+        let (predicted, raw_layer_inputs) = if capture_layer_ids.is_empty() {
+            let Some(predicted) = session.verify_batch_tree(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+            ) else {
+                return Ok(None);
+            };
+            (predicted, Vec::new())
+        } else {
+            let Some(captured) = session.verify_batch_tree_with_layer_inputs(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+                capture_layer_ids,
+            ) else {
+                return Ok(None);
+            };
+            captured
         };
 
         // Host accept: longest greedy-exact path through the tree, then COMPACT the accepted
@@ -1569,7 +1617,28 @@ impl super::LlamaInferenceSession {
                 emitted.len()
             );
         }
-        Ok(Some(emitted))
+        let layer_inputs = raw_layer_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(slot, values)| {
+                CpuTensor::from_f32(
+                    format!(
+                        "resident_tree_verify_layer_{}_input",
+                        capture_layer_ids[slot]
+                    ),
+                    vec![n, dims.embedding_length],
+                    values,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((
+            emitted,
+            LlamaGreedyVerifyCapture {
+                predictions: predicted,
+                layer_inputs,
+                timings: LlamaForwardTimings::default(),
+            },
+        )))
     }
 
     /// Non-macOS build: the Metal resident speculative-verify path is unavailable, so return
@@ -1604,6 +1673,17 @@ impl super::LlamaInferenceSession {
         &mut self,
         _tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: tree layer-input capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(None)
     }
 }

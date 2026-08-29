@@ -24303,6 +24303,13 @@ pub struct Eagle3MetalOutput {
     /// draft-vocabulary id.  `draft_token`/`target_token` above remain the independently
     /// GPU-selected greedy result, preserving the existing top-1 behavior.
     pub top_candidates: Vec<Eagle3DraftCandidate>,
+    /// Number of compact-vocabulary rows actually evaluated by the configured draft head.
+    /// This can be smaller than [`EAGLE3_DRAFT_VOCAB`] under the experimental reduced-head
+    /// gate; callers that require a normalized full-vocabulary distribution must check it.
+    pub evaluated_vocab_rows: usize,
+    /// Stable log-sum-exp over exactly `evaluated_vocab_rows` logits.  It is computed while
+    /// the shared Metal logits buffer is live and is never inferred from `top_candidates`.
+    pub evaluated_vocab_logsumexp: f32,
     /// Raw decoder output before the final RMSNorm.  This is the recurrent state used by
     /// the next speculative EAGLE step; applying `fc` to it would be incorrect.
     pub raw_hidden: Vec<f32>,
@@ -24585,6 +24592,47 @@ fn eagle3_rank_top_candidates(
         }
     }
     Ok(ranked)
+}
+
+/// Numerically stable log-sum-exp over every evaluated draft-head row.
+///
+/// The maximum subtraction prevents overflow for large logits and the exponential sum uses
+/// f64 so 32k near-ties do not lose material probability mass. Negative infinity is a valid
+/// omitted candidate, but NaN, positive infinity, and an all-negative-infinity distribution
+/// fail closed rather than leaking a non-finite normalizer into dynamic-tree admission.
+fn eagle3_evaluated_vocab_logsumexp(logits: &[f32]) -> std::result::Result<f32, String> {
+    if logits.is_empty() {
+        return Err("EAGLE-3 cannot normalize an empty evaluated vocabulary".to_string());
+    }
+    let mut maximum = f32::NEG_INFINITY;
+    for (row, &logit) in logits.iter().enumerate() {
+        if logit.is_nan() || logit == f32::INFINITY {
+            return Err(format!(
+                "EAGLE-3 evaluated-vocabulary logit {row} is not finite: {logit}"
+            ));
+        }
+        maximum = maximum.max(logit);
+    }
+    if maximum == f32::NEG_INFINITY {
+        return Err("EAGLE-3 evaluated-vocabulary logits are all negative infinity".to_string());
+    }
+    let exponential_sum = logits
+        .iter()
+        .map(|&logit| (f64::from(logit) - f64::from(maximum)).exp())
+        .sum::<f64>();
+    if !exponential_sum.is_finite() || exponential_sum <= 0.0 {
+        return Err(format!(
+            "EAGLE-3 evaluated-vocabulary exponential sum is invalid: {exponential_sum}"
+        ));
+    }
+    let logsumexp = f64::from(maximum) + exponential_sum.ln();
+    let logsumexp = logsumexp as f32;
+    if !logsumexp.is_finite() {
+        return Err(format!(
+            "EAGLE-3 evaluated-vocabulary logsumexp is not finite: {logsumexp}"
+        ));
+    }
+    Ok(logsumexp)
 }
 
 fn eagle3_validate_batch_shape(
@@ -25406,6 +25454,7 @@ impl Eagle3MetalState {
             std::slice::from_raw_parts(logits.contents() as *const f32, self.lm_head_rows)
         };
         let top_candidates = eagle3_rank_top_candidates(draft_logits, &self.d2t_offsets);
+        let evaluated_vocab_logsumexp = eagle3_evaluated_vocab_logsumexp(draft_logits);
         let mut raw_hidden_out = vec![0.0f32; EAGLE3_HIDDEN];
         read_buffer_f32(&raw_hidden, &mut raw_hidden_out);
 
@@ -25449,11 +25498,14 @@ impl Eagle3MetalState {
         pool_recycle(k, keep);
         let target_token = target_token?;
         let top_candidates = top_candidates?;
+        let evaluated_vocab_logsumexp = evaluated_vocab_logsumexp?;
         self.filled = position + 1;
         Ok(Eagle3MetalOutput {
             draft_token,
             target_token,
             top_candidates,
+            evaluated_vocab_rows: self.lm_head_rows,
+            evaluated_vocab_logsumexp,
             raw_hidden: raw_hidden_out,
         })
     }
@@ -25647,6 +25699,28 @@ mod eagle3_metal_contract_tests {
                 .map(|candidate| candidate.draft_token)
                 .collect::<Vec<_>>(),
             (0..EAGLE3_TOP_K_CANDIDATES as u32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn eagle3_evaluated_vocab_logsumexp_is_stable_and_fail_closed() {
+        let logits = [10_000.0, 9_999.0, f32::NEG_INFINITY];
+        let actual = eagle3_evaluated_vocab_logsumexp(&logits).unwrap();
+        let expected = 10_000.0f64 + (1.0f64 + (-1.0f64).exp()).ln();
+        assert!((f64::from(actual) - expected).abs() < 5.0e-4);
+
+        let near_ties = vec![3.0f32; EAGLE3_DRAFT_VOCAB];
+        let actual = eagle3_evaluated_vocab_logsumexp(&near_ties).unwrap();
+        let expected = 3.0 + (EAGLE3_DRAFT_VOCAB as f32).ln();
+        assert!((actual - expected).abs() < 1.0e-5);
+
+        assert!(eagle3_evaluated_vocab_logsumexp(&[]).is_err());
+        assert!(eagle3_evaluated_vocab_logsumexp(&[f32::NAN, 0.0]).is_err());
+        assert!(eagle3_evaluated_vocab_logsumexp(&[f32::INFINITY, 0.0]).is_err());
+        assert!(eagle3_evaluated_vocab_logsumexp(&[f32::NEG_INFINITY; 2]).is_err());
+        assert_eq!(
+            eagle3_evaluated_vocab_logsumexp(&[0.0, f32::NEG_INFINITY]).unwrap(),
+            0.0
         );
     }
 
@@ -30154,6 +30228,44 @@ impl ResidentDecodeState {
             &[],
         )
         .map(|(preds, _, _)| preds)
+    }
+
+    /// Capture-capable twin of [`Self::verify_batch_tree`].  The forward, tree-attention
+    /// descriptor, target predictions, and eligibility gates are identical; this only asks
+    /// `verify_batch_inner` to snapshot the strictly-increasing decoder-layer inputs named by
+    /// `capture_layer_ids`. Captures remain in BFS verifier-row order so the host can gather
+    /// only the target-accepted root-to-leaf path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_tree_with_layer_inputs(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+        capture_layer_ids: &[usize],
+    ) -> Option<(Vec<u32>, Vec<Vec<f32>>)> {
+        let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            n,
+            scale,
+            false,
+            Some(&tree),
+            capture_layer_ids,
+        )
+        .map(|(preds, _, layer_inputs)| (preds, layer_inputs))
     }
 
     /// `verify_batch_tree` that also reads back the `n * vocab` pre-argmax logits (the gate
@@ -46412,6 +46524,39 @@ mod tests {
 
             assert_eq!(tree_preds.len(), k);
             assert_eq!(tree_logits.len(), k * vocab);
+
+            // Capture-capable tree seam: predictions are unchanged and layer 0 is the exact
+            // BFS-ordered input embedding matrix. This exercises the same tree descriptor and
+            // verify_batch_inner capture buffers the EAGLE host path consumes.
+            let mut capture_session = mk_session();
+            let stage = make_stage();
+            let (capture_preds, captures) = capture_session
+                .verify_batch_tree_with_layer_inputs(
+                    &emb_all,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    base,
+                    k,
+                    scale,
+                    &[0, 1],
+                )
+                .expect("verify_batch_tree capture eligible");
+            assert_eq!(capture_preds, tree_preds);
+            assert_eq!(captures.len(), 2);
+            assert_eq!(captures[0].len(), k * hidden);
+            assert_eq!(captures[1].len(), k * hidden);
+            for (index, (&actual, &expected)) in captures[0].iter().zip(&emb_all).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "LINEAR base={base} tree layer-0 capture element {index}"
+                );
+            }
             for i in 0..k {
                 let pc = base + i + 1;
                 for v in 0..vocab {
