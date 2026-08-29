@@ -15295,12 +15295,21 @@ fn encode_resident_kquant_matmul_f32(
     // v4 has precedence for the complete decode/verify window. It deliberately
     // uses the same 8-column-padded matrix pipeline at k=1 and k=2..8; wider
     // prefill remains on the established lanes below.
-    let v4_requested = kquant_v4_enabled()
+    // Resolve the runtime-compiled pipelines before suppressing v3. If shader
+    // construction failed, fall through to the established lane instead of
+    // silently treating the request as a working v4 dispatch.
+    let v4 = if kquant_v4_enabled()
         && n_tokens <= 8
         && matches!(
             weight.format,
             ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
-        );
+        )
+    {
+        kquant_v2_kernels()
+    } else {
+        None
+    };
+    let v4_requested = v4.is_some();
     // The v3 lane consumes the graph's f32 activations directly. Keep it to the
     // production verifier's eight-column window: prompt prefill is chunked at
     // 16 rows on the measured Llama path, and admitting that shape here turns
@@ -15367,8 +15376,7 @@ fn encode_resident_kquant_matmul_f32(
     e.set_buffer(4, Some(scalar), 8);
     dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
 
-    if v4_requested {
-        if let Some(v4) = kquant_v2_kernels() {
+    if let Some(v4) = v4 {
             const K_PAD: usize = 8;
             let is_q6k = matches!(weight.format, ResidentWeightFormat::Q6K);
             // Both v4 formats stage quantized activations as half: every Q8_K
@@ -15434,8 +15442,7 @@ fn encode_resident_kquant_matmul_f32(
                 keep.push(ysums);
             }
             keep.push(v4_scalar);
-            return;
-        }
+        return;
     }
 
     let scratch_ints_per_column = n_sb
