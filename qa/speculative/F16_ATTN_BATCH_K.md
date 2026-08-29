@@ -17,6 +17,12 @@ Eligibility is deliberately narrow: F16 primary or F16 mirrors, split-K, every
 row at `position_count >= 128`, and `2 <= k <= 16`. Every other shape takes the
 unchanged row-wise path.
 
+Widths 9 through 16 currently fail closed above position 2,048. The k=16 path
+has full exactness and a 1,819-token model receipt, but the first 4k stress run
+ended without a receipt and left mini2 at its local-login lock. Until that run
+is root-caused, the deeper shape is not admitted; k<=8 retains its independent
+4k proof and existing eligibility.
+
 ## Exactness
 
 The batch metadata retains each row's own `position_count` and `n_splits`, so a

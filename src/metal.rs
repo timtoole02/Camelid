@@ -15498,6 +15498,7 @@ fn encode_resident_matmul_f32(
                 input_width,
                 rows,
                 n_tokens,
+                true,
             );
             keep.extend([scales, quants]);
         }
@@ -15837,6 +15838,7 @@ fn encode_resident_kquant_matmul_f32(
     input_width: usize,
     rows: usize,
     n_tokens: usize,
+    allow_v4_wide: bool,
 ) {
     let n_sb = input_width / 256;
     unsafe {
@@ -15853,6 +15855,7 @@ fn encode_resident_kquant_matmul_f32(
     // silently treating the request as a working v4 dispatch.
     let v4 = if kquant_v4_enabled()
         && n_tokens <= KQUANT_V4_MAX_COLUMNS
+        && (n_tokens <= 8 || allow_v4_wide)
         && matches!(
             weight.format,
             ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
@@ -20537,6 +20540,7 @@ fn encode_attention_splitk_kv16_batch(
         || head_dim > 128
         || !(1..=4).contains(&group)
         || position_counts.iter().any(|&pc| pc < 128)
+        || (rows > 8 && position_counts.iter().any(|&pc| pc > 2048))
         || tree.is_some_and(|t| {
             t.tail_slots.len() != rows
                 || position_counts
@@ -28837,6 +28841,7 @@ impl ResidentDecodeState {
                         input_width,
                         rows,
                         n_tokens,
+                        false,
                     );
                 }
             }

@@ -13,7 +13,9 @@ with `n_tokens <= 16`. Widths 1 through 8 retain the original one-SIMDgroup
 kernel and 8-column staging. Widths 9 through 16 select a two-SIMDgroup kernel
 with 16-column staging; the simdgroups share one decoded weight tile and each
 owns an independent N=8 output tile. Wider prefill stays on the established
-path. The kbench micro cases select `q4kv4` / `q6kv4` (narrow) or `q4kv4w` /
+path: the prefill caller explicitly disallows V4 widths 9 through 16 so its
+normal 16-row chunks cannot accidentally enter the verifier experiment. The
+kbench micro cases select `q4kv4` / `q6kv4` (narrow) or `q4kv4w` /
 `q6kv4w` (wide) directly and therefore do not read the production environment
 variable.
 
