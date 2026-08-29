@@ -6685,6 +6685,13 @@ impl Gemma4GpuRuntime {
         // pass an empty slice so no duplicate ~0.8 GiB buffer is uploaded. The ordered
         // no-copy Q6_K wrapper above and the CPU fallback share the original mmap.
         let head_wire: &[u8] = if head_on_cpu { &[] } else { token_embd.bytes() };
+        if std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            eprintln!(
+                "[gemma4-dense] strict ordered Q4_0 x Q8 K=1 projection universe requested"
+            );
+        }
         let model = crate::metal::Gemma4ResidentModel::new(
             layers,
             ple,

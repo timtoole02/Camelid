@@ -16683,6 +16683,20 @@ fn encode_gemma4_matmul(
     }
 }
 
+/// Opt-in dense-QAT arithmetic universe used to qualify the future K-column
+/// verifier. The shipped resident decode keeps its established f32 x Q4_0
+/// projection unless this is explicitly selected. When selected, every Q4_0
+/// projection consumes the exact RMSNorm/quantize-Q8 activation and ordered
+/// integer-dot path used by the strict K=1/2/4/8 verifier kernels.
+///
+/// Q8_0 and NVFP4 rows are unchanged, and an unset or malformed value retains
+/// the production path.
+#[cfg(target_os = "macos")]
+fn gemma4_dense_ordered_q4_enabled() -> bool {
+    std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 /// Encode one f32-activation × wire-Q8 GEMV into the shared encoder:
 /// `out[r] = Σ_b w_scale[b] · Σ_j (w_i8[b][j] · y[b*32+j])`. The weight is the raw
 /// 34-byte GGUF wire layout (f16 scale + 32 i8). Gemma's resident decode always
@@ -16899,6 +16913,18 @@ fn encode_gemma4_ffn(
     let act_buf = nb((ffn_dim * 4) as u64);
     let down_buf = nb((hidden * 4) as u64);
     let dn_buf = nb((hidden * 4) as u64);
+    // Strict Q4_0 x Q8_0 activation storage. These small buffers are allocated
+    // only for the explicitly selected dense-QAT qualification lane.
+    let ordered_q4 = fmt == GemmaWireFmt::Q4_0
+        && hidden == 3_840
+        && ffn_dim == 15_360
+        && !gemma4_ghost_turbo_enabled()
+        && gemma4_dense_ordered_q4_enabled();
+    let input_scales = ordered_q4.then(|| nb(((hidden / 32) * 4) as u64));
+    let input_quants = ordered_q4.then(|| nb(hidden as u64));
+    let act_scales = ordered_q4.then(|| nb(((ffn_dim / 32) * 4) as u64));
+    let act_quants = ordered_q4.then(|| nb(ffn_dim as u64));
+    let act_blocks = ordered_q4.then(|| nb(4));
 
     write_buffer_f32(&norm_w, ffn_norm);
     write_buffer_f32(&postnorm_w, post_ffw_norm);
@@ -16909,25 +16935,68 @@ fn encode_gemma4_ffn(
         let g = gateup_scalar.contents() as *mut u32;
         *g = bpr_hidden as u32;
         *g.add(1) = ffn_dim as u32;
+        *g.add(2) = 1;
         let d = down_scalar.contents() as *mut u32;
         *d = bpr_ffn as u32;
         *d.add(1) = hidden as u32;
+        *d.add(2) = 1;
         *(geglu_n.contents() as *mut u32) = ffn_dim as u32;
         *(resid_n.contents() as *mut u32) = hidden as u32;
+        if let Some(blocks) = act_blocks.as_ref() {
+            *(blocks.contents() as *mut u32) = bpr_ffn as u32;
+        }
     }
 
-    encode_rms_norm_f32(e, k, in_buf, &norm_w, &normf, &rms_scalar);
-    encode_gemma4_matmul(
-        fmt,
-        e,
-        k,
-        &normf,
-        gate_w,
-        &gate_buf,
-        &gateup_scalar,
-        ffn_dim,
-    );
-    encode_gemma4_matmul(fmt, e, k, &normf, up_w, &up_buf, &gateup_scalar, ffn_dim);
+    if ordered_q4 {
+        let input_scales = input_scales.as_ref().expect("ordered Q4 input scales");
+        let input_quants = input_quants.as_ref().expect("ordered Q4 input quants");
+        encode_rms_norm_quantize(
+            e,
+            k,
+            in_buf,
+            &norm_w,
+            input_scales,
+            input_quants,
+            &rms_scalar,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            e,
+            k,
+            input_scales,
+            input_quants,
+            gate_w,
+            &gate_buf,
+            &gateup_scalar,
+            ffn_dim,
+            bpr_hidden,
+            true,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            e,
+            k,
+            input_scales,
+            input_quants,
+            up_w,
+            &up_buf,
+            &gateup_scalar,
+            ffn_dim,
+            bpr_hidden,
+            true,
+        );
+    } else {
+        encode_rms_norm_f32(e, k, in_buf, &norm_w, &normf, &rms_scalar);
+        encode_gemma4_matmul(
+            fmt,
+            e,
+            k,
+            &normf,
+            gate_w,
+            &gate_buf,
+            &gateup_scalar,
+            ffn_dim,
+        );
+        encode_gemma4_matmul(fmt, e, k, &normf, up_w, &up_buf, &gateup_scalar, ffn_dim);
+    }
     encode_binary(
         e,
         &k.gelu_mul_pipeline,
@@ -16937,7 +17006,33 @@ fn encode_gemma4_ffn(
         &geglu_n,
         ffn_dim,
     );
-    encode_gemma4_matmul(fmt, e, k, &act_buf, down_w, &down_buf, &down_scalar, hidden);
+    if ordered_q4 {
+        let act_scales = act_scales.as_ref().expect("ordered Q4 activation scales");
+        let act_quants = act_quants.as_ref().expect("ordered Q4 activation quants");
+        encode_quantize(
+            e,
+            k,
+            &act_buf,
+            act_scales,
+            act_quants,
+            act_blocks.as_ref().expect("ordered Q4 activation blocks"),
+            bpr_ffn,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            e,
+            k,
+            act_scales,
+            act_quants,
+            down_w,
+            &down_buf,
+            &down_scalar,
+            hidden,
+            bpr_ffn,
+            true,
+        );
+    } else {
+        encode_gemma4_matmul(fmt, e, k, &act_buf, down_w, &down_buf, &down_scalar, hidden);
+    }
     encode_rms_norm_f32(e, k, &down_buf, &postnorm_w, &dn_buf, &rms_scalar);
     encode_binary(
         e,
@@ -16964,6 +17059,11 @@ fn encode_gemma4_ffn(
         down_buf,
         dn_buf,
     ]);
+    keep.extend(input_scales);
+    keep.extend(input_quants);
+    keep.extend(act_scales);
+    keep.extend(act_quants);
+    keep.extend(act_blocks);
 }
 
 /// Encode a per-head RMSNorm (Gemma QK-norm / weightless V-norm) into the encoder:
@@ -17076,9 +17176,9 @@ fn encode_gemma4_attention(
     let perhead_q = nb(12);
     let perhead_k = nb(12);
     let perhead_v = nb(12);
-    let q_mm = nb(8);
-    let kv_mm = nb(8);
-    let o_mm = nb(8);
+    let q_mm = nb(12);
+    let kv_mm = nb(12);
+    let o_mm = nb(12);
     let rope_q = nb(16);
     let rope_k = nb(16);
     let attn_scalar = nb(32);
@@ -17098,6 +17198,21 @@ fn encode_gemma4_attention(
     let ctx_buf = f32b(q_dim);
     let o_buf = f32b(hidden);
     let on_buf = f32b(hidden);
+    let exact_12b_attention = hidden == 3_840
+        && n_heads == 16
+        && matches!(
+            (n_kv_heads, head_dim, v_w.is_some()),
+            (8, 256, true) | (1, 512, false)
+        );
+    let ordered_q4 = fmt == GemmaWireFmt::Q4_0
+        && exact_12b_attention
+        && !gemma4_ghost_turbo_enabled()
+        && gemma4_dense_ordered_q4_enabled();
+    let input_scales = ordered_q4.then(|| f32b(hidden / 32));
+    let input_quants = ordered_q4.then(|| nb(hidden as u64));
+    let context_scales = ordered_q4.then(|| f32b(q_dim / 32));
+    let context_quants = ordered_q4.then(|| nb(q_dim as u64));
+    let context_blocks = ordered_q4.then(|| nb(4));
 
     write_buffer_f32(&norm_w, attn_norm);
     write_buffer_f32(&qnorm_w, q_norm);
@@ -17126,6 +17241,7 @@ fn encode_gemma4_attention(
             let p = buf.contents() as *mut u32;
             *p = bpr as u32;
             *p.add(1) = rows as u32;
+            *p.add(2) = 1;
         };
         set_mm(&q_mm, bpr_hidden, q_dim);
         set_mm(&kv_mm, bpr_hidden, kv_dim);
@@ -17155,10 +17271,37 @@ fn encode_gemma4_attention(
         *s.add(3) = kv_dim as u32;
         *(kv16_write.contents() as *mut u32) = 0; // gemma keeps the f32 cache
         *(resid_n.contents() as *mut u32) = hidden as u32;
+        if let Some(blocks) = context_blocks.as_ref() {
+            *(blocks.contents() as *mut u32) = bpr_q as u32;
+        }
     }
 
-    encode_rms_norm_f32(e, k, in_buf, &norm_w, &normf, &rms_scalar);
-    encode_gemma4_matmul(fmt, e, k, &normf, q_w, &query_buf, &q_mm, q_dim);
+    if ordered_q4 {
+        encode_rms_norm_quantize(
+            e,
+            k,
+            in_buf,
+            &norm_w,
+            input_scales.as_ref().expect("ordered Q4 input scales"),
+            input_quants.as_ref().expect("ordered Q4 input quants"),
+            &rms_scalar,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            e,
+            k,
+            input_scales.as_ref().expect("ordered Q4 input scales"),
+            input_quants.as_ref().expect("ordered Q4 input quants"),
+            q_w,
+            &query_buf,
+            &q_mm,
+            q_dim,
+            bpr_hidden,
+            true,
+        );
+    } else {
+        encode_rms_norm_f32(e, k, in_buf, &norm_w, &normf, &rms_scalar);
+        encode_gemma4_matmul(fmt, e, k, &normf, q_w, &query_buf, &q_mm, q_dim);
+    }
     encode_rms_norm_per_head(e, k, &query_buf, &qnorm_w, &qn_buf, &perhead_q, n_heads, 0);
     encode_rope(
         e, k, &qn_buf, &cos_buf, &sin_buf, &rope_q, n_heads, half_rope, 0, 0,
@@ -17167,14 +17310,44 @@ fn encode_gemma4_attention(
     // skip all of that and run attention against the source layer's cache
     // (`cache_k_buf`/`cache_v_buf` are the source's, already holding this token).
     if owns_kv {
-        encode_gemma4_matmul(fmt, e, k, &normf, k_w, &key_buf, &kv_mm, kv_dim);
+        if ordered_q4 {
+            encode_gemma4_q4_0_q8_ordered_single(
+                e,
+                k,
+                input_scales.as_ref().expect("ordered Q4 input scales"),
+                input_quants.as_ref().expect("ordered Q4 input quants"),
+                k_w,
+                &key_buf,
+                &kv_mm,
+                kv_dim,
+                bpr_hidden,
+                true,
+            );
+        } else {
+            encode_gemma4_matmul(fmt, e, k, &normf, k_w, &key_buf, &kv_mm, kv_dim);
+        }
         // V source: the layer's own V projection, or — on V-less layers (12B-class
         // full attention, no attn_v tensor) — the RAW K projection output, before
         // k_norm/RoPE touch it (reference: `if v_proj is not present, use Kcur as
         // Vcur`). `key_buf` is never mutated (norms/rope write to kn_buf), so
         // reading it as the V source is safe in the serial encoder.
         let v_src = if let Some(v_w) = v_w {
-            encode_gemma4_matmul(fmt, e, k, &normf, v_w, &val_buf, &kv_mm, kv_dim);
+            if ordered_q4 {
+                encode_gemma4_q4_0_q8_ordered_single(
+                    e,
+                    k,
+                    input_scales.as_ref().expect("ordered Q4 input scales"),
+                    input_quants.as_ref().expect("ordered Q4 input quants"),
+                    v_w,
+                    &val_buf,
+                    &kv_mm,
+                    kv_dim,
+                    bpr_hidden,
+                    true,
+                );
+            } else {
+                encode_gemma4_matmul(fmt, e, k, &normf, v_w, &val_buf, &kv_mm, kv_dim);
+            }
             &val_buf
         } else {
             &key_buf
@@ -17222,7 +17395,31 @@ fn encode_gemma4_attention(
         0,
         0,
     );
-    encode_gemma4_matmul(fmt, e, k, &ctx_buf, o_w, &o_buf, &o_mm, hidden);
+    if ordered_q4 {
+        encode_quantize(
+            e,
+            k,
+            &ctx_buf,
+            context_scales.as_ref().expect("ordered Q4 context scales"),
+            context_quants.as_ref().expect("ordered Q4 context quants"),
+            context_blocks.as_ref().expect("ordered Q4 context blocks"),
+            bpr_q,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            e,
+            k,
+            context_scales.as_ref().expect("ordered Q4 context scales"),
+            context_quants.as_ref().expect("ordered Q4 context quants"),
+            o_w,
+            &o_buf,
+            &o_mm,
+            hidden,
+            bpr_q,
+            true,
+        );
+    } else {
+        encode_gemma4_matmul(fmt, e, k, &ctx_buf, o_w, &o_buf, &o_mm, hidden);
+    }
     encode_rms_norm_f32(e, k, &o_buf, &postnorm_w, &on_buf, &post_rms_scalar);
     encode_binary(
         e,
@@ -17267,6 +17464,11 @@ fn encode_gemma4_attention(
         o_buf,
         on_buf,
     ]);
+    keep.extend(input_scales);
+    keep.extend(input_quants);
+    keep.extend(context_scales);
+    keep.extend(context_quants);
+    keep.extend(context_blocks);
 }
 
 /// One gemma4 layer's resident weights: the six f32 norms plus the seven Q8 wire
