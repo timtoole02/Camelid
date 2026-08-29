@@ -14323,14 +14323,11 @@ impl Gemma4Dense12bVerifierScratch {
     const MAX_KV: usize = 8 * 256;
 
     fn new(kernel: &MetalLinearKernel, max_positions: usize) -> Option<Self> {
-        let shared = |elements: usize, element_bytes: usize| {
-            kernel
-                .device
-                .new_buffer(
-                    elements.checked_mul(element_bytes)? as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
-                .into()
+        let shared = |elements: usize, element_bytes: usize| -> Option<Buffer> {
+            Some(kernel.device.new_buffer(
+                elements.checked_mul(element_bytes)? as u64,
+                MTLResourceOptions::StorageModeShared,
+            ))
         };
         let f32s = |elements: usize| shared(elements, std::mem::size_of::<f32>());
         let bytes = |elements: usize| shared(elements, 1);
