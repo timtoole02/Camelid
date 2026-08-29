@@ -8233,9 +8233,20 @@ fn generate_run_speculative(
 struct BenchSpeculativeRecord {
     runtime: &'static str,
     commit: String,
+    camelid_version: String,
+    binary_sha256: String,
     workload: String,
+    input_sha256: String,
+    prompt_sha256: String,
+    prompt_format: &'static str,
+    add_bos: bool,
+    add_eos: bool,
+    parse_special: bool,
     model: String,
+    model_sha256: String,
+    tokenizer_metadata_sha256: Option<String>,
     draft_model: Option<String>,
+    draft_model_sha256: Option<String>,
     quantization: String,
     drafter: String,
     cpu_draft: bool,
@@ -8286,10 +8297,37 @@ struct BenchSpeculativeRecord {
     // Lossless gate (intra-Camelid: spec stream vs this run's plain greedy stream).
     first_divergent_generated_token_index: i64,
     lossless: bool,
+    plain_token_ids: Vec<u32>,
+    spec_token_ids: Vec<u32>,
+
+    metal_device: Option<String>,
+    host_isa: String,
+    effective_env: BTreeMap<String, Option<String>>,
+    planner_env_updates: BTreeMap<String, Option<String>>,
+    execution_plan: camelid::execution_plan::ExecutionPlan,
 
     peak_memory_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     offload: Option<camelid::offload::OffloadRunStatus>,
+}
+
+fn speculative_effective_env() -> BTreeMap<String, Option<String>> {
+    const EXTRA_KEYS: &[&str] = &[
+        "CAMELID_SPEC_GPU",
+        "CAMELID_SPEC_DECODE",
+        "CAMELID_SPEC_TREE_GATE",
+        "CAMELID_SPEC_NGRAM_MIN",
+        "CAMELID_METAL_ATTN_SPLITK",
+        "CAMELID_METAL_KV_DTYPE",
+        "CAMELID_KQUANT_MC_GEMV",
+    ];
+    let mut values = eagle3_effective_env();
+    values.extend(
+        EXTRA_KEYS
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok())),
+    );
+    values
 }
 
 /// Load a draft GGUF and wrap it as a `ModelDrafter`. Mirrors the target load path so the
@@ -8354,11 +8392,27 @@ fn run_bench_speculative(
         (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
     };
 
+    let current_exe = std::env::current_exe()?;
+    let binary_sha256 = camelid::receipt::sha256_file_hex(&current_exe)
+        .map_err(|error| anyhow::anyhow!("hashing benchmark binary: {error}"))?;
+    let model_sha256 = camelid::receipt::sha256_file_hex_cached(&model)
+        .map_err(|error| anyhow::anyhow!("hashing target {}: {error}", model.display()))?;
+    let draft_model_sha256 = draft_model
+        .as_deref()
+        .map(camelid::receipt::sha256_file_hex_cached)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("hashing draft model: {error}"))?;
+
     // Load the target exactly as bench-generate does (execution plan applied before weights).
     let gguf = read_metadata(&model)?;
     ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let planner_env_updates = plan_outcome
+        .env_updates
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+        .collect();
     let config = LlamaModelConfig::from_gguf(&gguf)?;
     let binding = LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&model, &gguf);
@@ -8568,9 +8622,20 @@ fn run_bench_speculative(
     let record = BenchSpeculativeRecord {
         runtime: "camelid",
         commit: benchmark_commit(),
+        camelid_version: camelid::receipt::camelid_version(),
+        binary_sha256,
         workload,
+        input_sha256: camelid::receipt::sha256_hex(prompt_text.as_bytes()),
+        prompt_sha256: camelid::receipt::sha256_hex(prompt_text.as_bytes()),
+        prompt_format: "raw_completion_bos_no_eos",
+        add_bos: true,
+        add_eos: false,
+        parse_special: false,
         model: model.display().to_string(),
+        model_sha256,
+        tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
         draft_model: draft_model.as_ref().map(|p| p.display().to_string()),
+        draft_model_sha256,
         quantization: camelid::receipt::quantization_label(&gguf),
         drafter: drafter_kind,
         cpu_draft,
@@ -8601,6 +8666,13 @@ fn run_bench_speculative(
         cpu_verify_rounds: spec.cpu_verify_rounds,
         first_divergent_generated_token_index: first_divergent,
         lossless: first_divergent < 0,
+        plain_token_ids: plain.generated,
+        spec_token_ids: spec.generated,
+        metal_device: camelid::metal::detect_metal_device().device_name,
+        host_isa: camelid::receipt::host_isa_marker(),
+        effective_env: speculative_effective_env(),
+        planner_env_updates,
+        execution_plan: plan_outcome.plan,
         peak_memory_bytes: peak_rss_bytes(),
         offload: camelid::offload::offload_run_status(),
     };
