@@ -1228,7 +1228,11 @@ mod tests {
     }
 
     fn build_weights(rng: &mut Rng, rows: usize) -> Vec<u8> {
-        let mut w = vec![0u8; rows * N_SB * Q6K_WIRE];
+        build_weights_for(rng, rows, N_SB)
+    }
+
+    fn build_weights_for(rng: &mut Rng, rows: usize, n_superblocks: usize) -> Vec<u8> {
+        let mut w = vec![0u8; rows * n_superblocks * Q6K_WIRE];
         for block in w.chunks_exact_mut(Q6K_WIRE) {
             fill_q6k_block(rng, block);
         }
@@ -1236,10 +1240,19 @@ mod tests {
     }
 
     fn build_activations(rng: &mut Rng, k: usize) -> (Vec<f32>, Vec<i8>) {
-        let scales: Vec<f32> = (0..k * N_SB)
+        build_activations_for(rng, k, HIDDEN, N_SB)
+    }
+
+    fn build_activations_for(
+        rng: &mut Rng,
+        k: usize,
+        hidden: usize,
+        n_superblocks: usize,
+    ) -> (Vec<f32>, Vec<i8>) {
+        let scales: Vec<f32> = (0..k * n_superblocks)
             .map(|_| 0.002 + (rng.next() % 4096) as f32 * 1.0e-6)
             .collect();
-        let quants: Vec<i8> = (0..k * HIDDEN).map(|_| rng.byte() as i8).collect();
+        let quants: Vec<i8> = (0..k * hidden).map(|_| rng.byte() as i8).collect();
         (scales, quants)
     }
 
@@ -1302,6 +1315,35 @@ mod tests {
         softcap: f32,
         force_batch_k: bool,
     ) {
+        encode_reference_n_sb(
+            encoder,
+            refs,
+            scales,
+            quants,
+            weight,
+            output,
+            rows,
+            N_SB,
+            k,
+            softcap,
+            force_batch_k,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_reference_n_sb(
+        encoder: &metal::ComputeCommandEncoderRef,
+        refs: &RefKernels,
+        scales: &Buffer,
+        quants: &Buffer,
+        weight: &Buffer,
+        output: &Buffer,
+        rows: usize,
+        n_superblocks: usize,
+        k: usize,
+        softcap: f32,
+        force_batch_k: bool,
+    ) {
         if k == 1 && !force_batch_k {
             encoder.set_compute_pipeline_state(&refs.single);
         } else if k == 8 && !force_batch_k {
@@ -1313,7 +1355,7 @@ mod tests {
         encoder.set_buffer(1, Some(quants), 0);
         encoder.set_buffer(2, Some(weight), 0);
         encoder.set_buffer(3, Some(output), 0);
-        let n_sb_u32 = N_SB as u32;
+        let n_sb_u32 = n_superblocks as u32;
         let rows_u32 = rows as u32;
         let k_u32 = k as u32;
         encoder.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
@@ -1537,6 +1579,83 @@ mod tests {
                 );
             }
             eprintln!("[spec50] bitwise identical to reference for K=1..=8 at rows={rows}");
+        }
+    }
+
+    /// The production 12B target has a 3,840-wide tied head: fifteen Q6_K
+    /// superblocks per vocabulary row. Keep that exact geometry in the gate;
+    /// the original 26B campaign exercised only eleven superblocks.
+    #[test]
+    fn spec50_batch_is_bitwise_identical_at_12b_head_geometry() {
+        const HIDDEN_12B: usize = 3840;
+        const N_SB_12B: usize = HIDDEN_12B / 256;
+        const ROWS: usize = 2051;
+
+        let refs = reference_kernels();
+        let kernels = spec50_head_kernels().expect("spec50 pipelines");
+        let mut rng = Rng(0x12b0_3840_2621_4400);
+        let weights = build_weights_for(&mut rng, ROWS, N_SB_12B);
+        let (scales, quants) = build_activations_for(&mut rng, 8, HIDDEN_12B, N_SB_12B);
+        let wbuf = shared(&refs.device, weights.len());
+        write_buffer_u8(&wbuf, &weights);
+        let sbuf = shared(&refs.device, scales.len() * 4);
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let fbuf = shared(
+            &refs.device,
+            spec50_activation_scratch_bytes(8, HIDDEN_12B),
+        );
+
+        for k in [1usize, 2, 4, 8] {
+            let out_ref = shared(&refs.device, k * ROWS * 4);
+            let out_new = shared(&refs.device, k * ROWS * 4);
+            let cb = refs.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_reference_n_sb(
+                encoder,
+                &refs,
+                &sbuf,
+                &qbuf,
+                &wbuf,
+                &out_ref,
+                ROWS,
+                N_SB_12B,
+                k,
+                SOFTCAP,
+                k == 1,
+            );
+            assert!(encode_q6k_spec50_batch(
+                encoder,
+                kernels,
+                &sbuf,
+                &qbuf,
+                &fbuf,
+                &wbuf,
+                0,
+                &out_new,
+                N_SB_12B,
+                ROWS,
+                k,
+                HIDDEN_12B,
+                SOFTCAP,
+            ));
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+            let mut expected = vec![0.0f32; k * ROWS];
+            let mut actual = vec![0.0f32; k * ROWS];
+            read_buffer_f32(&out_ref, &mut expected);
+            read_buffer_f32(&out_new, &mut actual);
+            for (index, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "12B Q6_K head K={k} output index {index} diverged"
+                );
+            }
         }
     }
 
@@ -1822,7 +1941,7 @@ mod tests {
                     cb.commit();
                     cb.wait_until_completed();
                     if pass == 1 {
-                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
                         let ms = gpu_us as f64 / 1000.0 / REPS as f64;
                         eprintln!(
                             "[spec50] sweep rb={rb} rg={rg} sg={sg} flat={flat} ablate={ablate} yfmt={yfmt} K={k}: {ms:7.2} ms  {:6.1} GB/s",
@@ -1896,7 +2015,7 @@ mod tests {
                     cb.wait_until_completed();
                     assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
                     if pass == 1 {
-                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
                         let ms = gpu_us as f64 / 1000.0 / REPS as f64;
                         eprintln!(
                             "[spec50] K={k} {label:<26} {ms:7.2} ms  {:6.1} GB/s",
