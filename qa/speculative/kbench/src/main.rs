@@ -3,9 +3,10 @@
 // production shapes. Also cross-checks the mc kernel against k single-token
 // dispatches bit-for-bit, so a kernel edit that breaks exactness fails HERE first.
 //
-// Usage: kbench [q4k|q5k|q6k|q4kv2|q6kv2|q4kmma|q6kmma]
+// Usage: kbench [q4k|q5k|q6k|q4kv2|q6kv2|q4kmma|q6kmma|q4kv4|q6kv4]
 //               [--rows N] [--nsb N] [--iters N]
 use metal::*;
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -103,8 +104,9 @@ fn main() {
         .new_library_with_source(&extract_ref_shader(), &options)
         .expect("ref shader compiles");
 
-    let is_mma = which == "q4kmma" || which == "q6kmma";
-    let is_mma_q6 = which == "q6kmma";
+    let is_v4 = which.ends_with("v4");
+    let is_mma = which == "q4kmma" || which == "q6kmma" || is_v4;
+    let is_mma_q6 = which == "q6kmma" || which == "q6kv4";
     let is_v3 = which.ends_with("v3");
     let is_v2 = which.ends_with("v2") || is_mma;
     let case = match which {
@@ -154,6 +156,22 @@ fn main() {
             scratch_ints_per_sb: 8,
             single: "q6k_linear_simd_v2",
             mc: "q6k_linear_mma_mc_v2",
+            tiled: "q6k_linear_tiled",
+        },
+        "q4kv4" => Case {
+            name: "q4kv4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_v4",
+            mc: "q4k_linear_mma_combined_v4",
+            tiled: "q4k_linear_tiled",
+        },
+        "q6kv4" => Case {
+            name: "q6kv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_v4",
+            mc: "q6k_linear_mma_combined_v4",
             tiled: "q6k_linear_tiled",
         },
         "q5kv2" => Case {
@@ -341,6 +359,8 @@ fn main() {
         (max_k * rows * 4) as u64,
         MTLResourceOptions::StorageModeShared,
     );
+    let v4_single_dispatches = Cell::new(0usize);
+    let v4_multi_dispatches = Cell::new(0usize);
 
     let weight_bytes = (rows * n_sb * case.block_bytes) as f64;
 
@@ -413,7 +433,7 @@ fn main() {
 
     // --- MMA staging pipelines + buffers (q4kmma only) --------------------------
     let mma_aux = if is_mma {
-        let stage_y = v2_pipe(if is_mma_q6 {
+        let stage_y = v2_pipe(if is_mma_q6 && !is_v4 {
             "q6k_mma_stage_y_f32"
         } else {
             "q4k_mma_stage_y"
@@ -521,6 +541,114 @@ fn main() {
             cb.wait_until_completed();
             best = best.min(t0.elapsed().as_secs_f64() * 1000.0 / REPS as f64);
         }
+        if is_v4 {
+            let counter = if k == 1 {
+                &v4_single_dispatches
+            } else {
+                &v4_multi_dispatches
+            };
+            counter.set(counter.get() + REPS * timed_iters);
+        }
+        best
+    };
+
+    // v4's single-column oracle is deliberately the very same padded matrix
+    // kernel as its multi-column path.  Stage one source column into an
+    // 8-column zero-padded tile, dispatch n_tokens=1, and repeat for each
+    // requested column.  That makes the v4 single==multi contract independent
+    // of every older scalar arithmetic universe.
+    let run_v4_singles = |k: usize, timed_iters: usize| -> f64 {
+        assert!(is_v4 && k <= 8);
+        let (stage_y, stage_ysums, y_staged, ysums) = mma_aux.as_ref().unwrap();
+        let scalar = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let p = scalar.contents() as *mut u32;
+            *p = n_sb as u32; // @0  n_sb
+            *p.add(1) = rows as u32; // @4  rows
+            *p.add(2) = 1; // @8  n_tokens
+            *p.add(3) = cols as u32; // @12 width
+            *p.add(4) = 8; // @16 k_pad
+        }
+        let mut best = f64::MAX;
+        for _ in 0..timed_iters {
+            let cb = queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            for _rep in 0..REPS {
+                for t in 0..k {
+                    e.set_compute_pipeline_state(stage_y);
+                    e.set_buffer(0, Some(&quants_buf), (t * cols) as u64);
+                    e.set_buffer(1, Some(y_staged), 0);
+                    e.set_buffer(2, Some(&scalar), 12);
+                    e.set_buffer(3, Some(&scalar), 8);
+                    e.set_buffer(4, Some(&scalar), 16);
+                    let total = (cols * 8) as u64;
+                    let w = stage_y.thread_execution_width();
+                    e.dispatch_thread_groups(
+                        MTLSize {
+                            width: total.div_ceil(w),
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: w,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    if !is_mma_q6 {
+                        e.set_compute_pipeline_state(stage_ysums);
+                        e.set_buffer(0, Some(&quants_buf), (t * cols) as u64);
+                        e.set_buffer(1, Some(ysums), 0);
+                        e.set_buffer(2, Some(&scalar), 0);
+                        e.set_buffer(3, Some(&scalar), 8);
+                        e.set_buffer(4, Some(&scalar), 16);
+                        let total = (n_sb * 16 * 8) as u64;
+                        let w = stage_ysums.thread_execution_width();
+                        e.dispatch_thread_groups(
+                            MTLSize {
+                                width: total.div_ceil(w),
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: w,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
+                    e.set_compute_pipeline_state(&mc);
+                    e.set_buffer(0, Some(&scales_buf), (t * n_sb * 4) as u64);
+                    e.set_buffer(2, Some(&w_buf), 0);
+                    e.set_buffer(3, Some(&out_single), (t * rows * 4) as u64);
+                    e.set_buffer(4, Some(&scalar), 0);
+                    e.set_buffer(5, Some(&scalar), 4);
+                    e.set_buffer(6, Some(&scalar), 8);
+                    e.set_buffer(7, Some(y_staged), 0);
+                    if !is_mma_q6 {
+                        e.set_buffer(8, Some(ysums), 0);
+                    }
+                    e.dispatch_thread_groups(
+                        MTLSize {
+                            width: (rows as u64).div_ceil(8),
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+            }
+            e.end_encoding();
+            let t0 = Instant::now();
+            cb.commit();
+            cb.wait_until_completed();
+            best = best.min(t0.elapsed().as_secs_f64() * 1000.0 / REPS as f64);
+        }
+        v4_single_dispatches.set(v4_single_dispatches.get() + REPS * k * timed_iters);
         best
     };
 
@@ -663,9 +791,13 @@ fn main() {
     }
     if !skip_check {
         let debug = std::env::var("KBENCH_MMA_DEBUG").is_ok();
-        let max_check_k = if is_v3 { 8 } else { max_k };
+        let max_check_k = if is_v3 || is_v4 { 8 } else { max_k };
         for k in 2..=max_check_k {
-            run_single_k(k, 1);
+            if is_v4 {
+                run_v4_singles(k, 1);
+            } else {
+                run_single_k(k, 1);
+            }
             run_mc(k, 1);
             let a = unsafe {
                 std::slice::from_raw_parts(out_single.contents() as *const u32, k * rows)
@@ -714,6 +846,17 @@ fn main() {
             "{} rows={} n_sb={} bit-identity PASS (k=2..={})",
             case.name, rows, n_sb, max_check_k
         );
+        if is_v4 {
+            assert_eq!(case.single, case.mc, "v4 must use one pipeline name");
+            assert!(v4_single_dispatches.get() > 0);
+            assert!(v4_multi_dispatches.get() > 0);
+            println!(
+                "{} structural SAME-PIPELINE PASS (n_tokens=1 dispatches={}, n_tokens=2..8 dispatches={})",
+                case.name,
+                v4_single_dispatches.get(),
+                v4_multi_dispatches.get()
+            );
+        }
     } else {
         println!(
             "{} rows={} n_sb={} PERF-ONLY (identity checks SKIPPED)",
@@ -802,21 +945,29 @@ kernel void probe128(device const uint4* w [[buffer(0)]], device float* out [[bu
     }
 
     // Perf: warmup + best-of-iters.
-    let t1 = run_single_k(1, iters);
+    let t1 = if is_v4 {
+        run_mma(1, iters)
+    } else {
+        run_single_k(1, iters)
+    };
     println!(
         "{} single-token: {:.3} ms  ({:.1} GB/s weight stream)",
         case.name,
         t1,
         weight_bytes / (t1 / 1000.0) / 1e9
     );
-    let perf_ks: &[usize] = if is_v3 {
+    let perf_ks: &[usize] = if is_v3 || is_v4 {
         &[2, 4, 6, 8]
     } else {
         &[2, 4, 6, 8, 12, 16]
     };
     for &k in perf_ks {
         let tk = run_mc(k, iters);
-        let tks = run_single_k(k, iters.min(10));
+        let tks = if is_v4 {
+            run_v4_singles(k, iters.min(10))
+        } else {
+            run_single_k(k, iters.min(10))
+        };
         println!(
             "{} k={:2}: mc {:.3} ms ({:.2}x single, {:.3} ms/col, {:.1} GB/s) | k-singles {:.3} ms | mc speedup {:.2}x",
             case.name, k, tk, tk / t1, tk / k as f64, weight_bytes / (tk / 1000.0) / 1e9,
