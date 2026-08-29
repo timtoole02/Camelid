@@ -5483,7 +5483,7 @@ async fn main() -> anyhow::Result<()> {
                     let overlap = 8 - committed;
                     let mut tail_b = Vec::with_capacity(8);
                     for row in 0..8 {
-                        let stale = (row < overlap).then_some(tail_a[committed + row]);
+                        let stale = (row < overlap).then(|| tail_a[committed + row]);
                         let replacement = candidate_pool
                             .iter()
                             .copied()
