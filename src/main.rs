@@ -100,12 +100,14 @@ mod ghost_moe_cli_tests {
                     tree_nodes,
                     tree_topk,
                     tree_expansions,
+                    suffix_first,
                     ..
                 }) => {
                     assert_eq!(draft_tokens, 4);
                     assert_eq!(tree_nodes, None);
                     assert_eq!(tree_topk, 4);
                     assert_eq!(tree_expansions, 4);
+                    assert!(!suffix_first);
                 }
                 other => panic!("expected BenchEagle3, got {other:?}"),
             }
@@ -124,6 +126,7 @@ mod ghost_moe_cli_tests {
                 "8",
                 "--tree-expansions",
                 "5",
+                "--suffix-first",
             ])
             .expect("parse EAGLE-3 dynamic tree flags");
             match tree.command {
@@ -132,16 +135,49 @@ mod ghost_moe_cli_tests {
                     tree_nodes,
                     tree_topk,
                     tree_expansions,
+                    suffix_first,
                     ..
                 }) => {
                     assert_eq!(draft_tokens, 7);
                     assert_eq!(tree_nodes, Some(12));
                     assert_eq!(tree_topk, 8);
                     assert_eq!(tree_expansions, 5);
+                    assert!(suffix_first);
                 }
                 other => panic!("expected BenchEagle3, got {other:?}"),
             }
+
+            let suffix_without_tree = Cli::try_parse_from([
+                "camelid",
+                "bench-eagle3",
+                "target.gguf",
+                "--eagle3",
+                "head",
+                "--suffix-first",
+            ])
+            .expect_err("--suffix-first must require --tree-nodes");
+            assert_eq!(
+                suffix_without_tree.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
         });
+    }
+
+    #[test]
+    fn deepest_suffix_chain_prefers_the_first_deepest_branch_within_budget() {
+        let tree = camelid::inference::spec_tree::TokenTree {
+            tokens: vec![10, 20, 30, 21, 31, 22],
+            parent: vec![-1, 0, 0, 1, 2, 3],
+            depth: vec![0, 1, 1, 2, 2, 3],
+        };
+        assert_eq!(deepest_suffix_chain(&tree, 3), vec![20, 21, 22]);
+        assert_eq!(deepest_suffix_chain(&tree, 2), vec![20, 21]);
+        assert!(deepest_suffix_chain(&tree, 0).is_empty());
+        assert!(deepest_suffix_chain(
+            &camelid::inference::spec_tree::TokenTree::linear(10, &[]),
+            4
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2917,6 +2953,11 @@ enum Command {
         /// Learned-head parent expansions per tree round, including the root expansion.
         #[arg(long, default_value_t = 4)]
         tree_expansions: usize,
+        /// Try a model-free suffix chain first, falling back to the dynamic EAGLE tree
+        /// when history contains no usable suffix continuation. Benchmark-only and
+        /// valid only with --tree-nodes.
+        #[arg(long, default_value_t = false, requires = "tree_nodes")]
+        suffix_first: bool,
         /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
@@ -5470,6 +5511,7 @@ async fn main() -> anyhow::Result<()> {
             tree_nodes,
             tree_topk,
             tree_expansions,
+            suffix_first,
             prompt_file,
             prompt,
             chat,
@@ -5484,6 +5526,7 @@ async fn main() -> anyhow::Result<()> {
                 tree_nodes,
                 tree_topk,
                 tree_expansions,
+                suffix_first,
                 prompt_file,
                 prompt,
                 chat,
@@ -8801,6 +8844,38 @@ struct Eagle3BenchRun {
     resident_verify_rounds: u64,
     cpu_verify_rounds: u64,
     resident_normal_steps: u64,
+    suffix_rounds: u64,
+    suffix_offered: u64,
+    suffix_emitted_tokens: u64,
+    dynamic_tree_rounds: u64,
+    dynamic_tree_offered: u64,
+    dynamic_tree_emitted_tokens: u64,
+    materialized_head_forwards: u64,
+    dynamic_tree_max_depth_sum: u64,
+}
+
+/// Flatten the first deepest suffix-tree branch, bounded by the verify depth.
+/// Suffix children are inserted in descending frequency order, so choosing the
+/// earliest node at a tied depth preserves the drafter's deterministic ranking.
+fn deepest_suffix_chain(
+    tree: &camelid::inference::spec_tree::TokenTree,
+    max_depth: usize,
+) -> Vec<u32> {
+    let mut leaf = 0usize;
+    for (node, &depth) in tree.depth.iter().enumerate().skip(1) {
+        let depth = depth as usize;
+        if depth <= max_depth && depth > tree.depth[leaf] as usize {
+            leaf = node;
+        }
+    }
+    if leaf == 0 {
+        return Vec::new();
+    }
+    tree.path_to(leaf)
+        .into_iter()
+        .skip(1)
+        .map(|node| tree.tokens[node])
+        .collect()
 }
 
 fn run_plain_resident_greedy(
@@ -8861,10 +8936,13 @@ fn run_eagle3_resident_greedy(
     tree_nodes: Option<usize>,
     tree_topk: usize,
     tree_expansions: usize,
+    suffix_first: bool,
     checkpoint: camelid::eagle3::Eagle3DraftModel,
 ) -> anyhow::Result<Eagle3BenchRun> {
     use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
     use camelid::eagle3_runtime::{Eagle3Drafter, Eagle3DynamicFrontierConfig};
+    use camelid::inference::spec_tree::TreeDrafter;
+    use camelid::inference::suffix_decoding::SuffixDecodingDrafter;
 
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
     let _ = session.prewarm_resident_weights();
@@ -8912,6 +8990,13 @@ fn run_eagle3_resident_greedy(
                 .ok_or_else(|| anyhow::anyhow!("EAGLE-3 dynamic lattice budget overflow"))
         })
         .transpose()?;
+    let mut suffix_drafter = suffix_first.then(SuffixDecodingDrafter::default);
+    let mut suffix_history = suffix_first.then(|| {
+        let mut history = Vec::with_capacity(prompt_tokens.len() + max_tokens);
+        history.extend_from_slice(prompt_tokens);
+        history.push(first);
+        history
+    });
 
     let decode_started = Instant::now();
     while run.generated.len() < max_tokens
@@ -8939,6 +9024,9 @@ fn run_eagle3_resident_greedy(
                 .0;
             run.resident_normal_steps += 1;
             run.generated.push(next);
+            if let Some(history) = suffix_history.as_mut() {
+                history.push(next);
+            }
             continue;
         }
 
@@ -8946,60 +9034,115 @@ fn run_eagle3_resident_greedy(
         let target_before = session.kv_position();
         let (emitted, offered, verify_nodes) = if let Some(node_budget) = tree_nodes {
             let round_node_budget = node_budget.min(context_room);
-            let draft_started = Instant::now();
-            let frontier = drafter.draft_dynamic_frontier(
-                weights,
-                anchor,
-                Eagle3DynamicFrontierConfig {
-                    max_verify_nodes: round_node_budget,
-                    max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
-                    max_depth: budget,
-                    candidates_per_parent: tree_topk,
-                    max_head_expansions: tree_expansions,
-                },
-            )?;
-            let forest = frontier.finish()?;
-            let actual_nodes = forest.scored.tree.nodes();
-            anyhow::ensure!(
-                (2..=round_node_budget).contains(&actual_nodes),
-                "dynamic EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
-            );
-            run.drafted_token_ids
-                .extend_from_slice(&forest.scored.tree.tokens[1..]);
-            run.draft_us += draft_started.elapsed().as_micros();
+            let suffix_drafts = if let (Some(suffix), Some(history)) =
+                (suffix_drafter.as_mut(), suffix_history.as_ref())
+            {
+                let draft_started = Instant::now();
+                let suffix_depth = budget.min(round_node_budget.saturating_sub(1));
+                let tree = suffix.draft_tree(history, anchor, round_node_budget, suffix_depth);
+                let drafts = deepest_suffix_chain(&tree, suffix_depth);
+                run.draft_us += draft_started.elapsed().as_micros();
+                drafts
+            } else {
+                Vec::new()
+            };
 
-            let verify_started = Instant::now();
-            let verified = session
-                .verify_tree_metal_with_layer_inputs(
-                    &forest.scored.tree,
-                    &TARGET_LAYER_INPUT_IDS,
-                )?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "resident Metal EAGLE-3 tree verification became unavailable at position {target_before}"
-                    )
-                })?;
-            run.verify_us += verify_started.elapsed().as_micros();
-            anyhow::ensure!(
-                verified.predictions.len() == actual_nodes,
-                "EAGLE-3 tree target returned {} predictions for {actual_nodes} rows",
-                verified.predictions.len()
-            );
-            let acceptance = forest.accept_target_predictions(&verified.predictions)?;
-            anyhow::ensure!(
-                acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
-                "EAGLE-3 tree emitted/capture path lengths diverged: {}/{}",
-                acceptance.emitted_tokens.len(),
-                acceptance.capture_rows.len()
-            );
-            let update_started = Instant::now();
-            drafter.accept_authoritative_forest(weights, &verified.layer_inputs, &acceptance)?;
-            run.head_update_us += update_started.elapsed().as_micros();
-            (
-                acceptance.emitted_tokens,
-                actual_nodes.saturating_sub(1),
-                actual_nodes,
-            )
+            if !suffix_drafts.is_empty() {
+                run.drafted_token_ids.extend_from_slice(&suffix_drafts);
+                let verify_started = Instant::now();
+                let verified = session
+                    .verify_drafts_metal_with_layer_inputs(
+                        anchor,
+                        &suffix_drafts,
+                        &TARGET_LAYER_INPUT_IDS,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "resident Metal suffix-first verification became unavailable at position {target_before}"
+                        )
+                    })?;
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    verified.predictions.len() == suffix_drafts.len() + 1,
+                    "suffix-first target returned {} predictions for {} draft tokens",
+                    verified.predictions.len(),
+                    suffix_drafts.len()
+                );
+                let accepted = accepted_draft_prefix(&suffix_drafts, &verified.predictions);
+                let emitted = verified.predictions[..=accepted].to_vec();
+                let update_started = Instant::now();
+                drafter.accept_authoritative(weights, &verified.layer_inputs, &emitted)?;
+                run.head_update_us += update_started.elapsed().as_micros();
+                let offered = suffix_drafts.len();
+                run.suffix_rounds += 1;
+                run.suffix_offered += offered as u64;
+                run.suffix_emitted_tokens += emitted.len() as u64;
+                (emitted, offered, offered + 1)
+            } else {
+                let draft_started = Instant::now();
+                let frontier = drafter.draft_dynamic_frontier(
+                    weights,
+                    anchor,
+                    Eagle3DynamicFrontierConfig {
+                        max_verify_nodes: round_node_budget,
+                        max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                        max_depth: budget,
+                        candidates_per_parent: tree_topk,
+                        max_head_expansions: tree_expansions,
+                    },
+                )?;
+                let materialized_head_forwards = frontier.materialized_head_forwards();
+                let forest = frontier.finish()?;
+                let actual_nodes = forest.scored.tree.nodes();
+                let actual_max_depth = forest.scored.tree.max_depth();
+                anyhow::ensure!(
+                    (2..=round_node_budget).contains(&actual_nodes),
+                    "dynamic EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                );
+                run.drafted_token_ids
+                    .extend_from_slice(&forest.scored.tree.tokens[1..]);
+                run.draft_us += draft_started.elapsed().as_micros();
+
+                let verify_started = Instant::now();
+                let verified = session
+                    .verify_tree_metal_with_layer_inputs(
+                        &forest.scored.tree,
+                        &TARGET_LAYER_INPUT_IDS,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "resident Metal EAGLE-3 tree verification became unavailable at position {target_before}"
+                        )
+                    })?;
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    verified.predictions.len() == actual_nodes,
+                    "EAGLE-3 tree target returned {} predictions for {actual_nodes} rows",
+                    verified.predictions.len()
+                );
+                let acceptance = forest.accept_target_predictions(&verified.predictions)?;
+                anyhow::ensure!(
+                    acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
+                    "EAGLE-3 tree emitted/capture path lengths diverged: {}/{}",
+                    acceptance.emitted_tokens.len(),
+                    acceptance.capture_rows.len()
+                );
+                let update_started = Instant::now();
+                drafter.accept_authoritative_forest(
+                    weights,
+                    &verified.layer_inputs,
+                    &acceptance,
+                )?;
+                run.head_update_us += update_started.elapsed().as_micros();
+                let emitted_count = acceptance.emitted_tokens.len();
+                let offered = actual_nodes.saturating_sub(1);
+                run.dynamic_tree_rounds += 1;
+                run.dynamic_tree_offered += offered as u64;
+                run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                (acceptance.emitted_tokens, offered, actual_nodes)
+            }
         } else {
             // Existing top-1 chain path: kept independent of every dynamic-tree option.
             let draft_started = Instant::now();
@@ -9046,6 +9189,7 @@ fn run_eagle3_resident_greedy(
         run.drafted += offered as u64;
         run.accepted_drafts += emitted.len().saturating_sub(1) as u64;
         run.verify_nodes += verify_nodes as u64;
+        let generated_before = run.generated.len();
         for token in emitted {
             if run.generated.len() >= max_tokens {
                 break;
@@ -9054,6 +9198,9 @@ fn run_eagle3_resident_greedy(
             if tokenizer.special.eog.contains(&token) {
                 break;
             }
+        }
+        if let Some(history) = suffix_history.as_mut() {
+            history.extend_from_slice(&run.generated[generated_before..]);
         }
     }
     run.decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
@@ -9119,6 +9266,24 @@ struct BenchEagle3Record {
     draft_ms: f64,
     verify_ms: f64,
     head_update_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tree_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tree_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tree_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    materialized_head_forwards: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_materialized_head_forwards_per_dynamic_round: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_dynamic_tree_max_depth: Option<f64>,
     resident_verify_rounds: u64,
     cpu_verify_rounds: u64,
     resident_normal_steps: u64,
@@ -9155,6 +9320,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_V2",
         "CAMELID_KQUANT_V3",
         "CAMELID_KQUANT_V4",
+        "CAMELID_KQUANT_V4_TRACE",
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
     ];
@@ -9171,6 +9337,7 @@ fn run_bench_eagle3(
     tree_nodes: Option<usize>,
     tree_topk: usize,
     tree_expansions: usize,
+    suffix_first: bool,
     prompt_file: Option<PathBuf>,
     prompt: Option<String>,
     chat: bool,
@@ -9195,6 +9362,10 @@ fn run_bench_eagle3(
             camelid::inference::spec_tree::TREE_MAX_NODES
         );
     }
+    anyhow::ensure!(
+        !suffix_first || tree_nodes.is_some(),
+        "--suffix-first requires --tree-nodes"
+    );
     anyhow::ensure!(
         (1..=camelid::metal::EAGLE3_TOP_K_CANDIDATES).contains(&tree_topk),
         "--tree-topk must be in 1..={}",
@@ -9306,6 +9477,7 @@ fn run_bench_eagle3(
         tree_nodes,
         tree_topk,
         tree_expansions,
+        suffix_first,
         checkpoint,
     )?;
 
@@ -9339,6 +9511,16 @@ fn run_bench_eagle3(
     } else {
         eagle.verify_nodes as f64 / eagle.rounds as f64
     };
+    let mean_materialized_head_forwards = if eagle.dynamic_tree_rounds == 0 {
+        0.0
+    } else {
+        eagle.materialized_head_forwards as f64 / eagle.dynamic_tree_rounds as f64
+    };
+    let mean_dynamic_tree_max_depth = if eagle.dynamic_tree_rounds == 0 {
+        0.0
+    } else {
+        eagle.dynamic_tree_max_depth_sum as f64 / eagle.dynamic_tree_rounds as f64
+    };
     let record = BenchEagle3Record {
         runtime: "camelid-eagle3-resident-metal",
         commit: benchmark_commit(),
@@ -9361,7 +9543,9 @@ fn run_bench_eagle3(
         prompt_tokens: prompt_token_ids.len(),
         max_tokens,
         draft_tokens,
-        draft_mode: if tree_nodes.is_some() {
+        draft_mode: if suffix_first {
+            "suffix_then_dynamic_tree"
+        } else if tree_nodes.is_some() {
             "dynamic_tree"
         } else {
             "linear_top1"
@@ -9401,6 +9585,16 @@ fn run_bench_eagle3(
         draft_ms: eagle.draft_us as f64 / 1000.0,
         verify_ms: eagle.verify_us as f64 / 1000.0,
         head_update_ms: eagle.head_update_us as f64 / 1000.0,
+        suffix_rounds: suffix_first.then_some(eagle.suffix_rounds),
+        suffix_offered: suffix_first.then_some(eagle.suffix_offered),
+        suffix_emitted_tokens: suffix_first.then_some(eagle.suffix_emitted_tokens),
+        dynamic_tree_rounds: suffix_first.then_some(eagle.dynamic_tree_rounds),
+        dynamic_tree_offered: suffix_first.then_some(eagle.dynamic_tree_offered),
+        dynamic_tree_emitted_tokens: suffix_first.then_some(eagle.dynamic_tree_emitted_tokens),
+        materialized_head_forwards: tree_nodes.map(|_| eagle.materialized_head_forwards),
+        mean_materialized_head_forwards_per_dynamic_round: tree_nodes
+            .map(|_| mean_materialized_head_forwards),
+        mean_dynamic_tree_max_depth: tree_nodes.map(|_| mean_dynamic_tree_max_depth),
         resident_verify_rounds: eagle.resident_verify_rounds,
         cpu_verify_rounds: eagle.cpu_verify_rounds,
         resident_normal_steps: eagle.resident_normal_steps,
