@@ -6,17 +6,22 @@ use metal::{
 
 // Kept isolated from the target runtime until the 12B Q4_0 target verifier has
 // its own parity receipt.  This module owns only the exact official assistant
-// artifact, its resident Q4_0 pack, and a K=1 parity/profiling entry point.
+// artifact, its resident Q4_0 pack, K=1 oracles, and an unwired K<=8 resident
+// draft chain; target verification/acceptance remains outside the module.
 #[cfg(target_os = "macos")]
 mod gemma4_mtp12;
 
 #[cfg(target_os = "macos")]
 pub use gemma4_mtp12::{
-    validate_gemma4_12b_shared_kv_schedule, Gemma4Mtp12AssistantMetal, Gemma4Mtp12CpuKv,
-    Gemma4Mtp12DeviceKv, Gemma4Mtp12MetalBufferView, Gemma4Mtp12Proposal,
-    Gemma4Mtp12ProposalTiming, Gemma4Mtp12Q6KEmbeddingRow, Gemma4Mtp12ResidentLedger,
-    GEMMA4_12B_MTP_ASSISTANT_SHA256, GEMMA4_12B_MTP_FULL_HOST_LAYER,
-    GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES, GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
+    validate_gemma4_12b_shared_kv_schedule, Gemma4Mtp12AssistantMetal,
+    Gemma4Mtp12ChainLedger, Gemma4Mtp12ChainProposal, Gemma4Mtp12ChainTiming,
+    Gemma4Mtp12CpuKv, Gemma4Mtp12DeviceKv, Gemma4Mtp12DeviceRecurrentHidden,
+    Gemma4Mtp12MetalBufferView, Gemma4Mtp12Proposal, Gemma4Mtp12ProposalTiming,
+    Gemma4Mtp12Q6KEmbeddingRow, Gemma4Mtp12Q6KEmbeddingTable,
+    Gemma4Mtp12ResidentLedger, GEMMA4_12B_MTP_ASSISTANT_SHA256,
+    GEMMA4_12B_MTP_FULL_HOST_LAYER, GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES,
+    GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES, GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
+    GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
 };
 
 #[cfg(target_os = "macos")]
@@ -14265,6 +14270,59 @@ impl Gemma4Q6KHead {
             }),
             _mmap: mmap,
         })
+    }
+
+    /// Borrow the exact 12B tied Q6_K table under the head mutex without
+    /// copying or exposing a buffer reference past the callback.  The runtime
+    /// supplies the SHA from its verified target-artifact admission; geometry,
+    /// byte range, device buffer bounds, and that pinned identity are checked
+    /// before invoking `use_table`.
+    ///
+    /// The lock intentionally remains held through the callback (including an
+    /// assistant command-buffer wait), preventing concurrent head dispatch from
+    /// racing a scoped table user.  `R` cannot borrow the callback's table view,
+    /// so neither the view nor its mutex-guarded lifetime can escape.
+    #[allow(dead_code)] // Deliberately landed before the target verifier wiring.
+    pub(crate) fn with_full_table_device<R, F>(
+        &self,
+        target_model_sha256: &str,
+        use_table: F,
+    ) -> Option<R>
+    where
+        F: for<'a> FnOnce(Gemma4Mtp12Q6KEmbeddingTable<'a>) -> R,
+    {
+        const TARGET_HIDDEN: usize = 3_840;
+        const TARGET_VOCAB: usize = 262_144;
+        const Q6K_VALUES: usize = 256;
+        const Q6K_WIRE: usize = 210;
+        if target_model_sha256 != GEMMA4_12B_QAT_Q4_0_TARGET_SHA256 {
+            return None;
+        }
+        let state = self.inner.lock().ok()?;
+        if state.hidden != TARGET_HIDDEN || state.vocab != TARGET_VOCAB {
+            return None;
+        }
+        let table_bytes = state
+            .vocab
+            .checked_mul(state.hidden.checked_div(Q6K_VALUES)?)?
+            .checked_mul(Q6K_WIRE)?;
+        if table_bytes as u64 != GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES {
+            return None;
+        }
+        let table_end = state.weight_offset.checked_add(table_bytes)?;
+        if table_end > state.weight.length() as usize {
+            return None;
+        }
+        Some(use_table(Gemma4Mtp12Q6KEmbeddingTable {
+            wire: Gemma4Mtp12MetalBufferView {
+                buffer: &state.weight,
+                byte_offset: state.weight_offset as u64,
+                byte_len: table_bytes as u64,
+            },
+            hidden: state.hidden,
+            vocab: state.vocab,
+            target_model_sha256,
+        }))
     }
 
     /// Evaluate the final hidden state through the tied head. `None` is a soft
@@ -36093,6 +36151,66 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(argmax(&got), argmax(&expected));
+    }
+
+    /// Composition gate for the 12B assistant: the head must lend exactly one
+    /// full target table under its mutex, preserve the mmap window offset, and
+    /// refuse a caller that cannot supply the pinned target identity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_q6k_head_scopes_exact_12b_full_table_alias() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let offset = 96u64;
+        let mut file = tempfile::NamedTempFile::new().expect("temp sparse 12B Q6_K table");
+        file.as_file_mut()
+            .set_len(offset + GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES)
+            .expect("size sparse 12B Q6_K table");
+        let mmap = crate::wire_mmap::GgufWireMmap::map(file.path()).expect("map sparse table");
+        let output_norm = vec![1.0f32; 3_840];
+        let Some(head) = Gemma4Q6KHead::new_ordered_file_backed(
+            mmap,
+            offset,
+            GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES as usize,
+            &output_norm,
+            262_144,
+            30.0,
+            1.0e-6,
+        ) else {
+            eprintln!("Metal cannot map an 825,753,600-byte buffer; skipping scoped alias gate");
+            return;
+        };
+        assert!(head
+            .with_full_table_device("not-the-pinned-target", |_| ())
+            .is_none());
+        let mut callback_count = 0usize;
+        let seen = head
+            .with_full_table_device(GEMMA4_12B_QAT_Q4_0_TARGET_SHA256, |table| {
+                callback_count += 1;
+                (
+                    table.wire.byte_offset,
+                    table.wire.byte_len,
+                    table.hidden,
+                    table.vocab,
+                    table.target_model_sha256.to_owned(),
+                    table.wire.buffer.device().registry_id(),
+                )
+            })
+            .expect("exact scoped full-table alias");
+        assert_eq!(callback_count, 1);
+        assert_eq!(seen.0, offset);
+        assert_eq!(seen.1, GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES);
+        assert_eq!(seen.2, 3_840);
+        assert_eq!(seen.3, 262_144);
+        assert_eq!(seen.4, GEMMA4_12B_QAT_Q4_0_TARGET_SHA256);
+        assert_eq!(
+            seen.5,
+            metal_linear_kernel()
+                .expect("Metal common core")
+                .device
+                .registry_id()
+        );
     }
 
     /// Direct arithmetic gate for the strict ordered Q6_K head kernel.  Feed
