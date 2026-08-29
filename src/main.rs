@@ -5017,6 +5017,26 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .into());
                 }
+                for timing_env in [
+                    "CAMELID_GEMMA4_VERIFY_TRACE",
+                    "CAMELID_GEMMA4_METAL_HEAD_TIMING",
+                    "CAMELID_GEMMA4_GPU_TIMING",
+                ] {
+                    if std::env::var(timing_env).ok().as_deref().is_some_and(|value| {
+                        value == "1" || value.eq_ignore_ascii_case("true")
+                    }) {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "gemma4 verifier timing receipt requires {timing_env} to be unset"
+                        ))
+                        .into());
+                    }
+                }
+                if max_tokens == 0 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "gemma4 verifier qualification requires max_tokens > 0".into(),
+                    )
+                    .into());
+                }
                 widths.sort_unstable();
                 widths.dedup();
                 if widths.is_empty() || widths.iter().any(|width| !matches!(width, 1 | 2 | 4 | 8))
@@ -5072,14 +5092,14 @@ async fn main() -> anyhow::Result<()> {
                     "[gemma4-verify] whole-target established-vs-ordered K1 qualification..."
                 );
                 let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
-                let qualification_decode_tok_s = if qualification.decode_us == 0 {
+                let qualification_decode_forwards_per_s = if qualification.decode_us == 0 {
                     0.0
                 } else {
                     qualification.decode_forward_count as f64 * 1_000_000.0
                         / qualification.decode_us as f64
                 };
                 eprintln!(
-                    "[gemma4-verify] K1 IDs exact: {} outputs; ordered prefill {:.3}s, decode {:.3}s ({qualification_decode_tok_s:.3} tok/s)",
+                    "[gemma4-verify] K1 IDs exact: {} outputs; ordered prefill {:.3}s, decode {:.3}s ({qualification_decode_forwards_per_s:.3} target forwards/s)",
                     qualification.token_ids.len(),
                     qualification.prefill_us as f64 / 1_000_000.0,
                     qualification.decode_us as f64 / 1_000_000.0,
@@ -5348,14 +5368,17 @@ async fn main() -> anyhow::Result<()> {
                     "environment": {
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
                         "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
-                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok()
+                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
+                        "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
+                        "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
+                        "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
                     },
                     "ordered_k1_qualification": {
                         "exact_vs_established": true,
                         "prefill_us": qualification.prefill_us,
                         "decode_us": qualification.decode_us,
                         "decode_forward_count": qualification.decode_forward_count,
-                        "decode_output_tok_s": qualification_decode_tok_s,
+                        "decode_target_forwards_per_s": qualification_decode_forwards_per_s,
                         "token_ids": qualification.token_ids
                     },
                     "runs": runs,
