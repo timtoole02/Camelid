@@ -6409,6 +6409,45 @@ impl Gemma4Runtime {
 /// uploaded. Gated by `crate::metal::gemma4_gpu_enabled()` at the call site. Numerics
 /// follow the CPU [`Gemma4Runtime`] (attention score scale = 1.0 — gemma folds it in).
 #[cfg(target_os = "macos")]
+fn gemma4_dense_q6k_metal_head_policy(value: Option<&str>, deterministic: bool) -> bool {
+    if deterministic {
+        return false;
+    }
+    match value {
+        None => true,
+        Some(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
+        Some(value) if value == "0" || value.eq_ignore_ascii_case("false") => false,
+        Some(_) => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_dense_q6k_metal_head_enabled() -> bool {
+    let value = std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok();
+    gemma4_dense_q6k_metal_head_policy(
+        value.as_deref(),
+        crate::inference::deterministic_mode_enabled(),
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod dense_q6k_metal_head_policy_tests {
+    use super::gemma4_dense_q6k_metal_head_policy;
+
+    #[test]
+    fn dense_q6k_head_policy_defaults_on_and_fails_closed() {
+        assert!(gemma4_dense_q6k_metal_head_policy(None, false));
+        assert!(gemma4_dense_q6k_metal_head_policy(Some("1"), false));
+        assert!(gemma4_dense_q6k_metal_head_policy(Some("TRUE"), false));
+        assert!(!gemma4_dense_q6k_metal_head_policy(Some("0"), false));
+        assert!(!gemma4_dense_q6k_metal_head_policy(Some("false"), false));
+        assert!(!gemma4_dense_q6k_metal_head_policy(Some("yes"), false));
+        assert!(!gemma4_dense_q6k_metal_head_policy(None, true));
+        assert!(!gemma4_dense_q6k_metal_head_policy(Some("1"), true));
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub struct Gemma4GpuRuntime {
     model: crate::metal::Gemma4ResidentModel,
     tokenizer: Tokenizer,
@@ -6428,9 +6467,12 @@ pub struct Gemma4GpuRuntime {
     hidden: usize,
     ple_dim: usize,
     n_layers: usize,
-    /// QAT hybrid lane: the tied head is Q6_K (no GPU kernel), so the GPU runs the
-    /// decoder layers (Q4_0) and the CPU runs the head. False for the all-Q8 path,
-    /// where the head is encoded on the GPU inside `forward_token`.
+    /// Strict ordered, file-backed Metal Q6_K head for the QAT lane. Construction
+    /// and runtime failures preserve the established CPU projection as fallback.
+    q6k_gpu_head: Option<crate::metal::Gemma4Q6KHead>,
+    /// QAT hybrid lane: the tied head is Q6_K, so decoder layers are Q4_0 and the
+    /// optional ordered Metal head (or CPU fallback) projects logits. False for
+    /// the all-Q8 path, where `forward_token` encodes the head in the resident graph.
     head_on_cpu: bool,
     /// Held for the CPU head (`head_on_cpu`): output RMS-norm weights + vocab.
     output_norm: Vec<f32>,
@@ -6461,10 +6503,10 @@ impl Gemma4GpuRuntime {
         // The GPU-resident decode kernels run the layer projections as Q8_0 (34-byte
         // wire blocks), Q4_0 (18-byte QAT wire blocks), or NVFP4 (36-byte 64-value
         // superblocks; GABBRO M3) — all parity-gated GPU GEMVs. The tied head is read
-        // separately: Q8_0 runs on the GPU (inside forward_token); Q6_K (the QAT tied
-        // head, no GPU kernel) runs on the CPU via the held WireQuant. Layer 0's attn_q
-        // is representative of the projection format (the export quantizes every
-        // layer's projections alike).
+        // separately: Q8_0 runs inside the resident graph; Q6_K uses the strict ordered
+        // file-backed Metal head when available and the held WireQuant CPU path as its
+        // fail-closed fallback. Layer 0's attn_q is representative of the projection
+        // format (the export quantizes every layer's projections alike).
         let layer_fmt = gemma4_metal_layer_fmt(
             store
                 .descriptor(&binding.layers[0].attn_q.name)?
@@ -6472,7 +6514,7 @@ impl Gemma4GpuRuntime {
         )?;
         let head_on_cpu = match store.descriptor(&binding.token_embedding.name)?.tensor_type {
             GgufTensorType::Q8_0 => false, // GPU Q8 head
-            GgufTensorType::Q6K => true,   // CPU Q6_K head (QAT tied head)
+            GgufTensorType::Q6K => true,   // ordered Metal Q6_K head or CPU fallback
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
                     "gemma4 GPU runtime supports a Q8_0 or Q6_K tied head; \
@@ -6617,9 +6659,31 @@ impl Gemma4GpuRuntime {
 
         let token_embd = q8(&binding.token_embedding.name)?;
         let output_norm = f32t(&binding.output_norm.name)?;
-        // QAT hybrid (Q6_K head on CPU): don't hand the tied table to the GPU head — pass
-        // an empty slice so no ~0.5 GB head buffer is uploaded. The all-Q8 lane passes the
-        // wire bytes for the GPU head as before.
+        let q6k_gpu_head = if head_on_cpu && gemma4_dense_q6k_metal_head_enabled() {
+            let desc = store.descriptor(&binding.token_embedding.name)?;
+            let head = crate::metal::Gemma4Q6KHead::new_ordered_file_backed(
+                Arc::clone(&mmap),
+                desc.absolute_offset,
+                desc.n_bytes as usize,
+                &output_norm,
+                vocab,
+                softcap,
+                eps,
+            );
+            if head.is_some() {
+                eprintln!("[gemma4-dense] ordered file-backed Metal Q6_K head enabled");
+            } else {
+                eprintln!(
+                    "[gemma4-dense] Metal Q6_K head unavailable; retaining CPU fallback"
+                );
+            }
+            head
+        } else {
+            None
+        };
+        // QAT hybrid: don't hand the tied Q6_K table to the resident model's Q8 head —
+        // pass an empty slice so no duplicate ~0.8 GiB buffer is uploaded. The ordered
+        // no-copy Q6_K wrapper above and the CPU fallback share the original mmap.
         let head_wire: &[u8] = if head_on_cpu { &[] } else { token_embd.bytes() };
         let model = crate::metal::Gemma4ResidentModel::new(
             layers,
@@ -6674,6 +6738,7 @@ impl Gemma4GpuRuntime {
             hidden,
             ple_dim,
             n_layers,
+            q6k_gpu_head,
             head_on_cpu,
             output_norm,
             vocab,
@@ -6683,6 +6748,15 @@ impl Gemma4GpuRuntime {
 
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    fn project_q6k_logits_cpu(&self, hidden: &[f32]) -> Vec<f32> {
+        let last = rms_norm(hidden, Some(&self.output_norm), self.eps);
+        let mut logits = self.token_embd.matvec(self.hidden, self.vocab, &last);
+        if let Some(cap) = self.g.final_logit_softcapping {
+            soft_cap_in_place(&mut logits, cap);
+        }
+        logits
     }
 
     /// Run one token's forward on the GPU and return the next-token logits.
@@ -6749,10 +6823,10 @@ impl Gemma4GpuRuntime {
             .collect();
         let prep_us = t_prep.elapsed().as_micros();
         let t_gpu = std::time::Instant::now();
-        // All-Q8 path: the GPU encodes the head and returns logits directly. QAT hybrid
-        // path: the GPU returns the final hidden state and the CPU runs the Q6_K tied
-        // head (rms_norm -> Q6_K logits matvec -> final_logit_softcap), matching the CPU
-        // runtime's head exactly.
+        // All-Q8 path: the resident graph encodes the head and returns logits directly.
+        // QAT path: the graph returns final hidden, then the strict ordered Metal Q6_K
+        // wrapper runs the tied projection. Every construction/dispatch/policy failure
+        // falls back to the original CPU projection unchanged.
         let logits = if self.head_on_cpu {
             let last_hidden = self
                 .model
@@ -6760,12 +6834,19 @@ impl Gemma4GpuRuntime {
                 .ok_or_else(|| {
                     BackendError::UnsupportedModelArchitecture("gpu forward failed".into())
                 })?;
-            let last = rms_norm(&last_hidden, Some(&self.output_norm), self.eps);
-            let mut logits = self.token_embd.matvec(self.hidden, self.vocab, &last);
-            if let Some(cap) = self.g.final_logit_softcapping {
-                soft_cap_in_place(&mut logits, cap);
+            if gemma4_dense_q6k_metal_head_enabled() {
+                if let Some(logits) = self
+                    .q6k_gpu_head
+                    .as_ref()
+                    .and_then(|head| head.forward(&last_hidden))
+                {
+                    logits
+                } else {
+                    self.project_q6k_logits_cpu(&last_hidden)
+                }
+            } else {
+                self.project_q6k_logits_cpu(&last_hidden)
             }
-            logits
         } else {
             self.model
                 .forward_token(&h0, &inputs, &ti, position)

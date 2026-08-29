@@ -12977,8 +12977,9 @@ fn encode_q6k_ordered_single(
     scalar: &Buffer,
     n_superblocks: usize,
     rows: usize,
+    allow_turbo: bool,
 ) {
-    let turbo_pipeline = gemma4_ghost_turbo_enabled()
+    let turbo_pipeline = (allow_turbo && gemma4_ghost_turbo_enabled())
         .then(|| admitted_32_lane_pipeline(kernel.q6k_linear_turbo_pipeline.as_ref()))
         .flatten();
     encoder
@@ -13516,6 +13517,9 @@ struct Gemma4Q6KHeadInner {
     hidden: usize,
     vocab: usize,
     softcap: f32,
+    /// The dense Gemma lane pins the parity-preserving ordered kernel even when
+    /// an unrelated Ghost-MoE benchmark has enabled its reassociated turbo path.
+    allow_turbo: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -13533,6 +13537,60 @@ impl Gemma4Q6KHead {
         vocab: usize,
         softcap: f32,
         eps: f32,
+    ) -> Option<Self> {
+        let resident_head = std::env::var("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        Self::new_with_policy(
+            mmap,
+            absolute_offset,
+            byte_len,
+            output_norm,
+            vocab,
+            softcap,
+            eps,
+            true,
+            resident_head,
+        )
+    }
+
+    /// Dense-QAT constructor: use the strict ordered Q6_K kernel and retain the
+    /// file-backed no-copy mapping. This keeps an ambient Ghost benchmark's
+    /// turbo/resident-copy switches from changing dense-model numerics or adding
+    /// a second ~0.8 GiB allocation on a 16 GiB Mac.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_ordered_file_backed(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        absolute_offset: u64,
+        byte_len: usize,
+        output_norm: &[f32],
+        vocab: usize,
+        softcap: f32,
+        eps: f32,
+    ) -> Option<Self> {
+        Self::new_with_policy(
+            mmap,
+            absolute_offset,
+            byte_len,
+            output_norm,
+            vocab,
+            softcap,
+            eps,
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_policy(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        absolute_offset: u64,
+        byte_len: usize,
+        output_norm: &[f32],
+        vocab: usize,
+        softcap: f32,
+        eps: f32,
+        allow_turbo: bool,
+        resident_head: bool,
     ) -> Option<Self> {
         const Q6K_VALUES: usize = 256;
         const Q6K_WIRE: usize = 210;
@@ -13563,8 +13621,6 @@ impl Gemma4Q6KHead {
         // clean/evictable, so heavy expert paging can silently turn the head
         // sweep into per-token SSD refaults. The opt-in resident copy pins the
         // table in an owned allocation at the cost of one ~600 MB load copy.
-        let resident_head = std::env::var("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         let weight = if resident_head {
             let owned = kernel.device.new_buffer(
                 tensor.window.len as u64,
@@ -13617,6 +13673,7 @@ impl Gemma4Q6KHead {
                 hidden,
                 vocab,
                 softcap,
+                allow_turbo,
             }),
             _mmap: mmap,
         })
@@ -13670,6 +13727,7 @@ impl Gemma4Q6KHead {
             &state.matmul_scalar,
             n_superblocks,
             state.vocab,
+            state.allow_turbo,
         );
         encoder.end_encoding();
         cb.commit();
@@ -34105,7 +34163,7 @@ mod tests {
         ];
 
         let kernel = metal_linear_kernel().expect("Metal ordered Q6_K pipeline");
-        for n_sb in [1usize, 8, 9, 17] {
+        for n_sb in [1usize, 8, 9, 15, 17] {
             let q8: Vec<crate::inference::Q8KBlock> = (0..n_sb)
                 .map(|sb| {
                     let mut qs = [0i8; 256];
@@ -34219,6 +34277,7 @@ mod tests {
                 &scalar,
                 n_sb,
                 ROWS,
+                false,
             );
             encoder.end_encoding();
             command_buffer.commit();
