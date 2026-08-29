@@ -237,3 +237,57 @@ difference between `lossless=false` and `lossless=true`.
 ~4.5 h of continuous benchmarking downclocks this M4 (Q8_0 decode read 11.9
 in the morning and 10.8 in the afternoon). Compare arms only within one
 back-to-back set; treat absolutes across sessions as drifted.
+
+## Result — 4.30x, measured 2026-08-27
+
+Llama-3-8B Q4_K_M, 4137-token agentic prompt, one machine, one prompt; the last
+row differs from the one above it by a single env flag on the same binary.
+Records in `receipts/m2_*.jsonl`.
+
+| | plain | speculative | verify round |
+| --- | --- | --- | --- |
+| default lane (v1 kernels) | 7.13 | 4.72 | 1528 ms |
+| + K-quant v2 / MMA verify | 8.22 | 9.55 | 389 ms |
+| + suffix drafter on the chain | 8.22 | 11.41 | 621 ms |
+| **+ kv16 split-K attention** | **13.51** | **30.68** | **215 ms** |
+
+**7.13 -> 30.68 tok/s = 4.30x.** Speculation went from a 0.66x *regression* to
+2.27x. Plain decode alone went 1.89x, which lands for any K-quant workload at
+depth whether it speculates or not.
+
+### How it was found, in order
+
+1. **The verify round, not the drafter.** The default lane had A=7.15 at 87.9%
+   acceptance -- excellent drafting -- and still lost, because the round cost
+   10.9 plain steps to commit 7.15 tokens. A perfect draft head would also have
+   lost on that lane. Fixing the round came first for that reason.
+2. **A width sweep that actually varied width.** An earlier sweep looked "flat
+   in k" (+8% for 3x the width). It was an artifact: the n-gram drafter never
+   filled the window, so every arm verified ~4 columns regardless of k. With a
+   drafter that fills it, the round is ~70 ms per *actual* column, linear.
+3. **Ablation over arithmetic.** A byte model said KV was 47% of round bytes, so
+   shared-prefix attention looked like the lever. Ablating stages showed
+   attention was 67% of the per-column cost while its KV bytes were only 8% of
+   it -- the kernel was ~10x off its own bandwidth bound. The bytes were right
+   and the conclusion was wrong.
+4. **A routing gate, not a kernel.** Tracing the dispatch found split-K excluded
+   kv16 primaries. The fix was deleting a condition.
+
+### What this cost in wrong turns
+
+Three confident models were falsified by measurement: that Q4_K_M would be the
+fast target (it was slower until the K-quant lane was fixed), that the verify
+GEMV's activation panel was the bottleneck (widening rows returned a fifth of
+its prediction), and that shared-prefix attention was the remaining lever (worth
+~6%). Each was caught by an A/B rather than by more reading. The habit worth
+keeping: measure the thing, and check that the measurement varied what you think
+it varied.
+
+### Not done
+
+- The v2 K-quant lane is ~1 ulp off v1, so it stays env-gated with no support
+  claim. Promotion needs model-level parity receipts.
+- The v1 default K-quant speculative lane is NOT lossless (see above); the
+  likely fix is `set_fast_math_enabled(false)` on `LINEAR_ROW_SHADER`, unmeasured.
+- Trained MTP heads (EAGLE-3 sidecar) remain unbuilt. They are now a real lever
+  rather than a wrong one: the drafter caps A, and A caps the multiplier.
