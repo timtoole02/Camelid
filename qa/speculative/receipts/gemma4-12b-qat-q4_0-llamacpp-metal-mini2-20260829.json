@@ -1,0 +1,76 @@
+{
+  "schema": "camelid.external_decode_baseline.v1",
+  "date": "2026-08-29",
+  "claim_scope": "Stock llama.cpp Metal decode reference for the exact Gemma 4 12B QAT Q4_0 target. llama.cpp-reported predicted-token throughput excludes prompt evaluation.",
+  "host": {
+    "model_identifier": "Mac16,10",
+    "chip": "Apple M4",
+    "cores": "10 (4 performance, 6 efficiency)",
+    "memory_bytes": 17179869184,
+    "macos_version": "26.5.2",
+    "macos_build": "25F84"
+  },
+  "llama_cpp": {
+    "version": "9632",
+    "commit": "acd79d603",
+    "compiler": "AppleClang 17.0.0.17000404",
+    "binary_sha256": "25cbbe6d4ea7e327c093ec4687caefa11fd8da73b54bfaf46b926d14aa18359d",
+    "device": "MTL0: Apple M4",
+    "flags": [
+      "-c 512",
+      "-ngl 99",
+      "--jinja",
+      "--no-webui"
+    ],
+    "parallel_slots": 4
+  },
+  "target": {
+    "file": "gemma-4-12b-it-qat-q4_0.gguf",
+    "bytes": 6975879296,
+    "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+    "huggingface_commit": "29d097773436b69ff9feafd636ab4cf873786537"
+  },
+  "request": {
+    "endpoint": "/completion",
+    "prompt": "Write a detailed technical explanation of speculative decoding and its performance tradeoffs.",
+    "prompt_sha256": "a342b95cc70f2120a785e8b5796ae81ebf887b857b7335bf5272261da657e9c7",
+    "prompt_tokens": 14,
+    "n_predict": 96,
+    "temperature": 0,
+    "cache_prompt": false,
+    "seed": 1
+  },
+  "runs": [
+    {
+      "id": "r1",
+      "prompt_ms": 505.791,
+      "predicted_ms": 6878.749,
+      "predicted_tok_s": 13.956026015776997,
+      "response_sha256": "36477f5a888882f4590638898ff328c104b5b10f51ba5723e3fb60b31288fbd1"
+    },
+    {
+      "id": "r2",
+      "prompt_ms": 423.282,
+      "predicted_ms": 6866.160,
+      "predicted_tok_s": 13.981614177356777,
+      "response_sha256": "8cc187747ebfa141215367569a042a7d73240ccfb63fa230dd12739569a93df7"
+    },
+    {
+      "id": "r3",
+      "prompt_ms": 423.481,
+      "predicted_ms": 6855.125,
+      "predicted_tok_s": 14.004121004358055,
+      "response_sha256": "9fb4bc13ae87eebafe0db761b1fba216b4a0289df539295b8bc24b363e72877d"
+    }
+  ],
+  "aggregate": {
+    "mean_predicted_tok_s": 13.98058706583061,
+    "min_predicted_tok_s": 13.956026015776997,
+    "max_predicted_tok_s": 14.004121004358055
+  },
+  "output": {
+    "all_runs_identical": true,
+    "prefix": "\n1.\n1.\n1."
+  },
+  "verdict": "PASS"
+}
