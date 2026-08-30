@@ -12681,6 +12681,19 @@ fn gemma4_q4_mma_enabled() -> bool {
     })
 }
 
+/// Opt-in batching for the dense Gemma 4 verifier's row-separable attention
+/// setup. The underlying kernels retain one independent reduction per head
+/// and one independent RoPE/scatter lane per token; only the dispatch grid is
+/// widened across the active speculative rows.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_row_ops_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Dynamic threadgroup-memory requirement for the slab-free strict verifier.
 /// One output-row threadgroup retains exactly one f32 block term for every
 /// `(column, input block)`. Only K=2/4/8 is admitted; K=1 remains on the
@@ -15296,6 +15309,7 @@ impl Gemma4ResidentModel {
             rms_scalar,
         ];
         let mut from_a = true;
+        let batch_row_ops = gemma4_q4_row_ops_enabled();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let sliding = layer_idx % 6 != 5;
@@ -15433,9 +15447,7 @@ impl Gemma4ResidentModel {
                 sin.to_owned(),
             ]);
 
-            for row in 0..columns {
-                let q_offset = (row * q_dim * 4) as u64;
-                let kv_offset = (row * kv_dim * 4) as u64;
+            if batch_row_ops {
                 encode_rms_norm_per_head(
                     encoder,
                     kernel,
@@ -15443,8 +15455,8 @@ impl Gemma4ResidentModel {
                     &q_norm,
                     &scratch.q_normed,
                     &q_head_args,
-                    HEADS,
-                    q_offset,
+                    columns * HEADS,
+                    0,
                 );
                 encode_rms_norm_per_head(
                     encoder,
@@ -15453,8 +15465,8 @@ impl Gemma4ResidentModel {
                     &k_norm,
                     &scratch.k_normed,
                     &k_head_args,
-                    layer.n_kv_heads,
-                    kv_offset,
+                    columns * layer.n_kv_heads,
+                    0,
                 );
                 encode_rms_norm_per_head(
                     encoder,
@@ -15466,50 +15478,105 @@ impl Gemma4ResidentModel {
                     &q_norm,
                     &scratch.v_normed,
                     &v_head_args,
-                    layer.n_kv_heads,
-                    kv_offset,
+                    columns * layer.n_kv_heads,
+                    0,
                 );
-                let table_offset = (row * (layer.head_dim / 2) * 4) as u64;
-                encode_rope(
-                    encoder,
-                    kernel,
-                    &scratch.q_normed,
-                    &cos,
-                    &sin,
-                    &rope_q_args,
-                    HEADS,
-                    layer.head_dim / 2,
-                    q_offset,
-                    table_offset,
-                );
-                encode_rope(
-                    encoder,
-                    kernel,
-                    &scratch.k_normed,
-                    &cos,
-                    &sin,
-                    &rope_k_args,
-                    layer.n_kv_heads,
-                    layer.head_dim / 2,
-                    kv_offset,
-                    table_offset,
-                );
+                for (data, args, heads) in [
+                    (&scratch.q_normed, &rope_q_args, HEADS),
+                    (&scratch.k_normed, &rope_k_args, layer.n_kv_heads),
+                ] {
+                    encoder.set_compute_pipeline_state(&kernel.rope_rotate_batch_pipeline);
+                    encoder.set_buffer(0, Some(data), 0);
+                    encoder.set_buffer(1, Some(&cos), 0);
+                    encoder.set_buffer(2, Some(&sin), 0);
+                    for index in 0..4u64 {
+                        encoder.set_buffer(3 + index, Some(args), index * 4);
+                    }
+                    dispatch_2d_rows(
+                        encoder,
+                        &kernel.rope_rotate_batch_pipeline,
+                        heads * (layer.head_dim / 2),
+                        columns,
+                    );
+                }
+            } else {
+                for row in 0..columns {
+                    let q_offset = (row * q_dim * 4) as u64;
+                    let kv_offset = (row * kv_dim * 4) as u64;
+                    encode_rms_norm_per_head(
+                        encoder,
+                        kernel,
+                        &scratch.q_raw,
+                        &q_norm,
+                        &scratch.q_normed,
+                        &q_head_args,
+                        HEADS,
+                        q_offset,
+                    );
+                    encode_rms_norm_per_head(
+                        encoder,
+                        kernel,
+                        &scratch.k_raw,
+                        &k_norm,
+                        &scratch.k_normed,
+                        &k_head_args,
+                        layer.n_kv_heads,
+                        kv_offset,
+                    );
+                    encode_rms_norm_per_head(
+                        encoder,
+                        kernel,
+                        layer
+                            .v_w
+                            .as_ref()
+                            .map_or(&scratch.k_raw, |_| &scratch.v_raw),
+                        &q_norm,
+                        &scratch.v_normed,
+                        &v_head_args,
+                        layer.n_kv_heads,
+                        kv_offset,
+                    );
+                    let table_offset = (row * (layer.head_dim / 2) * 4) as u64;
+                    encode_rope(
+                        encoder,
+                        kernel,
+                        &scratch.q_normed,
+                        &cos,
+                        &sin,
+                        &rope_q_args,
+                        HEADS,
+                        layer.head_dim / 2,
+                        q_offset,
+                        table_offset,
+                    );
+                    encode_rope(
+                        encoder,
+                        kernel,
+                        &scratch.k_normed,
+                        &cos,
+                        &sin,
+                        &rope_k_args,
+                        layer.n_kv_heads,
+                        layer.head_dim / 2,
+                        kv_offset,
+                        table_offset,
+                    );
+                }
             }
 
             let (cache_k, cache_v) = self.caches[layer_idx].as_ref()?;
-            for row in 0..columns {
-                let position = base_position + row;
+            if batch_row_ops {
                 let scatter_args = shared(16);
                 unsafe {
                     let args = scatter_args.contents().cast::<u32>();
                     *args = layer.head_dim as u32;
                     *args.add(1) = self.max_positions as u32;
-                    *args.add(2) = position as u32;
+                    *args.add(2) = base_position as u32;
                     *args.add(3) = kv_dim as u32;
                 }
-                encoder.set_compute_pipeline_state(&kernel.kv_scatter_pipeline);
-                encoder.set_buffer(0, Some(&scratch.k_normed), (row * kv_dim * 4) as u64);
-                encoder.set_buffer(1, Some(&scratch.v_normed), (row * kv_dim * 4) as u64);
+                encoder.set_compute_pipeline_state(&kernel.kv_scatter_batch_pipeline);
+                encoder.set_buffer(0, Some(&scratch.k_normed), 0);
+                encoder.set_buffer(1, Some(&scratch.v_normed), 0);
                 encoder.set_buffer(2, Some(cache_k), 0);
                 encoder.set_buffer(3, Some(cache_v), 0);
                 encoder.set_buffer(4, Some(&scatter_args), 0);
@@ -15519,8 +15586,39 @@ impl Gemma4ResidentModel {
                 encoder.set_buffer(8, Some(&scatter_args), 0);
                 encoder.set_buffer(9, Some(&scatter_args), 0);
                 encoder.set_buffer(10, Some(&keep[4]), 0);
-                dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
+                dispatch_2d_rows(
+                    encoder,
+                    &kernel.kv_scatter_batch_pipeline,
+                    kv_dim,
+                    columns,
+                );
                 keep.push(scatter_args);
+            } else {
+                for row in 0..columns {
+                    let position = base_position + row;
+                    let scatter_args = shared(16);
+                    unsafe {
+                        let args = scatter_args.contents().cast::<u32>();
+                        *args = layer.head_dim as u32;
+                        *args.add(1) = self.max_positions as u32;
+                        *args.add(2) = position as u32;
+                        *args.add(3) = kv_dim as u32;
+                    }
+                    encoder.set_compute_pipeline_state(&kernel.kv_scatter_pipeline);
+                    encoder.set_buffer(0, Some(&scratch.k_normed), (row * kv_dim * 4) as u64);
+                    encoder.set_buffer(1, Some(&scratch.v_normed), (row * kv_dim * 4) as u64);
+                    encoder.set_buffer(2, Some(cache_k), 0);
+                    encoder.set_buffer(3, Some(cache_v), 0);
+                    encoder.set_buffer(4, Some(&scatter_args), 0);
+                    encoder.set_buffer(5, Some(&scatter_args), 4);
+                    encoder.set_buffer(6, Some(&scatter_args), 8);
+                    encoder.set_buffer(7, Some(&scatter_args), 12);
+                    encoder.set_buffer(8, Some(&scatter_args), 0);
+                    encoder.set_buffer(9, Some(&scatter_args), 0);
+                    encoder.set_buffer(10, Some(&keep[4]), 0);
+                    dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
+                    keep.push(scatter_args);
+                }
             }
 
             // Every row keeps its own immutable scalar blocks.  Reusing one
@@ -16804,6 +16902,28 @@ fn dispatch_1d(
         metal::MTLSize {
             width: (n as u64).div_ceil(w),
             height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_2d_rows(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    n: usize,
+    rows: usize,
+) {
+    let w = pipeline.thread_execution_width().max(1);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (n as u64).div_ceil(w),
+            height: rows as u64,
             depth: 1,
         },
         metal::MTLSize {
