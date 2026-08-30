@@ -1,0 +1,40 @@
+{
+  "schema": "camelid-eagle3-leakage-policy-v1",
+  "policy_version": "1.0.0",
+  "protected_reference_sha256": "7c7319ab066e8e6f5bb83a813082db1ee117aacd88405a36616b7e54dd0de6a2",
+  "notes": [
+    "These are corpus-output exclusions, not a copy of the protected canary.",
+    "An operator should also pass the exact protected prompt with --forbidden-file and its pinned SHA-256 when producing a training receipt.",
+    "The optional forbidden-file audit rejects exact normalized eight-word spans and high content-word overlap against any equally sized window."
+  ],
+  "deny_regex": [
+    "https?://",
+    "www\\.",
+    "smartchef",
+    "panamahitek",
+    "daily\\s+caloric",
+    "caloric\\s+(?:intake|output)",
+    "meal\\s+assembly",
+    "apple\\s+watch",
+    "fitness\\s+app",
+    "live\\s+activit(?:y|ies)",
+    "bluetooth\\s+(?:based\\s+)?scale",
+    "food\\s+measurement",
+    "saved\\s+meals?",
+    "body\\s+profile",
+    "smart\\s+display",
+    "local\\s+wi[- ]?fi",
+    "xcode\\s+app",
+    "calories?\\s+for\\s+the\\s+day"
+  ],
+  "forbidden_ngram_words": 8,
+  "near_window_min_content_words": 12,
+  "near_window_overlap_threshold": 0.72,
+  "url_policy": "reject",
+  "min_user_chars": 120,
+  "max_user_chars": 900,
+  "min_user_words": 18,
+  "max_user_words": 150,
+  "min_max_new_tokens": 64,
+  "max_max_new_tokens": 256
+}

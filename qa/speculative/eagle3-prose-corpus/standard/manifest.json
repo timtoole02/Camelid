@@ -1,0 +1,354 @@
+{
+  "audit": {
+    "category_ratios": {
+      "code_system_design": 0.25,
+      "general": 0.3,
+      "technical_instructional": 0.45
+    },
+    "counts": {
+      "eval": {
+        "code_system_design": 100,
+        "general": 120,
+        "technical_instructional": 180
+      },
+      "train": {
+        "code_system_design": 600,
+        "general": 720,
+        "technical_instructional": 1080
+      }
+    },
+    "leakage_matches": 0,
+    "lengths": {
+      "user_chars_max": 425,
+      "user_chars_min": 286,
+      "user_words_max": 60,
+      "user_words_min": 42
+    },
+    "record_count": 2800,
+    "split_overlap": {
+      "families": 0,
+      "sources": 0,
+      "templates": 0
+    },
+    "status": "pass",
+    "unique_content_hashes": 2800,
+    "unique_normalized_prompts": 2800,
+    "unique_record_ids": 2800
+  },
+  "corpus_job_schema": "camelid-eagle3-corpus-job-v1",
+  "determinism": {
+    "generator_inputs": {
+      "builder": {
+        "file": "build_corpus.py",
+        "sha256": "37daef2986c26db3faef31d7b92938f9912bc564a0be246fb0929ed07e6b26d9"
+      },
+      "catalog": {
+        "file": "catalog.json",
+        "sha256": "3a67c5d69aa4a1398ca0a2272476c769f44d218522aa204b52ae540fa96f2bcf"
+      },
+      "job_schema": {
+        "file": "corpus_job.schema.json",
+        "sha256": "7fb4247cde4b9f78ee6555f510d56f77244e4301e9ef58022dc75b154acb0ab8"
+      },
+      "leakage_policy": {
+        "file": "leakage_rules.json",
+        "sha256": "c81cce44257c374be1fa4de8c350bac4f866d78f448ee449b00ce8942fd301ba"
+      }
+    },
+    "ordering": "split,category,family,id; canonical sorted-key JSONL",
+    "randomness": "none",
+    "records_digest": "8e5d68c8a9ce188e41d77563c958fa1902e5af3354c993838528196d060da17f"
+  },
+  "family_assignments": [
+    {
+      "category": "technical_instructional",
+      "family_id": "api_contracts",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.api_contracts.v1",
+      "split": "train",
+      "template_id": "train.tech.api-contracts.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "architecture_tradeoffs",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.architecture_tradeoffs.v1",
+      "split": "train",
+      "template_id": "train.tech.architecture-tradeoffs.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "capacity_planning",
+      "license_spdx": "MIT",
+      "records": 60,
+      "source_id": "camelid.local.eval.capacity_planning.v1",
+      "split": "eval",
+      "template_id": "eval.tech.capacity-planning.v1"
+    },
+    {
+      "category": "code_system_design",
+      "family_id": "cli_design",
+      "license_spdx": "MIT",
+      "records": 50,
+      "source_id": "camelid.local.eval.cli_design.v1",
+      "split": "eval",
+      "template_id": "eval.code.cli-design.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "comparison_guides",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.comparison_guides.v1",
+      "split": "train",
+      "template_id": "train.general.comparison-guide.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "concept_teaching",
+      "license_spdx": "MIT",
+      "records": 60,
+      "source_id": "camelid.local.eval.concept_teaching.v1",
+      "split": "eval",
+      "template_id": "eval.general.concept-teaching.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "concise_explanations",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.concise_explanations.v1",
+      "split": "train",
+      "template_id": "train.general.concise-explanation.v1"
+    },
+    {
+      "category": "code_system_design",
+      "family_id": "concurrency_debugging",
+      "license_spdx": "MIT",
+      "records": 50,
+      "source_id": "camelid.local.eval.concurrency_debugging.v1",
+      "split": "eval",
+      "template_id": "eval.code.concurrency-debug.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "data_migrations",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.data_migrations.v1",
+      "split": "train",
+      "template_id": "train.tech.data-migrations.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "decision_memos",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.decision_memos.v1",
+      "split": "train",
+      "template_id": "train.general.decision-memo.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "failure_analysis",
+      "license_spdx": "MIT",
+      "records": 60,
+      "source_id": "camelid.local.eval.failure_analysis.v1",
+      "split": "eval",
+      "template_id": "eval.tech.failure-analysis.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "incident_runbook",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.incident_runbook.v1",
+      "split": "train",
+      "template_id": "train.tech.incident-runbook.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "learning_plans",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.learning_plans.v1",
+      "split": "train",
+      "template_id": "train.general.learning-plan.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "observability_plans",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.observability_plans.v1",
+      "split": "train",
+      "template_id": "train.tech.observability.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "performance_diagnosis",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.performance_diagnosis.v1",
+      "split": "train",
+      "template_id": "train.tech.performance-diagnosis.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "project_retrospectives",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.project_retrospectives.v1",
+      "split": "train",
+      "template_id": "train.general.retrospective.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "protocol_reviews",
+      "license_spdx": "MIT",
+      "records": 60,
+      "source_id": "camelid.local.eval.protocol_reviews.v1",
+      "split": "eval",
+      "template_id": "eval.tech.protocol-review.v1"
+    },
+    {
+      "category": "code_system_design",
+      "family_id": "python_pipelines",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.python_pipelines.v1",
+      "split": "train",
+      "template_id": "train.code.python-pipeline.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "reliability_reviews",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.reliability_reviews.v1",
+      "split": "train",
+      "template_id": "train.tech.reliability-review.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "requirements_decomposition",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.requirements_decomposition.v1",
+      "split": "train",
+      "template_id": "train.tech.requirements.v1"
+    },
+    {
+      "category": "code_system_design",
+      "family_id": "rust_modules",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.rust_modules.v1",
+      "split": "train",
+      "template_id": "train.code.rust-module.v1"
+    },
+    {
+      "category": "technical_instructional",
+      "family_id": "security_threat_models",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.security_threat_models.v1",
+      "split": "train",
+      "template_id": "train.tech.security-threat-model.v1"
+    },
+    {
+      "category": "code_system_design",
+      "family_id": "sql_migrations",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.sql_migrations.v1",
+      "split": "train",
+      "template_id": "train.code.sql-migration.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "stakeholder_updates",
+      "license_spdx": "MIT",
+      "records": 60,
+      "source_id": "camelid.local.eval.stakeholder_updates.v1",
+      "split": "eval",
+      "template_id": "eval.general.stakeholder-update.v1"
+    },
+    {
+      "category": "code_system_design",
+      "family_id": "swift_state_management",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.swift_state_management.v1",
+      "split": "train",
+      "template_id": "train.code.swift-state.v1"
+    },
+    {
+      "category": "code_system_design",
+      "family_id": "test_strategies",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.test_strategies.v1",
+      "split": "train",
+      "template_id": "train.code.test-strategy.v1"
+    },
+    {
+      "category": "general",
+      "family_id": "writing_revisions",
+      "license_spdx": "MIT",
+      "records": 120,
+      "source_id": "camelid.local.train.writing_revisions.v1",
+      "split": "train",
+      "template_id": "train.general.writing-revision.v1"
+    }
+  ],
+  "files": {
+    "eval": {
+      "bytes": 482376,
+      "file": "eval.jobs.jsonl",
+      "records": 400,
+      "sha256": "d36b31826ccd9a5fc606d812f4961c5ed4fd5ea3a9635f34e6c6eb4087a2bda8"
+    },
+    "train": {
+      "bytes": 2961744,
+      "file": "train.jobs.jsonl",
+      "records": 2400,
+      "sha256": "406d0a61e71482101eeb8ff83a30ef2b34d854f87470ab9ad589d5d6c20497fb"
+    }
+  },
+  "forbidden_reference": {
+    "audited_sha256": null,
+    "expected_sha256": "7c7319ab066e8e6f5bb83a813082db1ee117aacd88405a36616b7e54dd0de6a2",
+    "path_recorded": false,
+    "status": "not_supplied_policy_only"
+  },
+  "generator_version": "1.0.0",
+  "license": {
+    "name": "MIT License",
+    "notice": "Copyright (c) 2026 Tim Toole",
+    "provenance": "Original deterministic prompt matrices authored for Camelid; no third-party text is embedded.",
+    "spdx": "MIT"
+  },
+  "materialization_contract": {
+    "capture_replay": "a teacher-forced replay is permitted only to capture exact-Q4 features when capture was not fused into generation",
+    "chat_rendering": "target-native template; record exact rendered bytes and token ids",
+    "exported_loss_mask": "exporter shifts once: base_loss_mask[P]=raw_loss_mask[P+1], then zeros the final row because base row P predicts token P+2",
+    "exporter_input": "one JSONL object per job: {id,input_ids,loss_mask}",
+    "prohibition": "no reference answer, cached response, prepared continuation, alternate teacher, or protected-canary material",
+    "raw_loss_mask": "raw_loss_mask[Q]=1 exactly when input_ids[Q+1] is a target-generated assistant token; otherwise 0",
+    "status": "required_not_performed",
+    "target": "pinned exact-Q4 Llama-3.2-3B-Instruct greedy decode",
+    "temperature": 0.0
+  },
+  "profile": "standard",
+  "schema": "camelid-eagle3-corpus-manifest-v1",
+  "split_strategy": {
+    "expansion": "ordered Cartesian product of declared axes",
+    "method": "source/template/family assigned to one split in catalog before expansion",
+    "train_eval_family_overlap": 0,
+    "train_eval_source_overlap": 0,
+    "train_eval_template_overlap": 0
+  }
+}

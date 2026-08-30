@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "camelid-eagle3-corpus-job-v1",
+  "title": "Camelid EAGLE-3 pre-materialization corpus job",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "split",
+    "category",
+    "source",
+    "messages",
+    "generation",
+    "supervision",
+    "content_sha256"
+  ],
+  "properties": {
+    "schema": {"const": "camelid-eagle3-corpus-job-v1"},
+    "id": {"type": "string", "minLength": 1},
+    "split": {"enum": ["train", "eval"]},
+    "category": {
+      "enum": ["technical_instructional", "code_system_design", "general"]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id",
+        "source_record_key",
+        "family_id",
+        "template_id",
+        "provenance",
+        "license_spdx",
+        "license_name",
+        "notice"
+      ],
+      "properties": {
+        "source_id": {"type": "string"},
+        "source_record_key": {"type": "string"},
+        "family_id": {"type": "string"},
+        "template_id": {"type": "string"},
+        "provenance": {"const": "deterministic-local-generation"},
+        "license_spdx": {"const": "MIT"},
+        "license_name": {"type": "string"},
+        "notice": {"type": "string"}
+      }
+    },
+    "messages": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "content"],
+          "properties": {
+            "role": {"const": "system"},
+            "content": {"type": "string", "minLength": 1}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "content"],
+          "properties": {
+            "role": {"const": "user"},
+            "content": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "temperature", "max_new_tokens"],
+      "properties": {
+        "method": {"const": "target_greedy"},
+        "temperature": {"const": 0.0},
+        "max_new_tokens": {"type": "integer", "minimum": 1}
+      }
+    },
+    "supervision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "materialization"],
+      "properties": {
+        "scope": {"const": "assistant_completion_only"},
+        "materialization": {"const": "exact_q4_target_required"}
+      }
+    },
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

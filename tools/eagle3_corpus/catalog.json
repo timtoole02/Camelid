@@ -1,0 +1,547 @@
+{
+  "schema": "camelid-eagle3-corpus-catalog-v1",
+  "generator_version": "1.0.0",
+  "license": {
+    "name": "MIT License",
+    "spdx": "MIT",
+    "notice": "Copyright (c) 2026 Tim Toole",
+    "provenance": "Original deterministic prompt matrices authored for Camelid; no third-party text is embedded."
+  },
+  "profiles": {
+    "standard": {
+      "description": "Full warm-start corpus plan",
+      "expected": {
+        "train": {
+          "technical_instructional": 1080,
+          "code_system_design": 600,
+          "general": 720
+        },
+        "eval": {
+          "technical_instructional": 180,
+          "code_system_design": 100,
+          "general": 120
+        }
+      }
+    },
+    "pilot": {
+      "description": "Stratified 50-job exporter and trainer smoke subset",
+      "expected": {
+        "train": {
+          "technical_instructional": 18,
+          "code_system_design": 10,
+          "general": 12
+        },
+        "eval": {
+          "technical_instructional": 5,
+          "code_system_design": 2,
+          "general": 3
+        }
+      }
+    }
+  },
+  "shared_axes": {
+    "train_contexts": [
+      "for a small team that rotates on-call ownership",
+      "for a product that must keep working during intermittent connectivity",
+      "for a service with uneven bursts of traffic",
+      "for an internal platform with a cautious release process"
+    ],
+    "train_audiences": [
+      "a senior engineer reviewing the proposal",
+      "a mixed product and engineering group",
+      "a new maintainer taking ownership next week"
+    ],
+    "train_styles": [
+      "Use compact headings, explicit assumptions, and concrete verification steps.",
+      "Prioritize tradeoffs, failure cases, and decisions that can be tested."
+    ],
+    "eval_contexts": [
+      "during a staged regional launch",
+      "under a strict maintenance window"
+    ],
+    "eval_audiences": [
+      "an operations lead who did not design the system",
+      "an architecture review panel",
+      "an engineer preparing the first implementation"
+    ],
+    "eval_styles": [
+      "Keep the response self-contained and state how each claim would be checked.",
+      "Separate immediate actions from longer-term design choices."
+    ]
+  },
+  "families": [
+    {
+      "id": "requirements_decomposition",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.requirements.v1",
+      "system": "Act as a pragmatic technical planner. Be precise and avoid invented dependencies.",
+      "template": "Decompose a request for {subject} {context}. Write for {audience}. Identify assumptions, boundaries, implementation phases, acceptance checks, and likely failure modes. {style}",
+      "subjects": [
+        "an offline note synchronization feature",
+        "a document approval workflow",
+        "a sensor telemetry gateway",
+        "an inventory reconciliation service",
+        "a backup rotation utility"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "incident_runbook",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.incident-runbook.v1",
+      "system": "Write operational guidance that is safe to execute and easy to verify.",
+      "template": "Create a diagnostic runbook for {subject} {context}. The reader is {audience}. Include symptoms, evidence to collect, a decision path, reversible mitigations, and recovery validation. {style}",
+      "subjects": [
+        "a growing queue backlog",
+        "stale cache entries after deployment",
+        "intermittent authentication timeouts",
+        "workers exiting during batch processing",
+        "a search index returning incomplete results"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "architecture_tradeoffs",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.architecture-tradeoffs.v1",
+      "system": "Analyze architecture choices with explicit constraints and measurable consequences.",
+      "template": "Compare two viable architectures for {subject} {context}. Address {audience}. Cover data flow, consistency, failure isolation, operating cost, migration risk, and the evidence needed to choose. {style}",
+      "subjects": [
+        "an event ingestion pipeline",
+        "a permission evaluation service",
+        "a search indexing subsystem",
+        "a notification routing layer",
+        "an immutable audit log"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "api_contracts",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.api-contracts.v1",
+      "system": "Design interfaces conservatively and make error behavior unambiguous.",
+      "template": "Draft an API contract for {subject} {context}. Explain it to {audience}. Specify requests, responses, validation, idempotency, pagination or retries where relevant, error semantics, and contract tests. {style}",
+      "subjects": [
+        "a batch export endpoint",
+        "an idempotent command submission endpoint",
+        "a paginated catalog reader",
+        "a webhook delivery service",
+        "an access-token rotation endpoint"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "data_migrations",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.data-migrations.v1",
+      "system": "Plan data changes with rollback, observability, and integrity checks.",
+      "template": "Plan a zero-surprise migration for {subject} {context}. The plan is reviewed by {audience}. Include preconditions, backfill sequencing, dual-read or dual-write choices, rollback, reconciliation queries, and completion gates. {style}",
+      "subjects": [
+        "merging duplicate account records",
+        "normalizing legacy status values",
+        "correcting stored time-zone offsets",
+        "moving old events into partitions",
+        "remapping externally visible identifiers"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "observability_plans",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.observability.v1",
+      "system": "Turn operational uncertainty into measurable signals and useful alerts.",
+      "template": "Design observability for {subject} {context}. Write for {audience}. Define service-level signals, structured events, traces, dashboards, alert thresholds, diagnostic queries, and a validation drill. {style}",
+      "subjects": [
+        "a background job system",
+        "a message relay",
+        "an image processing service",
+        "a configuration rollout controller",
+        "an object storage proxy"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "reliability_reviews",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.reliability-review.v1",
+      "system": "Review reliability using concrete hazards, controls, and recovery evidence.",
+      "template": "Perform a reliability review of {subject} {context}. Present it to {audience}. Discuss overload, dependency failure, state corruption, retries, graceful degradation, recovery objectives, and fault-injection tests. {style}",
+      "subjects": [
+        "a distributed scheduler",
+        "an edge response cache",
+        "a cross-device synchronization engine",
+        "a release orchestration service",
+        "a shared build farm"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "security_threat_models",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.security-threat-model.v1",
+      "system": "Produce defensive security analysis without offensive operational detail.",
+      "template": "Create a defensive threat model for {subject} {context}. Make it useful to {audience}. Identify assets, trust boundaries, abuse cases, mitigations, residual risk, audit events, and security tests. {style}",
+      "subjects": [
+        "workspace sharing",
+        "application secret storage",
+        "untrusted file uploads",
+        "session revocation",
+        "delegated administrator access"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "performance_diagnosis",
+      "split": "train",
+      "category": "technical_instructional",
+      "count": 120,
+      "template_id": "train.tech.performance-diagnosis.v1",
+      "system": "Diagnose performance from measurements, not guesses.",
+      "template": "Lay out an evidence-first performance investigation for {subject} {context}. The audience is {audience}. Include a baseline, instrumentation, controlled experiments, bottleneck hypotheses, confounders, and stop conditions. {style}",
+      "subjects": [
+        "a Rust text parser",
+        "a database query planner",
+        "an asynchronous event loop",
+        "a streaming log compressor",
+        "a custom memory allocator"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "rust_modules",
+      "split": "train",
+      "category": "code_system_design",
+      "count": 120,
+      "template_id": "train.code.rust-module.v1",
+      "system": "Write idiomatic Rust designs with explicit ownership, error, and test behavior.",
+      "template": "Design and sketch the core Rust types for {subject} {context}. Explain the design to {audience}. Cover ownership, concurrency where applicable, errors, public interfaces, edge cases, and focused tests. {style}",
+      "subjects": [
+        "a bounded worker pool",
+        "a streaming CSV decoder",
+        "a time-to-live cache",
+        "a retry scheduler",
+        "a framed TCP codec"
+      ],
+      "max_new_tokens": 192
+    },
+    {
+      "id": "swift_state_management",
+      "split": "train",
+      "category": "code_system_design",
+      "count": 120,
+      "template_id": "train.code.swift-state.v1",
+      "system": "Design clear Swift state transitions and testable async boundaries.",
+      "template": "Propose a Swift implementation for {subject} {context}. Write for {audience}. Define state, actions, asynchronous boundaries, cancellation, persistence, error presentation, and unit tests. {style}",
+      "subjects": [
+        "an offline editor",
+        "a navigation coordinator",
+        "an asynchronous image loader",
+        "a preference repository",
+        "a background upload queue"
+      ],
+      "max_new_tokens": 192
+    },
+    {
+      "id": "python_pipelines",
+      "split": "train",
+      "category": "code_system_design",
+      "count": 120,
+      "template_id": "train.code.python-pipeline.v1",
+      "system": "Prefer typed, testable Python with bounded resource use.",
+      "template": "Outline a production-quality Python implementation of {subject} {context}. Address {audience}. Include module boundaries, types, streaming behavior, error handling, deterministic tests, and a small usage example. {style}",
+      "subjects": [
+        "a typed transformation pipeline",
+        "a configuration validator",
+        "a structured log analyzer",
+        "a retrying service client",
+        "a dependency graph evaluator"
+      ],
+      "max_new_tokens": 192
+    },
+    {
+      "id": "sql_migrations",
+      "split": "train",
+      "category": "code_system_design",
+      "count": 120,
+      "template_id": "train.code.sql-migration.v1",
+      "system": "Write database changes that preserve correctness during rollout.",
+      "template": "Draft the SQL and rollout approach for {subject} {context}. Explain it to {audience}. Cover locking, indexes, backfill batches, compatibility during deployment, rollback, and verification queries. {style}",
+      "subjects": [
+        "adding an append-only audit schema",
+        "introducing tenant keys",
+        "rolling out soft deletion",
+        "reworking a compound index",
+        "handing off records between partitions"
+      ],
+      "max_new_tokens": 192
+    },
+    {
+      "id": "test_strategies",
+      "split": "train",
+      "category": "code_system_design",
+      "count": 120,
+      "template_id": "train.code.test-strategy.v1",
+      "system": "Build test plans around invariants, observable outcomes, and failure reproduction.",
+      "template": "Create a layered test strategy for {subject} {context}. The reader is {audience}. Include unit invariants, integration seams, property cases, fault injection, deterministic fixtures, and release gates. {style}",
+      "subjects": [
+        "a binary parser",
+        "a concurrent cache",
+        "a recurring task scheduler",
+        "an HTTP client library",
+        "a schema migration utility"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "concise_explanations",
+      "split": "train",
+      "category": "general",
+      "count": 120,
+      "template_id": "train.general.concise-explanation.v1",
+      "system": "Explain ideas accurately in plain language while preserving the important nuance.",
+      "template": "Explain {subject} {context} to {audience}. Start with an intuitive summary, then give one concrete example, one common misconception, and a short way to check understanding. {style}",
+      "subjects": [
+        "why queues can improve resilience",
+        "how version control preserves history",
+        "what an index changes in a database",
+        "why retries need backoff",
+        "how checksums reveal accidental changes"
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "decision_memos",
+      "split": "train",
+      "category": "general",
+      "count": 120,
+      "template_id": "train.general.decision-memo.v1",
+      "system": "Write balanced decision support with explicit uncertainty.",
+      "template": "Write a short decision memo about {subject} {context} for {audience}. State the decision, alternatives, evidence, tradeoffs, reversibility, open questions, and a review date. {style}",
+      "subjects": [
+        "adopting a shared issue template",
+        "moving meetings to written updates",
+        "retiring an unused internal tool",
+        "standardizing release notes",
+        "starting a weekly support rotation"
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "learning_plans",
+      "split": "train",
+      "category": "general",
+      "count": 120,
+      "template_id": "train.general.learning-plan.v1",
+      "system": "Create realistic learning sequences with practice and feedback.",
+      "template": "Create a four-session learning plan for {subject} {context}. Aim it at {audience}. Include prerequisites, a small exercise per session, feedback criteria, common sticking points, and a final demonstration. {style}",
+      "subjects": [
+        "reading unfamiliar source code",
+        "writing useful bug reports",
+        "reasoning about asynchronous work",
+        "reviewing a technical proposal",
+        "using command-line text tools"
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "writing_revisions",
+      "split": "train",
+      "category": "general",
+      "count": 120,
+      "template_id": "train.general.writing-revision.v1",
+      "system": "Improve technical writing without changing the author's factual claims.",
+      "template": "Describe how you would revise {subject} {context} for {audience}. Give a proposed structure, examples of clearer phrasing, facts that need verification, and a final editing checklist. {style}",
+      "subjects": [
+        "an ambiguous deployment notice",
+        "a long troubleshooting guide",
+        "a terse project handoff",
+        "an inconsistent interface reference",
+        "a speculative performance report"
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "project_retrospectives",
+      "split": "train",
+      "category": "general",
+      "count": 120,
+      "template_id": "train.general.retrospective.v1",
+      "system": "Facilitate blameless retrospectives focused on evidence and improvement.",
+      "template": "Structure a retrospective for {subject} {context}. Make it useful to {audience}. Separate facts from interpretations, identify contributing conditions, propose bounded experiments, assign follow-up evidence, and avoid blame. {style}",
+      "subjects": [
+        "a release that required a rollback",
+        "a project with repeated scope changes",
+        "an incident with a slow diagnosis",
+        "a migration that exceeded its window",
+        "a feature with confusing ownership"
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "comparison_guides",
+      "split": "train",
+      "category": "general",
+      "count": 120,
+      "template_id": "train.general.comparison-guide.v1",
+      "system": "Compare options using criteria that can be observed or tested.",
+      "template": "Build a comparison guide for {subject} {context}, written for {audience}. Define the criteria, explain when each option fits, expose hidden costs, give a small example, and end with a decision rule. {style}",
+      "subjects": [
+        "polling versus event notifications",
+        "files versus a small database",
+        "synchronous versus queued work",
+        "feature flags versus release branches",
+        "centralized versus local configuration"
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "capacity_planning",
+      "split": "eval",
+      "category": "technical_instructional",
+      "count": 60,
+      "template_id": "eval.tech.capacity-planning.v1",
+      "system": "Use explicit assumptions and sensitivity analysis for capacity planning.",
+      "template": "Prepare a capacity plan for {subject} {context}. Address {audience}. Show the demand model, headroom policy, limiting resource, measurement plan, degradation trigger, and recalibration cadence. {style}",
+      "subjects": [
+        "a thumbnail generation cluster",
+        "a write-heavy metrics store",
+        "a websocket connection tier",
+        "a nightly reporting pipeline",
+        "a regional metadata service"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "protocol_reviews",
+      "split": "eval",
+      "category": "technical_instructional",
+      "count": 60,
+      "template_id": "eval.tech.protocol-review.v1",
+      "system": "Review protocols for state, ordering, compatibility, and recovery hazards.",
+      "template": "Review the proposed protocol for {subject} {context}. Write for {audience}. Trace normal state changes, duplicate and out-of-order messages, version negotiation, timeouts, recovery, and conformance tests. {style}",
+      "subjects": [
+        "leasing work to remote agents",
+        "replicating configuration updates",
+        "resuming interrupted file transfers",
+        "coordinating leader handoff",
+        "acknowledging durable notifications"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "failure_analysis",
+      "split": "eval",
+      "category": "technical_instructional",
+      "count": 60,
+      "template_id": "eval.tech.failure-analysis.v1",
+      "system": "Analyze failures by reconstructing evidence and testing competing explanations.",
+      "template": "Plan an investigation of {subject} {context}. The report is for {audience}. Define the timeline evidence, competing hypotheses, discriminating experiments, containment, proof of recovery, and unresolved risk. {style}",
+      "subjects": [
+        "missing events after a failover",
+        "duplicate work after a process restart",
+        "configuration drift between regions",
+        "unexpected disk growth",
+        "sporadic request reordering"
+      ],
+      "max_new_tokens": 176
+    },
+    {
+      "id": "concurrency_debugging",
+      "split": "eval",
+      "category": "code_system_design",
+      "count": 50,
+      "template_id": "eval.code.concurrency-debug.v1",
+      "system": "Debug concurrency with causal traces, invariants, and deterministic reproduction.",
+      "template": "Show how to debug {subject} {context}. Explain the approach to an engineer preparing the first implementation. Include the suspected invariant, trace points, a deterministic reproducer, a minimal fix shape, and regression tests. {style}",
+      "subjects": [
+        "a lost wake-up in a condition-variable loop",
+        "a lock-order deadlock",
+        "an actor receiving stale state",
+        "a cancellation race in asynchronous cleanup",
+        "a reference-count lifetime bug"
+      ],
+      "extra_contexts": [
+        "after a compiler upgrade",
+        "only under sustained load",
+        "when shutdown overlaps active work",
+        "on machines with many cores",
+        "inside a reusable library"
+      ],
+      "max_new_tokens": 192
+    },
+    {
+      "id": "cli_design",
+      "split": "eval",
+      "category": "code_system_design",
+      "count": 50,
+      "template_id": "eval.code.cli-design.v1",
+      "system": "Design command-line tools with stable contracts and safe defaults.",
+      "template": "Design a command-line interface for {subject} {context}. Explain it to an engineer preparing the first implementation. Specify subcommands, flags, input validation, exit behavior, machine-readable output, interruption handling, and golden tests. {style}",
+      "subjects": [
+        "inspecting archive metadata",
+        "replaying an event journal",
+        "validating configuration bundles",
+        "comparing directory snapshots",
+        "managing local development certificates"
+      ],
+      "extra_contexts": [
+        "for use in automated jobs",
+        "for interactive troubleshooting",
+        "with very large inputs",
+        "across multiple operating systems",
+        "with backward compatibility requirements"
+      ],
+      "max_new_tokens": 192
+    },
+    {
+      "id": "stakeholder_updates",
+      "split": "eval",
+      "category": "general",
+      "count": 60,
+      "template_id": "eval.general.stakeholder-update.v1",
+      "system": "Communicate project state candidly, with evidence and clear decisions.",
+      "template": "Draft a stakeholder update about {subject} {context}. It is for {audience}. Separate completed work, measured results, current risk, decisions needed, the next checkpoint, and what remains uncertain. {style}",
+      "subjects": [
+        "a delayed integration milestone",
+        "a successful reliability experiment",
+        "a dependency that changed its interface",
+        "a pilot with mixed user feedback",
+        "a rollout paused by incomplete evidence"
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "concept_teaching",
+      "split": "eval",
+      "category": "general",
+      "count": 60,
+      "template_id": "eval.general.concept-teaching.v1",
+      "system": "Teach concepts through a mental model, example, boundary, and check for understanding.",
+      "template": "Teach {subject} {context} to {audience}. Give a mental model, a worked example, a boundary where the model breaks, two diagnostic questions, and a brief recap. {style}",
+      "subjects": [
+        "why clocks disagree in distributed programs",
+        "how immutable data can simplify debugging",
+        "what makes an experiment falsifiable",
+        "why interfaces should hide unstable details",
+        "how sampling can distort a measurement"
+      ],
+      "max_new_tokens": 160
+    }
+  ]
+}
