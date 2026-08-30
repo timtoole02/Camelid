@@ -214,6 +214,10 @@ pub(crate) struct MetalLinearKernel {
     /// Native 8-row Q4 sibling. Each row-octet tile keeps a scale plane followed
     /// by a quant plane whose per-block quarters are contiguous 32-byte panels.
     q4_0_q8_ordered_columns_mma_native_pipeline: Option<ComputePipelineState>,
+    /// Register-fed sibling over the same native planes. Q4 and staged Q8
+    /// fragment cells are populated directly by their owning lanes, eliminating
+    /// Q4 threadgroup staging and every per-block barrier.
+    q4_0_q8_ordered_columns_mma_native_register_pipeline: Option<ComputePipelineState>,
     /// Serial-row-tile siblings of the exact padded-eight MMA verifier. A
     /// single simdgroup owns two or four consecutive 8-row tiles so the Q8
     /// panel is staged into threadgroup memory once per Q4 block and reused
@@ -3887,6 +3891,111 @@ kernel void q4_0_q8_ordered_columns_mma_native(
         const uint tile_output_row = index >> 3;
         const uint column = index & 7u;
         const uint output_row = row0 + tile_output_row;
+        if (output_row < rows && column < columns) {
+            output[ulong(column) * rows + output_row] = accum[cell];
+        }
+    }
+}
+
+// Apple-family 8x8 fragment ownership: every lane owns two adjacent cells.
+// Keep this sibling-local so the established wire-layout fragment experiment
+// and the qualified native-MMA fallback can evolve independently.
+inline uint2 q4_native_mma_fragment_coord(uint lane) {
+    const uint fragment_row = 4u * (lane >> 4) + ((lane & 7u) >> 1);
+    const uint fragment_column =
+        4u * ((lane >> 3) & 1u) + 2u * (lane & 1u);
+    return uint2(fragment_column, fragment_row);
+}
+
+// Native-plane adaptation of the exact register-fed B kernel. Each lane loads
+// the two Q4 bytes backing each of its two fragment cells directly from the
+// sidecar's coalesced quarter planes. Both MMA operands and the f32 result stay
+// in registers; there is no Q4 threadgroup staging, C-tile roundtrip, or
+// per-block barrier. Arithmetic and k-tile order match the qualified wire B:
+// low(first), low(second), high(first), high(second).
+kernel void q4_0_q8_ordered_columns_mma_native_register(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* native_weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = tile * 8u;
+    if (row0 >= rows) return;
+
+    const uint2 fragment_coord = q4_native_mma_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+    const uint output_row = row0 + fragment_row;
+    const ulong tile_span = ulong(blocks_per_row) * 144ul;
+    device const uchar* tile_base =
+        native_weight_bytes + ulong(tile) * tile_span;
+    device const half* scales =
+        reinterpret_cast<device const half*>(tile_base);
+    const ulong quant_plane = ulong(blocks_per_row) * 16ul;
+    const uint first_quarter = fragment_column0 >> 2;
+    const uint second_quarter = first_quarter + 2u;
+    const uint quarter_item = fragment_column0 & 3u;
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const float weight_scale =
+            float(scales[block_index * 8u + fragment_row]);
+        device const uchar* quant_block = tile_base + quant_plane
+            + ulong(block_index) * 128ul;
+        const uchar2 packed_first = uchar2(
+            *reinterpret_cast<device const packed_uchar2*>(
+                quant_block + ulong(first_quarter) * 32ul
+                    + ulong(fragment_row) * 4ul + quarter_item));
+        const uchar2 packed_second = uchar2(
+            *reinterpret_cast<device const packed_uchar2*>(
+                quant_block + ulong(second_quarter) * 32ul
+                    + ulong(fragment_row) * 4ul + quarter_item));
+
+        simdgroup_float8x8 dots =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#pragma clang loop unroll(full)
+        for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+            const uchar2 packed = (k_tile & 1u) == 0u
+                ? packed_first
+                : packed_second;
+            const bool high_nibble = k_tile >= 2u;
+            simdgroup_half8x8 weights;
+            weights.thread_elements()[0] = high_nibble
+                ? half(int(packed.x >> 4) - 8)
+                : half(int(packed.x & 0x0fu) - 8);
+            weights.thread_elements()[1] = high_nibble
+                ? half(int(packed.y >> 4) - 8)
+                : half(int(packed.y & 0x0fu) - 8);
+
+            const ulong activation_row =
+                (ulong(block_index) * 32ul + k_tile * 8ul + fragment_row) * 8ul;
+            simdgroup_half8x8 activations;
+            activations.thread_elements()[0] =
+                staged_quants[activation_row + fragment_column0];
+            activations.thread_elements()[1] =
+                staged_quants[activation_row + fragment_column0 + 1u];
+            simdgroup_multiply_accumulate(dots, weights, activations, dots);
+        }
+
+        for (uint cell = 0; cell < 2u; ++cell) {
+            const uint column = fragment_column0 + cell;
+            if (output_row < rows && column < columns) {
+                const float isum = dots.thread_elements()[cell];
+                float term = isum * weight_scale;
+                term = term *
+                    input_scales[ulong(column) * blocks_per_row + block_index];
+                accum[cell] = accum[cell] + term;
+            }
+        }
+    }
+
+    for (uint cell = 0; cell < 2u; ++cell) {
+        const uint column = fragment_column0 + cell;
         if (output_row < rows && column < columns) {
             output[ulong(column) * rows + output_row] = accum[cell];
         }
@@ -12014,6 +12123,14 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let q4_0_q8_ordered_columns_mma_native_register_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_native_register", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let q4_0_q8_ordered_columns_mma_serial2_pipeline = strict_q8k_library
                 .get_function("q4_0_q8_ordered_columns_mma_serial2", None)
                 .ok()
@@ -12247,6 +12364,7 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4_0_q8_ordered_columns_mma_rowmajor_pipeline,
                 q4_0_q8_ordered_columns_mma_rowmajor_fragment_pipeline,
                 q4_0_q8_ordered_columns_mma_native_pipeline,
+                q4_0_q8_ordered_columns_mma_native_register_pipeline,
                 q4_0_q8_ordered_columns_mma_serial2_pipeline,
                 q4_0_q8_ordered_columns_mma_serial4_pipeline,
                 q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline,
@@ -13689,6 +13807,20 @@ fn gemma4_q4_mma_register_fragment_enabled() -> bool {
     })
 }
 
+/// Opt in to the register-fed B sibling for native-octet sidecar weights.
+/// Sidecar admission already pins the exact source/layout and this selector
+/// changes only the qualified native verifier kernel. An unset selector keeps
+/// the established native MMA sibling; a set selector is admitted fail-closed
+/// and is never silently reported while executing the baseline.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_native_register_fragment_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Mini2-qualified serial-row-tile policy for the opt-in exact MMA lane.
 /// Q/gate/up/down/output projections have at least 3,840 output rows and won
 /// with two serial tiles. K/V projections are smaller and regressed sharply,
@@ -13966,6 +14098,22 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_native(
     )
 }
 
+/// Explicit native-plane register-fed B sibling for exactness qualification.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_native_register(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_columns_impl(
+        inputs,
+        weight_wire,
+        rows,
+        Gemma4Q4ColumnsTestPath::MmaNativeRegister,
+    )
+}
+
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor_fragment(
@@ -14037,6 +14185,7 @@ enum Gemma4Q4ColumnsTestPath {
     MmaRowMajorFragment,
     MmaRegisterFragment,
     MmaNative,
+    MmaNativeRegister,
     MmaSerial2,
     MmaSerial4,
     MmaSerial2Fragment,
@@ -14080,6 +14229,7 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
         | Gemma4Q4ColumnsTestPath::MmaRowMajorFragment
         | Gemma4Q4ColumnsTestPath::MmaRegisterFragment
         | Gemma4Q4ColumnsTestPath::MmaNative
+        | Gemma4Q4ColumnsTestPath::MmaNativeRegister
         | Gemma4Q4ColumnsTestPath::MmaSerial2
         | Gemma4Q4ColumnsTestPath::MmaSerial4
         | Gemma4Q4ColumnsTestPath::MmaSerial2Fragment => {
@@ -14096,7 +14246,10 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
         }
     }
 
-    let native_wire = if path == Gemma4Q4ColumnsTestPath::MmaNative {
+    let native_wire = if matches!(
+        path,
+        Gemma4Q4ColumnsTestPath::MmaNative | Gemma4Q4ColumnsTestPath::MmaNativeRegister
+    ) {
         Some(
             crate::gemma4_q4_sidecar::pack_native_q4_octets(weight_wire, rows, blocks_per_row)
                 .ok()?,
@@ -14217,6 +14370,21 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
             blocks_per_row,
             columns,
         ),
+        Gemma4Q4ColumnsTestPath::MmaNativeRegister => {
+            encode_gemma4_q4_0_q8_ordered_columns_mma_native_register(
+                encoder,
+                kernel,
+                &scales_buf,
+                &quants_buf,
+                &weight_buf,
+                0,
+                &output_buf,
+                terms_buf.as_ref()?,
+                rows,
+                blocks_per_row,
+                columns,
+            )
+        }
         Gemma4Q4ColumnsTestPath::MmaSerial2
         | Gemma4Q4ColumnsTestPath::MmaSerial4 => {
             let row_tiles = if path == Gemma4Q4ColumnsTestPath::MmaSerial2 {
@@ -19788,6 +19956,13 @@ pub(crate) fn gemma4_native_q4_kernel_family_admitted() -> bool {
                 kernel.q4_0_q8_ordered_columns_mma_native_pipeline.as_ref(),
             )
             .is_some()
+            && (!gemma4_q4_native_register_fragment_enabled()
+                || admitted_32_lane_pipeline(
+                    kernel
+                        .q4_0_q8_ordered_columns_mma_native_register_pipeline
+                        .as_ref(),
+                )
+                .is_some())
     })
 }
 
@@ -19955,6 +20130,7 @@ enum Gemma4Q4MmaLayout {
     RowMajorFragment,
     RegisterFragment,
     NativeOctets,
+    NativeRegister,
 }
 
 #[cfg(target_os = "macos")]
@@ -20118,6 +20294,38 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native(
     )
 }
 
+/// Register-fed B encoder for the same validated native-octet Q4 layout.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
+        encoder,
+        kernel,
+        input_scales,
+        input_quants,
+        weight,
+        weight_offset,
+        output,
+        staged_quants,
+        rows,
+        blocks_per_row,
+        columns,
+        Gemma4Q4MmaLayout::NativeRegister,
+    )
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
@@ -20165,7 +20373,7 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
         | Gemma4Q4MmaLayout::RegisterFragment => rows
             .checked_mul(blocks_per_row)
             .and_then(|blocks| blocks.checked_mul(18)),
-        Gemma4Q4MmaLayout::NativeOctets => rows
+        Gemma4Q4MmaLayout::NativeOctets | Gemma4Q4MmaLayout::NativeRegister => rows
             .div_ceil(8)
             .checked_mul(blocks_per_row)
             .and_then(|records| records.checked_mul(144)),
@@ -20212,6 +20420,9 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
         Gemma4Q4MmaLayout::NativeOctets => {
             kernel.q4_0_q8_ordered_columns_mma_native_pipeline.as_ref()
         }
+        Gemma4Q4MmaLayout::NativeRegister => kernel
+            .q4_0_q8_ordered_columns_mma_native_register_pipeline
+            .as_ref(),
     };
     let Some(mma_pipeline) = admitted_32_lane_pipeline(mma_candidate) else {
         return false;
@@ -20569,23 +20780,40 @@ fn encode_gemma4_q4_0_q8_ordered_columns_with_layout(
     let columns_u32 = columns as u32;
 
     // Native bytes have no row-major fallback. The sidecar itself is an
-    // explicit opt-in, so route directly to the exact native MMA sibling and
-    // refuse before encoding if its pipeline/scratch cannot be admitted.
+    // explicit opt-in. Its register-fed B experiment is independently gated.
+    // A set gate is fail-closed (and pre-admitted with the sidecar), while an
+    // unset gate retains the qualified native MMA sibling byte-for-byte.
     if weight_layout == Gemma4Q4WeightLayout::NativeOctets {
         return terms.is_some_and(|staged| {
-            encode_gemma4_q4_0_q8_ordered_columns_mma_native(
-                encoder,
-                kernel,
-                input_scales,
-                input_quants,
-                weight,
-                weight_offset,
-                output,
-                staged,
-                rows,
-                blocks_per_row,
-                columns,
-            )
+            if gemma4_q4_native_register_fragment_enabled() {
+                encode_gemma4_q4_0_q8_ordered_columns_mma_native_register(
+                    encoder,
+                    kernel,
+                    input_scales,
+                    input_quants,
+                    weight,
+                    weight_offset,
+                    output,
+                    staged,
+                    rows,
+                    blocks_per_row,
+                    columns,
+                )
+            } else {
+                encode_gemma4_q4_0_q8_ordered_columns_mma_native(
+                    encoder,
+                    kernel,
+                    input_scales,
+                    input_quants,
+                    weight,
+                    weight_offset,
+                    output,
+                    staged,
+                    rows,
+                    blocks_per_row,
+                    columns,
+                )
+            }
         });
     }
 
@@ -42595,6 +42823,12 @@ mod tests {
         )
         .is_some());
         assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_native_register_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(admitted_32_lane_pipeline(
             kernel.q4_0_q8_ordered_columns_mma_serial2_pipeline.as_ref()
         )
         .is_some());
@@ -42767,6 +43001,13 @@ mod tests {
                     .unwrap_or_else(|| {
                         panic!("native-octet padded-eight MMA Q4_0 columns: {label} K={columns}")
                     });
+                let mma_native_register =
+                    try_gemma4_q4_0_matmul_q8_columns_mma_native_register(&refs, &wire, rows)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "native register-fed MMA Q4_0 columns: {label} K={columns}"
+                            )
+                        });
                 for column in 0..columns {
                     for row in 0..rows {
                         assert_eq!(
@@ -42793,6 +43034,11 @@ mod tests {
                             mma_native[column][row].to_bits(),
                             mma_rowmajor[column][row].to_bits(),
                             "native-vs-rowmajor shape={label} K={columns} column={column} row={row}"
+                        );
+                        assert_eq!(
+                            mma_native_register[column][row].to_bits(),
+                            mma_native[column][row].to_bits(),
+                            "native-register-vs-native shape={label} K={columns} column={column} row={row}"
                         );
                     }
                 }
