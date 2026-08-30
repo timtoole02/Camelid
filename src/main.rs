@@ -8961,6 +8961,107 @@ fn run_bench_speculative(
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3TokenRecyclingTelemetry {
+    admission_decisions: u64,
+    admission_declines: u64,
+    primary_depth_sum: u64,
+    parent_rows_sum: u64,
+    known_parent_rows_sum: u64,
+    known_parent_share_q16_sum: u64,
+    e9_rounds: u64,
+    e9_offered: u64,
+    e9_accepted_drafts: u64,
+    e9_emitted_tokens: u64,
+    tr_rounds: u64,
+    tr_offered: u64,
+    tr_accepted_drafts: u64,
+    tr_emitted_tokens: u64,
+    cold_seed_anchors: u64,
+    candidate_rows: u64,
+    candidate_ids: u64,
+}
+
+impl Eagle3TokenRecyclingTelemetry {
+    fn note_decision(
+        &mut self,
+        evidence: camelid::inference::token_recycling::TokenRecyclingTreeEvidence,
+    ) {
+        self.admission_decisions += 1;
+        self.admission_declines += u64::from(!evidence.admitted);
+        self.primary_depth_sum += evidence.primary_depth as u64;
+        self.parent_rows_sum += evidence.parent_rows as u64;
+        self.known_parent_rows_sum += evidence.known_parent_rows as u64;
+        self.known_parent_share_q16_sum += evidence.known_parent_share_q16 as u64;
+    }
+
+    fn note_e9(&mut self, offered: usize, emitted: usize, cold_seed: bool) {
+        self.e9_rounds += 1;
+        self.e9_offered += offered as u64;
+        self.e9_accepted_drafts += emitted.saturating_sub(1) as u64;
+        self.e9_emitted_tokens += emitted as u64;
+        self.cold_seed_anchors += u64::from(cold_seed);
+    }
+
+    fn note_tr(&mut self, offered: usize, emitted: usize) {
+        self.tr_rounds += 1;
+        self.tr_offered += offered as u64;
+        self.tr_accepted_drafts += emitted.saturating_sub(1) as u64;
+        self.tr_emitted_tokens += emitted as u64;
+    }
+
+    fn note_candidates(&mut self, rows: usize, ids: usize) {
+        self.candidate_rows += rows as u64;
+        self.candidate_ids += ids as u64;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_token_recycling_telemetry_splits_e9_tr_and_cold_seed_rounds() {
+    use camelid::inference::token_recycling::TokenRecyclingTreeEvidence;
+
+    let mut telemetry = Eagle3TokenRecyclingTelemetry::default();
+    telemetry.note_decision(TokenRecyclingTreeEvidence {
+        root_known: false,
+        nodes: 1,
+        max_depth: 0,
+        primary_depth: 0,
+        parent_rows: 0,
+        known_parent_rows: 0,
+        known_parent_share_q16: 0,
+        admitted: false,
+    });
+    telemetry.note_e9(7, 2, true);
+    telemetry.note_candidates(8, 64);
+    telemetry.note_decision(TokenRecyclingTreeEvidence {
+        root_known: true,
+        nodes: 7,
+        max_depth: 2,
+        primary_depth: 2,
+        parent_rows: 3,
+        known_parent_rows: 2,
+        known_parent_share_q16: 43_690,
+        admitted: true,
+    });
+    telemetry.note_tr(6, 3);
+    telemetry.note_candidates(7, 56);
+
+    assert_eq!(telemetry.admission_decisions, 2);
+    assert_eq!(telemetry.admission_declines, 1);
+    assert_eq!(telemetry.e9_rounds, 1);
+    assert_eq!(telemetry.e9_offered, 7);
+    assert_eq!(telemetry.e9_accepted_drafts, 1);
+    assert_eq!(telemetry.e9_emitted_tokens, 2);
+    assert_eq!(telemetry.tr_rounds, 1);
+    assert_eq!(telemetry.tr_offered, 6);
+    assert_eq!(telemetry.tr_accepted_drafts, 2);
+    assert_eq!(telemetry.tr_emitted_tokens, 3);
+    assert_eq!(telemetry.cold_seed_anchors, 1);
+    assert_eq!(telemetry.candidate_rows, 15);
+    assert_eq!(telemetry.candidate_ids, 120);
+}
+
 #[derive(Default)]
 struct Eagle3BenchRun {
     generated: Vec<u32>,
@@ -9001,6 +9102,7 @@ struct Eagle3BenchRun {
     dynamic_tree_emitted_tokens: u64,
     materialized_head_forwards: u64,
     dynamic_tree_max_depth_sum: u64,
+    token_recycling: Eagle3TokenRecyclingTelemetry,
 }
 
 fn run_plain_resident_greedy(
@@ -9062,13 +9164,16 @@ fn run_eagle3_resident_greedy(
     tree_topk: usize,
     tree_expansions: usize,
     suffix_first: bool,
+    token_recycling_hybrid: bool,
     checkpoint: camelid::eagle3::Eagle3DraftModel,
 ) -> anyhow::Result<Eagle3BenchRun> {
     use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
     use camelid::eagle3_runtime::{
         Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig,
+        Eagle3ForestAcceptance,
     };
     use camelid::inference::suffix_decoding::SuffixDecodingDrafter;
+    use camelid::inference::token_recycling::TokenRecyclingDrafter;
 
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
     let _ = session.prewarm_resident_weights();
@@ -9117,6 +9222,13 @@ fn run_eagle3_resident_greedy(
         })
         .transpose()?;
     let mut suffix_drafter = suffix_first.then(SuffixDecodingDrafter::default);
+    // Per-run only: benchmark hybrid state is never serialized, prepared, or shared with serving.
+    let mut recycling_drafter = token_recycling_hybrid.then(|| {
+        let mut drafter = TokenRecyclingDrafter::default();
+        drafter.topk = camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K;
+        drafter.branch = 2;
+        drafter
+    });
     let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
     let mut suffix_history = suffix_first.then(|| {
         let mut history = Vec::with_capacity(prompt_tokens.len() + max_tokens);
@@ -9224,6 +9336,230 @@ fn run_eagle3_resident_greedy(
                 run.suffix_offered += offered as u64;
                 run.suffix_emitted_tokens += emitted.len() as u64;
                 (emitted, offered, offered + 1)
+            } else if let Some(recycling) = recycling_drafter.as_mut() {
+                anyhow::ensure!(
+                    pending_suffix_head.is_empty(),
+                    "EAGLE/TR hybrid cannot consume deferred suffix rows"
+                );
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position(),
+                    "EAGLE/TR hybrid head watermark diverged before admission: head={} target={}",
+                    drafter.filled(),
+                    session.kv_position()
+                );
+
+                // Admission is deliberately BEFORE either target verification or EAGLE
+                // materialization. It sees only exact target rows installed by earlier rounds.
+                let proposal_started = Instant::now();
+                let proposal = recycling.draft_known_target_tree(
+                    anchor,
+                    round_node_budget,
+                    budget,
+                );
+                run.draft_us += proposal_started.elapsed().as_micros();
+                let evidence = proposal.evidence;
+                run.token_recycling.note_decision(evidence);
+                if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                    eprintln!(
+                        "[eagle3-tr-hybrid] decision={} root_known={} nodes={} depth={} \
+                         primary_depth={} known_parents={}/{} share_q16={}",
+                        if evidence.admitted { "tr" } else { "e9" },
+                        evidence.root_known,
+                        evidence.nodes,
+                        evidence.max_depth,
+                        evidence.primary_depth,
+                        evidence.known_parent_rows,
+                        evidence.parent_rows,
+                        evidence.known_parent_share_q16,
+                    );
+                }
+
+                if evidence.admitted {
+                    let tree = proposal.tree;
+                    let actual_nodes = tree.nodes();
+                    anyhow::ensure!(
+                        (2..=round_node_budget).contains(&actual_nodes),
+                        "admitted Token Recycling forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                    );
+                    run.drafted_token_ids.extend_from_slice(&tree.tokens[1..]);
+
+                    let verify_started = Instant::now();
+                    let verified = session
+                        .verify_tree_metal_with_layer_inputs_and_target_top_k(
+                            &tree,
+                            &TARGET_LAYER_INPUT_IDS,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "resident Metal Token Recycling tree verification became unavailable at position {target_before}"
+                            )
+                        })?;
+                    run.verify_us += verify_started.elapsed().as_micros();
+                    anyhow::ensure!(
+                        verified.predictions.len() == actual_nodes
+                            && verified.target_top_k.len() == actual_nodes,
+                        "Token Recycling target returned predictions/top-k rows {}/{} for {actual_nodes} verifier rows",
+                        verified.predictions.len(),
+                        verified.target_top_k.len(),
+                    );
+                    let (target_emitted, leaf_row) =
+                        tree.accept_longest_path(&verified.predictions);
+                    anyhow::ensure!(
+                        verified.emitted == target_emitted,
+                        "Token Recycling host acceptance diverged from resident target emission"
+                    );
+                    let capture_rows = tree.path_to(leaf_row);
+                    anyhow::ensure!(
+                        capture_rows.len() == target_emitted.len(),
+                        "Token Recycling emitted/capture path lengths diverged: {}/{}",
+                        target_emitted.len(),
+                        capture_rows.len()
+                    );
+                    let acceptance = Eagle3ForestAcceptance {
+                        emitted_tokens: target_emitted,
+                        leaf_row,
+                        source_nodes: capture_rows.clone(),
+                        capture_rows,
+                    };
+                    let update_started = Instant::now();
+                    drafter.accept_authoritative_forest(
+                        weights,
+                        &verified.layer_inputs,
+                        &acceptance,
+                    )?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+
+                    let mut candidate_ids = 0usize;
+                    for ((&from, candidates), &prediction) in tree
+                        .tokens
+                        .iter()
+                        .zip(&verified.target_top_k)
+                        .zip(&verified.predictions)
+                    {
+                        anyhow::ensure!(
+                            candidates[0] == prediction,
+                            "Token Recycling top-1 candidate {} disagrees with greedy prediction {prediction} for verifier token {from}",
+                            candidates[0]
+                        );
+                        candidate_ids += recycling.replace_target_candidates(from, candidates);
+                    }
+                    let emitted_count = acceptance.emitted_tokens.len();
+                    let offered = actual_nodes.saturating_sub(1);
+                    run.token_recycling
+                        .note_candidates(actual_nodes, candidate_ids);
+                    run.token_recycling.note_tr(offered, emitted_count);
+                    if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                        eprintln!(
+                            "[eagle3-tr-hybrid] lane=tr rows={actual_nodes} candidate_ids={candidate_ids} \
+                             offered={offered} emitted={emitted_count}"
+                        );
+                    }
+                    (acceptance.emitted_tokens, offered, actual_nodes)
+                } else {
+                    // E9 fallback is also the cold seed. Its root row and every other verified
+                    // BFS row overwrite the in-session Token Recycling table after acceptance.
+                    let draft_started = Instant::now();
+                    let frontier = drafter.draft_dynamic_frontier(
+                        weights,
+                        anchor,
+                        Eagle3DynamicFrontierConfig {
+                            max_verify_nodes: round_node_budget,
+                            max_lattice_nodes: tree_lattice_nodes
+                                .expect("tree budget is present"),
+                            max_depth: budget,
+                            candidates_per_parent: tree_topk,
+                            max_head_expansions: tree_expansions,
+                        },
+                    )?;
+                    let materialized_head_forwards = frontier.materialized_head_forwards();
+                    let forest = frontier.finish()?;
+                    let actual_nodes = forest.scored.tree.nodes();
+                    let actual_max_depth = forest.scored.tree.max_depth();
+                    anyhow::ensure!(
+                        (2..=round_node_budget).contains(&actual_nodes),
+                        "dynamic E9 forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                    );
+                    run.drafted_token_ids
+                        .extend_from_slice(&forest.scored.tree.tokens[1..]);
+                    run.draft_us += draft_started.elapsed().as_micros();
+
+                    let verify_started = Instant::now();
+                    let verified = session
+                        .verify_tree_metal_with_layer_inputs_and_target_top_k(
+                            &forest.scored.tree,
+                            &TARGET_LAYER_INPUT_IDS,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "resident Metal E9 fallback verification became unavailable at position {target_before}"
+                            )
+                        })?;
+                    run.verify_us += verify_started.elapsed().as_micros();
+                    anyhow::ensure!(
+                        verified.predictions.len() == actual_nodes
+                            && verified.target_top_k.len() == actual_nodes,
+                        "E9 fallback target returned predictions/top-k rows {}/{} for {actual_nodes} verifier rows",
+                        verified.predictions.len(),
+                        verified.target_top_k.len(),
+                    );
+                    let acceptance = forest.accept_target_predictions(&verified.predictions)?;
+                    anyhow::ensure!(
+                        verified.emitted == acceptance.emitted_tokens,
+                        "E9 fallback host acceptance diverged from resident target emission"
+                    );
+                    anyhow::ensure!(
+                        acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
+                        "E9 fallback emitted/capture path lengths diverged: {}/{}",
+                        acceptance.emitted_tokens.len(),
+                        acceptance.capture_rows.len()
+                    );
+                    let update_started = Instant::now();
+                    drafter.accept_authoritative_forest(
+                        weights,
+                        &verified.layer_inputs,
+                        &acceptance,
+                    )?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+
+                    let mut candidate_ids = 0usize;
+                    for ((&from, candidates), &prediction) in forest
+                        .scored
+                        .tree
+                        .tokens
+                        .iter()
+                        .zip(&verified.target_top_k)
+                        .zip(&verified.predictions)
+                    {
+                        anyhow::ensure!(
+                            candidates[0] == prediction,
+                            "E9 fallback top-1 candidate {} disagrees with greedy prediction {prediction} for verifier token {from}",
+                            candidates[0]
+                        );
+                        candidate_ids += recycling.replace_target_candidates(from, candidates);
+                    }
+                    let emitted_count = acceptance.emitted_tokens.len();
+                    let offered = actual_nodes.saturating_sub(1);
+                    run.dynamic_tree_rounds += 1;
+                    run.dynamic_tree_offered += offered as u64;
+                    run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                    run.materialized_head_forwards += materialized_head_forwards as u64;
+                    run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                    run.token_recycling
+                        .note_candidates(actual_nodes, candidate_ids);
+                    run.token_recycling.note_e9(
+                        offered,
+                        emitted_count,
+                        !evidence.root_known,
+                    );
+                    if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                        eprintln!(
+                            "[eagle3-tr-hybrid] lane=e9 cold_seed={} rows={actual_nodes} \
+                             candidate_ids={candidate_ids} offered={offered} emitted={emitted_count}",
+                            !evidence.root_known,
+                        );
+                    }
+                    (acceptance.emitted_tokens, offered, actual_nodes)
+                }
             } else {
                 if !pending_suffix_head.is_empty() {
                     let update_started = Instant::now();
@@ -9376,6 +9712,25 @@ fn run_eagle3_resident_greedy(
         run.cpu_verify_rounds,
         run.rounds
     );
+    if token_recycling_hybrid {
+        anyhow::ensure!(
+            run.token_recycling.admission_decisions == run.rounds
+                && run.token_recycling.e9_rounds + run.token_recycling.tr_rounds == run.rounds
+                && run.token_recycling.admission_declines == run.token_recycling.e9_rounds,
+            "EAGLE/TR lane telemetry diverged: decisions={} declines={} e9={} tr={} rounds={}",
+            run.token_recycling.admission_decisions,
+            run.token_recycling.admission_declines,
+            run.token_recycling.e9_rounds,
+            run.token_recycling.tr_rounds,
+            run.rounds,
+        );
+        anyhow::ensure!(
+            run.token_recycling.candidate_rows == run.verify_nodes,
+            "EAGLE/TR top-k coverage missed verifier rows: candidates={} verified={}",
+            run.token_recycling.candidate_rows,
+            run.verify_nodes,
+        );
+    }
 
     Ok(run)
 }
@@ -9407,6 +9762,47 @@ struct BenchEagle3Record {
     tree_node_budget: Option<usize>,
     tree_topk: Option<usize>,
     tree_expansions: Option<usize>,
+    token_recycling_hybrid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_admission_decisions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_admission_declines: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_primary_depth_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_parent_rows_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_known_parent_rows_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_known_parent_share_q16_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_confidence_q16_scale: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_min_primary_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_min_known_parent_share_q16: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_e9_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_tr_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_cold_seed_anchors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_candidate_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_candidate_ids: Option<u64>,
     plain_generated_tokens: usize,
     eagle3_generated_tokens: usize,
     head_load_ms: f64,
@@ -9500,6 +9896,11 @@ struct BenchEagle3Record {
     peak_memory_bytes: u64,
 }
 
+fn eagle3_token_recycling_hybrid_enabled() -> bool {
+    std::env::var_os("CAMELID_BENCH_EAGLE3_TR_HYBRID")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
     const KEYS: &[&str] = &[
         "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
@@ -9526,6 +9927,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_V4_TRACE",
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID",
     ];
     KEYS.iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
@@ -9572,6 +9974,7 @@ fn run_bench_eagle3(
         "f5a87b575c502b9c93ce995198a54d683a02a53c";
     const PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
         "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
+    let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -9587,6 +9990,18 @@ fn run_bench_eagle3(
     anyhow::ensure!(
         !suffix_first || tree_nodes.is_some(),
         "--suffix-first requires --tree-nodes"
+    );
+    anyhow::ensure!(
+        !token_recycling_hybrid || tree_nodes.is_some_and(|nodes| nodes >= 3),
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID requires --tree-nodes >= 3"
+    );
+    anyhow::ensure!(
+        !token_recycling_hybrid || draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        !token_recycling_hybrid || !suffix_first,
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID cannot be combined with --suffix-first"
     );
     anyhow::ensure!(
         (1..=camelid::metal::EAGLE3_TOP_K_CANDIDATES).contains(&tree_topk),
@@ -9629,6 +10044,10 @@ fn run_bench_eagle3(
             "EAGLE-3 SHA-256 {eagle3_sha256} is not one of the four pinned checkpoint artifacts ({PINNED_EAGLE3_THOUGHTWORKS_SHA256}, {PINNED_EAGLE3_SHAREGPT_E8_SHA256}, {PINNED_EAGLE3_SHAREGPT_E9_SHA256}, {PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256})"
         ),
     };
+    anyhow::ensure!(
+        !token_recycling_hybrid || eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E9_SHA256,
+        "CAMELID_BENCH_EAGLE3_TR_HYBRID requires the pinned ShareGPT-E9 checkpoint"
+    );
     let pinned_sharegpt_config = match eagle3_sha256.as_str() {
         PINNED_EAGLE3_SHAREGPT_E8_SHA256 => Some((
             "ShareGPT-E8",
@@ -9735,6 +10154,7 @@ fn run_bench_eagle3(
         tree_topk,
         tree_expansions,
         suffix_first,
+        token_recycling_hybrid,
         checkpoint,
     )?;
 
@@ -9800,7 +10220,9 @@ fn run_bench_eagle3(
         prompt_tokens: prompt_token_ids.len(),
         max_tokens,
         draft_tokens,
-        draft_mode: if suffix_first {
+        draft_mode: if token_recycling_hybrid {
+            "dynamic_tree_e9_tr_hybrid"
+        } else if suffix_first {
             "suffix_then_dynamic_tree"
         } else if tree_nodes.is_some() {
             "dynamic_tree"
@@ -9810,6 +10232,48 @@ fn run_bench_eagle3(
         tree_node_budget: tree_nodes,
         tree_topk: tree_nodes.map(|_| tree_topk),
         tree_expansions: tree_nodes.map(|_| tree_expansions),
+        token_recycling_hybrid,
+        hybrid_admission_decisions: token_recycling_hybrid
+            .then_some(eagle.token_recycling.admission_decisions),
+        hybrid_admission_declines: token_recycling_hybrid
+            .then_some(eagle.token_recycling.admission_declines),
+        hybrid_primary_depth_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.primary_depth_sum),
+        hybrid_parent_rows_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.parent_rows_sum),
+        hybrid_known_parent_rows_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.known_parent_rows_sum),
+        hybrid_known_parent_share_q16_sum: token_recycling_hybrid
+            .then_some(eagle.token_recycling.known_parent_share_q16_sum),
+        hybrid_confidence_q16_scale: token_recycling_hybrid.then_some(
+            camelid::inference::token_recycling::TOKEN_RECYCLING_CONFIDENCE_Q16_ONE,
+        ),
+        hybrid_min_primary_depth: token_recycling_hybrid.then_some(
+            camelid::inference::token_recycling::TOKEN_RECYCLING_MIN_PRIMARY_DEPTH,
+        ),
+        hybrid_min_known_parent_share_q16: token_recycling_hybrid.then_some(
+            camelid::inference::token_recycling::TOKEN_RECYCLING_MIN_KNOWN_PARENT_SHARE_Q16,
+        ),
+        hybrid_e9_rounds: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_rounds),
+        hybrid_e9_offered: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_offered),
+        hybrid_e9_accepted_drafts: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_accepted_drafts),
+        hybrid_e9_emitted_tokens: token_recycling_hybrid
+            .then_some(eagle.token_recycling.e9_emitted_tokens),
+        hybrid_tr_rounds: token_recycling_hybrid.then_some(eagle.token_recycling.tr_rounds),
+        hybrid_tr_offered: token_recycling_hybrid.then_some(eagle.token_recycling.tr_offered),
+        hybrid_tr_accepted_drafts: token_recycling_hybrid
+            .then_some(eagle.token_recycling.tr_accepted_drafts),
+        hybrid_tr_emitted_tokens: token_recycling_hybrid
+            .then_some(eagle.token_recycling.tr_emitted_tokens),
+        hybrid_cold_seed_anchors: token_recycling_hybrid
+            .then_some(eagle.token_recycling.cold_seed_anchors),
+        hybrid_candidate_rows: token_recycling_hybrid
+            .then_some(eagle.token_recycling.candidate_rows),
+        hybrid_candidate_ids: token_recycling_hybrid
+            .then_some(eagle.token_recycling.candidate_ids),
         plain_generated_tokens: plain.generated.len(),
         eagle3_generated_tokens: eagle.generated.len(),
         head_load_ms,
@@ -9908,6 +10372,23 @@ fn run_bench_eagle3(
         record.speedup,
         if record.lossless { "LOSSLESS ✓" } else { "DIVERGED" },
     );
+    if token_recycling_hybrid {
+        eprintln!(
+            "[bench-eagle3-hybrid] E9 rounds={} offered={} accepted={} emitted={} | \
+             TR rounds={} offered={} accepted={} emitted={} | cold seeds={} rows={} ids={}",
+            eagle.token_recycling.e9_rounds,
+            eagle.token_recycling.e9_offered,
+            eagle.token_recycling.e9_accepted_drafts,
+            eagle.token_recycling.e9_emitted_tokens,
+            eagle.token_recycling.tr_rounds,
+            eagle.token_recycling.tr_offered,
+            eagle.token_recycling.tr_accepted_drafts,
+            eagle.token_recycling.tr_emitted_tokens,
+            eagle.token_recycling.cold_seed_anchors,
+            eagle.token_recycling.candidate_rows,
+            eagle.token_recycling.candidate_ids,
+        );
+    }
     anyhow::ensure!(
         record.lossless,
         "EAGLE-3 output diverged from the resident plain target at generated token {}",

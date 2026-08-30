@@ -20,6 +20,41 @@ use std::collections::HashMap;
 
 use crate::inference::spec_tree::{TokenTree, TreeDrafter};
 
+/// Fixed-point scale for structural Token Recycling admission evidence.
+pub const TOKEN_RECYCLING_CONFIDENCE_Q16_ONE: u32 = 1 << 16;
+/// A hybrid round needs two already-supported rank-0 edges before replacing EAGLE drafting.
+pub const TOKEN_RECYCLING_MIN_PRIMARY_DEPTH: usize = 2;
+/// At least half of the possible parent rows above the proposed tree's deepest level must have
+/// exact target rows. This rejects a deep primary path when most competing parent slots are cold.
+pub const TOKEN_RECYCLING_MIN_KNOWN_PARENT_SHARE_Q16: u32 = TOKEN_RECYCLING_CONFIDENCE_Q16_ONE / 2;
+
+/// Deterministic, model-free evidence used by the benchmark EAGLE/TR hybrid.
+///
+/// Every field is computed from target rows that were installed before the current target
+/// verification. There are no logits, probabilities, future outcomes, or accepted-stream counts
+/// in this decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRecyclingTreeEvidence {
+    pub root_known: bool,
+    pub nodes: usize,
+    pub max_depth: usize,
+    /// Depth of the first-child path. Target rows preserve rank order, so this is the depth of
+    /// the candidate chain formed by the previously observed target top-1 at each step.
+    pub primary_depth: usize,
+    /// Proposed nodes above the deepest level: these are the rows that could have expanded the
+    /// known forest further during this draft.
+    pub parent_rows: usize,
+    pub known_parent_rows: usize,
+    pub known_parent_share_q16: u32,
+    pub admitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRecyclingTreeProposal {
+    pub tree: TokenTree,
+    pub evidence: TokenRecyclingTreeEvidence,
+}
+
 /// Per-token successor counts: `succ[token]` maps a following token to how
 /// often it has been observed in that position.
 #[derive(Debug, Clone)]
@@ -88,6 +123,98 @@ impl TokenRecyclingDrafter {
             self.target_rows.insert(from, row);
         }
         stored
+    }
+
+    /// Whether this token already has an exact target candidate row in the current run.
+    pub fn has_target_candidates(&self, token: u32) -> bool {
+        self.target_rows.contains_key(&token)
+    }
+
+    /// Build and assess a tree using only exact target rows already known before this round.
+    ///
+    /// Unlike [`TreeDrafter::draft_tree`], this is read-only and never consults or mutates the
+    /// accepted-stream frequency fallback. It is therefore suitable for a deterministic hybrid
+    /// admission decision: EAGLE remains the cold/low-support fallback, while Token Recycling is
+    /// admitted only once its in-session target-row forest is both deep and sufficiently covered.
+    pub fn draft_known_target_tree(
+        &self,
+        anchor: u32,
+        max_nodes: usize,
+        max_depth: usize,
+    ) -> TokenRecyclingTreeProposal {
+        let root_known = self.has_target_candidates(anchor);
+        let mut tree = TokenTree::linear(anchor, &[]);
+        if max_nodes > 1 && max_depth > 0 && self.branch > 0 {
+            let mut frontier = vec![0usize];
+            while let Some(node) = pop_front(&mut frontier) {
+                if tree.nodes() >= max_nodes {
+                    break;
+                }
+                let node_depth = tree.depth[node] as usize;
+                if node_depth >= max_depth {
+                    continue;
+                }
+                let Some(successors) = self.target_rows.get(&tree.tokens[node]) else {
+                    continue;
+                };
+                for &token in successors.iter().take(self.branch.min(self.topk)) {
+                    if tree.nodes() >= max_nodes {
+                        break;
+                    }
+                    let child = tree.nodes();
+                    tree.tokens.push(token);
+                    tree.parent.push(node as i32);
+                    tree.depth.push((node_depth + 1) as u16);
+                    frontier.push(child);
+                }
+            }
+        }
+
+        let proposed_max_depth = tree.max_depth();
+        let mut primary_depth = 0usize;
+        let mut primary_parent = 0usize;
+        loop {
+            let Some(child) = ((primary_parent + 1)..tree.nodes())
+                .find(|&node| tree.parent[node] == primary_parent as i32)
+            else {
+                break;
+            };
+            primary_depth += 1;
+            primary_parent = child;
+        }
+        let parent_rows = tree
+            .depth
+            .iter()
+            .filter(|&&depth| (depth as usize) < proposed_max_depth)
+            .count();
+        let known_parent_rows = tree
+            .tokens
+            .iter()
+            .zip(&tree.depth)
+            .filter(|(token, depth)| {
+                (**depth as usize) < proposed_max_depth && self.has_target_candidates(**token)
+            })
+            .count();
+        let known_parent_share_q16 = if parent_rows == 0 {
+            0
+        } else {
+            ((known_parent_rows as u64 * TOKEN_RECYCLING_CONFIDENCE_Q16_ONE as u64)
+                / parent_rows as u64) as u32
+        };
+        let admitted = root_known
+            && primary_depth >= TOKEN_RECYCLING_MIN_PRIMARY_DEPTH
+            && known_parent_share_q16 >= TOKEN_RECYCLING_MIN_KNOWN_PARENT_SHARE_Q16;
+        let evidence = TokenRecyclingTreeEvidence {
+            root_known,
+            nodes: tree.nodes(),
+            max_depth: proposed_max_depth,
+            primary_depth,
+            parent_rows,
+            known_parent_rows,
+            known_parent_share_q16,
+            admitted,
+        };
+        TokenRecyclingTreeProposal { tree, evidence }
     }
 
     /// Learn every adjacent transition in an observed token stream (the
@@ -240,6 +367,64 @@ mod tests {
             [10, 7, 9],
             "latest target evidence replaces, rather than accumulates with, the old row"
         );
+    }
+
+    #[test]
+    fn known_target_forest_admission_is_pure_deep_and_coverage_gated() {
+        let mut d = TokenRecyclingDrafter::new();
+        d.branch = 2;
+
+        let cold = d.draft_known_target_tree(10, 7, 3);
+        assert_eq!(cold.tree, TokenTree::linear(10, &[]));
+        assert!(!cold.evidence.root_known);
+        assert!(!cold.evidence.admitted);
+
+        d.replace_target_candidates(10, &[20, 30]);
+        let shallow = d.draft_known_target_tree(10, 7, 3);
+        assert!(shallow.evidence.root_known);
+        assert_eq!(shallow.evidence.primary_depth, 1);
+        assert!(!shallow.evidence.admitted);
+
+        d.replace_target_candidates(20, &[40, 50]);
+        let deep = d.draft_known_target_tree(10, 7, 3);
+        assert_eq!(deep.evidence.primary_depth, 2);
+        assert_eq!(deep.evidence.parent_rows, 3);
+        assert_eq!(deep.evidence.known_parent_rows, 2);
+        assert_eq!(deep.evidence.known_parent_share_q16, 43_690);
+        assert!(deep.evidence.admitted);
+        assert_eq!(deep, d.draft_known_target_tree(10, 7, 3));
+    }
+
+    #[test]
+    fn known_target_forest_rejects_supported_alternative_without_primary_depth() {
+        let mut d = TokenRecyclingDrafter::new();
+        d.branch = 2;
+        d.replace_target_candidates(10, &[20, 30]);
+        d.replace_target_candidates(30, &[40, 50]);
+
+        let proposal = d.draft_known_target_tree(10, 7, 3);
+        assert_eq!(proposal.evidence.max_depth, 2);
+        assert_eq!(proposal.evidence.primary_depth, 1);
+        assert_eq!(proposal.evidence.known_parent_rows, 2);
+        assert!(!proposal.evidence.admitted);
+    }
+
+    #[test]
+    fn known_target_forest_rejects_low_known_parent_share() {
+        let mut d = TokenRecyclingDrafter::new();
+        d.branch = 4;
+        d.topk = 4;
+        d.replace_target_candidates(10, &[20, 30, 40, 50]);
+        d.replace_target_candidates(20, &[60]);
+
+        let proposal = d.draft_known_target_tree(10, 9, 3);
+        assert_eq!(proposal.evidence.primary_depth, 2);
+        assert_eq!(proposal.evidence.parent_rows, 5);
+        assert_eq!(proposal.evidence.known_parent_rows, 2);
+        assert!(
+            proposal.evidence.known_parent_share_q16 < TOKEN_RECYCLING_MIN_KNOWN_PARENT_SHARE_Q16
+        );
+        assert!(!proposal.evidence.admitted);
     }
 
     #[test]
