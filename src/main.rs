@@ -9062,6 +9062,183 @@ fn eagle3_token_recycling_telemetry_splits_e9_tr_and_cold_seed_rounds() {
     assert_eq!(telemetry.candidate_ids, 120);
 }
 
+const EAGLE3_ADAPTIVE_EXPANSION_WINDOW: usize = 4;
+const EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS: usize = 4;
+const EAGLE3_ADAPTIVE_DEEP_EXPANSIONS: usize = 7;
+const EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM: u32 = 12;
+const EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM: u32 = 16;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Eagle3AdaptiveExpansionMode {
+    #[default]
+    Shallow,
+    Deep,
+}
+
+impl Eagle3AdaptiveExpansionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shallow => "shallow",
+            Self::Deep => "deep",
+        }
+    }
+
+    fn expansions(self) -> usize {
+        match self {
+            Self::Shallow => EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS,
+            Self::Deep => EAGLE3_ADAPTIVE_DEEP_EXPANSIONS,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3AdaptiveExpansionTelemetry {
+    shallow_rounds: u64,
+    shallow_accepted_drafts: u64,
+    deep_rounds: u64,
+    deep_accepted_drafts: u64,
+    shallow_to_deep_transitions: u64,
+    deep_to_shallow_transitions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Eagle3AdaptiveExpansionDecision {
+    used_mode: Eagle3AdaptiveExpansionMode,
+    next_mode: Eagle3AdaptiveExpansionMode,
+    accepted_drafts: u32,
+    window_count: usize,
+    window_sum: u32,
+}
+
+/// Causal controller for the benchmark-only EAGLE expansion experiment.
+///
+/// A round reads [`Self::expansions`] before target verification, then reports only that
+/// completed round's target-authoritative accepted-draft count. Therefore a transition can
+/// affect the next round but never the proposal that produced its own observation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3AdaptiveExpansionController {
+    mode: Eagle3AdaptiveExpansionMode,
+    last_accepted: [u8; EAGLE3_ADAPTIVE_EXPANSION_WINDOW],
+    history_len: usize,
+    history_cursor: usize,
+    telemetry: Eagle3AdaptiveExpansionTelemetry,
+}
+
+impl Eagle3AdaptiveExpansionController {
+    #[cfg(test)]
+    fn mode(&self) -> Eagle3AdaptiveExpansionMode {
+        self.mode
+    }
+
+    fn expansions(&self) -> usize {
+        self.mode.expansions()
+    }
+
+    fn telemetry(&self) -> Eagle3AdaptiveExpansionTelemetry {
+        self.telemetry
+    }
+
+    fn note_completed_round(
+        &mut self,
+        accepted_drafts: usize,
+    ) -> Eagle3AdaptiveExpansionDecision {
+        let accepted_drafts = u8::try_from(accepted_drafts)
+            .expect("an eight-node verifier accepts at most seven draft tokens");
+        let used_mode = self.mode;
+        match used_mode {
+            Eagle3AdaptiveExpansionMode::Shallow => {
+                self.telemetry.shallow_rounds += 1;
+                self.telemetry.shallow_accepted_drafts += u64::from(accepted_drafts);
+            }
+            Eagle3AdaptiveExpansionMode::Deep => {
+                self.telemetry.deep_rounds += 1;
+                self.telemetry.deep_accepted_drafts += u64::from(accepted_drafts);
+            }
+        }
+
+        self.last_accepted[self.history_cursor] = accepted_drafts;
+        self.history_cursor =
+            (self.history_cursor + 1) % EAGLE3_ADAPTIVE_EXPANSION_WINDOW;
+        self.history_len = (self.history_len + 1).min(EAGLE3_ADAPTIVE_EXPANSION_WINDOW);
+        let window_sum = self.last_accepted[..self.history_len]
+            .iter()
+            .map(|&value| u32::from(value))
+            .sum();
+
+        if self.history_len == EAGLE3_ADAPTIVE_EXPANSION_WINDOW {
+            match used_mode {
+                Eagle3AdaptiveExpansionMode::Shallow
+                    if window_sum >= EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM =>
+                {
+                    self.mode = Eagle3AdaptiveExpansionMode::Deep;
+                    self.telemetry.shallow_to_deep_transitions += 1;
+                }
+                Eagle3AdaptiveExpansionMode::Deep
+                    if window_sum < EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM =>
+                {
+                    self.mode = Eagle3AdaptiveExpansionMode::Shallow;
+                    self.telemetry.deep_to_shallow_transitions += 1;
+                }
+                _ => {}
+            }
+        }
+
+        Eagle3AdaptiveExpansionDecision {
+            used_mode,
+            next_mode: self.mode,
+            accepted_drafts: u32::from(accepted_drafts),
+            window_count: self.history_len,
+            window_sum,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansions_are_causal_and_start_shallow() {
+    let mut controller = Eagle3AdaptiveExpansionController::default();
+    for round in 0..4 {
+        assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS);
+        let decision = controller.note_completed_round(3);
+        assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        if round < 3 {
+            assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        }
+    }
+    // The fourth completed shallow result changes only round five.
+    assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_DEEP_EXPANSIONS);
+    assert_eq!(controller.telemetry().shallow_rounds, 4);
+    assert_eq!(controller.telemetry().shallow_accepted_drafts, 12);
+    assert_eq!(controller.telemetry().shallow_to_deep_transitions, 1);
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansions_use_last_four_with_asymmetric_thresholds() {
+    let mut controller = Eagle3AdaptiveExpansionController::default();
+    for accepted in [4, 4, 4, 4] {
+        controller.note_completed_round(accepted);
+    }
+    assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Deep);
+
+    // A deep round is allowed to complete before its result can move the next round shallow.
+    let decision = controller.note_completed_round(3);
+    assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(decision.window_count, 4);
+    assert_eq!(decision.window_sum, 15);
+    assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(controller.telemetry().deep_rounds, 1);
+    assert_eq!(controller.telemetry().deep_accepted_drafts, 3);
+    assert_eq!(controller.telemetry().deep_to_shallow_transitions, 1);
+
+    // The sliding window, not lifetime history, controls re-entry at mean >= 3.0.
+    for accepted in [0, 4, 4, 4] {
+        controller.note_completed_round(accepted);
+    }
+    assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(controller.telemetry().shallow_to_deep_transitions, 2);
+}
+
 #[derive(Default)]
 struct Eagle3BenchRun {
     generated: Vec<u32>,
@@ -9102,6 +9279,7 @@ struct Eagle3BenchRun {
     dynamic_tree_emitted_tokens: u64,
     materialized_head_forwards: u64,
     dynamic_tree_max_depth_sum: u64,
+    adaptive_expansions: Eagle3AdaptiveExpansionTelemetry,
     token_recycling: Eagle3TokenRecyclingTelemetry,
 }
 
@@ -9163,6 +9341,7 @@ fn run_eagle3_resident_greedy(
     tree_nodes: Option<usize>,
     tree_topk: usize,
     tree_expansions: usize,
+    adaptive_expansions: bool,
     suffix_first: bool,
     token_recycling_hybrid: bool,
     checkpoint: camelid::eagle3::Eagle3DraftModel,
@@ -9212,6 +9391,9 @@ fn run_eagle3_resident_greedy(
     let seed_started = Instant::now();
     drafter.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
     run.head_seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+    // Size the temporary lattice from the caller's requested maximum, not the controller's
+    // current shallow value. A later causal move to seven expansions therefore changes only
+    // the expansion limit for that next round; it never runs against a truncated lattice.
     let tree_lattice_nodes = tree_nodes
         .map(|node_budget| {
             tree_topk
@@ -9230,6 +9412,8 @@ fn run_eagle3_resident_greedy(
         drafter
     });
     let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
+    let mut adaptive_expansion_controller =
+        adaptive_expansions.then(Eagle3AdaptiveExpansionController::default);
     let mut suffix_history = suffix_first.then(|| {
         let mut history = Vec::with_capacity(prompt_tokens.len() + max_tokens);
         history.extend_from_slice(prompt_tokens);
@@ -9271,6 +9455,9 @@ fn run_eagle3_resident_greedy(
 
         let anchor = *run.generated.last().expect("generated is seeded");
         let target_before = session.kv_position();
+        let round_tree_expansions = adaptive_expansion_controller
+            .as_ref()
+            .map_or(tree_expansions, Eagle3AdaptiveExpansionController::expansions);
         let (emitted, offered, verify_nodes) = if let Some(node_budget) = tree_nodes {
             let round_node_budget = node_budget.min(context_room);
             let suffix_drafts = if let (Some(suffix), Some(history)) =
@@ -9468,7 +9655,7 @@ fn run_eagle3_resident_greedy(
                                 .expect("tree budget is present"),
                             max_depth: budget,
                             candidates_per_parent: tree_topk,
-                            max_head_expansions: tree_expansions,
+                            max_head_expansions: round_tree_expansions,
                         },
                     )?;
                     let materialized_head_forwards = frontier.materialized_head_forwards();
@@ -9584,7 +9771,7 @@ fn run_eagle3_resident_greedy(
                         max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
                         max_depth: budget,
                         candidates_per_parent: tree_topk,
-                        max_head_expansions: tree_expansions,
+                        max_head_expansions: round_tree_expansions,
                     },
                 )?;
                 let materialized_head_forwards = frontier.materialized_head_forwards();
@@ -9687,6 +9874,28 @@ fn run_eagle3_resident_greedy(
         run.drafted += offered as u64;
         run.accepted_drafts += emitted.len().saturating_sub(1) as u64;
         run.verify_nodes += verify_nodes as u64;
+        if let Some(controller) = adaptive_expansion_controller.as_mut() {
+            let decision = controller.note_completed_round(emitted.len().saturating_sub(1));
+            if std::env::var_os("CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE").is_some() {
+                eprintln!(
+                    "[eagle3-adaptive-expansions] round={} used={} expansions={} accepted={} \
+                     window={}/{} sum={} next={} transition={}",
+                    run.rounds,
+                    decision.used_mode.label(),
+                    decision.used_mode.expansions(),
+                    decision.accepted_drafts,
+                    decision.window_count,
+                    EAGLE3_ADAPTIVE_EXPANSION_WINDOW,
+                    decision.window_sum,
+                    decision.next_mode.label(),
+                    if decision.used_mode == decision.next_mode {
+                        "none"
+                    } else {
+                        "yes"
+                    },
+                );
+            }
+        }
         let generated_before = run.generated.len();
         for token in emitted {
             if run.generated.len() >= max_tokens {
@@ -9704,6 +9913,9 @@ fn run_eagle3_resident_greedy(
     // Once generation has stopped, no consumer can observe the learned head again. Deliberately
     // drop a final suffix-only streak instead of paying a useless catch-up in the epilogue.
     run.suffix_head_discarded_rows = pending_suffix_head.pending_rows() as u64;
+    if let Some(controller) = adaptive_expansion_controller {
+        run.adaptive_expansions = controller.telemetry();
+    }
     run.decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
     anyhow::ensure!(
         run.cpu_verify_rounds == 0 && run.resident_verify_rounds == run.rounds,
@@ -9729,6 +9941,25 @@ fn run_eagle3_resident_greedy(
             "EAGLE/TR top-k coverage missed verifier rows: candidates={} verified={}",
             run.token_recycling.candidate_rows,
             run.verify_nodes,
+        );
+    }
+    if adaptive_expansions {
+        anyhow::ensure!(
+            run.adaptive_expansions.shallow_rounds + run.adaptive_expansions.deep_rounds
+                == run.rounds,
+            "adaptive expansion telemetry missed rounds: shallow={} deep={} total={}",
+            run.adaptive_expansions.shallow_rounds,
+            run.adaptive_expansions.deep_rounds,
+            run.rounds,
+        );
+        anyhow::ensure!(
+            run.adaptive_expansions.shallow_accepted_drafts
+                + run.adaptive_expansions.deep_accepted_drafts
+                == run.accepted_drafts,
+            "adaptive expansion telemetry missed accepted drafts: shallow={} deep={} total={}",
+            run.adaptive_expansions.shallow_accepted_drafts,
+            run.adaptive_expansions.deep_accepted_drafts,
+            run.accepted_drafts,
         );
     }
 
@@ -9762,6 +9993,29 @@ struct BenchEagle3Record {
     tree_node_budget: Option<usize>,
     tree_topk: Option<usize>,
     tree_expansions: Option<usize>,
+    adaptive_expansions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_window_rounds: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_expansions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_expansions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_to_deep_min_accepted_sum: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_to_shallow_below_accepted_sum: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_accepted_drafts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_to_deep_transitions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_to_shallow_transitions: Option<u64>,
     token_recycling_hybrid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     hybrid_admission_decisions: Option<u64>,
@@ -9901,6 +10155,53 @@ fn eagle3_token_recycling_hybrid_enabled() -> bool {
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
+fn eagle3_adaptive_expansions_enabled() -> bool {
+    std::env::var_os("CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn validate_eagle3_adaptive_expansions_config(
+    enabled: bool,
+    tree_nodes: Option<usize>,
+    tree_expansions: usize,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes == Some(8),
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS requires --tree-nodes 8"
+    );
+    anyhow::ensure!(
+        tree_expansions >= EAGLE3_ADAPTIVE_DEEP_EXPANSIONS,
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS requires --tree-expansions >= {}",
+        EAGLE3_ADAPTIVE_DEEP_EXPANSIONS
+    );
+    anyhow::ensure!(
+        !suffix_first,
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS cannot be combined with --suffix-first"
+    );
+    anyhow::ensure!(
+        !token_recycling_hybrid,
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS cannot be combined with CAMELID_BENCH_EAGLE3_TR_HYBRID"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansion_config_fails_closed() {
+    assert!(validate_eagle3_adaptive_expansions_config(false, None, 1, true, true).is_ok());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 7, false, false).is_ok());
+    assert!(validate_eagle3_adaptive_expansions_config(true, None, 7, false, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(7), 7, false, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 6, false, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 7, true, false).is_err());
+    assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 7, false, true).is_err());
+}
+
 fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
     const KEYS: &[&str] = &[
         "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
@@ -9929,6 +10230,8 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
         "CAMELID_BENCH_EAGLE3_TR_HYBRID",
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS",
+        "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE",
     ];
     KEYS.iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
@@ -9976,6 +10279,7 @@ fn run_bench_eagle3(
     const PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
         "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
     let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
+    let adaptive_expansions = eagle3_adaptive_expansions_enabled();
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -10014,6 +10318,13 @@ fn run_bench_eagle3(
         "--tree-expansions must be in 1..={} (including the root)",
         camelid::inference::spec_tree::TREE_MAX_NODES
     );
+    validate_eagle3_adaptive_expansions_config(
+        adaptive_expansions,
+        tree_nodes,
+        tree_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+    )?;
     configure_rayon_threads(threads)?;
     let input_text = match (&prompt_file, &prompt) {
         (Some(path), _) => std::fs::read_to_string(path)?,
@@ -10154,6 +10465,7 @@ fn run_bench_eagle3(
         tree_nodes,
         tree_topk,
         tree_expansions,
+        adaptive_expansions,
         suffix_first,
         token_recycling_hybrid,
         checkpoint,
@@ -10223,6 +10535,8 @@ fn run_bench_eagle3(
         draft_tokens,
         draft_mode: if token_recycling_hybrid {
             "dynamic_tree_e9_tr_hybrid"
+        } else if adaptive_expansions {
+            "dynamic_tree_adaptive_expansions"
         } else if suffix_first {
             "suffix_then_dynamic_tree"
         } else if tree_nodes.is_some() {
@@ -10233,6 +10547,29 @@ fn run_bench_eagle3(
         tree_node_budget: tree_nodes,
         tree_topk: tree_nodes.map(|_| tree_topk),
         tree_expansions: tree_nodes.map(|_| tree_expansions),
+        adaptive_expansions,
+        adaptive_window_rounds: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_EXPANSION_WINDOW),
+        adaptive_shallow_expansions: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS),
+        adaptive_deep_expansions: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_DEEP_EXPANSIONS),
+        adaptive_shallow_to_deep_min_accepted_sum: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM),
+        adaptive_deep_to_shallow_below_accepted_sum: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM),
+        adaptive_shallow_rounds: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_rounds),
+        adaptive_shallow_accepted_drafts: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_accepted_drafts),
+        adaptive_deep_rounds: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_rounds),
+        adaptive_deep_accepted_drafts: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_accepted_drafts),
+        adaptive_shallow_to_deep_transitions: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_to_deep_transitions),
+        adaptive_deep_to_shallow_transitions: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_to_shallow_transitions),
         token_recycling_hybrid,
         hybrid_admission_decisions: token_recycling_hybrid
             .then_some(eagle.token_recycling.admission_decisions),
@@ -10388,6 +10725,18 @@ fn run_bench_eagle3(
             eagle.token_recycling.cold_seed_anchors,
             eagle.token_recycling.candidate_rows,
             eagle.token_recycling.candidate_ids,
+        );
+    }
+    if adaptive_expansions {
+        eprintln!(
+            "[bench-eagle3-adaptive-expansions] shallow rounds={} accepted={} | \
+             deep rounds={} accepted={} | transitions shallow->deep={} deep->shallow={}",
+            eagle.adaptive_expansions.shallow_rounds,
+            eagle.adaptive_expansions.shallow_accepted_drafts,
+            eagle.adaptive_expansions.deep_rounds,
+            eagle.adaptive_expansions.deep_accepted_drafts,
+            eagle.adaptive_expansions.shallow_to_deep_transitions,
+            eagle.adaptive_expansions.deep_to_shallow_transitions,
         );
     }
     anyhow::ensure!(
