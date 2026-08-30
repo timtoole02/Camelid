@@ -1461,6 +1461,30 @@ impl super::LlamaInferenceSession {
             }))
     }
 
+    /// Benchmark-only combined EAGLE capture and Token Recycling candidate seam.
+    ///
+    /// The target tree forward and commit rule are identical to
+    /// [`Self::verify_tree_metal_with_layer_inputs`]. The only additional work is the opt-in
+    /// compact top-8 dispatch/readback for each verifier row.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_and_target_top_k(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, capture_layer_ids, true, true)?
+            .map(
+                |(emitted, capture, target_top_k)| LlamaTargetTopKVerifyCapture {
+                    predictions: capture.predictions,
+                    target_top_k,
+                    emitted,
+                    layer_inputs: capture.layer_inputs,
+                    timings: capture.timings,
+                },
+            ))
+    }
+
     /// Non-committing target top-k probe used to bootstrap an empty Token Recycling row.
     ///
     /// The resident target executes the same exact tree forward, but logical/Metal `filled` and
@@ -1598,23 +1622,44 @@ impl super::LlamaInferenceSession {
         // Keep the existing no-capture entry point byte-for-byte on its original Metal API.
         // Only the new EAGLE seam asks verify_batch_inner to retain layer-input buffers.
         let (predicted, raw_layer_inputs, target_top_k) = if read_target_top_k {
-            debug_assert!(capture_layer_ids.is_empty());
-            let Some((predicted, target_top_k)) = session.verify_batch_tree_with_target_top_k(
-                &embeddings.data,
-                &cos_all,
-                &sin_all,
-                &layer_views,
-                &logits_stage,
-                &node_kvslot,
-                &ancestor_bits,
-                words,
-                position,
-                n,
-                scale,
-            ) else {
-                return Ok(None);
-            };
-            (predicted, Vec::new(), target_top_k)
+            if capture_layer_ids.is_empty() {
+                let Some((predicted, target_top_k)) = session.verify_batch_tree_with_target_top_k(
+                    &embeddings.data,
+                    &cos_all,
+                    &sin_all,
+                    &layer_views,
+                    &logits_stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    position,
+                    n,
+                    scale,
+                ) else {
+                    return Ok(None);
+                };
+                (predicted, Vec::new(), target_top_k)
+            } else {
+                let Some((predicted, raw_layer_inputs, target_top_k)) = session
+                    .verify_batch_tree_with_layer_inputs_and_target_top_k(
+                        &embeddings.data,
+                        &cos_all,
+                        &sin_all,
+                        &layer_views,
+                        &logits_stage,
+                        &node_kvslot,
+                        &ancestor_bits,
+                        words,
+                        position,
+                        n,
+                        scale,
+                        capture_layer_ids,
+                    )
+                else {
+                    return Ok(None);
+                };
+                (predicted, raw_layer_inputs, target_top_k)
+            }
         } else if capture_layer_ids.is_empty() {
             let Some(predicted) = session.verify_batch_tree(
                 &embeddings.data,
@@ -1764,6 +1809,17 @@ impl super::LlamaInferenceSession {
         &mut self,
         _tree: &spec_tree::TokenTree,
     ) -> Result<Option<LlamaTargetTopKVerify>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: combined Metal layer capture/target-top-k is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_and_target_top_k(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
         Ok(None)
     }
 

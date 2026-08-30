@@ -32696,6 +32696,50 @@ impl ResidentDecodeState {
         .map(|(preds, _, _, target_top_k)| (preds, target_top_k))
     }
 
+    /// Benchmark-only EAGLE/Token-Recycling twin that retains both selected decoder-layer
+    /// inputs and the exact target top-8 ids for every BFS verifier row. This is a thin opt-in
+    /// wrapper over the same forward used by the two individual seams; greedy predictions still
+    /// come from the unchanged production argmax buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_tree_with_layer_inputs_and_target_top_k(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+        capture_layer_ids: &[usize],
+    ) -> Option<(
+        Vec<u32>,
+        Vec<Vec<f32>>,
+        Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>,
+    )> {
+        let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            n,
+            scale,
+            false,
+            true,
+            Some(&tree),
+            capture_layer_ids,
+        )
+        .map(|(preds, _, layer_inputs, target_top_k)| {
+            (preds, layer_inputs, target_top_k)
+        })
+    }
+
     /// `verify_batch_tree` that also reads back the `n * vocab` pre-argmax logits (the gate
     /// compares logits by exact `to_bits`). Test-only.
     #[cfg(test)]
@@ -49733,6 +49777,31 @@ mod tests {
                     "LINEAR base={base} tree layer-0 capture element {index}"
                 );
             }
+
+            // The benchmark hybrid's combined seam must be exactly the composition of the two
+            // opt-in readbacks above: same production predictions, same candidate rows, and
+            // bit-identical captures.
+            let mut combined_session = mk_session();
+            let stage = make_stage();
+            let (combined_preds, combined_captures, combined_top_k) = combined_session
+                .verify_batch_tree_with_layer_inputs_and_target_top_k(
+                    &emb_all,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    base,
+                    k,
+                    scale,
+                    &[0, 1],
+                )
+                .expect("combined tree capture/target-top-k eligible");
+            assert_eq!(combined_preds, tree_preds);
+            assert_eq!(combined_top_k, target_top_k);
+            assert_eq!(combined_captures, captures);
             for i in 0..k {
                 let pc = base + i + 1;
                 for v in 0..vocab {
@@ -49860,6 +49929,29 @@ mod tests {
             for row in 0..n {
                 assert_eq!(target_top_k[row][0], predicted[row]);
             }
+
+            let mut combined_tree_session = mk_session();
+            let stage = make_stage();
+            let (combined_predictions, combined_captures, combined_top_k) =
+                combined_tree_session
+                    .verify_batch_tree_with_layer_inputs_and_target_top_k(
+                        &emb_node,
+                        &cos_all,
+                        &sin_all,
+                        &weights,
+                        &stage,
+                        &node_kvslot,
+                        &ancestor_bits,
+                        words,
+                        base,
+                        n,
+                        scale,
+                        &[0],
+                    )
+                    .expect("branching combined tree capture/target-top-k eligible");
+            assert_eq!(combined_predictions, predicted);
+            assert_eq!(combined_top_k, target_top_k);
+            assert_eq!(combined_captures, vec![emb_node.clone()]);
 
             // Craft tokens so accept_longest_path follows the right branch 0 -> 2 -> 5 (a
             // genuine reorder: path[1]=2!=1 and path[2]=5!=2, so compaction does real work).

@@ -1527,6 +1527,20 @@ pub struct LlamaTargetTopKVerify {
     pub timings: LlamaForwardTimings,
 }
 
+/// EAGLE-capable target verification with both decoder captures and compact target candidates.
+///
+/// This remains opt-in: ordinary greedy, EAGLE, and Token Recycling callers keep their existing
+/// result types and Metal entry points. `layer_inputs` and `target_top_k` share verifier-row order,
+/// while `predictions` continues to come from the production greedy argmax buffer.
+#[derive(Debug, Clone)]
+pub struct LlamaTargetTopKVerifyCapture {
+    pub predictions: Vec<u32>,
+    pub target_top_k: Vec<[u32; 8]>,
+    pub emitted: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub timings: LlamaForwardTimings,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaTensorCheckpoint {
     pub shape: Vec<usize>,
