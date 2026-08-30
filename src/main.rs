@@ -9368,6 +9368,8 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_V2",
         "CAMELID_KQUANT_V3",
         "CAMELID_KQUANT_V4",
+        "CAMELID_KQUANT_V4_DIRECT_FRAGMENT",
+        "CAMELID_KQUANT_V4_SHARED_PREP",
         "CAMELID_KQUANT_V4_TRACE",
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
