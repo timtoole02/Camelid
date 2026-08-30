@@ -685,6 +685,48 @@ pub struct Eagle3Drafter {
     stable_seed: Option<Eagle3MetalOutput>,
 }
 
+fn stable_root_target_top_k(output: &Eagle3MetalOutput, count: usize) -> Result<Vec<u32>> {
+    if count == 0 || count > crate::metal::EAGLE3_TOP_K_CANDIDATES {
+        return Err(invalid(format!(
+            "EAGLE-3 stable-root ranking count must be in 1..={}, got {count}",
+            crate::metal::EAGLE3_TOP_K_CANDIDATES
+        )));
+    }
+    if output.evaluated_vocab_rows != crate::metal::EAGLE3_DRAFT_VOCAB {
+        return Err(invalid(format!(
+            "EAGLE-3 stable-root ranking requires all {} draft rows, evaluated {}",
+            crate::metal::EAGLE3_DRAFT_VOCAB,
+            output.evaluated_vocab_rows
+        )));
+    }
+    if output.top_candidates.len() < count {
+        return Err(invalid(format!(
+            "EAGLE-3 stable root retained only {} candidates, need {count}",
+            output.top_candidates.len()
+        )));
+    }
+    if output.top_candidates[0].target_token != output.target_token {
+        return Err(invalid(format!(
+            "EAGLE-3 stable root top-1 {} disagrees with selected token {}",
+            output.top_candidates[0].target_token, output.target_token
+        )));
+    }
+    let candidates: Vec<u32> = output
+        .top_candidates
+        .iter()
+        .take(count)
+        .map(|candidate| candidate.target_token)
+        .collect();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidates[..index].contains(candidate) {
+            return Err(invalid(format!(
+                "EAGLE-3 stable root target token {candidate} appears more than once"
+            )));
+        }
+    }
+    Ok(candidates)
+}
+
 impl Eagle3Drafter {
     fn forward_authoritative_last_output(
         &mut self,
@@ -788,6 +830,24 @@ impl Eagle3Drafter {
 
     pub fn filled(&self) -> usize {
         self.head.filled()
+    }
+
+    /// Return the current stable root's target-vocabulary ranking without advancing the
+    /// private EAGLE cache. This is intentionally a read-only seam for benchmark selection:
+    /// the returned candidates were produced by the last prompt seed or target-authoritative
+    /// update, before the next target verification exists.
+    pub fn stable_root_target_top_k(&self, count: usize) -> Result<Vec<u32>> {
+        if count == 0 || count > crate::metal::EAGLE3_TOP_K_CANDIDATES {
+            return Err(invalid(format!(
+                "EAGLE-3 stable-root ranking count must be in 1..={}, got {count}",
+                crate::metal::EAGLE3_TOP_K_CANDIDATES
+            )));
+        }
+        let seed = self
+            .stable_seed
+            .as_ref()
+            .ok_or_else(|| invalid("EAGLE-3 must be seeded before reading its stable root"))?;
+        stable_root_target_top_k(seed, count)
     }
 
     /// Explore a budgeted dynamic frontier while retaining the longest common prefix between
@@ -1142,6 +1202,40 @@ mod tests {
             evaluated_vocab_logsumexp: 0.0,
             raw_hidden: vec![hidden_marker; HIDDEN_SIZE],
         }
+    }
+
+    #[test]
+    fn stable_root_ranking_is_read_only_full_vocab_and_fail_closed() {
+        let root = output(
+            &[
+                (101, 0.30),
+                (102, 0.20),
+                (103, 0.15),
+                (104, 0.10),
+                (105, 0.08),
+                (106, 0.06),
+                (107, 0.05),
+                (108, 0.03),
+            ],
+            1.0,
+        );
+        assert_eq!(
+            stable_root_target_top_k(&root, 8).unwrap(),
+            vec![101, 102, 103, 104, 105, 106, 107, 108]
+        );
+        assert!(stable_root_target_top_k(&root, 0).is_err());
+
+        let mut reduced = root.clone();
+        reduced.evaluated_vocab_rows -= 1;
+        assert!(stable_root_target_top_k(&reduced, 8).is_err());
+
+        let mut mismatched_top1 = root.clone();
+        mismatched_top1.target_token = 999;
+        assert!(stable_root_target_top_k(&mismatched_top1, 8).is_err());
+
+        let mut duplicate = root;
+        duplicate.top_candidates[7].target_token = duplicate.top_candidates[0].target_token;
+        assert!(stable_root_target_top_k(&duplicate, 8).is_err());
     }
 
     fn frontier_config(

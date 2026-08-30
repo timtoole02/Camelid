@@ -96,6 +96,7 @@ mod ghost_moe_cli_tests {
                     .expect("parse EAGLE-3 linear defaults");
             match defaults.command {
                 Some(Command::BenchEagle3 {
+                    eagle3_secondary,
                     draft_tokens,
                     tree_nodes,
                     tree_topk,
@@ -104,6 +105,7 @@ mod ghost_moe_cli_tests {
                     ..
                 }) => {
                     assert_eq!(draft_tokens, 4);
+                    assert_eq!(eagle3_secondary, None);
                     assert_eq!(tree_nodes, None);
                     assert_eq!(tree_topk, 4);
                     assert_eq!(tree_expansions, 4);
@@ -160,6 +162,30 @@ mod ghost_moe_cli_tests {
                 suffix_without_tree.kind(),
                 clap::error::ErrorKind::MissingRequiredArgument
             );
+
+            let paired = Cli::try_parse_from([
+                "camelid",
+                "bench-eagle3",
+                "target.gguf",
+                "--eagle3",
+                "e9",
+                "--eagle3-secondary",
+                "sw512",
+                "--tree-nodes",
+                "8",
+            ])
+            .expect("parse dual-EAGLE checkpoint paths");
+            match paired.command {
+                Some(Command::BenchEagle3 {
+                    eagle3,
+                    eagle3_secondary,
+                    ..
+                }) => {
+                    assert_eq!(eagle3, PathBuf::from("e9"));
+                    assert_eq!(eagle3_secondary, Some(PathBuf::from("sw512")));
+                }
+                other => panic!("expected BenchEagle3, got {other:?}"),
+            }
         });
     }
 
@@ -2923,6 +2949,11 @@ enum Command {
         /// Directory containing the pinned EAGLE-3 config.json and model.safetensors.
         #[arg(long)]
         eagle3: PathBuf,
+        /// Second pinned EAGLE-3 checkpoint for the benchmark-only paired-root selector.
+        /// Accepted only when CAMELID_BENCH_DUAL_EAGLE_SELECTOR is enabled; the primary
+        /// --eagle3 must be ShareGPT-E9 and this checkpoint must be ShareGPT-SW512-E9.
+        #[arg(long)]
+        eagle3_secondary: Option<PathBuf>,
         /// Top-1 draft-chain length per verify round.
         #[arg(long, default_value_t = 4)]
         draft_tokens: usize,
@@ -5490,6 +5521,7 @@ async fn main() -> anyhow::Result<()> {
         Command::BenchEagle3 {
             model,
             eagle3,
+            eagle3_secondary,
             draft_tokens,
             tree_nodes,
             tree_topk,
@@ -5505,6 +5537,7 @@ async fn main() -> anyhow::Result<()> {
             run_bench_eagle3(
                 model,
                 eagle3,
+                eagle3_secondary,
                 draft_tokens,
                 tree_nodes,
                 tree_topk,
@@ -9094,6 +9127,30 @@ impl Eagle3AdaptiveExpansionMode {
     }
 }
 
+const DUAL_EAGLE_RACE_ROUNDS: u8 = 6;
+const DUAL_EAGLE_ROOT_RANKING: usize = 8;
+// 840 is the least common multiple of 1..=8, so reciprocal rank remains exact and
+// deterministic without floating-point comparisons.
+const DUAL_EAGLE_RECIPROCAL_RANK_SCALE: u64 = 840;
+const DUAL_EAGLE_RECIPROCAL_RANK_POINTS: [u64; DUAL_EAGLE_ROOT_RANKING] =
+    [840, 420, 280, 210, 168, 140, 120, 105];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DualEagleHead {
+    E9,
+    Sw512,
+}
+
+impl DualEagleHead {
+    fn other(self) -> Self {
+        match self {
+            Self::E9 => Self::Sw512,
+            Self::Sw512 => Self::E9,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Eagle3AdaptiveExpansionTelemetry {
     shallow_rounds: u64,
@@ -9355,6 +9412,317 @@ fn eagle3_adaptive_expansions_reject_one_window_prose_bursts() {
     assert_eq!(controller.telemetry().shallow_qualification_resets, 1);
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+struct DualEagleScore {
+    top1_hits: u64,
+    top4_hits: u64,
+    reciprocal_rank_840_sum: u64,
+}
+
+impl DualEagleScore {
+    fn note_rank(&mut self, rank: Option<u8>) -> anyhow::Result<()> {
+        if let Some(rank) = rank {
+            anyhow::ensure!(
+                (1..=DUAL_EAGLE_ROOT_RANKING as u8).contains(&rank),
+                "dual-EAGLE root rank {rank} is outside 1..={DUAL_EAGLE_ROOT_RANKING}"
+            );
+            self.top1_hits += u64::from(rank == 1);
+            self.top4_hits += u64::from(rank <= 4);
+            self.reciprocal_rank_840_sum +=
+                DUAL_EAGLE_RECIPROCAL_RANK_POINTS[usize::from(rank - 1)];
+        }
+        Ok(())
+    }
+
+    fn ordering_key(self) -> (u64, u64, u64) {
+        (
+            self.top1_hits,
+            self.top4_hits,
+            self.reciprocal_rank_840_sum,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DualEagleCheckpointRoundEvidence {
+    root_top8: Vec<u32>,
+    target_rank: Option<u8>,
+    top1_match: bool,
+    top4_inclusion: bool,
+    cumulative_score: DualEagleScore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DualEagleRoundReceipt {
+    round: u8,
+    proposal_head: DualEagleHead,
+    target_token: u32,
+    e9: DualEagleCheckpointRoundEvidence,
+    sw512: DualEagleCheckpointRoundEvidence,
+    leader_for_next_round: DualEagleHead,
+}
+
+#[derive(Debug)]
+struct PendingDualEagleRound {
+    round: u8,
+    proposal_head: DualEagleHead,
+    e9_top8: Vec<u32>,
+    sw512_top8: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct DualEagleSelector {
+    completed_rounds: u8,
+    pending: bool,
+    e9_score: DualEagleScore,
+    sw512_score: DualEagleScore,
+    receipts: Vec<DualEagleRoundReceipt>,
+}
+
+impl DualEagleSelector {
+    fn validate_top8(label: &str, candidates: &[u32]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            candidates.len() == DUAL_EAGLE_ROOT_RANKING,
+            "dual-EAGLE {label} root retained {} candidates, expected {DUAL_EAGLE_ROOT_RANKING}",
+            candidates.len()
+        );
+        for (index, candidate) in candidates.iter().enumerate() {
+            anyhow::ensure!(
+                !candidates[..index].contains(candidate),
+                "dual-EAGLE {label} root contains duplicate target token {candidate}"
+            );
+        }
+        Ok(())
+    }
+
+    fn leader(&self) -> DualEagleHead {
+        // The score is intentionally lexicographic: top-1 hits dominate top-4 inclusion,
+        // which dominates exact reciprocal rank within the retained top eight. Every exact
+        // tie resolves to the original E9 checkpoint.
+        if self.sw512_score.ordering_key() > self.e9_score.ordering_key() {
+            DualEagleHead::Sw512
+        } else {
+            DualEagleHead::E9
+        }
+    }
+
+    fn begin_round(
+        &mut self,
+        e9_top8: Vec<u32>,
+        sw512_top8: Vec<u32>,
+    ) -> anyhow::Result<PendingDualEagleRound> {
+        anyhow::ensure!(
+            self.completed_rounds < DUAL_EAGLE_RACE_ROUNDS,
+            "dual-EAGLE race already completed its {DUAL_EAGLE_RACE_ROUNDS} rounds"
+        );
+        anyhow::ensure!(!self.pending, "dual-EAGLE race already has a pending round");
+        Self::validate_top8("E9", &e9_top8)?;
+        Self::validate_top8("SW512", &sw512_top8)?;
+        let pending = PendingDualEagleRound {
+            round: self.completed_rounds + 1,
+            // This choice uses only evidence completed before this round. The target token
+            // below cannot retroactively select the tree it is about to verify.
+            proposal_head: self.leader(),
+            e9_top8,
+            sw512_top8,
+        };
+        self.pending = true;
+        Ok(pending)
+    }
+
+    fn target_rank(candidates: &[u32], target: u32) -> Option<u8> {
+        candidates
+            .iter()
+            .position(|candidate| *candidate == target)
+            .map(|index| (index + 1) as u8)
+    }
+
+    fn finish_round(
+        &mut self,
+        pending: PendingDualEagleRound,
+        target_token: u32,
+    ) -> anyhow::Result<DualEagleRoundReceipt> {
+        anyhow::ensure!(self.pending, "dual-EAGLE race has no pending round to score");
+        anyhow::ensure!(
+            pending.round == self.completed_rounds + 1,
+            "dual-EAGLE pending round {} is out of order after {} completed rounds",
+            pending.round,
+            self.completed_rounds
+        );
+        anyhow::ensure!(
+            pending.proposal_head == self.leader(),
+            "dual-EAGLE pending proposal head changed before target evidence"
+        );
+        let e9_rank = Self::target_rank(&pending.e9_top8, target_token);
+        let sw512_rank = Self::target_rank(&pending.sw512_top8, target_token);
+        self.e9_score.note_rank(e9_rank)?;
+        self.sw512_score.note_rank(sw512_rank)?;
+        self.completed_rounds += 1;
+        self.pending = false;
+        let receipt = DualEagleRoundReceipt {
+            round: pending.round,
+            proposal_head: pending.proposal_head,
+            target_token,
+            e9: DualEagleCheckpointRoundEvidence {
+                root_top8: pending.e9_top8,
+                target_rank: e9_rank,
+                top1_match: e9_rank == Some(1),
+                top4_inclusion: e9_rank.is_some_and(|rank| rank <= 4),
+                cumulative_score: self.e9_score,
+            },
+            sw512: DualEagleCheckpointRoundEvidence {
+                root_top8: pending.sw512_top8,
+                target_rank: sw512_rank,
+                top1_match: sw512_rank == Some(1),
+                top4_inclusion: sw512_rank.is_some_and(|rank| rank <= 4),
+                cumulative_score: self.sw512_score,
+            },
+            leader_for_next_round: self.leader(),
+        };
+        self.receipts.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completed_rounds >= DUAL_EAGLE_RACE_ROUNDS
+    }
+
+    fn selected_head(&self) -> Option<DualEagleHead> {
+        self.is_complete().then(|| self.leader())
+    }
+}
+
+#[cfg(test)]
+mod dual_eagle_selector_tests {
+    use super::*;
+
+    fn top8(first: u32) -> Vec<u32> {
+        (first..first + DUAL_EAGLE_ROOT_RANKING as u32).collect()
+    }
+
+    fn finish(
+        selector: &mut DualEagleSelector,
+        e9: Vec<u32>,
+        sw512: Vec<u32>,
+        target: u32,
+    ) -> DualEagleRoundReceipt {
+        let pending = selector.begin_round(e9, sw512).unwrap();
+        selector.finish_round(pending, target).unwrap()
+    }
+
+    #[test]
+    fn target_evidence_changes_only_the_following_round() {
+        let mut selector = DualEagleSelector::default();
+        let first = selector.begin_round(top8(10), top8(20)).unwrap();
+        assert_eq!(first.proposal_head, DualEagleHead::E9);
+        let receipt = selector.finish_round(first, 20).unwrap();
+        assert_eq!(receipt.proposal_head, DualEagleHead::E9);
+        assert_eq!(receipt.leader_for_next_round, DualEagleHead::Sw512);
+
+        let second = selector.begin_round(top8(30), top8(40)).unwrap();
+        assert_eq!(second.proposal_head, DualEagleHead::Sw512);
+    }
+
+    #[test]
+    fn lexicographic_score_orders_top1_then_top4_then_reciprocal_rank() {
+        let mut top1_wins = DualEagleSelector::default();
+        finish(&mut top1_wins, top8(10), top8(20), 10);
+        for target in [21, 21, 21, 21, 21] {
+            finish(&mut top1_wins, top8(30), top8(20), target);
+        }
+        assert_eq!(top1_wins.e9_score.top1_hits, 1);
+        assert_eq!(top1_wins.sw512_score.top1_hits, 0);
+        assert_eq!(top1_wins.selected_head(), Some(DualEagleHead::E9));
+
+        let mut top4_wins = DualEagleSelector::default();
+        for _ in 0..DUAL_EAGLE_RACE_ROUNDS {
+            finish(&mut top4_wins, top8(10), top8(20), 21);
+        }
+        assert_eq!(top4_wins.e9_score.top4_hits, 0);
+        assert_eq!(top4_wins.sw512_score.top4_hits, 6);
+        assert_eq!(top4_wins.selected_head(), Some(DualEagleHead::Sw512));
+
+        let mut reciprocal_rank_wins = DualEagleSelector::default();
+        for _ in 0..DUAL_EAGLE_RACE_ROUNDS {
+            finish(
+                &mut reciprocal_rank_wins,
+                vec![10, 99, 11, 12, 13, 14, 15, 16],
+                vec![20, 21, 99, 22, 23, 24, 25, 26],
+                99,
+            );
+        }
+        assert_eq!(reciprocal_rank_wins.e9_score.top4_hits, 6);
+        assert_eq!(reciprocal_rank_wins.sw512_score.top4_hits, 6);
+        assert!(
+            reciprocal_rank_wins.e9_score.reciprocal_rank_840_sum
+                > reciprocal_rank_wins
+                    .sw512_score
+                    .reciprocal_rank_840_sum
+        );
+        assert_eq!(
+            reciprocal_rank_wins.selected_head(),
+            Some(DualEagleHead::E9)
+        );
+    }
+
+    #[test]
+    fn exact_ties_default_to_e9_after_six_rounds() {
+        let mut selector = DualEagleSelector::default();
+        for _ in 0..DUAL_EAGLE_RACE_ROUNDS {
+            let receipt = finish(&mut selector, top8(10), top8(10), 12);
+            assert_eq!(receipt.leader_for_next_round, DualEagleHead::E9);
+        }
+        assert!(selector.is_complete());
+        assert_eq!(selector.selected_head(), Some(DualEagleHead::E9));
+        assert!(selector.begin_round(top8(10), top8(20)).is_err());
+    }
+
+    #[test]
+    fn state_machine_rejects_overlap_bad_rank_and_duplicate_roots() {
+        let mut idle = DualEagleSelector::default();
+        let impossible = PendingDualEagleRound {
+            round: 1,
+            proposal_head: DualEagleHead::E9,
+            e9_top8: top8(10),
+            sw512_top8: top8(20),
+        };
+        assert!(idle.finish_round(impossible, 10).is_err());
+
+        let mut selector = DualEagleSelector::default();
+        let pending = selector.begin_round(top8(10), top8(20)).unwrap();
+        assert!(selector.begin_round(top8(30), top8(40)).is_err());
+        selector.finish_round(pending, 999).unwrap();
+        assert_eq!(selector.e9_score, DualEagleScore::default());
+        assert_eq!(selector.sw512_score, DualEagleScore::default());
+
+        let mut duplicate = top8(10);
+        duplicate[7] = duplicate[0];
+        assert!(selector.begin_round(duplicate, top8(20)).is_err());
+        assert!(DualEagleScore::default().note_rank(Some(9)).is_err());
+    }
+
+    #[test]
+    fn reciprocal_rank_integer_scale_is_exact_for_one_through_eight() {
+        for rank in 1..=DUAL_EAGLE_ROOT_RANKING {
+            assert_eq!(
+                DUAL_EAGLE_RECIPROCAL_RANK_POINTS[rank - 1] * rank as u64,
+                DUAL_EAGLE_RECIPROCAL_RANK_SCALE
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_gate_boolean_is_strict_and_deterministic() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+            assert!(!parse_dual_eagle_selector_env(value).unwrap());
+        }
+        for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+            assert!(parse_dual_eagle_selector_env(value).unwrap());
+        }
+        assert!(parse_dual_eagle_selector_env(Some("maybe")).is_err());
+    }
+}
+
 #[derive(Default)]
 struct Eagle3BenchRun {
     generated: Vec<u32>,
@@ -9397,6 +9765,9 @@ struct Eagle3BenchRun {
     dynamic_tree_max_depth_sum: u64,
     adaptive_expansions: Eagle3AdaptiveExpansionTelemetry,
     token_recycling: Eagle3TokenRecyclingTelemetry,
+    dual_eagle_rounds: Vec<DualEagleRoundReceipt>,
+    dual_eagle_shadow_update_us: u128,
+    dual_eagle_selected_head: Option<DualEagleHead>,
 }
 
 fn run_plain_resident_greedy(
@@ -9447,6 +9818,7 @@ fn run_plain_resident_greedy(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_eagle3_resident_greedy(
     config: &LlamaModelConfig,
     weights: &Arc<LlamaLoadedWeights>,
@@ -9460,12 +9832,13 @@ fn run_eagle3_resident_greedy(
     adaptive_expansions: bool,
     suffix_first: bool,
     token_recycling_hybrid: bool,
-    checkpoint: camelid::eagle3::Eagle3DraftModel,
+    mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
+    mut secondary_drafter: Option<camelid::eagle3_runtime::Eagle3Drafter>,
+    head_upload_ms: f64,
 ) -> anyhow::Result<Eagle3BenchRun> {
     use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
     use camelid::eagle3_runtime::{
-        Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig,
-        Eagle3ForestAcceptance,
+        Eagle3AuthoritativeCatchup, Eagle3DynamicFrontierConfig, Eagle3ForestAcceptance,
     };
     use camelid::inference::suffix_decoding::SuffixDecodingDrafter;
     use camelid::inference::token_recycling::TokenRecyclingDrafter;
@@ -9489,14 +9862,6 @@ fn run_eagle3_resident_greedy(
         .ok_or_else(|| anyhow::anyhow!("EAGLE-3 target prompt produced no prediction"))?;
     let ttft_ms = ttft_started.elapsed().as_secs_f64() * 1000.0;
 
-    let head_capacity = prompt_tokens
-        .len()
-        .checked_add(max_tokens)
-        .and_then(|n| n.checked_add(draft_tokens + 1))
-        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
-    let head_upload_started = Instant::now();
-    let mut drafter = Eagle3Drafter::new(&checkpoint, head_capacity)?;
-    let head_upload_ms = head_upload_started.elapsed().as_secs_f64() * 1000.0;
     let mut run = Eagle3BenchRun {
         generated: vec![first],
         ttft_ms,
@@ -9506,6 +9871,15 @@ fn run_eagle3_resident_greedy(
     };
     let seed_started = Instant::now();
     drafter.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
+    if let Some(secondary) = secondary_drafter.as_mut() {
+        secondary.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
+        anyhow::ensure!(
+            secondary.filled() == drafter.filled(),
+            "dual-EAGLE prompt seed watermarks diverged: E9={} SW512={}",
+            drafter.filled(),
+            secondary.filled()
+        );
+    }
     run.head_seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
     // Size the temporary lattice from the caller's requested maximum, not the controller's
     // current shallow value. A later causal move to seven expansions therefore changes only
@@ -9530,6 +9904,9 @@ fn run_eagle3_resident_greedy(
     let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
     let mut adaptive_expansion_controller =
         adaptive_expansions.then(Eagle3AdaptiveExpansionController::default);
+    let mut dual_selector = secondary_drafter
+        .as_ref()
+        .map(|_| DualEagleSelector::default());
     let mut suffix_history = suffix_first.then(|| {
         let mut history = Vec::with_capacity(prompt_tokens.len() + max_tokens);
         history.extend_from_slice(prompt_tokens);
@@ -9556,6 +9933,12 @@ fn run_eagle3_resident_greedy(
         // A final single token has no successor to draft. Keep it on the resident target;
         // no head update is needed once the requested output length is reached.
         if budget == 0 {
+            anyhow::ensure!(
+                dual_selector
+                    .as_ref()
+                    .is_none_or(DualEagleSelector::is_complete),
+                "dual-EAGLE race ran out of generation/context room before completing {DUAL_EAGLE_RACE_ROUNDS} rounds"
+            );
             let anchor = *run.generated.last().expect("generated is seeded");
             let next = session
                 .generate_next_token_greedy_resident(anchor)?
@@ -9604,7 +9987,196 @@ fn run_eagle3_resident_greedy(
                 Vec::new()
             };
 
-            if !suffix_drafts.is_empty() {
+            if dual_selector
+                .as_ref()
+                .is_some_and(|selector| !selector.is_complete())
+            {
+                anyhow::ensure!(
+                    suffix_drafts.is_empty()
+                        && recycling_drafter.is_none()
+                        && pending_suffix_head.is_empty(),
+                    "dual-EAGLE selector cannot share a round with suffix or Token Recycling drafting"
+                );
+                let secondary = secondary_drafter.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("dual-EAGLE race lost its SW512 shadow head before selection")
+                })?;
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position()
+                        && secondary.filled() == session.kv_position(),
+                    "dual-EAGLE head watermarks diverged before round: E9={} SW512={} target={}",
+                    drafter.filled(),
+                    secondary.filled(),
+                    session.kv_position()
+                );
+
+                // Both rankings are stable-root observations produced by prior authoritative
+                // updates. Capture them before the ordinary target verify for this round.
+                let e9_top8 =
+                    drafter.stable_root_target_top_k(DUAL_EAGLE_ROOT_RANKING)?;
+                let sw512_top8 =
+                    secondary.stable_root_target_top_k(DUAL_EAGLE_ROOT_RANKING)?;
+                let pending = dual_selector
+                    .as_mut()
+                    .expect("dual selector exists in race branch")
+                    .begin_round(e9_top8, sw512_top8)?;
+                let proposal_head = pending.proposal_head;
+
+                let draft_started = Instant::now();
+                let frontier = match proposal_head {
+                    DualEagleHead::E9 => drafter.draft_dynamic_frontier(
+                        weights,
+                        anchor,
+                        Eagle3DynamicFrontierConfig {
+                            max_verify_nodes: round_node_budget,
+                            max_lattice_nodes: tree_lattice_nodes
+                                .expect("tree budget is present"),
+                            max_depth: budget,
+                            candidates_per_parent: tree_topk,
+                            max_head_expansions: tree_expansions,
+                        },
+                    )?,
+                    DualEagleHead::Sw512 => secondary.draft_dynamic_frontier(
+                        weights,
+                        anchor,
+                        Eagle3DynamicFrontierConfig {
+                            max_verify_nodes: round_node_budget,
+                            max_lattice_nodes: tree_lattice_nodes
+                                .expect("tree budget is present"),
+                            max_depth: budget,
+                            candidates_per_parent: tree_topk,
+                            max_head_expansions: tree_expansions,
+                        },
+                    )?,
+                };
+                let materialized_head_forwards = frontier.materialized_head_forwards();
+                let forest = frontier.finish()?;
+                let actual_nodes = forest.scored.tree.nodes();
+                let actual_max_depth = forest.scored.tree.max_depth();
+                anyhow::ensure!(
+                    (2..=round_node_budget).contains(&actual_nodes),
+                    "dual-EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                );
+                run.drafted_token_ids
+                    .extend_from_slice(&forest.scored.tree.tokens[1..]);
+                run.draft_us += draft_started.elapsed().as_micros();
+
+                // Exactly one ordinary target verification supplies both lossless emission and
+                // the live root label used to score the already-captured rankings.
+                let verify_started = Instant::now();
+                let verified = session
+                    .verify_tree_metal_with_layer_inputs(
+                        &forest.scored.tree,
+                        &TARGET_LAYER_INPUT_IDS,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "resident Metal dual-EAGLE verification became unavailable at position {target_before}"
+                        )
+                    })?;
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    verified.predictions.len() == actual_nodes,
+                    "dual-EAGLE target returned {} predictions for {actual_nodes} rows",
+                    verified.predictions.len()
+                );
+                let target_root = *verified.predictions.first().ok_or_else(|| {
+                    anyhow::anyhow!("dual-EAGLE target verify produced no root prediction")
+                })?;
+                let acceptance = forest.accept_target_predictions(&verified.predictions)?;
+                anyhow::ensure!(
+                    acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
+                    "dual-EAGLE emitted/capture path lengths diverged: {}/{}",
+                    acceptance.emitted_tokens.len(),
+                    acceptance.capture_rows.len()
+                );
+                let receipt = dual_selector
+                    .as_mut()
+                    .expect("dual selector exists in race branch")
+                    .finish_round(pending, target_root)?;
+
+                // Update both private caches from exactly the same target-authoritative rows.
+                // The non-proposal update is separately timed as the temporary race overhead.
+                match proposal_head {
+                    DualEagleHead::E9 => {
+                        let update_started = Instant::now();
+                        drafter.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.head_update_us += update_started.elapsed().as_micros();
+                        let shadow_started = Instant::now();
+                        secondary.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.dual_eagle_shadow_update_us +=
+                            shadow_started.elapsed().as_micros();
+                    }
+                    DualEagleHead::Sw512 => {
+                        let update_started = Instant::now();
+                        secondary.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.head_update_us += update_started.elapsed().as_micros();
+                        let shadow_started = Instant::now();
+                        drafter.accept_authoritative_forest(
+                            weights,
+                            &verified.layer_inputs,
+                            &acceptance,
+                        )?;
+                        run.dual_eagle_shadow_update_us +=
+                            shadow_started.elapsed().as_micros();
+                    }
+                }
+                anyhow::ensure!(
+                    drafter.filled() == secondary.filled(),
+                    "dual-EAGLE authoritative updates diverged: E9={} SW512={}",
+                    drafter.filled(),
+                    secondary.filled()
+                );
+
+                if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                    eprintln!(
+                        "[dual-eagle] round={} proposal={:?} target={} E9-rank={:?} SW512-rank={:?} next={:?}",
+                        receipt.round,
+                        receipt.proposal_head,
+                        receipt.target_token,
+                        receipt.e9.target_rank,
+                        receipt.sw512.target_rank,
+                        receipt.leader_for_next_round,
+                    );
+                }
+                run.dual_eagle_rounds.push(receipt);
+
+                // The sixth round updated both heads before either can be discarded. If SW512
+                // won, move it into the primary slot so the ordinary post-race path is shared.
+                if let Some(selected) = dual_selector
+                    .as_ref()
+                    .and_then(DualEagleSelector::selected_head)
+                {
+                    let mut shadow = secondary_drafter
+                        .take()
+                        .expect("completed dual-EAGLE race retains both synchronized heads");
+                    if selected == DualEagleHead::Sw512 {
+                        std::mem::swap(&mut drafter, &mut shadow);
+                    }
+                    drop(shadow);
+                    run.dual_eagle_selected_head = Some(selected);
+                }
+
+                let emitted_count = acceptance.emitted_tokens.len();
+                let offered = actual_nodes.saturating_sub(1);
+                run.dynamic_tree_rounds += 1;
+                run.dynamic_tree_offered += offered as u64;
+                run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                (acceptance.emitted_tokens, offered, actual_nodes)
+            } else if !suffix_drafts.is_empty() {
                 run.drafted_token_ids.extend_from_slice(&suffix_drafts);
                 let verify_started = Instant::now();
                 let verified = session
@@ -10085,6 +10657,21 @@ fn run_eagle3_resident_greedy(
             run.accepted_drafts,
         );
     }
+    if let Some(selector) = dual_selector.as_ref() {
+        anyhow::ensure!(
+            selector.is_complete()
+                && selector.receipts.len() == DUAL_EAGLE_RACE_ROUNDS as usize
+                && run.dual_eagle_rounds == selector.receipts
+                && run.dual_eagle_selected_head == selector.selected_head()
+                && secondary_drafter.is_none(),
+            "dual-EAGLE race did not complete and drop exactly one head: completed={} receipts={}/{} selected={:?} shadow_present={}",
+            selector.completed_rounds,
+            run.dual_eagle_rounds.len(),
+            selector.receipts.len(),
+            run.dual_eagle_selected_head,
+            secondary_drafter.is_some(),
+        );
+    }
 
     Ok(run)
 }
@@ -10158,6 +10745,47 @@ struct BenchEagle3Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_deep_rejection_resets: Option<u64>,
     token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_race_rounds: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_root_ranking: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_reciprocal_rank_scale: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_config_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_revision: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_config_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_revision: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_score: Option<DualEagleScore>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_score: Option<DualEagleScore>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_round_evidence: Option<Vec<DualEagleRoundReceipt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_selected_head: Option<DualEagleHead>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_dropped_head: Option<DualEagleHead>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_head_load_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_e9_head_upload_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_head_load_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_sw512_head_upload_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dual_eagle_shadow_update_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hybrid_admission_decisions: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10343,6 +10971,30 @@ fn eagle3_adaptive_expansion_config_fails_closed() {
     assert!(validate_eagle3_adaptive_expansions_config(true, Some(8), 7, false, true).is_err());
 }
 
+fn parse_dual_eagle_selector_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "CAMELID_BENCH_DUAL_EAGLE_SELECTOR must be a boolean, got {value:?}"
+        ),
+    }
+}
+
+fn dual_eagle_selector_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_DUAL_EAGLE_SELECTOR");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("CAMELID_BENCH_DUAL_EAGLE_SELECTOR is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_dual_eagle_selector_env(value)
+}
+
 fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
     const KEYS: &[&str] = &[
         "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
@@ -10373,6 +11025,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_TR_HYBRID",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE",
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR",
     ];
     KEYS.iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
@@ -10383,6 +11036,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
 fn run_bench_eagle3(
     model: PathBuf,
     eagle3_dir: PathBuf,
+    eagle3_secondary_dir: Option<PathBuf>,
     draft_tokens: usize,
     tree_nodes: Option<usize>,
     tree_topk: usize,
@@ -10421,6 +11075,7 @@ fn run_bench_eagle3(
         "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
     let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
     let adaptive_expansions = eagle3_adaptive_expansions_enabled();
+    let dual_eagle_selector = dual_eagle_selector_enabled()?;
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -10449,6 +11104,29 @@ fn run_bench_eagle3(
         !token_recycling_hybrid || !suffix_first,
         "CAMELID_BENCH_EAGLE3_TR_HYBRID cannot be combined with --suffix-first"
     );
+    anyhow::ensure!(
+        dual_eagle_selector == eagle3_secondary_dir.is_some(),
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR and --eagle3-secondary must be supplied together"
+    );
+    anyhow::ensure!(
+        !dual_eagle_selector || tree_nodes.is_some(),
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR requires --tree-nodes"
+    );
+    anyhow::ensure!(
+        !dual_eagle_selector || (!suffix_first && !token_recycling_hybrid),
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR cannot be combined with suffix-first or Token Recycling"
+    );
+    if dual_eagle_selector {
+        let nodes = tree_nodes.expect("dual selector requires a tree node budget");
+        let minimum_tokens = usize::from(DUAL_EAGLE_RACE_ROUNDS)
+            .checked_mul(nodes)
+            .and_then(|tokens| tokens.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("dual-EAGLE race token bound overflow"))?;
+        anyhow::ensure!(
+            max_tokens >= minimum_tokens,
+            "CAMELID_BENCH_DUAL_EAGLE_SELECTOR needs --max-tokens >= {minimum_tokens} so six maximum-width verifier rounds cannot exhaust the request"
+        );
+    }
     anyhow::ensure!(
         (1..=camelid::metal::EAGLE3_TOP_K_CANDIDATES).contains(&tree_topk),
         "--tree-topk must be in 1..={}",
@@ -10501,6 +11179,10 @@ fn run_bench_eagle3(
         !token_recycling_hybrid || eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E9_SHA256,
         "CAMELID_BENCH_EAGLE3_TR_HYBRID requires the pinned ShareGPT-E9 checkpoint"
     );
+    anyhow::ensure!(
+        !dual_eagle_selector || eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E9_SHA256,
+        "CAMELID_BENCH_DUAL_EAGLE_SELECTOR requires --eagle3 to be the pinned ShareGPT-E9 checkpoint"
+    );
     let pinned_sharegpt_config = match eagle3_sha256.as_str() {
         PINNED_EAGLE3_SHAREGPT_E8_SHA256 => Some((
             "ShareGPT-E8",
@@ -10529,6 +11211,37 @@ fn run_bench_eagle3(
             "{label} config SHA-256 is {config_sha256}, expected {expected_config_sha256}"
         );
     }
+    let (eagle3_secondary_sha256, eagle3_secondary_revision) =
+        if let Some(secondary_dir) = eagle3_secondary_dir.as_ref() {
+            let weights_path = secondary_dir.join("model.safetensors");
+            let sha256 = camelid::receipt::sha256_file_hex(&weights_path).map_err(|error| {
+                anyhow::anyhow!(
+                    "hashing secondary EAGLE-3 checkpoint {}: {error}",
+                    weights_path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                sha256 == PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256,
+                "dual-EAGLE secondary SHA-256 is {sha256}, expected pinned ShareGPT-SW512-E9 {PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256}"
+            );
+            let config_path = secondary_dir.join("config.json");
+            let config_sha256 = camelid::receipt::sha256_file_hex(&config_path).map_err(|error| {
+                anyhow::anyhow!(
+                    "hashing secondary EAGLE-3 config {}: {error}",
+                    config_path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                config_sha256 == PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256,
+                "dual-EAGLE secondary config SHA-256 is {config_sha256}, expected {PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256}"
+            );
+            (
+                Some(sha256),
+                Some(PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION),
+            )
+        } else {
+            (None, None)
+        };
     let current_exe = std::env::current_exe()?;
     let binary_sha256 = camelid::receipt::sha256_file_hex(&current_exe)
         .map_err(|error| anyhow::anyhow!("hashing benchmark binary: {error}"))?;
@@ -10591,10 +11304,41 @@ fn run_bench_eagle3(
     eprintln!("[bench-eagle3] plain resident Metal target lane...");
     let plain =
         run_plain_resident_greedy(&config, &weights, &tokenizer, &prompt_token_ids, max_tokens)?;
-    eprintln!("[bench-eagle3] loading strict EAGLE-3 checkpoint...");
-    let head_load_started = Instant::now();
-    let checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3_dir)?;
-    let head_load_ms = head_load_started.elapsed().as_secs_f64() * 1000.0;
+    let head_capacity = prompt_token_ids
+        .len()
+        .checked_add(max_tokens)
+        .and_then(|positions| positions.checked_add(draft_tokens + 1))
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
+    eprintln!("[bench-eagle3] loading and uploading strict EAGLE-3 checkpoint...");
+    let primary_load_started = Instant::now();
+    let primary_checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3_dir)?;
+    let primary_head_load_ms = primary_load_started.elapsed().as_secs_f64() * 1000.0;
+    let primary_upload_started = Instant::now();
+    let primary_drafter =
+        camelid::eagle3_runtime::Eagle3Drafter::new(&primary_checkpoint, head_capacity)?;
+    let primary_head_upload_ms = primary_upload_started.elapsed().as_secs_f64() * 1000.0;
+    // Eagle3MetalState owns all uploaded buffers; release the ~464 MiB host matrix copy before
+    // loading the second checkpoint so the benchmark does not need both SafeTensor payloads on
+    // the host at once.
+    drop(primary_checkpoint);
+
+    let (secondary_drafter, secondary_head_load_ms, secondary_head_upload_ms) =
+        if let Some(secondary_dir) = eagle3_secondary_dir.as_ref() {
+            eprintln!("[bench-eagle3] loading and uploading pinned SW512 shadow checkpoint...");
+            let load_started = Instant::now();
+            let checkpoint = camelid::eagle3::Eagle3DraftModel::load(secondary_dir)?;
+            let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+            let upload_started = Instant::now();
+            let drafter =
+                camelid::eagle3_runtime::Eagle3Drafter::new(&checkpoint, head_capacity)?;
+            let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+            drop(checkpoint);
+            (Some(drafter), load_ms, upload_ms)
+        } else {
+            (None, 0.0, 0.0)
+        };
+    let head_load_ms = primary_head_load_ms + secondary_head_load_ms;
+    let head_upload_ms = primary_head_upload_ms + secondary_head_upload_ms;
     eprintln!("[bench-eagle3] learned recurrent draft + resident target verify...");
     let eagle = run_eagle3_resident_greedy(
         &config,
@@ -10609,7 +11353,9 @@ fn run_bench_eagle3(
         adaptive_expansions,
         suffix_first,
         token_recycling_hybrid,
-        checkpoint,
+        primary_drafter,
+        secondary_drafter,
+        head_upload_ms,
     )?;
 
     let decode_tps = |run: &Eagle3BenchRun| {
@@ -10652,6 +11398,12 @@ fn run_bench_eagle3(
     } else {
         eagle.dynamic_tree_max_depth_sum as f64 / eagle.dynamic_tree_rounds as f64
     };
+    let dual_final_round = eagle.dual_eagle_rounds.last();
+    anyhow::ensure!(
+        dual_eagle_selector
+            == (dual_final_round.is_some() && eagle.dual_eagle_selected_head.is_some()),
+        "dual-EAGLE receipt completeness does not match its runtime gate"
+    );
     let record = BenchEagle3Record {
         runtime: "camelid-eagle3-resident-metal",
         commit: benchmark_commit(),
@@ -10668,13 +11420,15 @@ fn run_bench_eagle3(
         model_sha256,
         tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
         eagle3: eagle3_dir.display().to_string(),
-        eagle3_sha256,
+        eagle3_sha256: eagle3_sha256.clone(),
         eagle3_revision,
         quantization: camelid::receipt::quantization_label(&gguf),
         prompt_tokens: prompt_token_ids.len(),
         max_tokens,
         draft_tokens,
-        draft_mode: if token_recycling_hybrid {
+        draft_mode: if dual_eagle_selector {
+            "dynamic_tree_dual_eagle_selector"
+        } else if token_recycling_hybrid {
             "dynamic_tree_e9_tr_hybrid"
         } else if adaptive_expansions {
             "dynamic_tree_adaptive_expansions"
@@ -10730,6 +11484,37 @@ fn run_bench_eagle3(
         adaptive_deep_rejection_resets: adaptive_expansions
             .then_some(eagle.adaptive_expansions.deep_rejection_resets),
         token_recycling_hybrid,
+        dual_eagle_selector,
+        dual_eagle_race_rounds: dual_eagle_selector.then_some(DUAL_EAGLE_RACE_ROUNDS),
+        dual_eagle_root_ranking: dual_eagle_selector.then_some(DUAL_EAGLE_ROOT_RANKING),
+        dual_eagle_reciprocal_rank_scale: dual_eagle_selector
+            .then_some(DUAL_EAGLE_RECIPROCAL_RANK_SCALE),
+        dual_eagle_e9_sha256: dual_eagle_selector.then(|| eagle3_sha256.clone()),
+        dual_eagle_e9_config_sha256: dual_eagle_selector
+            .then(|| PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256.to_string()),
+        dual_eagle_e9_revision: dual_eagle_selector.then_some(eagle3_revision),
+        dual_eagle_sw512: eagle3_secondary_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        dual_eagle_sw512_sha256: eagle3_secondary_sha256,
+        dual_eagle_sw512_config_sha256: dual_eagle_selector
+            .then(|| PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256.to_string()),
+        dual_eagle_sw512_revision: eagle3_secondary_revision,
+        dual_eagle_e9_score: dual_final_round.map(|round| round.e9.cumulative_score),
+        dual_eagle_sw512_score: dual_final_round
+            .map(|round| round.sw512.cumulative_score),
+        dual_eagle_round_evidence: dual_eagle_selector
+            .then(|| eagle.dual_eagle_rounds.clone()),
+        dual_eagle_selected_head: eagle.dual_eagle_selected_head,
+        dual_eagle_dropped_head: eagle.dual_eagle_selected_head.map(DualEagleHead::other),
+        dual_eagle_e9_head_load_ms: dual_eagle_selector.then_some(primary_head_load_ms),
+        dual_eagle_e9_head_upload_ms: dual_eagle_selector.then_some(primary_head_upload_ms),
+        dual_eagle_sw512_head_load_ms: dual_eagle_selector
+            .then_some(secondary_head_load_ms),
+        dual_eagle_sw512_head_upload_ms: dual_eagle_selector
+            .then_some(secondary_head_upload_ms),
+        dual_eagle_shadow_update_ms: dual_eagle_selector
+            .then_some(eagle.dual_eagle_shadow_update_us as f64 / 1000.0),
         hybrid_admission_decisions: token_recycling_hybrid
             .then_some(eagle.token_recycling.admission_decisions),
         hybrid_admission_declines: token_recycling_hybrid
@@ -10904,6 +11689,17 @@ fn run_bench_eagle3(
             eagle.adaptive_expansions.shallow_qualification_resets,
             eagle.adaptive_expansions.deep_rejecting_windows,
             eagle.adaptive_expansions.deep_rejection_resets,
+        );
+    }
+    if dual_eagle_selector {
+        eprintln!(
+            "[bench-dual-eagle] selected={:?} dropped={:?} rounds={} E9-score={:?} SW512-score={:?} shadow-update={:.3}ms",
+            record.dual_eagle_selected_head,
+            record.dual_eagle_dropped_head,
+            record.dual_eagle_race_rounds.unwrap_or_default(),
+            record.dual_eagle_e9_score,
+            record.dual_eagle_sw512_score,
+            record.dual_eagle_shadow_update_ms.unwrap_or_default(),
         );
     }
     anyhow::ensure!(
