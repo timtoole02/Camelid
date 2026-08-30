@@ -4747,6 +4747,226 @@ kernel void q6k_linear_mma_combined_v4(
     }
 }
 
+// Apple-family 8x8 simdgroup matrices assign two adjacent columns to each
+// lane. This explicit map is established by the native Gemma Q4 verifier and
+// must not be replaced by the tempting row-major `lane * 2` assumption.
+inline uint2 kquant_v4_fragment_coord(uint lane) {
+    const uint fragment_row = 4u * (lane >> 4) + ((lane & 7u) >> 1);
+    const uint fragment_column0 =
+        4u * ((lane >> 3) & 1u) + 2u * (lane & 1u);
+    return uint2(fragment_column0, fragment_row);
+}
+
+// Direct-fragment sibling of q4k_linear_mma_combined_v4. Weight decode, MMA
+// order, and the increasing-superblock f32 tail are identical. Only the
+// synchronized C-tile store/reload is replaced with each lane's two native
+// accumulator elements and their explicit Apple ownership coordinates.
+kernel void q4k_linear_mma_combined_direct_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    device const half* ysums [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint k_pad = 8;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+
+    threadgroup half stage_a[256 * 8];
+    threadgroup half mn_a[8 * 16];
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        const uint r = lane & 7u;
+        const uint g = lane >> 3;
+        const uint rr = r0 + r;
+        if (rr < rows) {
+            device const uchar* block = weight_blocks + (rr * n_sb + sb) * 144;
+            uchar sc[8], mn[8];
+            q4k_scale_min_v2(block, sc, mn);
+            device const uint4* wq =
+                reinterpret_cast<device const uint4*>(block + 16 + g * 32);
+            const uint4 wv[2] = {wq[0], wq[1]};
+            const half slo = half(int(sc[2 * g]));
+            const half shi = half(int(sc[2 * g + 1]));
+            for (uint h = 0; h < 2; ++h) {
+                for (uint c = 0; c < 4; ++c) {
+                    const uint w = wv[h][c];
+                    for (uint j = 0; j < 4; ++j) {
+                        const uint pl = (h * 4 + c) * 4 + j;
+                        const uint byte = (w >> (8 * j)) & 0xffu;
+                        stage_a[(g * 64 + pl) * 8 + r] = slo * half(int(byte & 0x0fu));
+                        stage_a[(g * 64 + 32 + pl) * 8 + r] = shi * half(int(byte >> 4));
+                    }
+                }
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) {
+                    const uint j16 = g * 8 + i;
+                    mn_a[r * 16 + j16] =
+                        half(int(mn[((j16 >> 2) * 2) + ((j16 >> 1) & 1u)]));
+                }
+            }
+        } else {
+            for (uint pl = 0; pl < 64; ++pl) {
+                stage_a[(g * 64 + pl) * 8 + r] = half(0.0f);
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) mn_a[r * 16 + g * 8 + i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+        simdgroup_float8x8 c_min = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint m = 0; m < 2; ++m) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, mn_a + m * 8, 16);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, ysums + (sb * 16 + m * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_min, a, b, c_min);
+        }
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint token = fragment_column0 + cell;
+            const uint out_row = r0 + fragment_row;
+            if (out_row < rows && token < n_tokens) {
+                device const uchar* block =
+                    weight_blocks + (out_row * n_sb + sb) * 144;
+                const float dw = float(*reinterpret_cast<device const half*>(block));
+                const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+                const float da = input_scales[token * n_sb + sb];
+                accum[cell] += (dw * da) * c_main.thread_elements()[cell]
+                             - (dm * da) * c_min.thread_elements()[cell];
+            }
+        }
+        // Preserve the established superblock boundary: no lane may overwrite
+        // single-buffered A/min staging until every lane has consumed it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint token = fragment_column0 + cell;
+        const uint out_row = r0 + fragment_row;
+        if (out_row < rows && token < n_tokens) {
+            output[token * rows + out_row] = accum[cell];
+        }
+    }
+}
+
+// Q6 sibling with the same explicit fragment ownership. Its intentional half
+// weight rounding and the strict increasing-superblock f32 fold are unchanged.
+kernel void q6k_linear_mma_combined_direct_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint k_pad = 8;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+
+    threadgroup half stage_a[256 * 8];
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        const uint r = lane & 7u;
+        const uint q = lane >> 3;
+        const uint h = q >> 1;
+        const uint s = q & 1u;
+        const uint rr = r0 + r;
+        const uint base = h * 128 + s * 16;
+        if (rr < rows) {
+            device const uchar* block = weight_blocks + (rr * n_sb + sb) * 210;
+            device const char* scales = reinterpret_cast<device const char*>(block + 192);
+            const int s0 = int(scales[8 * h + s]);
+            const int s1 = int(scales[8 * h + s + 2]);
+            const int s2 = int(scales[8 * h + s + 4]);
+            const int s3 = int(scales[8 * h + s + 6]);
+            device const ushort* wl =
+                reinterpret_cast<device const ushort*>(block + h * 64 + s * 16);
+            device const ushort* wh =
+                reinterpret_cast<device const ushort*>(block + h * 64 + 32 + s * 16);
+            device const ushort* wq =
+                reinterpret_cast<device const ushort*>(block + 128 + h * 32 + s * 16);
+            for (uint l = 0; l < 16; ++l) {
+                const uint albyte = (uint(wl[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const uint ahbyte = (uint(wh[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const uint hbyte = (uint(wq[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                const int a1 = int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
+                const int a2 = int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
+                const int a3 = int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
+                stage_a[(base + l) * 8 + r] = half(s0 * a0);
+                stage_a[(base + l + 32) * 8 + r] = half(s1 * a1);
+                stage_a[(base + l + 64) * 8 + r] = half(s2 * a2);
+                stage_a[(base + l + 96) * 8 + r] = half(s3 * a3);
+            }
+        } else {
+            for (uint l = 0; l < 16; ++l) {
+                stage_a[(base + l) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 32) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 64) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 96) * 8 + r] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint token = fragment_column0 + cell;
+            const uint out_row = r0 + fragment_row;
+            if (out_row < rows && token < n_tokens) {
+                device const uchar* block =
+                    weight_blocks + (out_row * n_sb + sb) * 210;
+                const float dw = float(*reinterpret_cast<device const half*>(block + 208));
+                const float da = input_scales[token * n_sb + sb];
+                accum[cell] += (dw * da) * c_main.thread_elements()[cell];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint token = fragment_column0 + cell;
+        const uint out_row = r0 + fragment_row;
+        if (out_row < rows && token < n_tokens) {
+            output[token * rows + out_row] = accum[cell];
+        }
+    }
+}
+
 // Width-16 V4 lane. Two simdgroups share one decoded weight tile and each
 // owns an independent N=8 combined-chain accumulator. The per-column MMA and
 // f32 fold order is unchanged from the narrow V4 kernels above.
@@ -15516,7 +15736,7 @@ fn encode_kquant_v4_activation_stage(
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn encode_kquant_v4_prepared_projection(
+fn encode_kquant_v4_prepared_projection_route(
     e: &metal::ComputeCommandEncoderRef,
     v4: &KquantV2Kernels,
     scales: &Buffer,
@@ -15525,20 +15745,26 @@ fn encode_kquant_v4_prepared_projection(
     out: &Buffer,
     scalar: &Buffer,
     rows: usize,
-) {
+    direct_fragment: bool,
+) -> bool {
     let is_q6k = match weight.format {
         ResidentWeightFormat::Q4K => false,
         ResidentWeightFormat::Q6K => true,
         _ => unreachable!("V4 prepared projection requires Q4_K or Q6_K"),
     };
     let wide = stage.n_tokens > 8;
-    let pipeline = match (is_q6k, wide) {
-        (false, false) => &v4.q4k_v4,
-        (false, true) => &v4.q4k_v4_w16,
-        (true, false) => &v4.q6k_v4,
-        (true, true) => &v4.q6k_v4_w16,
+    let pipeline = match (is_q6k, wide, direct_fragment) {
+        (false, false, true) => v4.q4k_v4_direct.as_ref(),
+        (true, false, true) => v4.q6k_v4_direct.as_ref(),
+        (_, true, true) => None,
+        (false, false, false) => Some(&v4.q4k_v4),
+        (false, true, false) => Some(&v4.q4k_v4_w16),
+        (true, false, false) => Some(&v4.q6k_v4),
+        (true, true, false) => Some(&v4.q6k_v4_w16),
     };
-    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows);
+    let Some(pipeline) = pipeline else {
+        return false;
+    };
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(scales), 0);
     e.set_buffer(2, Some(&weight.buffer), 0);
@@ -15571,6 +15797,41 @@ fn encode_kquant_v4_prepared_projection(
             depth: 1,
         },
     );
+    true
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_kquant_v4_prepared_projection(
+    e: &metal::ComputeCommandEncoderRef,
+    v4: &KquantV2Kernels,
+    scales: &Buffer,
+    stage: &KquantV4ActivationStage,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    let direct_requested = stage.n_tokens <= 8 && kquant_v4_direct_fragment_enabled();
+    let used_direct = direct_requested
+        && encode_kquant_v4_prepared_projection_route(
+            e, v4, scales, stage, weight, out, scalar, rows, true,
+        );
+    if direct_requested && !used_direct {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[metal] CAMELID_KQUANT_V4_DIRECT_FRAGMENT requested, but its pipeline is \
+                 unavailable; retaining synchronized V4 materialization"
+            );
+        }
+    }
+    if !used_direct {
+        assert!(encode_kquant_v4_prepared_projection_route(
+            e, v4, scales, stage, weight, out, scalar, rows, false,
+        ));
+    }
+    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows, used_direct);
 }
 
 #[cfg(target_os = "macos")]
@@ -16592,8 +16853,10 @@ struct KquantV2Kernels {
     q6k_mma: ComputePipelineState,
     q6k_mma_stage_y: ComputePipelineState,
     q4k_v4: ComputePipelineState,
+    q4k_v4_direct: Option<ComputePipelineState>,
     q4k_v4_w16: ComputePipelineState,
     q6k_v4: ComputePipelineState,
+    q6k_v4_direct: Option<ComputePipelineState>,
     q6k_v4_w16: ComputePipelineState,
 }
 
@@ -16632,8 +16895,10 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q6k_mma: pipeline("q6k_linear_mma_mc_v2")?,
                 q6k_mma_stage_y: pipeline("q6k_mma_stage_y_f32")?,
                 q4k_v4: pipeline("q4k_linear_mma_combined_v4")?,
+                q4k_v4_direct: pipeline("q4k_linear_mma_combined_direct_v4"),
                 q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
+                q6k_v4_direct: pipeline("q6k_linear_mma_combined_direct_v4"),
                 q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
         })
@@ -16674,13 +16939,30 @@ fn kquant_v4_enabled() -> bool {
     })
 }
 
+/// Opt in to native fragment-owned result materialization for the narrow V4
+/// Q4_K/Q6_K kernels. The established threadgroup store/reload remains the
+/// default and all width-16 traffic stays on it, so this experiment can be
+/// qualified independently from shared activation preparation.
+fn kquant_v4_direct_fragment_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_KQUANT_V4_DIRECT_FRAGMENT")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// One-shot production dispatch proof for the experimental v4 lane. The trace
 /// is completely dormant unless explicitly requested, then prints the first
 /// Q4/Q6 single/narrow/wide encode observed by this process. This closes the gap
 /// between direct shader micros and the real Rust model route without putting
 /// an atomic or an environment lookup on every normal encode.
 #[cfg(target_os = "macos")]
-fn trace_kquant_v4_dispatch(format: ResidentWeightFormat, n_tokens: usize, rows: usize) {
+fn trace_kquant_v4_dispatch(
+    format: ResidentWeightFormat,
+    n_tokens: usize,
+    rows: usize,
+    direct_fragment: bool,
+) {
     static TRACE: OnceLock<bool> = OnceLock::new();
     static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     if !*TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()) {
@@ -16697,8 +16979,13 @@ fn trace_kquant_v4_dispatch(format: ResidentWeightFormat, n_tokens: usize, rows:
     };
     let previous = SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
     if previous & bit == 0 {
+        let pipeline = if direct_fragment {
+            "combined-mma-v4-direct-fragment"
+        } else {
+            "combined-mma-v4"
+        };
         eprintln!(
-            "[metal-kquant-v4] dispatch={label} n_tokens={n_tokens} rows={rows} pipeline=combined-mma-v4"
+            "[metal-kquant-v4] dispatch={label} n_tokens={n_tokens} rows={rows} pipeline={pipeline}"
         );
     }
 }
@@ -36213,6 +36500,224 @@ mod tests {
 
             // Keep every preparation alive through its command-buffer wait.
             drop((independent_preps, shared));
+        }
+    }
+
+    /// Corrected direct-fragment qualification. The oracle is the established
+    /// synchronized V4 materialization over the exact same prepared activation
+    /// and weights. Ragged output rows plus N=1/3/7 exercise both dimensions of
+    /// the Apple fragment map; N=8 covers the production verifier window.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_direct_fragment_is_bit_identical_and_guarded() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        assert!(v4.q4k_v4_direct.is_some(), "Q4 direct-fragment pipeline");
+        assert!(v4.q6k_v4_direct.is_some(), "Q6 direct-fragment pipeline");
+        let device = &kernel.device;
+        let rows = 19usize;
+        let n_sb = 3usize;
+        let input_width = n_sb * 256;
+        let physical_columns = 8usize;
+
+        let make_weight = |format: ResidentWeightFormat, salt: usize| {
+            let block_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                .map(|i| ((i * 53 + i / 23 + salt * 31) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                let d = 0.005 + block_index as f32 * 0.00009;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.4).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let buffer =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&buffer, &wire);
+            ResidentLinearWeight {
+                format,
+                buffer,
+                q8_wire: false,
+            }
+        };
+        let q4_weight = make_weight(ResidentWeightFormat::Q4K, 5);
+        let q6_weight = make_weight(ResidentWeightFormat::Q6K, 13);
+
+        for n_tokens in [1usize, 3, 7, 8] {
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| {
+                    let token = i / input_width;
+                    let col = i % input_width;
+                    ((((token * 149 + col * 37) % 263) as f32) - 131.0) * 0.013
+                        + token as f32 * 0.0007
+                })
+                .collect();
+            let input_buf = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let make_output = || {
+                let output = device.new_buffer(
+                    (physical_columns * rows * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                fill_buffer_sentinel(&output, physical_columns * rows);
+                output
+            };
+            let q4_control = make_output();
+            let q4_direct = make_output();
+            let q6_control = make_output();
+            let q6_direct = make_output();
+
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            let prepared = encode_shared_kquant_v4_activation(
+                e,
+                kernel,
+                v4,
+                &input_buf,
+                input_width,
+                n_tokens,
+            );
+            unsafe {
+                std::ptr::write_bytes(
+                    prepared.stage.y_stage.contents().cast::<u8>(),
+                    0xff,
+                    input_width * prepared.stage.k_pad * 2,
+                );
+                std::ptr::write_bytes(
+                    prepared
+                        .stage
+                        .ysums
+                        .as_ref()
+                        .expect("shared preparation has ysums")
+                        .contents()
+                        .cast::<u8>(),
+                    0xff,
+                    n_sb * 16 * prepared.stage.k_pad * 2,
+                );
+            }
+            for (weight, output, direct) in [
+                (&q4_weight, &q4_control, false),
+                (&q4_weight, &q4_direct, true),
+                (&q6_weight, &q6_control, false),
+                (&q6_weight, &q6_direct, true),
+            ] {
+                assert!(encode_kquant_v4_prepared_projection_route(
+                    e,
+                    v4,
+                    &prepared.scales,
+                    &prepared.stage,
+                    weight,
+                    output,
+                    &scalar,
+                    rows,
+                    direct,
+                ));
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            for (format, control, direct) in [
+                ("Q4", &q4_control, &q4_direct),
+                ("Q6", &q6_control, &q6_direct),
+            ] {
+                let mut control_values = vec![0.0f32; physical_columns * rows];
+                let mut direct_values = vec![0.0f32; physical_columns * rows];
+                read_buffer_f32(control, &mut control_values);
+                read_buffer_f32(direct, &mut direct_values);
+                let active = n_tokens * rows;
+                assert_no_sentinel(
+                    &control_values[..active],
+                    &format!("{format} control"),
+                    n_tokens,
+                );
+                assert_no_sentinel(
+                    &direct_values[..active],
+                    &format!("{format} direct"),
+                    n_tokens,
+                );
+                for i in 0..active {
+                    assert_eq!(
+                        direct_values[i].to_bits(),
+                        control_values[i].to_bits(),
+                        "{format} direct fragment n={n_tokens} element={i}: {} ({:#010x}) \
+                         != control {} ({:#010x})",
+                        direct_values[i],
+                        direct_values[i].to_bits(),
+                        control_values[i],
+                        control_values[i].to_bits(),
+                    );
+                }
+                for i in active..physical_columns * rows {
+                    assert_eq!(
+                        direct_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} direct fragment wrote padded output n={n_tokens} element={i}"
+                    );
+                    assert_eq!(
+                        control_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} control wrote padded output n={n_tokens} element={i}"
+                    );
+                }
+            }
+
+            let y_half = unsafe {
+                std::slice::from_raw_parts(
+                    prepared.stage.y_stage.contents() as *const u16,
+                    input_width * prepared.stage.k_pad,
+                )
+            };
+            let ysums = unsafe {
+                std::slice::from_raw_parts(
+                    prepared
+                        .stage
+                        .ysums
+                        .as_ref()
+                        .expect("shared preparation has ysums")
+                        .contents() as *const u16,
+                    n_sb * 16 * prepared.stage.k_pad,
+                )
+            };
+            for pos in 0..input_width {
+                for token in 0..n_tokens {
+                    assert_ne!(y_half[pos * 8 + token], u16::MAX);
+                }
+                for token in n_tokens..8 {
+                    assert_eq!(y_half[pos * 8 + token], 0);
+                }
+            }
+            for cell in 0..n_sb * 16 {
+                for token in 0..n_tokens {
+                    assert_ne!(ysums[cell * 8 + token], u16::MAX);
+                }
+                for token in n_tokens..8 {
+                    assert_eq!(ysums[cell * 8 + token], 0);
+                }
+            }
+            drop(prepared);
         }
     }
 
