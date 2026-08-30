@@ -6771,6 +6771,8 @@ pub struct Gemma4OrderedQ4Generation {
 /// baseline, while a misspelling fails before target identity or model work.
 #[cfg(target_os = "macos")]
 pub const GEMMA4_MTP12_W16_WARMUP8_ENV: &str = "CAMELID_GEMMA4_MTP_W16_WARMUP8";
+#[cfg(target_os = "macos")]
+pub const GEMMA4_MTP12_W16_ONESHOT_W8_PAD16_ENV: &str = "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16";
 
 #[cfg(target_os = "macos")]
 fn gemma4_mtp12_w16_warmup8_policy(value: Option<&str>) -> std::result::Result<bool, String> {
@@ -6779,6 +6781,19 @@ fn gemma4_mtp12_w16_warmup8_policy(value: Option<&str>) -> std::result::Result<b
         Some("1") => Ok(true),
         Some(other) => Err(format!(
             "{GEMMA4_MTP12_W16_WARMUP8_ENV} must be exactly 0 or 1; got {other:?}"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp12_w16_oneshot_w8_pad16_policy(
+    value: Option<&str>,
+) -> std::result::Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{GEMMA4_MTP12_W16_ONESHOT_W8_PAD16_ENV} must be exactly 0 or 1; got {other:?}"
         )),
     }
 }
@@ -6792,6 +6807,8 @@ pub enum Gemma4Mtp12WidthScheduleState {
     Fixed,
     /// W16 is configured and enabled, but a complete warmup round has not qualified it.
     Warmup,
+    /// The evidence-driven W8 bootstrap runs exactly once, irrespective of acceptance.
+    OneShotBootstrap,
     /// A complete warmup round qualified W16 for the next non-tail round.
     Wide16,
 }
@@ -6804,7 +6821,9 @@ pub enum Gemma4Mtp12WidthScheduleTransition {
     FixedWidth,
     WarmupPartialHold,
     WarmupFullEscalateToW16,
+    OneShotBootstrapCompleteToW16,
     Wide16FullHold,
+    Wide16PartialHold,
     Wide16PartialFallbackToWarmup,
     /// A physical 8/4/2 budget tail never changes the learned schedule state.
     BudgetTailHold,
@@ -6823,6 +6842,7 @@ pub struct Gemma4Mtp12WidthScheduleProvenance {
     /// `Some(8)` for this selector; explicit provenance leaves a safe seam for
     /// separately qualifying a W4 warmup without overloading the 0/1 gate.
     pub warmup_verify_width: Option<usize>,
+    pub padded_tail_policy: Option<&'static str>,
     pub policy: &'static str,
 }
 
@@ -6835,6 +6855,7 @@ impl Default for Gemma4Mtp12WidthScheduleProvenance {
             enabled: false,
             active_for_configured_width: false,
             warmup_verify_width: None,
+            padded_tail_policy: None,
             policy: "fixed_width",
         }
     }
@@ -6844,7 +6865,9 @@ impl Default for Gemma4Mtp12WidthScheduleProvenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gemma4Mtp12WidthRoundPlan {
     scheduled_verify_width: usize,
-    verifier_width: usize,
+    logical_verify_width: usize,
+    physical_verify_width: usize,
+    padding_rows: usize,
     budget_truncated: bool,
     state_before: Gemma4Mtp12WidthScheduleState,
 }
@@ -6859,6 +6882,7 @@ struct Gemma4Mtp12WidthRoundPlan {
 struct Gemma4Mtp12WidthScheduler {
     configured_verify_width: usize,
     warmup_verify_width: usize,
+    one_shot_padded_tail: bool,
     state: Gemma4Mtp12WidthScheduleState,
 }
 
@@ -6886,11 +6910,24 @@ impl Gemma4Mtp12WidthScheduler {
         Some(Self {
             configured_verify_width,
             warmup_verify_width: warmup_verify_width.unwrap_or(configured_verify_width),
+            one_shot_padded_tail: false,
             state: if warmup_verify_width.is_some() && configured_verify_width == 16 {
                 Gemma4Mtp12WidthScheduleState::Warmup
             } else {
                 Gemma4Mtp12WidthScheduleState::Fixed
             },
+        })
+    }
+
+    fn new_one_shot_w8_padded_w16(configured_verify_width: usize) -> Option<Self> {
+        if configured_verify_width != 16 {
+            return None;
+        }
+        Some(Self {
+            configured_verify_width,
+            warmup_verify_width: 8,
+            one_shot_padded_tail: true,
+            state: Gemma4Mtp12WidthScheduleState::OneShotBootstrap,
         })
     }
 
@@ -6902,18 +6939,33 @@ impl Gemma4Mtp12WidthScheduler {
         match self.state {
             Gemma4Mtp12WidthScheduleState::Fixed => self.configured_verify_width,
             Gemma4Mtp12WidthScheduleState::Warmup => self.warmup_verify_width,
+            Gemma4Mtp12WidthScheduleState::OneShotBootstrap => 8,
             Gemma4Mtp12WidthScheduleState::Wide16 => 16,
         }
     }
 
     fn plan_round(&self, remaining_including_anchor: usize) -> Option<Gemma4Mtp12WidthRoundPlan> {
         let scheduled_verify_width = self.scheduled_verify_width();
-        let verifier_width =
-            gemma4_mtp12_tail_verify_width(scheduled_verify_width, remaining_including_anchor)?;
+        let (logical_verify_width, physical_verify_width) = if self.one_shot_padded_tail
+            && self.state == Gemma4Mtp12WidthScheduleState::Wide16
+            && scheduled_verify_width == 16
+            && (10..=15).contains(&remaining_including_anchor)
+        {
+            // Reserve the already-predicted bonus anchor for the final free W1
+            // loop.  For the measured remaining=11 case this is logical W10
+            // (anchor + nine drafts) executed as physical W16.
+            (remaining_including_anchor - 1, 16)
+        } else {
+            let width =
+                gemma4_mtp12_tail_verify_width(scheduled_verify_width, remaining_including_anchor)?;
+            (width, width)
+        };
         Some(Gemma4Mtp12WidthRoundPlan {
             scheduled_verify_width,
-            verifier_width,
-            budget_truncated: verifier_width != scheduled_verify_width,
+            logical_verify_width,
+            physical_verify_width,
+            padding_rows: physical_verify_width - logical_verify_width,
+            budget_truncated: logical_verify_width != scheduled_verify_width,
             state_before: self.state,
         })
     }
@@ -6929,7 +6981,7 @@ impl Gemma4Mtp12WidthScheduler {
     )> {
         if plan.state_before != self.state
             || plan.scheduled_verify_width != self.scheduled_verify_width()
-            || accepted_drafts >= plan.verifier_width
+            || accepted_drafts >= plan.logical_verify_width
         {
             return None;
         }
@@ -6938,7 +6990,7 @@ impl Gemma4Mtp12WidthScheduler {
         } else if plan.budget_truncated {
             Gemma4Mtp12WidthScheduleTransition::BudgetTailHold
         } else {
-            let full = accepted_drafts + 1 == plan.verifier_width;
+            let full = accepted_drafts + 1 == plan.logical_verify_width;
             match (self.state, full) {
                 (Gemma4Mtp12WidthScheduleState::Fixed, _) => {
                     Gemma4Mtp12WidthScheduleTransition::FixedWidth
@@ -6950,12 +7002,20 @@ impl Gemma4Mtp12WidthScheduler {
                     self.state = Gemma4Mtp12WidthScheduleState::Wide16;
                     Gemma4Mtp12WidthScheduleTransition::WarmupFullEscalateToW16
                 }
+                (Gemma4Mtp12WidthScheduleState::OneShotBootstrap, _) => {
+                    self.state = Gemma4Mtp12WidthScheduleState::Wide16;
+                    Gemma4Mtp12WidthScheduleTransition::OneShotBootstrapCompleteToW16
+                }
                 (Gemma4Mtp12WidthScheduleState::Wide16, true) => {
                     Gemma4Mtp12WidthScheduleTransition::Wide16FullHold
                 }
                 (Gemma4Mtp12WidthScheduleState::Wide16, false) => {
-                    self.state = Gemma4Mtp12WidthScheduleState::Warmup;
-                    Gemma4Mtp12WidthScheduleTransition::Wide16PartialFallbackToWarmup
+                    if self.one_shot_padded_tail {
+                        Gemma4Mtp12WidthScheduleTransition::Wide16PartialHold
+                    } else {
+                        self.state = Gemma4Mtp12WidthScheduleState::Warmup;
+                        Gemma4Mtp12WidthScheduleTransition::Wide16PartialFallbackToWarmup
+                    }
                 }
             }
         };
@@ -6976,8 +7036,13 @@ pub struct Gemma4Mtp12MetalRoundReceipt {
     pub configured_verify_width: usize,
     /// Width selected by the adaptive state before output-budget truncation.
     pub scheduled_verify_width: usize,
-    /// Actual target width after adapting to the remaining output budget.
+    /// Target-authoritative rows eligible for acceptance and commit.
+    pub logical_verify_width: usize,
+    /// Actual target execution width, including causally-later padding rows.
+    pub physical_verify_width: usize,
+    /// Backward-compatible alias of `physical_verify_width`.
     pub verifier_width: usize,
+    pub padding_candidate_ids: Vec<u32>,
     pub budget_truncated: bool,
     pub schedule_state_before: Gemma4Mtp12WidthScheduleState,
     pub schedule_state_after: Gemma4Mtp12WidthScheduleState,
@@ -7205,6 +7270,26 @@ fn gemma4_mtp12_tail_verify_width(
 }
 
 #[cfg(target_os = "macos")]
+fn gemma4_mtp12_materialize_candidate_rows(
+    plan: Gemma4Mtp12WidthRoundPlan,
+    anchor_token: u32,
+    drafts: &[u32],
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    if drafts.len().checked_add(1)? != plan.logical_verify_width
+        || plan.physical_verify_width < plan.logical_verify_width
+        || plan.padding_rows != plan.physical_verify_width - plan.logical_verify_width
+    {
+        return None;
+    }
+    let mut candidates = Vec::with_capacity(plan.physical_verify_width);
+    candidates.push(anchor_token);
+    candidates.extend_from_slice(drafts);
+    let padding_candidate_ids = vec![anchor_token; plan.padding_rows];
+    candidates.extend_from_slice(&padding_candidate_ids);
+    Some((candidates, padding_candidate_ids))
+}
+
+#[cfg(target_os = "macos")]
 fn gemma4_mtp12_acceptance_decision(
     drafts: &[u32],
     target_greedy_ids: &[u32],
@@ -7250,7 +7335,8 @@ fn gemma4_mtp12_acceptance_decision(
 #[cfg(all(test, target_os = "macos"))]
 mod gemma4_mtp12_metal_generation_tests {
     use super::{
-        gemma4_mtp12_acceptance_decision, gemma4_mtp12_tail_verify_width,
+        gemma4_mtp12_acceptance_decision, gemma4_mtp12_materialize_candidate_rows,
+        gemma4_mtp12_tail_verify_width, gemma4_mtp12_w16_oneshot_w8_pad16_policy,
         gemma4_mtp12_w16_warmup8_policy, Gemma4Mtp12AcceptanceDecision, Gemma4Mtp12MetalStats,
         Gemma4Mtp12WidthScheduleState, Gemma4Mtp12WidthScheduleTransition,
         Gemma4Mtp12WidthScheduler,
@@ -7269,6 +7355,125 @@ mod gemma4_mtp12_metal_generation_tests {
     }
 
     #[test]
+    fn one_shot_padded_gate_is_default_off_and_fails_closed() {
+        assert_eq!(gemma4_mtp12_w16_oneshot_w8_pad16_policy(None), Ok(false));
+        assert_eq!(
+            gemma4_mtp12_w16_oneshot_w8_pad16_policy(Some("0")),
+            Ok(false)
+        );
+        assert_eq!(
+            gemma4_mtp12_w16_oneshot_w8_pad16_policy(Some(" 1 ")),
+            Ok(true)
+        );
+        for invalid in ["", "true", "on", "2", "01", "disabled"] {
+            let error = gemma4_mtp12_w16_oneshot_w8_pad16_policy(Some(invalid))
+                .expect_err("non-0/1 one-shot values must fail closed");
+            assert!(error.contains("must be exactly 0 or 1"), "{error}");
+        }
+    }
+
+    #[test]
+    fn one_shot_w8_then_w16_pins_logical10_physical16_remaining11_tail() {
+        let mut scheduler = Gemma4Mtp12WidthScheduler::new_one_shot_w8_padded_w16(16)
+            .expect("one-shot configured W16");
+        let mut generated = 0usize;
+        let mut widths = Vec::new();
+
+        let bootstrap = scheduler.plan_round(96).expect("one-shot W8 bootstrap");
+        assert_eq!(bootstrap.logical_verify_width, 8);
+        assert_eq!(bootstrap.physical_verify_width, 8);
+        widths.push((8, 8));
+        generated += 5; // Measured mismatch depth four: anchor + four drafts.
+        let (state, transition) = scheduler
+            .finish_round(bootstrap, 4, false)
+            .expect("partial bootstrap still advances exactly once");
+        assert_eq!(state, Gemma4Mtp12WidthScheduleState::Wide16);
+        assert_eq!(
+            transition,
+            Gemma4Mtp12WidthScheduleTransition::OneShotBootstrapCompleteToW16
+        );
+
+        for _ in 0..5 {
+            let wide = scheduler
+                .plan_round(96 - generated)
+                .expect("five measured full W16 rounds");
+            assert_eq!(wide.logical_verify_width, 16);
+            assert_eq!(wide.physical_verify_width, 16);
+            widths.push((16, 16));
+            generated += 16;
+            scheduler.finish_round(wide, 15, false).expect("full W16");
+        }
+        assert_eq!(generated, 85);
+        assert_eq!(96 - generated, 11, "remaining_including_anchor");
+
+        let tail = scheduler.plan_round(11).expect("padded W16 tail");
+        assert_eq!(tail.scheduled_verify_width, 16);
+        assert_eq!(tail.logical_verify_width, 10);
+        assert_eq!(tail.physical_verify_width, 16);
+        assert_eq!(tail.padding_rows, 6);
+        widths.push((10, 16));
+        let drafts = (200u32..209).collect::<Vec<_>>();
+        let (candidates, padding) = gemma4_mtp12_materialize_candidate_rows(tail, 42, &drafts)
+            .expect("logical W10 padded to physical W16");
+        let mut expected_logical = vec![42];
+        expected_logical.extend_from_slice(&drafts);
+        assert_eq!(&candidates[..10], expected_logical.as_slice());
+        assert_eq!(padding, vec![42; 6]);
+        assert_eq!(&candidates[10..], padding.as_slice());
+        let (state, transition) = scheduler
+            .finish_round(tail, 9, false)
+            .expect("full logical W10 acceptance");
+        assert_eq!(state, Gemma4Mtp12WidthScheduleState::Wide16);
+        assert_eq!(
+            transition,
+            Gemma4Mtp12WidthScheduleTransition::BudgetTailHold
+        );
+        generated += 10;
+        assert_eq!(generated, 95);
+        assert!(scheduler.plan_round(1).is_none());
+        generated += 1; // Final already-predicted target anchor, no target pass.
+        assert_eq!(generated, 96);
+        assert_eq!(
+            widths,
+            vec![
+                (8, 8),
+                (16, 16),
+                (16, 16),
+                (16, 16),
+                (16, 16),
+                (16, 16),
+                (10, 16)
+            ]
+        );
+    }
+
+    #[test]
+    fn one_shot_wide_partial_acceptance_holds_w16() {
+        let mut scheduler = Gemma4Mtp12WidthScheduler::new_one_shot_w8_padded_w16(16)
+            .expect("one-shot configured W16");
+        let bootstrap = scheduler.plan_round(96).expect("bootstrap");
+        scheduler
+            .finish_round(bootstrap, 4, false)
+            .expect("advance after partial bootstrap");
+        let wide = scheduler.plan_round(91).expect("W16 after bootstrap");
+        let (state, transition) = scheduler
+            .finish_round(wide, 4, false)
+            .expect("partial W16 holds one-shot policy");
+        assert_eq!(state, Gemma4Mtp12WidthScheduleState::Wide16);
+        assert_eq!(
+            transition,
+            Gemma4Mtp12WidthScheduleTransition::Wide16PartialHold
+        );
+        assert_eq!(
+            scheduler
+                .plan_round(86)
+                .expect("still W16")
+                .physical_verify_width,
+            16
+        );
+    }
+
+    #[test]
     fn adaptive_w16_measured_acceptance_shape_uses_8_8_then_wide_and_tail() {
         let mut scheduler = Gemma4Mtp12WidthScheduler::new(16, true);
         let mut generated = 0usize;
@@ -7283,9 +7488,9 @@ mod gemma4_mtp12_metal_generation_tests {
             let accepted = if widths.is_empty() {
                 4
             } else {
-                plan.verifier_width - 1
+                plan.logical_verify_width - 1
             };
-            widths.push(plan.verifier_width);
+            widths.push(plan.physical_verify_width);
             generated += 1 + accepted;
             let (_, transition) = scheduler
                 .finish_round(plan, accepted, false)
@@ -7320,9 +7525,9 @@ mod gemma4_mtp12_metal_generation_tests {
             let plan = scheduler
                 .plan_round(96 - generated)
                 .expect("96-token full-acceptance shape has no W1 tail");
-            widths.push(plan.verifier_width);
-            let accepted = plan.verifier_width - 1;
-            generated += plan.verifier_width;
+            widths.push(plan.physical_verify_width);
+            let accepted = plan.logical_verify_width - 1;
+            generated += plan.logical_verify_width;
             scheduler
                 .finish_round(plan, accepted, false)
                 .expect("full W4/W16/tail round");
@@ -7339,7 +7544,7 @@ mod gemma4_mtp12_metal_generation_tests {
         let mut scheduler = Gemma4Mtp12WidthScheduler::new(16, true);
 
         let warmup = scheduler.plan_round(96).expect("initial W8");
-        assert_eq!(warmup.verifier_width, 8);
+        assert_eq!(warmup.physical_verify_width, 8);
         let (state, transition) = scheduler.finish_round(warmup, 7, false).expect("full W8");
         assert_eq!(state, Gemma4Mtp12WidthScheduleState::Wide16);
         assert_eq!(
@@ -7348,7 +7553,7 @@ mod gemma4_mtp12_metal_generation_tests {
         );
 
         let wide = scheduler.plan_round(88).expect("qualified W16");
-        assert_eq!(wide.verifier_width, 16);
+        assert_eq!(wide.physical_verify_width, 16);
         let (state, transition) = scheduler.finish_round(wide, 4, false).expect("partial W16");
         assert_eq!(state, Gemma4Mtp12WidthScheduleState::Warmup);
         assert_eq!(
@@ -7357,7 +7562,7 @@ mod gemma4_mtp12_metal_generation_tests {
         );
 
         let partial_warmup = scheduler.plan_round(83).expect("fallback W8");
-        assert_eq!(partial_warmup.verifier_width, 8);
+        assert_eq!(partial_warmup.physical_verify_width, 8);
         scheduler
             .finish_round(partial_warmup, 3, false)
             .expect("partial fallback W8");
@@ -7372,7 +7577,7 @@ mod gemma4_mtp12_metal_generation_tests {
             scheduler
                 .plan_round(71)
                 .expect("requalified W16")
-                .verifier_width,
+                .physical_verify_width,
             16
         );
     }
@@ -7388,7 +7593,7 @@ mod gemma4_mtp12_metal_generation_tests {
         let mut tails = Vec::new();
         for remaining in [15usize, 7, 3] {
             let plan = scheduler.plan_round(remaining).expect("admitted tail");
-            tails.push(plan.verifier_width);
+            tails.push(plan.physical_verify_width);
             let (state, transition) = scheduler
                 .finish_round(plan, 0, false)
                 .expect("partial budget tail");
@@ -7417,7 +7622,7 @@ mod gemma4_mtp12_metal_generation_tests {
     fn unset_schedule_preserves_fixed_width_and_never_affects_non_w16_runs() {
         let mut fixed_w16 = Gemma4Mtp12WidthScheduler::new(16, false);
         let plan = fixed_w16.plan_round(96).expect("fixed W16");
-        assert_eq!(plan.verifier_width, 16);
+        assert_eq!(plan.physical_verify_width, 16);
         let (state, transition) = fixed_w16
             .finish_round(plan, 4, false)
             .expect("fixed partial W16");
@@ -7427,18 +7632,24 @@ mod gemma4_mtp12_metal_generation_tests {
             fixed_w16
                 .plan_round(91)
                 .expect("still fixed W16")
-                .verifier_width,
+                .physical_verify_width,
             16
         );
 
         let fixed_w8 = Gemma4Mtp12WidthScheduler::new(8, true);
         assert_eq!(fixed_w8.state(), Gemma4Mtp12WidthScheduleState::Fixed);
-        assert_eq!(fixed_w8.plan_round(96).expect("fixed W8").verifier_width, 8);
+        assert_eq!(
+            fixed_w8
+                .plan_round(96)
+                .expect("fixed W8")
+                .physical_verify_width,
+            8
+        );
 
         let mut malformed = Gemma4Mtp12WidthScheduler::new(16, true);
         let plan = malformed.plan_round(96).expect("initial W8");
         assert!(malformed
-            .finish_round(plan, plan.verifier_width, false)
+            .finish_round(plan, plan.logical_verify_width, false)
             .is_none());
     }
 
@@ -8536,13 +8747,18 @@ impl Gemma4GpuRuntime {
     /// 2/4/8/16 (assistant draft counts 1/3/7/15).  The default is fixed width.
     /// With `CAMELID_GEMMA4_MTP_W16_WARMUP8=1`, configured W16 starts at W8,
     /// promotes after a full W8 round, and conservatively falls back after a
-    /// partial W16 round. Near the output budget the scheduled width steps down
-    /// through 16/8/4/2; a final single-token budget is satisfied by the
-    /// already-predicted anchor without forwarding it.
+    /// partial W16 round. The mutually-exclusive one-shot selector runs W8 once,
+    /// then holds W16; when 10..=15 outputs remain it reserves the final bonus
+    /// anchor, verifies the logical `remaining - 1` prefix in a causally padded
+    /// physical W16 call, and never compares or commits padding. Otherwise near
+    /// the output budget the scheduled width steps down through 16/8/4/2; a final
+    /// single-token budget is satisfied by the already-predicted anchor without
+    /// forwarding it.
     ///
     /// The target remains authoritative at every position.  An immediate
     /// mismatch commits one anchor row, accepting `m` drafts commits `1 + m`
-    /// rows, and an all-accepted round commits all K candidate rows.  Stop ids
+    /// rows, and an all-accepted round commits all logical candidate rows. Padded
+    /// physical rows are never eligible for comparison or commit. Stop ids
     /// are never emitted or committed as input rows, including a stop proposed
     /// by the assistant and confirmed by the target.
     pub fn generate_greedy_mtp12_ordered_q4(
@@ -8558,7 +8774,7 @@ impl Gemma4GpuRuntime {
             )));
         }
 
-        let width_schedule_selector_value = std::env::var_os(GEMMA4_MTP12_W16_WARMUP8_ENV)
+        let adaptive_selector_value = std::env::var_os(GEMMA4_MTP12_W16_WARMUP8_ENV)
             .map(|value| {
                 value.into_string().map_err(|value| {
                     BackendError::RuntimeShapeMismatch(format!(
@@ -8567,12 +8783,34 @@ impl Gemma4GpuRuntime {
                 })
             })
             .transpose()?;
-        let width_schedule_enabled =
-            gemma4_mtp12_w16_warmup8_policy(width_schedule_selector_value.as_deref())
+        let one_shot_selector_value =
+            std::env::var_os(GEMMA4_MTP12_W16_ONESHOT_W8_PAD16_ENV)
+                .map(|value| {
+                    value.into_string().map_err(|value| {
+                        BackendError::RuntimeShapeMismatch(format!(
+                            "{GEMMA4_MTP12_W16_ONESHOT_W8_PAD16_ENV} must be UTF-8 and exactly 0 or 1; got {value:?}"
+                        ))
+                    })
+                })
+                .transpose()?;
+        let adaptive_enabled = gemma4_mtp12_w16_warmup8_policy(adaptive_selector_value.as_deref())
+            .map_err(BackendError::RuntimeShapeMismatch)?;
+        let one_shot_enabled =
+            gemma4_mtp12_w16_oneshot_w8_pad16_policy(one_shot_selector_value.as_deref())
                 .map_err(BackendError::RuntimeShapeMismatch)?;
-        let width_schedule_active = width_schedule_enabled && verify_width == 16;
-        let mut width_scheduler =
-            Gemma4Mtp12WidthScheduler::new(verify_width, width_schedule_enabled);
+        if adaptive_enabled && one_shot_enabled {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "{GEMMA4_MTP12_W16_WARMUP8_ENV} and {GEMMA4_MTP12_W16_ONESHOT_W8_PAD16_ENV} are mutually exclusive"
+            )));
+        }
+        let adaptive_active = adaptive_enabled && verify_width == 16;
+        let one_shot_active = one_shot_enabled && verify_width == 16;
+        let mut width_scheduler = if one_shot_active {
+            Gemma4Mtp12WidthScheduler::new_one_shot_w8_padded_w16(verify_width)
+                .expect("active one-shot schedule is configured W16")
+        } else {
+            Gemma4Mtp12WidthScheduler::new(verify_width, adaptive_enabled)
+        };
 
         let target_identity_us = self.admit_mtp12_target_identity()?;
         let prefill = self.prefill_ordered_q4(prompt)?;
@@ -8580,12 +8818,25 @@ impl Gemma4GpuRuntime {
         let mut stats = Gemma4Mtp12MetalStats {
             configured_verify_width: verify_width,
             width_schedule: Gemma4Mtp12WidthScheduleProvenance {
-                selector: GEMMA4_MTP12_W16_WARMUP8_ENV,
-                selector_value: width_schedule_selector_value,
-                enabled: width_schedule_enabled,
-                active_for_configured_width: width_schedule_active,
-                warmup_verify_width: width_schedule_active.then_some(8),
-                policy: if width_schedule_active {
+                selector: if one_shot_enabled {
+                    GEMMA4_MTP12_W16_ONESHOT_W8_PAD16_ENV
+                } else {
+                    GEMMA4_MTP12_W16_WARMUP8_ENV
+                },
+                selector_value: if one_shot_enabled {
+                    one_shot_selector_value
+                } else {
+                    adaptive_selector_value
+                },
+                enabled: adaptive_enabled || one_shot_enabled,
+                active_for_configured_width: adaptive_active || one_shot_active,
+                warmup_verify_width: (adaptive_active || one_shot_active).then_some(8),
+                padded_tail_policy: one_shot_active.then_some(
+                    "remaining_10_through_15_reserves_bonus_anchor; logical_remaining_minus_1; physical_w16; repeat_anchor_padding",
+                ),
+                policy: if one_shot_active {
+                    "one_shot_w8_then_w16; partial_acceptance_does_not_fallback; padded_w16_tail"
+                } else if adaptive_active {
                     "start_warmup; full_warmup_to_w16; partial_w16_to_warmup; tails_hold_state"
                 } else {
                     "fixed_width"
@@ -8613,8 +8864,9 @@ impl Gemma4GpuRuntime {
                 generated.push(anchor_token);
                 break;
             };
-            let round_width = round_plan.verifier_width;
-            let draft_k = round_width - 1;
+            let logical_width = round_plan.logical_verify_width;
+            let physical_width = round_plan.physical_verify_width;
+            let draft_k = logical_width - 1;
             let assistant_started = std::time::Instant::now();
             let draft_proposal = self.propose_mtp12_chain_ordered_q4(
                 assistant,
@@ -8631,23 +8883,35 @@ impl Gemma4GpuRuntime {
                 )));
             }
 
-            let mut candidates = Vec::with_capacity(round_width);
-            candidates.push(anchor_token);
-            candidates.extend_from_slice(&draft_proposal.tokens);
+            let (candidates, padding_candidate_ids) =
+                gemma4_mtp12_materialize_candidate_rows(
+                    round_plan,
+                    anchor_token,
+                    &draft_proposal.tokens,
+                )
+                .ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch(format!(
+                        "MTP candidate materialization refused logical W{logical_width} / physical W{physical_width} / drafts {draft_k}"
+                    ))
+                })?;
             let verify_started = std::time::Instant::now();
             let target_batch = self.verify_consecutive_greedy(&candidates, position)?;
             let target_verify_us = verify_started.elapsed().as_micros();
-            let decision = gemma4_mtp12_acceptance_decision(
-                &draft_proposal.tokens,
-                &target_batch.greedy_ids,
-                &stop_ids,
-            )
+            let logical_target_greedy_ids = (target_batch.greedy_ids.len() == physical_width)
+                .then(|| target_batch.greedy_ids[..logical_width].to_vec());
+            let decision = logical_target_greedy_ids.as_deref().and_then(|target_ids| {
+                gemma4_mtp12_acceptance_decision(
+                    &draft_proposal.tokens,
+                    target_ids,
+                    &stop_ids,
+                )
+            })
             .ok_or_else(|| {
                 // The verifier contract guarantees K predictions, but leave no
                 // pending ticket behind if a future implementation violates it.
                 let _ = self.rollback_verifier_batch(target_batch.ticket);
                 BackendError::RuntimeShapeMismatch(format!(
-                    "MTP target returned {} predictions for {} drafts",
+                    "MTP target returned {} predictions for logical W{logical_width} / physical W{physical_width} / {} drafts",
                     target_batch.greedy_ids.len(),
                     draft_proposal.tokens.len()
                 ))
@@ -8674,7 +8938,7 @@ impl Gemma4GpuRuntime {
             stats.drafted += draft_k as u64;
             stats.accepted_drafts += decision.accepted_drafts as u64;
             stats.committed_input_rows += decision.committed_input_rows as u64;
-            stats.target_verify_rows += round_width as u64;
+            stats.target_verify_rows += physical_width as u64;
             stats.assistant_us = stats.assistant_us.saturating_add(assistant_call_us);
             stats.assistant_gpu_us = stats
                 .assistant_gpu_us
@@ -8694,9 +8958,10 @@ impl Gemma4GpuRuntime {
                 )
                 .ok_or_else(|| {
                     BackendError::RuntimeShapeMismatch(format!(
-                        "MTP adaptive width state refused scheduled W{} / physical W{} / accepted {}",
+                        "MTP width state refused scheduled W{} / logical W{} / physical W{} / accepted {}",
                         round_plan.scheduled_verify_width,
-                        round_plan.verifier_width,
+                        round_plan.logical_verify_width,
+                        round_plan.physical_verify_width,
                         decision.accepted_drafts,
                     ))
                 })?;
@@ -8705,7 +8970,10 @@ impl Gemma4GpuRuntime {
                 anchor_token,
                 configured_verify_width: verify_width,
                 scheduled_verify_width: round_plan.scheduled_verify_width,
-                verifier_width: round_width,
+                logical_verify_width: logical_width,
+                physical_verify_width: physical_width,
+                verifier_width: physical_width,
+                padding_candidate_ids,
                 budget_truncated: round_plan.budget_truncated,
                 schedule_state_before: round_plan.state_before,
                 schedule_state_after,

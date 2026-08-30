@@ -2594,6 +2594,9 @@ enum Command {
     /// For an explicitly configured W16 run, the default-off strict selector
     /// `CAMELID_GEMMA4_MTP_W16_WARMUP8=1` starts at W8 and promotes only after
     /// a complete W8 acceptance round.
+    /// `CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1` is a mutually-exclusive
+    /// experiment: run one W8 bootstrap, stay W16 regardless of its acceptance,
+    /// and admit a causally padded physical-W16 tail when it replaces two tails.
     Gemma4Mtp12Gpu {
         path: PathBuf,
         /// Exact official 12B assistant `model.safetensors` file.
@@ -5357,6 +5360,7 @@ async fn main() -> anyhow::Result<()> {
                     "assistant_load_us": assistant_load_us,
                     "environment": {
                         "CAMELID_GEMMA4_MTP_W16_WARMUP8": std::env::var("CAMELID_GEMMA4_MTP_W16_WARMUP8").ok(),
+                        "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16": std::env::var("CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16").ok(),
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
