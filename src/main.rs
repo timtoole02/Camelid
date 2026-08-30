@@ -2591,6 +2591,9 @@ enum Command {
     /// Qualify and benchmark lossless Gemma 4 12B MTP speculative decode on
     /// Metal. The exact official assistant drafts 1/3/7/15 tokens for target
     /// verifier widths 2/4/8/16; every run must reproduce ordered K1 token IDs.
+    /// For an explicitly configured W16 run, the default-off strict selector
+    /// `CAMELID_GEMMA4_MTP_W16_WARMUP8=1` starts at W8 and promotes only after
+    /// a complete W8 acceptance round.
     Gemma4Mtp12Gpu {
         path: PathBuf,
         /// Exact official 12B assistant `model.safetensors` file.
@@ -5353,6 +5356,7 @@ async fn main() -> anyhow::Result<()> {
                     "target_identity_us": target_identity_us,
                     "assistant_load_us": assistant_load_us,
                     "environment": {
+                        "CAMELID_GEMMA4_MTP_W16_WARMUP8": std::env::var("CAMELID_GEMMA4_MTP_W16_WARMUP8").ok(),
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
