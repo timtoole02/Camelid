@@ -201,6 +201,12 @@ pub(crate) struct MetalLinearKernel {
     /// arithmetic operation while staging the Q4 operand row-major so the MMA
     /// tile load is dense and non-transposed.
     q4_0_q8_ordered_columns_mma_rowmajor_pipeline: Option<ComputePipelineState>,
+    /// Serial-row-tile siblings of the exact padded-eight MMA verifier. A
+    /// single simdgroup owns two or four consecutive 8-row tiles so the Q8
+    /// panel is staged into threadgroup memory once per Q4 block and reused
+    /// across those output tiles. Kept separate for exact A/B qualification.
+    q4_0_q8_ordered_columns_mma_serial2_pipeline: Option<ComputePipelineState>,
+    q4_0_q8_ordered_columns_mma_serial4_pipeline: Option<ComputePipelineState>,
     /// Fixed-geometry Gemma 4 26B routed-expert lane. These three strict
     /// pipelines consume caller-owned, persistent expert slot slabs: no weight
     /// buffer is allocated or copied on the token hot path.
@@ -3536,6 +3542,174 @@ kernel void q4_0_q8_ordered_columns_mma_rowmajor(
     }
 }
 
+// Serial-row-tile exact MMA experiment. One simdgroup owns ROW_TILES
+// consecutive 8-row tiles. Unlike the one-tile kernel above, it cooperatively
+// stages the current 32x8 Q8 panel into threadgroup memory once per block and
+// reuses that panel while visiting each output tile. Every output cell retains
+// an independent accumulator and observes Q4 blocks in strictly increasing
+// order, including the comparator's two scale multiplies.
+inline void q4_0_q8_ordered_columns_mma_serial_impl(
+    device const float* input_scales,
+    device const uchar* weight_bytes,
+    device float* output,
+    uint blocks_per_row,
+    uint rows,
+    uint columns,
+    device const half* staged_quants,
+    uint tile_group,
+    uint lane,
+    uint row_tiles,
+    threadgroup half* stage_a,
+    threadgroup half* stage_b,
+    threadgroup float* c_stage,
+    threadgroup float* weight_scales,
+    thread float* accum
+) {
+    const uint group_row0 = tile_group * row_tiles * 8u;
+    if (group_row0 >= rows) return;
+
+    for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+        // The source panel is position-major [32][8]. Thirty-two lanes each
+        // move eight consecutive halves, covering the panel exactly once.
+        const uint b0 = lane * 8u;
+        for (uint item = 0; item < 8u; ++item) {
+            const uint panel_index = b0 + item;
+            stage_b[panel_index] = staged_quants[
+                ulong(block_index) * 32ul * 8ul + panel_index];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint serial_tile = 0; serial_tile < row_tiles; ++serial_tile) {
+            const uint row0 = group_row0 + serial_tile * 8u;
+            const uint tile_row = lane & 7u;
+            const uint packed_quarter = lane >> 3;
+            const uint row = row0 + tile_row;
+            if (row < rows) {
+                device const uchar* block = weight_bytes
+                    + (ulong(row) * blocks_per_row + block_index) * 18ul;
+                if (packed_quarter == 0u) {
+                    weight_scales[tile_row] =
+                        float(*reinterpret_cast<device const half*>(block));
+                }
+                device const packed_uchar4* packed_ptr =
+                    reinterpret_cast<device const packed_uchar4*>(
+                        block + 2ul + ulong(packed_quarter) * 4ul);
+                const uchar4 packed = uchar4(*packed_ptr);
+                for (uint item = 0; item < 4u; ++item) {
+                    const uint low_position = packed_quarter * 4u + item;
+                    const uint byte = uint(packed[item]);
+                    stage_a[low_position * 8u + tile_row] =
+                        half(int(byte & 0x0fu) - 8);
+                    stage_a[(low_position + 16u) * 8u + tile_row] =
+                        half(int(byte >> 4) - 8);
+                }
+            } else {
+                if (packed_quarter == 0u) weight_scales[tile_row] = 0.0f;
+                for (uint item = 0; item < 4u; ++item) {
+                    const uint low_position = packed_quarter * 4u + item;
+                    stage_a[low_position * 8u + tile_row] = half(0.0f);
+                    stage_a[(low_position + 16u) * 8u + tile_row] =
+                        half(0.0f);
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 dots =
+                make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+                simdgroup_half8x8 weights;
+                simdgroup_load(
+                    weights, stage_a + k_tile * 8u * 8u, 8,
+                    ulong2(0, 0), true);
+                simdgroup_half8x8 activations;
+                simdgroup_load(
+                    activations, stage_b + k_tile * 8u * 8u, 8);
+                simdgroup_multiply_accumulate(dots, weights, activations, dots);
+            }
+            simdgroup_store(dots, c_stage, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint cell = 0; cell < 2u; ++cell) {
+                const uint index = lane * 2u + cell;
+                const uint tile_output_row = index >> 3;
+                const uint column = index & 7u;
+                const uint output_row = row0 + tile_output_row;
+                if (output_row < rows && column < columns) {
+                    const float isum =
+                        c_stage[tile_output_row * 8u + column];
+                    float term = isum * weight_scales[tile_output_row];
+                    term = term * input_scales[
+                        ulong(column) * blocks_per_row + block_index];
+                    const uint accum_index = serial_tile * 2u + cell;
+                    accum[accum_index] = accum[accum_index] + term;
+                }
+            }
+            // All c_stage/weight_scales readers finish before the next serial
+            // tile overwrites either scratch array.
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint serial_tile = 0; serial_tile < row_tiles; ++serial_tile) {
+        const uint row0 = group_row0 + serial_tile * 8u;
+        for (uint cell = 0; cell < 2u; ++cell) {
+            const uint index = lane * 2u + cell;
+            const uint tile_output_row = index >> 3;
+            const uint column = index & 7u;
+            const uint output_row = row0 + tile_output_row;
+            if (output_row < rows && column < columns) {
+                output[ulong(column) * rows + output_row] =
+                    accum[serial_tile * 2u + cell];
+            }
+        }
+    }
+}
+
+kernel void q4_0_q8_ordered_columns_mma_serial2(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    uint tile_group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup half stage_a[32 * 8];
+    threadgroup half stage_b[32 * 8];
+    threadgroup float c_stage[8 * 8];
+    threadgroup float weight_scales[8];
+    float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    q4_0_q8_ordered_columns_mma_serial_impl(
+        input_scales, weight_bytes, output, blocks_per_row, rows, columns,
+        staged_quants, tile_group, lane, 2u, stage_a, stage_b, c_stage,
+        weight_scales, accum);
+}
+
+kernel void q4_0_q8_ordered_columns_mma_serial4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    uint tile_group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup half stage_a[32 * 8];
+    threadgroup half stage_b[32 * 8];
+    threadgroup float c_stage[8 * 8];
+    threadgroup float weight_scales[8];
+    float accum[8] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+    };
+    q4_0_q8_ordered_columns_mma_serial_impl(
+        input_scales, weight_bytes, output, blocks_per_row, rows, columns,
+        staged_quants, tile_group, lane, 4u, stage_a, stage_b, c_stage,
+        weight_scales, accum);
+}
 // Production Ghost-MoE geometry for Gemma 4 26B. The .cghost v2 record stores
 // gate||up first, then down. Each mutable slot starts on a 16 KiB boundary so a
 // positioned file read can target Metal-visible shared memory directly; padding
@@ -11256,6 +11430,22 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let q4_0_q8_ordered_columns_mma_serial2_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_serial2", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q4_0_q8_ordered_columns_mma_serial4_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_serial4", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let gemma4_q4_expert_gate_up_geglu_function = strict_q8k_library
                 .get_function("gemma4_q4_expert_gate_up_geglu", None)
                 .ok()?;
@@ -11453,6 +11643,8 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4_0_q8_ordered_columns_mma_stage_pipeline,
                 q4_0_q8_ordered_columns_mma_pipeline,
                 q4_0_q8_ordered_columns_mma_rowmajor_pipeline,
+                q4_0_q8_ordered_columns_mma_serial2_pipeline,
+                q4_0_q8_ordered_columns_mma_serial4_pipeline,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
                 gemma4_q4_expert_gate_up_geglu_simd_pipeline,
                 gemma4_q4_expert_gate_up_split_pipeline,
@@ -12824,6 +13016,16 @@ fn gemma4_q4_mma_rowmajor_enabled() -> bool {
     })
 }
 
+/// Mini2-qualified serial-row-tile policy for the opt-in exact MMA lane.
+/// Q/gate/up/down/output projections have at least 3,840 output rows and won
+/// with two serial tiles. K/V projections are smaller and regressed sharply,
+/// so they stay on the established one-tile simdgroup kernel. Serial4 remains
+/// diagnostic-only.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_mma_serial2_selected(rows: usize) -> bool {
+    rows >= 3_840
+}
+
 /// Dynamic threadgroup-memory requirement for the slab-free strict verifier.
 /// One output-row threadgroup retains exactly one f32 block term for every
 /// `(column, input block)`. Only K=2/4/8 is admitted; K=1 remains on the
@@ -13075,12 +13277,30 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_serial(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+    row_tiles: usize,
+) -> Option<Vec<Vec<f32>>> {
+    let path = match row_tiles {
+        2 => Gemma4Q4ColumnsTestPath::MmaSerial2,
+        4 => Gemma4Q4ColumnsTestPath::MmaSerial4,
+        _ => return None,
+    };
+    try_gemma4_q4_0_matmul_q8_columns_impl(inputs, weight_wire, rows, path)
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gemma4Q4ColumnsTestPath {
     Slab,
     Threadgroup,
     Mma,
     MmaRowMajor,
+    MmaSerial2,
+    MmaSerial4,
 }
 
 #[cfg(target_os = "macos")]
@@ -13118,7 +13338,10 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
             gemma4_q4_column_threadgroup_bytes(blocks_per_row, columns)?;
             0
         }
-        Gemma4Q4ColumnsTestPath::Mma | Gemma4Q4ColumnsTestPath::MmaRowMajor => {
+        Gemma4Q4ColumnsTestPath::Mma
+        | Gemma4Q4ColumnsTestPath::MmaRowMajor
+        | Gemma4Q4ColumnsTestPath::MmaSerial2
+        | Gemma4Q4ColumnsTestPath::MmaSerial4 => {
             gemma4_q4_mma_stage_bytes(blocks_per_row)?
         }
     };
@@ -13200,6 +13423,28 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
                 rows,
                 blocks_per_row,
                 columns,
+            )
+        }
+        Gemma4Q4ColumnsTestPath::MmaSerial2
+        | Gemma4Q4ColumnsTestPath::MmaSerial4 => {
+            let row_tiles = if path == Gemma4Q4ColumnsTestPath::MmaSerial2 {
+                2
+            } else {
+                4
+            };
+            encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
+                encoder,
+                kernel,
+                &scales_buf,
+                &quants_buf,
+                &weight_buf,
+                0,
+                &output_buf,
+                terms_buf.as_ref()?,
+                rows,
+                blocks_per_row,
+                columns,
+                row_tiles,
             )
         }
         Gemma4Q4ColumnsTestPath::Slab => encode_gemma4_q4_0_q8_ordered_columns(
@@ -19036,6 +19281,136 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
     true
 }
 
+/// Encode the serial-row-tile exact Q4_0 x Q8_0 MMA experiment.
+///
+/// `row_tiles` is deliberately restricted to 2 or 4 so both variants retain
+/// their own pipeline for A/B timing against the established one-tile SG1
+/// kernel. The staged global panel is unchanged; each serial kernel copies the
+/// current 32x8 block panel into simdgroup-owned threadgroup memory once and
+/// reuses it for `row_tiles * 8` consecutive output rows.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+    row_tiles: usize,
+) -> bool {
+    if rows == 0
+        || blocks_per_row == 0
+        || rows > u32::MAX as usize
+        || blocks_per_row > u32::MAX as usize
+        || !matches!(columns, 1 | 2 | 4 | 8)
+        || !matches!(row_tiles, 2 | 4)
+    {
+        return false;
+    }
+    let Some(input_width) = blocks_per_row.checked_mul(32) else {
+        return false;
+    };
+    if input_width > (u32::MAX as usize) / 8 {
+        return false;
+    }
+    let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
+        return false;
+    };
+    let Some(scale_bytes) = input_blocks.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(quant_bytes) = input_blocks.checked_mul(32) else {
+        return false;
+    };
+    let Some(weight_bytes) = rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(18))
+    else {
+        return false;
+    };
+    let Some(weight_end) = weight_offset.checked_add(weight_bytes as u64) else {
+        return false;
+    };
+    let Some(output_bytes) = rows
+        .checked_mul(columns)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(stage_bytes) = gemma4_q4_mma_stage_bytes(blocks_per_row) else {
+        return false;
+    };
+    if input_scales.length() < scale_bytes as u64
+        || input_quants.length() < quant_bytes as u64
+        || weight.length() < weight_end
+        || output.length() < output_bytes as u64
+        || staged_quants.length() < stage_bytes as u64
+    {
+        return false;
+    }
+    let Some(stage_pipeline) = kernel
+        .q4_0_q8_ordered_columns_mma_stage_pipeline
+        .as_ref()
+    else {
+        return false;
+    };
+    let serial_pipeline = match row_tiles {
+        2 => kernel
+            .q4_0_q8_ordered_columns_mma_serial2_pipeline
+            .as_ref(),
+        4 => kernel
+            .q4_0_q8_ordered_columns_mma_serial4_pipeline
+            .as_ref(),
+        _ => None,
+    };
+    let Some(serial_pipeline) = admitted_32_lane_pipeline(serial_pipeline) else {
+        return false;
+    };
+    let blocks_u32 = blocks_per_row as u32;
+    let rows_u32 = rows as u32;
+    let columns_u32 = columns as u32;
+    let Some(stage_values) = input_width.checked_mul(8) else {
+        return false;
+    };
+    let rows_per_group = row_tiles * 8;
+
+    encoder.set_compute_pipeline_state(stage_pipeline);
+    encoder.set_buffer(0, Some(input_quants), 0);
+    encoder.set_buffer(1, Some(staged_quants), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    dispatch_1d(encoder, stage_pipeline, stage_values);
+
+    encoder.set_compute_pipeline_state(serial_pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    encoder.set_buffer(7, Some(staged_quants), 0);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(rows_per_group) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    record_gemma4_q4_column_dispatch(columns);
+    true
+}
+
 /// Lazily encode one strict shared-weight Q4_0 x Q8_0 projection into an
 /// existing command encoder.
 ///
@@ -19115,8 +19490,25 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
     // the established scalar/slab path below.
     if gemma4_q4_mma_enabled()
         && terms.is_some_and(|staged| {
-            if gemma4_q4_mma_rowmajor_enabled() {
-                encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor(
+            if gemma4_q4_mma_serial2_selected(rows)
+                && encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
+                    encoder,
+                    kernel,
+                    input_scales,
+                    input_quants,
+                    weight,
+                    weight_offset,
+                    output,
+                    staged,
+                    rows,
+                    blocks_per_row,
+                    columns,
+                    2,
+                )
+            {
+                true
+            } else if gemma4_q4_mma_rowmajor_enabled()
+                && encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor(
                     encoder,
                     kernel,
                     input_scales,
@@ -19129,6 +19521,8 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
                     blocks_per_row,
                     columns,
                 )
+            {
+                true
             } else {
                 encode_gemma4_q4_0_q8_ordered_columns_mma(
                     encoder,
@@ -40474,6 +40868,26 @@ mod tests {
         assert_eq!(fallback[0][0].to_bits(), expected.to_bits());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_q4_mma_serial2_policy_selects_only_large_projections() {
+        for &(rows, selected, label) in &[
+            (512usize, false, "value"),
+            (2_048, false, "key"),
+            (3_839, false, "boundary-below"),
+            (3_840, true, "output/down"),
+            (4_096, true, "query"),
+            (8_192, true, "query-wide"),
+            (15_360, true, "gate/up"),
+        ] {
+            assert_eq!(
+                gemma4_q4_mma_serial2_selected(rows),
+                selected,
+                "serial2 selection mismatch for {label} rows={rows}"
+            );
+        }
+    }
+
     // Dense Gemma 4 12B verifier foundation: K=1/2/4/8 must share one Q4_0
     // weight sweep without leaving the existing ordered K=1 arithmetic
     // universe. The 120- and 480-block cases are the real 3,840- and 15,360-
@@ -40523,6 +40937,18 @@ mod tests {
                 .as_ref()
         )
         .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_serial2_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_serial4_pipeline
+                .as_ref()
+        )
+        .is_some());
         assert!(kernel.q4_0_q8_ordered_columns_fold_pipeline.is_some());
         assert_eq!(
             gemma4_q4_column_term_slab_bytes(15_360, 120, 8),
@@ -40564,7 +40990,7 @@ mod tests {
             (1usize, 9usize, "edge-1"),
             (31, 9, "edge-31"),
             (32, 9, "edge-32"),
-            (33, 9, "edge-33"),
+            (33, 35, "edge-33-serial-boundaries"),
             (120, 11, "gemma4-12b-hidden-3840"),
             (480, 7, "gemma4-12b-ffn-15360"),
         ] {
@@ -40666,6 +41092,29 @@ mod tests {
                             mma[column][row].to_bits(),
                             "rowmajor-vs-old-mma shape={label} K={columns} column={column} row={row}"
                         );
+                    }
+                }
+
+                for row_tiles in [2usize, 4] {
+                    let serial = try_gemma4_q4_0_matmul_q8_columns_mma_serial(
+                        &refs,
+                        &wire,
+                        rows,
+                        row_tiles,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "serial MMA Q4_0 columns: {label} K={columns} row_tiles={row_tiles}"
+                        )
+                    });
+                    for column in 0..columns {
+                        for row in 0..rows {
+                            assert_eq!(
+                                serial[column][row].to_bits(),
+                                got[column][row].to_bits(),
+                                "serial-vs-slab shape={label} K={columns} row_tiles={row_tiles} column={column} row={row}"
+                            );
+                        }
                     }
                 }
 
@@ -41119,6 +41568,190 @@ mod tests {
                      rowmajor_sg1_gpu_us={} rowmajor_vs_old={speedup:.4}x \
                      samples=9 exact_bits=true",
                     old_us[4], rowmajor_us[4],
+                );
+            }
+        }
+    }
+
+    /// Focused A/B receipt for the one-simdgroup serial-row-tile experiment.
+    /// Every candidate includes the identical Q8 half-panel staging dispatch;
+    /// only the second dispatch changes from one 8-row tile per simdgroup to
+    /// two or four serial tiles. Full production-shaped outputs must be
+    /// bit-identical before nine alternating-order GPU samples are reported.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "full Gemma 4 12B serial-row-tile MMA performance receipt"]
+    fn metal_gemma4_q4_0_q8_mma_serial_tile_receipt() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        const MAX_K: usize = 8;
+
+        for &(blocks_per_row, rows, label) in &[
+            (120usize, 4_096usize, "3840-to-4096"),
+            (120, 8_192, "3840-to-8192"),
+            (120, 2_048, "3840-to-2048"),
+            (120, 512, "3840-to-512"),
+            (120, 15_360, "3840-to-15360-gate-up"),
+            (480, 3_840, "15360-to-3840-down"),
+            (128, 3_840, "4096-attention-to-3840"),
+        ] {
+            let input_blocks = MAX_K * blocks_per_row;
+            let scales: Vec<f32> = (0..input_blocks)
+                .map(|index| 0.000_7 * (1 + index % 37) as f32)
+                .collect();
+            let quants: Vec<u8> = (0..input_blocks * 32)
+                .map(|index| (((index * 29 + index / 31) % 255) as i16 - 127) as i8 as u8)
+                .collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = 0.000_11 * (1 + (row * 7 + block * 13) % 101) as f32;
+                    wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(((row * 43 + block * 19 + j * 11 + 5) % 256) as u8);
+                    }
+                }
+            }
+
+            let scales_buf = kernel.device.new_buffer(
+                std::mem::size_of_val(scales.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let quants_buf = kernel
+                .device
+                .new_buffer(quants.len() as u64, MTLResourceOptions::StorageModeShared);
+            let weight_buf = kernel
+                .device
+                .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let stage_buf = kernel.device.new_buffer(
+                gemma4_q4_mma_stage_bytes(blocks_per_row).unwrap() as u64,
+                MTLResourceOptions::StorageModePrivate,
+            );
+            write_buffer_f32(&scales_buf, &scales);
+            write_buffer_u8(&quants_buf, &quants);
+            write_buffer_u8(&weight_buf, &wire);
+
+            for columns in [1usize, 2, 4, 8] {
+                let output_bytes = columns * rows * std::mem::size_of::<f32>();
+                let sg1_buf = kernel
+                    .device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+                let serial2_buf = kernel
+                    .device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+                let serial4_buf = kernel
+                    .device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+
+                let run = |output: &Buffer, row_tiles: Option<usize>| -> u128 {
+                    let cb = kernel.queue.new_command_buffer();
+                    let encoder = cb.new_compute_command_encoder();
+                    let encoded = if let Some(row_tiles) = row_tiles {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
+                            encoder,
+                            kernel,
+                            &scales_buf,
+                            &quants_buf,
+                            &weight_buf,
+                            0,
+                            output,
+                            &stage_buf,
+                            rows,
+                            blocks_per_row,
+                            columns,
+                            row_tiles,
+                        )
+                    } else {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma(
+                            encoder,
+                            kernel,
+                            &scales_buf,
+                            &quants_buf,
+                            &weight_buf,
+                            0,
+                            output,
+                            &stage_buf,
+                            rows,
+                            blocks_per_row,
+                            columns,
+                        )
+                    };
+                    if !encoded {
+                        encoder.end_encoding();
+                        panic!(
+                            "serial MMA encoder rejected shape={label} K={columns} row_tiles={row_tiles:?} rows={rows} blocks_per_row={blocks_per_row}"
+                        );
+                    }
+                    encoder.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    command_buffer_gpu_times_us(&cb.to_owned()).0
+                };
+
+                for _ in 0..2 {
+                    run(&sg1_buf, None);
+                    run(&serial2_buf, Some(2));
+                    run(&serial4_buf, Some(4));
+                }
+                let mut sg1 = vec![0.0f32; columns * rows];
+                let mut serial2 = vec![0.0f32; columns * rows];
+                let mut serial4 = vec![0.0f32; columns * rows];
+                read_buffer_f32(&sg1_buf, &mut sg1);
+                read_buffer_f32(&serial2_buf, &mut serial2);
+                read_buffer_f32(&serial4_buf, &mut serial4);
+                for (index, ((&two, &four), &one)) in serial2
+                    .iter()
+                    .zip(&serial4)
+                    .zip(&sg1)
+                    .enumerate()
+                {
+                    assert_eq!(
+                        two.to_bits(),
+                        one.to_bits(),
+                        "serial2 full shape={label} K={columns} flat-output={index}"
+                    );
+                    assert_eq!(
+                        four.to_bits(),
+                        one.to_bits(),
+                        "serial4 full shape={label} K={columns} flat-output={index}"
+                    );
+                }
+
+                let mut sg1_us = [0u128; 9];
+                let mut serial2_us = [0u128; 9];
+                let mut serial4_us = [0u128; 9];
+                for repeat in 0..9 {
+                    match repeat % 3 {
+                        0 => {
+                            sg1_us[repeat] = run(&sg1_buf, None);
+                            serial2_us[repeat] = run(&serial2_buf, Some(2));
+                            serial4_us[repeat] = run(&serial4_buf, Some(4));
+                        }
+                        1 => {
+                            serial2_us[repeat] = run(&serial2_buf, Some(2));
+                            serial4_us[repeat] = run(&serial4_buf, Some(4));
+                            sg1_us[repeat] = run(&sg1_buf, None);
+                        }
+                        _ => {
+                            serial4_us[repeat] = run(&serial4_buf, Some(4));
+                            sg1_us[repeat] = run(&sg1_buf, None);
+                            serial2_us[repeat] = run(&serial2_buf, Some(2));
+                        }
+                    }
+                }
+                sg1_us.sort_unstable();
+                serial2_us.sort_unstable();
+                serial4_us.sort_unstable();
+                let serial2_vs_sg1 = sg1_us[4] as f64 / serial2_us[4] as f64;
+                let serial4_vs_sg1 = sg1_us[4] as f64 / serial4_us[4] as f64;
+                eprintln!(
+                    "gemma4-q4-mma-serial shape={label} K={columns} rows={rows} \
+                     blocks_per_row={blocks_per_row} sg1_gpu_us={} serial2_gpu_us={} \
+                     serial4_gpu_us={} serial2_vs_sg1={serial2_vs_sg1:.3}x \
+                     serial4_vs_sg1={serial4_vs_sg1:.3}x exact=true",
+                    sg1_us[4], serial2_us[4], serial4_us[4],
                 );
             }
         }
