@@ -153,6 +153,11 @@ struct MetalLinearKernel {
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
     quantize_q8k_rows_pipeline: ComputePipelineState,
+    /// Exact verifier-only sibling of `quantize_q8k_rows_pipeline`. It emits
+    /// the V4 scales/half-panel/16-value sums directly, so an opted-in narrow
+    /// verifier preparation does not materialize the transient i8 panel or
+    /// dispatch the two generic staging kernels.
+    quantize_q8k_v4_stage_pipeline: Option<ComputePipelineState>,
     /// Ordered Q4_0 x Q8_0 row dot used by disk-paged Gemma 4 experts. Unlike
     /// the resident f32-activation Q4 kernel, this preserves the CPU Ghost-MoE
     /// comparator's per-block integer dot and left-to-right f32 accumulation.
@@ -2966,6 +2971,80 @@ kernel void quantize_q8k_rows_strict(
     for (uint i = 0; i < 256; ++i) {
         quants[base + i] =
             char(min(nearest_int_q8k_strict(iscale * input[base + i]), 127));
+    }
+}
+
+// Narrow verifier preparation for the V4 Q4_K/Q6_K matrix lane. This is the
+// exact composition of quantize_q8k_rows_strict, q4k_mma_stage_y, and
+// q4k_mma_stage_ysums: one thread still owns one (row, super-block), visits the
+// 256 source values in the same order, and uses the same strict rounding
+// expression. Q8 codes are converted to half only after narrowing through
+// `char`, exactly as the generic stage does. The 16-value sums are accumulated
+// in increasing element order in signed short, then converted to half.
+//
+// y_half is [position][k_pad], ysums is [super-block][j16][k_pad]. The verifier
+// currently uses physical k_pad=8 for logical widths 1..=8. Row zero owns every
+// padded-column write for its super-block, avoiding benign-but-undefined races.
+kernel void quantize_q8k_v4_stage_strict(
+    device const float* input [[buffer(0)]],
+    device float* scales [[buffer(1)]],
+    device half* y_half [[buffer(2)]],
+    device half* ysums [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& n_rows [[buffer(5)]],
+    constant uint& k_pad [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint total = n_rows * n_sb;
+    if (gid >= total) return;
+    const uint row = gid / n_sb;
+    const uint sb = gid - row * n_sb;
+    const uint input_base = row * n_sb * 256 + sb * 256;
+    const uint stage_base = sb * 256 * k_pad + row;
+
+    // The generic stage kernels define every physical pad cell as positive
+    // half zero. Preserve that contract even when the pooled buffers are dirty.
+    if (row == 0) {
+        for (uint c = n_rows; c < k_pad; ++c) {
+            for (uint i = 0; i < 256; ++i) {
+                y_half[sb * 256 * k_pad + i * k_pad + c] = half(0.0f);
+            }
+            for (uint j16 = 0; j16 < 16; ++j16) {
+                ysums[(sb * 16 + j16) * k_pad + c] = half(0.0f);
+            }
+        }
+    }
+
+    float amax = 0.0f;
+    float maxv = 0.0f;
+    for (uint i = 0; i < 256; ++i) {
+        const float v = input[input_base + i];
+        const float a = fabs(v);
+        if (a > amax) {
+            amax = a;
+            maxv = v;
+        }
+    }
+
+    short sums[16];
+    for (uint j16 = 0; j16 < 16; ++j16) sums[j16] = 0;
+    if (amax == 0.0f) {
+        scales[gid] = 0.0f;
+        for (uint i = 0; i < 256; ++i) {
+            y_half[stage_base + i * k_pad] = half(0.0f);
+        }
+    } else {
+        const float iscale = -127.0f / maxv;
+        scales[gid] = 1.0f / iscale;
+        for (uint i = 0; i < 256; ++i) {
+            const char q = char(min(
+                nearest_int_q8k_strict(iscale * input[input_base + i]), 127));
+            y_half[stage_base + i * k_pad] = half(int(q));
+            sums[i / 16] += short(q);
+        }
+    }
+    for (uint j16 = 0; j16 < 16; ++j16) {
+        ysums[(sb * 16 + j16) * k_pad + row] = half(int(sums[j16]));
     }
 }
 
@@ -10967,6 +11046,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let quantize_q8k_rows_pipeline = device
                 .new_compute_pipeline_state_with_function(&quantize_q8k_rows_function)
                 .ok()?;
+            let quantize_q8k_v4_stage_pipeline = strict_q8k_library
+                .get_function("quantize_q8k_v4_stage_strict", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let q4_0_q8_ordered_function = strict_q8k_library
                 .get_function("q4_0_q8_ordered_rows", None)
                 .ok()?;
@@ -11166,6 +11253,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
                 quantize_q8k_rows_pipeline,
+                quantize_q8k_v4_stage_pipeline,
                 q4_0_q8_ordered_pipeline,
                 q4_0_q8_ordered_simd_pipeline,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
@@ -15730,14 +15818,17 @@ impl KquantV4ActivationStage {
 #[cfg(target_os = "macos")]
 struct SharedKquantV4Activation {
     scales: Buffer,
-    quants: Buffer,
+    quants: Option<Buffer>,
     stage: KquantV4ActivationStage,
 }
 
 #[cfg(target_os = "macos")]
 impl SharedKquantV4Activation {
     fn recycle_into(self, keep: &mut Vec<Buffer>) {
-        keep.extend([self.scales, self.quants]);
+        keep.push(self.scales);
+        if let Some(quants) = self.quants {
+            keep.push(quants);
+        }
         self.stage.recycle_into(keep);
     }
 }
@@ -15799,6 +15890,43 @@ fn encode_kquant_v4_activation_stage(
         e.set_buffer(4, Some(&stage.scalar), 16);
         dispatch_1d(e, &v4.q4k_mma_stage_ysums, stage.n_sb * 16 * stage.k_pad);
     }
+}
+
+/// Emit the exact V4 verifier activation representation in one strict kernel.
+/// Returns false before encoding any work unless every shape/buffer invariant
+/// of the fused kernel is satisfied, so the caller can use the three-dispatch
+/// canonical path unchanged.
+#[cfg(target_os = "macos")]
+fn encode_kquant_v4_strict_fused_stage(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    scales: &Buffer,
+    stage: &KquantV4ActivationStage,
+) -> bool {
+    if !(1..=8).contains(&stage.n_tokens)
+        || stage.k_pad != 8
+        || stage.input_width == 0
+        || !stage.input_width.is_multiple_of(256)
+    {
+        return false;
+    }
+    let Some(ysums) = stage.ysums.as_ref() else {
+        return false;
+    };
+    let Some(pipeline) = k.quantize_q8k_v4_stage_pipeline.as_ref() else {
+        return false;
+    };
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(1, Some(scales), 0);
+    e.set_buffer(2, Some(&stage.y_stage), 0);
+    e.set_buffer(3, Some(ysums), 0);
+    e.set_buffer(4, Some(&stage.scalar), 0);
+    e.set_buffer(5, Some(&stage.scalar), 8);
+    e.set_buffer(6, Some(&stage.scalar), 16);
+    dispatch_1d(e, pipeline, stage.n_tokens * stage.n_sb);
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -15912,25 +16040,72 @@ fn encode_shared_kquant_v4_activation(
 ) -> SharedKquantV4Activation {
     let n_sb = input_width / 256;
     let scales = pool_get(k, (n_tokens * n_sb * 4) as u64);
-    let quants = pool_get(k, (n_tokens * input_width) as u64);
+    let fusion_requested = kquant_v4_strict_prep_fusion_enabled();
+    if !fusion_requested {
+        // Keep the flag-off allocation and dispatch sequence exactly as it was:
+        // scales, transient quants, stage buffers, then quantize/y/ysums.
+        let quants = pool_get(k, (n_tokens * input_width) as u64);
+        let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true);
+        e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
+        e.set_buffer(0, Some(y), 0);
+        e.set_buffer(1, Some(&scales), 0);
+        e.set_buffer(2, Some(&quants), 0);
+        e.set_buffer(3, Some(&stage.scalar), 0);
+        e.set_buffer(4, Some(&stage.scalar), 8);
+        dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+        encode_kquant_v4_activation_stage(e, v4, &quants, &stage);
+        return SharedKquantV4Activation {
+            scales,
+            quants: Some(quants),
+            stage,
+        };
+    }
+
     // A shared verifier preparation always includes ysums: a mixed Q4/Q6
     // projection group can then reuse one panel, while Q6 simply ignores it.
     let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true);
-
-    e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
-    e.set_buffer(0, Some(y), 0);
-    e.set_buffer(1, Some(&scales), 0);
-    e.set_buffer(2, Some(&quants), 0);
-    e.set_buffer(3, Some(&stage.scalar), 0);
-    e.set_buffer(4, Some(&stage.scalar), 8);
-    dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
-    encode_kquant_v4_activation_stage(e, v4, &quants, &stage);
+    let fused = encode_kquant_v4_strict_fused_stage(e, k, y, &scales, &stage);
+    let quants = if fused {
+        None
+    } else {
+        static WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[metal] CAMELID_KQUANT_V4_STRICT_PREP_FUSION requested, but the narrow \
+                 fused path is unavailable; retaining exact three-dispatch preparation"
+            );
+        }
+        let quants = pool_get(k, (n_tokens * input_width) as u64);
+        e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
+        e.set_buffer(0, Some(y), 0);
+        e.set_buffer(1, Some(&scales), 0);
+        e.set_buffer(2, Some(&quants), 0);
+        e.set_buffer(3, Some(&stage.scalar), 0);
+        e.set_buffer(4, Some(&stage.scalar), 8);
+        dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+        encode_kquant_v4_activation_stage(e, v4, &quants, &stage);
+        Some(quants)
+    };
 
     SharedKquantV4Activation {
         scales,
         quants,
         stage,
     }
+}
+
+/// Opt-in exact composition of strict Q8_K quantization and the two narrow V4
+/// staging passes. It is deliberately independent of the default-on shared
+/// preparation gate: absent this explicit flag, buffer allocation and dispatch
+/// order remain the established path.
+#[cfg(target_os = "macos")]
+fn kquant_v4_strict_prep_fusion_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_KQUANT_V4_STRICT_PREP_FUSION")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
 }
 
 /// Default-on inside the explicit V4 arithmetic universe. The opt-out exists
@@ -15946,7 +16121,12 @@ fn kquant_v4_shared_prep_enabled() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn trace_kquant_v4_shared_prep(projections: usize, n_tokens: usize, input_width: usize) {
+fn trace_kquant_v4_shared_prep(
+    projections: usize,
+    n_tokens: usize,
+    input_width: usize,
+    strict_fused: bool,
+) {
     static TRACE: OnceLock<bool> = OnceLock::new();
     static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     if !*TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()) {
@@ -15956,7 +16136,7 @@ fn trace_kquant_v4_shared_prep(projections: usize, n_tokens: usize, input_width:
     if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
         eprintln!(
             "[metal-kquant-v4] shared_prep projections={projections} \
-             n_tokens={n_tokens} input_width={input_width}"
+             n_tokens={n_tokens} input_width={input_width} strict_fused={strict_fused}"
         );
     }
 }
@@ -15964,8 +16144,10 @@ fn trace_kquant_v4_shared_prep(projections: usize, n_tokens: usize, input_width:
 /// Encode a verifier projection group that reads the same activation rows.
 /// Returns false before emitting anything unless the complete group is eligible
 /// for the narrow V4 lane, so callers can safely fall back projection-by-
-/// projection. At N=8 this turns Q/K/V from 11 dispatches into 6 and gate/up
-/// from 8 into 5 without changing the V4 projection kernel or its operands.
+/// projection. At N=8 the ordinary shared preparation turns Q/K/V from 11
+/// dispatches into 6 and gate/up from 8 into 5. The separately opted-in strict
+/// fusion reduces those groups again to 4 and 3 dispatches, respectively,
+/// without changing either V4 projection kernel or its operands.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_resident_kquant_v4_shared_group(
@@ -16023,7 +16205,12 @@ fn encode_resident_kquant_v4_shared_group(
             rows,
         );
     }
-    trace_kquant_v4_shared_prep(projections.len(), n_tokens, input_width);
+    trace_kquant_v4_shared_prep(
+        projections.len(),
+        n_tokens,
+        input_width,
+        prepared.quants.is_none(),
+    );
     prepared.recycle_into(keep);
     true
 }
@@ -36561,6 +36748,232 @@ mod tests {
              below would be against untouched memory, not a numerical result",
             values.len()
         );
+    }
+
+    /// Model-free qualification for the strict verifier-preparation fusion.
+    /// The established three-kernel path is the byte oracle. The candidate's
+    /// output buffers are deliberately offset inside poisoned allocations, so
+    /// this checks exact scale bits, the integer-code-derived half panel,
+    /// 16-value sums, every physical pad cell, and both surrounding guards.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_strict_prep_fusion_is_byte_identical_and_guarded() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        let fused = kernel
+            .quantize_q8k_v4_stage_pipeline
+            .as_ref()
+            .expect("strict fused verifier-preparation pipeline");
+        let device = &kernel.device;
+        let n_sb = 3usize;
+        let input_width = n_sb * 256;
+        let k_pad = 8usize;
+        let guard = 64usize;
+        let poison = 0xa5u8;
+
+        let bytes = |buffer: &Buffer, offset: usize, len: usize| unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>().add(offset), len).to_vec()
+        };
+        let guarded = |payload: usize| {
+            let buffer = device.new_buffer(
+                (guard + payload + guard) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_u8(&buffer, &vec![poison; guard + payload + guard]);
+            buffer
+        };
+        let assert_guards = |name: &str, buffer: &Buffer, payload: usize| {
+            let all = bytes(buffer, 0, guard + payload + guard);
+            assert!(
+                all[..guard].iter().all(|&byte| byte == poison),
+                "{name} prefix guard was modified"
+            );
+            assert!(
+                all[guard + payload..].iter().all(|&byte| byte == poison),
+                "{name} suffix guard was modified"
+            );
+        };
+
+        for n_tokens in [1usize, 3, 7, 8] {
+            let mut input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| {
+                    let token = i / input_width;
+                    let col = i % input_width;
+                    ((((token * 139 + col * 23) % 257) as f32) - 128.0) * 0.007
+                        + token as f32 * 0.0009
+                })
+                .collect();
+            // Exercise the quantizer's all-zero branch and both signs of maxv.
+            input[..256].fill(0.0);
+            input[256..512].iter_mut().for_each(|value| *value *= 0.5);
+            input[256] = -3.0;
+            if n_tokens > 1 {
+                let tied = input_width + 512;
+                input[tied..tied + 256]
+                    .iter_mut()
+                    .for_each(|value| *value *= 0.25);
+                input[tied] = 2.0;
+                input[tied + 1] = -2.0; // `>` keeps the first equal-magnitude max.
+            }
+            let input_buf = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+            let input_len = input.len() * 4;
+            let candidate_input = guarded(input_len);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr().cast::<u8>(),
+                    candidate_input.contents().cast::<u8>().add(guard),
+                    input_len,
+                );
+            }
+
+            let scales_len = n_tokens * n_sb * 4;
+            let quants_len = n_tokens * input_width;
+            let y_len = input_width * k_pad * 2;
+            let ysums_len = n_sb * 16 * k_pad * 2;
+            let control_scales = device
+                .new_buffer(scales_len as u64, MTLResourceOptions::StorageModeShared);
+            let control_quants = device
+                .new_buffer(quants_len as u64, MTLResourceOptions::StorageModeShared);
+            let control_y =
+                device.new_buffer(y_len as u64, MTLResourceOptions::StorageModeShared);
+            let control_ysums =
+                device.new_buffer(ysums_len as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&control_scales, &vec![0xff; scales_len]);
+            write_buffer_u8(&control_quants, &vec![0xff; quants_len]);
+            write_buffer_u8(&control_y, &vec![0xff; y_len]);
+            write_buffer_u8(&control_ysums, &vec![0xff; ysums_len]);
+
+            let candidate_scales = guarded(scales_len);
+            let candidate_y = guarded(y_len);
+            let candidate_ysums = guarded(ysums_len);
+            let scalar = device.new_buffer(24, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32; //             @0
+                *p.add(1) = 0; //                @4
+                *p.add(2) = n_tokens as u32; //  @8
+                *p.add(3) = input_width as u32; // @12
+                *p.add(4) = k_pad as u32; //     @16
+            }
+
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            // Canonical strict quantization followed by both generic stages.
+            e.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
+            e.set_buffer(0, Some(&input_buf), 0);
+            e.set_buffer(1, Some(&control_scales), 0);
+            e.set_buffer(2, Some(&control_quants), 0);
+            e.set_buffer(3, Some(&scalar), 0);
+            e.set_buffer(4, Some(&scalar), 8);
+            dispatch_1d(e, &kernel.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+            e.set_compute_pipeline_state(&v4.q4k_mma_stage_y);
+            e.set_buffer(0, Some(&control_quants), 0);
+            e.set_buffer(1, Some(&control_y), 0);
+            e.set_buffer(2, Some(&scalar), 12);
+            e.set_buffer(3, Some(&scalar), 8);
+            e.set_buffer(4, Some(&scalar), 16);
+            dispatch_1d(e, &v4.q4k_mma_stage_y, input_width * k_pad);
+            e.set_compute_pipeline_state(&v4.q4k_mma_stage_ysums);
+            e.set_buffer(0, Some(&control_quants), 0);
+            e.set_buffer(1, Some(&control_ysums), 0);
+            e.set_buffer(2, Some(&scalar), 0);
+            e.set_buffer(3, Some(&scalar), 8);
+            e.set_buffer(4, Some(&scalar), 16);
+            dispatch_1d(e, &v4.q4k_mma_stage_ysums, n_sb * 16 * k_pad);
+
+            // Candidate: the same logical outputs, bound between poison guards.
+            e.set_compute_pipeline_state(fused);
+            e.set_buffer(0, Some(&candidate_input), guard as u64);
+            e.set_buffer(1, Some(&candidate_scales), guard as u64);
+            e.set_buffer(2, Some(&candidate_y), guard as u64);
+            e.set_buffer(3, Some(&candidate_ysums), guard as u64);
+            e.set_buffer(4, Some(&scalar), 0);
+            e.set_buffer(5, Some(&scalar), 8);
+            e.set_buffer(6, Some(&scalar), 16);
+            dispatch_1d(e, fused, n_tokens * n_sb);
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let control_scale_bytes = bytes(&control_scales, 0, scales_len);
+            let control_quant_bytes = bytes(&control_quants, 0, quants_len);
+            let control_y_bytes = bytes(&control_y, 0, y_len);
+            let control_ysum_bytes = bytes(&control_ysums, 0, ysums_len);
+            let candidate_scale_bytes = bytes(&candidate_scales, guard, scales_len);
+            let candidate_y_bytes = bytes(&candidate_y, guard, y_len);
+            let candidate_ysum_bytes = bytes(&candidate_ysums, guard, ysums_len);
+            assert_eq!(
+                candidate_scale_bytes, control_scale_bytes,
+                "strict fused scale bytes differ at n={n_tokens}"
+            );
+            assert_eq!(
+                candidate_y_bytes, control_y_bytes,
+                "strict fused y_half bytes differ at n={n_tokens}"
+            );
+            assert_eq!(
+                candidate_ysum_bytes, control_ysum_bytes,
+                "strict fused ysums bytes differ at n={n_tokens}"
+            );
+
+            let half_at = |raw: &[u8], cell: usize| {
+                u16::from_le_bytes([raw[cell * 2], raw[cell * 2 + 1]])
+            };
+            for row in 0..n_tokens {
+                for pos in 0..input_width {
+                    let q = control_quant_bytes[row * input_width + pos] as i8;
+                    assert_eq!(
+                        half_at(&candidate_y_bytes, pos * k_pad + row),
+                        f32_to_f16_bits(q as f32),
+                        "fused staged code differs n={n_tokens} row={row} pos={pos} q={q}"
+                    );
+                }
+                for sb in 0..n_sb {
+                    for j16 in 0..16 {
+                        let base = row * input_width + sb * 256 + j16 * 16;
+                        let sum: i32 = control_quant_bytes[base..base + 16]
+                            .iter()
+                            .map(|&q| (q as i8) as i32)
+                            .sum();
+                        assert_eq!(
+                            half_at(&candidate_ysum_bytes, (sb * 16 + j16) * k_pad + row),
+                            f32_to_f16_bits(sum as f32),
+                            "fused staged sum differs n={n_tokens} row={row} sb={sb} j16={j16}"
+                        );
+                    }
+                }
+            }
+            for pos in 0..input_width {
+                for row in n_tokens..k_pad {
+                    assert_eq!(
+                        half_at(&candidate_y_bytes, pos * k_pad + row),
+                        0,
+                        "fused y_half pad is not +0 n={n_tokens} row={row} pos={pos}"
+                    );
+                }
+            }
+            for cell in 0..n_sb * 16 {
+                for row in n_tokens..k_pad {
+                    assert_eq!(
+                        half_at(&candidate_ysum_bytes, cell * k_pad + row),
+                        0,
+                        "fused ysums pad is not +0 n={n_tokens} row={row} cell={cell}"
+                    );
+                }
+            }
+            assert_guards("scales", &candidate_scales, scales_len);
+            assert_guards("y_half", &candidate_y, y_len);
+            assert_guards("ysums", &candidate_ysums, ysums_len);
+            assert_guards("input", &candidate_input, input_len);
+        }
     }
 
     /// Model-free exactness gate for verifier activation sharing. Three
