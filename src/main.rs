@@ -9350,6 +9350,7 @@ struct BenchEagle3Record {
 fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
     const KEYS: &[&str] = &[
         "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
+        "CAMELID_EAGLE3_BODY_Q8",
         "CAMELID_EAGLE3_LM_HEAD_Q8",
         "CAMELID_EAGLE3_LM_HEAD_ROWS",
         "CAMELID_METAL_LINEAR",

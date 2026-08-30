@@ -25817,6 +25817,9 @@ fn eagle3_bf16_bytes(rows: usize, cols: usize) -> Option<usize> {
 struct Eagle3LmHeadPlan {
     rows: usize,
     q8: bool,
+    /// Quantize the eight non-LM-head draft matrices at load time. This is a
+    /// proposal-only approximation: the target verifier remains authoritative.
+    body_q8: bool,
 }
 
 fn eagle3_parse_env_bool(name: &str, value: Option<&str>) -> std::result::Result<bool, String> {
@@ -25833,6 +25836,7 @@ fn eagle3_parse_env_bool(name: &str, value: Option<&str>) -> std::result::Result
 fn eagle3_lm_head_plan_from(
     rows: Option<&str>,
     q8: Option<&str>,
+    body_q8: Option<&str>,
 ) -> std::result::Result<Eagle3LmHeadPlan, String> {
     let rows = match rows.map(str::trim) {
         None | Some("") => EAGLE3_DRAFT_VOCAB,
@@ -25848,13 +25852,15 @@ fn eagle3_lm_head_plan_from(
     Ok(Eagle3LmHeadPlan {
         rows,
         q8: eagle3_parse_env_bool("CAMELID_EAGLE3_LM_HEAD_Q8", q8)?,
+        body_q8: eagle3_parse_env_bool("CAMELID_EAGLE3_BODY_Q8", body_q8)?,
     })
 }
 
 fn eagle3_lm_head_plan() -> std::result::Result<Eagle3LmHeadPlan, String> {
     let rows = std::env::var("CAMELID_EAGLE3_LM_HEAD_ROWS").ok();
     let q8 = std::env::var("CAMELID_EAGLE3_LM_HEAD_Q8").ok();
-    eagle3_lm_head_plan_from(rows.as_deref(), q8.as_deref())
+    let body_q8 = std::env::var("CAMELID_EAGLE3_BODY_Q8").ok();
+    eagle3_lm_head_plan_from(rows.as_deref(), q8.as_deref(), body_q8.as_deref())
 }
 
 /// Quantize row-major BF16 weights to GGUF's compact 34-byte Q8_0 wire blocks.  This is
@@ -26240,6 +26246,21 @@ fn eagle3_upload_q8_wire(
 }
 
 #[cfg(target_os = "macos")]
+fn eagle3_upload_matrix(
+    k: &MetalLinearKernel,
+    bf16: &[u8],
+    rows: usize,
+    cols: usize,
+    q8: bool,
+) -> std::result::Result<ResidentLinearWeight, String> {
+    if q8 {
+        eagle3_upload_q8_wire(k, bf16, rows, cols)
+    } else {
+        Ok(eagle3_upload_bf16(k, bf16))
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn eagle3_upload_f32(k: &MetalLinearKernel, values: &[f32]) -> Buffer {
     let buffer = k.device.new_buffer(
         std::mem::size_of_val(values) as u64,
@@ -26322,14 +26343,62 @@ impl Eagle3MetalState {
             eagle3_upload_bf16(k, lm_head_bf16)
         };
         Ok(Self {
-            fc: eagle3_upload_bf16(k, weights.fc_bf16),
-            q_proj: eagle3_upload_bf16(k, weights.q_proj_bf16),
-            k_proj: eagle3_upload_bf16(k, weights.k_proj_bf16),
-            v_proj: eagle3_upload_bf16(k, weights.v_proj_bf16),
-            o_proj: eagle3_upload_bf16(k, weights.o_proj_bf16),
-            gate_proj: eagle3_upload_bf16(k, weights.gate_proj_bf16),
-            up_proj: eagle3_upload_bf16(k, weights.up_proj_bf16),
-            down_proj: eagle3_upload_bf16(k, weights.down_proj_bf16),
+            fc: eagle3_upload_matrix(
+                k,
+                weights.fc_bf16,
+                EAGLE3_HIDDEN,
+                EAGLE3_AUX_WIDTH,
+                lm_head_plan.body_q8,
+            )?,
+            q_proj: eagle3_upload_matrix(
+                k,
+                weights.q_proj_bf16,
+                EAGLE3_HIDDEN,
+                EAGLE3_ATTN_INPUT,
+                lm_head_plan.body_q8,
+            )?,
+            k_proj: eagle3_upload_matrix(
+                k,
+                weights.k_proj_bf16,
+                EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+                EAGLE3_ATTN_INPUT,
+                lm_head_plan.body_q8,
+            )?,
+            v_proj: eagle3_upload_matrix(
+                k,
+                weights.v_proj_bf16,
+                EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+                EAGLE3_ATTN_INPUT,
+                lm_head_plan.body_q8,
+            )?,
+            o_proj: eagle3_upload_matrix(
+                k,
+                weights.o_proj_bf16,
+                EAGLE3_HIDDEN,
+                EAGLE3_HIDDEN,
+                lm_head_plan.body_q8,
+            )?,
+            gate_proj: eagle3_upload_matrix(
+                k,
+                weights.gate_proj_bf16,
+                EAGLE3_FFN,
+                EAGLE3_HIDDEN,
+                lm_head_plan.body_q8,
+            )?,
+            up_proj: eagle3_upload_matrix(
+                k,
+                weights.up_proj_bf16,
+                EAGLE3_FFN,
+                EAGLE3_HIDDEN,
+                lm_head_plan.body_q8,
+            )?,
+            down_proj: eagle3_upload_matrix(
+                k,
+                weights.down_proj_bf16,
+                EAGLE3_HIDDEN,
+                EAGLE3_FFN,
+                lm_head_plan.body_q8,
+            )?,
             lm_head,
             lm_head_rows: lm_head_plan.rows,
             input_layernorm: eagle3_upload_f32(k, weights.input_layernorm),
@@ -27225,23 +27294,28 @@ mod eagle3_metal_contract_tests {
     #[test]
     fn eagle3_lm_head_plan_is_default_off_and_fail_closed() {
         assert_eq!(
-            eagle3_lm_head_plan_from(None, None).unwrap(),
+            eagle3_lm_head_plan_from(None, None, None).unwrap(),
             Eagle3LmHeadPlan {
                 rows: EAGLE3_DRAFT_VOCAB,
                 q8: false,
+                body_q8: false,
             }
         );
         assert_eq!(
-            eagle3_lm_head_plan_from(Some("16000"), Some("yes")).unwrap(),
+            eagle3_lm_head_plan_from(Some("16000"), Some("yes"), Some("1")).unwrap(),
             Eagle3LmHeadPlan {
                 rows: 16_000,
                 q8: true,
+                body_q8: true,
             }
         );
-        assert!(eagle3_lm_head_plan_from(Some("0"), None).is_err());
-        assert!(eagle3_lm_head_plan_from(Some("32001"), None).is_err());
-        assert!(eagle3_lm_head_plan_from(Some("sixteen-thousand"), None).is_err());
-        assert!(eagle3_lm_head_plan_from(None, Some("maybe")).is_err());
+        assert!(eagle3_lm_head_plan_from(Some("0"), None, None).is_err());
+        assert!(eagle3_lm_head_plan_from(Some("32001"), None, None).is_err());
+        assert!(
+            eagle3_lm_head_plan_from(Some("sixteen-thousand"), None, None).is_err()
+        );
+        assert!(eagle3_lm_head_plan_from(None, Some("maybe"), None).is_err());
+        assert!(eagle3_lm_head_plan_from(None, None, Some("maybe")).is_err());
     }
 
     #[test]
