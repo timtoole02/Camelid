@@ -2294,6 +2294,15 @@ struct PreparedSpeculative {
     verify_nodes: u64,
     suffix_rounds: u64,
     learned_rounds: u64,
+    suffix_candidate_rounds: u64,
+    suffix_confidence_declines: u64,
+    suffix_raw_depth_sum: u64,
+    suffix_confident_depth_sum: u64,
+    suffix_root_match_len_sum: u64,
+    suffix_root_support_sum: u64,
+    suffix_root_branch_count_sum: u64,
+    suffix_expected_accepted_q16_sum: u64,
+    suffix_terminal_survival_q16_sum: u64,
 }
 
 enum PreparedSpeculativeDrafter {
@@ -17560,6 +17569,20 @@ fn run_speculative_round(
                 .speculative
                 .as_mut()
                 .expect("EAGLE-3 spec remains installed");
+            let evidence = round.suffix_evidence;
+            if evidence.raw_depth > 0 {
+                spec.suffix_candidate_rounds += 1;
+                spec.suffix_raw_depth_sum += evidence.raw_depth as u64;
+                spec.suffix_confident_depth_sum += evidence.confident_depth as u64;
+                spec.suffix_root_match_len_sum += evidence.root_match_len as u64;
+                spec.suffix_root_support_sum += evidence.root_support as u64;
+                spec.suffix_root_branch_count_sum += evidence.root_branch_count as u64;
+                spec.suffix_expected_accepted_q16_sum += evidence.expected_accepted_q16 as u64;
+                spec.suffix_terminal_survival_q16_sum += evidence.terminal_survival_q16 as u64;
+                if !evidence.admitted {
+                    spec.suffix_confidence_declines += 1;
+                }
+            }
             if round.offered > 0 {
                 spec.rounds += 1;
                 spec.drafted += round.offered as u64;
@@ -18245,6 +18268,15 @@ async fn prepare_generation(
             verify_nodes: 0,
             suffix_rounds: 0,
             learned_rounds: 0,
+            suffix_candidate_rounds: 0,
+            suffix_confidence_declines: 0,
+            suffix_raw_depth_sum: 0,
+            suffix_confident_depth_sum: 0,
+            suffix_root_match_len_sum: 0,
+            suffix_root_support_sum: 0,
+            suffix_root_branch_count_sum: 0,
+            suffix_expected_accepted_q16_sum: 0,
+            suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::NGram) => Some(PreparedSpeculative {
             drafter: PreparedSpeculativeDrafter::Standard(SpeculativeDrafter::NGram(NGramDrafter::new(
@@ -18259,6 +18291,15 @@ async fn prepare_generation(
             verify_nodes: 0,
             suffix_rounds: 0,
             learned_rounds: 0,
+            suffix_candidate_rounds: 0,
+            suffix_confidence_declines: 0,
+            suffix_raw_depth_sum: 0,
+            suffix_confident_depth_sum: 0,
+            suffix_root_match_len_sum: 0,
+            suffix_root_support_sum: 0,
+            suffix_root_branch_count_sum: 0,
+            suffix_expected_accepted_q16_sum: 0,
+            suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::DraftModel) => Some(PreparedSpeculative {
             drafter: PreparedSpeculativeDrafter::Standard(
@@ -18272,6 +18313,15 @@ async fn prepare_generation(
             verify_nodes: 0,
             suffix_rounds: 0,
             learned_rounds: 0,
+            suffix_candidate_rounds: 0,
+            suffix_confidence_declines: 0,
+            suffix_raw_depth_sum: 0,
+            suffix_confident_depth_sum: 0,
+            suffix_root_match_len_sum: 0,
+            suffix_root_support_sum: 0,
+            suffix_root_branch_count_sum: 0,
+            suffix_expected_accepted_q16_sum: 0,
+            suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::Eagle3) => {
             validate_eagle3_logical_budget(token_ids.len(), max_tokens as usize).map_err(
@@ -18366,6 +18416,15 @@ async fn prepare_generation(
                 verify_nodes: 0,
                 suffix_rounds: 0,
                 learned_rounds: 0,
+                suffix_candidate_rounds: 0,
+                suffix_confidence_declines: 0,
+                suffix_raw_depth_sum: 0,
+                suffix_confident_depth_sum: 0,
+                suffix_root_match_len_sum: 0,
+                suffix_root_support_sum: 0,
+                suffix_root_branch_count_sum: 0,
+                suffix_expected_accepted_q16_sum: 0,
+                suffix_terminal_survival_q16_sum: 0,
             })
         }
     };
@@ -19698,6 +19757,23 @@ fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
         verify_nodes = spec.verify_nodes,
         suffix_rounds = spec.suffix_rounds,
         learned_rounds = spec.learned_rounds,
+        suffix_candidate_rounds = spec.suffix_candidate_rounds,
+        suffix_confidence_declines = spec.suffix_confidence_declines,
+        suffix_raw_depth_sum = spec.suffix_raw_depth_sum,
+        suffix_confident_depth_sum = spec.suffix_confident_depth_sum,
+        suffix_root_match_len_sum = spec.suffix_root_match_len_sum,
+        suffix_root_support_sum = spec.suffix_root_support_sum,
+        suffix_root_branch_count_sum = spec.suffix_root_branch_count_sum,
+        suffix_expected_accepted_q16_sum = spec.suffix_expected_accepted_q16_sum,
+        suffix_terminal_survival_q16_sum = spec.suffix_terminal_survival_q16_sum,
+        suffix_confidence_q16_scale =
+            crate::inference::suffix_decoding::SUFFIX_CONFIDENCE_Q16_ONE,
+        suffix_min_prefix_survival_q16 =
+            crate::inference::suffix_decoding::SUFFIX_MIN_PREFIX_SURVIVAL_Q16,
+        suffix_min_expected_accepted_q16 =
+            crate::inference::suffix_decoding::SUFFIX_MIN_EXPECTED_ACCEPTED_Q16,
+        suffix_min_confident_depth =
+            crate::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH,
         eagle3 = spec.is_eagle3(),
         generated,
         "speculative decode summary"

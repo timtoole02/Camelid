@@ -164,23 +164,6 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
-    fn deepest_suffix_chain_prefers_the_first_deepest_branch_within_budget() {
-        let tree = camelid::inference::spec_tree::TokenTree {
-            tokens: vec![10, 20, 30, 21, 31, 22],
-            parent: vec![-1, 0, 0, 1, 2, 3],
-            depth: vec![0, 1, 1, 2, 2, 3],
-        };
-        assert_eq!(deepest_suffix_chain(&tree, 3), vec![20, 21, 22]);
-        assert_eq!(deepest_suffix_chain(&tree, 2), vec![20, 21]);
-        assert!(deepest_suffix_chain(&tree, 0).is_empty());
-        assert!(deepest_suffix_chain(
-            &camelid::inference::spec_tree::TokenTree::linear(10, &[]),
-            4
-        )
-        .is_empty());
-    }
-
-    #[test]
     fn inspect_source_accepts_a_hugging_face_directory() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from(["camelid", "inspect-source", "hf-model"])
@@ -8845,6 +8828,15 @@ struct Eagle3BenchRun {
     cpu_verify_rounds: u64,
     resident_normal_steps: u64,
     suffix_rounds: u64,
+    suffix_candidate_rounds: u64,
+    suffix_confidence_declines: u64,
+    suffix_raw_depth_sum: u64,
+    suffix_confident_depth_sum: u64,
+    suffix_root_match_len_sum: u64,
+    suffix_root_support_sum: u64,
+    suffix_root_branch_count_sum: u64,
+    suffix_expected_accepted_q16_sum: u64,
+    suffix_terminal_survival_q16_sum: u64,
     suffix_offered: u64,
     suffix_emitted_tokens: u64,
     suffix_head_catchups: u64,
@@ -8856,30 +8848,6 @@ struct Eagle3BenchRun {
     dynamic_tree_emitted_tokens: u64,
     materialized_head_forwards: u64,
     dynamic_tree_max_depth_sum: u64,
-}
-
-/// Flatten the first deepest suffix-tree branch, bounded by the verify depth.
-/// Suffix children are inserted in descending frequency order, so choosing the
-/// earliest node at a tied depth preserves the drafter's deterministic ranking.
-fn deepest_suffix_chain(
-    tree: &camelid::inference::spec_tree::TokenTree,
-    max_depth: usize,
-) -> Vec<u32> {
-    let mut leaf = 0usize;
-    for (node, &depth) in tree.depth.iter().enumerate().skip(1) {
-        let depth = depth as usize;
-        if depth <= max_depth && depth > tree.depth[leaf] as usize {
-            leaf = node;
-        }
-    }
-    if leaf == 0 {
-        return Vec::new();
-    }
-    tree.path_to(leaf)
-        .into_iter()
-        .skip(1)
-        .map(|node| tree.tokens[node])
-        .collect()
 }
 
 fn run_plain_resident_greedy(
@@ -8947,7 +8915,6 @@ fn run_eagle3_resident_greedy(
     use camelid::eagle3_runtime::{
         Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig,
     };
-    use camelid::inference::spec_tree::TreeDrafter;
     use camelid::inference::suffix_decoding::SuffixDecodingDrafter;
 
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
@@ -9046,8 +9013,23 @@ fn run_eagle3_resident_greedy(
             {
                 let draft_started = Instant::now();
                 let suffix_depth = budget.min(round_node_budget.saturating_sub(1));
-                let tree = suffix.draft_tree(history, anchor, round_node_budget, suffix_depth);
-                let drafts = deepest_suffix_chain(&tree, suffix_depth);
+                let proposal =
+                    suffix.draft_confident_chain(history, anchor, round_node_budget, suffix_depth);
+                let evidence = proposal.evidence;
+                if evidence.raw_depth > 0 {
+                    run.suffix_candidate_rounds += 1;
+                    run.suffix_raw_depth_sum += evidence.raw_depth as u64;
+                    run.suffix_confident_depth_sum += evidence.confident_depth as u64;
+                    run.suffix_root_match_len_sum += evidence.root_match_len as u64;
+                    run.suffix_root_support_sum += evidence.root_support as u64;
+                    run.suffix_root_branch_count_sum += evidence.root_branch_count as u64;
+                    run.suffix_expected_accepted_q16_sum += evidence.expected_accepted_q16 as u64;
+                    run.suffix_terminal_survival_q16_sum += evidence.terminal_survival_q16 as u64;
+                    if !evidence.admitted {
+                        run.suffix_confidence_declines += 1;
+                    }
+                }
+                let drafts = proposal.tokens;
                 run.draft_us += draft_started.elapsed().as_micros();
                 drafts
             } else {
@@ -9298,6 +9280,32 @@ struct BenchEagle3Record {
     head_update_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     suffix_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_candidate_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_confidence_declines: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_raw_depth_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_confident_depth_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_root_match_len_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_root_support_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_root_branch_count_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_expected_accepted_q16_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_terminal_survival_q16_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_confidence_q16_scale: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_min_prefix_survival_q16: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_min_expected_accepted_q16: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_min_confident_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suffix_offered: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9666,6 +9674,25 @@ fn run_bench_eagle3(
         verify_ms: eagle.verify_us as f64 / 1000.0,
         head_update_ms: eagle.head_update_us as f64 / 1000.0,
         suffix_rounds: suffix_first.then_some(eagle.suffix_rounds),
+        suffix_candidate_rounds: suffix_first.then_some(eagle.suffix_candidate_rounds),
+        suffix_confidence_declines: suffix_first.then_some(eagle.suffix_confidence_declines),
+        suffix_raw_depth_sum: suffix_first.then_some(eagle.suffix_raw_depth_sum),
+        suffix_confident_depth_sum: suffix_first.then_some(eagle.suffix_confident_depth_sum),
+        suffix_root_match_len_sum: suffix_first.then_some(eagle.suffix_root_match_len_sum),
+        suffix_root_support_sum: suffix_first.then_some(eagle.suffix_root_support_sum),
+        suffix_root_branch_count_sum: suffix_first.then_some(eagle.suffix_root_branch_count_sum),
+        suffix_expected_accepted_q16_sum: suffix_first
+            .then_some(eagle.suffix_expected_accepted_q16_sum),
+        suffix_terminal_survival_q16_sum: suffix_first
+            .then_some(eagle.suffix_terminal_survival_q16_sum),
+        suffix_confidence_q16_scale: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_CONFIDENCE_Q16_ONE),
+        suffix_min_prefix_survival_q16: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_MIN_PREFIX_SURVIVAL_Q16),
+        suffix_min_expected_accepted_q16: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_MIN_EXPECTED_ACCEPTED_Q16),
+        suffix_min_confident_depth: suffix_first
+            .then_some(camelid::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH),
         suffix_offered: suffix_first.then_some(eagle.suffix_offered),
         suffix_emitted_tokens: suffix_first.then_some(eagle.suffix_emitted_tokens),
         suffix_head_catchups: suffix_first.then_some(eagle.suffix_head_catchups),

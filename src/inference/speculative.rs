@@ -236,7 +236,6 @@ impl SpeculativeDrafter {
             Self::NGram(drafter) => Ok(drafter.draft(history, max_tokens)),
             Self::Model(drafter) => drafter.draft(history, max_tokens),
             Self::Suffix(drafter) => {
-                use crate::inference::spec_tree::TreeDrafter;
                 let Some(&anchor) = history.last() else {
                     return Ok(Vec::new());
                 };
@@ -246,20 +245,20 @@ impl SpeculativeDrafter {
                 // Node budget = anchor + max_tokens, depth budget = max_tokens:
                 // a chain of `max_tokens` edges is exactly what the linear
                 // verify window holds.
-                let tree = drafter.draft_tree(history, anchor, max_tokens + 1, max_tokens);
-                // Deepest node = longest proposal. `path_to` walks parents from
-                // it back to the root, so dropping the root leaves the chain in
-                // emission order.
-                let Some(deepest) = (0..tree.tokens.len()).max_by_key(|&i| tree.depth[i]) else {
-                    return Ok(Vec::new());
-                };
-                let path = tree.path_to(deepest);
-                Ok(path
-                    .into_iter()
-                    .skip(1)
-                    .map(|i| tree.tokens[i])
-                    .take(max_tokens)
-                    .collect())
+                let proposal =
+                    drafter.draft_confident_chain(history, anchor, max_tokens + 1, max_tokens);
+                tracing::debug!(
+                    raw_depth = proposal.evidence.raw_depth,
+                    confident_depth = proposal.evidence.confident_depth,
+                    root_match_len = proposal.evidence.root_match_len,
+                    root_support = proposal.evidence.root_support,
+                    root_branch_count = proposal.evidence.root_branch_count,
+                    expected_accepted_q16 = proposal.evidence.expected_accepted_q16,
+                    terminal_survival_q16 = proposal.evidence.terminal_survival_q16,
+                    admitted = proposal.evidence.admitted,
+                    "suffix confidence admission"
+                );
+                Ok(proposal.tokens)
             }
         }
     }
@@ -799,6 +798,17 @@ impl SpecLatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_variant_only_returns_confidence_admitted_chains() {
+        let weak_history = vec![1, 2, 3, 4, 5, 6, 7, 8, 90, 1, 2, 3, 4];
+        let mut weak = SpeculativeDrafter::Suffix(Box::default());
+        assert!(weak.draft(&weak_history, 6).unwrap().is_empty());
+
+        let strong_history = vec![1, 2, 3, 4, 5, 6, 7, 90, 1, 2, 3, 4, 5, 6, 7, 91, 1, 2, 3, 4];
+        let mut strong = SpeculativeDrafter::Suffix(Box::default());
+        assert_eq!(strong.draft(&strong_history, 3).unwrap(), [5, 6, 7]);
+    }
 
     #[test]
     fn ngram_drafts_continuation_of_most_recent_match() {

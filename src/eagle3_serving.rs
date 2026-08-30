@@ -10,14 +10,12 @@ use std::sync::Arc;
 
 use crate::{
     eagle3::{Eagle3DraftModel, TARGET_LAYER_INPUT_IDS},
-    eagle3_runtime::{
-        Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig,
-    },
+    eagle3_runtime::{Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig},
     error::{BackendError, Result},
     inference::{
-        spec_tree::{TokenTree, TreeDrafter, TREE_MAX_NODES},
+        spec_tree::TREE_MAX_NODES,
         speculative::accepted_draft_prefix,
-        suffix_decoding::SuffixDecodingDrafter,
+        suffix_decoding::{SuffixAdmissionEvidence, SuffixDecodingDrafter},
         LlamaForwardTimings, LlamaInferenceSession, LlamaLoadedWeights,
     },
 };
@@ -84,6 +82,7 @@ pub struct Eagle3ServingRound {
     pub offered: usize,
     pub verify_nodes: usize,
     pub suffix: bool,
+    pub suffix_evidence: SuffixAdmissionEvidence,
     pub timings: LlamaForwardTimings,
 }
 
@@ -214,18 +213,29 @@ impl Eagle3ServingState {
                 offered: 0,
                 verify_nodes: 1,
                 suffix: false,
+                suffix_evidence: SuffixAdmissionEvidence::default(),
                 timings: LlamaForwardTimings::default(),
             }));
         }
 
         let target_before = session.kv_position();
-        let suffix_node_budget = (budget + 1)
-            .min(context_room)
-            .min(TREE_MAX_NODES);
-        let suffix_tree = self
-            .suffix
-            .draft_tree(history, anchor, suffix_node_budget, budget);
-        let suffix_drafts = deepest_suffix_chain(&suffix_tree, budget);
+        let suffix_node_budget = (budget + 1).min(context_room).min(TREE_MAX_NODES);
+        let suffix_proposal =
+            self.suffix
+                .draft_confident_chain(history, anchor, suffix_node_budget, budget);
+        let suffix_evidence = suffix_proposal.evidence;
+        let suffix_drafts = suffix_proposal.tokens;
+        tracing::debug!(
+            raw_depth = suffix_evidence.raw_depth,
+            confident_depth = suffix_evidence.confident_depth,
+            root_match_len = suffix_evidence.root_match_len,
+            root_support = suffix_evidence.root_support,
+            root_branch_count = suffix_evidence.root_branch_count,
+            expected_accepted_q16 = suffix_evidence.expected_accepted_q16,
+            terminal_survival_q16 = suffix_evidence.terminal_survival_q16,
+            admitted = suffix_evidence.admitted,
+            "EAGLE-3 suffix confidence admission"
+        );
 
         let round = if !suffix_drafts.is_empty() {
             let verified = session
@@ -255,14 +265,13 @@ impl Eagle3ServingState {
                 offered: suffix_drafts.len(),
                 verify_nodes: suffix_drafts.len() + 1,
                 suffix: true,
+                suffix_evidence,
                 timings: verified.timings,
             }
         } else {
             if !self.pending_suffix_head.is_empty() {
-                drafter.accept_authoritative_catchup(
-                    target_weights,
-                    &mut self.pending_suffix_head,
-                )?;
+                drafter
+                    .accept_authoritative_catchup(target_weights, &mut self.pending_suffix_head)?;
             }
             if drafter.filled() != session.kv_position() {
                 return Err(invalid(format!(
@@ -341,6 +350,7 @@ impl Eagle3ServingState {
                 offered: actual_nodes - 1,
                 verify_nodes: actual_nodes,
                 suffix: false,
+                suffix_evidence,
                 timings: verified.timings,
             }
         };
@@ -367,26 +377,6 @@ impl Eagle3ServingState {
     }
 }
 
-/// Flatten the first deepest suffix-tree branch, bounded by verifier depth.
-/// Children are frequency-ranked, so the first deepest tie is deterministic.
-fn deepest_suffix_chain(tree: &TokenTree, max_depth: usize) -> Vec<u32> {
-    let mut leaf = 0usize;
-    for (node, &depth) in tree.depth.iter().enumerate().skip(1) {
-        let depth = depth as usize;
-        if depth <= max_depth && depth > tree.depth[leaf] as usize {
-            leaf = node;
-        }
-    }
-    if leaf == 0 {
-        return Vec::new();
-    }
-    tree.path_to(leaf)
-        .into_iter()
-        .skip(1)
-        .map(|node| tree.tokens[node])
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,17 +397,5 @@ mod tests {
         assert_eq!(validate_logical_budget(1_024, 1_024).unwrap(), 2_048);
         assert!(validate_logical_budget(1_024, 1_025).is_err());
         assert!(validate_logical_budget(usize::MAX, 1).is_err());
-    }
-
-    #[test]
-    fn deepest_suffix_chain_prefers_first_deepest_path_within_budget() {
-        let tree = TokenTree {
-            tokens: vec![10, 11, 12, 13, 14, 15],
-            parent: vec![-1, 0, 0, 1, 2, 4],
-            depth: vec![0, 1, 1, 2, 2, 3],
-        };
-        assert_eq!(deepest_suffix_chain(&tree, 3), [12, 14, 15]);
-        assert_eq!(deepest_suffix_chain(&tree, 2), [11, 13]);
-        assert!(deepest_suffix_chain(&tree, 0).is_empty());
     }
 }
