@@ -27431,36 +27431,20 @@ impl Eagle3MetalState {
         Ok(fused)
     }
 
-    /// Append the exact K/V state for an authoritative row without computing an output that
-    /// the caller will discard.  K/V depend only on the normalized token embedding and `g`;
-    /// Q, attention, the MLP, and the language-model head cannot affect a future row's cache.
-    fn append_kv_only(
-        &mut self,
+    /// Encode one exact authoritative K/V row into an existing command encoder.
+    ///
+    /// This is the single source of truth for both the original one-row path and the opt-in
+    /// batched path below. Keeping the very same buffers, scalar values, pipelines, dispatch
+    /// order, and F16 scatter makes command-buffer coalescing a synchronization-only change.
+    fn encode_authoritative_kv_row(
+        &self,
+        e: &metal::ComputeCommandEncoderRef,
+        k: &MetalLinearKernel,
+        keep: &mut Vec<Buffer>,
         token_embedding: &[f32],
         g: &[f32],
         position: usize,
-    ) -> std::result::Result<(), String> {
-        if token_embedding.len() != EAGLE3_HIDDEN || g.len() != EAGLE3_HIDDEN {
-            return Err(format!(
-                "EAGLE-3 KV append expected embedding/g widths {EAGLE3_HIDDEN}, got {}/{}",
-                token_embedding.len(),
-                g.len()
-            ));
-        }
-        if position != self.filled {
-            return Err(format!(
-                "EAGLE-3 KV append position {position} does not match KV watermark {}",
-                self.filled
-            ));
-        }
-        if position >= self.max_positions {
-            return Err(format!(
-                "EAGLE-3 position {position} exceeds cache capacity {}",
-                self.max_positions
-            ));
-        }
-
-        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+    ) {
         let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
         let f32b = |n: usize| nb(n * std::mem::size_of::<f32>());
         let embedding = f32b(EAGLE3_HIDDEN);
@@ -27501,10 +27485,6 @@ impl Eagle3MetalState {
             *scatter.add(3) = (EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM) as u32;
         }
 
-        let cb = k.queue.new_command_buffer();
-        let e = cb.new_compute_command_encoder();
-        let mut keep = Vec::new();
-
         // Match `forward_token` byte-for-byte through the K/V scatter.  The cache is F16,
         // so later attention observes exactly the same half-rounded values in either lane.
         encode_eagle3_rms_norm(
@@ -27528,7 +27508,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &combined,
             &self.k_proj,
             &key,
@@ -27540,7 +27520,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &combined,
             &self.v_proj,
             &value,
@@ -27575,10 +27555,6 @@ impl Eagle3MetalState {
             &k.kv_scatter_kv16_pipeline,
             EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
         );
-        e.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-
         keep.extend([
             embedding,
             g_buf,
@@ -27592,9 +27568,109 @@ impl Eagle3MetalState {
             cos_buf,
             sin_buf,
         ]);
+    }
+
+    /// Append one or more exact authoritative K/V rows in one Metal command buffer.
+    ///
+    /// Rows remain encoded in strict sequence order. They are independent until the later
+    /// full cell reads the completed cache, so one serial command buffer has the same cache
+    /// bytes as N separately committed and waited command buffers while removing N-1 host/GPU
+    /// synchronization points.
+    fn append_kv_batch(
+        &mut self,
+        token_embeddings: &[f32],
+        g_states: &[f32],
+        start_position: usize,
+    ) -> std::result::Result<(), String> {
+        let rows = eagle3_validate_batch_shape(
+            token_embeddings.len(),
+            g_states.len(),
+            start_position,
+            self.filled,
+            self.max_positions,
+        )?;
+        if rows == 0 {
+            return Ok(());
+        }
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = Vec::new();
+        for row in 0..rows {
+            let start = row * EAGLE3_HIDDEN;
+            self.encode_authoritative_kv_row(
+                e,
+                k,
+                &mut keep,
+                &token_embeddings[start..start + EAGLE3_HIDDEN],
+                &g_states[start..start + EAGLE3_HIDDEN],
+                start_position + row,
+            );
+        }
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
         pool_recycle(k, keep);
-        self.filled = position + 1;
+        self.filled = start_position + rows;
         Ok(())
+    }
+
+    /// Append the exact K/V state for an authoritative row without computing an output that
+    /// the caller will discard.  K/V depend only on the normalized token embedding and `g`;
+    /// Q, attention, the MLP, and the language-model head cannot affect a future row's cache.
+    fn append_kv_only(
+        &mut self,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+    ) -> std::result::Result<(), String> {
+        self.append_kv_batch(token_embedding, g, position)
+    }
+
+    /// Opt-in authoritative extension that coalesces intermediate K/V-only rows into one
+    /// command buffer, then runs the unchanged full final cell. The output distribution and
+    /// stable seed therefore come from exactly the same final primitive as the default lane.
+    pub fn forward_batch_last_output_batched_kv(
+        &mut self,
+        token_embeddings: &[f32],
+        g_states: &[f32],
+        start_position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        let rows = eagle3_validate_batch_shape(
+            token_embeddings.len(),
+            g_states.len(),
+            start_position,
+            self.filled,
+            self.max_positions,
+        )?;
+        if rows == 0 {
+            return Err("EAGLE-3 last-output batch requires at least one row".to_string());
+        }
+
+        let rollback = self.filled;
+        if rows > 1 {
+            let prefix_values = (rows - 1) * EAGLE3_HIDDEN;
+            if let Err(error) = self.append_kv_batch(
+                &token_embeddings[..prefix_values],
+                &g_states[..prefix_values],
+                start_position,
+            ) {
+                self.filled = rollback;
+                return Err(error);
+            }
+        }
+        let start = (rows - 1) * EAGLE3_HIDDEN;
+        match self.forward_token(
+            &token_embeddings[start..start + EAGLE3_HIDDEN],
+            &g_states[start..start + EAGLE3_HIDDEN],
+            start_position + rows - 1,
+        ) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                self.filled = rollback;
+                Err(error)
+            }
+        }
     }
 
     /// Append one EAGLE cell at exactly the current cache watermark.
@@ -28159,6 +28235,15 @@ impl Eagle3MetalState {
         _g_states: &[f32],
         _start_position: usize,
     ) -> std::result::Result<Vec<Eagle3MetalOutput>, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn forward_batch_last_output_batched_kv(
+        &mut self,
+        _token_embeddings: &[f32],
+        _g_states: &[f32],
+        _start_position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
         Err("EAGLE-3 Metal is only available on macOS".to_string())
     }
 

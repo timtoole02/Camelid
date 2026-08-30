@@ -24,6 +24,20 @@ fn metal<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(|message| invalid(format!("EAGLE-3 Metal runtime: {message}")))
 }
 
+fn eagle3_batch_authoritative_kv_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    })
+}
+
+fn eagle3_batch_authoritative_kv_enabled() -> bool {
+    let value = std::env::var("CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV").ok();
+    eagle3_batch_authoritative_kv_enabled_from(value.as_deref())
+}
+
 // Cache capacity and attention span are independent. E9 keeps absolute K/V rows for
 // rollback/catch-up but each query reads at most its checkpoint-declared trailing window.
 fn validate_drafter_capacity(sliding_window: Option<usize>, max_positions: usize) -> Result<()> {
@@ -691,6 +705,12 @@ impl Eagle3Drafter {
                 .pop()
                 .ok_or_else(|| invalid("EAGLE-3 authoritative batch produced no output"));
         }
+        if eagle3_batch_authoritative_kv_enabled() {
+            return metal(
+                self.head
+                    .forward_batch_last_output_batched_kv(embeddings, fused, start),
+            );
+        }
         metal(
             self.head
                 .forward_batch_last_output(embeddings, fused, start),
@@ -1021,6 +1041,17 @@ impl Eagle3Drafter {
 mod tests {
     use super::*;
     use crate::metal::Eagle3DraftCandidate;
+
+    #[test]
+    fn authoritative_kv_batch_gate_is_explicit_and_fail_closed() {
+        for enabled in ["1", "true", "TRUE", " on ", "Yes", "enabled"] {
+            assert!(eagle3_batch_authoritative_kv_enabled_from(Some(enabled)));
+        }
+        for disabled in ["", "0", "false", "off", "no", "batch"] {
+            assert!(!eagle3_batch_authoritative_kv_enabled_from(Some(disabled)));
+        }
+        assert!(!eagle3_batch_authoritative_kv_enabled_from(None));
+    }
 
     #[test]
     fn sliding_window_limits_attention_span_not_cache_capacity() {
