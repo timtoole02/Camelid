@@ -3324,8 +3324,9 @@ kernel void q4_0_q8_ordered_columns_mma_stage(
 // One 32-lane threadgroup owns eight output rows. For every 32-value Q4_0
 // block it decodes an 8x32 integer weight tile into exact half values, performs
 // four 8x8x8 half-input/f32-output MMAs, and explicitly materializes the 8x8
-// integer-dot matrix. Products are bounded by 8*127 and complete dots by
-// 32*8*127, so neither half multiplication nor f32 accumulation can round.
+// integer-dot matrix. Products are bounded by 8*128 and complete dots by
+// 32*8*128 = 32768, so neither half multiplication nor f32 accumulation can
+// round.
 // Each lane then owns two (row,column) cells and advances their f32 accumulators
 // over blocks in increasing order. The two explicit multiplies deliberately
 // retain the established comparator's `(float(isum) * weight_scale) *
@@ -18591,7 +18592,8 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma(
     let Some(input_width) = blocks_per_row.checked_mul(32) else {
         return false;
     };
-    if input_width > u32::MAX as usize {
+    // The shader's grid id is a uint and visits the full padded-eight panel.
+    if input_width > (u32::MAX as usize) / 8 {
         return false;
     }
     let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
