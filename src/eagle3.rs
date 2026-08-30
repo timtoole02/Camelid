@@ -378,11 +378,11 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
         raw.use_sliding_window,
     ) {
         (true, None, None) => None,
-        (true, Some(256), Some(true)) => Some(256),
+        (true, Some(window @ (256 | 512)), Some(true)) => Some(window),
         (false, None, None) => None,
         (_, window, enabled) => {
             return Err(invalid(format!(
-                "EAGLE-3 config sliding-window fields are sliding_window={window:?}, use_sliding_window={enabled:?}; expected both absent, or exactly sliding_window=256 and use_sliding_window=true for LlamaForCausalLMEagle3"
+                "EAGLE-3 config sliding-window fields are sliding_window={window:?}, use_sliding_window={enabled:?}; expected both absent, or sliding_window in [256, 512] with use_sliding_window=true for LlamaForCausalLMEagle3"
             )))
         }
     };
@@ -1065,6 +1065,11 @@ mod tests {
         assert_eq!(e9.rope_theta, SHAREGPT_ROPE_THETA);
         assert_eq!(e9.torch_dtype, "bfloat16");
         assert_eq!(e9.sliding_window, Some(256));
+
+        let sw512 =
+            SHAREGPT_CONFIG.replace("\"sliding_window\": 256", "\"sliding_window\": 512");
+        let sw512 = parse_and_validate_config(sw512.as_bytes()).unwrap();
+        assert_eq!(sw512.sliding_window, Some(512));
 
         let e8 = SHAREGPT_CONFIG
             .replace("        \"sliding_window\": 256,\n", "")
