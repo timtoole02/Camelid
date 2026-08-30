@@ -1409,6 +1409,226 @@ impl super::LlamaInferenceSession {
         }))
     }
 
+    /// Create an empty resident target session for offline teacher forcing. Unlike the normal
+    /// prefill path, this intentionally executes no token and therefore abbreviates no final
+    /// layer: the exporter can capture every corpus row, starting at position zero, through the
+    /// same full verifier graph used for later chunks.
+    #[cfg(target_os = "macos")]
+    pub fn begin_eagle3_training_metal(&mut self) -> Result<bool> {
+        if self.resident_paths_disabled
+            || !resident_decode_metal_enabled()
+            || self.kv_cache.position != 0
+            || self.resident_decode.is_some()
+            || self.weights.layer_range.is_some()
+            || !self.resident_decode_eligible(true)?
+        {
+            return Ok(false);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let split_half_pairing = match rope::resident_decode_rope_tables(
+            0,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(tables) => tables.split_half_pairing,
+            None => return Ok(false),
+        };
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let kv_cap = self.config.context_length as usize;
+        metal::set_resident_kquant_lane(weights_use_kquant(&weights));
+        let session = match metal::ResidentDecodeState::new(
+            dims.block_count,
+            self.config.attention_head_count as usize,
+            dims.attention_head_count_kv,
+            head_dim,
+            dims.embedding_length,
+            dims.feed_forward_length,
+            512.min(kv_cap).max(1),
+            kv_cap,
+            rms_eps,
+            split_half_pairing,
+            self.gemma3_resident_schedule(0..dims.block_count),
+        ) {
+            Some(session) => session,
+            None => return Ok(false),
+        };
+        self.resident_decode = Some(session);
+        Ok(true)
+    }
+
+    /// Run one exact resident-Q4 teacher-forcing chunk and capture the target features needed
+    /// by EAGLE-3 training. Unlike speculative verification, every input row is authoritative:
+    /// the resident KV watermark advances by `input_tokens.len()` regardless of whether the
+    /// target's greedy prediction matches the following corpus token.
+    ///
+    /// The caller must first establish an empty resident teacher session with
+    /// [`Self::begin_eagle3_training_metal`].
+    #[cfg(target_os = "macos")]
+    pub fn forward_eagle3_training_chunk_metal(
+        &mut self,
+        input_tokens: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaEagle3TrainingCapture>> {
+        if input_tokens.is_empty()
+            || self.resident_paths_disabled
+            || !resident_decode_metal_enabled()
+        {
+            return Ok(None);
+        }
+        let position = self.kv_cache.position;
+        let k = input_tokens.len();
+        if k > MAX_VERIFY_K
+            || position + k > self.kv_cache.plan.max_sequence_length
+            || !self.resident_decode_eligible(true)?
+            || self
+                .resident_decode
+                .as_ref()
+                .is_none_or(|session| session.filled() != position)
+        {
+            return Ok(None);
+        }
+
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        if weights.layer_range.is_some() {
+            return Ok(None);
+        }
+        let head_dim = dims.head_dim;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let mut embeddings = weights
+            .token_embedding
+            .embedding_lookup(input_tokens, "token_embedding_eagle3_training")?;
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for value in &mut embeddings.data {
+                *value *= g.embed_scale;
+            }
+        }
+
+        let mut cos_all = Vec::with_capacity(k * head_dim);
+        let mut sin_all = Vec::with_capacity(k * head_dim);
+        for row in 0..k {
+            match rope::resident_decode_rope_tables(
+                position + row,
+                head_dim,
+                &self.config,
+                weights.rope_freqs.as_ref(),
+            )? {
+                Some(tables) => {
+                    cos_all.extend_from_slice(&tables.cos);
+                    sin_all.extend_from_slice(&tables.sin);
+                }
+                None => return Ok(None),
+            }
+        }
+
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|layer| metal::ResidentLayerWeights {
+                attn_norm: &layer.attention_norm.data,
+                ffn_norm: &layer.ffn_norm.data,
+                q_norm: layer
+                    .attention_q_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                k_norm: layer
+                    .attention_k_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                post_attn_norm: layer
+                    .post_attention_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                post_ffw_norm: layer
+                    .post_ffw_norm
+                    .as_ref()
+                    .map(|tensor| tensor.data.as_slice()),
+                ffn_geglu,
+                q_weight_blocks: resident_weight_bytes(&layer.attention_q),
+                k_weight_blocks: resident_weight_bytes(&layer.attention_k),
+                v_weight_blocks: resident_weight_bytes(&layer.attention_v),
+                o_weight_blocks: resident_weight_bytes(&layer.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&layer.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&layer.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&layer.ffn_down),
+            })
+            .collect();
+        let logits_stage = metal::LogitsStage {
+            final_norm: &weights.output_norm.data,
+            output_weight_blocks: resident_weight_bytes(weights.output_projection()),
+            vocab_size: dims.vocab_size,
+        };
+
+        let session = self
+            .resident_decode
+            .as_mut()
+            .expect("resident training session present (readiness checked above)");
+        let Some((predictions, raw_layer_inputs, raw_output_norm, raw_logits)) = session
+            .verify_batch_with_training_features(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                position,
+                k,
+                scale,
+                capture_layer_ids,
+            )
+        else {
+            return Ok(None);
+        };
+        if predictions.len() != k
+            || raw_output_norm.len() != k * dims.embedding_length
+            || raw_logits.len() != k * dims.vocab_size
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "resident EAGLE training capture returned {} predictions, {} norm values, and {} logits; expected {k}, {}, and {}",
+                predictions.len(),
+                raw_output_norm.len(),
+                raw_logits.len(),
+                k * dims.embedding_length,
+                k * dims.vocab_size
+            )));
+        }
+        let layer_inputs = raw_layer_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(slot, values)| {
+                CpuTensor::from_f32(
+                    format!("resident_training_layer_{}_input", capture_layer_ids[slot]),
+                    vec![k, dims.embedding_length],
+                    values,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_norm_state = CpuTensor::from_f32(
+            "resident_training_output_norm",
+            vec![k, dims.embedding_length],
+            raw_output_norm,
+        )?;
+        let logits = CpuTensor::from_f32(
+            "resident_training_logits",
+            vec![k, dims.vocab_size],
+            raw_logits,
+        )?;
+
+        let new_position = position + k;
+        session.set_filled(new_position);
+        self.kv_cache.position = new_position;
+        Ok(Some(LlamaEagle3TrainingCapture {
+            predictions,
+            layer_inputs,
+            output_norm_state,
+            logits,
+            timings: LlamaForwardTimings::default(),
+        }))
+    }
+
     /// macOS speculative-verify seam (TREE variant): verify a draft TOKEN TREE against the
     /// resident Metal engine in ONE batched forward (`metal::ResidentDecodeState::verify_batch_tree`,
     /// bit-identical to `verify_batch` on a single-branch tree) and return the accepted longest
@@ -1765,6 +1985,24 @@ impl super::LlamaInferenceSession {
         _last_token: u32,
         _drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: resident teacher-feature capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn begin_eagle3_training_metal(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Non-macOS build: resident teacher-feature capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn forward_eagle3_training_chunk_metal(
+        &mut self,
+        _input_tokens: &[u32],
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaEagle3TrainingCapture>> {
         Ok(None)
     }
 

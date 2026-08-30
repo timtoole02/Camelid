@@ -32065,10 +32065,11 @@ impl ResidentDecodeState {
             scale,
             false,
             false,
+            false,
             None,
             &[],
         )
-        .map(|(preds, _, _, _)| preds)
+        .map(|(preds, _, _, _, _)| preds)
     }
 
     /// Resident speculative verify with snapshots of selected target decoder layer inputs.
@@ -32103,10 +32104,50 @@ impl ResidentDecodeState {
             scale,
             false,
             false,
+            false,
             None,
             capture_layer_ids,
         )
-        .map(|(preds, _, layer_inputs, _)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _, _)| (preds, layer_inputs))
+    }
+
+    /// Teacher-forcing twin of [`Self::verify_batch_with_layer_inputs`] used by the
+    /// offline EAGLE feature exporter. In addition to the pre-layer residual taps, this
+    /// reads back the residual stream after the target's final RMSNorm, before the tied
+    /// output projection. All rows and predictions retain input order. This method does
+    /// not advance `filled`; the owning inference session commits the complete teacher-
+    /// forced chunk only after every capture shape has been validated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_with_training_features(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+        capture_layer_ids: &[usize],
+    ) -> Option<(Vec<u32>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>)> {
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            k,
+            scale,
+            true,
+            false,
+            true,
+            None,
+            capture_layer_ids,
+        )
+        .map(|(preds, logits, layer_inputs, _, output_norm)| {
+            (preds, layer_inputs, output_norm, logits)
+        })
     }
 
     /// Opt-in resident verification that additionally returns the exact target top-8 token ids
@@ -32136,10 +32177,11 @@ impl ResidentDecodeState {
             scale,
             false,
             true,
+            false,
             None,
             &[],
         )
-        .map(|(preds, _, _, target_top_k)| (preds, target_top_k))
+        .map(|(preds, _, _, target_top_k, _)| (preds, target_top_k))
     }
 
     /// `verify_batch` that also reads back the `k * vocab` pre-argmax logits (the byte-exact
@@ -32169,10 +32211,11 @@ impl ResidentDecodeState {
             scale,
             true,
             false,
+            false,
             None,
             &[],
         )
-        .map(|(preds, logits, _, _)| (preds, logits))
+        .map(|(preds, logits, _, _, _)| (preds, logits))
     }
 
     /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
@@ -32195,6 +32238,7 @@ impl ResidentDecodeState {
         scale: f32,
         read_logits: bool,
         read_target_top_k: bool,
+        read_output_norm: bool,
         tree: Option<&TreeAttn>,
         capture_layer_ids: &[usize],
     ) -> Option<(
@@ -32202,6 +32246,7 @@ impl ResidentDecodeState {
         Vec<f32>,
         Vec<Vec<f32>>,
         Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>,
+        Vec<f32>,
     )> {
         // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
         // The tree path widens the node cap to TREE_MAX_NODES (a tree of N nodes has at most
@@ -33015,6 +33060,13 @@ impl ResidentDecodeState {
                     .collect()
             })
             .unwrap_or_default();
+        let output_norm = if read_output_norm {
+            let mut out = vec![0.0f32; k * hidden];
+            read_buffer_f32(&fnorm_buf, &mut out);
+            out
+        } else {
+            Vec::new()
+        };
         // The command buffer completed and every host readback above is
         // done: return the round's scratch (activations, scalars, staging
         // from the batched projections) to the pool.
@@ -33064,7 +33116,13 @@ impl ResidentDecodeState {
             keep.push(buf);
         }
         pool_recycle(kern, keep);
-        Some((preds, logits_out, layer_inputs, target_top_k))
+        Some((
+            preds,
+            logits_out,
+            layer_inputs,
+            target_top_k,
+            output_norm,
+        ))
     }
 
     /// WIN2METAL Phase 4 — TREE speculative verify. Batched forward over the `n` BFS-ordered
@@ -33108,10 +33166,11 @@ impl ResidentDecodeState {
             scale,
             false,
             false,
+            false,
             Some(&tree),
             &[],
         )
-        .map(|(preds, _, _, _)| preds)
+        .map(|(preds, _, _, _, _)| preds)
     }
 
     /// Capture-capable twin of [`Self::verify_batch_tree`].  The forward, tree-attention
@@ -33147,10 +33206,11 @@ impl ResidentDecodeState {
             scale,
             false,
             false,
+            false,
             Some(&tree),
             capture_layer_ids,
         )
-        .map(|(preds, _, layer_inputs, _)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _, _)| (preds, layer_inputs))
     }
 
     /// Tree-attention twin of [`Self::verify_batch_with_target_top_k`]. Candidate rows retain
@@ -33183,10 +33243,11 @@ impl ResidentDecodeState {
             scale,
             false,
             true,
+            false,
             Some(&tree),
             &[],
         )
-        .map(|(preds, _, _, target_top_k)| (preds, target_top_k))
+        .map(|(preds, _, _, target_top_k, _)| (preds, target_top_k))
     }
 
     /// Benchmark-only EAGLE/Token-Recycling twin that retains both selected decoder-layer
@@ -33225,10 +33286,11 @@ impl ResidentDecodeState {
             scale,
             false,
             true,
+            false,
             Some(&tree),
             capture_layer_ids,
         )
-        .map(|(preds, _, layer_inputs, target_top_k)| {
+        .map(|(preds, _, layer_inputs, target_top_k, _)| {
             (preds, layer_inputs, target_top_k)
         })
     }
@@ -33263,10 +33325,11 @@ impl ResidentDecodeState {
             scale,
             true,
             false,
+            false,
             Some(&tree),
             &[],
         )
-        .map(|(preds, logits, _, _)| (preds, logits))
+        .map(|(preds, logits, _, _, _)| (preds, logits))
     }
 
     /// Build the per-node `TreeAttn` descriptor from the ancestor bitset. For node `i`, scan
@@ -50516,6 +50579,30 @@ mod tests {
                     "base={base} layer-1 capture element {i}: {actual} != {expected}"
                 );
             }
+
+            // Offline EAGLE exporter seam: requesting the post-final-RMSNorm stream must not
+            // perturb predictions or the already-proven layer captures. The norm readback is
+            // one complete hidden row per verifier input.
+            let mut training_session = mk_session();
+            let stage = make_stage();
+            let (training_preds, training_captures, output_norm, training_logits) = training_session
+                .verify_batch_with_training_features(
+                    &emb_all,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    base,
+                    k,
+                    scale,
+                    &[0, 1],
+                )
+                .expect("verify training capture eligible");
+            assert_eq!(training_preds, preds);
+            assert_eq!(training_captures, captures);
+            assert_eq!(output_norm.len(), k * hidden);
+            assert!(output_norm.iter().all(|value| value.is_finite()));
+            assert_eq!(training_logits, cand_logits);
 
             // Hard gate: exact u32 bit identity for every row/element + argmax id equality.
             for i in 0..k {

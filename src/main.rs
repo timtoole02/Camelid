@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    io::Write,
+    fs::File,
+    io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     sync::Arc,
@@ -185,6 +186,43 @@ mod ghost_moe_cli_tests {
                     assert_eq!(eagle3_secondary, Some(PathBuf::from("sw512")));
                 }
                 other => panic!("expected BenchEagle3, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn eagle3_feature_export_requires_explicit_input_and_output() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "export-eagle3-features",
+                "target-q4.gguf",
+                "--eagle3",
+                "sw512-head",
+                "--input",
+                "corpus.jsonl",
+                "--output",
+                "features",
+                "--limit",
+                "7",
+            ])
+            .expect("parse EAGLE feature exporter");
+            match cli.command {
+                Some(Command::ExportEagle3Features {
+                    model,
+                    eagle3,
+                    input,
+                    output,
+                    limit,
+                    ..
+                }) => {
+                    assert_eq!(model, PathBuf::from("target-q4.gguf"));
+                    assert_eq!(eagle3, PathBuf::from("sw512-head"));
+                    assert_eq!(input, PathBuf::from("corpus.jsonl"));
+                    assert_eq!(output, PathBuf::from("features"));
+                    assert_eq!(limit, Some(7));
+                }
+                other => panic!("expected ExportEagle3Features, got {other:?}"),
             }
         });
     }
@@ -2992,6 +3030,28 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Offline exact-Q4 teacher-feature export for one-layer Llama-3.2 EAGLE-3 training.
+    /// Input is JSONL with `{input_ids:[...], loss_mask:[...], id?:"..."}` records.
+    #[command(hide = true)]
+    ExportEagle3Features {
+        /// Exact Llama-3.2-3B-Instruct Q4 GGUF teacher.
+        model: PathBuf,
+        /// Pinned EAGLE-3 checkpoint directory supplying the fixed d2t/t2d draft vocabulary.
+        #[arg(long)]
+        eagle3: PathBuf,
+        /// Tokenized JSONL corpus. `loss_mask[P]` marks whether `input_ids[P]` is trainable.
+        #[arg(long)]
+        input: PathBuf,
+        /// New output dataset directory (must not already exist).
+        #[arg(long)]
+        output: PathBuf,
+        /// Stop after this many non-empty JSONL records.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Override Rayon worker threads used during model loading/fallback checks.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// EXPERIMENTAL ghost (layer-streaming) mode: execute a model one transformer block at
     /// a time, streaming each block's weights from a layer-contiguous `.cghost` file
     /// (see the `repack-ghost` tool) and holding only a one-layer working window plus the
@@ -5550,6 +5610,16 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 threads,
             )?;
+        }
+        Command::ExportEagle3Features {
+            model,
+            eagle3,
+            input,
+            output,
+            limit,
+            threads,
+        } => {
+            run_export_eagle3_features(model, eagle3, input, output, limit, threads)?;
         }
         Command::GhostRun {
             model,
@@ -11046,6 +11116,231 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_export_eagle3_features(
+    model: PathBuf,
+    eagle3: PathBuf,
+    input: PathBuf,
+    output: PathBuf,
+    limit: Option<usize>,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    use camelid::eagle3::{HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS};
+    use camelid::eagle3_export::{
+        shift_loss_mask, shift_teacher_rows, shifted_corpus_labels, Eagle3FeatureDatasetWriter,
+        Eagle3FeatureInput, Eagle3FeatureSample, AUX_WIDTH,
+    };
+    use camelid::eagle3_runtime::interleave_target_layer_inputs;
+
+    const TEACHER_CHUNK_ROWS: usize = 16;
+    const PINNED_SW512_SHA256: &str =
+        "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
+
+    configure_rayon_threads(threads)?;
+    let model_sha256 = camelid::receipt::sha256_file_hex(&model)
+        .map_err(|error| anyhow::anyhow!("hashing target model {}: {error}", model.display()))?;
+    let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    anyhow::ensure!(
+        config.architecture == "llama"
+            && config.embedding_length == HIDDEN_SIZE as u32
+            && config.block_count == 28
+            && config.vocab_size == Some(128_256),
+        "EAGLE feature export requires exact Llama-3.2-3B geometry; got arch={} hidden={} layers={} vocab={:?}",
+        config.architecture,
+        config.embedding_length,
+        config.block_count,
+        config.vocab_size
+    );
+    let quantization = camelid::receipt::quantization_label(&gguf);
+    anyhow::ensure!(
+        quantization.starts_with("Q4"),
+        "EAGLE exact-Q4 feature export requires a Q4 target GGUF, got {quantization}"
+    );
+    let eagle3_weights_path = eagle3.join("model.safetensors");
+    let eagle3_checkpoint_sha256 = camelid::receipt::sha256_file_hex(&eagle3_weights_path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "hashing EAGLE checkpoint {}: {error}",
+                eagle3_weights_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        eagle3_checkpoint_sha256 == PINNED_SW512_SHA256,
+        "exact-Q4 training export requires pinned ShareGPT-SW512 EAGLE mapping {}, got {}",
+        PINNED_SW512_SHA256,
+        eagle3_checkpoint_sha256
+    );
+    let eagle3_checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3)?;
+    anyhow::ensure!(
+        eagle3_checkpoint.config.sliding_window == Some(512),
+        "training export requires the pinned SW512 EAGLE checkpoint"
+    );
+    let draft_to_target = eagle3_checkpoint.draft_to_target.clone();
+    drop(eagle3_checkpoint);
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+    let mut writer = Eagle3FeatureDatasetWriter::create(
+        &output,
+        model.display().to_string(),
+        model_sha256,
+        quantization,
+        eagle3_checkpoint_sha256,
+        &draft_to_target,
+    )?;
+
+    let reader = BufReader::new(
+        File::open(&input)
+            .map_err(|error| anyhow::anyhow!("opening feature input {}: {error}", input.display()))?,
+    );
+    let mut exported = 0usize;
+    for (line_index, line) in reader.lines().enumerate() {
+        if limit.is_some_and(|limit| exported >= limit) {
+            break;
+        }
+        let line = line.map_err(|error| {
+            anyhow::anyhow!(
+                "reading {} line {}: {error}",
+                input.display(),
+                line_index + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: Eagle3FeatureInput = serde_json::from_str(&line).map_err(|error| {
+            anyhow::anyhow!(
+                "parsing {} line {} as EAGLE JSONL: {error}",
+                input.display(),
+                line_index + 1
+            )
+        })?;
+        record.validate()?;
+        anyhow::ensure!(
+            record.input_ids.len() <= config.context_length as usize,
+            "EAGLE sample at line {} has {} tokens, exceeding target context {}",
+            line_index + 1,
+            record.input_ids.len(),
+            config.context_length
+        );
+        let id = record
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("line-{:08}", line_index + 1));
+        let rows = record.input_ids.len();
+        let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(&weights))?;
+        let _ = session.prewarm_resident_weights();
+        session.set_resident_encode_ahead_enabled(false);
+        anyhow::ensure!(
+            session.begin_eagle3_training_metal()?,
+            "resident exact-Q4 empty teacher session is unavailable for sample {id}"
+        );
+        let target_vocab = config.vocab_size.expect("exact geometry checked") as usize;
+        let mut aux_layer_inputs = Vec::with_capacity(rows * AUX_WIDTH);
+        let mut hidden_state = Vec::with_capacity(rows * HIDDEN_SIZE);
+        let mut capture_argmax = Vec::with_capacity(rows);
+        let mut capture_draft_logits = Vec::with_capacity(rows * draft_to_target.len());
+        let mut capture_logsumexp = Vec::with_capacity(rows);
+
+        for start in (0..rows).step_by(TEACHER_CHUNK_ROWS) {
+            let end = (start + TEACHER_CHUNK_ROWS).min(rows);
+            let capture = session
+                .forward_eagle3_training_chunk_metal(
+                    &record.input_ids[start..end],
+                    &TARGET_LAYER_INPUT_IDS,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resident exact-Q4 teacher capture declined sample {id} rows {start}..{end}"
+                    )
+                })?;
+            let chunk_aux = interleave_target_layer_inputs(&capture.layer_inputs)?;
+            anyhow::ensure!(
+                capture.predictions.len() == end - start
+                    && chunk_aux.len() == (end - start) * AUX_WIDTH
+                    && capture.output_norm_state.data.len() == (end - start) * HIDDEN_SIZE
+                    && capture.logits.data.len() == (end - start) * target_vocab,
+                "sample {id} teacher capture returned malformed row counts at {start}..{end}"
+            );
+            capture_argmax.extend_from_slice(&capture.predictions);
+            aux_layer_inputs.extend_from_slice(&chunk_aux);
+            hidden_state.extend_from_slice(&capture.output_norm_state.data);
+            for row in capture.logits.data.chunks_exact(target_vocab) {
+                let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                anyhow::ensure!(
+                    maximum.is_finite() && row.iter().all(|value| value.is_finite()),
+                    "sample {id} contains non-finite exact-Q4 teacher logits"
+                );
+                let exp_sum = row
+                    .iter()
+                    .map(|value| f64::from(*value - maximum).exp())
+                    .sum::<f64>();
+                capture_logsumexp.push((f64::from(maximum) + exp_sum.ln()) as f32);
+                capture_draft_logits.extend(
+                    draft_to_target
+                        .iter()
+                        .map(|&target_id| row[target_id as usize]),
+                );
+            }
+        }
+
+        anyhow::ensure!(
+            capture_argmax.len() == rows
+                && capture_draft_logits.len() == rows * draft_to_target.len()
+                && capture_logsumexp.len() == rows,
+            "sample {id} did not capture every exact-Q4 teacher row"
+        );
+        let shifted_teacher = shift_teacher_rows(
+            &capture_argmax,
+            &capture_draft_logits,
+            &capture_logsumexp,
+        )?;
+        let labels = shifted_corpus_labels(&record.input_ids)?;
+        let loss_mask = shift_loss_mask(&record.loss_mask)?;
+        let input_embedding = weights
+            .token_embedding
+            .embedding_lookup(&record.input_ids, "eagle3_export_input_embedding")?
+            .data;
+        let mut next_token_embedding = weights
+            .token_embedding
+            .embedding_lookup(
+                &record.input_ids[1..],
+                "eagle3_export_next_token_embedding",
+            )?
+            .data;
+        next_token_embedding.resize(rows * HIDDEN_SIZE, 0.0);
+
+        writer.push(&Eagle3FeatureSample {
+            id,
+            input_ids: record.input_ids,
+            labels,
+            target_argmax: shifted_teacher.target_argmax,
+            loss_mask,
+            aux_layer_inputs,
+            hidden_state,
+            input_embedding,
+            next_token_embedding,
+            teacher_draft_logits: shifted_teacher.teacher_draft_logits,
+            teacher_logsumexp: shifted_teacher.teacher_logsumexp,
+            bootstrap_rows_masked: 0,
+        })?;
+        exported += 1;
+        eprintln!("[eagle3-export] wrote sample {exported} ({rows} rows)");
+    }
+    anyhow::ensure!(exported > 0, "EAGLE feature input contained no records");
+    let manifest = writer.finish()?;
+    eprintln!(
+        "[eagle3-export] complete schema={} samples={} output={}",
+        manifest.schema,
+        manifest.samples.len(),
+        output.display()
+    );
+    Ok(())
+}
+
 fn run_bench_eagle3(
     model: PathBuf,
     eagle3_dir: PathBuf,

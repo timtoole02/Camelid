@@ -1514,6 +1514,23 @@ pub struct LlamaGreedyVerifyCapture {
     pub timings: LlamaForwardTimings,
 }
 
+/// Teacher-forced target features used to train a one-layer EAGLE-3 head.
+///
+/// All tensors retain the input-token row order. `output_norm_state` is the residual
+/// stream after the target's final RMSNorm and immediately before its output projection;
+/// `layer_inputs` are the selected pre-layer residual streams. The target predictions are
+/// the exact greedy argmax ids produced by the same Q4 resident forward.
+#[derive(Debug, Clone)]
+pub struct LlamaEagle3TrainingCapture {
+    pub predictions: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub output_norm_state: CpuTensor,
+    /// Full target-vocabulary logits in row-major `[rows, vocab]` order. The exporter
+    /// immediately gathers the fixed checkpoint d2t rows and releases this transient buffer.
+    pub logits: CpuTensor,
+    pub timings: LlamaForwardTimings,
+}
+
 /// Opt-in resident target verification result with compact top-8 candidates per verifier row.
 ///
 /// `predictions` is still produced by the ordinary greedy verifier path. `target_top_k` is an
