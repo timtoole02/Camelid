@@ -201,12 +201,21 @@ pub(crate) struct MetalLinearKernel {
     /// arithmetic operation while staging the Q4 operand row-major so the MMA
     /// tile load is dense and non-transposed.
     q4_0_q8_ordered_columns_mma_rowmajor_pipeline: Option<ComputePipelineState>,
+    /// Fragment-owned sibling of the row-major exact MMA verifier. Every lane
+    /// consumes the two f32 accumulator cells already resident in its
+    /// `simdgroup_float8x8`, avoiding the 8x8 threadgroup store/read roundtrip.
+    q4_0_q8_ordered_columns_mma_rowmajor_fragment_pipeline: Option<ComputePipelineState>,
     /// Serial-row-tile siblings of the exact padded-eight MMA verifier. A
     /// single simdgroup owns two or four consecutive 8-row tiles so the Q8
     /// panel is staged into threadgroup memory once per Q4 block and reused
     /// across those output tiles. Kept separate for exact A/B qualification.
     q4_0_q8_ordered_columns_mma_serial2_pipeline: Option<ComputePipelineState>,
     q4_0_q8_ordered_columns_mma_serial4_pipeline: Option<ComputePipelineState>,
+    /// Fragment-owned serial2 sibling plus a fully register-fed diagnostic.
+    /// Both preserve the strict increasing-block f32 fold; the latter fills
+    /// Q4 and Q8 MMA operands through each lane's two fragment elements.
+    q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline: Option<ComputePipelineState>,
+    q4_0_q8_ordered_columns_mma_register_fragment_pipeline: Option<ComputePipelineState>,
     /// Fixed-geometry Gemma 4 26B routed-expert lane. These three strict
     /// pipelines consume caller-owned, persistent expert slot slabs: no weight
     /// buffer is allocated or copied on the token hot path.
@@ -3542,6 +3551,118 @@ kernel void q4_0_q8_ordered_columns_mma_rowmajor(
     }
 }
 
+// The Apple-family 32-lane 8x8 fragment map assigns two adjacent columns to
+// every lane. Camelid already uses this map for direct fragment stores in its
+// established dense MMA kernels. Keeping it explicit here lets the strict Q4
+// verifier consume `dots` without materializing an 8x8 threadgroup tile.
+inline uint2 q4_mma_fragment_coord(uint lane) {
+    const uint fragment_row = 4u * (lane >> 4) + ((lane & 7u) >> 1);
+    const uint fragment_column = 4u * ((lane >> 3) & 1u) + 2u * (lane & 1u);
+    return uint2(fragment_column, fragment_row);
+}
+
+// Arithmetic-identical row-major sibling whose accumulator ownership follows
+// the native simdgroup fragment map. The per-block integer dot remains four
+// increasing-k MMAs and every output cell retains its own increasing-block f32
+// fold. Only the c_stage store, barrier, and reload are removed.
+kernel void q4_0_q8_ordered_columns_mma_rowmajor_fragment(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = tile * 8u;
+    if (row0 >= rows) return;
+
+    threadgroup half stage_a[8 * 32];
+    threadgroup float weight_scales[8];
+    float accum[2] = {0.0f, 0.0f};
+    const uint2 fragment_coord = q4_mma_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+
+    for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const uint tile_row = lane & 7u;
+        const uint packed_quarter = lane >> 3;
+        const uint row = row0 + tile_row;
+        half4 low_values = half4(0.0h);
+        half4 high_values = half4(0.0h);
+        if (row < rows) {
+            device const uchar* block = weight_bytes
+                + (ulong(row) * blocks_per_row + block_index) * 18ul;
+            if (packed_quarter == 0u) {
+                weight_scales[tile_row] =
+                    float(*reinterpret_cast<device const half*>(block));
+            }
+            device const packed_uchar4* packed_ptr =
+                reinterpret_cast<device const packed_uchar4*>(
+                    block + 2ul + ulong(packed_quarter) * 4ul);
+            const uchar4 packed = uchar4(*packed_ptr);
+            low_values = half4(
+                half(int(packed.x & 0x0fu) - 8),
+                half(int(packed.y & 0x0fu) - 8),
+                half(int(packed.z & 0x0fu) - 8),
+                half(int(packed.w & 0x0fu) - 8));
+            high_values = half4(
+                half(int(packed.x >> 4) - 8),
+                half(int(packed.y >> 4) - 8),
+                half(int(packed.z >> 4) - 8),
+                half(int(packed.w >> 4) - 8));
+        } else if (packed_quarter == 0u) {
+            weight_scales[tile_row] = 0.0f;
+        }
+        threadgroup half4* stage_a4 =
+            reinterpret_cast<threadgroup half4*>(stage_a);
+        const uint row_half4 = tile_row * 8u;
+        stage_a4[row_half4 + packed_quarter] = low_values;
+        stage_a4[row_half4 + 4u + packed_quarter] = high_values;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 dots =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+            simdgroup_half8x8 weights;
+            simdgroup_load(weights, stage_a + k_tile * 8u, 32);
+            simdgroup_half8x8 activations;
+            simdgroup_load(
+                activations,
+                staged_quants +
+                    (ulong(block_index) * 32ul + k_tile * 8ul) * 8ul,
+                8);
+            simdgroup_multiply_accumulate(dots, weights, activations, dots);
+        }
+
+        for (uint cell = 0; cell < 2u; ++cell) {
+            const uint column = fragment_column0 + cell;
+            const uint output_row = row0 + fragment_row;
+            if (output_row < rows && column < columns) {
+                const float isum = dots.thread_elements()[cell];
+                float term = isum * weight_scales[fragment_row];
+                term = term *
+                    input_scales[ulong(column) * blocks_per_row + block_index];
+                accum[cell] = accum[cell] + term;
+            }
+        }
+        // stage_a and weight_scales are single-buffered. Apple requires a
+        // memory barrier before another block overwrites locations that other
+        // lanes may still be reading, even for a one-simdgroup threadgroup.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2u; ++cell) {
+        const uint column = fragment_column0 + cell;
+        const uint output_row = row0 + fragment_row;
+        if (output_row < rows && column < columns) {
+            output[ulong(column) * rows + output_row] = accum[cell];
+        }
+    }
+}
+
 // Serial-row-tile exact MMA experiment. One simdgroup owns ROW_TILES
 // consecutive 8-row tiles. Unlike the one-tile kernel above, it cooperatively
 // stages the current 32x8 Q8 panel into threadgroup memory once per block and
@@ -3709,6 +3830,207 @@ kernel void q4_0_q8_ordered_columns_mma_serial4(
         input_scales, weight_bytes, output, blocks_per_row, rows, columns,
         staged_quants, tile_group, lane, 4u, stage_a, stage_b, c_stage,
         weight_scales, accum);
+}
+
+// Serial2 experiment with native fragment-owned accumulator cells. It keeps
+// the qualified Q8-panel reuse and every established arithmetic operation, but
+// removes one 8x8 c_stage roundtrip and one barrier for each serial tile.
+kernel void q4_0_q8_ordered_columns_mma_serial2_fragment(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    uint tile_group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row_tiles = 2u;
+    const uint group_row0 = tile_group * row_tiles * 8u;
+    if (group_row0 >= rows) return;
+
+    threadgroup half stage_a[32 * 8];
+    threadgroup half stage_b[32 * 8];
+    threadgroup float weight_scales[8];
+    float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint2 fragment_coord = q4_mma_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+
+    for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const uint b0 = lane * 8u;
+        for (uint item = 0; item < 8u; ++item) {
+            const uint panel_index = b0 + item;
+            stage_b[panel_index] = staged_quants[
+                ulong(block_index) * 32ul * 8ul + panel_index];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint serial_tile = 0; serial_tile < row_tiles; ++serial_tile) {
+            const uint row0 = group_row0 + serial_tile * 8u;
+            const uint tile_row = lane & 7u;
+            const uint packed_quarter = lane >> 3;
+            const uint row = row0 + tile_row;
+            if (row < rows) {
+                device const uchar* block = weight_bytes
+                    + (ulong(row) * blocks_per_row + block_index) * 18ul;
+                if (packed_quarter == 0u) {
+                    weight_scales[tile_row] =
+                        float(*reinterpret_cast<device const half*>(block));
+                }
+                device const packed_uchar4* packed_ptr =
+                    reinterpret_cast<device const packed_uchar4*>(
+                        block + 2ul + ulong(packed_quarter) * 4ul);
+                const uchar4 packed = uchar4(*packed_ptr);
+                for (uint item = 0; item < 4u; ++item) {
+                    const uint low_position = packed_quarter * 4u + item;
+                    const uint byte = uint(packed[item]);
+                    stage_a[low_position * 8u + tile_row] =
+                        half(int(byte & 0x0fu) - 8);
+                    stage_a[(low_position + 16u) * 8u + tile_row] =
+                        half(int(byte >> 4) - 8);
+                }
+            } else {
+                if (packed_quarter == 0u) weight_scales[tile_row] = 0.0f;
+                for (uint item = 0; item < 4u; ++item) {
+                    const uint low_position = packed_quarter * 4u + item;
+                    stage_a[low_position * 8u + tile_row] = half(0.0f);
+                    stage_a[(low_position + 16u) * 8u + tile_row] =
+                        half(0.0f);
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 dots =
+                make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+                simdgroup_half8x8 weights;
+                simdgroup_load(
+                    weights, stage_a + k_tile * 8u * 8u, 8,
+                    ulong2(0, 0), true);
+                simdgroup_half8x8 activations;
+                simdgroup_load(
+                    activations, stage_b + k_tile * 8u * 8u, 8);
+                simdgroup_multiply_accumulate(dots, weights, activations, dots);
+            }
+
+            for (uint cell = 0; cell < 2u; ++cell) {
+                const uint column = fragment_column0 + cell;
+                const uint output_row = row0 + fragment_row;
+                if (output_row < rows && column < columns) {
+                    const float isum = dots.thread_elements()[cell];
+                    float term = isum * weight_scales[fragment_row];
+                    term = term * input_scales[
+                        ulong(column) * blocks_per_row + block_index];
+                    const uint accum_index = serial_tile * 2u + cell;
+                    accum[accum_index] = accum[accum_index] + term;
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint serial_tile = 0; serial_tile < row_tiles; ++serial_tile) {
+        const uint row0 = group_row0 + serial_tile * 8u;
+        for (uint cell = 0; cell < 2u; ++cell) {
+            const uint column = fragment_column0 + cell;
+            const uint output_row = row0 + fragment_row;
+            if (output_row < rows && column < columns) {
+                output[ulong(column) * rows + output_row] =
+                    accum[serial_tile * 2u + cell];
+            }
+        }
+    }
+}
+
+// Fully register-fed diagnostic. Each lane loads exactly four Q4 payload bytes
+// for its output row, derives the low/high nibble pairs for all four k-tiles,
+// and fills both MMA operands through `thread_elements()`. There is no
+// threadgroup scratch or barrier. The existing global padded-eight Q8 panel is
+// retained so K=1/2/4/8 share one exact activation layout and one fair staging
+// dispatch with the control kernels.
+kernel void q4_0_q8_ordered_columns_mma_register_fragment(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = tile * 8u;
+    if (row0 >= rows) return;
+
+    const uint2 fragment_coord = q4_mma_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+    const uint output_row = row0 + fragment_row;
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+        float weight_scale = 0.0f;
+        uchar2 packed_first = uchar2(0);
+        uchar2 packed_second = uchar2(0);
+        if (output_row < rows) {
+            device const uchar* block = weight_bytes
+                + (ulong(output_row) * blocks_per_row + block_index) * 18ul;
+            weight_scale =
+                float(*reinterpret_cast<device const half*>(block));
+            packed_first = uchar2(
+                *reinterpret_cast<device const packed_uchar2*>(
+                    block + 2ul + fragment_column0));
+            packed_second = uchar2(
+                *reinterpret_cast<device const packed_uchar2*>(
+                    block + 10ul + fragment_column0));
+        }
+
+        simdgroup_float8x8 dots =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#pragma clang loop unroll(full)
+        for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+            const uchar2 packed = (k_tile & 1u) == 0u
+                ? packed_first
+                : packed_second;
+            const bool high_nibble = k_tile >= 2u;
+            simdgroup_half8x8 weights;
+            weights.thread_elements()[0] = high_nibble
+                ? half(int(packed.x >> 4) - 8)
+                : half(int(packed.x & 0x0fu) - 8);
+            weights.thread_elements()[1] = high_nibble
+                ? half(int(packed.y >> 4) - 8)
+                : half(int(packed.y & 0x0fu) - 8);
+
+            const ulong activation_row =
+                (ulong(block_index) * 32ul + k_tile * 8ul + fragment_row) * 8ul;
+            simdgroup_half8x8 activations;
+            activations.thread_elements()[0] =
+                staged_quants[activation_row + fragment_column0];
+            activations.thread_elements()[1] =
+                staged_quants[activation_row + fragment_column0 + 1u];
+            simdgroup_multiply_accumulate(dots, weights, activations, dots);
+        }
+
+        for (uint cell = 0; cell < 2u; ++cell) {
+            const uint column = fragment_column0 + cell;
+            if (output_row < rows && column < columns) {
+                const float isum = dots.thread_elements()[cell];
+                float term = isum * weight_scale;
+                term = term *
+                    input_scales[ulong(column) * blocks_per_row + block_index];
+                accum[cell] = accum[cell] + term;
+            }
+        }
+    }
+
+    for (uint cell = 0; cell < 2u; ++cell) {
+        const uint column = fragment_column0 + cell;
+        if (output_row < rows && column < columns) {
+            output[ulong(column) * rows + output_row] = accum[cell];
+        }
+    }
 }
 // Production Ghost-MoE geometry for Gemma 4 26B. The .cghost v2 record stores
 // gate||up first, then down. Each mutable slot starts on a 16 KiB boundary so a
@@ -11430,6 +11752,14 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let q4_0_q8_ordered_columns_mma_rowmajor_fragment_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_rowmajor_fragment", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let q4_0_q8_ordered_columns_mma_serial2_pipeline = strict_q8k_library
                 .get_function("q4_0_q8_ordered_columns_mma_serial2", None)
                 .ok()
@@ -11440,6 +11770,22 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 });
             let q4_0_q8_ordered_columns_mma_serial4_pipeline = strict_q8k_library
                 .get_function("q4_0_q8_ordered_columns_mma_serial4", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_serial2_fragment", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q4_0_q8_ordered_columns_mma_register_fragment_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_register_fragment", None)
                 .ok()
                 .and_then(|function| {
                     device
@@ -11643,8 +11989,11 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4_0_q8_ordered_columns_mma_stage_pipeline,
                 q4_0_q8_ordered_columns_mma_pipeline,
                 q4_0_q8_ordered_columns_mma_rowmajor_pipeline,
+                q4_0_q8_ordered_columns_mma_rowmajor_fragment_pipeline,
                 q4_0_q8_ordered_columns_mma_serial2_pipeline,
                 q4_0_q8_ordered_columns_mma_serial4_pipeline,
+                q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline,
+                q4_0_q8_ordered_columns_mma_register_fragment_pipeline,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
                 gemma4_q4_expert_gate_up_geglu_simd_pipeline,
                 gemma4_q4_expert_gate_up_split_pipeline,
@@ -13016,6 +13365,29 @@ fn gemma4_q4_mma_rowmajor_enabled() -> bool {
     })
 }
 
+/// Opt-in direct consumption of the two accumulator cells owned by each lane.
+/// This selector never enables the parent MMA path by itself.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_mma_fragment_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_Q4_MMA_FRAGMENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Diagnostic fully register-fed Q4/Q8 fragment kernel. Kept separate from
+/// the lower-risk accumulator-only experiment so either result can fail
+/// closed without changing the established policy.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_mma_register_fragment_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Mini2-qualified serial-row-tile policy for the opt-in exact MMA lane.
 /// Q/gate/up/down/output projections have at least 3,840 output rows and won
 /// with two serial tiles. K/V projections are smaller and regressed sharply,
@@ -13278,6 +13650,36 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor(
 
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor_fragment(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_columns_impl(
+        inputs,
+        weight_wire,
+        rows,
+        Gemma4Q4ColumnsTestPath::MmaRowMajorFragment,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_columns_impl(
+        inputs,
+        weight_wire,
+        rows,
+        Gemma4Q4ColumnsTestPath::MmaRegisterFragment,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_serial(
     inputs: &[&[crate::tensor::Q8_0Block]],
     weight_wire: &[u8],
@@ -13293,14 +13695,32 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_serial(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_serial2_fragment(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_columns_impl(
+        inputs,
+        weight_wire,
+        rows,
+        Gemma4Q4ColumnsTestPath::MmaSerial2Fragment,
+    )
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gemma4Q4ColumnsTestPath {
     Slab,
     Threadgroup,
     Mma,
     MmaRowMajor,
+    MmaRowMajorFragment,
+    MmaRegisterFragment,
     MmaSerial2,
     MmaSerial4,
+    MmaSerial2Fragment,
 }
 
 #[cfg(target_os = "macos")]
@@ -13340,8 +13760,11 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
         }
         Gemma4Q4ColumnsTestPath::Mma
         | Gemma4Q4ColumnsTestPath::MmaRowMajor
+        | Gemma4Q4ColumnsTestPath::MmaRowMajorFragment
+        | Gemma4Q4ColumnsTestPath::MmaRegisterFragment
         | Gemma4Q4ColumnsTestPath::MmaSerial2
-        | Gemma4Q4ColumnsTestPath::MmaSerial4 => {
+        | Gemma4Q4ColumnsTestPath::MmaSerial4
+        | Gemma4Q4ColumnsTestPath::MmaSerial2Fragment => {
             gemma4_q4_mma_stage_bytes(blocks_per_row)?
         }
     };
@@ -13425,6 +13848,36 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
                 columns,
             )
         }
+        Gemma4Q4ColumnsTestPath::MmaRowMajorFragment => {
+            encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor_fragment(
+                encoder,
+                kernel,
+                &scales_buf,
+                &quants_buf,
+                &weight_buf,
+                0,
+                &output_buf,
+                terms_buf.as_ref()?,
+                rows,
+                blocks_per_row,
+                columns,
+            )
+        }
+        Gemma4Q4ColumnsTestPath::MmaRegisterFragment => {
+            encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment(
+                encoder,
+                kernel,
+                &scales_buf,
+                &quants_buf,
+                &weight_buf,
+                0,
+                &output_buf,
+                terms_buf.as_ref()?,
+                rows,
+                blocks_per_row,
+                columns,
+            )
+        }
         Gemma4Q4ColumnsTestPath::MmaSerial2
         | Gemma4Q4ColumnsTestPath::MmaSerial4 => {
             let row_tiles = if path == Gemma4Q4ColumnsTestPath::MmaSerial2 {
@@ -13445,6 +13898,21 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
                 blocks_per_row,
                 columns,
                 row_tiles,
+            )
+        }
+        Gemma4Q4ColumnsTestPath::MmaSerial2Fragment => {
+            encode_gemma4_q4_0_q8_ordered_columns_mma_serial2_fragment(
+                encoder,
+                kernel,
+                &scales_buf,
+                &quants_buf,
+                &weight_buf,
+                0,
+                &output_buf,
+                terms_buf.as_ref()?,
+                rows,
+                blocks_per_row,
+                columns,
             )
         }
         Gemma4Q4ColumnsTestPath::Slab => encode_gemma4_q4_0_q8_ordered_columns(
@@ -19096,6 +19564,15 @@ fn encode_gemma4_q4_0_matmul(
 /// or written. Refusal is side-effect-free and lets the caller use the ordered
 /// slab/scalar fallback.
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum Gemma4Q4MmaOneTileVariant {
+    Control,
+    RowMajor,
+    RowMajorFragment,
+    RegisterFragment,
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -19122,7 +19599,7 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma(
         rows,
         blocks_per_row,
         columns,
-        false,
+        Gemma4Q4MmaOneTileVariant::Control,
     )
 }
 
@@ -19156,7 +19633,71 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor(
         rows,
         blocks_per_row,
         columns,
-        true,
+        Gemma4Q4MmaOneTileVariant::RowMajor,
+    )
+}
+
+/// Exact row-major MMA with native fragment-owned accumulator consumption.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor_fragment(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
+        encoder,
+        kernel,
+        input_scales,
+        input_quants,
+        weight,
+        weight_offset,
+        output,
+        staged_quants,
+        rows,
+        blocks_per_row,
+        columns,
+        Gemma4Q4MmaOneTileVariant::RowMajorFragment,
+    )
+}
+
+/// Exact diagnostic with both MMA operands populated through fragment lanes.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
+        encoder,
+        kernel,
+        input_scales,
+        input_quants,
+        weight,
+        weight_offset,
+        output,
+        staged_quants,
+        rows,
+        blocks_per_row,
+        columns,
+        Gemma4Q4MmaOneTileVariant::RegisterFragment,
     )
 }
 
@@ -19174,7 +19715,7 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
     rows: usize,
     blocks_per_row: usize,
     columns: usize,
-    rowmajor_a: bool,
+    variant: Gemma4Q4MmaOneTileVariant,
 ) -> bool {
     if rows == 0
         || blocks_per_row == 0
@@ -19232,12 +19773,19 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
     else {
         return false;
     };
-    let mma_candidate = if rowmajor_a {
-        kernel
+    let mma_candidate = match variant {
+        Gemma4Q4MmaOneTileVariant::Control => {
+            kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref()
+        }
+        Gemma4Q4MmaOneTileVariant::RowMajor => kernel
             .q4_0_q8_ordered_columns_mma_rowmajor_pipeline
-            .as_ref()
-    } else {
-        kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref()
+            .as_ref(),
+        Gemma4Q4MmaOneTileVariant::RowMajorFragment => kernel
+            .q4_0_q8_ordered_columns_mma_rowmajor_fragment_pipeline
+            .as_ref(),
+        Gemma4Q4MmaOneTileVariant::RegisterFragment => kernel
+            .q4_0_q8_ordered_columns_mma_register_fragment_pipeline
+            .as_ref(),
     };
     let Some(mma_pipeline) = admitted_32_lane_pipeline(mma_candidate)
     else {
@@ -19304,6 +19852,73 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
     columns: usize,
     row_tiles: usize,
 ) -> bool {
+    encode_gemma4_q4_0_q8_ordered_columns_mma_serial_impl(
+        encoder,
+        kernel,
+        input_scales,
+        input_quants,
+        weight,
+        weight_offset,
+        output,
+        staged_quants,
+        rows,
+        blocks_per_row,
+        columns,
+        row_tiles,
+        false,
+    )
+}
+
+/// Qualified serial2 geometry with direct accumulator-fragment consumption.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial2_fragment(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    encode_gemma4_q4_0_q8_ordered_columns_mma_serial_impl(
+        encoder,
+        kernel,
+        input_scales,
+        input_quants,
+        weight,
+        weight_offset,
+        output,
+        staged_quants,
+        rows,
+        blocks_per_row,
+        columns,
+        2,
+        true,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial_impl(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+    row_tiles: usize,
+    fragment_accumulator: bool,
+) -> bool {
     if rows == 0
         || blocks_per_row == 0
         || rows > u32::MAX as usize
@@ -19360,11 +19975,14 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
     else {
         return false;
     };
-    let serial_pipeline = match row_tiles {
-        2 => kernel
+    let serial_pipeline = match (row_tiles, fragment_accumulator) {
+        (2, true) => kernel
+            .q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline
+            .as_ref(),
+        (2, false) => kernel
             .q4_0_q8_ordered_columns_mma_serial2_pipeline
             .as_ref(),
-        4 => kernel
+        (4, false) => kernel
             .q4_0_q8_ordered_columns_mma_serial4_pipeline
             .as_ref(),
         _ => None,
@@ -19422,8 +20040,11 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
 /// reusable buffer is sufficient. `CAMELID_GEMMA4_Q4_DIRECT_TG=1` selects only
 /// measured-winning slab-free shapes, while `force` selects it for all K>1
 /// diagnostic A/B runs. With the MMA lane admitted,
-/// `CAMELID_GEMMA4_Q4_MMA_ROWMAJOR=1` selects row-major A staging; leaving it
-/// unset retains the original SG1 control. The call only encodes commands--the
+/// `CAMELID_GEMMA4_Q4_MMA_ROWMAJOR=1` selects row-major A staging;
+/// `CAMELID_GEMMA4_Q4_MMA_FRAGMENT=1` selects the direct-accumulator sibling;
+/// and `CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT=1` selects the separate fully
+/// register-fed diagnostic. Leaving them unset retains the qualified
+/// serial2/SG1 control. The call only encodes commands--the
 /// caller owns encoder end, commit, wait, and buffer lifetimes. Any
 /// unsupported/undersized shape refuses without dispatching or touching
 /// counters.
@@ -19490,7 +20111,40 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
     // the established scalar/slab path below.
     if gemma4_q4_mma_enabled()
         && terms.is_some_and(|staged| {
-            if gemma4_q4_mma_serial2_selected(rows)
+            if gemma4_q4_mma_register_fragment_enabled()
+                && encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment(
+                    encoder,
+                    kernel,
+                    input_scales,
+                    input_quants,
+                    weight,
+                    weight_offset,
+                    output,
+                    staged,
+                    rows,
+                    blocks_per_row,
+                    columns,
+                )
+            {
+                true
+            } else if gemma4_q4_mma_fragment_enabled()
+                && gemma4_q4_mma_serial2_selected(rows)
+                && encode_gemma4_q4_0_q8_ordered_columns_mma_serial2_fragment(
+                    encoder,
+                    kernel,
+                    input_scales,
+                    input_quants,
+                    weight,
+                    weight_offset,
+                    output,
+                    staged,
+                    rows,
+                    blocks_per_row,
+                    columns,
+                )
+            {
+                true
+            } else if gemma4_q4_mma_serial2_selected(rows)
                 && encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
                     encoder,
                     kernel,
@@ -19504,6 +20158,22 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
                     blocks_per_row,
                     columns,
                     2,
+                )
+            {
+                true
+            } else if gemma4_q4_mma_fragment_enabled()
+                && encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor_fragment(
+                    encoder,
+                    kernel,
+                    input_scales,
+                    input_quants,
+                    weight,
+                    weight_offset,
+                    output,
+                    staged,
+                    rows,
+                    blocks_per_row,
+                    columns,
                 )
             {
                 true
@@ -41278,6 +41948,12 @@ mod tests {
         .is_some());
         assert!(admitted_32_lane_pipeline(
             kernel
+                .q4_0_q8_ordered_columns_mma_rowmajor_fragment_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
                 .q4_0_q8_ordered_columns_mma_serial2_pipeline
                 .as_ref()
         )
@@ -41285,6 +41961,18 @@ mod tests {
         assert!(admitted_32_lane_pipeline(
             kernel
                 .q4_0_q8_ordered_columns_mma_serial4_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_register_fragment_pipeline
                 .as_ref()
         )
         .is_some());
@@ -41419,6 +42107,24 @@ mod tests {
                                 "row-major padded-eight MMA Q4_0 columns: {label} K={columns}"
                             )
                         });
+                let mma_rowmajor_fragment =
+                    try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor_fragment(
+                        &refs, &wire, rows,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "fragment-owned row-major MMA Q4_0 columns: {label} K={columns}"
+                        )
+                    });
+                let mma_register_fragment =
+                    try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment(
+                        &refs, &wire, rows,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "register-fed MMA Q4_0 columns: {label} K={columns}"
+                        )
+                    });
                 for column in 0..columns {
                     for row in 0..rows {
                         assert_eq!(
@@ -41430,6 +42136,16 @@ mod tests {
                             mma_rowmajor[column][row].to_bits(),
                             mma[column][row].to_bits(),
                             "rowmajor-vs-old-mma shape={label} K={columns} column={column} row={row}"
+                        );
+                        assert_eq!(
+                            mma_rowmajor_fragment[column][row].to_bits(),
+                            mma_rowmajor[column][row].to_bits(),
+                            "fragment-rowmajor-vs-rowmajor shape={label} K={columns} column={column} row={row}"
+                        );
+                        assert_eq!(
+                            mma_register_fragment[column][row].to_bits(),
+                            mma_rowmajor[column][row].to_bits(),
+                            "register-fragment-vs-rowmajor shape={label} K={columns} column={column} row={row}"
                         );
                     }
                 }
@@ -41454,6 +42170,25 @@ mod tests {
                                 "serial-vs-slab shape={label} K={columns} row_tiles={row_tiles} column={column} row={row}"
                             );
                         }
+                    }
+                }
+
+                let serial2_fragment =
+                    try_gemma4_q4_0_matmul_q8_columns_mma_serial2_fragment(
+                        &refs, &wire, rows,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "fragment-owned serial2 MMA Q4_0 columns: {label} K={columns}"
+                        )
+                    });
+                for column in 0..columns {
+                    for row in 0..rows {
+                        assert_eq!(
+                            serial2_fragment[column][row].to_bits(),
+                            got[column][row].to_bits(),
+                            "fragment-serial2-vs-slab shape={label} K={columns} column={column} row={row}"
+                        );
                     }
                 }
 
@@ -42093,6 +42828,262 @@ mod tests {
                     sg1_us[4], serial2_us[4], serial4_us[4],
                 );
             }
+        }
+    }
+
+    /// Seven-shape K=8 production receipt for native fragment ownership.
+    /// The control follows the Mini2-qualified geometry (serial2 for large
+    /// projections, row-major SG1 for K/V); every candidate includes the same
+    /// Q8 half-panel staging dispatch. Full outputs are bit-compared before
+    /// nine rotated-order GPU samples are admitted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "full Gemma 4 12B native-fragment production receipt"]
+    fn metal_gemma4_q4_0_q8_mma_fragment_production_receipt() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_rowmajor_fragment_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_register_fragment_pipeline
+                .as_ref()
+        )
+        .is_some());
+
+        const COLUMNS: usize = 8;
+        #[derive(Clone, Copy)]
+        enum Variant {
+            Control,
+            AccumulatorFragment,
+            RegisterFragment,
+        }
+
+        for &(blocks_per_row, rows, label) in &[
+            (120usize, 4_096usize, "3840-to-4096"),
+            (120, 8_192, "3840-to-8192"),
+            (120, 2_048, "3840-to-2048"),
+            (120, 512, "3840-to-512"),
+            (120, 15_360, "3840-to-15360-gate-up"),
+            (480, 3_840, "15360-to-3840-down"),
+            (128, 3_840, "4096-attention-to-3840"),
+        ] {
+            let input_blocks = COLUMNS * blocks_per_row;
+            let scales: Vec<f32> = (0..input_blocks)
+                .map(|index| 0.000_7 * (1 + index % 37) as f32)
+                .collect();
+            let quants: Vec<u8> = (0..input_blocks * 32)
+                .map(|index| (((index * 29 + index / 31) % 255) as i16 - 127) as i8 as u8)
+                .collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = 0.000_11 * (1 + (row * 7 + block * 13) % 101) as f32;
+                    wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(((row * 43 + block * 19 + j * 11 + 5) % 256) as u8);
+                    }
+                }
+            }
+
+            let scales_buf = kernel.device.new_buffer(
+                std::mem::size_of_val(scales.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let quants_buf = kernel
+                .device
+                .new_buffer(quants.len() as u64, MTLResourceOptions::StorageModeShared);
+            let weight_buf = kernel
+                .device
+                .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let stage_buf = kernel.device.new_buffer(
+                gemma4_q4_mma_stage_bytes(blocks_per_row).unwrap() as u64,
+                MTLResourceOptions::StorageModePrivate,
+            );
+            let output_bytes = COLUMNS * rows * std::mem::size_of::<f32>();
+            let control_buf = kernel
+                .device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+            let accumulator_buf = kernel
+                .device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+            let register_buf = kernel
+                .device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_f32(&scales_buf, &scales);
+            write_buffer_u8(&quants_buf, &quants);
+            write_buffer_u8(&weight_buf, &wire);
+
+            let run = |variant: Variant, output: &Buffer| -> u128 {
+                let cb = kernel.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                let encoded = match variant {
+                    Variant::Control if gemma4_q4_mma_serial2_selected(rows) => {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_serial(
+                            encoder,
+                            kernel,
+                            &scales_buf,
+                            &quants_buf,
+                            &weight_buf,
+                            0,
+                            output,
+                            &stage_buf,
+                            rows,
+                            blocks_per_row,
+                            COLUMNS,
+                            2,
+                        )
+                    }
+                    Variant::Control => encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor(
+                        encoder,
+                        kernel,
+                        &scales_buf,
+                        &quants_buf,
+                        &weight_buf,
+                        0,
+                        output,
+                        &stage_buf,
+                        rows,
+                        blocks_per_row,
+                        COLUMNS,
+                    ),
+                    Variant::AccumulatorFragment if gemma4_q4_mma_serial2_selected(rows) => {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_serial2_fragment(
+                            encoder,
+                            kernel,
+                            &scales_buf,
+                            &quants_buf,
+                            &weight_buf,
+                            0,
+                            output,
+                            &stage_buf,
+                            rows,
+                            blocks_per_row,
+                            COLUMNS,
+                        )
+                    }
+                    Variant::AccumulatorFragment => {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor_fragment(
+                            encoder,
+                            kernel,
+                            &scales_buf,
+                            &quants_buf,
+                            &weight_buf,
+                            0,
+                            output,
+                            &stage_buf,
+                            rows,
+                            blocks_per_row,
+                            COLUMNS,
+                        )
+                    }
+                    Variant::RegisterFragment => {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment(
+                            encoder,
+                            kernel,
+                            &scales_buf,
+                            &quants_buf,
+                            &weight_buf,
+                            0,
+                            output,
+                            &stage_buf,
+                            rows,
+                            blocks_per_row,
+                            COLUMNS,
+                        )
+                    }
+                };
+                if !encoded {
+                    encoder.end_encoding();
+                    panic!(
+                        "native-fragment encoder rejected shape={label} rows={rows} blocks_per_row={blocks_per_row}"
+                    );
+                }
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                command_buffer_gpu_times_us(&cb.to_owned()).0
+            };
+
+            for _ in 0..2 {
+                run(Variant::Control, &control_buf);
+                run(Variant::AccumulatorFragment, &accumulator_buf);
+                run(Variant::RegisterFragment, &register_buf);
+            }
+            let mut control = vec![0.0f32; COLUMNS * rows];
+            let mut accumulator = vec![0.0f32; COLUMNS * rows];
+            let mut register = vec![0.0f32; COLUMNS * rows];
+            read_buffer_f32(&control_buf, &mut control);
+            read_buffer_f32(&accumulator_buf, &mut accumulator);
+            read_buffer_f32(&register_buf, &mut register);
+            for (index, ((&acc, &reg), &established)) in accumulator
+                .iter()
+                .zip(&register)
+                .zip(&control)
+                .enumerate()
+            {
+                assert_eq!(
+                    acc.to_bits(),
+                    established.to_bits(),
+                    "accumulator fragment shape={label} flat-output={index}"
+                );
+                assert_eq!(
+                    reg.to_bits(),
+                    established.to_bits(),
+                    "register fragment shape={label} flat-output={index}"
+                );
+            }
+
+            let mut control_us = [0u128; 9];
+            let mut accumulator_us = [0u128; 9];
+            let mut register_us = [0u128; 9];
+            for repeat in 0..9 {
+                match repeat % 3 {
+                    0 => {
+                        control_us[repeat] = run(Variant::Control, &control_buf);
+                        accumulator_us[repeat] =
+                            run(Variant::AccumulatorFragment, &accumulator_buf);
+                        register_us[repeat] = run(Variant::RegisterFragment, &register_buf);
+                    }
+                    1 => {
+                        accumulator_us[repeat] =
+                            run(Variant::AccumulatorFragment, &accumulator_buf);
+                        register_us[repeat] = run(Variant::RegisterFragment, &register_buf);
+                        control_us[repeat] = run(Variant::Control, &control_buf);
+                    }
+                    _ => {
+                        register_us[repeat] = run(Variant::RegisterFragment, &register_buf);
+                        control_us[repeat] = run(Variant::Control, &control_buf);
+                        accumulator_us[repeat] =
+                            run(Variant::AccumulatorFragment, &accumulator_buf);
+                    }
+                }
+            }
+            control_us.sort_unstable();
+            accumulator_us.sort_unstable();
+            register_us.sort_unstable();
+            let accumulator_speedup = control_us[4] as f64 / accumulator_us[4] as f64;
+            let register_speedup = control_us[4] as f64 / register_us[4] as f64;
+            eprintln!(
+                "gemma4-q4-mma-fragment shape={label} K={COLUMNS} rows={rows} \
+                 blocks_per_row={blocks_per_row} control_gpu_us={} \
+                 accumulator_fragment_gpu_us={} register_fragment_gpu_us={} \
+                 accumulator_vs_control={accumulator_speedup:.4}x \
+                 register_vs_control={register_speedup:.4}x samples=9 exact_bits=true",
+                control_us[4], accumulator_us[4], register_us[4],
+            );
         }
     }
 
