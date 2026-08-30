@@ -206,7 +206,7 @@ mod ghost_moe_cli_tests {
                 "--max-tokens",
                 "96",
                 "--widths",
-                "2,4,8",
+                "2,4,8,16",
             ])
             .expect("parse Gemma 4 MTP12 Metal harness");
             match cli.command {
@@ -223,7 +223,7 @@ mod ghost_moe_cli_tests {
                         PathBuf::from("assistant/model.safetensors")
                     );
                     assert_eq!(max_tokens, 96);
-                    assert_eq!(widths, vec![2, 4, 8]);
+                    assert_eq!(widths, vec![2, 4, 8, 16]);
                 }
                 other => panic!("expected Gemma4Mtp12Gpu, got {other:?}"),
             }
@@ -2543,8 +2543,8 @@ enum Command {
         max_tokens: usize,
     },
     /// Qualify and benchmark lossless Gemma 4 12B MTP speculative decode on
-    /// Metal. The exact official assistant drafts 1/3/7 tokens for target
-    /// verifier widths 2/4/8; every run must reproduce ordered K1 token IDs.
+    /// Metal. The exact official assistant drafts 1/3/7/15 tokens for target
+    /// verifier widths 2/4/8/16; every run must reproduce ordered K1 token IDs.
     Gemma4Mtp12Gpu {
         path: PathBuf,
         /// Exact official 12B assistant `model.safetensors` file.
@@ -2555,11 +2555,12 @@ enum Command {
         #[arg(long, default_value_t = 96)]
         max_tokens: usize,
         /// Target verifier widths. The anchor row is included, so these map to
-        /// assistant draft counts 1/3/7.
+        /// assistant draft counts 1/3/7/15. The default remains the established
+        /// 2/4/8 sweep; pass 16 explicitly to exercise the opt-in K16 Q4 lane.
         #[arg(long, value_delimiter = ',', default_value = "2,4,8")]
         widths: Vec<usize>,
     },
-    /// Qualify and time the strict K<=8 ordered-Q4 Gemma 4 target verifier.
+    /// Qualify and time the strict K<=16 ordered-Q4 Gemma 4 target verifier.
     /// This is a developer harness: it first requires whole-output K=1 parity
     /// with the established GPU lane, then teacher-forces one fixed sequence
     /// through each requested width and requires every target prediction to
@@ -2570,8 +2571,9 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 96)]
         max_tokens: usize,
-        /// Verifier row widths. Only 1,2,4,8 are admitted; each timed batch is
-        /// full-width so rows/s cannot be inflated by a scalar tail.
+        /// Verifier row widths. Only 1,2,4,8,16 are admitted; each timed batch
+        /// is full-width so rows/s cannot be inflated by a scalar tail. The
+        /// default remains the established K<=8 sweep.
         #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
         widths: Vec<usize>,
     },
@@ -5107,12 +5109,17 @@ async fn main() -> anyhow::Result<()> {
             {
                 widths.sort_unstable();
                 widths.dedup();
-                if widths.is_empty() || widths.iter().any(|width| !matches!(width, 2 | 4 | 8)) {
+                if widths.is_empty()
+                    || widths
+                        .iter()
+                        .any(|width| !matches!(width, 2 | 4 | 8 | 16))
+                {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 MTP12 verifier widths must be a non-empty subset of 2,4,8; got {widths:?}"
+                        "Gemma 4 MTP12 verifier widths must be a non-empty subset of 2,4,8,16; got {widths:?}"
                     ))
                     .into());
                 }
+                let max_width = *widths.last().expect("non-empty MTP12 widths");
                 if max_tokens == 0 {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(
                         "Gemma 4 MTP12 qualification requires max_tokens > 0".into(),
@@ -5143,7 +5150,7 @@ async fn main() -> anyhow::Result<()> {
                 let conservative_positions = prompt
                     .len()
                     .saturating_add(max_tokens)
-                    .saturating_add(8);
+                    .saturating_add(max_width);
                 if conservative_positions > max_positions {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
                         "Gemma 4 MTP12 benchmark is capped at {max_positions} KV rows; UTF-8-byte upper bound is {conservative_positions}"
@@ -5167,7 +5174,7 @@ async fn main() -> anyhow::Result<()> {
                 let required_positions = prompt_tokens
                     .len()
                     .saturating_add(max_tokens)
-                    .saturating_add(8);
+                    .saturating_add(max_width);
                 if required_positions > max_positions {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
                         "Gemma 4 MTP12 needs {required_positions} KV positions, capacity is {max_positions}"
@@ -5179,9 +5186,9 @@ async fn main() -> anyhow::Result<()> {
                     "[gemma4-mtp12] qualifying established vs ordered K1 target output..."
                 );
                 let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
-                if qualification.token_ids.len() < 8 {
+                if qualification.token_ids.len() < max_width {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 MTP12 benchmark needs at least 8 qualified outputs; got {}",
+                        "Gemma 4 MTP12 benchmark needs at least {max_width} qualified outputs; got {}",
                         qualification.token_ids.len(),
                     ))
                     .into());
@@ -5302,6 +5309,8 @@ async fn main() -> anyhow::Result<()> {
                     "environment": {
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
                         "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
                         "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok(),
@@ -5381,10 +5390,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 widths.sort_unstable();
                 widths.dedup();
-                if widths.is_empty() || widths.iter().any(|width| !matches!(width, 1 | 2 | 4 | 8))
+                if widths.is_empty()
+                    || widths
+                        .iter()
+                        .any(|width| !matches!(width, 1 | 2 | 4 | 8 | 16))
                 {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                        "Gemma 4 ordered verifier widths must be a non-empty subset of 1,2,4,8; got {widths:?}"
+                        "Gemma 4 ordered verifier widths must be a non-empty subset of 1,2,4,8,16; got {widths:?}"
                     ))
                     .into());
                 }
@@ -5710,6 +5722,8 @@ async fn main() -> anyhow::Result<()> {
                     "environment": {
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
                         "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
                         "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),

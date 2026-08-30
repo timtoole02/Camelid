@@ -6,7 +6,7 @@ use metal::{
 
 // Kept isolated from the target runtime until the 12B Q4_0 target verifier has
 // its own parity receipt.  This module owns only the exact official assistant
-// artifact, its resident Q4_0 pack, K=1 oracles, and an unwired K<=8 resident
+// artifact, its resident Q4_0 pack, K=1 oracles, and a K<=15 resident
 // draft chain; target verification/acceptance remains outside the module.
 #[cfg(target_os = "macos")]
 mod gemma4_mtp12;
@@ -21,7 +21,7 @@ pub use gemma4_mtp12::{
     Gemma4Mtp12ResidentLedger, GEMMA4_12B_MTP_ASSISTANT_SHA256,
     GEMMA4_12B_MTP_FULL_HOST_LAYER, GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES,
     GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES, GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
-    GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
+    GEMMA4_12B_MTP_MAX_DRAFTS, GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
 };
 
 #[cfg(target_os = "macos")]
@@ -15936,7 +15936,8 @@ struct Gemma4Q6KHeadInner {
     q8k_quants: Buffer,
     logits: Buffer,
     /// Lazily allocated width-eight scratch for the experimental speculative
-    /// head. The default ordered-logit lane pays no extra allocation.
+    /// head. W16 reuses it for two ordered K8 calls; the default ordered-logit
+    /// lane pays no extra allocation.
     batch: Option<Gemma4Q6KBatchScratch>,
     matmul_scalar: Buffer,
     output_norm: Vec<f32>,
@@ -16251,35 +16252,33 @@ impl Gemma4Q6KHead {
         Some(output)
     }
 
+    /// Split one admitted verifier width into exact SPEC50 head calls. SPEC50
+    /// has separately-qualified K=1/2/4/8 kernels; W16 deliberately bootstraps
+    /// as two ordered K8 calls instead of introducing new head arithmetic.
+    fn gemma4_spec50_head_chunk_ranges(
+        columns: usize,
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        match columns {
+            1 | 2 | 4 | 8 => Some(vec![0..columns]),
+            16 => Some(vec![0..8, 8..16]),
+            _ => None,
+        }
+    }
+
     /// Project K final-hidden rows and return only their greedy ids.  K=1 and
     /// K>1 bind the same strict SPEC50 kernel family, so the normal step and the
-    /// verifier live in one arithmetic universe.  This API is deliberately
-    /// separate from [`Self::forward`]: the established ordered full-logit path
-    /// remains the default until whole-model token parity admits this lane.
+    /// verifier live in one arithmetic universe. W16 concatenates two exact K8
+    /// calls in row order. This API is deliberately separate from
+    /// [`Self::forward`]: the established ordered full-logit path remains the
+    /// default until whole-model token parity admits this lane.
     pub(crate) fn forward_argmax_spec50_batch(&self, hidden_rows: &[f32]) -> Option<Vec<u32>> {
         let mut state = self.inner.lock().ok()?;
         if state.hidden == 0 || !hidden_rows.len().is_multiple_of(state.hidden) {
             return None;
         }
         let columns = hidden_rows.len() / state.hidden;
-        if !matches!(columns, 1 | 2 | 4 | 8) {
-            return None;
-        }
+        let chunks = Self::gemma4_spec50_head_chunk_ranges(columns)?;
         let n_superblocks = state.hidden / 256;
-        let mut scales = Vec::with_capacity(columns * n_superblocks);
-        let mut quants = Vec::with_capacity(columns * state.hidden);
-        for hidden in hidden_rows.chunks_exact(state.hidden) {
-            let normalized =
-                crate::gemma4_runtime::rms_norm(hidden, Some(&state.output_norm), state.eps);
-            let q8 = crate::inference::quantize_q8_k_blocks(&normalized);
-            if q8.len() != n_superblocks {
-                return None;
-            }
-            for block in &q8 {
-                scales.push(block.d);
-                quants.extend_from_slice(&block.qs);
-            }
-        }
         let kernels = spec50_head::spec50_head_kernels()?;
         if state.batch.is_none() {
             let shared = |bytes: usize| {
@@ -16298,58 +16297,82 @@ impl Gemma4Q6KHead {
             });
         }
         let batch = state.batch.as_ref()?;
-        write_buffer_f32(&batch.scales, &scales);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                quants.as_ptr(),
-                batch.quants.contents().cast::<i8>(),
-                quants.len(),
-            );
-        }
+        let mut ids = Vec::with_capacity(columns);
+        for rows in chunks {
+            let chunk_columns = rows.end.checked_sub(rows.start)?;
+            let mut scales = Vec::with_capacity(chunk_columns * n_superblocks);
+            let mut quants = Vec::with_capacity(chunk_columns * state.hidden);
+            let row_values = rows.start.checked_mul(state.hidden)?
+                ..rows.end.checked_mul(state.hidden)?;
+            for hidden in hidden_rows.get(row_values)?.chunks_exact(state.hidden) {
+                let normalized = crate::gemma4_runtime::rms_norm(
+                    hidden,
+                    Some(&state.output_norm),
+                    state.eps,
+                );
+                let q8 = crate::inference::quantize_q8_k_blocks(&normalized);
+                if q8.len() != n_superblocks {
+                    return None;
+                }
+                for block in &q8 {
+                    scales.push(block.d);
+                    quants.extend_from_slice(&block.qs);
+                }
+            }
+            write_buffer_f32(&batch.scales, &scales);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    quants.as_ptr(),
+                    batch.quants.contents().cast::<i8>(),
+                    quants.len(),
+                );
+            }
 
-        let command_buffer = kernels.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        if !spec50_head::encode_q6k_spec50_batch(
-            encoder,
-            kernels,
-            &batch.scales,
-            &batch.quants,
-            &batch.permuted,
-            &state.weight,
-            state.weight_offset as u64,
-            &batch.logits,
-            n_superblocks,
-            state.vocab,
-            columns,
-            state.hidden,
-            state.softcap,
-        ) {
+            let command_buffer = kernels.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            if !spec50_head::encode_q6k_spec50_batch(
+                encoder,
+                kernels,
+                &batch.scales,
+                &batch.quants,
+                &batch.permuted,
+                &state.weight,
+                state.weight_offset as u64,
+                &batch.logits,
+                n_superblocks,
+                state.vocab,
+                chunk_columns,
+                state.hidden,
+                state.softcap,
+            ) {
+                encoder.end_encoding();
+                return None;
+            }
+            spec50_head::encode_q6k_spec50_argmax(
+                encoder,
+                kernels,
+                &batch.logits,
+                &batch.argmax_ids,
+                &batch.argmax_vals,
+                state.vocab,
+                chunk_columns,
+            );
             encoder.end_encoding();
-            return None;
-        }
-        spec50_head::encode_q6k_spec50_argmax(
-            encoder,
-            kernels,
-            &batch.logits,
-            &batch.argmax_ids,
-            &batch.argmax_vals,
-            state.vocab,
-            columns,
-        );
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
-            return None;
-        }
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+                return None;
+            }
 
-        let mut ids = vec![0u32; columns];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                batch.argmax_ids.contents().cast::<u32>(),
-                ids.as_mut_ptr(),
-                columns,
-            );
+            let old_len = ids.len();
+            ids.resize(old_len + chunk_columns, 0);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    batch.argmax_ids.contents().cast::<u32>(),
+                    ids.as_mut_ptr().add(old_len),
+                    chunk_columns,
+                );
+            }
         }
         Some(ids)
     }
@@ -16412,7 +16435,7 @@ struct Gemma4PliResident {
     ple_dim: usize,
 }
 
-/// Reusable width-eight scratch for the dense Gemma 4 12B verifier.  The large
+/// Reusable width-sixteen scratch for the dense Gemma 4 12B verifier.  The large
 /// Q4 term slab is private GPU memory; everything read back or populated by the
 /// host stays in coherent shared storage.  No model weights are duplicated.
 #[cfg(target_os = "macos")]
@@ -16447,11 +16470,36 @@ struct Gemma4Dense12bVerifierScratch {
 
 #[cfg(target_os = "macos")]
 impl Gemma4Dense12bVerifierScratch {
-    const MAX_K: usize = 8;
+    const MAX_K: usize = 16;
+    const LEGACY_MAX_K: usize = 8;
     const HIDDEN: usize = 3_840;
     const FFN: usize = 15_360;
     const MAX_Q: usize = 16 * 512;
     const MAX_KV: usize = 8 * 256;
+
+    fn row_elements(width: usize) -> Option<usize> {
+        Self::MAX_K.checked_mul(width)
+    }
+
+    /// One reusable allocation covers the qualified K<=8 term slab and the
+    /// much smaller position-major K16 MMA staging panel. The K16 encoder has
+    /// no term-slab fallback, so preserving the old K8 term extent keeps every
+    /// pre-existing selector and fallback byte-for-byte unchanged.
+    fn q4_work_bytes() -> Option<usize> {
+        let hidden_blocks = Self::HIDDEN / 32;
+        let activation_blocks = Self::FFN / 32;
+        let legacy_terms = gemma4_q4_column_term_slab_bytes(
+            Self::FFN,
+            hidden_blocks,
+            Self::LEGACY_MAX_K,
+        )?
+        .max(gemma4_q4_column_term_slab_bytes(
+            Self::HIDDEN,
+            activation_blocks,
+            Self::LEGACY_MAX_K,
+        )?);
+        Some(legacy_terms.max(gemma4_q4_mma_stage16_bytes(activation_blocks)?))
+    }
 
     fn new(kernel: &MetalLinearKernel, max_positions: usize) -> Option<Self> {
         let shared = |elements: usize, element_bytes: usize| -> Option<Buffer> {
@@ -16462,41 +16510,37 @@ impl Gemma4Dense12bVerifierScratch {
         };
         let f32s = |elements: usize| shared(elements, std::mem::size_of::<f32>());
         let bytes = |elements: usize| shared(elements, 1);
-        let k = Self::MAX_K;
         let hidden_blocks = Self::HIDDEN / 32;
         let context_blocks = Self::MAX_Q / 32;
         let activation_blocks = Self::FFN / 32;
-        let term_bytes =
-            gemma4_q4_column_term_slab_bytes(Self::FFN, hidden_blocks, Self::MAX_K)?.max(
-                gemma4_q4_column_term_slab_bytes(Self::HIDDEN, activation_blocks, Self::MAX_K)?,
-            );
+        let term_bytes = Self::q4_work_bytes()?;
         let q4_terms = kernel
             .device
             .new_buffer(term_bytes as u64, MTLResourceOptions::StorageModePrivate);
         Some(Self {
-            act_a: f32s(k * Self::HIDDEN)?,
-            act_b: f32s(k * Self::HIDDEN)?,
-            mid: f32s(k * Self::HIDDEN)?,
-            norm: f32s(k * Self::HIDDEN)?,
-            q_raw: f32s(k * Self::MAX_Q)?,
-            k_raw: f32s(k * Self::MAX_KV)?,
-            v_raw: f32s(k * Self::MAX_KV)?,
-            q_normed: f32s(k * Self::MAX_Q)?,
-            k_normed: f32s(k * Self::MAX_KV)?,
-            v_normed: f32s(k * Self::MAX_KV)?,
-            context: f32s(k * Self::MAX_Q)?,
-            projection: f32s(k * Self::HIDDEN)?,
-            post: f32s(k * Self::HIDDEN)?,
-            gate: f32s(k * Self::FFN)?,
-            up: f32s(k * Self::FFN)?,
-            activation: f32s(k * Self::FFN)?,
-            down: f32s(k * Self::HIDDEN)?,
-            input_scales: f32s(k * hidden_blocks)?,
-            input_quants: bytes(k * Self::HIDDEN)?,
-            context_scales: f32s(k * context_blocks)?,
-            context_quants: bytes(k * Self::MAX_Q)?,
-            activation_scales: f32s(k * activation_blocks)?,
-            activation_quants: bytes(k * Self::FFN)?,
+            act_a: f32s(Self::row_elements(Self::HIDDEN)?)?,
+            act_b: f32s(Self::row_elements(Self::HIDDEN)?)?,
+            mid: f32s(Self::row_elements(Self::HIDDEN)?)?,
+            norm: f32s(Self::row_elements(Self::HIDDEN)?)?,
+            q_raw: f32s(Self::row_elements(Self::MAX_Q)?)?,
+            k_raw: f32s(Self::row_elements(Self::MAX_KV)?)?,
+            v_raw: f32s(Self::row_elements(Self::MAX_KV)?)?,
+            q_normed: f32s(Self::row_elements(Self::MAX_Q)?)?,
+            k_normed: f32s(Self::row_elements(Self::MAX_KV)?)?,
+            v_normed: f32s(Self::row_elements(Self::MAX_KV)?)?,
+            context: f32s(Self::row_elements(Self::MAX_Q)?)?,
+            projection: f32s(Self::row_elements(Self::HIDDEN)?)?,
+            post: f32s(Self::row_elements(Self::HIDDEN)?)?,
+            gate: f32s(Self::row_elements(Self::FFN)?)?,
+            up: f32s(Self::row_elements(Self::FFN)?)?,
+            activation: f32s(Self::row_elements(Self::FFN)?)?,
+            down: f32s(Self::row_elements(Self::HIDDEN)?)?,
+            input_scales: f32s(Self::row_elements(hidden_blocks)?)?,
+            input_quants: bytes(Self::row_elements(Self::HIDDEN)?)?,
+            context_scales: f32s(Self::row_elements(context_blocks)?)?,
+            context_quants: bytes(Self::row_elements(Self::MAX_Q)?)?,
+            activation_scales: f32s(Self::row_elements(activation_blocks)?)?,
+            activation_quants: bytes(Self::row_elements(Self::FFN)?)?,
             q4_terms,
             scores: f32s(16usize.checked_mul(max_positions)?)?,
             denom: f32s(16)?,
@@ -16534,7 +16578,7 @@ pub struct Gemma4ResidentModel {
     eps: f32,
     max_positions: usize,
     scale: f32,
-    /// Lazily allocated only when the opt-in 12B K<=8 verifier is exercised.
+    /// Lazily allocated only when the opt-in 12B K<=16 verifier is exercised.
     dense12b_verifier: Mutex<Option<Gemma4Dense12bVerifierScratch>>,
 }
 
@@ -16731,7 +16775,7 @@ impl Gemma4ResidentModel {
         Some(callback(&views))
     }
 
-    /// Exact dense Gemma 4 12B verifier foundation for K=1/2/4/8 consecutive
+    /// Exact dense Gemma 4 12B verifier foundation for K=1/2/4/8/16 consecutive
     /// rows.  Q4 projections share each weight traversal across the K Q8_0
     /// columns; row-wise QK norm, RoPE, f32 KV scatter, split-three attention,
     /// sandwich norms, GeGLU and residuals retain the K=1 dispatch arithmetic.
@@ -16762,7 +16806,7 @@ impl Gemma4ResidentModel {
         const SLIDING_WINDOW: usize = 1_024;
 
         let columns = inputs_by_row.len();
-        if !matches!(columns, 1 | 2 | 4 | 8)
+        if !matches!(columns, 1 | 2 | 4 | 8 | 16)
             || self.layers.len() != LAYERS
             || self.hidden != HIDDEN
             || h0_rows.len() != columns.checked_mul(HIDDEN)?
@@ -38245,6 +38289,62 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_w16_spec50_head_is_two_ordered_k8_chunks() {
+        use super::Gemma4Q6KHead;
+
+        let chunks = Gemma4Q6KHead::gemma4_spec50_head_chunk_ranges(16)
+            .expect("W16 head chunk plan");
+        assert_eq!(chunks, vec![0..8, 8..16]);
+
+        // The production loop appends each chunk's ids in this exact order.
+        // Model that concatenation with row ids so an offset/reordering bug is
+        // caught without requiring a Metal device or model artifact.
+        let source = (0u32..16).collect::<Vec<_>>();
+        let concatenated = chunks
+            .into_iter()
+            .flat_map(|range| source[range].to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(concatenated, source);
+
+        for width in [1usize, 2, 4, 8] {
+            assert_eq!(
+                Gemma4Q6KHead::gemma4_spec50_head_chunk_ranges(width),
+                Some(vec![0..width])
+            );
+        }
+        for refused in [0usize, 3, 6, 12, 15, 17] {
+            assert!(Gemma4Q6KHead::gemma4_spec50_head_chunk_ranges(refused).is_none());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_w16_dense_verifier_scratch_extents_cover_every_row() {
+        use super::{gemma4_q4_mma_stage16_bytes, Gemma4Dense12bVerifierScratch};
+
+        type Scratch = Gemma4Dense12bVerifierScratch;
+        assert_eq!(Scratch::MAX_K, 16);
+        assert_eq!(Scratch::row_elements(Scratch::HIDDEN), Some(61_440));
+        assert_eq!(Scratch::row_elements(Scratch::FFN), Some(245_760));
+        assert_eq!(Scratch::row_elements(Scratch::MAX_Q), Some(131_072));
+        assert_eq!(Scratch::row_elements(Scratch::MAX_KV), Some(32_768));
+        assert_eq!(
+            Scratch::row_elements(Scratch::HIDDEN / 32),
+            Some(1_920)
+        );
+        assert_eq!(
+            Scratch::row_elements(Scratch::FFN / 32),
+            Some(7_680)
+        );
+        assert_eq!(Scratch::q4_work_bytes(), Some(58_982_400));
+        assert!(
+            Scratch::q4_work_bytes().unwrap()
+                >= gemma4_q4_mma_stage16_bytes(Scratch::FFN / 32).unwrap()
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_copy_f32_preserves_resident_activation_bits() {

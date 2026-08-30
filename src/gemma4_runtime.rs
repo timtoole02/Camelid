@@ -6541,6 +6541,11 @@ struct Gemma4DenseVerifierState {
 }
 
 #[cfg(target_os = "macos")]
+fn gemma4_dense_verify_width_admitted(width: usize) -> bool {
+    matches!(width, 1 | 2 | 4 | 8 | 16)
+}
+
+#[cfg(target_os = "macos")]
 impl Gemma4DenseVerifierState {
     fn claim_established(&mut self, position: usize) -> bool {
         match self.lane {
@@ -6591,7 +6596,7 @@ impl Gemma4DenseVerifierState {
         if self.lane != Gemma4DenseSequenceLane::OrderedVerifier
             || self.pending.is_some()
             || self.logical_len != start_position
-            || !matches!(width, 1 | 2 | 4 | 8)
+            || !gemma4_dense_verify_width_admitted(width)
         {
             return None;
         }
@@ -6618,7 +6623,25 @@ impl Gemma4DenseVerifierState {
 
 #[cfg(all(test, target_os = "macos"))]
 mod dense_verifier_state_tests {
-    use super::{Gemma4DenseSequenceLane, Gemma4DenseVerifierState};
+    use super::{
+        gemma4_dense_verify_width_admitted, Gemma4DenseSequenceLane,
+        Gemma4DenseVerifierState,
+    };
+
+    #[test]
+    fn dense_verifier_width_gate_admits_w16_and_only_exact_powers_of_two() {
+        for admitted in [1usize, 2, 4, 8, 16] {
+            assert!(gemma4_dense_verify_width_admitted(admitted));
+        }
+        for refused in [0usize, 3, 6, 12, 15, 17, usize::MAX] {
+            assert!(!gemma4_dense_verify_width_admitted(refused));
+        }
+
+        let mut state = Gemma4DenseVerifierState::default();
+        assert!(state.claim_ordered_verifier(0));
+        let ticket = state.record_completed_batch(0, 16).expect("W16 ticket");
+        assert_eq!(state.resolve_prefix(ticket, 15), Some(15));
+    }
 
     #[test]
     fn rejected_tail_is_only_a_logical_cursor_change() {
@@ -6973,7 +6996,7 @@ fn gemma4_mtp12_tail_verify_width(
 ) -> Option<usize> {
     // Equivalent to `width <= remaining_after_anchor + 1`: this caller's
     // budget includes the already-predicted anchor as candidate row zero.
-    [8usize, 4, 2]
+    [16usize, 8, 4, 2]
         .into_iter()
         .find(|&width| width <= configured && width <= remaining_including_anchor)
 }
@@ -7030,6 +7053,11 @@ mod gemma4_mtp12_metal_generation_tests {
 
     #[test]
     fn tail_width_counts_the_anchor_in_the_remaining_budget() {
+        assert_eq!(gemma4_mtp12_tail_verify_width(16, 17), Some(16));
+        assert_eq!(gemma4_mtp12_tail_verify_width(16, 15), Some(8));
+        assert_eq!(gemma4_mtp12_tail_verify_width(16, 7), Some(4));
+        assert_eq!(gemma4_mtp12_tail_verify_width(16, 3), Some(2));
+        assert_eq!(gemma4_mtp12_tail_verify_width(16, 1), None);
         assert_eq!(gemma4_mtp12_tail_verify_width(8, 9), Some(8));
         assert_eq!(gemma4_mtp12_tail_verify_width(8, 7), Some(4));
         assert_eq!(gemma4_mtp12_tail_verify_width(8, 3), Some(2));
@@ -7080,6 +7108,20 @@ mod gemma4_mtp12_metal_generation_tests {
         .expect("valid target rows");
         assert_eq!(decision.accepted_drafts, 3);
         assert_eq!(decision.committed_input_rows, 4);
+        assert_eq!(decision.mismatch_draft_index, None);
+        assert_eq!(decision.stop_token, None);
+        assert_eq!(decision.next_anchor_token, Some(42));
+    }
+
+    #[test]
+    fn w16_acceptance_keeps_the_generic_commit_contract() {
+        let drafts = (10u32..25).collect::<Vec<_>>();
+        let mut target = drafts.clone();
+        target.push(42);
+        let decision = gemma4_mtp12_acceptance_decision(&drafts, &target, &[99])
+            .expect("valid W16 target rows");
+        assert_eq!(decision.accepted_drafts, 15);
+        assert_eq!(decision.committed_input_rows, 16);
         assert_eq!(decision.mismatch_draft_index, None);
         assert_eq!(decision.stop_token, None);
         assert_eq!(decision.next_anchor_token, Some(42));
@@ -7673,7 +7715,7 @@ impl Gemma4GpuRuntime {
         Ok((h0, inputs))
     }
 
-    /// Materialize K=1/2/4/8 target rows in the strict ordered-Q4 verifier
+    /// Materialize K=1/2/4/8/16 target rows in the strict ordered-Q4 verifier
     /// universe and project all final states through the matching SPEC50 Q6_K
     /// head.  No logical cursor is advanced yet; the caller must commit an
     /// consumed input-row prefix with the returned ticket. Zero means the whole
@@ -7684,9 +7726,9 @@ impl Gemma4GpuRuntime {
         start_position: usize,
     ) -> Result<Gemma4DenseVerifierBatch> {
         let width = candidate_tokens.len();
-        if !matches!(width, 1 | 2 | 4 | 8) || !self.head_on_cpu {
+        if !gemma4_dense_verify_width_admitted(width) || !self.head_on_cpu {
             return Err(BackendError::UnsupportedModelArchitecture(
-                "dense verifier requires K=1/2/4/8 and a Q6_K tied head".into(),
+                "dense verifier requires K=1/2/4/8/16 and a Q6_K tied head".into(),
             ));
         }
         let head = self.q6k_gpu_head.as_ref().ok_or_else(|| {
@@ -7944,7 +7986,7 @@ impl Gemma4GpuRuntime {
         Ok(started.elapsed().as_micros())
     }
 
-    /// Propose 1..=8 MTP12 drafts against the exact ordered target prefix.
+    /// Propose up to 15 MTP12 drafts against the exact ordered target prefix.
     ///
     /// This is the only runtime bridge into the resident assistant.  It holds
     /// the target sequence-state mutex across the complete synchronous Metal
@@ -7976,9 +8018,10 @@ impl Gemma4GpuRuntime {
                 self.hidden,
             )));
         }
-        if !(1..=8).contains(&draft_k) {
+        if !(1..=crate::metal::GEMMA4_12B_MTP_MAX_DRAFTS).contains(&draft_k) {
             return Err(BackendError::RuntimeShapeMismatch(format!(
-                "Gemma 4 MTP draft width is {draft_k}, expected 1..=8"
+                "Gemma 4 MTP draft width is {draft_k}, expected 1..={}",
+                crate::metal::GEMMA4_12B_MTP_MAX_DRAFTS,
             )));
         }
         let normalized_hidden = rms_norm(
@@ -8099,7 +8142,7 @@ impl Gemma4GpuRuntime {
     }
 
     /// Lossless greedy MTP12 generation for strict target verifier widths
-    /// 2/4/8 (assistant draft counts 1/3/7).  Near the output budget the width
+    /// 2/4/8/16 (assistant draft counts 1/3/7/15). Near the output budget the width
     /// steps down through the same admitted set; a final single-token budget is
     /// satisfied by the already-predicted anchor without forwarding it.
     ///
@@ -8115,9 +8158,9 @@ impl Gemma4GpuRuntime {
         max_new: usize,
         verify_width: usize,
     ) -> Result<Gemma4Mtp12MetalGeneration> {
-        if !matches!(verify_width, 2 | 4 | 8) {
+        if !matches!(verify_width, 2 | 4 | 8 | 16) {
             return Err(BackendError::RuntimeShapeMismatch(format!(
-                "Gemma 4 MTP target verify width is {verify_width}, expected 2, 4, or 8"
+                "Gemma 4 MTP target verify width is {verify_width}, expected 2, 4, 8, or 16"
             )));
         }
 

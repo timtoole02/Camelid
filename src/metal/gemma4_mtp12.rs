@@ -3,7 +3,7 @@
 //! This deliberately does not enter the Gemma target/verifier runtime.  It
 //! admits one byte-identical assistant artifact, packs all 23 BF16 matrices to
 //! canonical GGML Q4_0, releases the 846 MB source mapping, and preserves K=1
-//! CPU/device parity oracles beside a scoped one-command K<=8 device
+//! CPU/device parity oracles beside a scoped one-command K<=15 device
 //! chain.  Target verification, acceptance, and rollback remain outside this
 //! module, so none of these assistant paths changes target-authoritative output.
 
@@ -52,7 +52,18 @@ const Q4_0_BLOCK_BYTES: usize = 18;
 const Q6_K_BLOCK_VALUES: usize = 256;
 const Q6_K_BLOCK_BYTES: usize = 210;
 const FULL_Q4_MATRIX_BYTES: u64 = 237_846_528;
-const MTP12_CHAIN_MAX_DRAFTS: usize = 8;
+/// Maximum official-assistant draft chain paired with the W16 target verifier.
+pub const GEMMA4_12B_MTP_MAX_DRAFTS: usize = 15;
+const MTP12_CHAIN_MAX_DRAFTS: usize = GEMMA4_12B_MTP_MAX_DRAFTS;
+const MTP12_CHAIN_TOKEN_SLOTS: usize = MTP12_CHAIN_MAX_DRAFTS + 1;
+const MTP12_CHAIN_RECURRENT_ELEMENTS: usize = MTP12_CHAIN_MAX_DRAFTS * TARGET_HIDDEN;
+const MTP12_CHAIN_LOCAL_ROPE_ELEMENTS: usize =
+    MTP12_CHAIN_MAX_DRAFTS * LOCAL_HEAD_DIM / 2;
+const MTP12_CHAIN_FULL_ROPE_ELEMENTS: usize = MTP12_CHAIN_MAX_DRAFTS * FULL_HEAD_DIM / 2;
+
+fn mtp12_chain_draft_k_admitted(draft_k: usize) -> bool {
+    (1..=MTP12_CHAIN_MAX_DRAFTS).contains(&draft_k)
+}
 
 /// Exact SHA-256 of the only target artifact admitted by the 12B resident
 /// draft-chain API.  The assistant loader independently verifies its own
@@ -1189,7 +1200,7 @@ pub struct Gemma4Mtp12Proposal {
     pub timing: Gemma4Mtp12ProposalTiming,
 }
 
-/// Aggregate timing for one K<=8 resident chain.  Exactly one command
+/// Aggregate timing for one K<=15 resident chain. Exactly one command
 /// buffer is committed and waited; GPU timestamps cover that complete buffer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gemma4Mtp12ChainTiming {
@@ -1816,20 +1827,20 @@ impl Mtp12Scratch {
             final_normalized: f32s(ASSISTANT_HIDDEN),
             recurrent_hidden: f32s(TARGET_HIDDEN),
             chain_initial_recurrent_hidden: f32s(TARGET_HIDDEN),
-            chain_recurrent_hidden: f32s(MTP12_CHAIN_MAX_DRAFTS * TARGET_HIDDEN),
+            chain_recurrent_hidden: f32s(MTP12_CHAIN_RECURRENT_ELEMENTS),
             logits: f32s(VOCAB),
             // Slot zero holds either the K=1 result or a chain anchor.  Chain
-            // draft tokens occupy slots 1..=8 so each can feed the next step.
+            // draft tokens occupy slots 1..=15 so each can feed the next step.
             output_token: shared_buffer(
                 device,
-                (MTP12_CHAIN_MAX_DRAFTS + 1) * std::mem::size_of::<u32>(),
+                MTP12_CHAIN_TOKEN_SLOTS * std::mem::size_of::<u32>(),
             ),
             // Row zero remains the K=1 scratch.  The resident chain binds one
             // precomputed RoPE row per advancing proposal position.
-            local_cos: f32s(MTP12_CHAIN_MAX_DRAFTS * LOCAL_HEAD_DIM / 2),
-            local_sin: f32s(MTP12_CHAIN_MAX_DRAFTS * LOCAL_HEAD_DIM / 2),
-            full_cos: f32s(MTP12_CHAIN_MAX_DRAFTS * FULL_HEAD_DIM / 2),
-            full_sin: f32s(MTP12_CHAIN_MAX_DRAFTS * FULL_HEAD_DIM / 2),
+            local_cos: f32s(MTP12_CHAIN_LOCAL_ROPE_ELEMENTS),
+            local_sin: f32s(MTP12_CHAIN_LOCAL_ROPE_ELEMENTS),
+            full_cos: f32s(MTP12_CHAIN_FULL_ROPE_ELEMENTS),
+            full_sin: f32s(MTP12_CHAIN_FULL_ROPE_ELEMENTS),
         }
     }
 
@@ -2448,7 +2459,7 @@ impl Gemma4Mtp12AssistantMetal {
 
     /// Lossless one-command device-fed draft chain for the exact 12B target.
     ///
-    /// `draft_k` is admitted only in 1..=8.  Slot zero of resident token
+    /// `draft_k` is admitted only in 1..=15. Slot zero of resident token
     /// scratch is initialized with `anchor_token`; each step gathers its target
     /// Q6_K row from the single borrowed full-table alias, consumes the prior
     /// recurrent hidden directly from Metal, and writes the next token/recurrent
@@ -2474,7 +2485,7 @@ impl Gemma4Mtp12AssistantMetal {
         draft_k: usize,
     ) -> Result<Gemma4Mtp12ChainProposal> {
         let wall_started = Instant::now();
-        if draft_k == 0 || draft_k > MTP12_CHAIN_MAX_DRAFTS {
+        if !mtp12_chain_draft_k_admitted(draft_k) {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "Gemma 4 12B MTP resident draft K is {draft_k}, expected 1..={MTP12_CHAIN_MAX_DRAFTS}"
             )));
@@ -2766,7 +2777,7 @@ impl Gemma4Mtp12AssistantMetal {
                 "Gemma 4 12B MTP initial recurrent hidden contains non-finite values".into(),
             ));
         }
-        if draft_k == 0 || draft_k > MTP12_CHAIN_MAX_DRAFTS {
+        if !mtp12_chain_draft_k_admitted(draft_k) {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "Gemma 4 12B MTP resident draft K is {draft_k}, expected 1..={MTP12_CHAIN_MAX_DRAFTS}"
             )));
@@ -3463,6 +3474,20 @@ fn write_chain_rope_tables(
 mod tests {
     use super::*;
 
+    #[test]
+    fn w16_assistant_bounds_and_resident_extents_are_exact() {
+        assert_eq!(GEMMA4_12B_MTP_MAX_DRAFTS, 15);
+        assert!(!mtp12_chain_draft_k_admitted(0));
+        assert!(mtp12_chain_draft_k_admitted(1));
+        assert!(mtp12_chain_draft_k_admitted(15));
+        assert!(!mtp12_chain_draft_k_admitted(16));
+
+        assert_eq!(MTP12_CHAIN_TOKEN_SLOTS, 16);
+        assert_eq!(MTP12_CHAIN_RECURRENT_ELEMENTS, 57_600);
+        assert_eq!(MTP12_CHAIN_LOCAL_ROPE_ELEMENTS, 1_920);
+        assert_eq!(MTP12_CHAIN_FULL_ROPE_ELEMENTS, 3_840);
+    }
+
     fn official_target_schedule() -> Vec<&'static str> {
         (0..48)
             .map(|index| {
@@ -4014,6 +4039,12 @@ mod tests {
                 .expect("fixed prefix with advancing proposal positions"),
             9
         );
+        assert!(validate_device_chain_positions(16, 16, 2, 2, 15).is_err());
+        assert_eq!(
+            validate_device_chain_positions(17, 17, 2, 2, 15)
+                .expect("W16 chain fits through final draft position"),
+            16
+        );
     }
 
     #[test]
@@ -4190,7 +4221,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_chain_k1_through_k8_matches_repeated_device_k1_bit_for_bit() {
+    fn resident_chain_k1_through_k15_matches_repeated_device_k1_bit_for_bit() {
         let Some(device) = Device::system_default() else {
             eprintln!("Metal is unavailable; skipping Gemma 4 12B resident-chain parity");
             return;
@@ -4198,7 +4229,7 @@ mod tests {
         let mut assistant = synthetic_assistant(&device);
         let anchor_token = 7u32;
         let logical_position = 2usize;
-        let max_positions = 16usize;
+        let max_positions = 32usize;
         let initial_hidden: Vec<f32> = (0..TARGET_HIDDEN)
             .map(|index| (index as i32 % 13 - 6) as f32 * 0.0078125)
             .collect();
