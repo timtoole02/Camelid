@@ -24,13 +24,16 @@ fn metal<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(|message| invalid(format!("EAGLE-3 Metal runtime: {message}")))
 }
 
+// Cache capacity and attention span are independent. E9 keeps absolute K/V rows for
+// rollback/catch-up but each query reads at most its checkpoint-declared trailing window.
 fn validate_drafter_capacity(sliding_window: Option<usize>, max_positions: usize) -> Result<()> {
-    if let Some(window) = sliding_window {
-        if max_positions > window {
-            return Err(BackendError::UnsupportedModelArchitecture(format!(
-                "EAGLE-3 checkpoint uses a {window}-position sliding attention window; the full-causal draft runtime is faithful only when max_positions <= {window}, got {max_positions}"
-            )));
-        }
+    if max_positions == 0 {
+        return Err(invalid("EAGLE-3 head cache capacity must be non-zero"));
+    }
+    if sliding_window == Some(0) {
+        return Err(BackendError::UnsupportedModelArchitecture(
+            "EAGLE-3 checkpoint requests a zero-position sliding attention window".to_string(),
+        ));
     }
     Ok(())
 }
@@ -754,6 +757,7 @@ impl Eagle3Drafter {
             output_norm: &norms.output,
             d2t_offsets: &model.d2t_offsets,
             rope_theta: model.config.rope_theta,
+            sliding_window: model.config.sliding_window,
         };
         let head = metal(Eagle3MetalState::new(weights, max_positions))?;
         Ok(Self {
@@ -1019,16 +1023,15 @@ mod tests {
     use crate::metal::Eagle3DraftCandidate;
 
     #[test]
-    fn sliding_window_drafter_capacity_is_inclusive_and_fails_closed() {
-        validate_drafter_capacity(Some(256), 255).unwrap();
-        validate_drafter_capacity(Some(256), 256).unwrap();
+    fn sliding_window_limits_attention_span_not_cache_capacity() {
+        for capacity in [1, 255, 256, 257, 2_048, 131_072] {
+            validate_drafter_capacity(Some(256), capacity).unwrap();
+        }
+        validate_drafter_capacity(None, 131_072).unwrap();
 
-        let error = validate_drafter_capacity(Some(256), 257).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("max_positions <= 256"), "{message}");
-        assert!(message.contains("got 257"), "{message}");
-
-        validate_drafter_capacity(None, usize::MAX).unwrap();
+        let error = validate_drafter_capacity(Some(0), 2_048).unwrap_err();
+        assert!(error.to_string().contains("zero-position"), "{error}");
+        assert!(validate_drafter_capacity(None, 0).is_err());
     }
 
     fn capture(name: &str, rows: usize, base: f32) -> CpuTensor {

@@ -1080,6 +1080,24 @@ mod tests {
             SHAREGPT_CONFIG.replace("\"sliding_window\": 256", "\"sliding_window\": 255");
         let error = parse_and_validate_config(wrong_window.as_bytes()).unwrap_err();
         assert!(error.to_string().contains("sliding-window"));
+
+        let disabled_window = SHAREGPT_CONFIG.replace(
+            "\"use_sliding_window\": true",
+            "\"use_sliding_window\": false",
+        );
+        let error = parse_and_validate_config(disabled_window.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("sliding-window"));
+
+        let missing_window = SHAREGPT_CONFIG.replace("        \"sliding_window\": 256,\n", "");
+        let error = parse_and_validate_config(missing_window.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("sliding-window"));
+
+        let missing_enable = SHAREGPT_CONFIG.replace(
+            "        \"use_cache\": true,\n        \"use_sliding_window\": true\n",
+            "        \"use_cache\": true\n",
+        );
+        let error = parse_and_validate_config(missing_enable.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("sliding-window"));
     }
 
     #[test]

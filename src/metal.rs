@@ -20013,10 +20013,19 @@ fn try_attention_splitk_kv16_for_test(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
-    positions: usize,
+    cache_positions: usize,
+    window_start: usize,
+    position_count: usize,
     scale: f32,
     direct: bool,
 ) -> Option<Vec<f32>> {
+    if position_count == 0
+        || window_start.checked_add(position_count)? > cache_positions
+        || keys.len() != n_kv_heads * cache_positions * head_dim
+        || values.len() != keys.len()
+    {
+        return None;
+    }
     let kernel = metal_linear_kernel()?;
     let device = &kernel.device;
     let opts = MTLResourceOptions::StorageModeShared;
@@ -20036,7 +20045,7 @@ fn try_attention_splitk_kv16_for_test(
             *vp.add(i) = f32_to_f16_bits(*x);
         }
     }
-    let n_splits = positions.div_ceil(64).clamp(2, 64);
+    let n_splits = position_count.div_ceil(64).clamp(2, 64);
     let partials = device.new_buffer((n_heads * n_splits * (head_dim + 2) * 4) as u64, opts);
     let splits_scalar = device.new_buffer(4, opts);
     unsafe {
@@ -20044,12 +20053,12 @@ fn try_attention_splitk_kv16_for_test(
         let p = scalar.contents() as *mut u32;
         *p = n_heads as u32;
         *p.add(1) = head_dim as u32;
-        *p.add(2) = positions as u32;
+        *p.add(2) = position_count as u32;
         *p.add(3) = (n_heads / n_kv_heads) as u32;
         *(p.add(4) as *mut f32) = scale;
         *p.add(5) = head_dim as u32; // position_stride (contiguous)
-        *p.add(6) = (positions * head_dim) as u32; // kv_head_stride
-        *p.add(7) = 0; // kv_base_offset
+        *p.add(6) = (cache_positions * head_dim) as u32; // kv_head_stride
+        *p.add(7) = (window_start * head_dim) as u32; // kv_base_offset
     }
     let cb = kernel.queue.new_command_buffer();
     let e = cb.new_compute_command_encoder();
@@ -26256,8 +26265,7 @@ pub const EAGLE3_RMS_EPS: f32 = 1.0e-5;
 /// single-token forward API or its GPU-selected top-1 result.
 pub const EAGLE3_TOP_K_CANDIDATES: usize = 8;
 
-/// Borrowed view of the 15-tensor
-/// `thoughtworks/Llama-3.2-3B-Instruct-Eagle3` checkpoint.
+/// Borrowed view of one admitted 15-tensor Llama-3.2-3B EAGLE-3 checkpoint.
 ///
 /// Matrix bytes are unmodified little-endian BF16 safetensor payloads in row-major
 /// `[output, input]` order.  Norms are widened to f32 by the checkpoint loader.  `d2t`
@@ -26283,6 +26291,9 @@ pub struct Eagle3MetalWeights<'a> {
     /// ShareGPT-trained head uses 10k; proposal quality depends on honoring the
     /// value the head was trained with.
     pub rope_theta: f32,
+    /// Checkpoint attention mask. `None` is full causal; a finite value limits
+    /// each head query to that many trailing positions, including the current one.
+    pub sliding_window: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26440,6 +26451,9 @@ fn eagle3_validate_weights(
             "EAGLE-3 rope_theta must be finite and positive, got {}",
             weights.rope_theta
         ));
+    }
+    if weights.sliding_window == Some(0) {
+        return Err("EAGLE-3 sliding_window must be positive when present".to_string());
     }
     let matrices = [
         (
@@ -26694,6 +26708,22 @@ fn eagle3_rope_tables(position: usize, rope_theta: f32) -> (Vec<f32>, Vec<f32>) 
     (cos, sin)
 }
 
+/// Resolve the exact EAGLE attention read span for one absolute query position.
+///
+/// The private cache remains full-sized so authoritative catch-up and ephemeral
+/// branch rollback continue to use simple logical watermarks. Sliding attention
+/// changes only the contiguous range read by the existing decode kernel:
+/// `position_count` is the window length and `kv_base_offset` shifts every KV
+/// head to the first visible absolute position.
+fn eagle3_attention_window(
+    position: usize,
+    sliding_window: Option<usize>,
+) -> (usize, usize, usize) {
+    let (window_start, position_count) = crate::window_ref::window_bounds(position, sliding_window);
+    let kv_base_offset = window_start * EAGLE3_HEAD_DIM;
+    (window_start, position_count, kv_base_offset)
+}
+
 #[cfg(target_os = "macos")]
 pub struct Eagle3MetalState {
     fc: ResidentLinearWeight,
@@ -26716,6 +26746,7 @@ pub struct Eagle3MetalState {
     max_positions: usize,
     filled: usize,
     rope_theta: f32,
+    sliding_window: Option<usize>,
 }
 
 #[cfg(target_os = "macos")]
@@ -26923,6 +26954,7 @@ impl Eagle3MetalState {
             max_positions,
             filled: 0,
             rope_theta: weights.rope_theta,
+            sliding_window: weights.sliding_window,
         })
     }
 
@@ -27231,7 +27263,8 @@ impl Eagle3MetalState {
         let k_rope_scalar = nb(16);
         let scatter_scalar = nb(16);
         let attention_scalar = nb(32);
-        let position_count = position + 1;
+        let (window_start, position_count, kv_base_offset) =
+            eagle3_attention_window(position, self.sliding_window);
         let scores = f32b(EAGLE3_HEADS * position_count);
         let (cos, sin) = eagle3_rope_tables(position, self.rope_theta);
         let cos_buf = f32b(cos.len());
@@ -27284,7 +27317,12 @@ impl Eagle3MetalState {
             *(attn.add(16) as *mut f32) = 1.0 / (EAGLE3_HEAD_DIM as f32).sqrt();
             *(attn.add(20) as *mut u32) = EAGLE3_HEAD_DIM as u32;
             *(attn.add(24) as *mut u32) = (self.max_positions * EAGLE3_HEAD_DIM) as u32;
-            *(attn.add(28) as *mut u32) = 0;
+            // Cache layout is [kv_head][max_positions][head_dim]. Keep the full
+            // head stride, but shift the common base to the oldest visible row.
+            // Below the configured window this remains zero and reproduces the
+            // former full-causal scalar byte-for-byte.
+            debug_assert_eq!(kv_base_offset, window_start * EAGLE3_HEAD_DIM);
+            *(attn.add(28) as *mut u32) = kv_base_offset as u32;
         }
 
         let cb = k.queue.new_command_buffer();
@@ -27881,8 +27919,42 @@ mod eagle3_metal_contract_tests {
     }
 
     #[test]
+    fn eagle3_sliding_window_is_full_causal_through_256_then_advances() {
+        for position in 0..256usize {
+            assert_eq!(
+                eagle3_attention_window(position, Some(256)),
+                eagle3_attention_window(position, None),
+                "E9 must reproduce the formerly admitted full-causal scalar at position {position}"
+            );
+        }
+        assert_eq!(eagle3_attention_window(255, Some(256)), (0, 256, 0));
+        assert_eq!(eagle3_attention_window(256, Some(256)), (1, 256, 128));
+        assert_eq!(
+            eagle3_attention_window(511, Some(256)),
+            (256, 256, 256 * EAGLE3_HEAD_DIM)
+        );
+        assert_eq!(
+            eagle3_attention_window(512, Some(256)),
+            (257, 256, 257 * EAGLE3_HEAD_DIM)
+        );
+        assert_eq!(eagle3_attention_window(512, None), (0, 513, 0));
+    }
+
+    #[test]
+    fn eagle3_sliding_window_tracks_logical_rollback_without_stale_tail_reads() {
+        let stable = eagle3_attention_window(1_023, Some(256));
+        let ephemeral = eagle3_attention_window(1_031, Some(256));
+        let rolled_back = eagle3_attention_window(1_023, Some(256));
+
+        assert_eq!(stable, (768, 256, 768 * EAGLE3_HEAD_DIM));
+        assert_eq!(ephemeral, (776, 256, 776 * EAGLE3_HEAD_DIM));
+        assert_eq!(rolled_back, stable);
+        assert!(rolled_back.0 + rolled_back.1 <= 1_024);
+    }
+
+    #[test]
     fn checkpoint_shape_validation_fails_before_metal_allocation() {
-        let weights = Eagle3MetalWeights {
+        let mut weights = Eagle3MetalWeights {
             fc_bf16: &[],
             q_proj_bf16: &[],
             k_proj_bf16: &[],
@@ -27898,12 +27970,17 @@ mod eagle3_metal_contract_tests {
             output_norm: &[],
             d2t_offsets: &[],
             rope_theta: EAGLE3_ROPE_THETA,
+            sliding_window: None,
         };
         let error = eagle3_validate_weights(&weights, 2_048).unwrap_err();
         assert!(error.contains("fc.weight"), "{error}");
         assert!(eagle3_validate_weights(&weights, 0)
             .unwrap_err()
             .contains("max_positions"));
+
+        weights.sliding_window = Some(0);
+        let error = eagle3_validate_weights(&weights, 2_048).unwrap_err();
+        assert!(error.contains("sliding_window"), "{error}");
     }
 
     #[test]
@@ -37563,64 +37640,79 @@ mod tests {
         if !detect_metal_device().available {
             return;
         }
-        // Production-shaped GQA (group of 3, so the fourth simdgroup is inactive) at
-        // head_dim 128 (full half4 staging width). 131 positions -> 3 splits of chunk
-        // 44 where the last covers 43: a 16/16/11 tile sequence whose tail round
-        // exercises the -INF score padding and the guarded v_s reads.
+        // Production-shaped EAGLE GQA at head_dim 128 (the direct split-K path).
+        // The first case exercises a ragged full-causal tail. The second is the
+        // E9 boundary after two 256-position spans: a 513-row physical cache with
+        // the logical attention range shifted to [257, 513).
         let n_heads = 6usize;
         let n_kv_heads = 2usize;
         let head_dim = 128usize;
-        let positions = 131usize;
         let scale = 1.0 / (head_dim as f32).sqrt();
         // Steps of 0.25 are exactly representable in f16, so the f32 CPU reference
         // sees the same values the kernel reads back from the half mirrors.
         let query: Vec<f32> = (0..n_heads * head_dim)
             .map(|i| ((i as f32 % 5.0) - 2.0) * 0.25)
             .collect();
-        let keys: Vec<f32> = (0..n_kv_heads * positions * head_dim)
-            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.25)
-            .collect();
-        let values: Vec<f32> = (0..n_kv_heads * positions * head_dim)
-            .map(|i| ((i as f32 % 9.0) - 4.0) * 0.25)
-            .collect();
-        let group = n_heads / n_kv_heads;
-        let mut expected = vec![0.0f32; n_heads * head_dim];
-        for h in 0..n_heads {
-            let qb = h * head_dim;
-            let kvb = (h / group) * positions * head_dim;
-            let mut scores = vec![0.0f32; positions];
-            for (p, score) in scores.iter_mut().enumerate() {
-                let kb = kvb + p * head_dim;
-                let mut s = 0.0;
+        for (cache_positions, window_start, position_count) in
+            [(131usize, 0usize, 131usize), (513, 257, 256)]
+        {
+            let keys: Vec<f32> = (0..n_kv_heads * cache_positions * head_dim)
+                .map(|i| ((i as f32 % 7.0) - 3.0) * 0.25)
+                .collect();
+            let values: Vec<f32> = (0..n_kv_heads * cache_positions * head_dim)
+                .map(|i| ((i as f32 % 9.0) - 4.0) * 0.25)
+                .collect();
+            let group = n_heads / n_kv_heads;
+            let mut expected = vec![0.0f32; n_heads * head_dim];
+            for h in 0..n_heads {
+                let qb = h * head_dim;
+                let kvb = (h / group) * cache_positions * head_dim;
+                let mut scores = vec![0.0f32; position_count];
+                for (p, score) in scores.iter_mut().enumerate() {
+                    let kb = kvb + (window_start + p) * head_dim;
+                    let mut s = 0.0;
+                    for d in 0..head_dim {
+                        s += query[qb + d] * keys[kb + d];
+                    }
+                    *score = s * scale;
+                }
+                let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    sum += *s;
+                }
                 for d in 0..head_dim {
-                    s += query[qb + d] * keys[kb + d];
+                    let mut acc = 0.0;
+                    for (p, s) in scores.iter().enumerate() {
+                        let vb = kvb + (window_start + p) * head_dim + d;
+                        acc += (s / sum) * values[vb];
+                    }
+                    expected[qb + d] = acc;
                 }
-                *score = s * scale;
             }
-            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0;
-            for s in scores.iter_mut() {
-                *s = (*s - m).exp();
-                sum += *s;
-            }
-            for d in 0..head_dim {
-                let mut acc = 0.0;
-                for (p, s) in scores.iter().enumerate() {
-                    acc += (s / sum) * values[kvb + p * head_dim + d];
+            for direct in [false, true] {
+                let got = try_attention_splitk_kv16_for_test(
+                    &query,
+                    &keys,
+                    &values,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cache_positions,
+                    window_start,
+                    position_count,
+                    scale,
+                    direct,
+                )
+                .expect("splitk kv16 attention");
+                for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1.0e-4,
+                        "direct={direct} cache={cache_positions} window={window_start}..{} dim {i}: {a} != {b}",
+                        window_start + position_count
+                    );
                 }
-                expected[qb + d] = acc;
-            }
-        }
-        for direct in [false, true] {
-            let got = try_attention_splitk_kv16_for_test(
-                &query, &keys, &values, n_heads, n_kv_heads, head_dim, positions, scale, direct,
-            )
-            .expect("splitk kv16 attention");
-            for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
-                assert!(
-                    (a - b).abs() < 1.0e-4,
-                    "direct={direct} dim {i}: {a} != {b}"
-                );
             }
         }
     }
