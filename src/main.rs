@@ -9566,6 +9566,12 @@ fn run_bench_eagle3(
         "03ea9aeacd593c07d9f55e0a64e161e69f71a6cd";
     const PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256: &str =
         "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
+    const PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256: &str =
+        "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
+    const PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION: &str =
+        "f5a87b575c502b9c93ce995198a54d683a02a53c";
+    const PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
+        "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -9616,8 +9622,11 @@ fn run_bench_eagle3(
         PINNED_EAGLE3_THOUGHTWORKS_SHA256 => PINNED_EAGLE3_THOUGHTWORKS_REVISION,
         PINNED_EAGLE3_SHAREGPT_E8_SHA256 => PINNED_EAGLE3_SHAREGPT_E8_REVISION,
         PINNED_EAGLE3_SHAREGPT_E9_SHA256 => PINNED_EAGLE3_SHAREGPT_E9_REVISION,
+        PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256 => {
+            PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION
+        }
         _ => anyhow::bail!(
-            "EAGLE-3 SHA-256 {eagle3_sha256} is not one of the three pinned checkpoint artifacts ({PINNED_EAGLE3_THOUGHTWORKS_SHA256}, {PINNED_EAGLE3_SHAREGPT_E8_SHA256}, {PINNED_EAGLE3_SHAREGPT_E9_SHA256})"
+            "EAGLE-3 SHA-256 {eagle3_sha256} is not one of the four pinned checkpoint artifacts ({PINNED_EAGLE3_THOUGHTWORKS_SHA256}, {PINNED_EAGLE3_SHAREGPT_E8_SHA256}, {PINNED_EAGLE3_SHAREGPT_E9_SHA256}, {PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256})"
         ),
     };
     let pinned_sharegpt_config = match eagle3_sha256.as_str() {
@@ -9628,6 +9637,10 @@ fn run_bench_eagle3(
         PINNED_EAGLE3_SHAREGPT_E9_SHA256 => Some((
             "ShareGPT-E9",
             PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256,
+        )),
+        PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256 => Some((
+            "ShareGPT-SW512-E9",
+            PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256,
         )),
         _ => None,
     };
