@@ -10,13 +10,11 @@
 //! authoritative). The adjacency is sparse (a `HashMap<u32, ...>` keyed on the
 //! tokens actually seen), so memory is O(distinct tokens × k), not O(vocab²).
 //!
-//! Learning scope: the full Token-Recycling method updates the adjacency from
-//! the target model's top-k predictions at every verified position, which needs
-//! the GPU verify kernel's full logits (deferred to Lane A's GPU phase). For
-//! now we learn from the *accepted token stream* alone — `observe`/`learn` feed
-//! the realized (history) transitions, which is a strict subset of the eventual
-//! signal but already a useful, lossless drafter. This limitation is
-//! documented so the GPU phase knows to wire top-k learning in later.
+//! Learning scope: the default drafter learns from the *accepted token stream*
+//! alone — `observe`/`learn` feed realized history transitions. The experimental
+//! benchmark lane can additionally call `observe_target_candidates` with the
+//! resident verifier's compact target top-k rows. No logits are read back and
+//! the target verifier remains authoritative in either mode.
 
 use std::collections::HashMap;
 
@@ -57,6 +55,24 @@ impl TokenRecyclingDrafter {
                 entry.remove(&victim);
             }
         }
+    }
+
+    /// Record one verified row's target candidate set as outgoing adjacency for `from`.
+    ///
+    /// Candidates are set-valued evidence: duplicates within a row are counted once, and the
+    /// verifier's `u32::MAX` exhausted-rank sentinel is ignored. Across rows, repeated candidate
+    /// membership accumulates frequency exactly like [`Self::observe`]. Returns the number of
+    /// valid distinct candidates consumed, which is useful for benchmark telemetry.
+    pub fn observe_target_candidates(&mut self, from: u32, candidates: &[u32]) -> usize {
+        let mut observed = 0;
+        for (rank, &to) in candidates.iter().enumerate() {
+            if to == u32::MAX || candidates[..rank].contains(&to) {
+                continue;
+            }
+            self.observe(from, to);
+            observed += 1;
+        }
+        observed
     }
 
     /// Learn every adjacent transition in an observed token stream (the
@@ -178,6 +194,24 @@ mod tests {
             d.observe(1, to);
         }
         assert!(d.succ.get(&1).unwrap().len() <= 3);
+    }
+
+    #[test]
+    fn target_candidate_rows_feed_deterministic_adjacency() {
+        let mut d = TokenRecyclingDrafter::new();
+        d.branch = 3;
+        assert_eq!(
+            d.observe_target_candidates(10, &[5, 3, 5, u32::MAX, 7]),
+            3,
+            "duplicate ids and exhausted-rank sentinels are not double-counted"
+        );
+        let tree = d.draft_tree(&[], 10, 4, 1);
+        assert_eq!(tree.tokens, [10, 3, 5, 7], "equal support ties by token id");
+        assert_eq!(tree.parent, [-1, 0, 0, 0]);
+
+        assert_eq!(d.observe_target_candidates(10, &[7]), 1);
+        let tree = d.draft_tree(&[], 10, 4, 1);
+        assert_eq!(tree.tokens, [10, 7, 3, 5], "cross-row support wins");
     }
 
     #[test]

@@ -7945,7 +7945,17 @@ fn generate_run_speculative(
     let spec_tree = std::env::var_os("CAMELID_SPEC_TREE")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    let mut tree_drafter = camelid::inference::suffix_decoding::SuffixDecodingDrafter::default();
+    // Benchmark-only Phase-1 Token Recycling experiment. This flag is consumed only by this
+    // benchmark generator: serving and the default benchmark continue to use suffix decoding
+    // and the ordinary greedy verifier API. The experimental lane asks Metal for compact target
+    // top-8 ids per verified tree row and feeds them into Token Recycling's sparse adjacency.
+    let bench_token_recycling_topk = std::env::var_os("CAMELID_BENCH_TOKEN_RECYCLING_TOPK")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let mut suffix_tree_drafter =
+        camelid::inference::suffix_decoding::SuffixDecodingDrafter::default();
+    let mut recycling_tree_drafter =
+        camelid::inference::token_recycling::TokenRecyclingDrafter::default();
     // ACCEPTANCE-GATED DRAFTING (CAMELID_SPEC_TREE lane only).
     //
     // The suffix drafter only PROPOSES; `verify_tree_gpu` is the exact greedy gate, so any
@@ -8083,12 +8093,44 @@ fn generate_run_speculative(
             };
 
             let draft_started = Instant::now();
-            let tree = tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth);
+            let tree = if bench_token_recycling_topk {
+                recycling_tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth)
+            } else {
+                suffix_tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth)
+            };
             run.draft_us += draft_started.elapsed().as_micros();
             if tree.nodes() > 1 {
                 let verify_started = Instant::now();
                 let gpu_emitted = if cpu_verify_pinned {
                     None
+                } else if bench_token_recycling_topk {
+                    session
+                        .verify_tree_metal_with_target_top_k(&tree)?
+                        .map(|verified| {
+                            debug_assert_eq!(verified.target_top_k.len(), tree.nodes());
+                            debug_assert_eq!(verified.predictions.len(), tree.nodes());
+                            let mut candidate_observations = 0usize;
+                            for ((&from, candidates), &prediction) in tree
+                                .tokens
+                                .iter()
+                                .zip(&verified.target_top_k)
+                                .zip(&verified.predictions)
+                            {
+                                debug_assert_eq!(candidates[0], prediction);
+                                candidate_observations += recycling_tree_drafter
+                                    .observe_target_candidates(from, candidates);
+                            }
+                            if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                                eprintln!(
+                                    "[spec-tree-target-topk] rows={} candidate_observations={} \
+                                     emitted_len={}",
+                                    tree.nodes(),
+                                    candidate_observations,
+                                    verified.emitted.len()
+                                );
+                            }
+                            verified.emitted
+                        })
                 } else {
                     session.verify_tree_gpu(&tree)?
                 };
@@ -8133,7 +8175,11 @@ fn generate_run_speculative(
                             // primary-chain flatten becomes exact.
                             cpu_verify_pinned = true;
                             session.set_resident_paths_disabled(true);
-                            tree_drafter.branch = 1;
+                            if bench_token_recycling_topk {
+                                recycling_tree_drafter.branch = 1;
+                            } else {
+                                suffix_tree_drafter.branch = 1;
+                            }
                         }
                         let base_position = session.kv_position();
                         let mut batch = Vec::with_capacity(1 + chain.len());
@@ -8414,6 +8460,7 @@ fn speculative_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_SPEC_GPU",
         "CAMELID_SPEC_DECODE",
         "CAMELID_SPEC_TREE_GATE",
+        "CAMELID_BENCH_TOKEN_RECYCLING_TOPK",
         "CAMELID_SPEC_NGRAM_MIN",
         "CAMELID_METAL_ATTN_SPLITK",
         "CAMELID_METAL_KV_DTYPE",
