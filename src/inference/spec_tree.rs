@@ -425,32 +425,56 @@ impl DynamicDraftLattice {
         if max_nodes == 0 {
             return Err("a verifier tree must retain at least its root".to_string());
         }
-        let mut selected: Vec<usize> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| (usize::from(node.depth) <= max_depth).then_some(index))
-            .collect();
-        selected.sort_by(|&left, &right| {
-            self.nodes[right]
-                .cumulative_log_probability
-                .total_cmp(&self.nodes[left].cumulative_log_probability)
-                .then_with(|| self.nodes[left].depth.cmp(&self.nodes[right].depth))
-                .then_with(|| left.cmp(&right))
-        });
-        selected.truncate(max_nodes);
-        // The root is score 0/depth 0 and every child is <= it, so it must survive any
-        // non-empty truncation.  Keep this a checked contract rather than a debug-only claim.
-        if !selected.contains(&0) {
-            return Err("dynamic draft rerank dropped the root".to_string());
+        let mut selected: Vec<usize> = Vec::with_capacity(max_nodes);
+        selected.push(0);
+
+        // 1. Trace the primary top-1 spine down to max_depth or max_nodes - 2 (leaving 2 hedge slots).
+        let spine_cap = max_nodes.saturating_sub(2).max(1).min(max_nodes);
+        let mut curr = 0usize;
+        while selected.len() < spine_cap && usize::from(self.nodes[curr].depth) < max_depth {
+            // Find child of curr with best probability
+            let best_child = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(idx, node)| {
+                    node.parent == Some(curr) && usize::from(node.depth) <= max_depth && !selected.contains(idx)
+                })
+                .max_by(|(_, a), (_, b)| {
+                    a.cumulative_log_probability
+                        .total_cmp(&b.cumulative_log_probability)
+                })
+                .map(|(idx, _)| idx);
+
+            if let Some(child) = best_child {
+                selected.push(child);
+                curr = child;
+            } else {
+                break;
+            }
         }
-        for &node in &selected {
-            if let Some(parent) = self.nodes[node].parent {
-                if !selected.contains(&parent) {
-                    return Err(format!(
-                        "dynamic draft rerank selected node {node} without parent {parent}"
-                    ));
-                }
+
+        // 2. Fill the remaining node budget with highest-scoring candidate nodes whose parents are in selected.
+        while selected.len() < max_nodes {
+            let next_best = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(idx, node)| {
+                    !selected.contains(idx)
+                        && usize::from(node.depth) <= max_depth
+                        && node.parent.is_some_and(|p| selected.contains(&p))
+                })
+                .max_by(|(_, a), (_, b)| {
+                    a.cumulative_log_probability
+                        .total_cmp(&b.cumulative_log_probability)
+                })
+                .map(|(idx, _)| idx);
+
+            if let Some(node) = next_best {
+                selected.push(node);
+            } else {
+                break;
             }
         }
 
