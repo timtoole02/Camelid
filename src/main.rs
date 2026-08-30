@@ -15,6 +15,52 @@ extern "C" {
     ) -> std::os::raw::c_int;
 }
 
+/// Commit prefixes used by the rejected-tail overwrite receipt for one physical
+/// verifier width. The middle case straddles the boundary between the two K8
+/// fragments at W16, while zero/full pin rollback and complete-commit behavior.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_rejected_tail_commit_prefixes(width: usize) -> Option<Vec<usize>> {
+    if !matches!(width, 1 | 2 | 4 | 8 | 16) {
+        return None;
+    }
+    let mut prefixes = vec![
+        0,
+        1,
+        (width / 2).saturating_sub(1),
+        width.saturating_sub(1),
+        width,
+    ];
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    Some(prefixes)
+}
+
+#[cfg(test)]
+mod gemma4_verifier_receipt_tests {
+    use super::gemma4_rejected_tail_commit_prefixes;
+
+    #[test]
+    fn rejected_tail_prefixes_scale_through_physical_w16() {
+        let cases: [(usize, &[usize]); 5] = [
+            (1, &[0, 1]),
+            (2, &[0, 1, 2]),
+            (4, &[0, 1, 3, 4]),
+            (8, &[0, 1, 3, 7, 8]),
+            (16, &[0, 1, 7, 15, 16]),
+        ];
+        for (width, expected) in cases {
+            assert_eq!(
+                gemma4_rejected_tail_commit_prefixes(width).as_deref(),
+                Some(expected),
+                "physical W{width}",
+            );
+        }
+        for refused in [0usize, 3, 6, 12, 15, 17, usize::MAX] {
+            assert!(gemma4_rejected_tail_commit_prefixes(refused).is_none());
+        }
+    }
+}
+
 #[cfg(test)]
 mod ghost_moe_cli_tests {
     use super::*;
@@ -5310,6 +5356,10 @@ async fn main() -> anyhow::Result<()> {
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
+                        "CAMELID_GEMMA4_Q4_ROW_OPS": std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_ROWMAJOR": std::env::var("CAMELID_GEMMA4_Q4_MMA_ROWMAJOR").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16").ok(),
                         "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
@@ -5319,6 +5369,11 @@ async fn main() -> anyhow::Result<()> {
                         "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
                         "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
                         "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
+                    },
+                    "dense_attention_rows_contract": {
+                        "selector": "CAMELID_GEMMA4_DENSE_ATTN_ROWS",
+                        "explicit_request_admission": "all_48_dense_layers_per_target_batch_or_fail_closed",
+                        "default_when_unset": "per_row_split3"
                     },
                     "ordered_k1_qualification": {
                         "exact_vs_established": true,
@@ -5513,17 +5568,24 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 // Exercise the transactional invariant used by real speculative
-                // decode, not merely the full-commit throughput path. K8 writes
-                // eight physical cache rows; committing 1/3/7 must leave every
-                // rejected row invisible and overwritable at the logical cursor.
-                if qualification.token_ids.len() < 8 {
+                // decode, not merely the full-commit throughput path. Use the
+                // requested maximum physical width so a W16 receipt really writes
+                // sixteen cache rows. Zero/full pin the boundary cases; 1, 7 and
+                // 15 span a large tail, the K8-fragment boundary, and a one-row tail.
+                let rejected_tail_width = max_width;
+                let rejected_tail_prefixes = gemma4_rejected_tail_commit_prefixes(
+                    rejected_tail_width,
+                )
+                .expect("validated verifier width has an overwrite-prefix plan");
+                if qualification.token_ids.len() < rejected_tail_width {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(
-                        "Gemma 4 rejected-tail gate requires at least eight qualified output tokens"
-                            .into(),
+                        format!(
+                            "Gemma 4 rejected-tail W{rejected_tail_width} gate requires at least {rejected_tail_width} qualified output tokens"
+                        ),
                     )
                     .into());
                 }
-                let tail_a = &qualification.token_ids[..8];
+                let tail_a = &qualification.token_ids[..rejected_tail_width];
                 let stop_ids = runtime.stop_token_ids();
                 let mut candidate_pool: Vec<u32> = prompt_tokens
                     .iter()
@@ -5540,11 +5602,11 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .into());
                 }
-                let mut rejected_tail_runs = Vec::with_capacity(3);
-                for committed in [1usize, 3, 7] {
-                    let overlap = 8 - committed;
-                    let mut tail_b = Vec::with_capacity(8);
-                    for row in 0..8 {
+                let mut rejected_tail_runs = Vec::with_capacity(rejected_tail_prefixes.len());
+                for committed in rejected_tail_prefixes.iter().copied() {
+                    let overlap = rejected_tail_width - committed;
+                    let mut tail_b = Vec::with_capacity(rejected_tail_width);
+                    for row in 0..rejected_tail_width {
                         let stale = (row < overlap).then(|| tail_a[committed + row]);
                         let replacement = candidate_pool
                             .iter()
@@ -5572,7 +5634,11 @@ async fn main() -> anyhow::Result<()> {
                         .flatten()
                         .map(|value| value.to_bits())
                         .collect();
-                    runtime.commit_verifier_prefix(a_batch.ticket, committed)?;
+                    if committed == 0 {
+                        runtime.rollback_verifier_batch(a_batch.ticket)?;
+                    } else {
+                        runtime.commit_verifier_prefix(a_batch.ticket, committed)?;
+                    }
                     let b_batch = runtime.verify_consecutive_greedy(&tail_b, start + committed)?;
                     let b_ids = b_batch.greedy_ids.clone();
                     let b_hidden_bits: Vec<u32> = b_batch
@@ -5581,7 +5647,7 @@ async fn main() -> anyhow::Result<()> {
                         .flatten()
                         .map(|value| value.to_bits())
                         .collect();
-                    runtime.commit_verifier_prefix(b_batch.ticket, 8)?;
+                    runtime.commit_verifier_prefix(b_batch.ticket, rejected_tail_width)?;
 
                     let reference_prefill = runtime.prefill_ordered_q4(&prompt)?;
                     if reference_prefill.first_greedy_id != tail_a[0] {
@@ -5590,9 +5656,11 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .into());
                     }
-                    let mut reference_ids = Vec::with_capacity(committed + 8);
-                    let mut reference_hidden_bits =
-                        Vec::with_capacity((committed + 8).saturating_mul(3_840));
+                    let mut reference_ids =
+                        Vec::with_capacity(committed + rejected_tail_width);
+                    let mut reference_hidden_bits = Vec::with_capacity(
+                        (committed + rejected_tail_width).saturating_mul(3_840),
+                    );
                     let mut reference_position = reference_prefill.prompt_token_count;
                     for &token in tail_a[..committed].iter().chain(&tail_b) {
                         let (prediction, hidden) =
@@ -5620,12 +5688,12 @@ async fn main() -> anyhow::Result<()> {
                         && experiment_hidden_bits.len() == reference_hidden_bits.len();
                     if !ids_exact || !hidden_bit_exact {
                         return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
-                            "Gemma 4 rejected-tail K8/commit-{committed} gate diverged: id={first_id_divergence:?}, hidden_scalar={first_hidden_divergence:?}"
+                            "Gemma 4 rejected-tail W{rejected_tail_width}/commit-{committed} gate diverged: id={first_id_divergence:?}, hidden_scalar={first_hidden_divergence:?}"
                         ))
                         .into());
                     }
                     rejected_tail_runs.push(serde_json::json!({
-                        "physical_width": 8,
+                        "physical_width": rejected_tail_width,
                         "committed_prefix": committed,
                         "rejected_rows_overwritten": overlap,
                         "overwrite_tokens": tail_b,
@@ -5725,6 +5793,10 @@ async fn main() -> anyhow::Result<()> {
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
+                        "CAMELID_GEMMA4_Q4_ROW_OPS": std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_ROWMAJOR": std::env::var("CAMELID_GEMMA4_Q4_MMA_ROWMAJOR").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16").ok(),
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
@@ -5734,6 +5806,11 @@ async fn main() -> anyhow::Result<()> {
                         "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
                         "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
                         "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
+                    },
+                    "dense_attention_rows_contract": {
+                        "selector": "CAMELID_GEMMA4_DENSE_ATTN_ROWS",
+                        "explicit_request_admission": "all_48_dense_layers_per_target_batch_or_fail_closed",
+                        "default_when_unset": "per_row_split3"
                     },
                     "ordered_k1_qualification": {
                         "exact_vs_established": true,
@@ -5745,6 +5822,10 @@ async fn main() -> anyhow::Result<()> {
                     },
                     "runs": runs,
                     "rejected_tail_overwrite_gate": {
+                        "physical_width": rejected_tail_width,
+                        "commit_prefixes": rejected_tail_prefixes,
+                        "includes_zero_rollback": true,
+                        "includes_full_commit": true,
                         "exact_all_commit_prefixes": true,
                         "runs": rejected_tail_runs
                     },

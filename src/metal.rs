@@ -14157,8 +14157,9 @@ fn gemma4_q4_row_ops_enabled() -> bool {
 /// Default-off host-loop collapse for the dense Gemma verifier's f32 attention.
 /// The already-batched KV scatter remains a separate dispatch; this selector only
 /// replaces K independent score/softmax/context triples with one `(head,row)` grid.
-/// Any unsupported shape or scratch/metadata overflow falls back to the established
-/// per-row split-three path even when the selector is set.
+/// An unset selector retains the established per-row split-three path. Once explicitly
+/// requested, any pipeline, shape, scratch, or metadata refusal fails the verifier batch
+/// closed so a receipt can never silently qualify the baseline under the fused label.
 #[cfg(target_os = "macos")]
 fn gemma4_dense_attention_rows_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -14166,6 +14167,18 @@ fn gemma4_dense_attention_rows_enabled() -> bool {
         std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
+}
+
+/// Resolve the fused-attention selector without consulting process-global state.
+/// `Some(false)` is the unchanged default split-three route, `Some(true)` is a
+/// successfully encoded fused route, and `None` makes an explicit request fail closed.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_dense_attention_rows_policy(requested: bool, encoded: bool) -> Option<bool> {
+    match (requested, encoded) {
+        (false, _) => Some(false),
+        (true, true) => Some(true),
+        (true, false) => None,
+    }
 }
 
 /// One row's explicit visibility contract for dense speculative attention.
@@ -14183,7 +14196,7 @@ struct Gemma4DenseAttentionRowMeta {
 
 /// Build causal row metadata and return the exact packed-score scratch size in bytes.
 /// Only the verifier widths qualified by the dense runtime are admitted, including
-/// W16; every other width remains on the established per-row split-three fallback.
+/// W16; every other width is declined for the caller's default/fail-closed policy.
 #[cfg(any(target_os = "macos", test))]
 fn gemma4_dense_attention_row_plan(
     base_position: usize,
@@ -17603,11 +17616,12 @@ impl Gemma4ResidentModel {
 
             // Q4's term slab is idle between the Q/K/V projections above and the O
             // projection below, so the opt-in row-aware attention may reuse it as packed
-            // score scratch without adding a long-lived verifier allocation.  The encoder
-            // checks the exact byte requirement before binding it.  Any declined shape
-            // falls through to the established immutable per-row scalar blocks and 3*K
-            // score/softmax/context dispatches.
-            let batched_attention = gemma4_dense_attention_rows_enabled()
+            // score scratch without adding a long-lived verifier allocation. The encoder
+            // checks the exact byte requirement before binding it. An explicit selector
+            // is receipt-bearing and therefore fail-closed; only the default-off route
+            // may retain the immutable per-row scalar blocks and 3*K dispatches.
+            let attention_rows_requested = gemma4_dense_attention_rows_enabled();
+            let attention_rows_encoded = attention_rows_requested
                 && encode_gemma4_dense_attention_rows_f32(
                     encoder,
                     kernel,
@@ -17626,6 +17640,13 @@ impl Gemma4ResidentModel {
                     sliding.then_some(SLIDING_WINDOW),
                     1.0,
                 );
+            let Some(batched_attention) = gemma4_dense_attention_rows_policy(
+                attention_rows_requested,
+                attention_rows_encoded,
+            ) else {
+                encoder.end_encoding();
+                return None;
+            };
             if !batched_attention {
                 // Every row keeps its own immutable scalar blocks.  Reusing one
                 // host-visible argument buffer would make all queued dispatches see
@@ -25917,8 +25938,8 @@ fn encode_attention_split3(
 /// Encode all dense Gemma verifier rows through one f32 decode-attention dispatch.
 /// K/V have already been scattered.  The score slab is packed by each row's own
 /// visible count, and every row carries an explicit exclusive causal end; invalid
-/// geometry, metadata, or scratch capacity declines the encode so the caller can
-/// retain the established per-row split-three chain.
+/// geometry, metadata, or scratch capacity declines before dispatch. The caller's
+/// selector policy decides whether that means default fallback or explicit refusal.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_gemma4_dense_attention_rows_f32(
@@ -50321,6 +50342,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, got2);
+    }
+
+    #[test]
+    fn gemma4_dense_attention_rows_policy_never_labels_a_fallback_as_fused() {
+        assert_eq!(
+            gemma4_dense_attention_rows_policy(false, false),
+            Some(false),
+            "the default route remains split-three",
+        );
+        assert_eq!(
+            gemma4_dense_attention_rows_policy(false, true),
+            Some(false),
+            "an unrequested candidate cannot relabel the default route",
+        );
+        assert_eq!(
+            gemma4_dense_attention_rows_policy(true, true),
+            Some(true),
+            "an admitted explicit request uses the fused primitive",
+        );
+        assert_eq!(
+            gemma4_dense_attention_rows_policy(true, false),
+            None,
+            "a declined explicit request fails the verifier batch closed",
+        );
     }
 
     #[test]
