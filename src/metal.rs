@@ -309,6 +309,7 @@ pub(crate) struct MetalLinearKernel {
     scale_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
+    attention_decode_f32_rows_pipeline: Option<ComputePipelineState>,
     attention_decode_scores_pipeline: ComputePipelineState,
     attention_decode_softmax_pipeline: ComputePipelineState,
     attention_decode_context_pipeline: ComputePipelineState,
@@ -7169,6 +7170,91 @@ kernel void attention_decode_f32(
     }
 }
 
+// Dense Gemma verifier sibling of attention_decode_f32.  The speculative rows are
+// independent queries over one already-scattered f32 KV cache, so widening only the
+// threadgroup grid from `head` to `(head,row)` removes the host's 3*K score/softmax/context
+// dispatches without combining any floating-point reduction.  `row_meta` is
+// (window_start, position_count, packed_score_offset, visible_end_exclusive).  The final
+// component is deliberately redundant: both the host encoder and the kernel require
+// `window_start + position_count == visible_end_exclusive`, preventing an earlier
+// speculative row from observing a later candidate (including stale rejected slots).
+//
+// The three arithmetic phases below are a textual clone of attention_decode_f32.  Keep
+// the scalar dot order, the post-dot scale, simd_max / exp / simd_sum / reciprocal, and
+// the ascending-p context expression unchanged.  The exact comparator against the
+// established per-row split-three path is load-bearing; do not replace this with a
+// numerically-close batched attention formulation.
+kernel void attention_decode_f32_rows(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& rows [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const uint4* row_meta [[buffer(13)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint head = tg.x;
+    uint row = tg.y;
+    if (head >= n_heads || row >= rows) return;
+    uint4 meta = row_meta[row];
+    uint window_start = meta.x;
+    uint position_count = meta.y;
+    if (position_count == 0u || meta.w < window_start ||
+        position_count != meta.w - window_start) return;
+
+    uint kv_head = head / group;
+    uint row_stride = n_heads * head_dim;
+    uint q_base = row * row_stride + head * head_dim;
+    uint kv_base = kv_base_offset + kv_head * kv_head_stride +
+                   window_start * position_stride;
+    uint score_base = meta.z + head * position_count;
+
+    // Phase 1: scaled q.k scores, lanes striding over positions; reduce the row max.
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32) {
+        uint k_base = kv_base + p * position_stride;
+        float s = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * keys[k_base + d];
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+        local_max = max(local_max, s);
+    }
+    float max_score = simd_max(local_max);
+
+    // Phase 2: exp(score - max) in place, reduce the denominator.
+    float local_sum = 0.0;
+    for (uint p = lane; p < position_count; p += 32) {
+        float e = exp(scores[score_base + p] - max_score);
+        scores[score_base + p] = e;
+        local_sum += e;
+    }
+    float inv = 1.0 / simd_sum(local_sum);
+
+    // Ensure every lane's score writes are visible before the weighted-value sum reads them.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Phase 3: out[d] = sum_p prob_p * v_p[d], lanes striding over the output dimensions so
+    // each lane owns a disjoint set of dims and writes them directly (no cross-lane reduce).
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            acc += scores[score_base + p] * inv * values[kv_base + p * position_stride + d];
+        }
+        output[q_base + d] = acc;
+    }
+}
+
 // ---- SPLIT-3 decode attention (bit-identical twin of attention_decode_f32) ------
 //
 // Why this exists. `attention_decode_f32` runs a whole layer's attention on exactly
@@ -11683,6 +11769,14 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_decode_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_function)
                 .ok()?;
+            let attention_decode_f32_rows_pipeline = elementwise_library
+                .get_function("attention_decode_f32_rows", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let attention_decode_scores_function = elementwise_library
                 .get_function("attention_decode_scores_f32", None)
                 .ok()?;
@@ -12579,6 +12673,7 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 scale_pipeline,
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
+                attention_decode_f32_rows_pipeline,
                 attention_decode_scores_pipeline,
                 attention_decode_softmax_pipeline,
                 attention_decode_context_pipeline,
@@ -13933,6 +14028,70 @@ fn gemma4_q4_row_ops_enabled() -> bool {
         std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
+}
+
+/// Default-off host-loop collapse for the dense Gemma verifier's f32 attention.
+/// The already-batched KV scatter remains a separate dispatch; this selector only
+/// replaces K independent score/softmax/context triples with one `(head,row)` grid.
+/// Any unsupported shape or scratch/metadata overflow falls back to the established
+/// per-row split-three path even when the selector is set.
+#[cfg(target_os = "macos")]
+fn gemma4_dense_attention_rows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// One row's explicit visibility contract for dense speculative attention.
+/// `visible_end` is exclusive and must equal `window_start + position_count`.
+/// `score_offset` indexes the packed f32 scratch (not bytes).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+struct Gemma4DenseAttentionRowMeta {
+    window_start: u32,
+    position_count: u32,
+    score_offset: u32,
+    visible_end: u32,
+}
+
+/// Build causal row metadata and return the exact packed-score scratch size in bytes.
+/// Only the verifier widths qualified by the dense runtime are admitted, including
+/// W16; every other width remains on the established per-row split-three fallback.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_dense_attention_row_plan(
+    base_position: usize,
+    rows: usize,
+    sliding_window: Option<usize>,
+    max_positions: usize,
+    n_heads: usize,
+) -> Option<(Vec<Gemma4DenseAttentionRowMeta>, usize)> {
+    if !matches!(rows, 1 | 2 | 4 | 8 | 16)
+        || n_heads == 0
+        || sliding_window == Some(0)
+        || base_position.checked_add(rows)? > max_positions
+    {
+        return None;
+    }
+    let mut plan = Vec::with_capacity(rows);
+    let mut score_elements = 0usize;
+    for row in 0..rows {
+        let visible_end = base_position.checked_add(row)?.checked_add(1)?;
+        let window_start = sliding_window.map_or(0, |window| visible_end.saturating_sub(window));
+        let position_count = visible_end.checked_sub(window_start)?;
+        plan.push(Gemma4DenseAttentionRowMeta {
+            window_start: u32::try_from(window_start).ok()?,
+            position_count: u32::try_from(position_count).ok()?,
+            score_offset: u32::try_from(score_elements).ok()?,
+            visible_end: u32::try_from(visible_end).ok()?,
+        });
+        score_elements = score_elements.checked_add(n_heads.checked_mul(position_count)?)?;
+    }
+    u32::try_from(score_elements).ok()?;
+    let score_bytes = score_elements.checked_mul(std::mem::size_of::<f32>())?;
+    Some((plan, score_bytes))
 }
 
 /// Diagnostic A/B selector for the row-major A-staging sibling. It has no
@@ -17265,49 +17424,76 @@ impl Gemma4ResidentModel {
                 }
             }
 
-            // Every row keeps its own immutable scalar blocks.  Reusing one
-            // host-visible argument buffer would make all queued dispatches see
-            // the last row's position at execution time.
-            for row in 0..columns {
-                let position = base_position + row;
-                let filled = position + 1;
-                let window_start = if sliding {
-                    filled.saturating_sub(SLIDING_WINDOW)
-                } else {
-                    0
-                };
-                let position_count = filled - window_start;
-                let attention_args = shared(32);
-                unsafe {
-                    let args = attention_args.contents().cast::<u8>();
-                    *args.cast::<u32>() = HEADS as u32;
-                    *args.add(4).cast::<u32>() = layer.head_dim as u32;
-                    *args.add(8).cast::<u32>() = position_count as u32;
-                    *args.add(12).cast::<u32>() = (HEADS / layer.n_kv_heads) as u32;
-                    *args.add(16).cast::<f32>() = 1.0;
-                    *args.add(20).cast::<u32>() = layer.head_dim as u32;
-                    *args.add(24).cast::<u32>() = (self.max_positions * layer.head_dim) as u32;
-                    *args.add(28).cast::<u32>() = (window_start * layer.head_dim) as u32;
-                }
-                let attention_blocks = shared(8);
-                encode_attention_split3(
+            // Q4's term slab is idle between the Q/K/V projections above and the O
+            // projection below, so the opt-in row-aware attention may reuse it as packed
+            // score scratch without adding a long-lived verifier allocation.  The encoder
+            // checks the exact byte requirement before binding it.  Any declined shape
+            // falls through to the established immutable per-row scalar blocks and 3*K
+            // score/softmax/context dispatches.
+            let batched_attention = gemma4_dense_attention_rows_enabled()
+                && encode_gemma4_dense_attention_rows_f32(
                     encoder,
                     kernel,
+                    &mut keep,
                     &scratch.q_normed,
                     cache_k,
                     cache_v,
-                    &scratch.scores,
-                    &scratch.denom,
+                    &scratch.q4_terms,
                     &scratch.context,
-                    &attention_args,
-                    &attention_blocks,
                     HEADS,
+                    layer.n_kv_heads,
                     layer.head_dim,
-                    position_count,
-                    (row * q_dim * 4) as u64,
-                    (row * q_dim * 4) as u64,
+                    self.max_positions,
+                    base_position,
+                    columns,
+                    sliding.then_some(SLIDING_WINDOW),
+                    1.0,
                 );
-                keep.extend([attention_args, attention_blocks]);
+            if !batched_attention {
+                // Every row keeps its own immutable scalar blocks.  Reusing one
+                // host-visible argument buffer would make all queued dispatches see
+                // the last row's position at execution time.
+                for row in 0..columns {
+                    let position = base_position + row;
+                    let filled = position + 1;
+                    let window_start = if sliding {
+                        filled.saturating_sub(SLIDING_WINDOW)
+                    } else {
+                        0
+                    };
+                    let position_count = filled - window_start;
+                    let attention_args = shared(32);
+                    unsafe {
+                        let args = attention_args.contents().cast::<u8>();
+                        *args.cast::<u32>() = HEADS as u32;
+                        *args.add(4).cast::<u32>() = layer.head_dim as u32;
+                        *args.add(8).cast::<u32>() = position_count as u32;
+                        *args.add(12).cast::<u32>() = (HEADS / layer.n_kv_heads) as u32;
+                        *args.add(16).cast::<f32>() = 1.0;
+                        *args.add(20).cast::<u32>() = layer.head_dim as u32;
+                        *args.add(24).cast::<u32>() = (self.max_positions * layer.head_dim) as u32;
+                        *args.add(28).cast::<u32>() = (window_start * layer.head_dim) as u32;
+                    }
+                    let attention_blocks = shared(8);
+                    encode_attention_split3(
+                        encoder,
+                        kernel,
+                        &scratch.q_normed,
+                        cache_k,
+                        cache_v,
+                        &scratch.scores,
+                        &scratch.denom,
+                        &scratch.context,
+                        &attention_args,
+                        &attention_blocks,
+                        HEADS,
+                        layer.head_dim,
+                        position_count,
+                        (row * q_dim * 4) as u64,
+                        (row * q_dim * 4) as u64,
+                    );
+                    keep.extend([attention_args, attention_blocks]);
+                }
             }
 
             let context_block_count = u32_arg(columns * context_blocks);
@@ -18250,6 +18436,139 @@ fn try_attention_decode_strided_split3_f32(
         kv_base_offset,
         true,
     )
+}
+
+/// Test-only exactness comparator for the dense row-aware f32 attention primitive.
+/// Both sides read the same already-populated cache in one command buffer: the oracle
+/// encodes the established split-three path once per row, then the candidate encodes
+/// one `(head,row)` dispatch using explicit causal metadata.
+#[cfg(all(target_os = "macos", test))]
+#[allow(clippy::too_many_arguments)]
+fn try_gemma4_dense_attention_rows_for_test(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_positions: usize,
+    base_position: usize,
+    rows: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let q_dim = n_heads.checked_mul(head_dim)?;
+    let cache_elements = n_kv_heads
+        .checked_mul(max_positions)?
+        .checked_mul(head_dim)?;
+    let (row_plan, score_bytes) = gemma4_dense_attention_row_plan(
+        base_position,
+        rows,
+        sliding_window,
+        max_positions,
+        n_heads,
+    )?;
+    if n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+        || query.len() != rows.checked_mul(q_dim)?
+        || keys.len() != cache_elements
+        || values.len() != cache_elements
+    {
+        return None;
+    }
+
+    let kernel = metal_linear_kernel()?;
+    let opts = MTLResourceOptions::StorageModeShared;
+    let buffer = |bytes: usize| kernel.device.new_buffer(bytes.max(4) as u64, opts);
+    let query_buf = buffer(std::mem::size_of_val(query));
+    let keys_buf = buffer(std::mem::size_of_val(keys));
+    let values_buf = buffer(std::mem::size_of_val(values));
+    let row_scores = buffer(
+        n_heads
+            .checked_mul(max_positions)?
+            .checked_mul(std::mem::size_of::<f32>())?,
+    );
+    let row_denom = buffer(n_heads.checked_mul(std::mem::size_of::<f32>())?);
+    let fused_scores = buffer(score_bytes);
+    let output_bytes = query.len().checked_mul(std::mem::size_of::<f32>())?;
+    let row_output = buffer(output_bytes);
+    let fused_output = buffer(output_bytes);
+    write_buffer_f32(&query_buf, query);
+    write_buffer_f32(&keys_buf, keys);
+    write_buffer_f32(&values_buf, values);
+    let poison = vec![f32::NAN; query.len()];
+    write_buffer_f32(&row_output, &poison);
+    write_buffer_f32(&fused_output, &poison);
+
+    let command = kernel.queue.new_command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    let mut keep = Vec::with_capacity(rows * 2 + 2);
+    for (row, meta) in row_plan.iter().enumerate() {
+        let scalar = buffer(32);
+        let blocks = buffer(8);
+        unsafe {
+            let args = scalar.contents().cast::<u8>();
+            *args.cast::<u32>() = n_heads as u32;
+            *args.add(4).cast::<u32>() = head_dim as u32;
+            *args.add(8).cast::<u32>() = meta.position_count;
+            *args.add(12).cast::<u32>() = (n_heads / n_kv_heads) as u32;
+            *args.add(16).cast::<f32>() = scale;
+            *args.add(20).cast::<u32>() = head_dim as u32;
+            *args.add(24).cast::<u32>() = (max_positions * head_dim) as u32;
+            *args.add(28).cast::<u32>() = meta.window_start * head_dim as u32;
+        }
+        encode_attention_split3(
+            encoder,
+            kernel,
+            &query_buf,
+            &keys_buf,
+            &values_buf,
+            &row_scores,
+            &row_denom,
+            &row_output,
+            &scalar,
+            &blocks,
+            n_heads,
+            head_dim,
+            meta.position_count as usize,
+            (row * q_dim * std::mem::size_of::<f32>()) as u64,
+            (row * q_dim * std::mem::size_of::<f32>()) as u64,
+        );
+        keep.extend([scalar, blocks]);
+    }
+    if !encode_gemma4_dense_attention_rows_f32(
+        encoder,
+        kernel,
+        &mut keep,
+        &query_buf,
+        &keys_buf,
+        &values_buf,
+        &fused_scores,
+        &fused_output,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_positions,
+        base_position,
+        rows,
+        sliding_window,
+        scale,
+    ) {
+        encoder.end_encoding();
+        return None;
+    }
+    encoder.end_encoding();
+    command.commit();
+    command.wait_until_completed();
+    if command.status() != metal::MTLCommandBufferStatus::Completed {
+        return None;
+    }
+    let mut rowwise = vec![0.0f32; query.len()];
+    let mut fused = vec![0.0f32; query.len()];
+    read_buffer_f32(&row_output, &mut rowwise);
+    read_buffer_f32(&fused_output, &mut fused);
+    drop(keep);
+    Some((rowwise, fused))
 }
 
 #[cfg(target_os = "macos")]
@@ -25266,6 +25585,138 @@ fn encode_attention_split3(
         },
         tg32,
     );
+}
+
+/// Encode all dense Gemma verifier rows through one f32 decode-attention dispatch.
+/// K/V have already been scattered.  The score slab is packed by each row's own
+/// visible count, and every row carries an explicit exclusive causal end; invalid
+/// geometry, metadata, or scratch capacity declines the encode so the caller can
+/// retain the established per-row split-three chain.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_dense_attention_rows_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    score_scratch: &Buffer,
+    out: &Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_positions: usize,
+    base_position: usize,
+    rows: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+) -> bool {
+    let Some(pipeline) = k.attention_decode_f32_rows_pipeline.as_ref() else {
+        return false;
+    };
+    let Some(group) = n_heads.checked_div(n_kv_heads) else {
+        return false;
+    };
+    let Some((row_plan, score_bytes)) = gemma4_dense_attention_row_plan(
+        base_position,
+        rows,
+        sliding_window,
+        max_positions,
+        n_heads,
+    ) else {
+        return false;
+    };
+    let Some(q_dim) = n_heads.checked_mul(head_dim) else {
+        return false;
+    };
+    let Some(query_elements) = rows.checked_mul(q_dim) else {
+        return false;
+    };
+    let Some(query_bytes) = query_elements.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(kv_head_stride) = max_positions.checked_mul(head_dim) else {
+        return false;
+    };
+    let Some(cache_elements) = n_kv_heads.checked_mul(kv_head_stride) else {
+        return false;
+    };
+    let Some(cache_bytes) = cache_elements.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    if n_kv_heads == 0
+        || group == 0
+        || n_heads % n_kv_heads != 0
+        || head_dim == 0
+        || !scale.is_finite()
+        || query.length() < query_bytes as u64
+        || out.length() < query_bytes as u64
+        || keys.length() < cache_bytes as u64
+        || values.length() < cache_bytes as u64
+        || score_scratch.length() < score_bytes as u64
+        || u32::try_from(n_heads).is_err()
+        || u32::try_from(head_dim).is_err()
+        || u32::try_from(rows).is_err()
+        || u32::try_from(group).is_err()
+        || u32::try_from(kv_head_stride).is_err()
+        || u32::try_from(query_elements).is_err()
+        || u32::try_from(cache_elements).is_err()
+    {
+        return false;
+    }
+
+    let scalars = k
+        .device
+        .new_buffer(32, MTLResourceOptions::StorageModeShared);
+    let row_meta = k.device.new_buffer(
+        (row_plan.len() * std::mem::size_of::<Gemma4DenseAttentionRowMeta>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    unsafe {
+        let args = scalars.contents().cast::<u8>();
+        *args.cast::<u32>() = n_heads as u32;
+        *args.add(4).cast::<u32>() = head_dim as u32;
+        *args.add(8).cast::<u32>() = rows as u32;
+        *args.add(12).cast::<u32>() = group as u32;
+        *args.add(16).cast::<f32>() = scale;
+        *args.add(20).cast::<u32>() = head_dim as u32;
+        *args.add(24).cast::<u32>() = kv_head_stride as u32;
+        *args.add(28).cast::<u32>() = 0;
+
+        let meta = row_meta.contents().cast::<u32>();
+        for (row, item) in row_plan.iter().enumerate() {
+            *meta.add(row * 4) = item.window_start;
+            *meta.add(row * 4 + 1) = item.position_count;
+            *meta.add(row * 4 + 2) = item.score_offset;
+            *meta.add(row * 4 + 3) = item.visible_end;
+        }
+    }
+
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(query), 0);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(2, Some(values), 0);
+    e.set_buffer(3, Some(score_scratch), 0);
+    e.set_buffer(4, Some(out), 0);
+    for index in 0..8u64 {
+        e.set_buffer(5 + index, Some(&scalars), index * 4);
+    }
+    e.set_buffer(13, Some(&row_meta), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: rows as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    keep.extend([scalars, row_meta]);
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -38322,7 +38773,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gemma4_w16_dense_verifier_scratch_extents_cover_every_row() {
-        use super::{gemma4_q4_mma_stage16_bytes, Gemma4Dense12bVerifierScratch};
+        use super::{
+            gemma4_dense_attention_row_plan, gemma4_q4_mma_stage16_bytes,
+            Gemma4Dense12bVerifierScratch,
+        };
 
         type Scratch = Gemma4Dense12bVerifierScratch;
         assert_eq!(Scratch::MAX_K, 16);
@@ -38343,6 +38797,21 @@ mod tests {
             Scratch::q4_work_bytes().unwrap()
                 >= gemma4_q4_mma_stage16_bytes(Scratch::FFN / 32).unwrap()
         );
+
+        // The fused attention sibling reuses the Q4 work slab only after Q/K/V
+        // projection and checks its exact byte need before encoding.  Pin the
+        // official 512-position W16 harness edge so that integration cannot
+        // silently resize one side without the other.
+        let (_, attention_bytes) = gemma4_dense_attention_row_plan(
+            512 - Scratch::MAX_K,
+            Scratch::MAX_K,
+            None,
+            512,
+            16,
+        )
+        .expect("W16 global attention plan at verifier capacity");
+        assert_eq!(attention_bytes, 516_608);
+        assert!(Scratch::q4_work_bytes().unwrap() >= attention_bytes);
     }
 
     #[cfg(target_os = "macos")]
@@ -49185,6 +49654,131 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, got2);
+    }
+
+    #[test]
+    fn gemma4_dense_attention_row_plan_pins_window_edges_and_packed_scratch() {
+        let (sliding, bytes) = gemma4_dense_attention_row_plan(1_023, 4, Some(1_024), 2_048, 16)
+            .expect("K4 sliding plan");
+        assert_eq!(
+            sliding
+                .iter()
+                .map(|row| (row.window_start, row.position_count, row.visible_end))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1_024, 1_024),
+                (1, 1_024, 1_025),
+                (2, 1_024, 1_026),
+                (3, 1_024, 1_027)
+            ],
+            "absolute positions 1023/1024/1025 must straddle the 1024-token window exactly",
+        );
+        assert_eq!(sliding[0].score_offset, 0);
+        assert_eq!(sliding[1].score_offset, 16 * 1_024);
+        assert_eq!(sliding[2].score_offset, 2 * 16 * 1_024);
+        assert_eq!(bytes, 4 * 16 * 1_024 * std::mem::size_of::<f32>());
+
+        let (global, global_bytes) =
+            gemma4_dense_attention_row_plan(1_023, 4, None, 2_048, 16).expect("K4 global plan");
+        assert_eq!(global[0].window_start, 0);
+        assert_eq!(global[0].position_count, 1_024);
+        assert_eq!(global[1].position_count, 1_025);
+        assert_eq!(global[2].position_count, 1_026);
+        assert_eq!(global[3].position_count, 1_027);
+        let global_positions = 1_024usize + 1_025 + 1_026 + 1_027;
+        assert_eq!(global_bytes, global_positions * 16 * 4);
+
+        assert!(gemma4_dense_attention_row_plan(7, 16, Some(1_024), 32, 16).is_some());
+        assert!(gemma4_dense_attention_row_plan(7, 3, Some(1_024), 32, 16).is_none());
+        assert!(gemma4_dense_attention_row_plan(7, 4, Some(0), 32, 16).is_none());
+        assert!(gemma4_dense_attention_row_plan(30, 4, None, 32, 16).is_none());
+    }
+
+    /// The fused dense verifier primitive must reproduce the established per-row
+    /// split-three path BIT-FOR-BIT for every qualified K.  The cases cover both
+    /// Gemma head widths, non-32-multiple position and dimension tails, the
+    /// 1023/1024/1025 sliding transition, global attention, and a K=16 rollback
+    /// shape whose cache retains poisoned rejected slots beyond the visible end.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_dense_attention_rows_is_bit_exact_and_causal() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // label, heads, kv_heads, head_dim, max_positions, base_position, rows, window
+        let cases: [(
+            &str,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            Option<usize>,
+        ); 5] = [
+            ("k1-global-dim-tail", 3, 1, 70, 48, 36, 1, None),
+            ("k2-sliding-256", 16, 8, 256, 1_040, 1_023, 2, Some(1_024)),
+            ("k4-global-512", 16, 1, 512, 48, 32, 4, None),
+            ("k8-sliding-tail", 4, 2, 96, 1_040, 1_020, 8, Some(1_024)),
+            ("k16-global-rollback", 4, 1, 65, 64, 32, 16, None),
+        ];
+        for (label, n_heads, n_kv_heads, head_dim, max_positions, base, rows, window) in cases {
+            let q_dim = n_heads * head_dim;
+            let query: Vec<f32> = (0..rows * q_dim)
+                .map(|index| ((index * 17 % 61) as f32 - 30.0) * 0.03125)
+                .collect();
+            let candidate_end = base + rows;
+            let mut keys = vec![0.0f32; n_kv_heads * max_positions * head_dim];
+            let mut values = vec![0.0f32; keys.len()];
+            for kv_head in 0..n_kv_heads {
+                for position in 0..max_positions {
+                    for dim in 0..head_dim {
+                        let index = (kv_head * max_positions + position) * head_dim + dim;
+                        let tail_poison = if position >= candidate_end {
+                            128.0
+                        } else {
+                            0.0
+                        };
+                        let candidate_marker = if position > base {
+                            (position - base) as f32 * 0.5
+                        } else {
+                            0.0
+                        };
+                        keys[index] = ((index * 13 % 47) as f32 - 23.0) * 0.015625
+                            + tail_poison
+                            + candidate_marker;
+                        values[index] = ((index * 19 % 53) as f32 - 26.0) * 0.015625
+                            - tail_poison
+                            - candidate_marker;
+                    }
+                }
+            }
+            let (rowwise, fused) = try_gemma4_dense_attention_rows_for_test(
+                &query,
+                &keys,
+                &values,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_positions,
+                base,
+                rows,
+                window,
+                1.0,
+            )
+            .unwrap_or_else(|| panic!("{label}: attention comparator declined"));
+            assert_eq!(rowwise.len(), rows * q_dim, "{label}: reference length");
+            assert_eq!(fused.len(), rowwise.len(), "{label}: fused length");
+            for (index, (&expected, &actual)) in rowwise.iter().zip(&fused).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{label} element {index}: fused={actual} ({:#010x}) != per-row={expected} ({:#010x})",
+                    actual.to_bits(),
+                    expected.to_bits(),
+                );
+            }
+        }
     }
 
     /// The three-dispatch decode attention must reproduce the single-kernel one

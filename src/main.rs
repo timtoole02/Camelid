@@ -5314,6 +5314,7 @@ async fn main() -> anyhow::Result<()> {
                         "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
                         "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok(),
+                        "CAMELID_GEMMA4_DENSE_ATTN_ROWS": std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS").ok(),
                         "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
                         "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
                         "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
@@ -5726,6 +5727,7 @@ async fn main() -> anyhow::Result<()> {
                         "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
                         "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
+                        "CAMELID_GEMMA4_DENSE_ATTN_ROWS": std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS").ok(),
                         "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
                         "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
                         "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
