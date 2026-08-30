@@ -1514,6 +1514,19 @@ pub struct LlamaGreedyVerifyCapture {
     pub timings: LlamaForwardTimings,
 }
 
+/// Opt-in resident target verification result with compact top-8 candidates per verifier row.
+///
+/// `predictions` is still produced by the ordinary greedy verifier path. `target_top_k` is an
+/// additional deterministic readback in verifier-row order, and `emitted` is the target-approved
+/// sequence actually committed by the host acceptance rule.
+#[derive(Debug, Clone)]
+pub struct LlamaTargetTopKVerify {
+    pub predictions: Vec<u32>,
+    pub target_top_k: Vec<[u32; 8]>,
+    pub emitted: Vec<u32>,
+    pub timings: LlamaForwardTimings,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaTensorCheckpoint {
     pub shape: Vec<usize>,

@@ -10,6 +10,13 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+/// Fixed candidate width exported by the opt-in resident verifier seam.
+///
+/// The ordinary greedy verifier does not allocate or dispatch this lane. Callers that opt in
+/// receive exactly this many target token ids for every verified row, in descending-logit order
+/// with the same lower-id tie break as the production greedy argmax.
+pub const RESIDENT_VERIFY_TARGET_TOP_K: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetalDeviceInfo {
     pub available: bool,
@@ -267,6 +274,7 @@ struct MetalLinearKernel {
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     argmax_f32_greedy_pipeline: ComputePipelineState,
+    topk8_f32_greedy_pipeline: ComputePipelineState,
     sample_gumbel_f32_pipeline: ComputePipelineState,
     attention_decode_splitk_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_pipeline: ComputePipelineState,
@@ -8950,6 +8958,58 @@ kernel void argmax_f32_greedy(
     }
 }
 
+// Opt-in target-candidate sibling of argmax_f32_greedy. This deliberately leaves the
+// production argmax kernel and output buffer untouched: it performs eight deterministic
+// repeated reductions into a compact [8] token-id row. Every pass uses the same strict-`>` /
+// lower-id tie contract as argmax_f32_greedy and excludes ids selected by earlier passes.
+// NaNs (and -INFINITY, matching the existing kernel) are never selected; exhausted ranks are
+// padded with UINT_MAX. The verifier dispatches this only for explicit target-top-k callers.
+kernel void topk8_f32_greedy(
+    device const float* logits [[buffer(0)]],
+    device uint* out_ids [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float sh_val[1024];
+    threadgroup uint sh_idx[1024];
+    threadgroup uint selected[8];
+    for (uint rank = 0; rank < 8; ++rank) {
+        float best = -INFINITY;
+        uint best_i = 0xffffffffu;
+        for (uint i = tid; i < count; i += tg_size) {
+            bool already_selected = false;
+            for (uint prior = 0; prior < rank; ++prior) {
+                already_selected = already_selected || selected[prior] == i;
+            }
+            const float v = logits[i];
+            if (!already_selected && v > best) {
+                best = v;
+                best_i = i;
+            }
+        }
+        sh_val[tid] = best;
+        sh_idx[tid] = best_i;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                const float ov = sh_val[tid + s];
+                const uint oi = sh_idx[tid + s];
+                if (ov > sh_val[tid] || (ov == sh_val[tid] && oi < sh_idx[tid])) {
+                    sh_val[tid] = ov;
+                    sh_idx[tid] = oi;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            selected[rank] = sh_idx[0];
+            out_ids[rank] = sh_idx[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // Temperature sampling via Gumbel-max. A categorical draw from
 // softmax(logits / temperature) is argmax(logit / temperature + Gumbel(0, 1)),
 // so one linear GPU pass replaces the full-logit host copy, softmax, and sort.
@@ -10784,6 +10844,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let argmax_f32_greedy_pipeline = device
                 .new_compute_pipeline_state_with_function(&argmax_f32_greedy_function)
                 .ok()?;
+            let topk8_f32_greedy_function = elementwise_library
+                .get_function("topk8_f32_greedy", None)
+                .ok()?;
+            let topk8_f32_greedy_pipeline = device
+                .new_compute_pipeline_state_with_function(&topk8_f32_greedy_function)
+                .ok()?;
             let sample_gumbel_f32_function = elementwise_library
                 .get_function("sample_gumbel_f32", None)
                 .ok()?;
@@ -11198,6 +11264,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 argmax_f32_greedy_pipeline,
+                topk8_f32_greedy_pipeline,
                 sample_gumbel_f32_pipeline,
                 attention_decode_splitk_pipeline,
                 attention_decode_splitk_kv16_pipeline,
@@ -31553,10 +31620,11 @@ impl ResidentDecodeState {
             k,
             scale,
             false,
+            false,
             None,
             &[],
         )
-        .map(|(preds, _, _)| preds)
+        .map(|(preds, _, _, _)| preds)
     }
 
     /// Resident speculative verify with snapshots of selected target decoder layer inputs.
@@ -31590,10 +31658,44 @@ impl ResidentDecodeState {
             k,
             scale,
             false,
+            false,
             None,
             capture_layer_ids,
         )
-        .map(|(preds, _, layer_inputs)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _)| (preds, layer_inputs))
+    }
+
+    /// Opt-in resident verification that additionally returns the exact target top-8 token ids
+    /// for every row. The predictions come from the unchanged production argmax dispatch and
+    /// buffer; the compact candidate matrix is produced by a separate sibling kernel, so callers
+    /// that use [`Self::verify_batch`] pay no allocation, dispatch, or readback for this seam.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_with_target_top_k(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Option<(Vec<u32>, Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>)> {
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            k,
+            scale,
+            false,
+            true,
+            None,
+            &[],
+        )
+        .map(|(preds, _, _, target_top_k)| (preds, target_top_k))
     }
 
     /// `verify_batch` that also reads back the `k * vocab` pre-argmax logits (the byte-exact
@@ -31622,10 +31724,11 @@ impl ResidentDecodeState {
             k,
             scale,
             true,
+            false,
             None,
             &[],
         )
-        .map(|(preds, logits, _)| (preds, logits))
+        .map(|(preds, logits, _, _)| (preds, logits))
     }
 
     /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
@@ -31647,9 +31750,15 @@ impl ResidentDecodeState {
         k: usize,
         scale: f32,
         read_logits: bool,
+        read_target_top_k: bool,
         tree: Option<&TreeAttn>,
         capture_layer_ids: &[usize],
-    ) -> Option<(Vec<u32>, Vec<f32>, Vec<Vec<f32>>)> {
+    ) -> Option<(
+        Vec<u32>,
+        Vec<f32>,
+        Vec<Vec<f32>>,
+        Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>,
+    )> {
         // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
         // The tree path widens the node cap to TREE_MAX_NODES (a tree of N nodes has at most
         // depth N-1); the linear path keeps the MAX_VERIFY_K window. `None`-tree callers see
@@ -31853,6 +31962,8 @@ impl ResidentDecodeState {
         let fnorm_buf = nb(k * hidden * 4);
         let logits_buf = nb(k * vocab * 4);
         let pred_buf = nb(k * 4);
+        let target_topk_buf =
+            read_target_top_k.then(|| nb(k * RESIDENT_VERIFY_TARGET_TOP_K * 4));
         let cos_buf = nb(cos_all.len() * 4);
         let sin_buf = nb(sin_all.len() * 4);
         let capture_bufs: Vec<Buffer> = capture_layer_ids
@@ -32334,6 +32445,30 @@ impl ResidentDecodeState {
                 },
             );
         }
+        if let Some(target_topk_buf) = target_topk_buf.as_ref() {
+            for i in (0..k).take_while(|_| !verify_ablate("argmax")) {
+                e.set_compute_pipeline_state(&kern.topk8_f32_greedy_pipeline);
+                e.set_buffer(0, Some(&logits_buf), (i * vocab * 4) as u64);
+                e.set_buffer(
+                    1,
+                    Some(target_topk_buf),
+                    (i * RESIDENT_VERIFY_TARGET_TOP_K * 4) as u64,
+                );
+                e.set_buffer(2, Some(&argmax_count), 0);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 1024,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
+        }
         e.end_encoding();
         let encode_us = encode_started.elapsed().as_micros();
         let commit_started = std::time::Instant::now();
@@ -32367,6 +32502,26 @@ impl ResidentDecodeState {
                 out
             })
             .collect();
+        let target_top_k = target_topk_buf
+            .as_ref()
+            .map(|buf| {
+                (0..k)
+                    .map(|row| {
+                        let mut ids = [u32::MAX; RESIDENT_VERIFY_TARGET_TOP_K];
+                        unsafe {
+                            let src = (buf.contents() as *const u32)
+                                .add(row * RESIDENT_VERIFY_TARGET_TOP_K);
+                            std::ptr::copy_nonoverlapping(
+                                src,
+                                ids.as_mut_ptr(),
+                                RESIDENT_VERIFY_TARGET_TOP_K,
+                            );
+                        }
+                        ids
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // The command buffer completed and every host readback above is
         // done: return the round's scratch (activations, scalars, staging
         // from the batched projections) to the pool.
@@ -32412,8 +32567,11 @@ impl ResidentDecodeState {
         }
         keep.extend(tree_tail_bufs);
         keep.extend(capture_bufs);
+        if let Some(buf) = target_topk_buf {
+            keep.push(buf);
+        }
         pool_recycle(kern, keep);
-        Some((preds, logits_out, layer_inputs))
+        Some((preds, logits_out, layer_inputs, target_top_k))
     }
 
     /// WIN2METAL Phase 4 — TREE speculative verify. Batched forward over the `n` BFS-ordered
@@ -32456,10 +32614,11 @@ impl ResidentDecodeState {
             n,
             scale,
             false,
+            false,
             Some(&tree),
             &[],
         )
-        .map(|(preds, _, _)| preds)
+        .map(|(preds, _, _, _)| preds)
     }
 
     /// Capture-capable twin of [`Self::verify_batch_tree`].  The forward, tree-attention
@@ -32494,10 +32653,47 @@ impl ResidentDecodeState {
             n,
             scale,
             false,
+            false,
             Some(&tree),
             capture_layer_ids,
         )
-        .map(|(preds, _, layer_inputs)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _)| (preds, layer_inputs))
+    }
+
+    /// Tree-attention twin of [`Self::verify_batch_with_target_top_k`]. Candidate rows retain
+    /// the tree's BFS verifier order, while greedy predictions still come from the existing
+    /// production argmax buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_tree_with_target_top_k(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+    ) -> Option<(Vec<u32>, Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>)> {
+        let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            n,
+            scale,
+            false,
+            true,
+            Some(&tree),
+            &[],
+        )
+        .map(|(preds, _, _, target_top_k)| (preds, target_top_k))
     }
 
     /// `verify_batch_tree` that also reads back the `n * vocab` pre-argmax logits (the gate
@@ -32529,10 +32725,11 @@ impl ResidentDecodeState {
             n,
             scale,
             true,
+            false,
             Some(&tree),
             &[],
         )
-        .map(|(preds, logits, _)| (preds, logits))
+        .map(|(preds, logits, _, _)| (preds, logits))
     }
 
     /// Build the per-node `TreeAttn` descriptor from the ancestor bitset. For node `i`, scan
@@ -49147,6 +49344,32 @@ mod tests {
             assert_eq!(preds.len(), k);
             assert_eq!(cand_logits.len(), k * vocab);
 
+            // Opt-in target-candidate seam: the authoritative predictions still come from
+            // the old argmax buffer, and every compact row equals repeated CPU first-max.
+            let mut topk_session = mk_session();
+            let stage = make_stage();
+            let (topk_preds, target_top_k) = topk_session
+                .verify_batch_with_target_top_k(
+                    &emb_all, &cos_all, &sin_all, &weights, &stage, base, k, scale,
+                )
+                .expect("verify target top-k eligible");
+            assert_eq!(topk_preds, preds, "k={k}: opt-in must not change predictions");
+            assert_eq!(target_top_k.len(), k);
+            for (row, logits) in ref_logits.iter().enumerate() {
+                let mut expected = [u32::MAX; RESIDENT_VERIFY_TARGET_TOP_K];
+                for rank in 0..RESIDENT_VERIFY_TARGET_TOP_K {
+                    let mut best = f32::NEG_INFINITY;
+                    for (id, &value) in logits.iter().enumerate() {
+                        if !expected[..rank].contains(&(id as u32)) && value > best {
+                            best = value;
+                            expected[rank] = id as u32;
+                        }
+                    }
+                }
+                assert_eq!(target_top_k[row], expected, "base={base} k={k} row={row}");
+                assert_eq!(target_top_k[row][0], preds[row]);
+            }
+
             // Capture candidate: predictions must be unchanged, layer 0 must snapshot the
             // input embeddings exactly, and layer 1 must equal the independent one-layer
             // token-by-token oracle above.
@@ -49221,8 +49444,11 @@ mod tests {
             );
         };
 
-        // C2: straddle the 128 split-K boundary (rows pc in [127..132]).
-        run(126, 6);
+        // Candidate-readback parity at the requested verifier widths. N=3/7/8 straddle the
+        // split-K boundary; N=1 proves the single-row API remains the same prediction path.
+        for k in [1, 3, 7, 8] {
+            run(126, k);
+        }
         // C3: deep split-K (rows pc in [511..516], n_splits varies).
         run(510, 6);
     }
@@ -49453,6 +49679,28 @@ mod tests {
             assert_eq!(tree_preds.len(), k);
             assert_eq!(tree_logits.len(), k * vocab);
 
+            let mut topk_tree_session = mk_session();
+            let stage = make_stage();
+            let (topk_tree_preds, target_top_k) = topk_tree_session
+                .verify_batch_tree_with_target_top_k(
+                    &emb_all,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    base,
+                    k,
+                    scale,
+                )
+                .expect("verify_batch_tree target top-k eligible");
+            assert_eq!(topk_tree_preds, tree_preds);
+            for row in 0..k {
+                assert_eq!(target_top_k[row][0], tree_preds[row]);
+            }
+
             // Capture-capable tree seam: predictions are unchanged and layer 0 is the exact
             // BFS-ordered input embedding matrix. This exercises the same tree descriptor and
             // verify_batch_inner capture buffers the EAGLE host path consumes.
@@ -49587,6 +49835,31 @@ mod tests {
                 )
                 .expect("verify_batch_tree eligible");
             assert_eq!(predicted.len(), n);
+
+            // The same genuinely branching ancestor mask through the opt-in candidate lane
+            // must preserve every production greedy prediction and row order.
+            let mut topk_tree_session = mk_session();
+            let stage = make_stage();
+            let (topk_predictions, target_top_k) = topk_tree_session
+                .verify_batch_tree_with_target_top_k(
+                    &emb_node,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    base,
+                    n,
+                    scale,
+                )
+                .expect("branching verify target top-k eligible");
+            assert_eq!(topk_predictions, predicted);
+            assert_eq!(target_top_k.len(), n);
+            for row in 0..n {
+                assert_eq!(target_top_k[row][0], predicted[row]);
+            }
 
             // Craft tokens so accept_longest_path follows the right branch 0 -> 2 -> 5 (a
             // genuine reorder: path[1]=2!=1 and path[2]=5!=2, so compaction does real work).
@@ -49811,19 +50084,28 @@ mod tests {
             vec![1.0, 5.0, 5.0, 3.0, 5.0], // tie -> lowest index (1)
             vec![7.0, 1.0, 2.0],           // max at 0
             vec![-3.0, -1.5, -2.0],        // all negative
+            vec![f32::NAN, 5.0, f32::NAN, 5.0, 4.0], // NaNs ignored; tie -> id 1
+            vec![f32::NAN, f32::NAN],      // no selectable id -> UINT_MAX
+            vec![f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY],
             (0..1000)
                 .map(|i| if i == 999 { 10.0 } else { 0.0 })
                 .collect(), // max at end
             vec![42.0],                    // single element
         ];
         for logits in cases {
-            let mut best_idx = 0usize;
-            let mut best = f32::NEG_INFINITY;
-            for (i, &v) in logits.iter().enumerate() {
-                if v > best {
-                    best = v;
-                    best_idx = i;
+            // Repeated application of the production sampler contract is the exact top-8
+            // oracle: strict greater-than, ascending-id scan, NaN/-INF never selected.
+            let mut expected = [u32::MAX; RESIDENT_VERIFY_TARGET_TOP_K];
+            for rank in 0..RESIDENT_VERIFY_TARGET_TOP_K {
+                let mut best = f32::NEG_INFINITY;
+                let mut best_idx = u32::MAX;
+                for (i, &v) in logits.iter().enumerate() {
+                    if !expected[..rank].contains(&(i as u32)) && v > best {
+                        best = v;
+                        best_idx = i as u32;
+                    }
                 }
+                expected[rank] = best_idx;
             }
             let lb = k.device.new_buffer_with_data(
                 logits.as_ptr() as *const _,
@@ -49833,6 +50115,11 @@ mod tests {
             let ib = k
                 .device
                 .new_buffer(4, MTLResourceOptions::StorageModeShared);
+            // Two independent rows prove ordering is stable across repeated dispatches.
+            let topk_ib = k.device.new_buffer(
+                (2 * RESIDENT_VERIFY_TARGET_TOP_K * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             let cb_scalar = k
                 .device
                 .new_buffer(4, MTLResourceOptions::StorageModeShared);
@@ -49855,11 +50142,43 @@ mod tests {
                     depth: 1,
                 },
             );
+            for repeat in 0..2 {
+                e.set_compute_pipeline_state(&k.topk8_f32_greedy_pipeline);
+                e.set_buffer(0, Some(&lb), 0);
+                e.set_buffer(
+                    1,
+                    Some(&topk_ib),
+                    (repeat * RESIDENT_VERIFY_TARGET_TOP_K * 4) as u64,
+                );
+                e.set_buffer(2, Some(&cb_scalar), 0);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 1024,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
             let got = unsafe { *(ib.contents() as *const u32) };
-            assert_eq!(got as usize, best_idx, "len {}", logits.len());
+            assert_eq!(got, expected[0], "greedy len {}", logits.len());
+            for repeat in 0..2 {
+                let got_topk: [u32; RESIDENT_VERIFY_TARGET_TOP_K] = std::array::from_fn(|rank| {
+                    unsafe {
+                        *(topk_ib.contents() as *const u32)
+                            .add(repeat * RESIDENT_VERIFY_TARGET_TOP_K + rank)
+                    }
+                });
+                assert_eq!(got_topk, expected, "top-k len {} repeat {repeat}", logits.len());
+                assert_eq!(got_topk[0], got, "top-1 must equal production greedy");
+            }
         }
     }
 

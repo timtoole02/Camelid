@@ -1423,8 +1423,8 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[])?
-            .map(|(emitted, _capture)| emitted))
+            .verify_tree_metal_inner(tree, &[], false)?
+            .map(|(emitted, _capture, _target_top_k)| emitted))
     }
 
     /// EAGLE-3 tree target seam: the ordinary target-authoritative tree verify plus snapshots
@@ -1438,8 +1438,27 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids)?
-            .map(|(_emitted, capture)| capture))
+            .verify_tree_metal_inner(tree, capture_layer_ids, false)?
+            .map(|(_emitted, capture, _target_top_k)| capture))
+    }
+
+    /// Experimental target-candidate seam for benchmark Token Recycling. This is opt-in and
+    /// leaves [`Self::verify_tree_metal`] on its original resident API and greedy prediction
+    /// buffer. Candidate rows retain BFS tree order so each row can train the adjacency for the
+    /// token that was verified in that row.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_target_top_k(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+    ) -> Result<Option<LlamaTargetTopKVerify>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, &[], true)?
+            .map(|(emitted, capture, target_top_k)| LlamaTargetTopKVerify {
+                predictions: capture.predictions,
+                target_top_k,
+                emitted,
+                timings: capture.timings,
+            }))
     }
 
     #[cfg(target_os = "macos")]
@@ -1447,7 +1466,14 @@ impl super::LlamaInferenceSession {
         &mut self,
         tree: &spec_tree::TokenTree,
         capture_layer_ids: &[usize],
-    ) -> Result<Option<(Vec<u32>, LlamaGreedyVerifyCapture)>> {
+        read_target_top_k: bool,
+    ) -> Result<
+        Option<(
+            Vec<u32>,
+            LlamaGreedyVerifyCapture,
+            Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>,
+        )>,
+    > {
         use spec_tree::TREE_MAX_NODES;
         if self.resident_paths_disabled || !resident_decode_metal_enabled() {
             return Ok(None);
@@ -1554,7 +1580,25 @@ impl super::LlamaInferenceSession {
             .expect("resident session present (readiness checked above)");
         // Keep the existing no-capture entry point byte-for-byte on its original Metal API.
         // Only the new EAGLE seam asks verify_batch_inner to retain layer-input buffers.
-        let (predicted, raw_layer_inputs) = if capture_layer_ids.is_empty() {
+        let (predicted, raw_layer_inputs, target_top_k) = if read_target_top_k {
+            debug_assert!(capture_layer_ids.is_empty());
+            let Some((predicted, target_top_k)) = session.verify_batch_tree_with_target_top_k(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+            ) else {
+                return Ok(None);
+            };
+            (predicted, Vec::new(), target_top_k)
+        } else if capture_layer_ids.is_empty() {
             let Some(predicted) = session.verify_batch_tree(
                 &embeddings.data,
                 &cos_all,
@@ -1570,7 +1614,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (predicted, Vec::new())
+            (predicted, Vec::new(), Vec::new())
         } else {
             let Some(captured) = session.verify_batch_tree_with_layer_inputs(
                 &embeddings.data,
@@ -1588,7 +1632,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            captured
+            (captured.0, captured.1, Vec::new())
         };
 
         // Host accept: longest greedy-exact path through the tree, then COMPACT the accepted
@@ -1638,6 +1682,7 @@ impl super::LlamaInferenceSession {
                 layer_inputs,
                 timings: LlamaForwardTimings::default(),
             },
+            target_top_k,
         )))
     }
 
@@ -1684,6 +1729,16 @@ impl super::LlamaInferenceSession {
         _tree: &spec_tree::TokenTree,
         _capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: resident target top-k verification is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_target_top_k(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+    ) -> Result<Option<LlamaTargetTopKVerify>> {
         Ok(None)
     }
 }
