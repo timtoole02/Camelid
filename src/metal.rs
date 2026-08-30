@@ -15410,6 +15410,296 @@ fn encode_q8_matmul_f32y(
     );
 }
 
+/// The format-independent activation side of one V4 K-quant contraction.
+///
+/// Q4_K and Q6_K consume the same strict Q8_K scales and the same half staging
+/// panel. Q4_K additionally consumes the 16-value activation sums used by its
+/// mins term. Keeping those buffers separate from the projection makes it safe
+/// for verifier Q/K/V and gate/up projections to read one immutable prepared
+/// activation instead of quantizing and staging the same normalized rows for
+/// every weight matrix.
+#[cfg(target_os = "macos")]
+struct KquantV4ActivationStage {
+    y_stage: Buffer,
+    ysums: Option<Buffer>,
+    scalar: Buffer,
+    n_sb: usize,
+    input_width: usize,
+    n_tokens: usize,
+    k_pad: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl KquantV4ActivationStage {
+    fn recycle_into(self, keep: &mut Vec<Buffer>) {
+        keep.push(self.y_stage);
+        if let Some(ysums) = self.ysums {
+            keep.push(ysums);
+        }
+        keep.push(self.scalar);
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct SharedKquantV4Activation {
+    scales: Buffer,
+    quants: Buffer,
+    stage: KquantV4ActivationStage,
+}
+
+#[cfg(target_os = "macos")]
+impl SharedKquantV4Activation {
+    fn recycle_into(self, keep: &mut Vec<Buffer>) {
+        keep.extend([self.scales, self.quants]);
+        self.stage.recycle_into(keep);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_kquant_v4_activation_stage(
+    k: &MetalLinearKernel,
+    input_width: usize,
+    n_tokens: usize,
+    with_ysums: bool,
+) -> KquantV4ActivationStage {
+    debug_assert!(input_width > 0 && input_width.is_multiple_of(256));
+    debug_assert!((1..=KQUANT_V4_MAX_COLUMNS).contains(&n_tokens));
+    let n_sb = input_width / 256;
+    let k_pad = if n_tokens <= 8 { 8 } else { 16 };
+    let y_stage = pool_get(k, (input_width * k_pad * 2) as u64);
+    let ysums = with_ysums.then(|| pool_get(k, (n_sb * 16 * k_pad * 2) as u64));
+    let scalar = pool_get(k, 24);
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = n_sb as u32; //             @0
+        *p.add(1) = 0; //                @4 (projection rows live elsewhere)
+        *p.add(2) = n_tokens as u32; //  @8
+        *p.add(3) = input_width as u32; // @12
+        *p.add(4) = k_pad as u32; //     @16
+    }
+    KquantV4ActivationStage {
+        y_stage,
+        ysums,
+        scalar,
+        n_sb,
+        input_width,
+        n_tokens,
+        k_pad,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn encode_kquant_v4_activation_stage(
+    e: &metal::ComputeCommandEncoderRef,
+    v4: &KquantV2Kernels,
+    quants: &Buffer,
+    stage: &KquantV4ActivationStage,
+) {
+    e.set_compute_pipeline_state(&v4.q4k_mma_stage_y);
+    e.set_buffer(0, Some(quants), 0);
+    e.set_buffer(1, Some(&stage.y_stage), 0);
+    e.set_buffer(2, Some(&stage.scalar), 12);
+    e.set_buffer(3, Some(&stage.scalar), 8);
+    e.set_buffer(4, Some(&stage.scalar), 16);
+    dispatch_1d(e, &v4.q4k_mma_stage_y, stage.input_width * stage.k_pad);
+
+    if let Some(ysums) = stage.ysums.as_ref() {
+        e.set_compute_pipeline_state(&v4.q4k_mma_stage_ysums);
+        e.set_buffer(0, Some(quants), 0);
+        e.set_buffer(1, Some(ysums), 0);
+        e.set_buffer(2, Some(&stage.scalar), 0);
+        e.set_buffer(3, Some(&stage.scalar), 8);
+        e.set_buffer(4, Some(&stage.scalar), 16);
+        dispatch_1d(e, &v4.q4k_mma_stage_ysums, stage.n_sb * 16 * stage.k_pad);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_kquant_v4_prepared_projection(
+    e: &metal::ComputeCommandEncoderRef,
+    v4: &KquantV2Kernels,
+    scales: &Buffer,
+    stage: &KquantV4ActivationStage,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    let is_q6k = match weight.format {
+        ResidentWeightFormat::Q4K => false,
+        ResidentWeightFormat::Q6K => true,
+        _ => unreachable!("V4 prepared projection requires Q4_K or Q6_K"),
+    };
+    let wide = stage.n_tokens > 8;
+    let pipeline = match (is_q6k, wide) {
+        (false, false) => &v4.q4k_v4,
+        (false, true) => &v4.q4k_v4_w16,
+        (true, false) => &v4.q6k_v4,
+        (true, true) => &v4.q6k_v4_w16,
+    };
+    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows);
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(scales), 0);
+    e.set_buffer(2, Some(&weight.buffer), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    e.set_buffer(7, Some(&stage.y_stage), 0);
+    if !is_q6k {
+        e.set_buffer(
+            8,
+            Some(
+                stage
+                    .ysums
+                    .as_ref()
+                    .expect("Q4_K V4 projection requires staged activation sums"),
+            ),
+            0,
+        );
+    }
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(8) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: if wide { 64 } else { 32 },
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn encode_shared_kquant_v4_activation(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    v4: &KquantV2Kernels,
+    y: &Buffer,
+    input_width: usize,
+    n_tokens: usize,
+) -> SharedKquantV4Activation {
+    let n_sb = input_width / 256;
+    let scales = pool_get(k, (n_tokens * n_sb * 4) as u64);
+    let quants = pool_get(k, (n_tokens * input_width) as u64);
+    // A shared verifier preparation always includes ysums: a mixed Q4/Q6
+    // projection group can then reuse one panel, while Q6 simply ignores it.
+    let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true);
+
+    e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(1, Some(&scales), 0);
+    e.set_buffer(2, Some(&quants), 0);
+    e.set_buffer(3, Some(&stage.scalar), 0);
+    e.set_buffer(4, Some(&stage.scalar), 8);
+    dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+    encode_kquant_v4_activation_stage(e, v4, &quants, &stage);
+
+    SharedKquantV4Activation {
+        scales,
+        quants,
+        stage,
+    }
+}
+
+/// Default-on inside the explicit V4 arithmetic universe. The opt-out exists
+/// only to make verifier-round A/B timings possible without changing any other
+/// kernel or numerical choice.
+#[cfg(target_os = "macos")]
+fn kquant_v4_shared_prep_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_KQUANT_V4_SHARED_PREP")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn trace_kquant_v4_shared_prep(projections: usize, n_tokens: usize, input_width: usize) {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    if !*TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()) {
+        return;
+    }
+    let bit = if projections == 3 { 1 } else { 2 };
+    if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        eprintln!(
+            "[metal-kquant-v4] shared_prep projections={projections} \
+             n_tokens={n_tokens} input_width={input_width}"
+        );
+    }
+}
+
+/// Encode a verifier projection group that reads the same activation rows.
+/// Returns false before emitting anything unless the complete group is eligible
+/// for the narrow V4 lane, so callers can safely fall back projection-by-
+/// projection. At N=8 this turns Q/K/V from 11 dispatches into 6 and gate/up
+/// from 8 into 5 without changing the V4 projection kernel or its operands.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_resident_kquant_v4_shared_group(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    y: &Buffer,
+    projections: &[(&ResidentLinearWeight, &Buffer, &Buffer, usize)],
+    input_width: usize,
+    n_tokens: usize,
+) -> bool {
+    if projections.is_empty()
+        || !kquant_v4_enabled()
+        || !kquant_v4_shared_prep_enabled()
+        || !(1..=8).contains(&n_tokens)
+        || input_width == 0
+        || !input_width.is_multiple_of(256)
+        || projections.iter().any(|(weight, _, _, rows)| {
+            *rows == 0
+                || !matches!(
+                    weight.format,
+                    ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+                )
+        })
+    {
+        return false;
+    }
+    let Some(v4) = kquant_v2_kernels() else {
+        return false;
+    };
+
+    // Shared scalar buffers are legal only when every use writes the same
+    // metadata (the verifier's K/V and gate/up pairs do). Populate all of them
+    // before encoding GPU work so no command can observe an intermediate host
+    // value from a later projection.
+    for &(_, _, scalar, rows) in projections {
+        unsafe {
+            let p = scalar.contents() as *mut u32;
+            *p = (input_width / 256) as u32;
+            *p.add(1) = rows as u32;
+            *p.add(2) = n_tokens as u32;
+        }
+    }
+
+    let prepared = encode_shared_kquant_v4_activation(e, k, v4, y, input_width, n_tokens);
+    for &(weight, out, scalar, rows) in projections {
+        encode_kquant_v4_prepared_projection(
+            e,
+            v4,
+            &prepared.scales,
+            &prepared.stage,
+            weight,
+            out,
+            scalar,
+            rows,
+        );
+    }
+    trace_kquant_v4_shared_prep(projections.len(), n_tokens, input_width);
+    prepared.recycle_into(keep);
+    true
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_resident_matmul_f32(
@@ -15932,79 +16222,14 @@ fn encode_resident_kquant_matmul_f32(
     dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
 
     if let Some(v4) = v4 {
-        trace_kquant_v4_dispatch(weight.format, n_tokens, rows);
-        let k_pad = if n_tokens <= 8 { 8 } else { 16 };
-        let wide = n_tokens > 8;
         let is_q6k = matches!(weight.format, ResidentWeightFormat::Q6K);
         // Both v4 formats stage quantized activations as half: every Q8_K
         // code is exactly representable. Q6's intentional rounding happens
         // only when its row-dependent dequantized weights enter half A.
-        let y_stage = pool_get(k, (input_width * k_pad * 2) as u64);
-        let v4_scalar = pool_get(k, 24);
-        unsafe {
-            let p = v4_scalar.contents() as *mut u32;
-            *p = n_sb as u32; //             @0
-            *p.add(1) = rows as u32; //      @4
-            *p.add(2) = n_tokens as u32; //  @8
-            *p.add(3) = input_width as u32; // @12
-            *p.add(4) = k_pad as u32; //     @16
-        }
-        e.set_compute_pipeline_state(&v4.q4k_mma_stage_y);
-        e.set_buffer(0, Some(quants), 0);
-        e.set_buffer(1, Some(&y_stage), 0);
-        e.set_buffer(2, Some(&v4_scalar), 12);
-        e.set_buffer(3, Some(&v4_scalar), 8);
-        e.set_buffer(4, Some(&v4_scalar), 16);
-        dispatch_1d(e, &v4.q4k_mma_stage_y, input_width * k_pad);
-
-        let ysums = if is_q6k {
-            None
-        } else {
-            let ysums = pool_get(k, (n_sb * 16 * k_pad * 2) as u64);
-            e.set_compute_pipeline_state(&v4.q4k_mma_stage_ysums);
-            e.set_buffer(0, Some(quants), 0);
-            e.set_buffer(1, Some(&ysums), 0);
-            e.set_buffer(2, Some(&v4_scalar), 0);
-            e.set_buffer(3, Some(&v4_scalar), 8);
-            e.set_buffer(4, Some(&v4_scalar), 16);
-            dispatch_1d(e, &v4.q4k_mma_stage_ysums, n_sb * 16 * k_pad);
-            Some(ysums)
-        };
-
-        let v4_pipeline = match (is_q6k, wide) {
-            (false, false) => &v4.q4k_v4,
-            (false, true) => &v4.q4k_v4_w16,
-            (true, false) => &v4.q6k_v4,
-            (true, true) => &v4.q6k_v4_w16,
-        };
-        e.set_compute_pipeline_state(v4_pipeline);
-        e.set_buffer(0, Some(scales), 0);
-        e.set_buffer(2, Some(&weight.buffer), 0);
-        e.set_buffer(3, Some(out), 0);
-        e.set_buffer(4, Some(&v4_scalar), 0);
-        e.set_buffer(5, Some(&v4_scalar), 4);
-        e.set_buffer(6, Some(&v4_scalar), 8);
-        e.set_buffer(7, Some(&y_stage), 0);
-        if let Some(ysums) = ysums.as_ref() {
-            e.set_buffer(8, Some(ysums), 0);
-        }
-        e.dispatch_thread_groups(
-            metal::MTLSize {
-                width: rows.div_ceil(8) as u64,
-                height: 1,
-                depth: 1,
-            },
-            metal::MTLSize {
-                width: if wide { 64 } else { 32 },
-                height: 1,
-                depth: 1,
-            },
-        );
-        keep.push(y_stage);
-        if let Some(ysums) = ysums {
-            keep.push(ysums);
-        }
-        keep.push(v4_scalar);
+        let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, !is_q6k);
+        encode_kquant_v4_activation_stage(e, v4, quants, &stage);
+        encode_kquant_v4_prepared_projection(e, v4, scales, &stage, weight, out, scalar, rows);
+        stage.recycle_into(keep);
         return;
     }
 
@@ -31431,15 +31656,29 @@ impl ResidentDecodeState {
             // 1. input RMSNorm (batched, byte-exact vs single rms_norm_f32 per row)
             encode_rms_norm_batch(kern, e, cur, &attn_norm_bufs[l], &norm_buf, &rms_scalar, k);
             // 2. Q/K/V projections (batched-column GEMV; column t == single-token row t)
-            encode_resident_matmul_f32(
-                e, kern, &mut keep, &norm_buf, &w[0], &q_buf, &q_gemv, hidden, q_dim, k,
-            );
-            encode_resident_matmul_f32(
-                e, kern, &mut keep, &norm_buf, &w[1], &k_buf, &kv_gemv, hidden, kv_dim, k,
-            );
-            encode_resident_matmul_f32(
-                e, kern, &mut keep, &norm_buf, &w[2], &v_buf, &kv_gemv, hidden, kv_dim, k,
-            );
+            if !encode_resident_kquant_v4_shared_group(
+                e,
+                kern,
+                &mut keep,
+                &norm_buf,
+                &[
+                    (&w[0], &q_buf, &q_gemv, q_dim),
+                    (&w[1], &k_buf, &kv_gemv, kv_dim),
+                    (&w[2], &v_buf, &kv_gemv, kv_dim),
+                ],
+                hidden,
+                k,
+            ) {
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &norm_buf, &w[0], &q_buf, &q_gemv, hidden, q_dim, k,
+                );
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &norm_buf, &w[1], &k_buf, &kv_gemv, hidden, kv_dim, k,
+                );
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &norm_buf, &w[2], &v_buf, &kv_gemv, hidden, kv_dim, k,
+                );
+            }
             // 3. per-head Q/K-norm (Qwen3) — per row, in place
             if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
                 for i in (0..k).take_while(|_| !verify_ablate("qknorm")) {
@@ -31630,30 +31869,43 @@ impl ResidentDecodeState {
             );
             // --- FFN block (all batched / elementwise) ---
             encode_rms_norm_batch(kern, e, &mid, &ffn_norm_bufs[l], &norm_buf, &rms_scalar, k);
-            encode_resident_matmul_f32(
+            if !encode_resident_kquant_v4_shared_group(
                 e,
                 kern,
                 &mut keep,
                 &norm_buf,
-                &w[4],
-                &gate_buf,
-                &gateup_gemv,
+                &[
+                    (&w[4], &gate_buf, &gateup_gemv, ffn_dim),
+                    (&w[5], &up_buf, &gateup_gemv, ffn_dim),
+                ],
                 hidden,
-                ffn_dim,
                 k,
-            );
-            encode_resident_matmul_f32(
-                e,
-                kern,
-                &mut keep,
-                &norm_buf,
-                &w[5],
-                &up_buf,
-                &gateup_gemv,
-                hidden,
-                ffn_dim,
-                k,
-            );
+            ) {
+                encode_resident_matmul_f32(
+                    e,
+                    kern,
+                    &mut keep,
+                    &norm_buf,
+                    &w[4],
+                    &gate_buf,
+                    &gateup_gemv,
+                    hidden,
+                    ffn_dim,
+                    k,
+                );
+                encode_resident_matmul_f32(
+                    e,
+                    kern,
+                    &mut keep,
+                    &norm_buf,
+                    &w[5],
+                    &up_buf,
+                    &gateup_gemv,
+                    hidden,
+                    ffn_dim,
+                    k,
+                );
+            }
             encode_binary(
                 e,
                 &kern.silu_mul_pipeline,
@@ -35704,6 +35956,264 @@ mod tests {
              below would be against untouched memory, not a numerical result",
             values.len()
         );
+    }
+
+    /// Model-free exactness gate for verifier activation sharing. Three
+    /// independent Q4/Q4/Q6 preparations are the control; the candidate
+    /// quantizes and stages once, then fans that immutable activation panel out
+    /// to all three V4 projections. The comparison is exact u32 output bits.
+    /// Narrow widths also read the staging buffers back and prove every padded
+    /// column is initialized to +0 rather than stale pooled memory.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_shared_prep_is_bit_identical_and_zero_padded() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        let device = &kernel.device;
+        let n_sb = 2usize;
+        let input_width = n_sb * 256;
+
+        let make_weight = |format: ResidentWeightFormat, rows: usize, salt: usize| {
+            let wire_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * wire_bytes)
+                .map(|i| ((i * 41 + i / 17 + salt * 29) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(wire_bytes).enumerate() {
+                let d = 0.006 + block_index as f32 * 0.0001;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.375).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let buffer =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&buffer, &wire);
+            ResidentLinearWeight {
+                format,
+                buffer,
+                q8_wire: false,
+            }
+        };
+
+        let q_rows = 19usize; // ragged 8-row output tile
+        let kv_rows = 11usize;
+        let q_weight = make_weight(ResidentWeightFormat::Q4K, q_rows, 3);
+        let k_weight = make_weight(ResidentWeightFormat::Q4K, kv_rows, 7);
+        let v_weight = make_weight(ResidentWeightFormat::Q6K, kv_rows, 11);
+
+        for n_tokens in [1usize, 3, 7, 8] {
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| {
+                    let token = i / input_width;
+                    let col = i % input_width;
+                    ((((token * 131 + col * 17) % 251) as f32) - 125.0) * 0.017
+                        + token as f32 * 0.0011
+                })
+                .collect();
+            let input_buf = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+
+            let make_scalar = |rows: usize| {
+                let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = scalar.contents() as *mut u32;
+                    *p = n_sb as u32;
+                    *p.add(1) = rows as u32;
+                    *p.add(2) = n_tokens as u32;
+                }
+                scalar
+            };
+            let q_scalar = make_scalar(q_rows);
+            let k_scalar = make_scalar(kv_rows);
+            let v_scalar = make_scalar(kv_rows);
+            let poison_stage = |stage: &KquantV4ActivationStage| unsafe {
+                std::ptr::write_bytes(
+                    stage.y_stage.contents().cast::<u8>(),
+                    0xff,
+                    input_width * stage.k_pad * 2,
+                );
+                if let Some(ysums) = stage.ysums.as_ref() {
+                    std::ptr::write_bytes(
+                        ysums.contents().cast::<u8>(),
+                        0xff,
+                        n_sb * 16 * stage.k_pad * 2,
+                    );
+                }
+            };
+            let make_output = |rows: usize| {
+                let out = device.new_buffer(
+                    (n_tokens * rows * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                fill_buffer_sentinel(&out, n_tokens * rows);
+                out
+            };
+
+            let ref_q = make_output(q_rows);
+            let ref_k = make_output(kv_rows);
+            let ref_v = make_output(kv_rows);
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            let mut independent_preps = Vec::new();
+            for (weight, out, scalar, rows) in [
+                (&q_weight, &ref_q, &q_scalar, q_rows),
+                (&k_weight, &ref_k, &k_scalar, kv_rows),
+                (&v_weight, &ref_v, &v_scalar, kv_rows),
+            ] {
+                let prep = encode_shared_kquant_v4_activation(
+                    e,
+                    kernel,
+                    v4,
+                    &input_buf,
+                    input_width,
+                    n_tokens,
+                );
+                poison_stage(&prep.stage);
+                encode_kquant_v4_prepared_projection(
+                    e,
+                    v4,
+                    &prep.scales,
+                    &prep.stage,
+                    weight,
+                    out,
+                    scalar,
+                    rows,
+                );
+                independent_preps.push(prep);
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let out_q = make_output(q_rows);
+            let out_k = make_output(kv_rows);
+            let out_v = make_output(kv_rows);
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            let shared = encode_shared_kquant_v4_activation(
+                e,
+                kernel,
+                v4,
+                &input_buf,
+                input_width,
+                n_tokens,
+            );
+            poison_stage(&shared.stage);
+            for (weight, out, scalar, rows) in [
+                (&q_weight, &out_q, &q_scalar, q_rows),
+                (&k_weight, &out_k, &k_scalar, kv_rows),
+                (&v_weight, &out_v, &v_scalar, kv_rows),
+            ] {
+                encode_kquant_v4_prepared_projection(
+                    e,
+                    v4,
+                    &shared.scales,
+                    &shared.stage,
+                    weight,
+                    out,
+                    scalar,
+                    rows,
+                );
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let compare = |label: &str, rows: usize, reference: &Buffer, actual: &Buffer| {
+                let mut reference_values = vec![0.0f32; n_tokens * rows];
+                let mut actual_values = vec![0.0f32; n_tokens * rows];
+                read_buffer_f32(reference, &mut reference_values);
+                read_buffer_f32(actual, &mut actual_values);
+                assert_no_sentinel(&reference_values, &format!("{label} independent"), n_tokens);
+                assert_no_sentinel(&actual_values, &format!("{label} shared"), n_tokens);
+                for (i, (&a, &b)) in actual_values.iter().zip(&reference_values).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{label} n={n_tokens} element {i}: shared {a} ({:#010x}) != \
+                         independent {b} ({:#010x})",
+                        a.to_bits(),
+                        b.to_bits(),
+                    );
+                }
+            };
+            compare("Q", q_rows, &ref_q, &out_q);
+            compare("K", kv_rows, &ref_k, &out_k);
+            compare("V", kv_rows, &ref_v, &out_v);
+
+            let y_half = unsafe {
+                std::slice::from_raw_parts(
+                    shared.stage.y_stage.contents() as *const u16,
+                    input_width * shared.stage.k_pad,
+                )
+            };
+            let ysums_buffer = shared
+                .stage
+                .ysums
+                .as_ref()
+                .expect("shared Q4/Q6 preparation stages ysums");
+            let ysums = unsafe {
+                std::slice::from_raw_parts(
+                    ysums_buffer.contents() as *const u16,
+                    n_sb * 16 * shared.stage.k_pad,
+                )
+            };
+            assert!(
+                (0..input_width)
+                    .flat_map(|pos| (0..n_tokens).map(move |c| y_half[pos * 8 + c]))
+                    .any(|bits| bits != 0),
+                "active staged Q8 values must not all be zero"
+            );
+            for pos in 0..input_width {
+                for c in 0..n_tokens {
+                    assert_ne!(
+                        y_half[pos * shared.stage.k_pad + c],
+                        u16::MAX,
+                        "y_stage active cell left poisoned n={n_tokens} pos={pos} column={c}"
+                    );
+                }
+                for c in n_tokens..shared.stage.k_pad {
+                    assert_eq!(
+                        y_half[pos * shared.stage.k_pad + c],
+                        0,
+                        "y_stage pad n={n_tokens} pos={pos} column={c}"
+                    );
+                }
+            }
+            for cell in 0..n_sb * 16 {
+                for c in 0..n_tokens {
+                    assert_ne!(
+                        ysums[cell * shared.stage.k_pad + c],
+                        u16::MAX,
+                        "ysums active cell left poisoned n={n_tokens} cell={cell} column={c}"
+                    );
+                }
+                for c in n_tokens..shared.stage.k_pad {
+                    assert_eq!(
+                        ysums[cell * shared.stage.k_pad + c],
+                        0,
+                        "ysums pad n={n_tokens} cell={cell} column={c}"
+                    );
+                }
+            }
+
+            // Keep every preparation alive through its command-buffer wait.
+            drop((independent_preps, shared));
+        }
     }
 
     #[cfg(target_os = "macos")]
