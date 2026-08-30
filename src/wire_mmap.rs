@@ -190,6 +190,35 @@ impl GgufWireMmap {
         }
     }
 
+    /// Release clean resident pages for `[offset, offset + len)` while retaining
+    /// the read-only mapping. A later access faults the source file back in.
+    ///
+    /// This is used after a validated native-weight sidecar replaces a GGUF
+    /// projection: the original file bytes stay addressable for identity and
+    /// metadata, but should not compete with the sidecar's anonymous NoCopy
+    /// pages in unified memory.
+    pub fn advise_dontneed_range(&self, offset: usize, len: usize) {
+        if len == 0 || offset >= self.mapped_len {
+            return;
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
+        let start = offset - (offset % page);
+        let end = offset.saturating_add(len).min(self.mapped_len);
+        let Some(span) = end.checked_sub(start).filter(|s| *s > 0) else {
+            return;
+        };
+        // SAFETY: `start` is page-aligned and the clamped span stays inside the
+        // immutable mapping. MADV_DONTNEED discards only clean resident pages.
+        unsafe {
+            libc::madvise(
+                self.ptr.add(start) as *mut libc::c_void,
+                span,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+
     pub fn file_len(&self) -> u64 {
         self.file_len
     }
@@ -288,6 +317,9 @@ impl GgufWireMmap {
 
     /// Ranged population hint; a no-op on Windows (see `advise_sequential`).
     pub fn advise_willneed_range(&self, _offset: usize, _len: usize) {}
+
+    /// Ranged eviction hint; a no-op on Windows (see `advise_sequential`).
+    pub fn advise_dontneed_range(&self, _offset: usize, _len: usize) {}
 
     pub fn file_len(&self) -> u64 {
         self.file_len

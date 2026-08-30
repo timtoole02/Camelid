@@ -28,6 +28,7 @@ pub mod gemma4_distributed;
 pub(crate) mod gemma4_attention_metal;
 pub mod gemma4_mtp;
 pub mod gemma4_mtp_cuda;
+pub mod gemma4_q4_sidecar;
 pub mod gemma4_runtime;
 pub mod gguf;
 pub mod ghost;

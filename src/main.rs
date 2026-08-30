@@ -231,6 +231,34 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn gemma4_q4_repack_requires_an_explicit_sidecar_destination() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "gemma4-q4-repack",
+                "target.gguf",
+                "--output",
+                "target.q4-native",
+            ])
+            .expect("parse Gemma 4 native Q4 repack command");
+            match cli.command {
+                Some(Command::Gemma4Q4Repack { path, output }) => {
+                    assert_eq!(path, PathBuf::from("target.gguf"));
+                    assert_eq!(output, PathBuf::from("target.q4-native"));
+                }
+                other => panic!("expected Gemma4Q4Repack, got {other:?}"),
+            }
+
+            let missing = Cli::try_parse_from(["camelid", "gemma4-q4-repack", "target.gguf"])
+                .expect_err("native Q4 repack must not invent an output path");
+            assert_eq!(
+                missing.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        });
+    }
+
+    #[test]
     fn inspect_prefix_requires_the_declared_artifact_length() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from([
@@ -2497,6 +2525,14 @@ enum Command {
         /// per-round draft-vs-target trace) to this path.
         #[arg(long)]
         receipt: Option<PathBuf>,
+    },
+    /// Offline, exact-target repack of dense Gemma 4 Q4_0 projections into the
+    /// native scale-plane/quant-plane sidecar consumed by the Metal runtime.
+    /// The source GGUF is never modified and an existing output is refused.
+    Gemma4Q4Repack {
+        path: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Generate text with a Gemma 4 model on the GPU (resident decode; macOS/Metal).
     Gemma4GenerateGpu {
@@ -5015,6 +5051,16 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Gemma4Q4Repack { path, output } => {
+            eprintln!(
+                "[gemma4-q4-repack] validating and repacking {} -> {}",
+                path.display(),
+                output.display()
+            );
+            let manifest =
+                camelid::gemma4_q4_sidecar::repack_exact_gemma4_q4_sidecar(&path, &output)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
         Command::Gemma4GenerateGpu {
             path,
             prompt,
@@ -5254,6 +5300,7 @@ async fn main() -> anyhow::Result<()> {
                     "target_identity_us": target_identity_us,
                     "assistant_load_us": assistant_load_us,
                     "environment": {
+                        "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
                         "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok(),
@@ -5660,6 +5707,7 @@ async fn main() -> anyhow::Result<()> {
                     "max_positions": max_positions,
                     "load_us": load_us,
                     "environment": {
+                        "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
                         "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
                         "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),

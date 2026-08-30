@@ -6432,6 +6432,24 @@ fn gemma4_dense_q6k_metal_head_enabled() -> bool {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn gemma4_sha256_mmap_hex(mmap: &GgufWireMmap) -> std::result::Result<String, String> {
+    let file_len = usize::try_from(mmap.file_len()).map_err(|_| {
+        format!(
+            "target file length {} cannot be represented on this host",
+            mmap.file_len()
+        )
+    })?;
+    let bytes = mmap
+        .bytes(0, file_len)
+        .map_err(|error| format!("target mmap could not be hashed: {error}"))?;
+    let mut hasher = Sha256::new();
+    for chunk in bytes.chunks(8 * 1_024 * 1_024) {
+        hasher.update(chunk);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod dense_q6k_metal_head_policy_tests {
     use super::gemma4_dense_q6k_metal_head_policy;
@@ -6490,6 +6508,10 @@ pub struct Gemma4GpuRuntime {
     /// no-copy Q6_K table.  `OnceLock` serializes the first check and caches both
     /// success and failure, so speculative rounds never rehash the 6.5 GiB file.
     mtp12_target_identity: std::sync::OnceLock<std::result::Result<(), String>>,
+    /// Exact GGUF Q4 projection ranges replaced by native sidecar pages. The
+    /// mapping remains alive for embeddings and the Q6_K head, but these clean
+    /// source pages are narrowed out after validation and after any identity hash.
+    native_q4_source_ranges: Vec<(usize, usize)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -7177,15 +7199,109 @@ impl Gemma4GpuRuntime {
         // bytes before any GPU upload; 0x7F/0xFF refuses fail-closed, matching the CPU
         // wire lane. (nvfp4_sidecar_check for D-B2 already ran up top.)
         nvfp4_metal_sentinel_check(&gguf.tensors, &mmap)?;
-        // Warm the embedding mmap off the loading thread (matching the CPU lane): the
-        // QAT hybrid head reads the whole Q6_K tied table every token on the CPU, and
-        // every row gather hits this mapping, so the first token would otherwise pay the
-        // cold page-fault cost serially. madvise(WILLNEED) on a USB-backed volume blocks
-        // until the range is paged in, so it MUST NOT run on the loading thread.
-        {
+
+        // Native Q4 is an explicit, exact-target sidecar. Presence of the env var
+        // changes failure semantics: a wrong model, corrupt index/payload, missing
+        // file, or unavailable native kernel is a hard refusal rather than silently
+        // interpreting native bytes through the row-major fallback.
+        let native_q4_sidecar_path =
+            std::env::var_os(crate::gemma4_q4_sidecar::GEMMA4_Q4_NATIVE_SIDECAR_ENV)
+                .map(std::path::PathBuf::from);
+        let (native_q4_sidecar, native_q4_source_ranges, target_identity_preverified) =
+            if let Some(sidecar_path) = native_q4_sidecar_path {
+                if layer_fmt != crate::metal::GemmaWireFmt::Q4_0 {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "{} requires dense Gemma 4 Q4_0 projection weights",
+                        crate::gemma4_q4_sidecar::GEMMA4_Q4_NATIVE_SIDECAR_ENV
+                    )));
+                }
+                if !crate::metal::gemma4_native_q4_kernel_family_admitted() {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 native Q4 sidecar requested, but the complete f32/ordered/MMA Metal kernel family was not admitted"
+                            .into(),
+                    ));
+                }
+                let source_sha256 = gemma4_sha256_mmap_hex(&mmap).map_err(|detail| {
+                    BackendError::InvalidTensorData(format!(
+                        "Gemma 4 native Q4 source identity refused: {detail}"
+                    ))
+                })?;
+                let sidecar = crate::gemma4_q4_sidecar::Gemma4Q4NativeSidecar::open(
+                    &sidecar_path,
+                    &gguf,
+                    mmap.file_len(),
+                    &source_sha256,
+                )?;
+                let ranges = sidecar.source_ranges().to_vec();
+                // The exact-source SHA just faulted every GGUF page. Drop the Q4
+                // source ranges before allocating their native replacements so the
+                // two layouts do not overlap at peak resident pressure.
+                for &(offset, len) in &ranges {
+                    mmap.advise_dontneed_range(offset, len);
+                }
+                eprintln!(
+                    "[gemma4-dense] native Q4 sidecar index admitted: {} ({} projections, {} bytes replacing GGUF Q4 pages)",
+                    sidecar_path.display(),
+                    sidecar.source_ranges().len(),
+                    sidecar
+                        .source_ranges()
+                        .iter()
+                        .map(|(_, len)| *len as u64)
+                        .sum::<u64>(),
+                );
+                (Some(sidecar), ranges, true)
+            } else {
+                (None, Vec::new(), false)
+            };
+
+        let native_q4_enabled = native_q4_sidecar.is_some();
+        if native_q4_enabled {
+            // Warm only mappings that stay live at inference time: token_embd
+            // and optional per_layer_token_embd. Whole-file readahead would
+            // immediately recreate the replaced source-Q4 resident pages.
+            let mut warm_ranges = Vec::with_capacity(2);
+            for name in std::iter::once(binding.token_embedding.name.as_str()).chain(
+                binding
+                    .per_layer_token_embd
+                    .as_ref()
+                    .map(|descriptor| descriptor.name.as_str()),
+            ) {
+                let descriptor = store.descriptor(name)?;
+                let offset = usize::try_from(descriptor.absolute_offset).map_err(|_| {
+                    BackendError::InvalidTensorData(format!(
+                        "embedding {name} offset does not fit this host"
+                    ))
+                })?;
+                let len = usize::try_from(descriptor.n_bytes).map_err(|_| {
+                    BackendError::InvalidTensorData(format!(
+                        "embedding {name} length does not fit this host"
+                    ))
+                })?;
+                warm_ranges.push((offset, len));
+            }
+            let mmap = mmap.clone();
+            std::thread::spawn(move || {
+                for (offset, len) in warm_ranges {
+                    mmap.advise_willneed_range(offset, len);
+                }
+            });
+        } else {
+            // Preserve the established fallback byte-for-byte, including its
+            // asynchronous whole-file warmup policy.
             let mmap = mmap.clone();
             std::thread::spawn(move || mmap.advise_willneed());
         }
+        let native_q4_pages = native_q4_sidecar
+            .as_ref()
+            .map(|sidecar| sidecar.read_all_pages(&gguf))
+            .transpose()?;
+        if let Some(pages) = native_q4_pages.as_ref() {
+            eprintln!(
+                "[gemma4-dense] verified {} native Q4 resident payload hashes before Metal binding",
+                pages.len()
+            );
+        }
+        drop(native_q4_sidecar);
         let q8 = |name: &str| WireQuant::new(&store, &mmap, name);
         let f32t = |name: &str| -> Result<Vec<f32>> { Ok(store.load_cpu_f32(name)?.data) };
 
@@ -7203,11 +7319,18 @@ impl Gemma4GpuRuntime {
         })?;
         let pages = |name: &str| -> Result<Arc<crate::wire_mmap::WirePages>> {
             let desc = store.descriptor(name)?;
-            crate::wire_mmap::WirePages::read_from_file(
-                &file,
-                desc.absolute_offset,
-                desc.n_bytes as usize,
-            )
+            match native_q4_pages.as_ref() {
+                Some(pages) => pages.get(name).cloned().ok_or_else(|| {
+                    BackendError::InvalidTensorData(format!(
+                        "validated native Q4 resident index has no projection {name}"
+                    ))
+                }),
+                None => crate::wire_mmap::WirePages::read_from_file(
+                    &file,
+                    desc.absolute_offset,
+                    desc.n_bytes as usize,
+                ),
+            }
         };
 
         let plan = g.layer_plan(n_layers, heads);
@@ -7248,33 +7371,72 @@ impl Gemma4GpuRuntime {
                     )));
                 }
             };
-            let layer = crate::metal::Gemma4ResidentLayer::from_wire_pages(
-                layer_fmt,
-                f32t(&lb.attn_norm.name)?,
-                f32t(&lb.attn_q_norm.name)?,
-                k_norm_v,
-                f32t(&lb.post_attention_norm.name)?,
-                f32t(&lb.ffn_norm.name)?,
-                f32t(&lb.post_ffw_norm.name)?,
-                &q_pages_arc,
-                &k_pages_arc,
-                lb.attn_v
-                    .as_ref()
-                    .map(|d| pages(&d.name))
-                    .transpose()?
-                    .as_ref(),
-                &pages(&lb.attn_output.name)?,
-                &pages(&lb.ffn_gate.name)?,
-                &pages(&lb.ffn_up.name)?,
-                &pages(&lb.ffn_down.name)?,
-                heads,
-                kv_heads,
-                hd,
-                ffn_dim,
-                eps,
-            )
+            let v_pages_arc = lb
+                .attn_v
+                .as_ref()
+                .map(|descriptor| pages(&descriptor.name))
+                .transpose()?;
+            let o_pages_arc = pages(&lb.attn_output.name)?;
+            let gate_pages_arc = pages(&lb.ffn_gate.name)?;
+            let up_pages_arc = pages(&lb.ffn_up.name)?;
+            let down_pages_arc = pages(&lb.ffn_down.name)?;
+            let attn_norm = f32t(&lb.attn_norm.name)?;
+            let q_norm = f32t(&lb.attn_q_norm.name)?;
+            let post_attention_norm = f32t(&lb.post_attention_norm.name)?;
+            let ffn_norm = f32t(&lb.ffn_norm.name)?;
+            let post_ffw_norm = f32t(&lb.post_ffw_norm.name)?;
+            let layer = if native_q4_enabled {
+                crate::metal::Gemma4ResidentLayer::from_native_q4_pages(
+                    layer_fmt,
+                    attn_norm,
+                    q_norm,
+                    k_norm_v,
+                    post_attention_norm,
+                    ffn_norm,
+                    post_ffw_norm,
+                    &q_pages_arc,
+                    &k_pages_arc,
+                    v_pages_arc.as_ref(),
+                    &o_pages_arc,
+                    &gate_pages_arc,
+                    &up_pages_arc,
+                    &down_pages_arc,
+                    heads,
+                    kv_heads,
+                    hd,
+                    ffn_dim,
+                    eps,
+                )
+            } else {
+                crate::metal::Gemma4ResidentLayer::from_wire_pages(
+                    layer_fmt,
+                    attn_norm,
+                    q_norm,
+                    k_norm_v,
+                    post_attention_norm,
+                    ffn_norm,
+                    post_ffw_norm,
+                    &q_pages_arc,
+                    &k_pages_arc,
+                    v_pages_arc.as_ref(),
+                    &o_pages_arc,
+                    &gate_pages_arc,
+                    &up_pages_arc,
+                    &down_pages_arc,
+                    heads,
+                    kv_heads,
+                    hd,
+                    ffn_dim,
+                    eps,
+                )
+            }
             .ok_or_else(|| {
-                BackendError::UnsupportedModelArchitecture("Metal unavailable".into())
+                let detail = if native_q4_enabled {
+                    "Metal native-Q4 kernel admission failed"
+                } else {
+                    "Metal unavailable"
+                };
+                BackendError::UnsupportedModelArchitecture(detail.into())
             })?;
             layers.push(layer);
             // layer_output_scale is unconditional in the reference. E-series
@@ -7299,6 +7461,13 @@ impl Gemma4GpuRuntime {
             });
             owns_kv.push(plan[l].owns_kv);
             kv_source.push(plan[l].kv_source_layer);
+        }
+
+        // Norm/metadata loads can share filesystem pages with projection tails.
+        // Narrow the replaced GGUF ranges once more after every native matrix is
+        // resident; subsequent decode has no legitimate read from these bytes.
+        for &(offset, len) in &native_q4_source_ranges {
+            mmap.advise_dontneed_range(offset, len);
         }
 
         let token_embd = q8(&binding.token_embedding.name)?;
@@ -7370,6 +7539,13 @@ impl Gemma4GpuRuntime {
             model.set_pli(proj, pn, ple_dim);
         }
 
+        let mtp12_target_identity = std::sync::OnceLock::new();
+        if target_identity_preverified {
+            mtp12_target_identity
+                .set(Ok(()))
+                .expect("fresh target identity lock accepts sidecar admission");
+        }
+
         Ok(Self {
             model,
             tokenizer,
@@ -7400,7 +7576,8 @@ impl Gemma4GpuRuntime {
                 next_ticket: 1,
                 pending: None,
             }),
-            mtp12_target_identity: std::sync::OnceLock::new(),
+            mtp12_target_identity,
+            native_q4_source_ranges,
         })
     }
 
@@ -7733,27 +7910,19 @@ impl Gemma4GpuRuntime {
     /// cached (including failure) for the lifetime of the runtime.
     fn require_mtp12_target_identity(&self) -> Result<()> {
         let admission = self.mtp12_target_identity.get_or_init(|| {
-            let file_len = usize::try_from(self._mmap.file_len()).map_err(|_| {
-                format!(
-                    "target file length {} cannot be represented on this host",
-                    self._mmap.file_len()
-                )
-            })?;
-            let bytes = self
-                ._mmap
-                .bytes(0, file_len)
-                .map_err(|error| format!("target mmap could not be hashed: {error}"))?;
-            let mut hasher = Sha256::new();
-            for chunk in bytes.chunks(8 * 1_024 * 1_024) {
-                hasher.update(chunk);
-            }
-            let actual = format!("{:x}", hasher.finalize());
+            let actual = gemma4_sha256_mmap_hex(&self._mmap)?;
             if actual != crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256 {
                 return Err(format!(
                     "loaded target {} has SHA-256 {actual}, expected {}",
                     self._mmap.path().display(),
                     crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
                 ));
+            }
+            // A lazy identity pass faults the entire GGUF. Shed the replaced
+            // source Q4 pages once, as part of that one-time admission—not on
+            // every speculative round that reads the cached OnceLock result.
+            for &(offset, len) in &self.native_q4_source_ranges {
+                self._mmap.advise_dontneed_range(offset, len);
             }
             Ok(())
         });
