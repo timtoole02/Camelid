@@ -8975,7 +8975,7 @@ fn run_eagle3_resident_greedy(
         .and_then(|n| n.checked_add(draft_tokens + 1))
         .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
     let head_upload_started = Instant::now();
-    let mut drafter = Eagle3Drafter::new(checkpoint, head_capacity)?;
+    let mut drafter = Eagle3Drafter::new(&checkpoint, head_capacity)?;
     let head_upload_ms = head_upload_started.elapsed().as_secs_f64() * 1000.0;
     let mut run = Eagle3BenchRun {
         generated: vec![first],
@@ -9386,9 +9386,16 @@ fn run_bench_eagle3(
 ) -> anyhow::Result<()> {
     const PINNED_TARGET_SHA256: &str =
         "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
-    const PINNED_EAGLE3_SHA256: &str =
+    const PINNED_EAGLE3_THOUGHTWORKS_SHA256: &str =
         "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
-    const PINNED_EAGLE3_REVISION: &str = "02d343789b502a3edfe351bdd4537a44affb98cd";
+    const PINNED_EAGLE3_THOUGHTWORKS_REVISION: &str =
+        "02d343789b502a3edfe351bdd4537a44affb98cd";
+    const PINNED_EAGLE3_SHAREGPT_E8_SHA256: &str =
+        "0694d52a4c7ebf3d4f9bb833cf5f2610f0cc0d30bf62a2376e0b2ee06cbe3662";
+    const PINNED_EAGLE3_SHAREGPT_E8_REVISION: &str =
+        "f3d27a2ec37a7b9807e0ed106f249c727b61d931";
+    const PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256: &str =
+        "1f6f8e7dcf67648757016925e28b09c40461e22b0ffe522b9abc9802ec14eff8";
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -9435,10 +9442,26 @@ fn run_bench_eagle3(
             eagle3_weights.display()
         )
     })?;
-    anyhow::ensure!(
-        eagle3_sha256 == PINNED_EAGLE3_SHA256,
-        "expected pinned EAGLE-3 SHA-256 {PINNED_EAGLE3_SHA256}, got {eagle3_sha256}"
-    );
+    let eagle3_revision = match eagle3_sha256.as_str() {
+        PINNED_EAGLE3_THOUGHTWORKS_SHA256 => PINNED_EAGLE3_THOUGHTWORKS_REVISION,
+        PINNED_EAGLE3_SHAREGPT_E8_SHA256 => PINNED_EAGLE3_SHAREGPT_E8_REVISION,
+        _ => anyhow::bail!(
+            "EAGLE-3 SHA-256 {eagle3_sha256} is not one of the two pinned checkpoint artifacts ({PINNED_EAGLE3_THOUGHTWORKS_SHA256}, {PINNED_EAGLE3_SHAREGPT_E8_SHA256})"
+        ),
+    };
+    if eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E8_SHA256 {
+        let config_path = eagle3_dir.join("config.json");
+        let config_sha256 = camelid::receipt::sha256_file_hex(&config_path).map_err(|error| {
+            anyhow::anyhow!(
+                "hashing EAGLE-3 config {}: {error}",
+                config_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            config_sha256 == PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256,
+            "ShareGPT-E8 config SHA-256 is {config_sha256}, expected {PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256}"
+        );
+    }
     let current_exe = std::env::current_exe()?;
     let binary_sha256 = camelid::receipt::sha256_file_hex(&current_exe)
         .map_err(|error| anyhow::anyhow!("hashing benchmark binary: {error}"))?;
@@ -9577,7 +9600,7 @@ fn run_bench_eagle3(
         tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
         eagle3: eagle3_dir.display().to_string(),
         eagle3_sha256,
-        eagle3_revision: PINNED_EAGLE3_REVISION,
+        eagle3_revision,
         quantization: camelid::receipt::quantization_label(&gguf),
         prompt_tokens: prompt_token_ids.len(),
         max_tokens,

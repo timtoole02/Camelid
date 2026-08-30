@@ -1,11 +1,13 @@
 //! Strict loader for the Llama 3.2 3B Instruct EAGLE-3 draft head.
 //!
-//! This module deliberately admits one pinned artifact contract: the 15-tensor
-//! `thoughtworks/Llama-3.2-3B-Instruct-Eagle3` SafeTensors checkpoint.  It does
-//! not implement drafting.  Keeping loading separate makes the first runtime
-//! slice fail closed on the two mistakes that most severely damage acceptance:
-//! silently accepting a head for a different target model, and interpreting the
-//! checkpoint's delta-coded `d2t` values as absolute target token ids.
+//! This module deliberately admits the two known 15-tensor Llama-3.2-3B EAGLE-3
+//! checkpoint layouts. Artifact identity is pinned by the benchmark and serving
+//! entry points; this loader independently pins their geometry, config variants,
+//! and tensor encodings. Keeping loading separate makes the runtime fail closed
+//! on the mistakes that most severely damage acceptance: silently accepting a
+//! head for a different target model, using the wrong per-head RoPE base, and
+//! interpreting the checkpoint's delta-coded `d2t` values as absolute target
+//! token ids.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -26,6 +28,7 @@ pub const HEAD_DIM: usize = 128;
 pub const TARGET_VOCAB_SIZE: usize = 128_256;
 pub const DRAFT_VOCAB_SIZE: usize = 32_000;
 pub const ROPE_THETA: f32 = 500_000.0;
+pub const SHAREGPT_ROPE_THETA: f32 = 10_000.0;
 pub const RMS_NORM_EPS: f32 = 1.0e-5;
 const CONFIG_RMS_NORM_EPS: f64 = 1.0e-5;
 
@@ -73,7 +76,6 @@ pub struct Eagle3Config {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ConfigFile {
     architectures: Vec<String>,
     model_type: String,
@@ -87,8 +89,13 @@ struct ConfigFile {
     draft_vocab_size: usize,
     rope_theta: f64,
     rms_norm_eps: f64,
-    torch_dtype: String,
+    #[serde(default)]
+    torch_dtype: Option<String>,
+    #[serde(default)]
+    dtype: Option<String>,
     tie_word_embeddings: bool,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// One dense matrix in the checkpoint's original row-major BF16 representation.
@@ -141,7 +148,7 @@ pub struct Eagle3DraftModel {
 }
 
 impl Eagle3DraftModel {
-    /// Load the exact 15-tensor Thoughtworks Llama 3.2 3B Instruct EAGLE-3 head.
+    /// Load one of the two exact-layout Llama 3.2 3B Instruct EAGLE-3 heads.
     pub fn load(dir: &Path) -> Result<Self> {
         let config_path = dir.join(CONFIG_FILE);
         let weights_path = dir.join(WEIGHTS_FILE);
@@ -309,11 +316,66 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
     let raw: ConfigFile = serde_json::from_slice(bytes)
         .map_err(|error| invalid(format!("invalid EAGLE-3 config.json: {error}")))?;
 
-    require_equal(
-        "architectures",
-        &raw.architectures,
-        &vec!["LlamaForCausalLM".to_string()],
-    )?;
+    let architecture_ok = matches!(
+        raw.architectures.as_slice(),
+        [architecture]
+            if architecture == "LlamaForCausalLM"
+                || architecture == "LlamaForCausalLMEagle3"
+    );
+    if !architecture_ok {
+        return Err(invalid(format!(
+            "EAGLE-3 config field architectures is {:?}, expected exactly one of LlamaForCausalLM or LlamaForCausalLMEagle3",
+            raw.architectures
+        )));
+    }
+    let sharegpt_extra = BTreeMap::from([
+            ("attention_bias".to_string(), serde_json::json!(false)),
+            ("attention_dropout".to_string(), serde_json::json!(0.0)),
+            ("bos_token_id".to_string(), serde_json::json!(128000)),
+            (
+                "eos_token_id".to_string(),
+                serde_json::json!([128001, 128008, 128009]),
+            ),
+            ("hidden_act".to_string(), serde_json::json!("silu")),
+            ("initializer_range".to_string(), serde_json::json!(0.02)),
+            (
+                "max_position_embeddings".to_string(),
+                serde_json::json!(131072),
+            ),
+            ("mlp_bias".to_string(), serde_json::json!(false)),
+            ("pad_token_id".to_string(), serde_json::json!(0)),
+            ("pretraining_tp".to_string(), serde_json::json!(1)),
+            ("rope_scaling".to_string(), serde_json::Value::Null),
+            (
+                "transformers_version".to_string(),
+                serde_json::json!("4.57.1"),
+            ),
+            ("use_cache".to_string(), serde_json::json!(true)),
+        ]);
+    let expected_extra = if raw.architectures == ["LlamaForCausalLMEagle3"] {
+        sharegpt_extra.clone()
+    } else {
+        BTreeMap::new()
+    };
+    let e9_sliding_window = raw.architectures == ["LlamaForCausalLMEagle3"]
+        && raw.extra.len() == sharegpt_extra.len() + 2
+        && raw.extra
+            .iter()
+            .all(|(key, value)| sharegpt_extra.get(key).is_some_and(|expected| expected == value)
+                || (key == "sliding_window" && value == &serde_json::json!(256))
+                || (key == "use_sliding_window" && value == &serde_json::json!(true)));
+    if e9_sliding_window {
+        return Err(BackendError::UnsupportedModelArchitecture(
+            "EAGLE-3 checkpoint requests sliding-window head attention, but the Metal draft head currently implements full causal attention only; refusing rather than using an unfaithful mask"
+                .to_string(),
+        ));
+    }
+    if raw.extra != expected_extra {
+        return Err(invalid(format!(
+            "EAGLE-3 config extra fields are {:?}, expected {:?} for architecture {}",
+            raw.extra, expected_extra, raw.architectures[0]
+        )));
+    }
     require_equal("model_type", &raw.model_type, &"llama".to_string())?;
     require_equal("hidden_size", &raw.hidden_size, &HIDDEN_SIZE)?;
     require_equal(
@@ -339,9 +401,29 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
     require_equal("head_dim", &raw.head_dim, &HEAD_DIM)?;
     require_equal("vocab_size", &raw.vocab_size, &TARGET_VOCAB_SIZE)?;
     require_equal("draft_vocab_size", &raw.draft_vocab_size, &DRAFT_VOCAB_SIZE)?;
-    require_equal("rope_theta", &raw.rope_theta, &(ROPE_THETA as f64))?;
+    if raw.rope_theta != ROPE_THETA as f64 && raw.rope_theta != SHAREGPT_ROPE_THETA as f64 {
+        return Err(invalid(format!(
+            "EAGLE-3 config field rope_theta is {:?}, expected one of {:?}",
+            raw.rope_theta,
+            [ROPE_THETA, SHAREGPT_ROPE_THETA]
+        )));
+    }
     require_equal("rms_norm_eps", &raw.rms_norm_eps, &CONFIG_RMS_NORM_EPS)?;
-    require_equal("torch_dtype", &raw.torch_dtype, &"bfloat16".to_string())?;
+    let dtype = match (raw.torch_dtype.as_deref(), raw.dtype.as_deref()) {
+        (Some(torch), None) | (None, Some(torch)) => torch,
+        (Some(torch), Some(dtype)) if torch == dtype => torch,
+        (Some(torch), Some(dtype)) => {
+            return Err(invalid(format!(
+                "EAGLE-3 config dtype aliases disagree: torch_dtype={torch:?}, dtype={dtype:?}"
+            )))
+        }
+        (None, None) => {
+            return Err(invalid(
+                "EAGLE-3 config must contain exactly one BF16 dtype field (torch_dtype or dtype)",
+            ))
+        }
+    };
+    require_equal("dtype", &dtype, &"bfloat16")?;
     require_equal("tie_word_embeddings", &raw.tie_word_embeddings, &false)?;
 
     Ok(Eagle3Config {
@@ -357,7 +439,7 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
         draft_vocab_size: raw.draft_vocab_size,
         rope_theta: raw.rope_theta as f32,
         rms_norm_eps: raw.rms_norm_eps as f32,
-        torch_dtype: raw.torch_dtype,
+        torch_dtype: dtype.to_string(),
         tie_word_embeddings: raw.tie_word_embeddings,
     })
 }
@@ -486,11 +568,12 @@ fn dtype_bytes(dtype: &str) -> Option<u64> {
         "BOOL" => Some(1),
         "BF16" => Some(2),
         "I32" => Some(4),
+        "I64" => Some(8),
         _ => None,
     }
 }
 
-fn tensor_bytes(spec: &TensorSpec) -> Result<u64> {
+fn tensor_elements(spec: &TensorSpec) -> Result<u64> {
     let elements = spec.shape.iter().try_fold(1u64, |acc, &dimension| {
         acc.checked_mul(dimension).ok_or_else(|| {
             invalid(format!(
@@ -499,7 +582,11 @@ fn tensor_bytes(spec: &TensorSpec) -> Result<u64> {
             ))
         })
     })?;
-    elements
+    Ok(elements)
+}
+
+fn tensor_bytes(spec: &TensorSpec) -> Result<u64> {
+    tensor_elements(spec)?
         .checked_mul(dtype_bytes(spec.dtype).expect("all pinned dtypes have a width"))
         .ok_or_else(|| invalid(format!("EAGLE-3 tensor {} byte count overflows", spec.name)))
 }
@@ -548,11 +635,17 @@ fn parse_and_validate_header(
                 spec.name
             ))
         })?;
-        require_equal(
-            &format!("tensor {} dtype", spec.name),
-            &tensor.dtype,
-            &spec.dtype.to_string(),
-        )?;
+        let dtype_allowed = tensor.dtype == spec.dtype
+            || (spec.name == D2T && tensor.dtype == "I64" && spec.dtype == "I32");
+        if !dtype_allowed {
+            return Err(invalid(format!(
+                "EAGLE-3 tensor {} dtype is {:?}, expected {}{}",
+                spec.name,
+                tensor.dtype,
+                spec.dtype,
+                if spec.name == D2T { " or I64" } else { "" }
+            )));
+        }
         require_equal(
             &format!("tensor {} shape", spec.name),
             &tensor.shape.as_slice(),
@@ -571,7 +664,22 @@ fn parse_and_validate_header(
                 spec.name
             )));
         }
-        let expected_bytes = tensor_bytes(spec)?;
+        let expected_bytes = if tensor.dtype == spec.dtype {
+            tensor_bytes(spec)?
+        } else {
+            let element_bytes = dtype_bytes(&tensor.dtype).ok_or_else(|| {
+                invalid(format!(
+                    "EAGLE-3 tensor {} has unsupported dtype {}",
+                    spec.name, tensor.dtype
+                ))
+            })?;
+            tensor_elements(spec)?.checked_mul(element_bytes).ok_or_else(|| {
+                invalid(format!(
+                    "EAGLE-3 tensor {} byte count overflows",
+                    spec.name
+                ))
+            })?
+        };
         if end - start != expected_bytes {
             return Err(invalid(format!(
                 "EAGLE-3 tensor {} occupies {} bytes, expected {expected_bytes}",
@@ -726,29 +834,53 @@ fn load_norm(
     Ok(values)
 }
 
-/// The source checkpoint stores a monotone delta from each draft row's index.
-/// llama.cpp's converter uses the same `raw[i] + i` reconstruction before runtime.
+/// Both known source checkpoints store a monotone delta from each draft row's
+/// index. The original head encodes it as I32 and the ShareGPT head as I64;
+/// runtime offsets stay I32, so the wider representation is narrowed only after
+/// a checked conversion. llama.cpp's converter uses the same `raw[i] + i`
+/// reconstruction before runtime.
 fn decode_d2t(
     bytes: &[u8],
     draft_vocab: usize,
     target_vocab: usize,
 ) -> Result<(Vec<i32>, Vec<u32>)> {
-    let expected_bytes = draft_vocab
+    let expected_i32_bytes = draft_vocab
         .checked_mul(4)
         .ok_or_else(|| invalid("EAGLE-3 d2t byte count overflows"))?;
-    if bytes.len() != expected_bytes {
+    let expected_i64_bytes = draft_vocab
+        .checked_mul(8)
+        .ok_or_else(|| invalid("EAGLE-3 d2t byte count overflows"))?;
+    let element_bytes = if bytes.len() == expected_i32_bytes {
+        4
+    } else if bytes.len() == expected_i64_bytes {
+        8
+    } else {
         return Err(invalid(format!(
-            "EAGLE-3 d2t contains {} bytes, expected {expected_bytes}",
+            "EAGLE-3 d2t contains {} bytes, expected {expected_i32_bytes} (I32) or {expected_i64_bytes} (I64)",
             bytes.len()
         )));
-    }
+    };
 
-    let mut seen = vec![false; target_vocab];
+    let mut seen = BTreeSet::new();
     let mut offsets = Vec::with_capacity(draft_vocab);
     let mut absolute = Vec::with_capacity(draft_vocab);
-    for (index, encoded) in bytes.chunks_exact(4).enumerate() {
-        let delta = i32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
-        let token = i64::from(delta)
+    for (index, encoded) in bytes.chunks_exact(element_bytes).enumerate() {
+        let wide_delta = if element_bytes == 4 {
+            i64::from(i32::from_le_bytes([
+                encoded[0], encoded[1], encoded[2], encoded[3],
+            ]))
+        } else {
+            i64::from_le_bytes([
+                encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5],
+                encoded[6], encoded[7],
+            ])
+        };
+        let delta = i32::try_from(wide_delta).map_err(|_| {
+            invalid(format!(
+                "EAGLE-3 d2t row {index} offset {wide_delta} does not fit the runtime I32 contract"
+            ))
+        })?;
+        let token = wide_delta
             .checked_add(index as i64)
             .ok_or_else(|| invalid(format!("EAGLE-3 d2t row {index} overflows")))?;
         if token < 0 || token >= target_vocab as i64 {
@@ -757,12 +889,11 @@ fn decode_d2t(
             )));
         }
         let token = token as usize;
-        if seen[token] {
+        if !seen.insert(token) {
             return Err(invalid(format!(
                 "EAGLE-3 d2t resolves more than one draft row to target token {token}"
             )));
         }
-        seen[token] = true;
         offsets.push(delta);
         absolute.push(token as u32);
     }
@@ -831,6 +962,38 @@ mod tests {
         "tie_word_embeddings": false
     }"#;
 
+    const SHAREGPT_CONFIG: &str = r#"{
+        "architectures": ["LlamaForCausalLMEagle3"],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 128000,
+        "model_type": "llama",
+        "hidden_size": 3072,
+        "intermediate_size": 8192,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 128256,
+        "draft_vocab_size": 32000,
+        "eos_token_id": [128001, 128008, 128009],
+        "hidden_act": "silu",
+        "initializer_range": 0.02,
+        "max_position_embeddings": 131072,
+        "mlp_bias": false,
+        "pad_token_id": 0,
+        "pretraining_tp": 1,
+        "rope_theta": 10000.0,
+        "rope_scaling": null,
+        "rms_norm_eps": 0.00001,
+        "sliding_window": 256,
+        "dtype": "bfloat16",
+        "tie_word_embeddings": false,
+        "transformers_version": "4.57.1",
+        "use_cache": true,
+        "use_sliding_window": true
+    }"#;
+
     fn pinned_header() -> (Map<String, Value>, u64) {
         let mut header = Map::new();
         let mut cursor = 0u64;
@@ -856,6 +1019,13 @@ mod tests {
             .collect()
     }
 
+    fn i64_bytes(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
     #[test]
     fn pinned_config_is_exact_and_exposes_target_taps() {
         let config = parse_and_validate_config(PINNED_CONFIG.as_bytes()).unwrap();
@@ -873,7 +1043,24 @@ mod tests {
             "\"tie_word_embeddings\": false, \"max_position_embeddings\": 2048",
         );
         let error = parse_and_validate_config(with_unknown.as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("extra fields"));
+    }
+
+    #[test]
+    fn sharegpt_e9_config_fails_closed_on_unsupported_sliding_window() {
+        let error = parse_and_validate_config(SHAREGPT_CONFIG.as_bytes()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("sliding-window"), "{message}");
+        assert!(message.contains("full causal"), "{message}");
+
+        let e8 = SHAREGPT_CONFIG
+            .replace("        \"sliding_window\": 256,\n", "")
+            .replace("        \"use_sliding_window\": true\n", "")
+            .replace("        \"use_cache\": true,\n", "        \"use_cache\": true\n");
+        let config = parse_and_validate_config(e8.as_bytes()).unwrap();
+        assert_eq!(config.architectures, ["LlamaForCausalLMEagle3"]);
+        assert_eq!(config.rope_theta, SHAREGPT_ROPE_THETA);
+        assert_eq!(config.torch_dtype, "bfloat16");
     }
 
     #[test]
@@ -898,6 +1085,34 @@ mod tests {
         let error = parse_and_validate_header(&encoded, payload_bytes).unwrap_err();
         assert!(error.to_string().contains(ATTN_Q));
         assert!(error.to_string().contains("shape"));
+    }
+
+    #[test]
+    fn header_admits_checked_i64_d2t_layout() {
+        let (mut header, payload_bytes) = pinned_header();
+        let extra = DRAFT_VOCAB_SIZE as u64 * 4;
+        for (name, value) in &mut header {
+            let descriptor = value.as_object_mut().unwrap();
+            if name == D2T {
+                descriptor.insert("dtype".into(), json!("I64"));
+            }
+            let offsets = descriptor
+                .get_mut("data_offsets")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+            let start = offsets[0].as_u64().unwrap();
+            let end = offsets[1].as_u64().unwrap();
+            if name == D2T {
+                offsets[1] = json!(end + extra);
+            } else {
+                offsets[0] = json!(start + extra);
+                offsets[1] = json!(end + extra);
+            }
+        }
+        let encoded = serde_json::to_vec(&Value::Object(header)).unwrap();
+        let descriptors = parse_and_validate_header(&encoded, payload_bytes + extra).unwrap();
+        assert_eq!(descriptors[D2T].len(), DRAFT_VOCAB_SIZE as u64 * 8);
     }
 
     #[test]
@@ -934,6 +1149,14 @@ mod tests {
 
         let negative = decode_d2t(&i32_bytes(&[-1]), 1, 5).unwrap_err();
         assert!(negative.to_string().contains("outside"));
+
+        let (offsets, decoded) = decode_d2t(&i64_bytes(&[0, 0, 1]), 3, 5).unwrap();
+        assert_eq!(offsets, [0, 0, 1]);
+        assert_eq!(decoded, [0, 1, 3]);
+
+        let too_wide = decode_d2t(&i64_bytes(&[i64::from(i32::MAX) + 1]), 1, usize::MAX)
+            .unwrap_err();
+        assert!(too_wide.to_string().contains("I32"));
     }
 
     #[test]

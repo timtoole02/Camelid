@@ -16,6 +16,7 @@ pub mod diffusion_gemma;
 pub mod distributed;
 pub mod eagle3;
 pub mod eagle3_runtime;
+pub mod eagle3_serving;
 pub mod embedding;
 pub mod error;
 pub mod execution_plan;

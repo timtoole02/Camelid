@@ -720,9 +720,10 @@ impl Eagle3Drafter {
         Ok(())
     }
 
-    /// Upload the validated head to Metal. The large host checkpoint buffers are released
-    /// before this returns; `Eagle3MetalState` owns its uploaded copies.
-    pub fn new(model: Eagle3DraftModel, max_positions: usize) -> Result<Self> {
+    /// Upload the validated head to Metal. `Eagle3MetalState` owns its uploaded
+    /// copies, so serving may retain and share one host checkpoint across
+    /// requests without cloning its hundreds of megabytes of buffers.
+    pub fn new(model: &Eagle3DraftModel, max_positions: usize) -> Result<Self> {
         let matrices = &model.matrices;
         let norms = &model.norms;
         let weights = Eagle3MetalWeights {
@@ -740,6 +741,7 @@ impl Eagle3Drafter {
             post_attention_layernorm: &norms.post_attention,
             output_norm: &norms.output,
             d2t_offsets: &model.d2t_offsets,
+            rope_theta: model.config.rope_theta,
         };
         let head = metal(Eagle3MetalState::new(weights, max_positions))?;
         Ok(Self {

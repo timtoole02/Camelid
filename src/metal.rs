@@ -25767,6 +25767,10 @@ pub struct Eagle3MetalWeights<'a> {
     pub post_attention_layernorm: &'a [f32],
     pub output_norm: &'a [f32],
     pub d2t_offsets: &'a [i32],
+    /// Checkpoint-specific RoPE base. The original head uses 500k while the
+    /// ShareGPT-trained head uses 10k; proposal quality depends on honoring the
+    /// value the head was trained with.
+    pub rope_theta: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25911,6 +25915,12 @@ fn eagle3_validate_weights(
         return Err(format!(
             "EAGLE-3 max_positions must be in 1..={}, got {max_positions}",
             max_positions_for_stride
+        ));
+    }
+    if !weights.rope_theta.is_finite() || weights.rope_theta <= 0.0 {
+        return Err(format!(
+            "EAGLE-3 rope_theta must be finite and positive, got {}",
+            weights.rope_theta
         ));
     }
     let matrices = [
@@ -26153,12 +26163,12 @@ fn eagle3_validate_batch_shape(
     Ok(rows)
 }
 
-fn eagle3_rope_tables(position: usize) -> (Vec<f32>, Vec<f32>) {
+fn eagle3_rope_tables(position: usize, rope_theta: f32) -> (Vec<f32>, Vec<f32>) {
     let half = EAGLE3_HEAD_DIM / 2;
     let mut cos = Vec::with_capacity(half);
     let mut sin = Vec::with_capacity(half);
     for pair in 0..half {
-        let frequency = 1.0 / EAGLE3_ROPE_THETA.powf(2.0 * pair as f32 / EAGLE3_HEAD_DIM as f32);
+        let frequency = 1.0 / rope_theta.powf(2.0 * pair as f32 / EAGLE3_HEAD_DIM as f32);
         let (s, c) = (position as f32 * frequency).sin_cos();
         cos.push(c);
         sin.push(s);
@@ -26187,6 +26197,7 @@ pub struct Eagle3MetalState {
     cache_v: Buffer,
     max_positions: usize,
     filled: usize,
+    rope_theta: f32,
 }
 
 #[cfg(target_os = "macos")]
@@ -26330,6 +26341,7 @@ impl Eagle3MetalState {
             cache_v: eagle3_zero_buffer(k, cache_bytes),
             max_positions,
             filled: 0,
+            rope_theta: weights.rope_theta,
         })
     }
 
@@ -26447,7 +26459,7 @@ impl Eagle3MetalState {
         let kv_scalar = nb(12);
         let k_rope_scalar = nb(16);
         let scatter_scalar = nb(16);
-        let (cos, sin) = eagle3_rope_tables(position);
+        let (cos, sin) = eagle3_rope_tables(position, self.rope_theta);
         let cos_buf = f32b(cos.len());
         let sin_buf = f32b(sin.len());
         write_buffer_f32(&cos_buf, &cos);
@@ -26640,7 +26652,7 @@ impl Eagle3MetalState {
         let attention_scalar = nb(32);
         let position_count = position + 1;
         let scores = f32b(EAGLE3_HEADS * position_count);
-        let (cos, sin) = eagle3_rope_tables(position);
+        let (cos, sin) = eagle3_rope_tables(position, self.rope_theta);
         let cos_buf = f32b(cos.len());
         let sin_buf = f32b(sin.len());
         write_buffer_f32(&cos_buf, &cos);
@@ -27271,13 +27283,15 @@ mod eagle3_metal_contract_tests {
     }
 
     #[test]
-    fn eagle3_rope_is_plain_split_half_theta_500k() {
-        let (cos0, sin0) = eagle3_rope_tables(0);
+    fn eagle3_rope_is_plain_split_half_and_honors_checkpoint_theta() {
+        let (cos0, sin0) = eagle3_rope_tables(0, EAGLE3_ROPE_THETA);
         assert_eq!(cos0, vec![1.0; EAGLE3_HEAD_DIM / 2]);
         assert_eq!(sin0, vec![0.0; EAGLE3_HEAD_DIM / 2]);
-        let (cos1, sin1) = eagle3_rope_tables(1);
+        let (cos1, sin1) = eagle3_rope_tables(1, EAGLE3_ROPE_THETA);
         assert!((cos1[0] - 1.0f32.cos()).abs() < 1.0e-6);
         assert!((sin1[0] - 1.0f32.sin()).abs() < 1.0e-6);
+        let (cos_sharegpt, _) = eagle3_rope_tables(1, 10_000.0);
+        assert_ne!(cos_sharegpt[1], cos1[1]);
     }
 
     #[test]
@@ -27297,6 +27311,7 @@ mod eagle3_metal_contract_tests {
             post_attention_layernorm: &[],
             output_norm: &[],
             d2t_offsets: &[],
+            rope_theta: EAGLE3_ROPE_THETA,
         };
         let error = eagle3_validate_weights(&weights, 2_048).unwrap_err();
         assert!(error.contains("fc.weight"), "{error}");
