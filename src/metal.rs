@@ -15324,6 +15324,31 @@ fn dispatch_1d(
     );
 }
 
+/// One thread per `(unit, row)` with rows on the second grid dimension.  This
+/// is the common dispatch geometry of the byte-exact batched elementwise twins
+/// (RoPE and KV scatter among them).
+#[cfg(target_os = "macos")]
+fn dispatch_rows_2d(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    units: usize,
+    rows: usize,
+) {
+    let width = pipeline.thread_execution_width().max(1);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (units as u64).div_ceil(width),
+            height: rows as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn admitted_32_lane_pipeline(
     pipeline: Option<&ComputePipelineState>,
@@ -20151,6 +20176,130 @@ fn verify_attention_batch_enabled() -> bool {
         std::env::var("CAMELID_METAL_ATTN_BATCH_K")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_batch_rope_scatter_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Experimental verifier-only collapse of `2*N` row-wise RoPE dispatches and
+/// `N` row-wise KV-scatter dispatches into their three existing row-dimensional
+/// twins.  It is deliberately limited to the EAGLE verifier width (`N<=8`) and
+/// opt-in until the target-machine timing gate is receipted.
+#[cfg(target_os = "macos")]
+fn verify_batch_rope_scatter_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        verify_batch_rope_scatter_from(
+            std::env::var("CAMELID_METAL_VERIFY_BATCH_ROPE_SCATTER")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_batch_rope_scatter_supported(
+    n_tokens: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    half_rope: usize,
+    kv_format: ResidentKvFormat,
+) -> bool {
+    (1..=8).contains(&n_tokens)
+        && n_heads > 0
+        && n_kv_heads > 0
+        && head_dim > 0
+        && half_rope > 0
+        && half_rope <= head_dim / 2
+        && (kv_format != ResidentKvFormat::Q8 || head_dim.is_multiple_of(32))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+static VERIFY_BATCH_ROPE_SCATTER_ENCODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Encode the exact batched twins used by prompt prefill for a verifier window.
+/// The Q/K rows and RoPE tables remain row-major; the scatter twin maps row `i`
+/// to `base_position+i`, which is also the validated BFS cache-slot contract of
+/// tree verification.  No arithmetic kernel is fused or otherwise changed.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_verify_batch_rope_scatter(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    query: &Buffer,
+    key: &Buffer,
+    value: &Buffer,
+    cos_all: &Buffer,
+    sin_all: &Buffer,
+    rope_q_scalar: &Buffer,
+    rope_k_scalar: &Buffer,
+    scatter_scalar: &Buffer,
+    cache_k: &Buffer,
+    cache_v: &Buffer,
+    f32_mirrors: Option<(&Buffer, &Buffer, &Buffer)>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    half_rope: usize,
+    n_tokens: usize,
+    kv_format: ResidentKvFormat,
+) -> bool {
+    if !verify_batch_rope_scatter_supported(
+        n_tokens, n_heads, n_kv_heads, head_dim, half_rope, kv_format,
+    ) || (kv_format == ResidentKvFormat::F32) != f32_mirrors.is_some()
+    {
+        return false;
+    }
+
+    for (data, scalar, heads) in [
+        (query, rope_q_scalar, n_heads),
+        (key, rope_k_scalar, n_kv_heads),
+    ] {
+        e.set_compute_pipeline_state(&k.rope_rotate_batch_pipeline);
+        e.set_buffer(0, Some(data), 0);
+        e.set_buffer(1, Some(cos_all), 0);
+        e.set_buffer(2, Some(sin_all), 0);
+        for index in 0..4u64 {
+            e.set_buffer(3 + index, Some(scalar), index * 4);
+        }
+        dispatch_rows_2d(
+            e,
+            &k.rope_rotate_batch_pipeline,
+            heads * half_rope,
+            n_tokens,
+        );
+    }
+
+    let (scatter_pipeline, scatter_units) = match kv_format {
+        ResidentKvFormat::F32 => (&k.kv_scatter_batch_pipeline, n_kv_heads * head_dim),
+        ResidentKvFormat::F16 => (&k.kv_scatter_batch_kv16_pipeline, n_kv_heads * head_dim),
+        ResidentKvFormat::Q8 => (
+            &k.kv_scatter_batch_kvq8_pipeline,
+            n_kv_heads * (head_dim / 32),
+        ),
+    };
+    e.set_compute_pipeline_state(scatter_pipeline);
+    e.set_buffer(0, Some(key), 0);
+    e.set_buffer(1, Some(value), 0);
+    e.set_buffer(2, Some(cache_k), 0);
+    e.set_buffer(3, Some(cache_v), 0);
+    for index in 0..4u64 {
+        e.set_buffer(4 + index, Some(scatter_scalar), index * 4);
+    }
+    if let Some((cache_k16, cache_v16, write_kv16)) = f32_mirrors {
+        e.set_buffer(8, Some(cache_k16), 0);
+        e.set_buffer(9, Some(cache_v16), 0);
+        e.set_buffer(10, Some(write_kv16), 0);
+    }
+    dispatch_rows_2d(e, scatter_pipeline, scatter_units, n_tokens);
+
+    #[cfg(test)]
+    VERIFY_BATCH_ROPE_SCATTER_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Split the f32 fallback decode attention into three dispatches
@@ -32297,6 +32446,7 @@ impl ResidentDecodeState {
         let e = cb.new_compute_command_encoder();
         let mut from_a = true;
         let mut batched_attention_layers = 0usize;
+        let mut batched_rope_scatter_layers = 0usize;
         for l in 0..layers.len() {
             let (cur, nxt) = if from_a {
                 (&act_a, &act_b)
@@ -32366,63 +32516,110 @@ impl ResidentDecodeState {
                     );
                 }
             }
-            // 4. RoPE — per row (position base+i; cos/sin position-major, stride half_rope)
-            for i in (0..k).take_while(|_| !verify_ablate("rope")) {
-                encode_rope(
+            // 4/5. RoPE + K/V scatter. The opt-in path only collapses dispatch
+            // geometry: the existing batch twins execute the same per-row math,
+            // read each row's own (possibly tree-depth) cos/sin table, and scatter
+            // row i to the already-validated BFS slot base+i. Keep the independent
+            // row loops as both rollback and stage-ablation path.
+            let omit_rope = verify_ablate("rope");
+            let omit_scatter = verify_ablate("scatter");
+            let kv_format = if self.kvq8 {
+                ResidentKvFormat::Q8
+            } else if self.kv16 {
+                ResidentKvFormat::F16
+            } else {
+                ResidentKvFormat::F32
+            };
+            let f32_mirrors = if kv_format == ResidentKvFormat::F32 {
+                Some((&self.cache_k16[l], &self.cache_v16[l], &kv16_write))
+            } else {
+                None
+            };
+            let batched_rope_scatter = !omit_rope
+                && !omit_scatter
+                && verify_batch_rope_scatter_enabled()
+                && encode_verify_batch_rope_scatter(
                     e,
                     kern,
                     &q_buf,
+                    &k_buf,
+                    &v_buf,
                     &cos_buf,
                     &sin_buf,
                     &rope_q_scalar,
-                    n_heads,
-                    half_rope,
-                    (i * q_dim * 4) as u64,
-                    (i * half_rope * 4) as u64,
-                );
-                encode_rope(
-                    e,
-                    kern,
-                    &k_buf,
-                    &cos_buf,
-                    &sin_buf,
                     &rope_k_scalar,
+                    &scatter_scalars,
+                    &self.cache_k[l],
+                    &self.cache_v[l],
+                    f32_mirrors,
+                    n_heads,
                     n_kv_heads,
+                    head_dim,
                     half_rope,
-                    (i * kv_dim * 4) as u64,
-                    (i * half_rope * 4) as u64,
+                    k,
+                    kv_format,
                 );
-            }
-            // 5. K/V scatter — per row into slot base+i, dual-writing the f16 mirrors the
-            //    split-K decode attention reads (ALL k before any attention reads).
-            for i in (0..k).take_while(|_| !verify_ablate("scatter")) {
-                let scatter_pipeline = if self.kvq8 {
-                    &kern.kv_scatter_kvq8_pipeline
-                } else if self.kv16 {
-                    &kern.kv_scatter_kv16_pipeline
-                } else {
-                    &kern.kv_scatter_pipeline
-                };
-                e.set_compute_pipeline_state(scatter_pipeline);
-                e.set_buffer(0, Some(&k_buf), (i * kv_dim * 4) as u64);
-                e.set_buffer(1, Some(&v_buf), (i * kv_dim * 4) as u64);
-                e.set_buffer(2, Some(&self.cache_k[l]), 0);
-                e.set_buffer(3, Some(&self.cache_v[l]), 0);
-                e.set_buffer(4, Some(&scatter_scalars), (i * 16) as u64);
-                e.set_buffer(5, Some(&scatter_scalars), (i * 16 + 4) as u64);
-                e.set_buffer(6, Some(&scatter_scalars), (i * 16 + 8) as u64);
-                e.set_buffer(7, Some(&scatter_scalars), (i * 16 + 12) as u64);
-                if !self.kv16 && !self.kvq8 {
-                    e.set_buffer(8, Some(&self.cache_k16[l]), 0);
-                    e.set_buffer(9, Some(&self.cache_v16[l]), 0);
-                    e.set_buffer(10, Some(&kv16_write), 0);
+            batched_rope_scatter_layers += usize::from(batched_rope_scatter);
+            if !batched_rope_scatter {
+                // RoPE — per row (cos/sin are position/node-major, stride half_rope).
+                for i in (0..k).take_while(|_| !omit_rope) {
+                    encode_rope(
+                        e,
+                        kern,
+                        &q_buf,
+                        &cos_buf,
+                        &sin_buf,
+                        &rope_q_scalar,
+                        n_heads,
+                        half_rope,
+                        (i * q_dim * 4) as u64,
+                        (i * half_rope * 4) as u64,
+                    );
+                    encode_rope(
+                        e,
+                        kern,
+                        &k_buf,
+                        &cos_buf,
+                        &sin_buf,
+                        &rope_k_scalar,
+                        n_kv_heads,
+                        half_rope,
+                        (i * kv_dim * 4) as u64,
+                        (i * half_rope * 4) as u64,
+                    );
                 }
-                let scatter_units = if self.kvq8 {
-                    n_kv_heads * (head_dim / 32)
-                } else {
-                    kv_dim
-                };
-                dispatch_1d(e, scatter_pipeline, scatter_units);
+                // K/V scatter — per row into slot base+i, dual-writing the f16
+                // mirrors the split-K decode attention reads. All k writes still
+                // precede every attention read.
+                for i in (0..k).take_while(|_| !omit_scatter) {
+                    let scatter_pipeline = if self.kvq8 {
+                        &kern.kv_scatter_kvq8_pipeline
+                    } else if self.kv16 {
+                        &kern.kv_scatter_kv16_pipeline
+                    } else {
+                        &kern.kv_scatter_pipeline
+                    };
+                    e.set_compute_pipeline_state(scatter_pipeline);
+                    e.set_buffer(0, Some(&k_buf), (i * kv_dim * 4) as u64);
+                    e.set_buffer(1, Some(&v_buf), (i * kv_dim * 4) as u64);
+                    e.set_buffer(2, Some(&self.cache_k[l]), 0);
+                    e.set_buffer(3, Some(&self.cache_v[l]), 0);
+                    e.set_buffer(4, Some(&scatter_scalars), (i * 16) as u64);
+                    e.set_buffer(5, Some(&scatter_scalars), (i * 16 + 4) as u64);
+                    e.set_buffer(6, Some(&scatter_scalars), (i * 16 + 8) as u64);
+                    e.set_buffer(7, Some(&scatter_scalars), (i * 16 + 12) as u64);
+                    if !self.kv16 && !self.kvq8 {
+                        e.set_buffer(8, Some(&self.cache_k16[l]), 0);
+                        e.set_buffer(9, Some(&self.cache_v16[l]), 0);
+                        e.set_buffer(10, Some(&kv16_write), 0);
+                    }
+                    let scatter_units = if self.kvq8 {
+                        n_kv_heads * (head_dim / 32)
+                    } else {
+                        kv_dim
+                    };
+                    dispatch_1d(e, scatter_pipeline, scatter_units);
+                }
             }
             // 6. attention. The opt-in F16 split-K batch emits one row-dimensional
             //    partial dispatch plus one row-dimensional merge for k<=16. Every row keeps
@@ -32667,7 +32864,8 @@ impl ResidentDecodeState {
             eprintln!(
                 "[metal-verify-phase] base={base_position} k={k} \
                  encode={encode_us}us commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
-                 kernel_window={kernel_window_us}us attn_batch_layers={batched_attention_layers}"
+                 kernel_window={kernel_window_us}us attn_batch_layers={batched_attention_layers} \
+                 rope_scatter_batch_layers={batched_rope_scatter_layers}"
             );
         }
         // Note: `filled` is intentionally NOT advanced — the host accept loop sets it.
@@ -35970,6 +36168,345 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verify_batch_rope_scatter_guard_is_narrow_and_parser_is_explicit() {
+        use super::*;
+
+        assert!(!verify_batch_rope_scatter_from(None));
+        assert!(!verify_batch_rope_scatter_from(Some("0")));
+        assert!(!verify_batch_rope_scatter_from(Some("yes")));
+        assert!(verify_batch_rope_scatter_from(Some("1")));
+        assert!(verify_batch_rope_scatter_from(Some("TRUE")));
+
+        for format in [
+            ResidentKvFormat::F32,
+            ResidentKvFormat::F16,
+            ResidentKvFormat::Q8,
+        ] {
+            for n in 1..=8 {
+                assert!(verify_batch_rope_scatter_supported(
+                    n, 4, 2, 64, 32, format
+                ));
+            }
+            assert!(!verify_batch_rope_scatter_supported(
+                0, 4, 2, 64, 32, format
+            ));
+            assert!(!verify_batch_rope_scatter_supported(
+                9, 4, 2, 64, 32, format
+            ));
+        }
+        assert!(!verify_batch_rope_scatter_supported(
+            8,
+            4,
+            2,
+            48,
+            24,
+            ResidentKvFormat::Q8,
+        ));
+        assert!(!verify_batch_rope_scatter_supported(
+            8,
+            4,
+            2,
+            64,
+            0,
+            ResidentKvFormat::F16,
+        ));
+        assert!(!verify_batch_rope_scatter_supported(
+            8,
+            4,
+            2,
+            64,
+            33,
+            ResidentKvFormat::F32,
+        ));
+    }
+
+    /// Direct proof that the three row-dimensional twins preserve every bit of
+    /// the verifier's established `2*N` RoPE plus `N` scatter route.  The RoPE
+    /// tables intentionally follow a branching-tree-like depth order rather
+    /// than monotonically increasing positions.  All three cache formats are
+    /// covered, including the F32 primary's F16 mirrors.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_verify_batch_rope_scatter_matches_row_dispatches() {
+        use super::*;
+
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal verifier elementwise pipelines");
+        let device = &kernel.device;
+        let opts = MTLResourceOptions::StorageModeShared;
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 64usize;
+        let half_rope = head_dim / 2;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let max_positions = 13usize;
+        let base_position = 3usize;
+        let tree_depth = [0usize, 1, 1, 2, 2, 2, 3, 1];
+
+        let bytes = |buffer: &Buffer, len: usize| unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>(), len).to_vec()
+        };
+        let words = |buffer: &Buffer, len: usize| unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u32>(), len).to_vec()
+        };
+
+        for n_tokens in [1usize, 2, 3, 7, 8] {
+            let query_values: Vec<f32> = (0..n_tokens * q_dim)
+                .map(|i| (((i * 37 + 11) % 257) as f32 - 128.0) * 0.0078125)
+                .collect();
+            let key_values: Vec<f32> = (0..n_tokens * kv_dim)
+                .map(|i| (((i * 29 + 7) % 251) as f32 - 125.0) * 0.009765625)
+                .collect();
+            let value_values: Vec<f32> = (0..n_tokens * kv_dim)
+                .map(|i| (((i * 43 + 3) % 241) as f32 - 120.0) * 0.0068359375)
+                .collect();
+            let mut cos = vec![0.0f32; n_tokens * half_rope];
+            let mut sin = vec![0.0f32; n_tokens * half_rope];
+            for row in 0..n_tokens {
+                for pair in 0..half_rope {
+                    let theta = 0.013
+                        * (base_position + tree_depth[row]) as f32
+                        + 0.021 * pair as f32;
+                    cos[row * half_rope + pair] = theta.cos();
+                    sin[row * half_rope + pair] = theta.sin();
+                }
+            }
+            let cos_buf = device.new_buffer_with_data(
+                cos.as_ptr().cast(),
+                std::mem::size_of_val(cos.as_slice()) as u64,
+                opts,
+            );
+            let sin_buf = device.new_buffer_with_data(
+                sin.as_ptr().cast(),
+                std::mem::size_of_val(sin.as_slice()) as u64,
+                opts,
+            );
+
+            for pairing in [0u32, 1] {
+                let rope_q_scalar = device.new_buffer(16, opts);
+                let rope_k_scalar = device.new_buffer(16, opts);
+                unsafe {
+                    for (scalar, heads) in [(&rope_q_scalar, n_heads), (&rope_k_scalar, n_kv_heads)]
+                    {
+                        let p = scalar.contents().cast::<u32>();
+                        *p = heads as u32;
+                        *p.add(1) = head_dim as u32;
+                        *p.add(2) = half_rope as u32;
+                        *p.add(3) = pairing;
+                    }
+                }
+                let write_kv16 = device.new_buffer(4, opts);
+                unsafe {
+                    *write_kv16.contents().cast::<u32>() = 1;
+                }
+
+                for kv_format in [
+                    ResidentKvFormat::F32,
+                    ResidentKvFormat::F16,
+                    ResidentKvFormat::Q8,
+                ] {
+                    let cache_bytes = match kv_format {
+                        ResidentKvFormat::F32 => n_kv_heads * max_positions * head_dim * 4,
+                        ResidentKvFormat::F16 => n_kv_heads * max_positions * head_dim * 2,
+                        ResidentKvFormat::Q8 => {
+                            n_kv_heads * max_positions * (head_dim / 32) * 34
+                        }
+                    };
+                    let scatter_units = if kv_format == ResidentKvFormat::Q8 {
+                        n_kv_heads * (head_dim / 32)
+                    } else {
+                        kv_dim
+                    };
+                    let scatter_scalars = device.new_buffer((n_tokens * 16) as u64, opts);
+                    unsafe {
+                        let p = scatter_scalars.contents().cast::<u32>();
+                        for row in 0..n_tokens {
+                            *p.add(row * 4) = head_dim as u32;
+                            *p.add(row * 4 + 1) = max_positions as u32;
+                            *p.add(row * 4 + 2) = (base_position + row) as u32;
+                            *p.add(row * 4 + 3) = scatter_units as u32;
+                        }
+                    }
+                    let make_route = || {
+                        let query = device.new_buffer_with_data(
+                            query_values.as_ptr().cast(),
+                            std::mem::size_of_val(query_values.as_slice()) as u64,
+                            opts,
+                        );
+                        let key = device.new_buffer_with_data(
+                            key_values.as_ptr().cast(),
+                            std::mem::size_of_val(key_values.as_slice()) as u64,
+                            opts,
+                        );
+                        let value = device.new_buffer_with_data(
+                            value_values.as_ptr().cast(),
+                            std::mem::size_of_val(value_values.as_slice()) as u64,
+                            opts,
+                        );
+                        let cache_k = device.new_buffer(cache_bytes as u64, opts);
+                        let cache_v = device.new_buffer(cache_bytes as u64, opts);
+                        write_buffer_u8(&cache_k, &vec![0xa5; cache_bytes]);
+                        write_buffer_u8(&cache_v, &vec![0x5a; cache_bytes]);
+                        let mirrors = (kv_format == ResidentKvFormat::F32).then(|| {
+                            let len = n_kv_heads * max_positions * head_dim * 2;
+                            let k16 = device.new_buffer(len as u64, opts);
+                            let v16 = device.new_buffer(len as u64, opts);
+                            write_buffer_u8(&k16, &vec![0x3c; len]);
+                            write_buffer_u8(&v16, &vec![0xc3; len]);
+                            (k16, v16)
+                        });
+                        (query, key, value, cache_k, cache_v, mirrors)
+                    };
+                    let (row_q, row_k, row_v, row_cache_k, row_cache_v, row_mirrors) =
+                        make_route();
+                    let (batch_q, batch_k, batch_v, batch_cache_k, batch_cache_v, batch_mirrors) =
+                        make_route();
+
+                    let row_cb = kernel.queue.new_command_buffer();
+                    let row_e = row_cb.new_compute_command_encoder();
+                    for row in 0..n_tokens {
+                        encode_rope(
+                            row_e,
+                            kernel,
+                            &row_q,
+                            &cos_buf,
+                            &sin_buf,
+                            &rope_q_scalar,
+                            n_heads,
+                            half_rope,
+                            (row * q_dim * 4) as u64,
+                            (row * half_rope * 4) as u64,
+                        );
+                        encode_rope(
+                            row_e,
+                            kernel,
+                            &row_k,
+                            &cos_buf,
+                            &sin_buf,
+                            &rope_k_scalar,
+                            n_kv_heads,
+                            half_rope,
+                            (row * kv_dim * 4) as u64,
+                            (row * half_rope * 4) as u64,
+                        );
+                    }
+                    for row in 0..n_tokens {
+                        let (pipeline, units) = match kv_format {
+                            ResidentKvFormat::F32 => {
+                                (&kernel.kv_scatter_pipeline, n_kv_heads * head_dim)
+                            }
+                            ResidentKvFormat::F16 => {
+                                (&kernel.kv_scatter_kv16_pipeline, n_kv_heads * head_dim)
+                            }
+                            ResidentKvFormat::Q8 => (
+                                &kernel.kv_scatter_kvq8_pipeline,
+                                n_kv_heads * (head_dim / 32),
+                            ),
+                        };
+                        row_e.set_compute_pipeline_state(pipeline);
+                        row_e.set_buffer(0, Some(&row_k), (row * kv_dim * 4) as u64);
+                        row_e.set_buffer(1, Some(&row_v), (row * kv_dim * 4) as u64);
+                        row_e.set_buffer(2, Some(&row_cache_k), 0);
+                        row_e.set_buffer(3, Some(&row_cache_v), 0);
+                        for index in 0..4u64 {
+                            row_e.set_buffer(
+                                4 + index,
+                                Some(&scatter_scalars),
+                                (row * 16) as u64 + index * 4,
+                            );
+                        }
+                        if let Some((k16, v16)) = row_mirrors.as_ref() {
+                            row_e.set_buffer(8, Some(k16), 0);
+                            row_e.set_buffer(9, Some(v16), 0);
+                            row_e.set_buffer(10, Some(&write_kv16), 0);
+                        }
+                        dispatch_1d(row_e, pipeline, units);
+                    }
+                    row_e.end_encoding();
+                    row_cb.commit();
+                    row_cb.wait_until_completed();
+                    assert_eq!(row_cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+                    let batch_cb = kernel.queue.new_command_buffer();
+                    let batch_e = batch_cb.new_compute_command_encoder();
+                    let mirror_args = batch_mirrors
+                        .as_ref()
+                        .map(|(k16, v16)| (k16, v16, &write_kv16));
+                    assert!(encode_verify_batch_rope_scatter(
+                        batch_e,
+                        kernel,
+                        &batch_q,
+                        &batch_k,
+                        &batch_v,
+                        &cos_buf,
+                        &sin_buf,
+                        &rope_q_scalar,
+                        &rope_k_scalar,
+                        &scatter_scalars,
+                        &batch_cache_k,
+                        &batch_cache_v,
+                        mirror_args,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        half_rope,
+                        n_tokens,
+                        kv_format,
+                    ));
+                    batch_e.end_encoding();
+                    batch_cb.commit();
+                    batch_cb.wait_until_completed();
+                    assert_eq!(batch_cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+                    assert_eq!(
+                        words(&row_q, n_tokens * q_dim),
+                        words(&batch_q, n_tokens * q_dim),
+                        "Q RoPE n={n_tokens} pairing={pairing} format={kv_format:?}",
+                    );
+                    assert_eq!(
+                        words(&row_k, n_tokens * kv_dim),
+                        words(&batch_k, n_tokens * kv_dim),
+                        "K RoPE n={n_tokens} pairing={pairing} format={kv_format:?}",
+                    );
+                    assert_eq!(
+                        bytes(&row_cache_k, cache_bytes),
+                        bytes(&batch_cache_k, cache_bytes),
+                        "K cache n={n_tokens} pairing={pairing} format={kv_format:?}",
+                    );
+                    assert_eq!(
+                        bytes(&row_cache_v, cache_bytes),
+                        bytes(&batch_cache_v, cache_bytes),
+                        "V cache n={n_tokens} pairing={pairing} format={kv_format:?}",
+                    );
+                    if let (Some((row_k16, row_v16)), Some((batch_k16, batch_v16))) =
+                        (row_mirrors.as_ref(), batch_mirrors.as_ref())
+                    {
+                        let mirror_bytes = n_kv_heads * max_positions * head_dim * 2;
+                        assert_eq!(
+                            bytes(row_k16, mirror_bytes),
+                            bytes(batch_k16, mirror_bytes),
+                            "K16 mirror n={n_tokens} pairing={pairing}",
+                        );
+                        assert_eq!(
+                            bytes(row_v16, mirror_bytes),
+                            bytes(batch_v16, mirror_bytes),
+                            "V16 mirror n={n_tokens} pairing={pairing}",
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "metal_verify_batch_rope_scatter_matches_row_dispatches: N=1/2/3/7/8, \
+             both pairings, F32/F16/Q8 BIT-IDENTICAL"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -49551,6 +50088,10 @@ mod tests {
             );
             return;
         }
+        let require_batched_rope_scatter = verify_batch_rope_scatter_enabled();
+        if require_batched_rope_scatter {
+            VERIFY_BATCH_ROPE_SCATTER_ENCODES.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let n_layers = 2usize;
         let n_heads = 4usize;
@@ -49908,6 +50449,17 @@ mod tests {
         }
         // C3: deep split-K (rows pc in [511..516], n_splits varies).
         run(510, 6);
+        if require_batched_rope_scatter {
+            let encoded =
+                VERIFY_BATCH_ROPE_SCATTER_ENCODES.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                encoded > 0,
+                "CAMELID_METAL_VERIFY_BATCH_ROPE_SCATTER=1 was armed but its verifier route never encoded"
+            );
+            eprintln!(
+                "metal_spec_verify_bit_identical: batched RoPE/scatter engaged encodes={encoded}"
+            );
+        }
     }
 
     /// WIN2METAL Phase 4 gate. The slot-indirected TREE verify path must reproduce the
@@ -49946,6 +50498,10 @@ mod tests {
                  CAMELID_METAL_ATTN_SPLITK unset — split-K is default-on)"
             );
             return;
+        }
+        let require_batched_rope_scatter = verify_batch_rope_scatter_enabled();
+        if require_batched_rope_scatter {
+            VERIFY_BATCH_ROPE_SCATTER_ENCODES.store(0, std::sync::atomic::Ordering::Relaxed);
         }
 
         let n_layers = 2usize;
@@ -50517,6 +51073,17 @@ mod tests {
         };
         branching(126);
         branching(510);
+        if require_batched_rope_scatter {
+            let encoded =
+                VERIFY_BATCH_ROPE_SCATTER_ENCODES.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                encoded > 0,
+                "CAMELID_METAL_VERIFY_BATCH_ROPE_SCATTER=1 was armed but its tree-verifier route never encoded"
+            );
+            eprintln!(
+                "metal_tree_verify_bit_identical: batched RoPE/scatter engaged encodes={encoded}"
+            );
+        }
     }
 
     /// Explicit opt-in proof lane for the f16-primary tree verifier. Unlike the broad

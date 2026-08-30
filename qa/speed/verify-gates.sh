@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # qa/speed/verify-gates.sh — ENFORCED PROOF LANE for the WIN2METAL byte-exact spec-verify gates.
 #
-# WHY THIS EXISTS (review M2/G1): the three bit-identity gates
+# WHY THIS EXISTS (review M2/G1): the four bit-identity gates
 #   metal_verify_gemv_batched_bit_identical   (Phase 3 C0 — the batched GEMV)
+#   metal_verify_batch_rope_scatter_matches_row_dispatches (N<=8 dispatch collapse)
 #   metal_spec_verify_bit_identical           (Phase 3 — linear verify_batch)
 #   metal_tree_verify_bit_identical           (Phase 4 — tree verify_batch_tree)
-# guard on process-wide OnceLock env gates (f32y / wire / nsg8 / attn2 / split-K), which the
-# CALLER must arm — a test may not arm them for itself (see the export block below). A plain
-# `cargo test --all-targets` arms nothing, so all three take their SKIP branch, and a skipped
-# #[test] counts as PASS. So a green `--all-targets` does NOT, by itself, exercise the byte-exact
-# assertions; only this script does.
+# The GEMV and end-to-end gates guard on process-wide OnceLock env gates (f32y / wire / nsg8 /
+# attn2 / split-K), which the CALLER must arm — a test may not arm them for itself (see the
+# export block below). A plain `cargo test --all-targets` arms nothing, so those three take their
+# SKIP branch, and a skipped #[test] counts as PASS. So a green `--all-targets` does NOT, by
+# itself, exercise all byte-exact assertions; only this script does. The linear/tree gates
+# additionally assert that the opt-in RoPE/scatter route actually encoded rather than silently
+# falling back to the established row loops.
 #
 # This script runs each gate in ITS OWN cargo process (fresh OnceLocks) with the gates armed in
 # the environment that process inherits — so the to_bits assertions actually run, and no sibling
@@ -33,11 +36,13 @@ export CAMELID_METAL_ATTN2=1
 # opt-out in the caller's environment cannot silently drop the straddle windows onto the v2 path —
 # which would SKIP the linear/tree gates and fail this script rather than quietly prove less.
 export CAMELID_METAL_ATTN_SPLITK=1
+export CAMELID_METAL_VERIFY_BATCH_ROPE_SCATTER=1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 GATES=(
   metal_verify_gemv_batched_bit_identical
+  metal_verify_batch_rope_scatter_matches_row_dispatches
   metal_spec_verify_bit_identical
   metal_tree_verify_bit_identical
 )
@@ -64,7 +69,7 @@ done
 
 echo
 if [ "$rc" -eq 0 ]; then
-  echo "PASS: all 3 byte-exact verify gates ran ENGAGED (split-K straddle 126 & 510) and are BIT-IDENTICAL."
+  echo "PASS: all 4 byte-exact verify gates ran ENGAGED (including batched RoPE/scatter and split-K straddle 126 & 510) and are BIT-IDENTICAL."
 else
   echo "FAIL: a byte-exact verify gate did not run/pass engaged — see above (this is the real proof, not --all-targets)."
 fi
