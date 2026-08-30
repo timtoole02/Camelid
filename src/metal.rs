@@ -26990,37 +26990,60 @@ fn eagle3_rank_top_candidates(
     d2t_offsets: &[i32],
 ) -> std::result::Result<Vec<Eagle3DraftCandidate>, String> {
     let limit = EAGLE3_TOP_K_CANDIDATES.min(logits.len());
-    let mut ranked = Vec::with_capacity(limit);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut top_logits = [(f32::NEG_INFINITY, u32::MAX); EAGLE3_TOP_K_CANDIDATES];
+    let mut count = 0usize;
+
     for (draft, &logit) in logits.iter().enumerate() {
-        // Match the resident greedy kernel's contract: NaNs are not candidates.
         if logit.is_nan() {
             continue;
         }
         let draft_token =
             u32::try_from(draft).map_err(|_| format!("EAGLE-3 draft row {draft} exceeds u32"))?;
-        let insert_at = ranked.iter().position(|candidate: &Eagle3DraftCandidate| {
-            logit > candidate.logit
-                || (logit == candidate.logit && draft_token < candidate.draft_token)
-        });
-        if let Some(insert_at) = insert_at {
-            if insert_at < limit {
-                ranked.insert(
-                    insert_at,
-                    Eagle3DraftCandidate {
-                        draft_token,
-                        target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
-                        logit,
-                    },
-                );
-                ranked.truncate(limit);
+
+        if count < limit {
+            let mut insert_idx = count;
+            for i in 0..count {
+                let (l, t) = top_logits[i];
+                if logit > l || (logit == l && draft_token < t) {
+                    insert_idx = i;
+                    break;
+                }
             }
-        } else if ranked.len() < limit {
-            ranked.push(Eagle3DraftCandidate {
-                draft_token,
-                target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
-                logit,
-            });
+            for j in (insert_idx..count).rev() {
+                top_logits[j + 1] = top_logits[j];
+            }
+            top_logits[insert_idx] = (logit, draft_token);
+            count += 1;
+        } else {
+            let (min_l, min_t) = top_logits[limit - 1];
+            if logit > min_l || (logit == min_l && draft_token < min_t) {
+                let mut insert_idx = limit - 1;
+                for i in 0..limit - 1 {
+                    let (l, t) = top_logits[i];
+                    if logit > l || (logit == l && draft_token < t) {
+                        insert_idx = i;
+                        break;
+                    }
+                }
+                for j in (insert_idx..limit - 1).rev() {
+                    top_logits[j + 1] = top_logits[j];
+                }
+                top_logits[insert_idx] = (logit, draft_token);
+            }
         }
+    }
+
+    let mut ranked = Vec::with_capacity(count);
+    for i in 0..count {
+        let (logit, draft_token) = top_logits[i];
+        ranked.push(Eagle3DraftCandidate {
+            draft_token,
+            target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
+            logit,
+        });
     }
     Ok(ranked)
 }
