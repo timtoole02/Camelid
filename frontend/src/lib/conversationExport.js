@@ -8,9 +8,12 @@ const MESSAGE_EXPORT_FIELDS = [
   'id', 'role', 'content', 'created_at', 'model_id', 'model_name',
   'finish_reason', 'usage', 'usage_source', 'elapsed_ms',
   'first_content_ms', 'tokens_out_per_sec', 'support_row',
+  'web_research',
 ]
 
 const SUPPORT_ROW_FIELDS = ['id', 'status', 'supported']
+const WEB_RESEARCH_FIELDS = ['reason', 'query', 'sources', 'warnings']
+const WEB_SOURCE_FIELDS = ['title', 'url']
 
 function pick(source, fields) {
   const out = {}
@@ -18,6 +21,19 @@ function pick(source, fields) {
     if (source?.[field] !== undefined && source?.[field] !== null) out[field] = source[field]
   }
   return out
+}
+
+function safeWebUrl(value) {
+  try {
+    const url = new URL(String(value || ''))
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : null
+  } catch {
+    return null
+  }
+}
+
+function markdownLabel(value) {
+  return String(value || '').replace(/([\\\[\]`*_<>])/g, '\\$1').replace(/[\r\n]+/g, ' ').trim()
 }
 
 export function exportableConversation(conversation) {
@@ -33,6 +49,14 @@ export function exportableConversation(conversation) {
     messages: (conversation?.messages || []).map((message) => {
       const picked = pick(message, MESSAGE_EXPORT_FIELDS)
       if (picked.support_row) picked.support_row = pick(picked.support_row, SUPPORT_ROW_FIELDS)
+      if (picked.web_research) {
+        picked.web_research = pick(picked.web_research, WEB_RESEARCH_FIELDS)
+        picked.web_research.sources = (picked.web_research.sources || [])
+          .map((source) => pick(source, WEB_SOURCE_FIELDS))
+          .map((source) => ({ ...source, url: safeWebUrl(source.url) }))
+          .filter((source) => source.url)
+        picked.web_research.warnings = (picked.web_research.warnings || []).map(String).filter(Boolean)
+      }
       return picked
     }),
   }
@@ -60,6 +84,12 @@ export function conversationToMarkdown(conversation) {
         meta.push(`${message.usage.prompt_tokens}→${message.usage.completion_tokens} tokens${message.usage_source === 'backend' ? '' : ' (client estimate)'}`)
       }
       if (meta.length) lines.push(`> ${meta.join(' · ')} — telemetry, not support evidence`, '')
+      if (message.web_research?.sources?.length || message.web_research?.warnings?.length) {
+        lines.push('### Web sources', '')
+        message.web_research.sources.forEach((source) => lines.push(`- [${markdownLabel(source.title || source.url)}](<${source.url}>)`))
+        message.web_research.warnings.forEach((warning) => lines.push(`> Web research warning: ${markdownLabel(warning)}`))
+        lines.push('')
+      }
     }
   }
   return lines.join('\n')

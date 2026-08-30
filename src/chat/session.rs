@@ -111,6 +111,11 @@ pub struct Session {
     pub active_id: Option<String>,
     pub active_label: String,
     pub active_posture: String,
+    /// Exact identity reported by the server for the loaded artifact. These are
+    /// separate from display/request ids because capability receipts attach to
+    /// GGUF bytes, not a user-controlled alias.
+    active_filename: Option<String>,
+    active_gguf_sha256: Option<String>,
     /// Training context length of the active model (for the context gauge).
     pub active_ctx: Option<u32>,
     pub last_prompt_tokens: Option<u32>,
@@ -135,6 +140,8 @@ impl Session {
             active_id: None,
             active_label: String::new(),
             active_posture: String::new(),
+            active_filename: None,
+            active_gguf_sha256: None,
             active_ctx: None,
             last_prompt_tokens: None,
             last_completion_tokens: None,
@@ -153,6 +160,8 @@ impl Session {
         self.active_ctx = info.context_length();
         let posture = self.posture_for(&info.id);
         self.set_active(info.id.clone(), info.id.clone(), posture);
+        self.active_filename = info.filename.clone();
+        self.active_gguf_sha256 = (!info.gguf_sha256.is_empty()).then(|| info.gguf_sha256.clone());
     }
 
     pub fn client(&self) -> Client {
@@ -172,6 +181,10 @@ impl Session {
         self.active_id.is_some()
     }
 
+    pub fn active_gguf_sha256(&self) -> Option<&str> {
+        self.active_gguf_sha256.as_deref()
+    }
+
     pub fn generation_ready(&self) -> bool {
         self.client
             .health()
@@ -181,6 +194,11 @@ impl Session {
 
     /// The ledger `family` of the active model (drives tool-call parsing), or "".
     pub fn active_family(&self) -> String {
+        if let Some(row_id) = self.active_artifact_row() {
+            if let Some(row) = self.ledger.iter().find(|row| row.id == row_id) {
+                return row.family.clone();
+            }
+        }
         self.ledger
             .iter()
             .find(|row| {
@@ -190,16 +208,24 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// True when the active model matches a ledger row verified for tool-calling
-    /// (agent mode). Matched by the display label (the picker sets it to the
-    /// ledger id) or the server-assigned id. Honest gate: an arbitrary `--model`
-    /// that doesn't match a tool-capable row is not tool-capable.
+    /// True only when the active model matches a ledger row verified for
+    /// tool-calling *and* the server reports an artifact filename/digest that
+    /// resolves to that same row. An alias or filename alone cannot make
+    /// different bytes inherit another artifact's agent receipt.
     pub fn active_tool_capable(&self) -> bool {
-        self.ledger.iter().any(|row| {
-            row.tool_capable
-                && (row.id == self.active_label
-                    || Some(row.id.as_str()) == self.active_id.as_deref())
-        })
+        let Some(artifact_row) = self.active_artifact_row() else {
+            return false;
+        };
+        self.ledger
+            .iter()
+            .any(|row| row.tool_capable && row.id == artifact_row)
+    }
+
+    fn active_artifact_row(&self) -> Option<&'static str> {
+        let filename = self.active_filename.as_deref()?;
+        let sha256 = self.active_gguf_sha256.as_deref()?;
+        crate::api::workspace::tool_capable_row_for_loaded_artifact(filename, sha256)
+            .map(|(row, _)| row)
     }
 
     /// Every ledger row promoted for agent mode — for refusal messages that
@@ -207,7 +233,10 @@ impl Session {
     pub fn tool_capable_rows(&self) -> Vec<String> {
         self.ledger
             .iter()
-            .filter(|r| r.tool_capable)
+            .filter(|r| {
+                r.tool_capable
+                    && crate::api::workspace::tool_capable_row_has_certified_artifact(&r.id)
+            })
             .map(|r| r.id.clone())
             .collect()
     }
@@ -252,12 +281,14 @@ impl Session {
                     .map(str::to_string)
                     .unwrap_or_else(|| self.posture_for(&id));
                 let label = label.map(str::to_string).unwrap_or_else(|| id.clone());
-                self.active_ctx = self
-                    .loaded_models()
-                    .iter()
-                    .find(|m| m.id == id)
-                    .and_then(|m| m.context_length());
+                let loaded = self.loaded_models().into_iter().find(|m| m.id == id);
+                self.active_ctx = loaded.as_ref().and_then(LoadedInfo::context_length);
                 self.set_active(id, label, posture);
+                if let Some(info) = loaded {
+                    self.active_filename = info.filename;
+                    self.active_gguf_sha256 =
+                        (!info.gguf_sha256.is_empty()).then_some(info.gguf_sha256);
+                }
                 Ok(LoadResult::Loaded)
             }
         }
@@ -270,6 +301,8 @@ impl Session {
         self.active_id = Some(request_id);
         self.active_label = label;
         self.active_posture = posture;
+        self.active_filename = None;
+        self.active_gguf_sha256 = None;
     }
 
     pub fn reset_history(&mut self) {
@@ -497,6 +530,8 @@ mod tests {
             active_id: Some("m".into()),
             active_label: "m".into(),
             active_posture: "loaded".into(),
+            active_filename: None,
+            active_gguf_sha256: None,
             active_ctx: None,
             last_prompt_tokens: None,
             last_completion_tokens: None,
@@ -516,6 +551,62 @@ mod tests {
         assert!(!s.settings.stream);
         assert!(s.set_param("temperature", "-1").is_err());
         assert!(s.set_param("bogus", "1").is_err());
+    }
+
+    #[test]
+    fn agent_gate_requires_the_certified_loaded_artifact_identity() {
+        let mut s = session();
+        s.active_id = Some("llama32_3b_instruct_q8_0".into());
+        s.active_label = "llama32_3b_instruct_q8_0".into();
+        s.ledger = vec![CompatRow {
+            id: "llama32_3b_instruct_q8_0".into(),
+            family: "llama_bpe_decoder".into(),
+            quantization: "Q8_0".into(),
+            status: "supported_exact_row_smoke".into(),
+            tool_capable: true,
+        }];
+        s.active_filename = Some("Llama-3.2-3B-Instruct-Q8_0.gguf".into());
+        s.active_gguf_sha256 =
+            Some("f34112a11b7dad74ab517dedf6dcf00d624c9adac2dc0c72c719ca0478554ef2".into());
+        assert!(s.active_tool_capable());
+
+        // The server id may be a startup hash or another local alias. Exact
+        // bytes, not that alias, are what earned the receipt.
+        s.active_id = Some("sha256:local-runtime-id".into());
+        s.active_label = "local-runtime-id".into();
+        assert!(s.active_tool_capable());
+        assert_eq!(s.active_family(), "llama_bpe_decoder");
+
+        s.active_gguf_sha256 = Some("00".repeat(32));
+        assert!(!s.active_tool_capable(), "same name with different bytes");
+
+        s.active_gguf_sha256 = None;
+        assert!(
+            !s.active_tool_capable(),
+            "missing identity must fail closed"
+        );
+    }
+
+    #[test]
+    fn agent_refusal_list_omits_unpinned_tool_rows() {
+        let mut s = session();
+        s.ledger = vec![
+            CompatRow {
+                id: "qwen3_4b_instruct_q8_0".into(),
+                family: "qwen".into(),
+                quantization: "Q8_0".into(),
+                status: "supported_exact_row_smoke".into(),
+                tool_capable: true,
+            },
+            CompatRow {
+                id: "qwen3_4b_q4_k_m".into(),
+                family: "qwen".into(),
+                quantization: "Q4_K_M".into(),
+                status: "supported_exact_row_smoke".into(),
+                tool_capable: true,
+            },
+        ];
+        assert_eq!(s.tool_capable_rows(), vec!["qwen3_4b_q4_k_m"]);
     }
 
     #[test]

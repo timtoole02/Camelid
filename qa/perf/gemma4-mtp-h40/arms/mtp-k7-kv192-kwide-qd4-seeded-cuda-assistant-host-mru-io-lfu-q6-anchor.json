@@ -1,0 +1,22 @@
+{
+  "description": "K=7 sibling of the composed auto-tier arm: alpha reached 7.00 at K=7 in the morning sweep (every draft accepted), so if the composed stack cuts the per-round wall the wider round should amortize it better. Same env as the K=6 composed arm.",
+  "mtp": true,
+  "draft_k": 7,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0",
+    "CAMELID_GEMMA4_GHOST_CUDA_CONTEXT": "192",
+    "CAMELID_GEMMA4_GHOST_BATCH_READS": "1",
+    "CAMELID_GEMMA4_GHOST_READ_THREADS": "4",
+    "CAMELID_GEMMA4_GHOST_UNCACHED_READERS": "4",
+    "CAMELID_GEMMA4_MTP_KWIDE": "1",
+    "CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP": "1",
+    "CAMELID_GEMMA4_MTP_CUDA_ASSISTANT": "1",
+    "CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION": "mru",
+    "CAMELID_GEMMA4_MTP_IO_PIPELINE": "1",
+    "CAMELID_GEMMA4_GHOST_CUDA_EVICTION": "lfu",
+    "CAMELID_GEMMA4_MTP_DENSE_Q6_ANCHOR_DP4A": "1"
+  }
+}

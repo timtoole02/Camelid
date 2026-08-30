@@ -93,6 +93,18 @@ origins are refused. The bundled browser UI stores an entered key in that browse
 only for the configured API origin. A fresh browser that reaches an authenticated listener opens
 the Settings credential field; a wrong key remains there instead of reporting the server offline.
 
+### Optional GitHub quota credential for Web Auto
+
+`CAMELID_WEB_GITHUB_TOKEN` optionally supplies a GitHub token to the bounded
+`/api/web/research` preflight. Camelid sends it only on its own repository
+metadata/tree/README requests whose current hop is exactly HTTPS
+`api.github.com`; it is never forwarded to arbitrary linked API URLs, GitHub
+raw content, search providers, redirects outside those managed request shapes,
+or the model. Private
+repositories remain outside public-web research even when the token can see
+them. Fetched public responses are held only in a short, bounded in-memory
+TTL/ETag cache; generated answers are never cached by this feature.
+
 ### Trusted-LAN browser Chat
 
 Create the LAN credential on the laptop first:

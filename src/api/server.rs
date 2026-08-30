@@ -59,6 +59,7 @@ impl ApiSurface {
                     | (&Method::GET, "/api/models/local")
                     | (&Method::GET, "/api/models/catalog/downloads")
                     | (&Method::POST, "/api/models/load")
+                    | (&Method::POST, "/api/web/research")
                     | (&Method::POST, "/v1/chat/completions")
             ),
         }
@@ -799,6 +800,7 @@ mod tests {
             (Method::GET, "/api/models/local"),
             (Method::GET, "/api/models/catalog/downloads"),
             (Method::POST, "/api/models/load"),
+            (Method::POST, "/api/web/research"),
             (Method::POST, "/v1/chat/completions"),
         ] {
             assert!(surface.allows(&method, path), "refused {method} {path}");
@@ -884,6 +886,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+
+        // Web research is part of the same authenticated LAN Chat surface.
+        // An irrelevant prompt deterministically skips and therefore proves
+        // route/auth integration without making a network request.
+        let research = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/web/research")
+                    .header(&X_API_KEY, "test-key")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"prompt":"Rewrite this sentence."}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(research.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(research.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "skipped");
+        assert_eq!(body["triggered"], false);
 
         let arbitrary_model = app
             .clone()

@@ -6,6 +6,7 @@
    arrival data, never the paced view (I4). Pure functions; smoke-tested. */
 
 export const MAX_LAG_MS = 150
+export const FIRST_VISIBLE_PREFIX_CHARS = 32
 
 /* Exponential catch-up time constant. The advance is computed from ELAPSED
    TIME, not from how often paceStep happens to be called, so the text flows at
@@ -49,6 +50,27 @@ export function paceStep(state, receivedText, nowMs) {
   if (received - shown < 1) shown = received
   state.shownChars = Math.min(received, Math.max(mustShow, shown, state.shownChars))
   return receivedText.slice(0, Math.floor(state.shownChars))
+}
+
+/* Reveal a small first prefix immediately so a backgrounded tab never looks
+   stuck at zero output. Record the full arrival with the ordinary pacer, but
+   keep the remainder queued for paced display instead of synchronously
+   rendering an arbitrarily large first network chunk. */
+export function paceFirstVisiblePrefix(state, receivedText, nowMs, maxChars = FIRST_VISIBLE_PREFIX_CHARS) {
+  const text = String(receivedText || '')
+  if (!text) return ''
+  paceStep(state, text, nowMs)
+  const parsedLimit = Math.floor(Number(maxChars))
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
+    ? parsedLimit
+    : FIRST_VISIBLE_PREFIX_CHARS
+  const prefix = [...text].slice(0, limit).join('')
+  state.shownChars = Math.max(state.shownChars, prefix.length)
+  return text.slice(0, Math.floor(state.shownChars))
+}
+
+export function paceHasPendingText(displayedText, receivedText) {
+  return String(displayedText || '').length < String(receivedText || '').length
 }
 
 /* Stream ended or aborted: drain instantly, byte-identical. */

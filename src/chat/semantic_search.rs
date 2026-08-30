@@ -228,25 +228,18 @@ fn collect_chunks(root: &Path) -> Result<Vec<SourceChunk>, String> {
     let mut chunks_by_file = Vec::new();
     let mut total_bytes = 0_u64;
     for path in files {
-        let length = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata.len(),
-            Err(_) => continue,
-        };
-        if length == 0
-            || length > MAX_FILE_BYTES
-            || total_bytes.saturating_add(length) > MAX_TOTAL_BYTES
-        {
+        let remaining = MAX_TOTAL_BYTES.saturating_sub(total_bytes);
+        let Some(raw) = read_indexable_source(&path, remaining) else {
             continue;
-        }
-        let raw = match std::fs::read(&path) {
-            Ok(raw) => raw,
-            Err(_) => continue,
         };
+        // Charge every successful read against the I/O budget, including
+        // binary/invalid UTF-8 files that are discarded below. Otherwise a
+        // repository full of mislabeled binaries could bypass MAX_TOTAL_BYTES.
+        total_bytes += raw.len() as u64;
         let text = match std::str::from_utf8(&raw) {
             Ok(text) => text,
             Err(_) => continue,
         };
-        total_bytes += length;
         let relative = path
             .strip_prefix(&canonical_root)
             .unwrap_or(&path)
@@ -258,6 +251,34 @@ fn collect_chunks(root: &Path) -> Result<Vec<SourceChunk>, String> {
         }
     }
     Ok(select_chunks_breadth_first(&chunks_by_file))
+}
+
+/// Read one semantic-index candidate without following a final symlink or
+/// opening a FIFO/device. The pre-open metadata is only a cheap quota filter;
+/// the shared reader repeats the regular-file and size checks on the opened
+/// handle and caps the actual read, closing the common replacement races.
+fn read_indexable_source(path: &Path, remaining_total_bytes: u64) -> Option<Vec<u8>> {
+    let max_bytes = remaining_total_bytes.min(MAX_FILE_BYTES);
+    if max_bytes == 0 {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > max_bytes
+    {
+        return None;
+    }
+    let read_limit = usize::try_from(max_bytes).ok()?;
+    let (raw, grew_past_limit) =
+        super::tools::read_regular_file_bounded(path, max_bytes, read_limit, "semantic index read")
+            .ok()?;
+    if grew_past_limit || raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
 /// Prefer the project's primary source tree, followed by nested application
@@ -488,5 +509,65 @@ mod tests {
             "the first selection round must cover every candidate file"
         );
         assert_eq!(selected[40].start_line, 2);
+    }
+
+    #[test]
+    fn semantic_source_reads_obey_file_and_total_byte_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "fn camelid() {}\n").unwrap();
+        assert_eq!(
+            read_indexable_source(&source, MAX_TOTAL_BYTES).unwrap(),
+            b"fn camelid() {}\n"
+        );
+        assert!(read_indexable_source(&source, 4).is_none());
+
+        let oversized = root.path().join("oversized.rs");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+        assert!(read_indexable_source(&oversized, MAX_TOTAL_BYTES).is_none());
+    }
+
+    #[test]
+    fn invalid_utf8_sources_still_consume_the_total_read_budget() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let file_count = MAX_TOTAL_BYTES / MAX_FILE_BYTES;
+        assert_eq!(MAX_TOTAL_BYTES % MAX_FILE_BYTES, 0);
+        for index in 0..file_count {
+            let path = root.path().join(format!("bad-{index:02}.rs"));
+            let mut file = std::fs::File::create(path).unwrap();
+            file.write_all(&[0xff]).unwrap();
+            file.set_len(MAX_FILE_BYTES).unwrap();
+        }
+        std::fs::write(
+            root.path().join("z-valid.rs"),
+            "fn should_not_be_read() {}\n",
+        )
+        .unwrap();
+
+        assert!(collect_chunks(root.path()).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_source_reads_refuse_fifo_and_symlink_without_opening_them() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("blocked.rs");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is live and NUL-terminated; mkfifo does not retain it.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(read_indexable_source(&fifo, MAX_TOTAL_BYTES).is_none());
+
+        let target = root.path().join("target.rs");
+        let linked = root.path().join("linked.rs");
+        std::fs::write(&target, "secret").unwrap();
+        symlink(&target, &linked).unwrap();
+        assert!(read_indexable_source(&linked, MAX_TOTAL_BYTES).is_none());
     }
 }

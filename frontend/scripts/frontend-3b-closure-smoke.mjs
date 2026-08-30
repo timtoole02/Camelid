@@ -297,7 +297,7 @@ assert.match(hookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge
 assert.match(chatSource, /modelCanChat\s*=\s*\(model\) => \['supported', 'verified', 'variance', 'experimental'\]\.includes\(getChatGateState\(capabilities, model, runtime\)\.chatMode\)/, 'chat model picker must derive supported, verified, variance, and unverified runnable lanes from the shared exact-row gate')
 assert.match(chatSource, /chatModels\s*=\s*models\.filter\(\(model\) => isGenerationCapableModel\(model, runtime\)\)/, 'chat model picker must exclude embedding and companion models before applying chat readiness')
 assert.match(chatSource, /runnableModels\s*=\s*chatModels\.filter\(modelCanChat\)/, 'chat model picker must filter generation-capable models through the shared supported-or-experimental lane predicate')
-assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && canChat && !generationActive/, 'composer send button must be blocked unless the chat gate (supported exact row or experimental lane) unlocked')
+assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && canChat && !requestActive/, 'composer send button must require an unlocked chat gate and no process-wide request in flight')
 /* Redesign (2026-08): the readiness fine print collapsed from a stack of lines
    into one composer status line plus a details tooltip, and its wording moved to
    plain product language (raw flag names like generation_ready=true and the

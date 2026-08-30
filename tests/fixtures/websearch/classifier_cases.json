@@ -1,0 +1,170 @@
+[
+  {
+    "prompt": "Explain Rust ownership without using outside sources.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Read https://example.com/reference and summarize it.",
+    "needed": true,
+    "has_query": false,
+    "url_count": 1
+  },
+  {
+    "prompt": "Compare the current versions of React and Vue.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Summarize the latest releases from Apple.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Do not\nopen or fetch https://example.com/private; just rewrite this sentence.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Use no web research; compare the current versions from my notes locally.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Do not use online sources; compare the current versions from my notes.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Stay offline; search the web for https://example.com/private.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Do not access https://example.com/private; just rewrite this sentence.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Without using outside sources, summarize the latest releases in my notes.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Use no external sources or network access; search online for current prices.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Do not open https://example.com/private; instead search the web for public alternatives.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Describe the state shown when there is no network access; search the web for current recovery guidance.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Design a banner that says no web access; search the web for current patterns.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Do not use the web page at https://example.com/private; search the web for public alternatives.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Don't consult external sites; compare the current versions from my notes.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Don't consult the web; compare current versions.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Read https://example.com/reference and search the web for current alternatives.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 1
+  },
+  {
+    "prompt": "Do not connect to the internet; what is the latest Xcode release?",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Answer without external sources; compare the latest releases in my notes.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Write UI copy that says do not connect to the internet; search the web for current examples.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Explain the phrase answer without external sources; search the web for current guidance.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Read https://example.com/spec and look up competing libraries too.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 1
+  },
+  {
+    "prompt": "Read https://example.com/spec and research alternatives too.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 1
+  },
+  {
+    "prompt": "Build a lookup table from this text.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Do not search online; what is the latest Xcode release?",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Don't browse online; compare current prices from my notes.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Write UI copy that says do not search online; search the web for current examples.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  }
+]

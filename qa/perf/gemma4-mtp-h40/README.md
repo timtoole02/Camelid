@@ -64,7 +64,13 @@ its control; pair bounded-context arms against the matching plain/MTP control.
 | `mtp-k8-kv192-kwide-qd4-router-overlap` | Crossed K-wide probe that moves the batched router DtoH to its own stream while the dense shared branch runs. |
 | `mtp-k8-kv192-kwide-qd8` | Crossed K-wide storage probe with eight unbuffered positioned readers instead of four. |
 | `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-q6-anchor-dp4a` | Minimum-memory exact hardware gate for the anchor-major Q6_K DP4A verifier lane. |
-| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-lfu-q6-anchor` | Current safe winner on the 16 GiB Windows host: QD4 I/O, lifetime-LFU VRAM eviction, CUDA assistant, and anchor-major Q6_K DP4A. |
+| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-tier1024-io-lfu-q6-anchor` | §15 winner in the RAM-starved regime: QD4 I/O, lifetime-LFU VRAM eviction, CUDA assistant, and anchor-major Q6_K DP4A on a forced 1 GiB tier. |
+| `mtp-k6-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-io-lfu-q6-anchor` | The same stack with the MRU tier free to auto-size. First arm to compose every promoted mechanism at a settled host. |
+| `mtp-k7-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-io-lfu-q6-anchor` | K=7 sibling of the composed arm; alpha 7.00 with every draft accepted on this fixture. |
+| `mtp-k7-kv192-kwide-qd4-seeded-cuda-assistant-host-mru-io-lfu-q6-anchor-rsplit` | **Current best on the 16 GiB Windows host (25.7–26.3 decode tok/s at ~8 GiB available)**: the composed K=7 arm plus the resident-first verifier split (§16). |
+| `mtp-k7-…-rsplit-dchain` | Plus the on-device assistant draft chain. Exact; measured NULL paired ×3 (§17) — the removed per-proposal syncs were waiting on kernels that had to finish anyway. |
+| `mtp-k7-…-rsplit-soa` | Plus the routed-arena SoA repack. Exact; measured REGRESSION paired ×3 (§17) — the CPU staging repack costs more than the kernel term it improves. Standing control for a device-side repack variant. |
+| `mtp-k7-kv192-profile` | The promotion gate: `--mtp-assistant` with no stack env at all. The CLI's promoted profile (§18) must match the full-env rsplit arm within noise — and does, paired ×3, ids exact. |
 
 ## What a run produces
 

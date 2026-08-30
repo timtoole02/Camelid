@@ -158,7 +158,7 @@ pub fn run(cfg: BenchConfig) -> anyhow::Result<i32> {
 fn bench_io_bound() -> WorkloadResult {
     const N: usize = 3;
     const SLEEP_MS: u64 = 2000;
-    subagent::configure(canned_config(N));
+    let _subagent_session = subagent::configure_scoped(canned_config(N));
     let temp = std::env::temp_dir().join(format!("camelid-bench-io-{}", std::process::id()));
     let seq = bench_canned(&temp.join("seq"), N, SLEEP_MS, false);
     let conc = bench_canned(&temp.join("conc"), N, SLEEP_MS, true);
@@ -226,10 +226,18 @@ fn bench_inference(
         Ok(Err(e)) => return Err(format!("load error: {e}")),
         Err(_) => return Err(format!("model did not load within {load_timeout}s")),
     };
+    let model_sha256 = client
+        .list_loaded()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.gguf_sha256)
+        .filter(|sha256| !sha256.is_empty())
+        .ok_or_else(|| "loaded model did not expose an exact GGUF SHA-256 identity".to_string())?;
 
     const N: usize = 2;
     let family = family_for(&abs);
-    subagent::configure(real_config(addr, model_id.clone(), family, N));
+    let _subagent_session =
+        subagent::configure_scoped(real_config(addr, model_id.clone(), model_sha256, family, N));
     let temp = std::env::temp_dir().join(format!("camelid-bench-inf-{}", std::process::id()));
     let goal = "In two short sentences, describe the number seven. Do not call any tools.";
     let seq = bench_real(&temp.join("seq"), N, goal, false);
@@ -275,8 +283,10 @@ fn canned_config(concurrency: usize) -> SubagentConfig {
     SubagentConfig {
         addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
         model_id: "canned".to_string(),
+        model_sha256: "00".repeat(32),
         family: "llama".to_string(),
         max_steps: 4,
+        context_budget_tokens: 512,
         max_tokens: 64,
         concurrency,
         depth_limit: 1,
@@ -289,14 +299,17 @@ fn canned_config(concurrency: usize) -> SubagentConfig {
 fn real_config(
     addr: SocketAddr,
     model_id: String,
+    model_sha256: String,
     family: String,
     concurrency: usize,
 ) -> SubagentConfig {
     SubagentConfig {
         addr,
         model_id,
+        model_sha256,
         family,
         max_steps: 3,
+        context_budget_tokens: super::agent::AGENT_VALIDATED_CTX,
         max_tokens: 128,
         concurrency,
         depth_limit: 1,

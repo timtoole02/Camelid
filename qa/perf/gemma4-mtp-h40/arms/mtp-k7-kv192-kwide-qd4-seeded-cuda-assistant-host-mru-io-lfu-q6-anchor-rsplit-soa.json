@@ -1,0 +1,24 @@
+{
+  "description": "The composed K=7 rsplit arm plus the routed-arena SoA repack: Q4_0 expert records are repacked quants-first at staging (host-tier insert / transfer-ring fill), the HtoD path is unchanged, and both routed consumers (scalar GEMV, K-wide GEMM) switch to the SoA kernels' aligned uint4 weight loads. Bit-identical by construction (same dp4a bytes, same per-block term, same single-lane increasing-b fold); pinned by q4_0_record_wire_to_soa_is_a_pure_permutation, q4_0_gemv_routed_soa_matches_wire, and q4_0_gemm_routed_soa_matches_wire.",
+  "mtp": true,
+  "draft_k": 7,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0",
+    "CAMELID_GEMMA4_GHOST_CUDA_CONTEXT": "192",
+    "CAMELID_GEMMA4_GHOST_BATCH_READS": "1",
+    "CAMELID_GEMMA4_GHOST_READ_THREADS": "4",
+    "CAMELID_GEMMA4_GHOST_UNCACHED_READERS": "4",
+    "CAMELID_GEMMA4_MTP_KWIDE": "1",
+    "CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP": "1",
+    "CAMELID_GEMMA4_MTP_CUDA_ASSISTANT": "1",
+    "CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION": "mru",
+    "CAMELID_GEMMA4_MTP_IO_PIPELINE": "1",
+    "CAMELID_GEMMA4_GHOST_CUDA_EVICTION": "lfu",
+    "CAMELID_GEMMA4_MTP_DENSE_Q6_ANCHOR_DP4A": "1",
+    "CAMELID_GEMMA4_MTP_RESIDENT_SPLIT": "1",
+    "CAMELID_GEMMA4_GHOST_ARENA_SOA": "1"
+  }
+}

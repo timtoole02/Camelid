@@ -427,6 +427,27 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:byte-units
 
+      # Pure contract check for Web Auto: exact linked-URL repair/deduplication,
+      # no-browse prompts, current-info detection, bounded untrusted evidence
+      # injection, and hardened source metadata.
+      - name: Frontend web-research smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:web-research
+
+      # Real compiled-UI coverage for Web Auto. A single loopback fixture serves
+      # both assets and deterministic API/SSE responses, so this neither starts
+      # a model process nor reaches the public web.
+      - name: Frontend web-research browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:web-research-browser
+
+      # Keeps the stream event boundary used to separate research latency,
+      # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
+      # smoke above covers cancellation; this lane covers SSE usage/fallbacks.
+      - name: Frontend streaming telemetry smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:streaming
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one

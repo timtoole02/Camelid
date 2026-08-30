@@ -1,0 +1,8 @@
+{
+  "description": "The promotion gate: --mtp-assistant with NO stack environment at all. The CLI's promoted profile must reconstruct the receipted composed K=7 + resident-split configuration on its own; this arm must match `...-io-lfu-q6-anchor-rsplit` within noise and reproduce the Windows ids exactly. Only the benchmark fixture's KV cap is set, because it is deliberately NOT part of the profile.",
+  "mtp": true,
+  "draft_k": 7,
+  "env": {
+    "CAMELID_GEMMA4_GHOST_CUDA_CONTEXT": "192"
+  }
+}

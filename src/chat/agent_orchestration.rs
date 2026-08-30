@@ -200,8 +200,10 @@ fn base_config(concurrency: usize, timeout: Duration) -> SubagentConfig {
     SubagentConfig {
         addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
         model_id: "canned".to_string(),
+        model_sha256: "00".repeat(32),
         family: "llama".to_string(),
         max_steps: 6,
+        context_budget_tokens: 512,
         max_tokens: 64,
         concurrency,
         depth_limit: 1,
@@ -231,7 +233,7 @@ fn run_battery() -> (EvalOutcome, Vec<CaseResult>, String) {
     {
         let work = temp.join("roundtrip");
         let _ = std::fs::create_dir_all(&work);
-        subagent::configure(base_config(2, Duration::from_secs(60)));
+        let _subagent_session = subagent::configure_scoped(base_config(2, Duration::from_secs(60)));
         let spawned = subagent::spawn_canned(&work, "rt-1", "say hello", "ROUNDTRIP-OK", 0);
         let status = poll_to_terminal(&work, "rt-1", Duration::from_secs(30));
         spawn_seen = spawned.is_ok()
@@ -253,7 +255,7 @@ fn run_battery() -> (EvalOutcome, Vec<CaseResult>, String) {
     {
         let work = temp.join("cap");
         let _ = std::fs::create_dir_all(&work);
-        subagent::configure(base_config(1, Duration::from_secs(60)));
+        let _subagent_session = subagent::configure_scoped(base_config(1, Duration::from_secs(60)));
         let a = subagent::spawn_canned(&work, "cap-a", "g", "A", 3000); // stays live ~3s
         let b = subagent::spawn_canned(&work, "cap-b", "g", "B", 0); // must be refused
         let ok = a.is_ok() && b.is_err() && b.as_ref().unwrap_err().contains("concurrency");
@@ -265,7 +267,7 @@ fn run_battery() -> (EvalOutcome, Vec<CaseResult>, String) {
     {
         let work = temp.join("depth");
         let _ = std::fs::create_dir_all(&work);
-        subagent::configure(base_config(2, Duration::from_secs(60)));
+        let _subagent_session = subagent::configure_scoped(base_config(2, Duration::from_secs(60)));
         std::env::set_var(subagent::DEPTH_ENV, "1");
         let d = subagent::spawn_canned(&work, "depth-1", "g", "D", 0);
         std::env::remove_var(subagent::DEPTH_ENV);
@@ -278,7 +280,7 @@ fn run_battery() -> (EvalOutcome, Vec<CaseResult>, String) {
     {
         let work = temp.join("reap");
         let _ = std::fs::create_dir_all(&work);
-        subagent::configure(base_config(2, Duration::from_secs(1)));
+        let _subagent_session = subagent::configure_scoped(base_config(2, Duration::from_secs(1)));
         let e = subagent::spawn_canned(&work, "reap-1", "g", "E", 5000); // 5s > 1s timeout
         std::thread::sleep(Duration::from_millis(1500));
         let status = subagent::status(&work, "reap-1").unwrap_or_default();
@@ -423,6 +425,21 @@ fn run_real_model_battery(
             )
         }
     };
+    let model_sha256 = match client
+        .list_loaded()
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.gguf_sha256)
+        .filter(|sha256| !sha256.is_empty())
+    {
+        Some(sha256) => sha256,
+        None => {
+            return inconclusive(
+                "loaded model did not expose an exact GGUF SHA-256 identity".to_string(),
+                Some(model_id),
+            )
+        }
+    };
 
     let work = std::env::temp_dir().join(format!("camelid-orch-real-{}", std::process::id()));
     if std::fs::create_dir_all(&work).is_err() {
@@ -438,11 +455,13 @@ fn run_real_model_battery(
     std::env::set_var("CAMELID_SUBAGENT_FORCE_CANNED", "notes.txt has 3 lines");
 
     let family = family_for(&abs);
-    subagent::configure(SubagentConfig {
+    let _subagent_session = subagent::configure_scoped(SubagentConfig {
         addr,
         model_id: model_id.clone(),
+        model_sha256: model_sha256.clone(),
         family: family.clone(),
         max_steps: 4,
+        context_budget_tokens: agent::AGENT_VALIDATED_CTX,
         max_tokens: 128,
         concurrency: 2,
         depth_limit: 1,
@@ -495,7 +514,14 @@ fn run_real_model_battery(
                 check_subagent_status with subtask_id \"counter\" and tell me the line count it \
                 reports.";
 
-    let mut driver = LiveDriver::with(client.clone(), model_id.clone(), family, 128, 0.0);
+    let mut driver = LiveDriver::with(
+        client.clone(),
+        model_id.clone(),
+        model_sha256,
+        family,
+        128,
+        0.0,
+    );
     let mut reporter = EvalReporter {
         calls: Vec::new(),
         answer: String::new(),

@@ -78,7 +78,7 @@ function pushRequest(record) {
 
 /* Chat generation: called from the real sendMessage path on completion,
    interruption, or error. */
-export function recordChatGeneration({ lifecycleId, modelId, durationMs, ttftMs, promptTokens, completionTokens, tokensPerSec, usageSource, outcome, promptText }) {
+export function recordChatGeneration({ lifecycleId, modelId, durationMs, ttftMs, webResearchMs, promptTokens, completionTokens, tokensPerSec, usageSource, outcome, promptText }) {
   pushRequest({
     lifecycleId,
     kind: 'chat',
@@ -87,6 +87,7 @@ export function recordChatGeneration({ lifecycleId, modelId, durationMs, ttftMs,
     outcome: outcome || 'ok',
     durationMs: Number.isFinite(durationMs) ? durationMs : null,
     ttftMs: Number.isFinite(ttftMs) ? ttftMs : null,
+    webResearchMs: Number.isFinite(webResearchMs) ? webResearchMs : null,
     promptTokens: Number.isFinite(promptTokens) ? promptTokens : null,
     completionTokens: Number.isFinite(completionTokens) ? completionTokens : null,
     tokensPerSec: Number.isFinite(tokensPerSec) ? tokensPerSec : null,
@@ -124,9 +125,10 @@ export function getTelemetrySnapshot() {
   return { requests: state.requests.slice(), health: state.health.slice() }
 }
 
-/* Export whitelist (I7): time, endpoint, model, outcome, duration, token
-   counts. promptText and any path-like field can never appear here. */
-const EXPORT_FIELDS = ['at', 'kind', 'endpoint', 'modelId', 'outcome', 'httpStatus', 'durationMs', 'ttftMs', 'promptTokens', 'completionTokens', 'tokensPerSec', 'usageSource']
+/* Export whitelist (I7): time, endpoint, model, outcome, independent web/model
+   timings, and token counts. promptText and any path-like field can never
+   appear here. */
+const EXPORT_FIELDS = ['at', 'kind', 'endpoint', 'modelId', 'outcome', 'httpStatus', 'durationMs', 'webResearchMs', 'ttftMs', 'promptTokens', 'completionTokens', 'tokensPerSec', 'usageSource']
 
 export function exportTelemetryJson() {
   const rows = state.requests.map((record) => {
@@ -158,6 +160,7 @@ export function summarizeTelemetry(requests) {
     total,
     errors,
     errorRate: total ? errors / total : null,
+    medianWebResearchMs: median(requests.map((r) => r.webResearchMs)),
     medianTtftMs: median(requests.map((r) => r.ttftMs)),
     medianDurationMs: median(requests.map((r) => r.durationMs)),
     medianTokensPerSec: median(requests.map((r) => r.tokensPerSec)),

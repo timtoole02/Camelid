@@ -201,12 +201,13 @@ assert.match(messageTurnSource, /data-streaming-state=\{assistantStreaming \? 'a
 assert.match(messageTurnSource, /\$\{assistantStreaming \? 'is-streaming' : ''\}/, 'only assistant rows that are actively streaming should receive the animated streaming class')
 assert.doesNotMatch(messageTurnSource, /\$\{message\.streaming \? 'is-streaming' : ''\}/, 'raw message.streaming should not keep completed/non-assistant rows visually active')
 assert.match(messageTurnSource, /\{message\.role === 'assistant' && <MessageMetaFooter message=\{message\} \/>\}/, 'the assistant meta footer should render during streaming too — it is the live tok/s readout (tokens_out_per_sec is live-patched per frame)')
-assert.match(messageTurnSource, /title="End-to-end output rate, measured in this browser"/, 'the browser whole-request output metric must not be mislabeled as model decode throughput')
-assert.doesNotMatch(messageTurnSource, /title="Decode rate, measured in this browser"/, 'the footer must not call its end-to-end browser timing a decode-only rate')
-assert.match(diagnosticsSource, /End-to-end Output Rate/, 'developer diagnostics must use the same truthful browser-rate label')
+assert.match(messageTurnSource, /title="Decode rate, measured in this browser"/, 'the footer must label the post-first-content browser timing as decode rate')
+assert.match(diagnosticsSource, /Decode Rate/, 'developer diagnostics must use the same decode-rate label')
 assert.match(messageTurnSource, /tokens est\.[\s\S]*in \{usage\.prompt_tokens\}[\s\S]*out \{usage\.completion_tokens/, 'the streaming footer should label live input and output token counts explicitly')
 assert.match(dashboardHookSource, /usage:\s*\{\s*prompt_tokens: promptTokenEstimate,\s*completion_tokens: 0,[\s\S]*usage_source: 'client_estimate'/, 'a new assistant row should expose input tokens and zero output tokens before the first streamed token')
 assert.match(dashboardHookSource, /completion_tokens: realTokens,[\s\S]*total_tokens: promptTokenEstimate \+ realTokens/, 'live assistant patches should advance output token usage during generation')
+assert.match(dashboardHookSource, /sendGate\.chatMode !== 'experimental' && sendGate\.hint\?\.target/, 'an experimental artifact must not persist a verified reference-row chip')
+assert.match(messageTurnSource, /message\.support_row && !message\.experimental_lane/, 'legacy experimental replies must hide contradictory verified reference-row chips')
 assert.doesNotMatch(messageTurnSource, /cxturn__meta--reserve/, 'the invisible footer placeholder is gone; the live footer itself holds the layout slot')
 assert.doesNotMatch(read('../src/styles/chat.css'), /cxturn__meta--reserve/, 'the reserved-footer spacer css must not outlive the placeholder it styled')
 assert.match(messageTurnSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
@@ -223,7 +224,7 @@ assert.match(streamingIndicatorSource, /className="streaming-loader-label">\{lab
 assert.match(dashboardHookSource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
 assert.match(
   dashboardHookSource,
-  /const requestMaxTokens = applyGemma4GhostChatTokenCap\([\s\S]*applyGemma4ChatTokenFloor\([\s\S]*applyBitNetFreshChatTokenCap\([\s\S]*localChatMaxTokens\(history, responseLimitModelId\)/,
+  /const requestedMaxTokens = applyGemma4GhostChatTokenCap\([\s\S]*applyGemma4ChatTokenFloor\([\s\S]*applyBitNetFreshChatTokenCap\([\s\S]*localChatMaxTokens\(history, responseLimitModelId\)/,
   'local chat sends should apply the fresh-BitNet cap before the Gemma 4 floor and Ghost-only Metal-context ceiling',
 )
 assert.match(dashboardHookSource, /max_tokens:\s*requestMaxTokens/, 'the computed lane-aware response budget must be sent to the backend')
@@ -232,7 +233,8 @@ assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.
 assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
 assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
 assert.match(chatWorkspaceSource, /isBitNetB158ChatModel\(selectedModel, runtime, selectedModelId\)/, 'BitNet controls must use the exact causal-model detector rather than architecture display metadata alone')
-assert.match(dashboardHookSource, /const outputElapsedMs = liveElapsedMs[\s\S]*tokensPerSecond\(realTokens, outputElapsedMs\)/, 'live output rate must use wall time from request start, matching its end-to-end label')
+assert.match(dashboardHookSource, /const decodeElapsedMs = firstTokenAt === null \? 0 : now - firstTokenAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the first generated token and exclude its baseline count')
+assert.match(dashboardHookSource, /effectiveGenerationTokenLimit\([\s\S]*runtime\?\.max_generation_tokens/, 'the outgoing max_tokens value must obey the same live server ceiling used by research budgeting')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
 assert.match(dashboardHookSource, /readStreamingChatCompletion\(response/, 'dashboard chat send should use the centralized stream parser')
@@ -577,7 +579,15 @@ assert.doesNotMatch(rlcSource, /navigator\.deviceMemory|performance\.memory/, 'n
 assert.match(chatWorkspaceSource, /validateSendBudget/, 'the composer must validate prompt+max_tokens against the real context rule at send time')
 
 /* ---- Display pacing honesty bounds (Phase 8B) ---- */
-const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../src/lib/streamPacing.js')
+const {
+  createPacerState,
+  paceStep,
+  paceDrain,
+  paceFirstVisiblePrefix,
+  paceHasPendingText,
+  FIRST_VISIBLE_PREFIX_CHARS,
+  MAX_LAG_MS,
+} = await import('../src/lib/streamPacing.js')
 {
   const state = createPacerState()
   let received = ''
@@ -599,8 +609,23 @@ const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../s
   const drained = paceDrain(state, received)
   assert.equal(drained, received, 'drain must be instant and byte-identical to the received stream')
 }
+{
+  const state = createPacerState()
+  const received = 'stream '.repeat(80)
+  const first = paceFirstVisiblePrefix(state, received, 0)
+  assert.ok(first.length > 0, 'the first streamed text must become visible immediately')
+  assert.ok(
+    [...first].length <= FIRST_VISIBLE_PREFIX_CHARS,
+    'an arbitrarily large first SSE chunk must reveal only the bounded prefix synchronously',
+  )
+  assert.equal(paceHasPendingText(first, received), true, 'the unrevealed first-chunk tail must remain queued for pacing')
+  const complete = paceDrain(state, received)
+  assert.equal(paceHasPendingText(complete, received), false, 'a caught-up display must stop requesting pacing frames')
+}
 assert.match(dashboardHookSource, /paceStep\(pacer, fullContent/, 'streaming display must go through the bounded pacer')
 assert.match(dashboardHookSource, /paceDrain\(pacer, streamed\.content/, 'final content must drain byte-identical from the real stream')
+assert.match(dashboardHookSource, /if \(paced !== lastPacedContent\)/, 'pacing ticks must not re-commit unchanged content')
+assert.match(dashboardHookSource, /if \(paceHasPendingText\(paced, fullContent\)\) startPacing\(\)/, 'the pacing loop must stop once displayed text catches the received stream')
 
 /* ---- Streaming feel: paced by elapsed time, and scroll is never stolen ---- */
 // The pacer must advance on its own animation frame loop, not only when a
@@ -662,15 +687,17 @@ assert.match(telemetryViewSource, /Nothing is seeded, stored, or shared/, 'the p
 assert.doesNotMatch(telemetryViewSource, /EvidenceChip[\s\S]{0,300}(ttftMs|tokensPerSec|durationMs|medianT)/, 'perf numbers must never render inside Evidence Chips')
 assert.doesNotMatch(telemetryLogSource, /Math\.random|seedData|sampleData|fakeData|demoData/, 'the telemetry store must have no synthetic data path')
 assert.match(dashboardHookSource, /recordChatGeneration\(/, 'chat sends must feed the session telemetry store')
+assert.match(dashboardHookSource, /ttftMs:\s*null,[\s\S]*webResearchMs,[\s\S]*outcome:\s*requestWasAborted/, 'failed and interrupted generations must retain separately measured web-research latency')
 assert.match(dashboardHookSource, /recordHealthPoll\(/, 'health polls must feed the reachability history')
 assert.match(apiWorkbenchSource, /recordWorkbenchRun\(/, 'workbench try-its must feed the session telemetry store')
 
 /* Behavioral: export is path/content-free by whitelist even for salted records. */
 const { recordChatGeneration: telRecord, exportTelemetryJson: telExport } = await import('../src/lib/telemetryLog.js')
-telRecord({ modelId: 'salt-model', durationMs: 12, ttftMs: 5, outcome: 'ok', promptText: 'SECRET PROMPT /Volumes/Untitled/models/secret.gguf' })
+telRecord({ modelId: 'salt-model', durationMs: 12, webResearchMs: 7, ttftMs: 5, outcome: 'ok', promptText: 'SECRET PROMPT /Volumes/Untitled/models/secret.gguf' })
 const telExported = telExport()
 assert.doesNotMatch(telExported, /SECRET PROMPT|\/Volumes\/|promptText/, 'telemetry exports must exclude prompt content and paths by whitelist')
 assert.match(telExported, /salt-model/, 'telemetry exports keep whitelisted fields')
+assert.match(telExported, /"webResearchMs": 7/, 'telemetry exports must preserve web latency separately from TTFT and total duration')
 assert.match(telExported, /Not compatibility or support evidence/, 'telemetry exports must carry the not-evidence note')
 
 /* ---- API workbench (Phase 5) ---- */

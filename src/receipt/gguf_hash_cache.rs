@@ -1,4 +1,4 @@
-//! Memoized full-file GGUF SHA-256 for the model-load path.
+//! Memoized full-file GGUF SHA-256 for non-authoritative diagnostics.
 //!
 //! `build_loaded_model` hashes the whole GGUF so a receipt can name the lane
 //! without re-hashing per request. That read is the dominant cost of loading a
@@ -13,16 +13,11 @@
 //! re-quantize, `cp` over the top, editing in place — moves at least one of
 //! those and misses the cache.
 //!
-//! # Why a stale entry cannot forge a passing receipt
-//!
-//! Defeating the key requires deliberately restoring mtime (`utimensat`) on a
-//! same-inode, same-length rewrite. Even then the failure is in the safe
-//! direction: the verifier re-hashes the artifact from disk every time
-//! (`receipt::verify`, and `crate::verify::run` when selecting a profile), so
-//! a receipt produced from a stale entry names a digest the file no longer
-//! has and *fails* verification. A stale cache can cost a false alarm; it
-//! cannot manufacture a false pass. Network downloads are also promoted only
-//! after an uncached digest check; the cache is for repeat local-file reads.
+//! The cache file is writable by the local user and its filesystem identity
+//! key is an invalidation heuristic, not authentication. Consequently this
+//! function must never authorize a capability, bind an agent request, select
+//! an exact-artifact kernel, establish a distributed identity, or mint a
+//! promotion receipt. Those paths use [`super::sha256_file_hex`] directly.
 //!
 //! Set `CAMELID_GGUF_HASH_CACHE=0` to always re-hash.
 
@@ -263,10 +258,9 @@ fn cache_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// Every assertion here pins the same invariant from a different angle: a
-    /// hit is served only for the exact bytes the digest was taken over. The
-    /// cache is on the receipt-producing path, so a wrong hit would put a
-    /// digest in a receipt that the artifact does not have.
+    /// Ordinary rewrites should invalidate the performance hint. This is an
+    /// optimization contract only; security-sensitive callers bypass it even
+    /// when an identity key appears unchanged.
     #[test]
     fn cache_returns_the_true_digest_and_misses_when_the_file_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -328,6 +322,36 @@ mod tests {
         let got = cached_at(&gguf, &cache, false).expect("hash");
         assert_eq!(got, sha256_file_hex(&gguf).expect("truth"));
         assert!(!cache.exists(), "the opt-out must not write a cache file");
+    }
+
+    #[test]
+    fn authoritative_hash_ignores_a_forged_performance_cache_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("gguf-sha256.json");
+        let gguf = dir.path().join("model.gguf");
+        std::fs::write(&gguf, b"actual model bytes").expect("write gguf");
+        let key = identity_key(&gguf).expect("filesystem identity");
+        let forged = "00".repeat(32);
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            key,
+            CacheEntry {
+                sha256: forged.clone(),
+                stamped: now_unix(),
+            },
+        );
+        store(&cache, &entries);
+
+        assert_eq!(
+            cached_at(&gguf, &cache, true).expect("performance-cache hit"),
+            forged,
+            "the local cache is explicitly not an authentication boundary"
+        );
+        assert_eq!(
+            super::sha256_file_hex(&gguf).expect("authoritative hash"),
+            crate::receipt::sha256_hex(b"actual model bytes"),
+            "security-sensitive hashing must read the artifact bytes"
+        );
     }
 
     #[test]

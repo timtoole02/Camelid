@@ -1,0 +1,23 @@
+{
+  "description": "The composed K=7 arm plus the resident-first verifier split: the union is reordered residents-first, the resident expert range's routed GEMMs are enqueued before the CPU blocks on the missing experts' storage reads, and the missing range runs after its copies land. Bit-identical by construction (each expert's fold happens whole in exactly one launch; the weighted sum consumes router order); pinned by the two-pass range case in q4_0_gemm_routed_matches_gemv.",
+  "mtp": true,
+  "draft_k": 7,
+  "env": {
+    "CAMELID_GEMMA4_CUDA_BATCH_EXPERT_COPIES": "1",
+    "CAMELID_GEMMA4_PREFILL_CHUNK_TOKENS": "512",
+    "CAMELID_GEMMA4_Q4_0_SOA": "1",
+    "CAMELID_GEMMA4_SPECULATIVE": "0",
+    "CAMELID_GEMMA4_GHOST_CUDA_CONTEXT": "192",
+    "CAMELID_GEMMA4_GHOST_BATCH_READS": "1",
+    "CAMELID_GEMMA4_GHOST_READ_THREADS": "4",
+    "CAMELID_GEMMA4_GHOST_UNCACHED_READERS": "4",
+    "CAMELID_GEMMA4_MTP_KWIDE": "1",
+    "CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP": "1",
+    "CAMELID_GEMMA4_MTP_CUDA_ASSISTANT": "1",
+    "CAMELID_GEMMA4_GHOST_HOST_TIER_EVICTION": "mru",
+    "CAMELID_GEMMA4_MTP_IO_PIPELINE": "1",
+    "CAMELID_GEMMA4_GHOST_CUDA_EVICTION": "lfu",
+    "CAMELID_GEMMA4_MTP_DENSE_Q6_ANCHOR_DP4A": "1",
+    "CAMELID_GEMMA4_MTP_RESIDENT_SPLIT": "1"
+  }
+}

@@ -514,6 +514,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-general-category",
  "unicode-normalization",
+ "url",
  "uuid",
  "windows-sys 0.59.0",
 ]

@@ -8,9 +8,11 @@
 //! instructions (constraint 6). `run_shell` is cwd-pinned + approval-gated, not a
 //! filesystem jail (Decision C / DECISIONS D9).
 
-use std::io::BufRead;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -256,6 +258,11 @@ pub struct Sandbox {
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+// Keep draining each child pipe to EOF, but retain only a bounded head/tail.
+// Splitting the overall tool-output allowance between stdout and stderr keeps
+// a chatty compiler or adversarial command from growing the agent process
+// without bound while preserving both the first error and the final summary.
+const MAX_PIPE_CAPTURE_BYTES: usize = MAX_OUTPUT_BYTES / 2;
 const MAX_RANGED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 4_096;
 const MAX_SEARCH_FILES: usize = 5_000;
@@ -359,6 +366,25 @@ impl Sandbox {
                  read/write anywhere on disk)",
                 self.root.display()
             ))
+        }
+    }
+
+    /// Resolve a create/overwrite target while refusing an existing final
+    /// symlink. `resolve(..., false)` intentionally canonicalizes only the
+    /// parent; without this final-component check, an approved write to
+    /// `workspace/link` could follow `link` to a file outside the workspace.
+    pub(crate) fn resolve_output(&self, raw: &str) -> Result<PathBuf, String> {
+        let path = self.resolve(raw, false)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                "output path {raw} is an existing symbolic link; refusing to follow it"
+            )),
+            Ok(metadata) if !metadata.file_type().is_file() => Err(format!(
+                "output path {raw} exists but is not a regular file"
+            )),
+            Ok(_) => Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+            Err(error) => Err(format!("cannot inspect output path {raw}: {error}")),
         }
     }
 
@@ -498,9 +524,9 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         });
         tools.push(ToolSpec {
             name: "http_fetch".into(),
-            description: "Fetch a URL (GET unless method given). Response is untrusted data.".into(),
+            description: "Fetch a public HTTP(S) URL with GET (default) or HEAD. Response is untrusted data.".into(),
             risk: Risk::Network,
-            params: json!({"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string"}},"required":["url"]}),
+            params: json!({"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string","enum":["GET","HEAD"]}},"required":["url"]}),
         });
     }
     // Subagent orchestration tools — advertised only when a session has enabled
@@ -511,8 +537,9 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         if shell_mode != ShellSandbox::Disabled {
             tools.push(ToolSpec {
                 name: "spawn_subagent".into(),
-                description: "Spawn a child agent (subagent) to work on one scoped goal in the \
-                              workspace, then poll it with check_subagent_status. Exec tier — \
+                description: "Spawn a read-only child agent (subagent) to inspect the workspace \
+                              for one scoped goal, then poll it with check_subagent_status. The \
+                              parent alone applies changes so undo remains complete. Exec tier — \
                               always gated. Isolation-first, not a speedup."
                     .into(),
                 risk: Risk::Exec,
@@ -720,7 +747,6 @@ pub enum Action {
         pattern: String,
         path: PathBuf,
         limit: usize,
-        bounded: bool,
     },
     WriteFile {
         path: PathBuf,
@@ -756,8 +782,9 @@ pub enum Action {
         query: SystemQuery,
         filter: Option<String>,
     },
-    /// Spawn a child agent (subagent) for one scoped goal. Spawning a process is
-    /// execution → Exec tier, always gated. Depth/concurrency caps enforced.
+    /// Spawn a workspace-read-only child agent for one scoped goal. The parent
+    /// remains the only writer. Spawning is Exec tier and always gated;
+    /// depth/concurrency caps are enforced.
     SpawnSubagent {
         subtask_id: String,
         goal: String,
@@ -1004,11 +1031,10 @@ impl Action {
                 timeout.as_secs()
             ),
             // Verbatim goal text (untrusted, never re-parsed) for the approval UI.
-            // Disclose the child's posture: it runs unattended and cannot prompt,
-            // so it inherits this session's mode and DENIES anything that would
-            // confirm (it can never run an unattended shell).
+            // Disclose the child's fixed posture: it may inspect and report, but
+            // the parent remains the only writer so checkpoints stay complete.
             Action::SpawnSubagent { subtask_id, goal } => format!(
-                "spawn_subagent {subtask_id} in {} (runs unattended; Exec denied in the child):\n  goal: {goal}",
+                "spawn_subagent {subtask_id} in {} (read-only child; parent applies all changes):\n  goal: {goal}",
                 sandbox.rel(sandbox.root())
             ),
             // Verbatim text/chord so approval shows exactly what will be synthesized
@@ -1024,7 +1050,29 @@ impl Action {
     }
 
     /// Execute the (already approved) action.
+    // Kept for focused tool tests and optional diagnostic lanes; the production
+    // agent path uses `execute_with_cancel` so process trees observe Ctrl-C.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn execute(&self, sandbox: &Sandbox) -> ToolOutcome {
+        static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+        self.execute_with_cancel(sandbox, &NEVER_CANCEL)
+    }
+
+    /// Execute an approved action while observing the owning agent turn's
+    /// cancellation flag. Direct diagnostic/test callers use [`Self::execute`];
+    /// the real agent loop always uses this path so Ctrl-C can tear down a
+    /// running process tree instead of waiting for the shell timeout.
+    pub(crate) fn execute_with_cancel(
+        &self,
+        sandbox: &Sandbox,
+        cancel: &AtomicBool,
+    ) -> ToolOutcome {
+        // Approval may have blocked while another thread delivered Ctrl-C.
+        // Re-check at the mutation/exec boundary so no action begins after the
+        // owning turn has been cancelled, including direct audited callers.
+        if cancel.load(Ordering::Acquire) {
+            return ToolOutcome::Err("action cancelled before execution".into());
+        }
         match self {
             Action::ReadFile {
                 path,
@@ -1040,8 +1088,7 @@ impl Action {
                 pattern,
                 path,
                 limit,
-                bounded,
-            } => search(pattern, path, *limit, *bounded, sandbox),
+            } => search(pattern, path, *limit, sandbox),
             // Snapshot before every mutation, at the execution site rather than
             // on the model's say-so, so undo is available whether or not the
             // model thought to ask for it. The snapshot only becomes a
@@ -1059,13 +1106,13 @@ impl Action {
                 super::checkpoint::finish(pending, !out.is_err());
                 out
             }
-            Action::RunShell { command } => run_shell(sandbox, command),
+            Action::RunShell { command } => run_shell(sandbox, command, cancel),
             Action::HttpFetch { method, url } => http_fetch(sandbox, method, url),
             Action::RunWindowsCommand {
                 workdir,
                 command,
                 timeout,
-            } => run_windows_command(workdir, command, *timeout),
+            } => run_windows_command(workdir, command, *timeout, cancel),
             Action::InspectSystem { query, filter } => inspect_system(*query, filter.as_deref()),
             Action::SpawnSubagent { subtask_id, goal } => {
                 match subagent::spawn(sandbox.root(), subtask_id, goal) {
@@ -1098,10 +1145,12 @@ impl Action {
             }
             // The server's reply is untrusted data and reaches the model through
             // the same fenced tool-result path as every native tool.
-            Action::McpCall { name, args } => match super::mcp::call(name, args) {
-                Ok(text) => ToolOutcome::Ok(clip(&text)),
-                Err(error) => ToolOutcome::Err(error),
-            },
+            Action::McpCall { name, args } => {
+                match super::mcp::call_with_cancel(name, args, cancel) {
+                    Ok(text) => ToolOutcome::Ok(clip(&text)),
+                    Err(error) => ToolOutcome::Err(error),
+                }
+            }
         }
     }
 }
@@ -1207,13 +1256,12 @@ pub fn validate_for(
                 pattern,
                 path: sandbox.resolve(path, true)?,
                 limit: limit as usize,
-                bounded: profile.is_workspace(),
             })
         }
         "write_file" => {
             let path_raw = str_arg("path")?;
             let content = str_arg("content")?;
-            let path = sandbox.resolve(&path_raw, false)?;
+            let path = sandbox.resolve_output(&path_raw)?;
             refuse_agent_state_write(sandbox, &path)?;
             let summary = write_summary(&path, &content);
             Ok(Action::WriteFile {
@@ -1243,6 +1291,9 @@ pub fn validate_for(
                 .and_then(Value::as_str)
                 .unwrap_or("GET")
                 .to_ascii_uppercase();
+            if !matches!(method.as_str(), "GET" | "HEAD") {
+                return Err("http_fetch allows only GET and HEAD".into());
+            }
             Ok(Action::HttpFetch {
                 method,
                 url: str_arg("url")?,
@@ -1471,7 +1522,7 @@ pub fn validate_for(
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or("screenshot.png");
                 Ok(Action::Screenshot {
-                    path: sandbox.resolve(raw, false)?,
+                    path: sandbox.resolve_output(raw)?,
                 })
             }
         }
@@ -1505,7 +1556,7 @@ pub fn validate_for(
         other if other.starts_with(super::mcp::PREFIX) => {
             if !super::mcp::is_enabled() {
                 return Err(format!(
-                    "`{other}` is an MCP tool but MCP is not enabled (start with --allow-mcp)"
+                    "`{other}` is an MCP tool but MCP is not enabled (start with --allow-mcp and --trust-mcp-server <NAME>)"
                 ));
             }
             if !super::mcp::has_tool(other) {
@@ -1526,25 +1577,238 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<
 
 // --- execution ------------------------------------------------------------
 
-fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -> ToolOutcome {
-    if start_line.is_some() || max_lines.is_some() {
-        if std::fs::metadata(path)
-            .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
-            .unwrap_or(false)
-        {
-            return ToolOutcome::Err(format!(
-                "ranged read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
+const MAX_SEARCH_FILE_BYTES: u64 = (MAX_READ_BYTES * 8) as u64;
+
+/// Open a regular file without following a final-component symlink on Unix.
+/// The metadata checks reject FIFOs, sockets, devices, and directories before
+/// any read can block on them.  The post-open check also catches ordinary
+/// replacement races; O_NOFOLLOW closes the final-symlink race and O_NONBLOCK
+/// prevents a raced-in FIFO from hanging the caller on Unix.
+fn open_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    operation: &str,
+) -> Result<std::fs::File, String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{operation} failed: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{operation} refused: path is a symbolic link"));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!("{operation} refused: path is not a regular file"));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{operation} refused: file exceeds {max_bytes} bytes"
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("{operation} failed: {error}"))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| format!("{operation} failed: {error}"))?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(format!("{operation} refused: path is not a regular file"));
+    }
+    if opened_metadata.len() > max_bytes {
+        return Err(format!(
+            "{operation} refused: file exceeds {max_bytes} bytes"
+        ));
+    }
+    Ok(file)
+}
+
+pub(crate) fn read_regular_file_bounded(
+    path: &Path,
+    max_file_bytes: u64,
+    read_limit: usize,
+    operation: &str,
+) -> Result<(Vec<u8>, bool), String> {
+    let file = open_regular_file(path, max_file_bytes, operation)?;
+    let capture_limit = read_limit.saturating_add(1);
+    let mut bytes = Vec::with_capacity(capture_limit.min(64 * 1024));
+    file.take(capture_limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{operation} failed: {error}"))?;
+    let truncated = bytes.len() > read_limit;
+    if truncated {
+        bytes.truncate(read_limit);
+    }
+    Ok((bytes, truncated))
+}
+
+/// Publish a fully-written same-directory temporary file without replacing an
+/// existing destination. Hard links are the portable fast path. Filesystems
+/// without hard-link support use the host's atomic no-replace rename primitive
+/// (Linux `renameat2`, Apple `renamex_np`, or Windows `MoveFileExW`).
+pub(crate) fn publish_temp_noclobber(temp: &Path, target: &Path) -> Result<(), String> {
+    match std::fs::hard_link(temp, target) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!(
+                "refusing to replace existing destination {}",
+                target.display()
             ));
         }
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+        Err(link_error) => {
+            atomic_rename_noclobber(temp, target).map_err(|rename_error| {
+                format!(
+                    "cannot publish {} without replacement (hard link: {link_error}; atomic rename: {rename_error})",
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Establish a mandatory guard around a newly spawned child. A containment
+/// failure must never degrade into direct-child-only teardown: the caller's
+/// cleanup runs on both guard creation and assignment failure before the error
+/// crosses the process boundary. Generic inputs keep the failure contract
+/// testable on hosts which do not provide Windows Job Objects.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn establish_child_guard<C, G, E>(
+    child: &mut C,
+    guard_name: &str,
+    create: impl FnOnce() -> Result<G, E>,
+    assign: impl FnOnce(&G, &C) -> Result<(), E>,
+    cleanup: impl FnOnce(&mut C) -> Result<(), String>,
+) -> Result<G, String>
+where
+    E: std::fmt::Display,
+{
+    let guard = match create() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let cleanup_error = cleanup(child).err();
+            let mut message = format!("could not create {guard_name}: {error}");
+            if let Some(cleanup_error) = cleanup_error {
+                message.push_str(&format!("; child cleanup also failed: {cleanup_error}"));
+            }
+            return Err(message);
+        }
+    };
+    if let Err(error) = assign(&guard, child) {
+        let cleanup_error = cleanup(child).err();
+        let mut message = format!("could not assign child to {guard_name}: {error}");
+        if let Some(cleanup_error) = cleanup_error {
+            message.push_str(&format!("; child cleanup also failed: {cleanup_error}"));
+        }
+        return Err(message);
+    }
+    Ok(guard)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn atomic_rename_noclobber(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = CString::new(temp.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn atomic_rename_noclobber(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = CString::new(temp.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let result = unsafe { libc::renamex_np(temp.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn atomic_rename_noclobber(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let temp = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe { MoveFileExW(temp.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    windows
+)))]
+fn atomic_rename_noclobber(_temp: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this host has no supported atomic no-replace rename primitive",
+    ))
+}
+
+fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -> ToolOutcome {
+    if start_line.is_some() || max_lines.is_some() {
+        let (bytes, grew_past_limit) = match read_regular_file_bounded(
+            path,
+            MAX_RANGED_FILE_BYTES,
+            MAX_RANGED_FILE_BYTES as usize,
+            "ranged read",
+        ) {
+            Ok(result) => result,
+            Err(error) => return ToolOutcome::Err(error),
         };
+        if grew_past_limit {
+            return ToolOutcome::Err(format!(
+                "ranged read refused: file exceeded {MAX_RANGED_FILE_BYTES} bytes while reading"
+            ));
+        }
         let start = start_line.unwrap_or(1);
         let limit = max_lines.unwrap_or(200);
         let mut output = String::new();
         let mut returned = 0usize;
-        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        for (index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
             let line_number = index + 1;
             if line_number < start {
                 continue;
@@ -1553,10 +1817,6 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
                 output.push_str(&format!("...[continue at start_line={line_number}]"));
                 break;
             }
-            let line = match line {
-                Ok(line) => line,
-                Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
-            };
             let rendered = format!("{line_number}: {line}\n");
             if output.len().saturating_add(rendered.len()) > MAX_READ_BYTES {
                 output.push_str(&format!("...[continue at start_line={line_number}]"));
@@ -1571,25 +1831,15 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
             output.trim_end().to_string()
         });
     }
-    if std::fs::metadata(path)
-        .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
-        .unwrap_or(false)
-    {
-        return ToolOutcome::Err(format!(
-            "read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
-        ));
-    }
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let truncated = bytes.len() > MAX_READ_BYTES;
-            let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
-            let mut text = String::from_utf8_lossy(slice).into_owned();
+    match read_regular_file_bounded(path, MAX_RANGED_FILE_BYTES, MAX_READ_BYTES, "read") {
+        Ok((bytes, truncated)) => {
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
             if truncated {
                 text.push_str(&format!("\n…[truncated at {MAX_READ_BYTES} bytes]"));
             }
             ToolOutcome::Ok(text)
         }
-        Err(e) => ToolOutcome::Err(format!("read failed: {e}")),
+        Err(error) => ToolOutcome::Err(error),
     }
 }
 
@@ -1650,20 +1900,21 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     })
 }
 
-fn search(
-    pattern: &str,
-    root: &Path,
-    limit: usize,
-    bounded: bool,
-    sandbox: &Sandbox,
-) -> ToolOutcome {
+fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOutcome {
     let needle = pattern.to_lowercase();
     let root = match std::fs::canonicalize(root) {
         Ok(root) if sandbox.permits(&root) => root,
         _ => return ToolOutcome::Err("search path is unavailable or outside the workspace".into()),
     };
-    if root.is_file() {
+    let root_metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) => return ToolOutcome::Err(format!("search path is unavailable: {error}")),
+    };
+    if root_metadata.file_type().is_file() {
         return search_file(&needle, &root, limit, sandbox);
+    }
+    if !root_metadata.file_type().is_dir() {
+        return ToolOutcome::Err("search path is not a regular file or directory".into());
     }
     let mut hits = Vec::new();
     let mut stack = vec![root];
@@ -1673,8 +1924,8 @@ fn search(
     let mut truncated = false;
     while let Some(dir) = stack.pop() {
         if hits.len() >= limit
-            || (bounded
-                && (files_scanned >= MAX_SEARCH_FILES || started.elapsed() >= MAX_SEARCH_DURATION))
+            || files_scanned >= MAX_SEARCH_FILES
+            || started.elapsed() >= MAX_SEARCH_DURATION
         {
             truncated = true;
             break;
@@ -1690,9 +1941,8 @@ fn search(
         };
         for entry in read.flatten() {
             if hits.len() >= limit
-                || (bounded
-                    && (files_scanned >= MAX_SEARCH_FILES
-                        || started.elapsed() >= MAX_SEARCH_DURATION))
+                || files_scanned >= MAX_SEARCH_FILES
+                || started.elapsed() >= MAX_SEARCH_DURATION
             {
                 truncated = true;
                 break;
@@ -1713,15 +1963,17 @@ fn search(
                 continue;
             }
             files_scanned += 1;
-            if std::fs::metadata(&path)
-                .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok((bytes, grew_past_limit)) = read_regular_file_bounded(
+                &path,
+                MAX_SEARCH_FILE_BYTES,
+                MAX_SEARCH_FILE_BYTES as usize,
+                "search read",
+            ) else {
                 continue;
             };
+            if grew_past_limit {
+                continue;
+            }
             let text = String::from_utf8_lossy(&bytes);
             for (n, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
@@ -1746,16 +1998,18 @@ fn search(
 }
 
 fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> ToolOutcome {
-    if std::fs::metadata(path)
-        .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
-        .unwrap_or(true)
-    {
-        return ToolOutcome::Err("search file is unreadable or exceeds the size limit".into());
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => return ToolOutcome::Err(format!("search read failed: {error}")),
+    let (bytes, grew_past_limit) = match read_regular_file_bounded(
+        path,
+        MAX_SEARCH_FILE_BYTES,
+        MAX_SEARCH_FILE_BYTES as usize,
+        "search read",
+    ) {
+        Ok(result) => result,
+        Err(error) => return ToolOutcome::Err(error),
     };
+    if grew_past_limit {
+        return ToolOutcome::Err("search file exceeded the size limit while reading".into());
+    }
     let mut hits = Vec::new();
     let mut truncated = false;
     for (line_index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
@@ -1783,8 +2037,202 @@ fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> To
     ToolOutcome::Ok(output)
 }
 
+fn regular_output_target(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("output path is a symbolic link; refusing to follow it".into())
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            Err("output path exists but is not a regular file".into())
+        }
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot inspect output path: {error}")),
+    }
+}
+
+#[cfg(windows)]
+fn ensure_regular_output_target(path: &Path) -> Result<(), String> {
+    regular_output_target(path).map(|_| ())
+}
+
+/// A same-directory temporary output which is removed unless publication has
+/// already consumed it. Keeping cleanup in Drop covers every write, sync,
+/// validation, and publication error without a second error path to maintain.
+struct PendingOutput {
+    path: PathBuf,
+}
+
+impl Drop for PendingOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn create_pending_output(path: &Path) -> Result<(std::fs::File, PendingOutput), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "output path has no parent directory".to_string())?;
+    for _ in 0..8 {
+        let temporary = parent.join(format!(
+            ".camelid-write-{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The unpublished bytes are private even when the user's umask is
+            // permissive. Existing-file permissions are restored below before
+            // the temporary name is promoted.
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        match options.open(&temporary) {
+            Ok(file) => {
+                let pending = PendingOutput { path: temporary };
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| format!("could not inspect temporary output: {error}"))?;
+                if !metadata.file_type().is_file() {
+                    return Err("temporary output is not a regular file".into());
+                }
+                return Ok((file, pending));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("could not create temporary output: {error}")),
+        }
+    }
+    Err("could not allocate a unique temporary output name".into())
+}
+
+#[cfg(unix)]
+fn same_output_identity(expected: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    expected.dev() == current.dev() && expected.ino() == current.ino()
+}
+
+#[cfg(not(unix))]
+fn same_output_identity(_expected: &std::fs::Metadata, _current: &std::fs::Metadata) -> bool {
+    // The publication primitive never follows the final component. Windows
+    // revalidates its type immediately before ReplaceFileW; ReplaceFileW then
+    // either atomically replaces that path or leaves it untouched.
+    true
+}
+
+#[cfg(windows)]
+pub(crate) fn replace_temp_atomically(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
+
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let temporary = wide(temporary);
+    let target = wide(target);
+    // SAFETY: both path buffers are live and NUL-terminated. A null backup path
+    // asks ReplaceFileW for one atomic replacement without a side file.
+    let result = unsafe {
+        ReplaceFileW(
+            target.as_ptr(),
+            temporary.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn replace_temp_atomically(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    // The temporary lives beside the destination, so rename is an atomic name
+    // replacement rather than a cross-filesystem copy.
+    std::fs::rename(temporary, target)
+}
+
+fn sync_output_parent(path: &Path) {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            // The content has already committed atomically. Directory sync is a
+            // durability reinforcement; its failure cannot be reported as a
+            // failed write because rolling back at that point would be unsafe.
+            if let Ok(directory) = std::fs::File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn write_regular_file_with_hook<F>(
+    path: &Path,
+    content: &[u8],
+    before_publish: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let original = regular_output_target(path)?;
+    let (mut temporary_file, pending) = create_pending_output(path)?;
+
+    temporary_file
+        .write_all(content)
+        .map_err(|error| format!("could not write temporary output: {error}"))?;
+    if let Some(metadata) = original.as_ref() {
+        temporary_file
+            .set_permissions(metadata.permissions())
+            .map_err(|error| format!("could not preserve output permissions: {error}"))?;
+    }
+    temporary_file
+        .sync_all()
+        .map_err(|error| format!("could not sync temporary output: {error}"))?;
+    drop(temporary_file);
+
+    // Tests inject a failure here to exercise the exact formerly-destructive
+    // boundary: the complete new bytes exist, but the old destination must not
+    // have changed yet.
+    before_publish()?;
+
+    match (original.as_ref(), regular_output_target(path)?) {
+        (None, None) => publish_temp_noclobber(&pending.path, path)
+            .map_err(|error| format!("could not publish new output: {error}"))?,
+        (None, Some(_)) => {
+            return Err("output path appeared while the write was being prepared".into())
+        }
+        (Some(_), None) => {
+            return Err("output path disappeared while the write was being prepared".into())
+        }
+        (Some(expected), Some(current)) => {
+            if !same_output_identity(expected, &current) {
+                return Err("output path changed while the write was being prepared".into());
+            }
+            replace_temp_atomically(&pending.path, path)
+                .map_err(|error| format!("could not atomically replace output: {error}"))?;
+        }
+    }
+    sync_output_parent(path);
+    Ok(())
+}
+
+fn write_regular_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    write_regular_file_with_hook(path, content, || Ok(()))
+}
+
 fn write_file(path: &Path, content: &str) -> ToolOutcome {
-    match std::fs::write(path, content) {
+    match write_regular_file(path, content.as_bytes()) {
         Ok(()) => ToolOutcome::Ok(format!(
             "wrote {} bytes to {}",
             content.len(),
@@ -1795,9 +2243,23 @@ fn write_file(path: &Path, content: &str) -> ToolOutcome {
 }
 
 fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => return ToolOutcome::Err(format!("read failed: {e}")),
+    let (bytes, grew_past_limit) = match read_regular_file_bounded(
+        path,
+        MAX_RANGED_FILE_BYTES,
+        MAX_RANGED_FILE_BYTES as usize,
+        "edit read",
+    ) {
+        Ok(result) => result,
+        Err(error) => return ToolOutcome::Err(error),
+    };
+    if grew_past_limit {
+        return ToolOutcome::Err(format!(
+            "edit read refused: file exceeded {MAX_RANGED_FILE_BYTES} bytes while reading"
+        ));
+    }
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(error) => return ToolOutcome::Err(format!("edit read failed: {error}")),
     };
     let count = content.matches(old).count();
     if count == 0 {
@@ -1809,13 +2271,113 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
         ));
     }
     let updated = content.replacen(old, new, 1);
-    match std::fs::write(path, &updated) {
+    match write_regular_file(path, updated.as_bytes()) {
         Ok(()) => ToolOutcome::Ok(format!("edited {}", path.display())),
         Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
     }
 }
 
-fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
+#[derive(Default)]
+struct BoundedPipeCapture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl BoundedPipeCapture {
+    fn push(&mut self, chunk: &[u8], limit: usize) {
+        self.total = self.total.saturating_add(chunk.len());
+        let head_limit = limit / 2;
+        let tail_limit = limit.saturating_sub(head_limit);
+
+        if self.head.len() < head_limit {
+            let take = (head_limit - self.head.len()).min(chunk.len());
+            self.head.extend_from_slice(&chunk[..take]);
+        }
+
+        if tail_limit == 0 {
+            return;
+        }
+        if chunk.len() >= tail_limit {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&chunk[chunk.len() - tail_limit..]);
+            return;
+        }
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(tail_limit);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+        }
+        self.tail.extend_from_slice(chunk);
+    }
+
+    fn render(self, limit: usize) -> String {
+        let mut bytes = self.head;
+        if self.total <= limit {
+            let suffix_len = self.total.saturating_sub(bytes.len()).min(self.tail.len());
+            bytes.extend_from_slice(&self.tail[self.tail.len() - suffix_len..]);
+        } else {
+            let omitted = self.total.saturating_sub(bytes.len() + self.tail.len());
+            bytes.extend_from_slice(format!("\n…[{omitted} bytes omitted]…\n").as_bytes());
+            bytes.extend_from_slice(&self.tail);
+        }
+        String::from_utf8_lossy(&bytes).trim_end().to_string()
+    }
+}
+
+fn drain_pipe_bounded(mut pipe: impl Read, limit: usize, stop: &AtomicBool) -> BoundedPipeCapture {
+    let mut capture = BoundedPipeCapture::default();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => capture.push(&chunk[..read], limit),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    capture
+}
+
+#[cfg(unix)]
+fn make_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(pipe);
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_unix_process_group(pgid: u32) {
+    // run_shell creates a fresh process group whose id is the direct child's
+    // pid. A negative pid targets that entire group, including grandchildren.
+    unsafe {
+        libc::kill(-(pgid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group(child: &mut std::process::Child) {
+    kill_unix_process_group(child.id());
+    // Backstop a failed group setup/kill and always reap the direct child.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_shell(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutcome {
     // Platform shell with a timeout: `/bin/sh -c <command>` on Unix, `cmd /C
     // <command>` on Windows. The cwd-pin and OS-level confinement are applied by
     // the shell-sandbox layer (Task 1), which fails closed when the configured
@@ -1828,6 +2390,9 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     };
     #[cfg(windows)]
     let mut builder = {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
         // Absolute interpreter path (W4), matching run_windows_command's
         // system32() discipline. Defense-in-depth only: std's process search
         // already consults System32 *before* the parent PATH and never the
@@ -1846,13 +2411,24 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         // `"`, which is an illegal Windows filename character, so a mangled path
         // errors out rather than escaping the cwd pin (verified Phase 0, W4).
         let mut c = Command::new(system32("cmd.exe"));
-        c.arg("/C").arg(command);
+        c.arg("/C")
+            .arg(command)
+            // The process must not execute before its mandatory Job Object is
+            // assigned. contain_suspended resumes it after assignment.
+            .creation_flags(CREATE_SUSPENDED);
         c
     };
     builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Isolate this invocation before exec so timeout/cancel can signal the
+        // entire descendant tree without touching unrelated Camelid processes.
+        builder.process_group(0);
+    }
     // Apply confinement. A sandboxed mode that can't be enforced here returns an
     // error → refuse to run, never a silent unconfined fallback.
     if let Err(e) =
@@ -1864,23 +2440,19 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         Ok(c) => c,
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
+    #[cfg(unix)]
+    let child_pgid = child.id();
 
     // Assign the child to a kill-on-close job object (W2) so a timeout tears down
-    // the WHOLE process tree, not just cmd.exe. `child.kill()` on Windows reaps
-    // only the direct child; every descendant cmd spawned (rustc, node, a CUDA
-    // process holding VRAM) otherwise survives as an orphan. Descendants spawned
-    // after assignment are captured too. Best-effort — if creation/assignment
-    // fails, the child.kill() backstop still reaps the direct process. Mirrors
-    // run_windows_command; the Unix path is unaffected (/bin/sh's own process
-    // group is already torn down by kill()).
+    // the WHOLE process tree, not just cmd.exe. This boundary is mandatory: if
+    // job creation, assignment, or resume fails, contain_suspended() kills and
+    // reaps the just-spawned child and the tool refuses to run.
     #[cfg(windows)]
-    let _job = {
-        use std::os::windows::io::AsRawHandle;
-        let job = JobObject::new().ok();
-        if let Some(ref j) = job {
-            let _ = j.assign(child.as_raw_handle());
+    let _job = match JobObject::contain_suspended(&mut child) {
+        Ok(job) => job,
+        Err(error) => {
+            return ToolOutcome::Err(format!("process-tree containment failed: {error}"));
         }
-        job
     };
 
     // Drain stdout/stderr on their own threads (W1). Nothing read these until
@@ -1892,19 +2464,18 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     // one command. Both pipes get their own quota, so either one alone can wedge
     // the child; both must be drained. This mirrors run_windows_command, which
     // has had the fix since it was written.
-    let out_reader = child.stdout.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-            buf
-        })
+    let pipe_stop = Arc::new(AtomicBool::new(false));
+    let out_reader = child.stdout.take().map(|pipe| {
+        #[cfg(unix)]
+        make_pipe_nonblocking(&pipe);
+        let stop = Arc::clone(&pipe_stop);
+        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
     });
-    let err_reader = child.stderr.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-            buf
-        })
+    let err_reader = child.stderr.take().map(|pipe| {
+        #[cfg(unix)]
+        make_pipe_nonblocking(&pipe);
+        let stop = Arc::clone(&pipe_stop);
+        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
     });
 
     let deadline = std::time::Instant::now() + sandbox.shell_timeout;
@@ -1912,16 +2483,20 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                let cancelled = cancel.load(Ordering::Acquire);
+                if cancelled || std::time::Instant::now() >= deadline {
                     // Tear down the whole tree (W2), then the direct-child
-                    // backstop. Terminating the job kills every descendant;
-                    // child.kill() covers the case where the job never assigned.
+                    // backstop. Terminating the job kills every descendant.
                     #[cfg(windows)]
-                    if let Some(ref j) = _job {
-                        j.terminate();
+                    _job.terminate();
+                    #[cfg(unix)]
+                    terminate_unix_process_group(&mut child);
+                    #[cfg(windows)]
+                    {
+                        let _ = child.kill();
+                        let _ = child.wait();
                     }
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    pipe_stop.store(true, Ordering::Release);
                     // Killing the child closes the write ends → the readers hit
                     // EOF. Join them so neither thread outlives this call.
                     if let Some(h) = out_reader {
@@ -1930,29 +2505,62 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
                     if let Some(h) = err_reader {
                         let _ = h.join();
                     }
-                    return ToolOutcome::Err(format!(
-                        "command timed out after {}s",
-                        sandbox.shell_timeout.as_secs()
-                    ));
+                    return ToolOutcome::Err(if cancelled {
+                        "command cancelled; process tree terminated".to_string()
+                    } else {
+                        format!(
+                            "command timed out after {}s",
+                            sandbox.shell_timeout.as_secs()
+                        )
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return ToolOutcome::Err(format!("wait failed: {e}")),
+            Err(e) => {
+                #[cfg(windows)]
+                _job.terminate();
+                #[cfg(unix)]
+                terminate_unix_process_group(&mut child);
+                #[cfg(windows)]
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                pipe_stop.store(true, Ordering::Release);
+                if let Some(h) = out_reader {
+                    let _ = h.join();
+                }
+                if let Some(h) = err_reader {
+                    let _ = h.join();
+                }
+                return ToolOutcome::Err(format!("wait failed: {e}"));
+            }
         }
     };
 
-    let stdout_bytes = out_reader
+    #[cfg(unix)]
+    // The approved invocation owns its complete process group. Even a command
+    // that returns success may have launched background grandchildren; do not
+    // let them survive the tool boundary or keep inherited pipes open.
+    kill_unix_process_group(child_pgid);
+    #[cfg(windows)]
+    // Do not let a successful shell detach descendants that retain the capture
+    // pipes or continue mutating state after the tool returns.
+    _job.terminate();
+    pipe_stop.store(true, Ordering::Release);
+
+    let stdout = out_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr_bytes = err_reader
+        .unwrap_or_default()
+        .render(MAX_PIPE_CAPTURE_BYTES);
+    let stderr = err_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .render(MAX_PIPE_CAPTURE_BYTES);
 
     let mut text = String::new();
     let code = status.code().unwrap_or(-1);
     text.push_str(&format!("exit: {code}\n"));
-    let stdout = clip(&String::from_utf8_lossy(&stdout_bytes));
-    let stderr = clip(&String::from_utf8_lossy(&stderr_bytes));
     if !stdout.is_empty() {
         text.push_str(&format!("stdout:\n{stdout}\n"));
     }
@@ -2151,28 +2759,18 @@ fn web_search(sandbox: &Sandbox, query: &str) -> ToolOutcome {
     let template =
         std::env::var("CAMELID_SEARCH_URL").unwrap_or_else(|_| DEFAULT_SEARCH_URL.to_string());
     let url = template.replace("{query}", &urlencode(query));
-    let output = Command::new("curl")
-        .args([
-            "-sSL",
-            "--max-time",
-            "30",
-            "-A",
-            "camelid-agent",
-            url.as_str(),
-        ])
-        .current_dir(&sandbox.root)
-        .stdin(Stdio::null())
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let body = String::from_utf8_lossy(&o.stdout);
+    match crate::api::fetch_public_http("GET", &url) {
+        Ok(response) if (200..300).contains(&response.status) => {
+            let body = String::from_utf8_lossy(&response.body);
             ToolOutcome::Ok(clip(&render_hits(&parse_results(&body))))
         }
-        Ok(o) => ToolOutcome::Err(format!(
-            "search failed: {}",
-            clip(&String::from_utf8_lossy(&o.stderr))
+        Ok(response) => ToolOutcome::Err(format!(
+            "search failed with HTTP {} from {}: {}",
+            response.status,
+            response.final_url,
+            clip(&String::from_utf8_lossy(&response.body))
         )),
-        Err(e) => ToolOutcome::Err(format!("could not run curl: {e}")),
+        Err(error) => ToolOutcome::Err(format!("search failed: {error}")),
     }
 }
 
@@ -2180,19 +2778,29 @@ fn http_fetch(sandbox: &Sandbox, method: &str, url: &str) -> ToolOutcome {
     if !sandbox.allow_net {
         return ToolOutcome::Err("network disabled".into());
     }
-    // Reuse curl (already a dependency for `pull`); no auto-injected credentials.
-    let output = Command::new("curl")
-        .args(["-sS", "--max-time", "30", "-X", method, url])
-        .current_dir(&sandbox.root)
-        .stdin(Stdio::null())
-        .output();
-    match output {
-        Ok(o) if o.status.success() => ToolOutcome::Ok(clip(&String::from_utf8_lossy(&o.stdout))),
-        Ok(o) => ToolOutcome::Err(format!(
-            "fetch failed: {}",
-            clip(&String::from_utf8_lossy(&o.stderr))
+    match crate::api::fetch_public_http(method, url) {
+        Ok(response) if (200..300).contains(&response.status) && method == "HEAD" => {
+            ToolOutcome::Ok(format!(
+                "HTTP {}\nURL: {}\nContent-Type: {}",
+                response.status,
+                response.final_url,
+                if response.content_type.is_empty() {
+                    "(not provided)"
+                } else {
+                    &response.content_type
+                }
+            ))
+        }
+        Ok(response) if (200..300).contains(&response.status) => {
+            ToolOutcome::Ok(clip(&String::from_utf8_lossy(&response.body)))
+        }
+        Ok(response) => ToolOutcome::Err(format!(
+            "fetch failed with HTTP {} from {}: {}",
+            response.status,
+            response.final_url,
+            clip(&String::from_utf8_lossy(&response.body))
         )),
-        Err(e) => ToolOutcome::Err(format!("could not run curl: {e}")),
+        Err(error) => ToolOutcome::Err(format!("fetch failed: {error}")),
     }
 }
 
@@ -2201,7 +2809,7 @@ fn http_fetch(sandbox: &Sandbox, method: &str, url: &str) -> ToolOutcome {
 /// workspace is writable by the agent AND is run_windows_command's cwd, and the
 /// Windows process search otherwise consults the current directory).
 #[cfg(windows)]
-fn system32(relative: &str) -> PathBuf {
+pub(crate) fn system32(relative: &str) -> PathBuf {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     Path::new(&root).join("System32").join(relative)
 }
@@ -2253,13 +2861,18 @@ fn base64_ascii(data: &[u8]) -> String {
 /// primary dev host has no pwsh to validate a second branch against (HARDPAN A8:
 /// an untestable branch ships untested, so it doesn't ship).
 #[cfg(windows)]
-fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> ToolOutcome {
-    use std::io::{Read, Write};
-    use std::os::windows::io::AsRawHandle;
+fn run_windows_command(
+    workdir: &Path,
+    command: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> ToolOutcome {
+    use std::io::Write;
     use std::os::windows::process::CommandExt;
 
     // No console window for the spawned child.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
     // Absolute path (not bare "powershell.exe") so the model-writable cwd cannot
     // shadow the interpreter.
@@ -2270,7 +2883,7 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
         // prevents a blocking prompt from hanging the agent.
         .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
         .current_dir(workdir)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2280,31 +2893,26 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
 
-    // Kill-on-close job object: descendants PowerShell spawns die with it on a
-    // timeout (or when the job handle drops). Best-effort — if assignment fails,
-    // the child.kill() backstop still reaps the direct PowerShell process (its
-    // descendants may then escape tree-teardown).
-    let job = JobObject::new().ok();
-    if let Some(ref j) = job {
-        let _ = j.assign(child.as_raw_handle());
-    }
+    // Kill-on-close containment is mandatory. On create/assign/resume failure,
+    // contain_suspended() kills and reaps the child before this tool returns.
+    let job = match JobObject::contain_suspended(&mut child) {
+        Ok(job) => job,
+        Err(error) => {
+            return ToolOutcome::Err(format!("process-tree containment failed: {error}"));
+        }
+    };
 
     // Drain stdout/stderr on their own threads so a command that emits more than a
     // pipe buffer (~64 KiB) before exiting cannot block in WriteFile and then get
     // false-timed-out with its output lost.
-    let out_reader = child.stdout.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.read_to_end(&mut buf);
-            buf
-        })
+    let pipe_stop = Arc::new(AtomicBool::new(false));
+    let out_reader = child.stdout.take().map(|pipe| {
+        let stop = Arc::clone(&pipe_stop);
+        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
     });
-    let err_reader = child.stderr.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.read_to_end(&mut buf);
-            buf
-        })
+    let err_reader = child.stderr.take().map(|pipe| {
+        let stop = Arc::clone(&pipe_stop);
+        std::thread::spawn(move || drain_pipe_bounded(pipe, MAX_PIPE_CAPTURE_BYTES, stop.as_ref()))
     });
 
     // Feed the command, then EOF so PowerShell executes it and exits.
@@ -2347,12 +2955,12 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    if let Some(ref j) = job {
-                        j.terminate();
-                    }
+                let cancelled = cancel.load(Ordering::Acquire);
+                if cancelled || std::time::Instant::now() >= deadline {
+                    job.terminate();
                     let _ = child.kill();
                     let _ = child.wait();
+                    pipe_stop.store(true, Ordering::Release);
                     // Pipes close on kill → readers EOF; join so no thread leaks.
                     if let Some(h) = out_reader {
                         let _ = h.join();
@@ -2360,29 +2968,48 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
                     if let Some(h) = err_reader {
                         let _ = h.join();
                     }
-                    return ToolOutcome::Err(format!(
-                        "command timed out after {}s",
-                        timeout.as_secs()
-                    ));
+                    return ToolOutcome::Err(if cancelled {
+                        "command cancelled; process tree terminated".to_string()
+                    } else {
+                        format!("command timed out after {}s", timeout.as_secs())
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return ToolOutcome::Err(format!("wait failed: {e}")),
+            Err(e) => {
+                job.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                pipe_stop.store(true, Ordering::Release);
+                if let Some(h) = out_reader {
+                    let _ = h.join();
+                }
+                if let Some(h) = err_reader {
+                    let _ = h.join();
+                }
+                return ToolOutcome::Err(format!("wait failed: {e}"));
+            }
         }
     };
 
-    let stdout_bytes = out_reader
+    // A successful PowerShell invocation may have launched background
+    // descendants. End the owned job before joining pipe readers so those
+    // descendants cannot outlive the approved tool call or pin its pipes.
+    job.terminate();
+    pipe_stop.store(true, Ordering::Release);
+
+    let stdout = out_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr_bytes = err_reader
+        .unwrap_or_default()
+        .render(MAX_PIPE_CAPTURE_BYTES);
+    let stderr = err_reader
         .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .render(MAX_PIPE_CAPTURE_BYTES);
 
     let mut text = String::new();
     let code = status.code().unwrap_or(-1);
     text.push_str(&format!("exit: {code}\n"));
-    let stdout = clip(&String::from_utf8_lossy(&stdout_bytes));
-    let stderr = clip(&String::from_utf8_lossy(&stderr_bytes));
     if !stdout.is_empty() {
         text.push_str(&format!("stdout:\n{stdout}\n"));
     }
@@ -2397,7 +3024,12 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
 }
 
 #[cfg(not(windows))]
-fn run_windows_command(_workdir: &Path, _command: &str, _timeout: Duration) -> ToolOutcome {
+fn run_windows_command(
+    _workdir: &Path,
+    _command: &str,
+    _timeout: Duration,
+    _cancel: &AtomicBool,
+) -> ToolOutcome {
     ToolOutcome::Err("run_windows_command is only available on Windows".into())
 }
 
@@ -2581,6 +3213,9 @@ fn uia_click(window: Option<&str>, name: &str) -> ToolOutcome {
 
 #[cfg(windows)]
 fn uia_screenshot(path: &Path) -> ToolOutcome {
+    if let Err(error) = ensure_regular_output_target(path) {
+        return ToolOutcome::Err(format!("screenshot refused: {error}"));
+    }
     match win_uia::screenshot(path) {
         Ok(s) => ToolOutcome::Ok(s),
         Err(e) => ToolOutcome::Err(e),
@@ -2626,14 +3261,26 @@ fn first_line(s: &str) -> String {
 /// the diff's own truncation markers).
 fn write_summary(path: &Path, content: &str) -> String {
     let new_lines = content.lines().count();
-    match std::fs::read_to_string(path) {
-        Ok(existing) => format!(
+    let existing = read_regular_file_bounded(
+        path,
+        MAX_RANGED_FILE_BYTES,
+        MAX_RANGED_FILE_BYTES as usize,
+        "write preview",
+    )
+    .ok()
+    .and_then(|(bytes, truncated)| (!truncated).then_some(bytes))
+    .and_then(|bytes| String::from_utf8(bytes).ok());
+    match existing {
+        Some(existing) => format!(
             "  overwrite: {} lines → {} lines\n{}",
             existing.lines().count(),
             new_lines,
             super::checkpoint::line_diff(&existing, content)
         ),
-        Err(_) => {
+        None if path.exists() => format!(
+            "  overwrite: existing file preview unavailable (non-regular, non-UTF-8, or over {MAX_RANGED_FILE_BYTES} bytes) → {new_lines} lines"
+        ),
+        None => {
             // A create shows its head: enough to see what is being written
             // without scrolling a modal off the screen.
             let head: Vec<&str> = content.lines().take(20).collect();
@@ -2661,6 +3308,207 @@ mod tests {
             name: name.into(),
             args,
         }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    ))]
+    #[test]
+    fn atomic_rename_fallback_is_no_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("published.json");
+        let first = dir.path().join("first.tmp");
+        std::fs::write(&first, "first").unwrap();
+        atomic_rename_noclobber(&first, &target).unwrap();
+        assert!(!first.exists());
+
+        let second = dir.path().join("second.tmp");
+        std::fs::write(&second, "second").unwrap();
+        assert!(atomic_rename_noclobber(&second, &target).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+    }
+
+    #[test]
+    fn temp_publication_never_replaces_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("published.json");
+        std::fs::write(&target, "first").unwrap();
+        let temp = dir.path().join("second.tmp");
+        std::fs::write(&temp, "second").unwrap();
+        assert!(publish_temp_noclobber(&temp, &target).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+    }
+
+    #[test]
+    fn child_guard_creation_failure_cleans_child_without_assigning() {
+        use std::cell::Cell;
+
+        let mut child = 0usize;
+        let assigned = Cell::new(false);
+        let error = establish_child_guard::<_, (), _>(
+            &mut child,
+            "test guard",
+            || Err("create failed"),
+            |_, _| {
+                assigned.set(true);
+                Ok(())
+            },
+            |child| {
+                *child += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not create test guard"), "{error}");
+        assert_eq!(child, 1);
+        assert!(!assigned.get());
+    }
+
+    #[test]
+    fn child_guard_assignment_failure_cleans_child_and_drops_guard() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        #[derive(Debug)]
+        struct Guard(Rc<Cell<usize>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Rc::new(Cell::new(0));
+        let mut child = 0usize;
+        let error = establish_child_guard(
+            &mut child,
+            "test guard",
+            || Ok::<_, &'static str>(Guard(Rc::clone(&drops))),
+            |_, _| Err("assign failed"),
+            |child| {
+                *child += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not assign child"), "{error}");
+        assert_eq!(child, 1);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn child_guard_success_retains_guard_and_does_not_clean_child() {
+        let mut child = 0usize;
+        let guard = establish_child_guard(
+            &mut child,
+            "test guard",
+            || Ok::<_, &'static str>("guard"),
+            |_, _| Ok(()),
+            |child| {
+                *child += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(guard, "guard");
+        assert_eq!(child, 0);
+    }
+
+    #[test]
+    fn failed_transactional_write_preserves_existing_bytes_and_cleans_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&target, "original bytes").unwrap();
+
+        let error = write_regular_file_with_hook(&target, b"replacement bytes", || {
+            Err("injected failure before atomic publication".into())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("injected failure"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"original bytes");
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".camelid-write-")
+            })
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "temporary outputs leaked");
+    }
+
+    #[test]
+    fn transactional_write_publishes_complete_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&target, "old").unwrap();
+
+        write_regular_file(&target, b"complete replacement").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete replacement");
+    }
+
+    #[test]
+    fn failed_atomic_replace_does_not_remove_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing.txt");
+        let missing_temporary = dir.path().join("missing.tmp");
+        std::fs::write(&target, "original").unwrap();
+
+        assert!(replace_temp_atomically(&missing_temporary, &target).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
+    }
+
+    #[test]
+    fn cancelled_action_cannot_begin_an_approved_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&target, "original").unwrap();
+        let sb = sandbox(dir.path());
+        let action = Action::WriteFile {
+            path: target.clone(),
+            content: "replacement".into(),
+            summary: String::new(),
+        };
+        let cancelled = AtomicBool::new(true);
+
+        let outcome = action.execute_with_cancel(&sb, &cancelled);
+
+        assert!(outcome.is_err());
+        assert!(outcome.text().contains("cancelled"));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transactional_write_rejects_fifo_without_opening_it() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("output.fifo");
+        let c_path = CString::new(target.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a live, NUL-terminated path and mkfifo does not
+        // retain the pointer.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let error = write_regular_file(&target, b"must not block").unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_fifo());
     }
 
     #[test]
@@ -2706,6 +3554,28 @@ mod tests {
         let outcome = read_file(&path, None, None);
         assert!(outcome.is_err());
         assert!(outcome.text().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_and_search_reject_fifo_without_opening_it() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a live, NUL-terminated path and mkfifo does not
+        // retain the pointer after returning.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let read = read_file(&path, None, None);
+        assert!(read.is_err());
+        assert!(read.text().contains("not a regular file"));
+
+        let sb = sandbox(dir.path());
+        let search = search_file("needle", &path, 1, &sb);
+        assert!(search.is_err());
+        assert!(search.text().contains("not a regular file"));
     }
 
     #[test]
@@ -2837,6 +3707,50 @@ mod tests {
         // absolute outside-root is refused too
         let err2 = validate(&call("read_file", json!({"path":"/etc/passwd"})), &sb).unwrap_err();
         assert!(err2.contains("escapes") || err2.contains("cannot access"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_target_rejects_existing_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "unchanged").unwrap();
+        symlink(&victim, root.path().join("output.txt")).unwrap();
+        let sb = sandbox(root.path());
+
+        let error = validate(
+            &call(
+                "write_file",
+                json!({"path":"output.txt","content":"attacker controlled"}),
+            ),
+            &sb,
+        )
+        .unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        // Screenshot validation uses this same output resolver on Windows.
+        assert!(sb.resolve_output("output.txt").is_err());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_open_rejects_symlink_created_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "unchanged").unwrap();
+        let sb = sandbox(root.path());
+        let target = sb.resolve_output("new.txt").unwrap();
+        symlink(&victim, &target).unwrap();
+
+        let error = write_regular_file(&target, b"replacement").unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
     }
 
     #[test]
@@ -2989,6 +3903,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path()); // allow_net = false
         assert!(validate(&call("http_fetch", json!({"url":"http://x"})), &sb).is_err());
+
+        let enabled = Sandbox::new(dir.path(), true, Duration::from_secs(5)).unwrap();
+        assert!(validate(
+            &call(
+                "http_fetch",
+                json!({"url":"https://example.com","method":"GET"})
+            ),
+            &enabled
+        )
+        .is_ok());
+        assert!(validate(
+            &call(
+                "http_fetch",
+                json!({"url":"https://example.com","method":"HEAD"})
+            ),
+            &enabled
+        )
+        .is_ok());
+        assert!(validate(
+            &call(
+                "http_fetch",
+                json!({"url":"https://example.com","method":"POST"})
+            ),
+            &enabled
+        )
+        .unwrap_err()
+        .contains("only GET and HEAD"));
     }
 
     #[test]
@@ -3532,7 +4473,16 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(
+            out.text().contains("bytes omitted"),
+            "oversized capture must disclose omitted output: {}",
+            out.text()
+        );
+        assert!(
+            out.text().len() <= MAX_OUTPUT_BYTES,
+            "tool output must remain bounded: {} bytes",
+            out.text().len()
+        );
     }
 
     #[cfg(windows)]
@@ -3611,7 +4561,16 @@ mod tests {
             "should complete, not time out: {}",
             out.text()
         );
-        assert!(out.text().contains("truncated"), "{}", out.text());
+        assert!(
+            out.text().contains("bytes omitted"),
+            "oversized capture must disclose omitted output: {}",
+            out.text()
+        );
+        assert!(
+            out.text().len() <= MAX_OUTPUT_BYTES,
+            "tool output must remain bounded: {} bytes",
+            out.text().len()
+        );
     }
 
     #[cfg(windows)]
@@ -3814,6 +4773,19 @@ mod tests {
             "captured output must contain the payload's first line"
         );
         assert!(
+            out.text().contains("004095"),
+            "bounded capture must preserve the payload's final line"
+        );
+        assert!(
+            out.text().contains("bytes omitted"),
+            "oversized capture must disclose omitted output"
+        );
+        assert!(
+            out.text().len() <= MAX_OUTPUT_BYTES,
+            "tool output must remain bounded: {} bytes",
+            out.text().len()
+        );
+        assert!(
             elapsed < Duration::from_secs(15),
             "must not burn the timeout budget (took {elapsed:?})"
         );
@@ -3844,7 +4816,106 @@ mod tests {
             out.text().contains("000000"),
             "stderr payload must be captured"
         );
+        assert!(
+            out.text().contains("004095"),
+            "stderr capture must retain the tail"
+        );
+        assert!(out.text().len() <= MAX_OUTPUT_BYTES);
         assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_shell_cancel_tears_down_the_unix_process_group() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let action = validate(
+            &call(
+                "run_shell",
+                json!({"command":"echo $$ > shell.pid; sleep 30 & wait"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            setter.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        let outcome = action.execute_with_cancel(&sb, cancel.as_ref());
+        assert!(
+            outcome.text().contains("cancelled"),
+            "expected cancellation, got {outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let pgid: i32 = std::fs::read_to_string(dir.path().join("shell.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let signal_result = unsafe { libc::kill(-pgid, 0) };
+            let alive = signal_result == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancel left process group {pgid} alive"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_run_shell_reaps_background_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let action = validate(
+            &call(
+                "run_shell",
+                json!({"command":"echo $$ > shell.pid; sleep 30 & exit 0"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let outcome = action.execute(&sb);
+        assert!(matches!(outcome, ToolOutcome::Ok(_)), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pgid: i32 = std::fs::read_to_string(dir.path().join("shell.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let signal_result = unsafe { libc::kill(-pgid, 0) };
+            let alive = signal_result == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "successful tool left process group {pgid} alive"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// PIDs of every live PING.EXE whose command line contains `marker`. Querying

@@ -169,6 +169,10 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         );
         return Ok(2);
     }
+    let Some(agent_context_budget) = cfg.ctx_budget else {
+        eprintln!("agent mode requires an effective runtime context budget");
+        return Ok(2);
+    };
     // Approval policy: --auto-approve is refused (fail closed) under production.
     let policy = match agent::resolve_policy(cfg.auto_approve, cfg.yolo, agent::is_production()) {
         Ok(p) => p,
@@ -182,18 +186,23 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         .with_fs_unrestricted(cfg.allow_fs);
 
     // Enable subagent orchestration (children share this serve + inherit gates).
-    super::subagent::configure(super::subagent::SubagentConfig::for_session(
-        addr,
-        session.active_id.clone().unwrap_or_default(),
-        session.active_family(),
-        cfg.max_tokens,
-        cfg.auto_approve,
-        cfg.shell_sandbox,
-    ));
+    let _subagent_session =
+        super::subagent::configure_scoped(super::subagent::SubagentConfig::for_session(
+            addr,
+            session.active_id.clone().unwrap_or_default(),
+            session.active_gguf_sha256().unwrap_or_default().to_string(),
+            session.active_family(),
+            agent_context_budget,
+            cfg.max_tokens,
+            cfg.auto_approve,
+            cfg.shell_sandbox,
+        ));
 
     super::checkpoint::clear();
 
-    let driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
+    let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
+    driver.set_context_budget(cfg.ctx_budget);
+    driver.set_stream_timeout(agent::AGENT_MODEL_STEP_TIMEOUT);
     let engine = Box::new(Engine {
         driver,
         sandbox,
@@ -509,6 +518,9 @@ impl<'a> App<'a> {
                 &mut engine.policy,
                 &mut history,
             );
+            if end == LoopEnd::Aborted {
+                super::subagent::cancel_all("parent goal was cancelled");
+            }
             engine.driver.set_delta_sink(None);
             engine.transcript = history;
             let _ = tx.send(Ev::Done {
@@ -551,6 +563,11 @@ impl<'a> App<'a> {
                                 .active_id
                                 .clone()
                                 .unwrap_or_else(|| self.session.active_label.clone()),
+                            model_sha256: self
+                                .session
+                                .active_gguf_sha256()
+                                .unwrap_or_default()
+                                .to_string(),
                             tool_capable: true,
                             workspace: e.sandbox.root().display().to_string(),
                             transcript: e.transcript.clone(),
@@ -571,12 +588,22 @@ impl<'a> App<'a> {
                     .active_id
                     .clone()
                     .unwrap_or_else(|| self.session.active_label.clone());
+                let model_sha256 = self
+                    .session
+                    .active_gguf_sha256()
+                    .unwrap_or_default()
+                    .to_string();
                 let mut notices: Vec<String> = Vec::new();
                 self.status = match self.engine.as_mut() {
                     None => "busy — /resume when idle".into(),
                     Some(e) => match super::agent_session::load(&e.sandbox, &id) {
                         Err(err) => err,
-                        Ok(s) => match super::agent_session::check_identity(&s, &model, true) {
+                        Ok(s) => match super::agent_session::check_identity(
+                            &s,
+                            &model,
+                            Some(&model_sha256),
+                            true,
+                        ) {
                             Err(refusal) => refusal.to_string(),
                             Ok(()) => {
                                 // Replayed as context, never re-executed; grants

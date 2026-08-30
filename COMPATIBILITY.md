@@ -97,9 +97,13 @@ inconclusive) are **Supported (experimental)**, scoped exactly as follows.
 **Claimed.** The approval-gated tool-calling loop on `tool_capable` ledger rows
 only: file tools jailed to `--workdir`, run_shell under the shell-sandbox
 policy, opt-in network (`--allow-net`: `web_search` + `http_fetch`) and opt-in
-stdio MCP servers (`--allow-mcp`, always exec-tier), per-file checkpoints with
-`/diff`//`/undo`, session `/save`//`/resume` with model-identity re-validation,
-and transcript compaction. Evidence: the per-row `qa/agent-eval` PASS receipts
+stdio MCP servers (`--allow-mcp` plus one CLI-supplied
+`--trust-mcp-server NAME` per reviewed workspace command; trusted commands
+execute immediately at startup; tools are always exec-tier), bounded read-only
+subagents (the parent remains the sole writer and checkpoint owner), per-file
+checkpoints with `/diff`//`/undo`, session `/save`//`/resume` with exact model
+artifact re-validation, and transcript compaction. Evidence: the per-row
+`qa/agent-eval` PASS receipts
 (the promotion basis for `tool_capable`), and the live-lane bundle
 `qa/evidence-bundles/agent-mode-supported-experimental-20260722/` — one run
 crossing the compaction budget six times and answering correctly, and one run
@@ -118,7 +122,10 @@ refuses them), unattended operation beyond the documented `--today-is-a-good-day
 `--yolo`; refused under `CAMELID_PRODUCTION`), MCP transports beyond stdio, Windows or
 Linux live-lane agent transcripts, production throughput, or parity of any
 kind — agent mode is a client-side loop over the already-validated serve lane
-and adds no token-level claim.
+and adds no token-level claim. The current digest binding is not an OS-level
+immutable model-file lease against an out-of-process rewrite after the final
+verification, and Windows workspace confinement does not claim race-free
+directory-handle pinning against a concurrent reparse-point swap.
 
 ## Locked next-family readiness language
 

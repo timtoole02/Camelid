@@ -75,6 +75,7 @@ function App() {
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
     thinkingMode, setThinkingMode,
+    webResearchEnabled, setWebResearchEnabled, webResearchStatus,
     loadingModelId, registerForm, setRegisterForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
@@ -411,6 +412,9 @@ function App() {
               setReceiptMode={setReceiptMode}
               thinkingMode={thinkingMode}
               setThinkingMode={setThinkingMode}
+              webResearchEnabled={webResearchEnabled}
+              setWebResearchEnabled={setWebResearchEnabled}
+              webResearchStatus={webResearchStatus}
               stoppingGeneration={stoppingGeneration}
               selectedModelRunnable={selectedModelRunnable}
               selectedModelExperimental={selectedModelExperimental}

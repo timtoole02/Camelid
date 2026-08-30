@@ -1226,9 +1226,9 @@ impl RunnableModel {
                     resident_cuda_artifact_from_sha256, ResidentCudaArtifact,
                 };
 
-                // Hash only the plausible exact Q1 row. API loads normally hit the
-                // receipt hash cache; direct CLI loads still prove identity before
-                // admitting kernels/layouts validated against one concrete artifact.
+                // Hash only the plausible exact Q1 row. This exact digest admits
+                // kernels/layouts validated against one concrete artifact, so a
+                // user-writable persistent cache cannot be its authority.
                 let ffn_dim = q35_layers
                     .first()
                     .map(|layer| layer.ffn_gate.out_features)
@@ -1245,7 +1245,7 @@ impl RunnableModel {
                     && has_q1_projection;
 
                 if candidate {
-                    match crate::receipt::sha256_file_hex_cached(std::path::Path::new(path)) {
+                    match crate::receipt::sha256_file_hex(std::path::Path::new(path)) {
                         Ok(sha256) => resident_cuda_artifact_from_sha256(&sha256),
                         Err(err) => {
                             eprintln!(

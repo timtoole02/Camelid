@@ -12,6 +12,7 @@ import { appStorage } from './appStorage.js'
 export const MAX_RESPONSE_TOKENS = 1000000
 export const MIN_RESPONSE_TOKENS = 1
 export const GEMMA4_MIN_CHAT_TOKENS = 8
+export const GEMMA4_GHOST_WEBUI_CONTEXT_TOKENS = 4096
 // Ghost's default common-core Metal cache holds 4,096 positions. Keeping the
 // WebUI reply allowance at 512 leaves a conservative 3,584-position envelope
 // for ordinary prompts/history instead of letting the global 8,192 default

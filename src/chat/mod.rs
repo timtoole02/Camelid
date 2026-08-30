@@ -99,9 +99,12 @@ pub struct ChatOptions {
     /// `--allow-fs`: agent file tools may read/write anywhere on disk (still
     /// approval-gated), not just under the workspace root.
     pub allow_fs: bool,
-    /// `--allow-mcp`: load MCP servers from `camelid.mcp.json` and offer their
-    /// tools. Off by default; refused under production.
+    /// `--allow-mcp`: permit MCP support. No workspace command is executed
+    /// without a matching entry in `trust_mcp_servers`.
     pub allow_mcp: bool,
+    /// Server names explicitly trusted on the command line. Each corresponding
+    /// workspace-declared command starts immediately during agent startup.
+    pub trust_mcp_servers: Vec<String>,
     pub shell_timeout: u64,
     /// Opt-in thinking mode (`chat --enable-thinking`): the model emits its own
     /// `<think>…</think>` reasoning. NOT parity-locked (leading-trace lane only).
@@ -114,6 +117,56 @@ pub struct ChatOptions {
     /// Headless one-shot (`camelid agent exec`): run this goal to completion and
     /// exit, instead of opening a REPL. Implies `agent` + `plain`.
     pub exec_goal: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentRuntimeBudget {
+    /// Total prompt-plus-reply budget passed to the exact prompt fitter.
+    context_tokens: u32,
+    /// Reply allowance sent on every generation request.
+    reply_tokens: u32,
+}
+
+/// Resolve the Full coding-agent budget against every live runtime ceiling.
+/// The server enforces prompt and generation limits independently, while the
+/// model and validated-agent limits are total-context ceilings, so the fitter
+/// receives `min(model, validated, server_prompt + reserved_reply)`.
+fn derive_agent_runtime_budget(
+    active_model_context: Option<u32>,
+    server_prompt_ceiling: usize,
+    server_generation_ceiling: u32,
+    requested_reply_tokens: u32,
+) -> Result<AgentRuntimeBudget, String> {
+    let model_context = active_model_context.ok_or_else(|| {
+        "agent mode cannot determine the active model's runtime context length".to_string()
+    })?;
+    if server_prompt_ceiling == 0 || server_generation_ceiling == 0 {
+        return Err(
+            "agent mode requires max_prompt_tokens and max_generation_tokens from /v1/health; \
+             restart or upgrade the local Camelid server so runtime ceilings are available"
+                .to_string(),
+        );
+    }
+    if requested_reply_tokens == 0 {
+        return Err("agent mode requires a positive reply-token allowance".to_string());
+    }
+
+    let reply_tokens = requested_reply_tokens.min(server_generation_ceiling);
+    let prompt_ceiling = u32::try_from(server_prompt_ceiling).unwrap_or(u32::MAX);
+    let context_tokens = model_context
+        .min(agent::AGENT_VALIDATED_CTX)
+        .min(prompt_ceiling.saturating_add(reply_tokens));
+    if context_tokens <= reply_tokens {
+        return Err(format!(
+            "agent mode has no prompt room: the effective {context_tokens}-token context does \
+             not exceed the {reply_tokens}-token reply allowance"
+        ));
+    }
+
+    Ok(AgentRuntimeBudget {
+        context_tokens,
+        reply_tokens,
+    })
 }
 
 /// Entry point for the `Chat` subcommand. Returns a process exit code (0 = ok,
@@ -162,6 +215,28 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             eprintln!("agent mode needs a model — pass --model <gguf>");
             return Ok(2);
         }
+        let Some(health) = session.client().health() else {
+            eprintln!("agent mode could not read runtime ceilings from /v1/health");
+            return Ok(2);
+        };
+        let runtime_budget = match derive_agent_runtime_budget(
+            session.active_ctx,
+            health.max_prompt_tokens,
+            health.max_generation_tokens,
+            opts.max_tokens,
+        ) {
+            Ok(budget) => budget,
+            Err(error) => {
+                eprintln!("{error}");
+                return Ok(2);
+            }
+        };
+        if runtime_budget.reply_tokens < opts.max_tokens {
+            eprintln!(
+                "agent reply allowance: requested {} tokens, capped to the server's {}-token generation ceiling",
+                opts.max_tokens, runtime_budget.reply_tokens
+            );
+        }
         let shell_sandbox = match opts.shell_sandbox.parse::<shell_sandbox::ShellSandbox>() {
             Ok(m) => m,
             Err(e) => {
@@ -177,20 +252,14 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             allow_net: opts.allow_net,
             allow_fs: opts.allow_fs,
             shell_timeout: std::time::Duration::from_secs(opts.shell_timeout),
-            max_tokens: opts.max_tokens,
+            max_tokens: runtime_budget.reply_tokens,
             temperature: opts.temperature,
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
             tool_profile: tools::ToolProfile::Full,
-            // The smaller of what the model was trained for and what the agent
-            // lane is validated to; falls back to the validated ceiling when the
-            // server has not reported a context length.
-            ctx_budget: Some(
-                session
-                    .active_ctx
-                    .unwrap_or(agent::AGENT_VALIDATED_CTX)
-                    .min(agent::AGENT_VALIDATED_CTX),
-            ),
+            // Exact prompt-plus-reply budget after intersecting the active
+            // model, validated agent lane, and this server process's limits.
+            ctx_budget: Some(runtime_budget.context_tokens),
         };
         // MCP servers, if the user opted in. A broken MCP config costs you MCP,
         // not your session, so problems are reported and the agent still runs.
@@ -201,7 +270,14 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
                         .into_iter()
                         .map(|t| t.name)
                         .collect();
-                    match mcp::configure(&sb, true, agent::is_production(), &native) {
+                    match mcp::configure(
+                        &sb,
+                        true,
+                        agent::is_production(),
+                        &native,
+                        &opts.trust_mcp_servers,
+                        &session::CANCEL,
+                    ) {
                         Ok(0) => eprintln!(
                             "--allow-mcp: no MCP tools loaded (no {} at the workspace root?)",
                             mcp::CONFIG_FILE
@@ -212,6 +288,10 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
                 }
                 Err(e) => eprintln!("MCP: workspace unavailable: {e}"),
             }
+        } else if !opts.trust_mcp_servers.is_empty() {
+            eprintln!(
+                "MCP: --trust-mcp-server requires --allow-mcp; no workspace command was started"
+            );
         }
 
         // Headless one-shot: no REPL, tri-state exit, answer on stdout.
@@ -360,3 +440,35 @@ fn init_terminal() {
 }
 #[cfg(not(windows))]
 fn init_terminal() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_server_ceilings_bound_full_agent_prompt_and_reply() {
+        let budget = derive_agent_runtime_budget(Some(8_192), 384, 96, 512).unwrap();
+        assert_eq!(budget.reply_tokens, 96);
+        assert_eq!(budget.context_tokens, 480);
+        assert_eq!(budget.context_tokens - budget.reply_tokens, 384);
+    }
+
+    #[test]
+    fn model_and_validated_contexts_remain_hard_agent_ceilings() {
+        let model_limited = derive_agent_runtime_budget(Some(320), 10_000, 1_000, 64).unwrap();
+        assert_eq!(model_limited.context_tokens, 320);
+        assert_eq!(model_limited.reply_tokens, 64);
+
+        let validated_limited =
+            derive_agent_runtime_budget(Some(32_768), 32_768, 32_768, 128).unwrap();
+        assert_eq!(validated_limited.context_tokens, agent::AGENT_VALIDATED_CTX);
+    }
+
+    #[test]
+    fn missing_or_impossible_runtime_budget_fails_closed() {
+        assert!(derive_agent_runtime_budget(None, 384, 96, 64).is_err());
+        assert!(derive_agent_runtime_budget(Some(512), 0, 96, 64).is_err());
+        assert!(derive_agent_runtime_budget(Some(512), 384, 0, 64).is_err());
+        assert!(derive_agent_runtime_budget(Some(64), 384, 96, 96).is_err());
+    }
+}

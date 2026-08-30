@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "7c299238",
+    "source_head": "5f715152",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -202,6 +202,11 @@
         "id": "web_workspace",
         "status": "supported_current_gate",
         "notes": "Loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim."
+      },
+      {
+        "id": "web_ui_research",
+        "status": "supported",
+        "notes": "POST /api/web/research is a bounded pre-generation research helper for the server-policy-protected embedded Chat UI. A deterministic prompt classifier can combine embedded public HTTP(S) reads with a supplemental Brave HTML search (DuckDuckGo Lite and Bing HTML fallbacks), then returns explicitly untrusted, path-labelled chunks and warning strings for the browser to fit into an ordinary chat request. GitHub repository roots and explicit tree/blob refs preserve requested provenance; API quota failures fall back to bounded public raw/HTML reads. CAMELID_WEB_GITHUB_TOKEN is optional, accepted only from the operator environment, sent only on Camelid-managed repository metadata/tree/README requests to exact HTTPS api.github.com hops, and never permits private-repository ingestion. A short bounded in-memory TTL/ETag cache stores fetched responses only, never generated answers. Targets with credentials, non-default ports, loopback/private/link-local/reserved addresses, unsafe redirects or HTTPS downgrades, binary/oversized responses, and excessive URLs/redirects fail closed. Shared admission caps concurrent and abandoned jobs; one total research deadline covers DNS resolution, redirects, and every curl hop, with a separate process-wide cap on resolver calls that outlive their caller. Provider and partial-fetch failures return a structured HTTP-200 response so local generation can continue. Configured Camelid API credentials are never forwarded, and this path does not advertise tools to or require tool support from the model."
       },
       {
         "id": "stream_options.include_usage",

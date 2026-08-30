@@ -216,6 +216,7 @@ impl ResponsesRequest {
         let response_format = responses_text_format(self.text.as_ref())?;
         Ok(ChatCompletionRequest {
             model: self.model.clone(),
+            camelid_expected_gguf_sha256: None,
             messages: Some(messages),
             stream: self.stream,
             max_tokens: self.max_output_tokens,

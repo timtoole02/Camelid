@@ -24,8 +24,6 @@ use super::workspace_memory::MemoryContext;
 
 const APPROVAL_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
-const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -126,10 +124,17 @@ pub(crate) struct WorkspaceRunConfig {
     pub turn_index: u32,
     pub memory: MemoryContext,
     pub model_id: String,
+    pub model_sha256: String,
     pub family: String,
     pub max_steps: usize,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// Total prompt-plus-reply budget derived from the active runtime context,
+    /// the operator's prompt ceiling, and the validated agent ceiling.
+    pub context_budget_tokens: u32,
+    /// One absolute deadline shared by every preflight and generation request
+    /// within a model step. The live driver remains cancellation-aware.
+    pub model_step_timeout: Duration,
     /// Optional session-scoped semantic index. When present, each turn gets a
     /// bounded set of relevant workspace excerpts before the model runs.
     pub semantic_retriever: Option<Arc<super::semantic_search::WorkspaceSemanticRetriever>>,
@@ -452,13 +457,14 @@ pub(crate) fn run_live(
     let mut driver = LiveDriver::with(
         Client::new(config.addr),
         config.model_id,
+        config.model_sha256,
         config.family,
         config.max_tokens,
         config.temperature,
     );
-    driver.set_context_budget(Some(WORKSPACE_CONTEXT_BUDGET_TOKENS));
+    driver.set_context_budget(Some(config.context_budget_tokens));
     driver.set_native_tool_history(true);
-    driver.set_stream_control(Arc::clone(&worker.cancel), WORKSPACE_MODEL_STEP_TIMEOUT);
+    driver.set_stream_control(Arc::clone(&worker.cancel), config.model_step_timeout);
     let delta_reporter = worker.reporter.clone();
     driver.set_delta_sink(Some(Box::new(move |delta| {
         delta_reporter.model_delta(delta);
@@ -476,7 +482,7 @@ pub(crate) fn run_live(
         audit: Box::new(NoopSink),
         shell_sandbox: ShellSandbox::Disabled,
         tool_profile: ToolProfile::WorkspaceReadOnly,
-        ctx_budget: None,
+        ctx_budget: Some(config.context_budget_tokens),
     };
     let end = run_loop(
         &mut driver,
@@ -789,5 +795,23 @@ mod tests {
         let _approval_id = next_approval(&client);
         assert_eq!(join.join().unwrap(), LoopEnd::Aborted);
         assert!(!root.path().join("result.txt").exists());
+    }
+
+    #[test]
+    fn model_timing_preserves_streamed_output_token_usage() {
+        let (mut worker, client) = bridge(1);
+        worker.reporter.model_timing(ModelStepMetrics {
+            total_ms: 1_250,
+            ttft_ms: Some(300),
+            output_tokens: Some(42),
+        });
+        assert_eq!(
+            client.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WorkspaceEvent::ModelTiming {
+                total_ms: 1_250,
+                ttft_ms: Some(300),
+                output_tokens: Some(42),
+            }
+        );
     }
 }

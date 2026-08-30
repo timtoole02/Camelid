@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -34,6 +35,54 @@ const MAX_GOAL_BYTES: usize = 4 * 1024;
 const EVENT_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const AUTO_COMPACT_TRIGGER_PERCENT: u32 = 75;
 const AUTO_COMPACT_MIN_TURNS: u32 = 4;
+const WORKSPACE_MODEL_STEP_TIMEOUT_ENV: &str = "CAMELID_WORKSPACE_MODEL_STEP_TIMEOUT_SECS";
+const DEFAULT_WORKSPACE_MODEL_STEP_TIMEOUT_SECS: u64 = 15 * 60;
+const MAX_WORKSPACE_MODEL_STEP_TIMEOUT_SECS: u64 = 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkspaceRuntimeBudget {
+    context_tokens: u32,
+    reply_tokens: u32,
+}
+
+fn workspace_runtime_budget(
+    model_context_tokens: u32,
+    server_prompt_ceiling: usize,
+    server_generation_ceiling: u32,
+    requested_reply_tokens: u32,
+) -> WorkspaceRuntimeBudget {
+    let reply_tokens = requested_reply_tokens.min(server_generation_ceiling);
+    let prompt_ceiling = u32::try_from(server_prompt_ceiling).unwrap_or(u32::MAX);
+    let context_tokens = model_context_tokens
+        .min(crate::chat::agent::AGENT_VALIDATED_CTX)
+        .min(prompt_ceiling.saturating_add(reply_tokens));
+    WorkspaceRuntimeBudget {
+        context_tokens,
+        reply_tokens,
+    }
+}
+
+fn parse_workspace_model_step_timeout(raw: Option<&str>) -> Duration {
+    let seconds = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (1..=MAX_WORKSPACE_MODEL_STEP_TIMEOUT_SECS).contains(seconds))
+        .unwrap_or(DEFAULT_WORKSPACE_MODEL_STEP_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
+
+fn workspace_model_step_timeout() -> Duration {
+    let configured = std::env::var(WORKSPACE_MODEL_STEP_TIMEOUT_ENV).ok();
+    parse_workspace_model_step_timeout(configured.as_deref())
+}
+
+fn workspace_model_identity_matches(
+    expected_id: &str,
+    expected_sha256: &str,
+    active_id: &str,
+    active_sha256: &str,
+) -> bool {
+    expected_id == active_id && expected_sha256.eq_ignore_ascii_case(active_sha256)
+}
 
 async fn run_workspace_blocking<T, F>(operation: F) -> Result<T, Response>
 where
@@ -65,6 +114,21 @@ fn should_auto_compact(
         >= u64::from(budget_total) * u64::from(AUTO_COMPACT_TRIGGER_PERCENT)
 }
 
+/// Forwarding runs on a dedicated blocking thread. A full bounded queue is
+/// backpressure, not a client disconnect; only receiver closure is terminal.
+/// Any compaction generated while settling a turn must precede the terminal
+/// event because the SSE consumer intentionally stops after that terminal.
+fn forward_workspace_event(
+    sender: &tokio::sync::mpsc::Sender<WorkspaceEvent>,
+    event: WorkspaceEvent,
+    before_terminal: Option<WorkspaceEvent>,
+) -> Result<(), ()> {
+    if let Some(prefix) = before_terminal {
+        sender.blocking_send(prefix).map_err(|_| ())?;
+    }
+    sender.blocking_send(event).map_err(|_| ())
+}
+
 #[derive(Clone, Default)]
 pub(super) struct WorkspaceSessionManager {
     active: Arc<Mutex<Option<Arc<ActiveWorkspaceSession>>>>,
@@ -74,9 +138,12 @@ struct ActiveWorkspaceSession {
     id: String,
     workspace: PathBuf,
     model_id: String,
+    model_sha256: String,
     max_steps: usize,
     max_tokens: u32,
     temperature: f32,
+    context_budget_tokens: u32,
+    model_step_timeout: Duration,
     allow_writes: bool,
     semantic_retriever: Option<Arc<crate::chat::semantic_search::WorkspaceSemanticRetriever>>,
     memory: WorkspaceMemoryStore,
@@ -743,6 +810,9 @@ fn workspace_model_options(models_dir: &std::path::Path) -> Vec<WorkspaceModelOp
     let mut models = Vec::new();
 
     for item in &catalog {
+        if supported_artifact_expected_sha256(item.filename).is_none() {
+            continue;
+        }
         if let Some(row) = rows.iter().find(|row| row.id == item.catalog_id) {
             let view = CatalogItemView::from_curated(item, hardware);
             models.push(WorkspaceModelOption {
@@ -759,6 +829,9 @@ fn workspace_model_options(models_dir: &std::path::Path) -> Vec<WorkspaceModelOp
     }
 
     for (filename, row_id, _) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+        if supported_artifact_expected_sha256(filename).is_none() {
+            continue;
+        }
         let Some(row) = rows.iter().find(|row| row.id == *row_id) else {
             continue;
         };
@@ -1060,10 +1133,47 @@ pub(super) async fn create_session(
             Err(response) => return response,
         };
 
+    // Publish the session while holding the same transition mutex as model
+    // load/unload. This closes the check-then-act window where a model could be
+    // replaced after identity validation but before the session became active.
+    let _model_transition = state.model_transition.lock().await;
     let (model, family) = match active_tool_capable_model(&state).await {
         Ok(value) => value,
         Err(response) => return response,
     };
+    let Some(model_context_tokens) = model
+        .llama_config
+        .as_ref()
+        .map(|config| config.context_length)
+    else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_model_context_unavailable",
+            "the active model does not expose an effective runtime context length".to_string(),
+            None,
+        );
+    };
+    let runtime_budget = workspace_runtime_budget(
+        model_context_tokens,
+        state.server_limits.max_prompt_tokens,
+        state.server_limits.max_generation_tokens,
+        max_tokens,
+    );
+    let context_budget_tokens = runtime_budget.context_tokens;
+    // Report and retain the effective reply allowance, so the initial turn and
+    // every follow-up use a value the active server can actually honor.
+    let max_tokens = runtime_budget.reply_tokens;
+    if context_budget_tokens <= max_tokens {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_context_too_small",
+            format!(
+                "the active model and server limits leave no prompt room after reserving {max_tokens} reply tokens"
+            ),
+            Some("max_tokens"),
+        );
+    }
+    let model_step_timeout = workspace_model_step_timeout();
     let semantic_retriever = workspace_semantic_retriever(&state, &workspace).await;
     let embedding_model_id = semantic_retriever
         .as_ref()
@@ -1160,19 +1270,25 @@ pub(super) async fn create_session(
         turn_index,
         memory: context,
         model_id: model.id.clone(),
+        model_sha256: model.lane.gguf_sha256.clone(),
         family,
         max_steps,
         max_tokens,
         temperature,
+        context_budget_tokens,
+        model_step_timeout,
         semantic_retriever: semantic_retriever.clone(),
     };
     let session = Arc::new(ActiveWorkspaceSession {
         id: id.clone(),
         workspace: workspace.clone(),
         model_id: model.id.clone(),
+        model_sha256: model.lane.gguf_sha256.clone(),
         max_steps,
         max_tokens,
         temperature,
+        context_budget_tokens,
+        model_step_timeout,
         allow_writes,
         semantic_retriever,
         memory,
@@ -1329,7 +1445,7 @@ pub(super) async fn session_events(
                         outcome,
                         &evidence,
                     ) {
-                        let _ = event_tx.try_send(WorkspaceEvent::Error {
+                        let _ = event_tx.blocking_send(WorkspaceEvent::Error {
                             message: format!("Workspace memory could not save this turn: {error}"),
                         });
                         persist_session.finish_turn_if_current(
@@ -1386,13 +1502,7 @@ pub(super) async fn session_events(
                     persist_session
                         .finish_turn_if_current(&persisted_turn.client_message_id, completion);
                 }
-                if event_tx.try_send(event).is_err() {
-                    forward_control.cancel();
-                    break;
-                }
-                if automatic_compaction
-                    .is_some_and(|event| event_tx.try_send(event).is_err())
-                {
+                if forward_workspace_event(&event_tx, event, automatic_compaction).is_err() {
                     forward_control.cancel();
                     break;
                 }
@@ -1499,7 +1609,7 @@ pub(super) async fn session_status(
         workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
-        context_budget_tokens: crate::chat::workspace_bridge::WORKSPACE_CONTEXT_BUDGET_TOKENS,
+        context_budget_tokens: session.context_budget_tokens,
         resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
             &session.model_id,
         )),
@@ -1595,15 +1705,24 @@ pub(super) async fn send_message(
             )
         }
     }
+    // Pair identity validation + turn installation atomically with model
+    // transitions. A transition that wins the lock first is observed below; a
+    // follow-up that wins first becomes blocking before the lock is released.
+    let _model_transition = state.model_transition.lock().await;
     let (model, family) = match active_tool_capable_model(&state).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    if model.id != session.model_id {
+    if !workspace_model_identity_matches(
+        &session.model_id,
+        &session.model_sha256,
+        &model.id,
+        &model.lane.gguf_sha256,
+    ) {
         return api_error(
             StatusCode::CONFLICT,
             "workspace_model_changed",
-            "resume this thread with the same model that created it".to_string(),
+            "resume this thread with the same model bytes that created it".to_string(),
             None,
         );
     }
@@ -1644,10 +1763,13 @@ pub(super) async fn send_message(
         turn_index,
         memory,
         model_id: session.model_id.clone(),
+        model_sha256: session.model_sha256.clone(),
         family,
         max_steps: session.max_steps,
         max_tokens: session.max_tokens,
         temperature: session.temperature,
+        context_budget_tokens: session.context_budget_tokens,
+        model_step_timeout: session.model_step_timeout,
         semantic_retriever: session.semantic_retriever.clone(),
     };
     match session.install_turn(events, worker, run_config, control) {
@@ -1917,16 +2039,22 @@ async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, Str
         None => Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "model_not_tool_capable",
-            "the active exact model row has not earned tool-capable status".to_string(),
+            "the active model is not an exact tool-capable artifact with a recorded certified digest"
+                .to_string(),
             None,
         )),
     }
 }
 
-/// Name-only resolution, for listing which rows COULD serve Workspace (nothing
-/// is loaded, so there are no bytes to check). Never use this to authorize a
-/// loaded model — see `tool_capable_row_for_loaded_artifact`.
+/// Resolve only rows with both earned tool capability and a recorded certified
+/// digest. The UI must not promise an unpinned row that the loaded-artifact
+/// authorization gate will necessarily refuse.
 fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'static str)> {
+    supported_artifact_expected_sha256(filename)?;
+    earned_tool_capable_row_for_filename(filename)
+}
+
+fn earned_tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'static str)> {
     let row_id = curated_catalog()
         .iter()
         .find(|item| item.filename == filename)
@@ -1945,18 +2073,30 @@ fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'stat
     })
 }
 
+/// Whether a ledger row has at least one exact filename whose certified digest
+/// is recorded. Used by CLI refusal copy so it lists only artifacts an operator
+/// can actually authorize, not name-only rows that fail closed at runtime.
+pub(crate) fn tool_capable_row_has_certified_artifact(row_id: &str) -> bool {
+    curated_catalog().iter().any(|item| {
+        item.catalog_id == row_id && tool_capable_row_for_filename(item.filename).is_some()
+    }) || NON_CATALOG_SUPPORTED_ARTIFACTS
+        .iter()
+        .any(|(filename, candidate, _)| {
+            *candidate == row_id && tool_capable_row_for_filename(filename).is_some()
+        })
+}
+
 /// Tool capability for a LOADED artifact. `tool_capable` is earned per exact row
 /// by a committed agent-eval receipt against specific bytes (the Ornith Q4_K_M
 /// row is the live example), so a hash-pinned artifact must present its
 /// certified digest before Workspace will drive it — otherwise a same-named
 /// replacement inherits an agent battery it never passed.
-fn tool_capable_row_for_loaded_artifact(
+pub(crate) fn tool_capable_row_for_loaded_artifact(
     filename: &str,
     gguf_sha256: &str,
 ) -> Option<(&'static str, &'static str)> {
-    if supported_artifact_expected_sha256(filename)
-        .is_some_and(|expected| !gguf_sha256.eq_ignore_ascii_case(expected))
-    {
+    let expected = supported_artifact_expected_sha256(filename)?;
+    if !gguf_sha256.eq_ignore_ascii_case(expected) {
         return None;
     }
     tool_capable_row_for_filename(filename)
@@ -2049,6 +2189,9 @@ mod tests {
         assert!(!options
             .iter()
             .any(|model| model.filename == "ornith-1.0-9b-Q3_K_M.gguf"));
+        assert!(!options
+            .iter()
+            .any(|model| model.filename == "Qwen3-4B-Q8_0.gguf"));
     }
 
     #[test]
@@ -2070,21 +2213,22 @@ mod tests {
             tool_capable_row_for_loaded_artifact(filename, HF_IMATRIX_SAME_NAME).is_none(),
             "uncertified bytes must not inherit the agent battery this row passed"
         );
-        // A row with no recorded digest keeps its existing filename gating.
-        // Resolved dynamically: naming a specific file here rots the moment that
-        // row gains a pin (it did — Qwen3-4B-Q4_K_M was the original example).
+        // A tool-capable compatibility row with no certified digest is useful
+        // ledger metadata, but it cannot authorize executable agent tools.
+        // Refuse it until evidence pins exact bytes.
         let unpinned = curated_catalog()
             .into_iter()
             .map(|item| item.filename)
             .find(|name| {
                 supported_artifact_expected_sha256(name).is_none()
-                    && tool_capable_row_for_filename(name).is_some()
+                    && earned_tool_capable_row_for_filename(name).is_some()
             })
             .expect("some tool-capable curated row still has no recorded digest");
-        assert_eq!(
-            tool_capable_row_for_loaded_artifact(unpinned, &"00".repeat(32)),
-            tool_capable_row_for_filename(unpinned),
-            "{unpinned} has no pin, so bytes must not gate it"
+        assert!(earned_tool_capable_row_for_filename(unpinned).is_some());
+        assert!(tool_capable_row_for_filename(unpinned).is_none());
+        assert!(
+            tool_capable_row_for_loaded_artifact(unpinned, &"00".repeat(32)).is_none(),
+            "{unpinned} must stay demoted until a certified digest is recorded"
         );
     }
 
@@ -2173,6 +2317,112 @@ mod tests {
     }
 
     #[test]
+    fn workspace_context_budget_reserves_reply_under_every_runtime_ceiling() {
+        assert_eq!(
+            workspace_runtime_budget(4_096, 16_384, 8_192, 512),
+            WorkspaceRuntimeBudget {
+                context_tokens: 4_096,
+                reply_tokens: 512,
+            }
+        );
+        assert_eq!(
+            workspace_runtime_budget(32_768, 2_048, 96, 512),
+            WorkspaceRuntimeBudget {
+                context_tokens: 2_144,
+                reply_tokens: 96,
+            },
+            "the generation ceiling must cap both generation and its reserve"
+        );
+        assert_eq!(
+            workspace_runtime_budget(32_768, 131_072, 8_192, 512).context_tokens,
+            crate::chat::agent::AGENT_VALIDATED_CTX
+        );
+        assert_eq!(
+            workspace_runtime_budget(32_768, usize::MAX, u32::MAX, u32::MAX).context_tokens,
+            crate::chat::agent::AGENT_VALIDATED_CTX
+        );
+    }
+
+    #[test]
+    fn workspace_step_timeout_is_configurable_but_bounded() {
+        assert_eq!(
+            parse_workspace_model_step_timeout(None),
+            Duration::from_secs(DEFAULT_WORKSPACE_MODEL_STEP_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            parse_workspace_model_step_timeout(Some(" 1200 ")),
+            Duration::from_secs(1_200)
+        );
+        for invalid in ["", "0", "not-a-number", "3601"] {
+            assert_eq!(
+                parse_workspace_model_step_timeout(Some(invalid)),
+                Duration::from_secs(DEFAULT_WORKSPACE_MODEL_STEP_TIMEOUT_SECS)
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_follow_ups_require_the_same_model_id_and_bytes() {
+        let sha = "ab".repeat(32);
+        assert!(workspace_model_identity_matches(
+            "model",
+            &sha,
+            "model",
+            &sha.to_uppercase()
+        ));
+        assert!(!workspace_model_identity_matches(
+            "model", &sha, "other", &sha
+        ));
+        assert!(!workspace_model_identity_matches(
+            "model",
+            &sha,
+            "model",
+            &"cd".repeat(32)
+        ));
+    }
+
+    #[test]
+    fn event_forwarding_backpressures_and_places_compaction_before_terminal() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let join = std::thread::spawn(move || {
+            forward_workspace_event(
+                &sender,
+                WorkspaceEvent::Finished {
+                    outcome: "answered",
+                },
+                Some(WorkspaceEvent::MemoryCompacted {
+                    compacted_through_turn: Some(3),
+                    archived_turns: 3,
+                    compaction_count: 1,
+                    trigger_tokens: 6_144,
+                    budget_total: 8_192,
+                }),
+            )
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while receiver.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(receiver.len(), 1, "prefix was not queued");
+        assert!(
+            !join.is_finished(),
+            "a full event queue must apply backpressure"
+        );
+        assert!(matches!(
+            receiver.blocking_recv(),
+            Some(WorkspaceEvent::MemoryCompacted { .. })
+        ));
+        assert_eq!(join.join().unwrap(), Ok(()));
+        assert!(matches!(
+            receiver.blocking_recv(),
+            Some(WorkspaceEvent::Finished {
+                outcome: "answered"
+            })
+        ));
+    }
+
+    #[test]
     fn manager_reads_terminal_and_active_session_states_without_guessing() {
         let make_session = |state| {
             let (worker, client) = bridge(1);
@@ -2181,9 +2431,12 @@ mod tests {
                 id: "session-test".to_string(),
                 workspace: PathBuf::from("."),
                 model_id: "model-test".to_string(),
+                model_sha256: "aa".repeat(32),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                context_budget_tokens: 8_192,
+                model_step_timeout: Duration::from_secs(1),
                 allow_writes: true,
                 semantic_retriever: None,
                 memory: WorkspaceMemoryStore::open(std::env::temp_dir().join(format!(
@@ -2229,9 +2482,12 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "aa".repeat(32),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            context_budget_tokens: 8_192,
+            model_step_timeout: Duration::from_secs(1),
             allow_writes: true,
             semantic_retriever: None,
             memory,
@@ -2250,10 +2506,13 @@ mod tests {
             turn_index: 3,
             memory: Default::default(),
             model_id: "model".into(),
+            model_sha256: "aa".repeat(32),
             family: "qwen3".into(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            context_budget_tokens: 8_192,
+            model_step_timeout: Duration::from_secs(1),
             semantic_retriever: None,
         };
         let (worker, client) = bridge(1);
@@ -2294,9 +2553,12 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "aa".repeat(32),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            context_budget_tokens: 8_192,
+            model_step_timeout: Duration::from_secs(1),
             allow_writes: false,
             semantic_retriever: None,
             memory,
@@ -2323,9 +2585,12 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "aa".repeat(32),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            context_budget_tokens: 8_192,
+            model_step_timeout: Duration::from_secs(1),
             allow_writes: false,
             semantic_retriever: None,
             memory,
@@ -2344,10 +2609,13 @@ mod tests {
             turn_index: 0,
             memory: Default::default(),
             model_id: "model".into(),
+            model_sha256: "aa".repeat(32),
             family: "qwen3".into(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            context_budget_tokens: 8_192,
+            model_step_timeout: Duration::from_secs(1),
             semantic_retriever: None,
         };
 
@@ -2381,9 +2649,12 @@ mod tests {
                 id: "thread".into(),
                 workspace: dir.path().to_path_buf(),
                 model_id: "model".into(),
+                model_sha256: "aa".repeat(32),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                context_budget_tokens: 8_192,
+                model_step_timeout: Duration::from_secs(1),
                 allow_writes: false,
                 semantic_retriever: None,
                 memory,
@@ -2402,10 +2673,13 @@ mod tests {
                 turn_index: 1,
                 memory: Default::default(),
                 model_id: "model".into(),
+                model_sha256: "aa".repeat(32),
                 family: "qwen3".into(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                context_budget_tokens: 8_192,
+                model_step_timeout: Duration::from_secs(1),
                 semantic_retriever: None,
             };
             let (worker, client) = bridge(1);
@@ -2435,9 +2709,12 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "aa".repeat(32),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            context_budget_tokens: 8_192,
+            model_step_timeout: Duration::from_secs(1),
             allow_writes: false,
             semantic_retriever: None,
             memory,
@@ -2452,10 +2729,13 @@ mod tests {
                 turn_index: 0,
                 memory: Default::default(),
                 model_id: "model".into(),
+                model_sha256: "aa".repeat(32),
                 family: "qwen3".into(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                context_budget_tokens: 8_192,
+                model_step_timeout: Duration::from_secs(1),
                 semantic_retriever: None,
             })),
             control: StdMutex::new(Some(control)),
@@ -2484,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn every_earned_tool_capable_artifact_resolves_by_exact_filename() {
+    fn every_certified_tool_capable_artifact_resolves_by_exact_filename() {
         let expected = [
             ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
             ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
@@ -2492,7 +2772,6 @@ mod tests {
                 "Llama-3.2-3B-Instruct-Q8_0.gguf",
                 "llama32_3b_instruct_q8_0",
             ),
-            ("Qwen3-4B-Q8_0.gguf", "qwen3_4b_instruct_q8_0"),
             ("Qwen3-4B-Q4_K_M.gguf", "qwen3_4b_q4_k_m"),
         ];
         for (filename, row_id) in expected {
@@ -2505,6 +2784,15 @@ mod tests {
         assert_eq!(
             tool_capable_row_for_filename("neighboring-model.gguf"),
             None
+        );
+        assert!(
+            earned_tool_capable_row_for_filename("Qwen3-4B-Q8_0.gguf").is_some(),
+            "precondition: the ledger still records the historical tool result"
+        );
+        assert_eq!(
+            tool_capable_row_for_filename("Qwen3-4B-Q8_0.gguf"),
+            None,
+            "an unpinned row must not be advertised as currently authorizable"
         );
     }
 }

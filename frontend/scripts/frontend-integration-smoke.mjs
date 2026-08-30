@@ -34,10 +34,12 @@ try {
     rowSupportNextStepCopy,
     statusContainsSupportedEvidence,
   } = await server.ssrLoadModule('/src/lib/capabilities.js')
-  const { mergeModelLists, resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
+  const { looksLikeCodePrompt, mergeModelLists, resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
   const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
 
   const noop = () => {}
+  assert.equal(looksLikeCodePrompt('Build an app architecture and phased requirements roadmap.'), false, 'planning deliverables that mention building an app must not activate code-first policy')
+  assert.equal(looksLikeCodePrompt('Write Python code implementing this architecture.'), true, 'an explicit runnable-code request must still activate code-first policy')
   assert.match(
     blockerNoteFor({ code: 'model_io_error' }),
     /could not open this model from the configured storage location/,
@@ -417,7 +419,7 @@ try {
   assert.match(streamingMarkup, /message-code-card is-generating/, 'open streaming code should render as the real ForgeLocal-derived code card, not fallback prose')
   assert.match(streamingMarkup, /Generation details \(client-measured telemetry\)/, 'the meta footer should render during streaming as the live tok/s readout')
   assert.match(streamingMarkup, /13 tok\/s/, 'the streaming footer should show the live-patched output rate')
-  assert.match(streamingMarkup, /End-to-end output rate, measured in this browser/, 'the browser output-rate hover must not imply decode-only timing')
+  assert.match(streamingMarkup, /Decode rate, measured in this browser/, 'the browser output-rate hover must identify post-first-content decode timing')
   assert.match(streamingMarkup, /tokens est\.[\s\S]*in 24[\s\S]*out 7/, 'the streaming footer should show live input and output token counts')
   assert.doesNotMatch(streamingMarkup, /cxturn__meta--reserve/, 'the invisible footer placeholder must not render; the live footer holds the layout slot itself')
 

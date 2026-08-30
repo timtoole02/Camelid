@@ -11,12 +11,16 @@
 //! resolved through the same canonical-prefix check as every other path, so a
 //! checkpoint can neither be written nor restored outside the sandbox root.
 
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use sha2::{Digest, Sha256};
+
 use super::tools::Sandbox;
 
-const DIR: &str = ".camelid/checkpoints";
+const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One saved file state, taken immediately before a write.
 #[derive(Clone)]
@@ -26,12 +30,13 @@ pub struct Checkpoint {
     /// Where the previous contents were saved, or `None` if the file did not
     /// exist yet (undo therefore means "delete it again").
     pub backup: Option<PathBuf>,
+    backup_hash: Option<[u8; 32]>,
     pub tool: String,
     /// Hash of the file as the agent left it, recorded when the mutation
     /// committed. If the file no longer matches at undo time, someone else --
     /// usually the user, by hand -- changed it since, and a blind restore
     /// would destroy their work.
-    pub post_hash: Option<u64>,
+    pub post_hash: Option<[u8; 32]>,
 }
 
 /// A snapshot taken before a mutation that has not happened yet. It becomes a
@@ -40,20 +45,195 @@ pub struct Checkpoint {
 pub struct Pending {
     rel: String,
     backup: Option<PathBuf>,
+    backup_hash: Option<[u8; 32]>,
     tool: String,
     target: PathBuf,
 }
 
-/// A cheap, dependency-free content hash (FNV-1a). Collision resistance is not
-/// the point; detecting "this file changed since the agent wrote it" is.
-fn content_hash(path: &Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+/// A bounded, collision-resistant digest used to detect both ordinary edits
+/// and deliberate checkpoint-store tampering.
+fn content_hash(path: &Path) -> Option<[u8; 32]> {
+    let mut file = open_regular_read(path, MAX_CHECKPOINT_BYTES).ok()?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_CHECKPOINT_BYTES {
+            return None;
+        }
+        h.update(&buf[..read]);
     }
-    Some(h)
+    Some(h.finalize().into())
+}
+
+fn open_regular_read(path: &Path, max_bytes: u64) -> Result<File, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!("refusing non-regular file {}", path.display()));
+    }
+    if meta.len() > max_bytes {
+        return Err(format!("{} is too large to checkpoint", path.display()));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect opened {}: {e}", path.display()))?;
+    if !opened.is_file() || opened.len() > max_bytes {
+        return Err(format!(
+            "refusing changed/non-regular file {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn secure_checkpoint_dir(sandbox: &Sandbox) -> Result<PathBuf, String> {
+    let camelid = sandbox.root().join(".camelid");
+    ensure_plain_directory(&camelid)?;
+    let checkpoints = camelid.join("checkpoints");
+    ensure_plain_directory(&checkpoints)?;
+    Ok(checkpoints)
+}
+
+fn ensure_plain_directory(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "refusing symlink state directory {}",
+            path.display()
+        )),
+        Ok(meta) if !meta.is_dir() => Err(format!(
+            "refusing non-directory state path {}",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            builder
+                .create(path)
+                .map_err(|e| format!("cannot create state directory {}: {e}", path.display()))
+        }
+        Err(err) => Err(format!("cannot inspect {}: {err}", path.display())),
+    }
+}
+
+fn copy_regular_create_new(source_path: &Path, destination: &Path) -> Result<(), String> {
+    let mut source = open_regular_read(source_path, MAX_CHECKPOINT_BYTES)?;
+    let source_permissions = source
+        .metadata()
+        .map_err(|e| format!("cannot inspect {}: {e}", source_path.display()))
+        .map(|meta| meta.permissions())?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut destination_file = options
+        .open(destination)
+        .map_err(|e| format!("cannot create {}: {e}", destination.display()))?;
+    let mut limited = std::io::Read::by_ref(&mut source).take(MAX_CHECKPOINT_BYTES + 1);
+    let copied = std::io::copy(&mut limited, &mut destination_file)
+        .and_then(|count| {
+            if count > MAX_CHECKPOINT_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "source grew beyond the checkpoint limit",
+                ));
+            }
+            destination_file.sync_all()
+        })
+        .map_err(|e| format!("cannot copy checkpoint: {e}"));
+    if let Err(error) = copied {
+        drop(destination_file);
+        let _ = std::fs::remove_file(destination);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::set_permissions(destination, source_permissions) {
+        drop(destination_file);
+        let _ = std::fs::remove_file(destination);
+        return Err(format!("cannot preserve checkpoint permissions: {error}"));
+    }
+    Ok(())
+}
+
+fn restore_regular(source: &Path, target: &Path) -> Result<(), String> {
+    let target_existed = match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err(format!("refusing non-regular target {}", target.display()))
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("cannot inspect {}: {error}", target.display())),
+    };
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("target {} has no parent", target.display()))?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("restore");
+    let temp = next_store_path(parent, ".camelid-restore", name);
+    copy_regular_create_new(source, &temp)?;
+
+    // Revalidate immediately before publication. An existing destination is
+    // replaced by the platform's atomic primitive (ReplaceFileW on Windows,
+    // rename on Unix); a formerly absent destination uses atomic no-clobber
+    // publication. No path removes the old bytes before the new file commits.
+    let published = if target_existed {
+        match std::fs::symlink_metadata(target) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                super::tools::replace_temp_atomically(&temp, target)
+                    .map_err(|e| format!("cannot publish restored {}: {e}", target.display()))
+            }
+            Ok(_) => Err(format!(
+                "refusing changed restore target {}",
+                target.display()
+            )),
+            Err(error) => Err(format!(
+                "restore target {} changed before publication: {error}",
+                target.display()
+            )),
+        }
+    } else {
+        super::tools::publish_temp_noclobber(&temp, target)
+            .map_err(|e| format!("cannot publish restored {}: {e}", target.display()))
+    };
+    // No-clobber hard-link publication leaves the temporary name behind; the
+    // replacement paths consume it. Cleanup is harmless in either case.
+    let _ = std::fs::remove_file(&temp);
+    published
+}
+
+fn next_store_path(dir: &Path, prefix: &str, _rel: &str) -> PathBuf {
+    // The relative workspace path belongs in the in-memory checkpoint record,
+    // not in one filesystem component: a valid deeply nested path can exceed
+    // NAME_MAX after flattening. A UUID keeps names short and unguessable while
+    // create_new remains the final no-clobber authority.
+    dir.join(format!("{prefix}_{}.bin", uuid::Uuid::new_v4()))
 }
 
 /// Canonical form of `path` (resolving the parent when the file does not exist
@@ -83,21 +263,6 @@ fn canonical_rel(sandbox: &Sandbox, target: &Path) -> Option<(PathBuf, String)> 
     Some((canon, rel))
 }
 
-/// A flattened path safe as a single filename component on every platform:
-/// anything outside [A-Za-z0-9._-] becomes '_' (colons would be NTFS stream
-/// syntax; separators would be directories).
-fn flat_name(rel: &str) -> String {
-    rel.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn log() -> &'static Mutex<Vec<Checkpoint>> {
     static L: OnceLock<Mutex<Vec<Checkpoint>>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(Vec::new()))
@@ -125,31 +290,24 @@ pub fn prepare(sandbox: &Sandbox, path: &Path, tool: &str) -> Option<Pending> {
     // store would pull outside content across the boundary the store lives
     // behind — so they get no undo, rather than a leak.
     let (target_canon, rel) = canonical_rel(sandbox, path)?;
-    // Create the store first, then resolve it through the jail. `resolve` with
-    // must_exist=false canonicalises the *parent*, so it cannot resolve a
-    // two-level path whose first level does not exist yet — the store has to
-    // exist before it can be checked, not after.
-    std::fs::create_dir_all(sandbox.root().join(DIR)).ok()?;
-    let dir = sandbox.resolve(DIR, true).ok()?;
+    let dir = secure_checkpoint_dir(sandbox).ok()?;
 
-    let backup = if path.exists() {
+    let backup = if target_canon.exists() {
         // Collision-proof across processes: a subagent shares this store, and
-        // a name derived from the process-local log length would let two
-        // processes silently clobber each other's backups. Pid + a process
-        // atomic counter + the flattened path can collide with nothing.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let flat = flat_name(&rel);
-        let dest = dir.join(format!("{}_{seq:04}_{flat}", std::process::id()));
-        std::fs::copy(&target_canon, &dest).ok()?;
+        // create_new also fails closed if an attacker predicts the name and
+        // plants a symlink or file there first.
+        let dest = next_store_path(&dir, "backup", &rel);
+        copy_regular_create_new(&target_canon, &dest).ok()?;
         Some(dest)
     } else {
         None
     };
+    let backup_hash = backup.as_deref().and_then(content_hash);
 
     Some(Pending {
         rel,
         backup,
+        backup_hash,
         tool: tool.to_string(),
         target: target_canon,
     })
@@ -172,6 +330,7 @@ pub fn finish(pending: Option<Pending>, mutated: bool) {
         g.push(Checkpoint {
             rel: p.rel,
             backup: p.backup,
+            backup_hash: p.backup_hash,
             tool: p.tool,
             post_hash,
         });
@@ -190,52 +349,86 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
         let g = log().lock().map_err(|_| "checkpoint log poisoned")?;
         g.last().cloned().ok_or("nothing to undo")?
     };
-    let target = sandbox.resolve(&cp.rel, false)?;
-    let target = canonical_target(&target).unwrap_or(target);
+    let target = sandbox.resolve_output(&cp.rel)?;
+
+    if let Some(backup) = &cp.backup {
+        let actual = content_hash(backup)
+            .ok_or_else(|| format!("checkpoint backup for {} is unavailable or unsafe", cp.rel))?;
+        if cp.backup_hash != Some(actual) {
+            return Err(format!(
+                "checkpoint backup for {} changed after it was created; refusing restore",
+                cp.rel
+            ));
+        }
+    }
 
     if !force {
-        if let (Some(expected), Some(now)) = (cp.post_hash, content_hash(&target)) {
-            if expected != now {
-                return Err(format!(
-                    "{} was changed after the agent wrote it (by you?). /undo would overwrite \
-                     those changes — use `/undo force` if that is what you want",
-                    cp.rel
-                ));
-            }
+        let expected = cp.post_hash.ok_or_else(|| {
+            format!(
+                "{} cannot be verified as the agent-written version; refusing to overwrite it \
+                 (use `/undo force` if that is what you want)",
+                cp.rel
+            )
+        })?;
+        let now = content_hash(&target).ok_or_else(|| {
+            format!(
+                "{} changed or disappeared after the agent wrote it; refusing to restore over \
+                 that state (use `/undo force` if that is what you want)",
+                cp.rel
+            )
+        })?;
+        if expected != now {
+            return Err(format!(
+                "{} was changed after the agent wrote it (by you?). /undo would overwrite \
+                 those changes — use `/undo force` if that is what you want",
+                cp.rel
+            ));
         }
     }
 
     // Park what is being overwritten, outside the LIFO log (pushing it onto
     // the log would turn walk-back into a toggle).
     if target.exists() {
-        if let Ok(dir) = sandbox.resolve(DIR, true) {
-            let flat: String = cp
-                .rel
-                .chars()
-                .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-                .collect();
-            let _ = std::fs::copy(
-                &target,
-                dir.join(format!("undone_{}_{flat}", std::process::id())),
-            );
-        }
+        let dir = secure_checkpoint_dir(sandbox)?;
+        let parked = next_store_path(&dir, "undone", &cp.rel);
+        copy_regular_create_new(&target, &parked).map_err(|e| {
+            format!(
+                "could not preserve the current {} before undo; nothing was changed: {e}",
+                cp.rel
+            )
+        })?;
     }
 
-    // Only pop once the guard has passed.
-    if let Ok(mut g) = log().lock() {
-        g.pop();
-    }
-    match &cp.backup {
+    let result = match &cp.backup {
         Some(b) => {
-            std::fs::copy(b, &target).map_err(|e| format!("restore failed: {e}"))?;
+            restore_regular(b, &target).map_err(|e| format!("restore failed: {e}"))?;
             Ok(format!("restored {}", cp.rel))
         }
         None => {
             // The file did not exist before the agent made it.
-            let _ = std::fs::remove_file(&target);
+            match std::fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+                    return Err(format!(
+                        "refusing to remove non-regular undo target {}",
+                        cp.rel
+                    ))
+                }
+                Ok(_) => {
+                    std::fs::remove_file(&target).map_err(|e| format!("remove failed: {e}"))?
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("remove failed: {err}")),
+            }
             Ok(format!("removed {} (it was newly created)", cp.rel))
         }
+    };
+    // Keep the checkpoint retryable until the restore/removal really succeeds.
+    if result.is_ok() {
+        if let Ok(mut g) = log().lock() {
+            g.pop();
+        }
     }
+    result
 }
 
 /// A unified-ish diff of every checkpointed file against what is on disk now.
@@ -248,29 +441,60 @@ pub fn diff(sandbox: &Sandbox) -> String {
     for cp in &cps {
         let now = sandbox
             .resolve(&cp.rel, false)
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok());
-        let before = cp
-            .backup
-            .as_ref()
-            .and_then(|b| std::fs::read_to_string(b).ok());
+            .map_err(|error| format!("unsafe current path: {error}"))
+            .and_then(|path| read_bounded_text(&path));
+        let before = match cp.backup.as_ref() {
+            Some(path) => read_bounded_text(path),
+            None => Ok(None),
+        };
         out.push_str(&format!("--- {} ({})\n", cp.rel, cp.tool));
         match (before, now) {
-            (None, Some(after)) => {
+            (Err(error), _) => {
+                out.push_str(&format!("(before image unavailable: {error})\n"));
+            }
+            (_, Err(error)) => {
+                out.push_str(&format!("(current file unavailable: {error})\n"));
+            }
+            (Ok(None), Ok(Some(after))) => {
                 for line in after.lines().take(40) {
                     out.push_str(&format!("+ {line}\n"));
                 }
             }
-            (Some(b), None) => {
+            (Ok(Some(b)), Ok(None)) => {
                 for line in b.lines().take(40) {
                     out.push_str(&format!("- {line}\n"));
                 }
             }
-            (Some(b), Some(a)) => out.push_str(&line_diff(&b, &a)),
-            (None, None) => out.push_str("(gone)\n"),
+            (Ok(Some(b)), Ok(Some(a))) => out.push_str(&line_diff(&b, &a)),
+            (Ok(None), Ok(None)) => out.push_str("(gone)\n"),
         }
     }
     out
+}
+
+/// Read at most one checkpoint-sized regular UTF-8 file. The metadata check is
+/// repeated on the opened handle by `open_regular_read`; Unix also uses
+/// O_NOFOLLOW, so `/diff` cannot be redirected to a FIFO or outside symlink.
+fn read_bounded_text(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        Ok(_) => {}
+    }
+    let file = open_regular_read(path, MAX_CHECKPOINT_BYTES)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CHECKPOINT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
+        return Err(format!(
+            "{} exceeds the {MAX_CHECKPOINT_BYTES}-byte checkpoint limit",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| format!("{} is not UTF-8 text", path.display()))
 }
 
 /// A positional line diff via LCS. A set-membership diff cannot see a moved or
@@ -388,6 +612,29 @@ pub(crate) mod tests {
         clear();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn failed_atomic_restore_leaves_existing_target_bytes_intact() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("backup.txt");
+        let target = dir.path().join("target.txt");
+        std::fs::write(&source, "restored bytes").unwrap();
+        std::fs::write(&target, "current bytes").unwrap();
+        // Deny delete sharing so ReplaceFileW deterministically fails. The old
+        // remove-then-rename path destroyed target before observing this error.
+        let _held = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&target)
+            .unwrap();
+
+        assert!(restore_regular(&source, &target).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "current bytes");
+    }
+
     #[test]
     fn undo_removes_a_file_the_agent_created() {
         let _g = cp_lock();
@@ -451,6 +698,56 @@ pub(crate) mod tests {
             "unchanged lines must not show: {out}"
         );
         assert!(summary().contains("1 change(s)"));
+        clear();
+    }
+
+    #[test]
+    fn diff_refuses_an_oversized_current_file_without_reading_it() {
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let target = d.path().join("large.txt");
+        std::fs::write(&target, "small before\n").unwrap();
+
+        let pending = prepare(&sandbox, &target, "write_file");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target)
+            .unwrap();
+        // Sparse on normal test filesystems, so the regression is cheap while
+        // still exercising the pre-allocation size guard.
+        file.set_len(MAX_CHECKPOINT_BYTES + 1).unwrap();
+        finish(pending, true);
+
+        let rendered = diff(&sandbox);
+        assert!(rendered.contains("current file unavailable"), "{rendered}");
+        assert!(rendered.contains("too large"), "{rendered}");
+        clear();
+    }
+
+    #[test]
+    fn deeply_nested_paths_still_receive_working_checkpoints() {
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let component = "nested".repeat(12);
+        let mut parent = d.path().to_path_buf();
+        for suffix in ["a", "b", "c", "d"] {
+            parent.push(format!("{component}{suffix}"));
+        }
+        std::fs::create_dir_all(&parent).unwrap();
+        let target = parent.join("source.txt");
+        std::fs::write(&target, "original").unwrap();
+
+        let pending = prepare(&sandbox, &target, "edit_file");
+        assert!(pending.is_some(), "long relative path silently lost undo");
+        std::fs::write(&target, "agent version").unwrap();
+        finish(pending, true);
+        undo(&sandbox, false).unwrap();
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
         clear();
     }
 
@@ -520,6 +817,29 @@ pub(crate) mod tests {
         assert_eq!(parked.len(), 1, "the overwritten state must be parked");
         let saved = std::fs::read_to_string(parked[0].path()).unwrap();
         assert_eq!(saved, "user's careful manual fix");
+        clear();
+    }
+
+    #[test]
+    fn undo_refuses_when_the_agent_output_disappeared() {
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let target = d.path().join("a.txt");
+        std::fs::write(&target, "original").unwrap();
+        let pending = prepare(&sandbox, &target, "write_file").unwrap();
+        std::fs::write(&target, "agent version").unwrap();
+        finish(Some(pending), true);
+
+        std::fs::remove_file(&target).unwrap();
+        let error = undo(&sandbox, false).unwrap_err();
+        assert!(error.contains("disappeared"), "{error}");
+        assert!(!target.exists(), "non-forced undo must preserve deletion");
+        assert_eq!(all().len(), 1, "refused undo remains retryable");
+
+        undo(&sandbox, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
         clear();
     }
 
@@ -648,6 +968,59 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not yours");
+        clear();
+    }
+
+    #[test]
+    fn a_changed_backup_is_refused_and_remains_retryable() {
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let target = d.path().join("a.txt");
+        std::fs::write(&target, "original").unwrap();
+        let pending = prepare(&sandbox, &target, "write_file").unwrap();
+        let backup = pending.backup.clone().unwrap();
+        std::fs::write(&target, "agent version").unwrap();
+        finish(Some(pending), true);
+
+        std::fs::write(&backup, "tampered").unwrap();
+        let error = undo(&sandbox, true).unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "agent version");
+        assert_eq!(all().len(), 1, "failed restore must remain retryable");
+        clear();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_state_and_undo_targets_refuse_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let _g = cp_lock();
+        clear();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sandbox = sb(root.path());
+        let target = root.path().join("a.txt");
+        std::fs::write(&target, "original").unwrap();
+
+        symlink(outside.path(), root.path().join(".camelid")).unwrap();
+        assert!(prepare(&sandbox, &target, "write_file").is_none());
+        assert!(!outside.path().join("checkpoints").exists());
+        std::fs::remove_file(root.path().join(".camelid")).unwrap();
+
+        let pending = prepare(&sandbox, &target, "write_file").unwrap();
+        std::fs::write(&target, "agent version").unwrap();
+        finish(Some(pending), true);
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "safe").unwrap();
+        std::fs::remove_file(&target).unwrap();
+        symlink(&victim, &target).unwrap();
+
+        assert!(undo(&sandbox, true).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "safe");
+        assert_eq!(all().len(), 1, "refused undo must retain the checkpoint");
         clear();
     }
 }

@@ -87,15 +87,16 @@ impl std::fmt::Debug for NodeIdentity {
 impl NodeIdentity {
     /// Build the identity for a node holding `worker_layers` of `model`.
     ///
-    /// Hashing is served from the on-disk digest cache, so this is a stat on the warm
-    /// path rather than a re-read of the whole GGUF.
+    /// Hashing is deliberately uncached because this digest authenticates the
+    /// model identity used by the distributed handshake. A writable local
+    /// performance cache is not authority for that decision.
     pub fn for_model(
         model: &Path,
         total_layers: u32,
         hidden_size: u32,
         worker_layers: std::ops::Range<u32>,
     ) -> Result<Self> {
-        let model_sha256 = crate::receipt::sha256_file_hex_cached(model).map_err(|err| {
+        let model_sha256 = crate::receipt::sha256_file_hex(model).map_err(|err| {
             BackendError::RuntimeShapeMismatch(format!(
                 "could not hash {} for the distributed handshake: {err}",
                 model.display()

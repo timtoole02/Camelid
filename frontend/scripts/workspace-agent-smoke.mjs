@@ -1,5 +1,20 @@
 import assert from 'node:assert/strict'
-import { reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
+import {
+  cancelWorkspaceSession,
+  createWorkspaceSession,
+  getWorkspaceSession,
+  reduceWorkspaceEvent,
+  sendWorkspaceMessage,
+  waitForWorkspaceSessionTerminal,
+  WORKSPACE_IDLE_STATE,
+  workspaceBrowseEndpoint,
+  workspaceCompactionEndpoint,
+  workspaceEndpoint,
+  workspaceFollowUpDisposition,
+  workspaceModelsEndpoint,
+  workspaceSessionMatchesRuntime,
+  workspaceThreadsEndpoint,
+} from '../src/lib/workspaceAgent.js'
 
 let state = { ...WORKSPACE_IDLE_STATE, events: [] }
 state = reduceWorkspaceEvent(state, { event: 'session.started', model_id: 'tool-model', sequence: 1 })
@@ -31,8 +46,14 @@ const impossibleApproval = reduceWorkspaceEvent(
   { ...WORKSPACE_IDLE_STATE, events: [] },
   { event: 'approval.required', approval_id: 'unexpected' },
 )
-assert.equal(impossibleApproval.phase, 'error')
+assert.equal(impossibleApproval.phase, 'recovering')
 assert.match(impossibleApproval.error, /unexpected approval request/)
+const recovering = reduceWorkspaceEvent(
+  { ...WORKSPACE_IDLE_STATE, events: [], turns: [] },
+  { event: 'session.recovering', message: 'stream interrupted' },
+)
+assert.equal(recovering.phase, 'recovering')
+assert.equal(recovering.error, 'stream interrupted')
 
 state = reduceWorkspaceEvent(state, { event: 'session.reset' })
 assert.deepEqual(state, { ...WORKSPACE_IDLE_STATE, events: [] })
@@ -61,17 +82,76 @@ assert.equal(state.phase, 'cancel_error', 'late nonterminal SSE events must not 
 const originalFetch = globalThis.fetch
 const terminalStates = ['running', 'cancelling', 'cancelled']
 let statusReads = 0
-globalThis.fetch = async () => new Response(JSON.stringify({ state: terminalStates[statusReads++] }), {
+const waitController = new AbortController()
+globalThis.fetch = async (_url, options) => {
+  assert.equal(options.signal, waitController.signal, 'terminal polling must forward its AbortSignal')
+  return new Response(JSON.stringify({ state: terminalStates[statusReads++] }), {
   status: 200,
   headers: { 'Content-Type': 'application/json' },
-})
+  })
+}
 try {
-  const settled = await waitForWorkspaceSessionTerminal('http://127.0.0.1:8181', 'thread-1', { timeoutMs: 1000, pollMs: 0 })
+  const settled = await waitForWorkspaceSessionTerminal('http://127.0.0.1:8181', 'thread-1', { timeoutMs: 1000, pollMs: 0, signal: waitController.signal })
   assert.equal(settled.state, 'cancelled')
   assert.equal(statusReads, 3, 'follow-up must wait through running and cancelling states')
 } finally {
   globalThis.fetch = originalFetch
 }
+
+const abortController = new AbortController()
+globalThis.fetch = async () => new Response(JSON.stringify({ state: 'running' }), {
+  status: 200,
+  headers: { 'Content-Type': 'application/json' },
+})
+try {
+  const pending = waitForWorkspaceSessionTerminal('http://127.0.0.1:8181', 'thread-1', {
+    timeoutMs: 20000,
+    pollMs: 10000,
+    signal: abortController.signal,
+  })
+  abortController.abort()
+  await assert.rejects(pending, (error) => error?.name === 'AbortError')
+} finally {
+  globalThis.fetch = originalFetch
+}
+
+const requestController = new AbortController()
+const apiCalls = []
+globalThis.fetch = async (url, options = {}) => {
+  apiCalls.push({ url: String(url), options })
+  assert.equal(options.signal, requestController.signal, 'Workspace lifecycle request must forward its AbortSignal')
+  if (options.method === 'DELETE') return new Response(null, { status: 204 })
+  const payload = String(url).endsWith('/messages')
+    ? { session_id: 'thread-1', turn_index: 1, state: 'waiting_for_events', duplicate: false }
+    : { id: 'thread-1', workspace: '/work', model_id: 'model-1', state: 'waiting_for_events' }
+  return new Response(JSON.stringify(payload), { status: options.method === 'POST' ? 201 : 200, headers: { 'Content-Type': 'application/json' } })
+}
+try {
+  await createWorkspaceSession('http://127.0.0.1:8181', { workspace: '/work', goal: 'inspect' }, { signal: requestController.signal })
+  await sendWorkspaceMessage('http://127.0.0.1:8181', 'thread-1', 'follow up', 'message-1', { signal: requestController.signal })
+  await getWorkspaceSession('http://127.0.0.1:8181', 'thread-1', { signal: requestController.signal })
+  await cancelWorkspaceSession('http://127.0.0.1:8181', 'thread-1', { signal: requestController.signal })
+  assert.equal(apiCalls.length, 4)
+  assert.equal(JSON.parse(apiCalls[1].options.body).client_message_id, 'message-1')
+} finally {
+  globalThis.fetch = originalFetch
+}
+
+assert.equal(workspaceFollowUpDisposition({ session_id: 'thread-1', state: 'waiting_for_events', duplicate: false }, 'thread-1'), 'stream')
+assert.equal(workspaceFollowUpDisposition({ session_id: 'thread-1', state: 'waiting_for_events', duplicate: true }, 'thread-1'), 'stream')
+assert.equal(workspaceFollowUpDisposition({ session_id: 'thread-1', state: 'idle', duplicate: true }, 'thread-1'), 'restore')
+assert.equal(workspaceFollowUpDisposition({ session_id: 'thread-1', state: 'running', duplicate: true }, 'thread-1'), 'recover')
+assert.throws(
+  () => workspaceFollowUpDisposition({ session_id: 'thread-2', state: 'waiting_for_events', duplicate: false }, 'thread-1'),
+  /mismatched session identity/,
+)
+
+const boundSession = { id: 'thread-1', model_id: 'model-1' }
+const readyRuntime = { status: 'online', loaded_now: true, generation_ready: true, active_model_id: 'model-1' }
+assert.equal(workspaceSessionMatchesRuntime(boundSession, readyRuntime, true), true)
+assert.equal(workspaceSessionMatchesRuntime(boundSession, { ...readyRuntime, active_model_id: 'model-2' }, true), false)
+assert.equal(workspaceSessionMatchesRuntime(boundSession, { ...readyRuntime, generation_ready: false }, true), false)
+assert.equal(workspaceSessionMatchesRuntime(boundSession, readyRuntime, false), false)
 
 let bounded = { ...WORKSPACE_IDLE_STATE, events: [], turns: [] }
 for (let index = 0; index < 300; index += 1) {

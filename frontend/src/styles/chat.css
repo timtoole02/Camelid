@@ -123,6 +123,56 @@
 }
 .cxturn__warning--error { color: var(--color-error); }
 .cxturn__warning--interrupted { color: var(--color-warning); }
+.cxturn__web-warning {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 35%, var(--color-border-soft));
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-warning);
+  font-size: var(--text-xs);
+}
+.cxturn__web-warning > span { display: flex; flex-direction: column; gap: 2px; }
+.cxturn__web-warning small { color: var(--color-text-muted); font-size: var(--text-2xs); overflow-wrap: anywhere; }
+.cxturn__web-sources {
+  margin-top: var(--space-3);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+}
+.cxturn__web-sources > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  font-weight: 650;
+  color: var(--color-text-muted);
+  list-style: none;
+}
+.cxturn__web-sources > summary::-webkit-details-marker { display: none; }
+.cxturn__web-sources[open] > summary { border-bottom: 1px solid var(--color-border-soft); }
+.cxturn__web-count {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+.cxturn__web-partial { margin-left: auto; color: var(--color-warning); font-size: var(--text-2xs); font-weight: 650; text-transform: uppercase; letter-spacing: var(--tracking-wide); }
+.cxturn__web-sources ol { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) var(--space-4) var(--space-3) 2.25rem; }
+.cxturn__web-sources li { padding-left: var(--space-1); }
+.cxturn__web-sources a { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--color-accent-text); overflow-wrap: anywhere; }
+.cxturn__web-sources a:hover { text-decoration: underline; text-underline-offset: 2px; }
+.cxturn__web-source-warning { display: flex; flex-direction: column; gap: var(--space-1); padding: 0 var(--space-3) var(--space-3); color: var(--color-warning); }
 .cxturn__actions { display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-3); }
 .cxturn__action-time {
   font-family: var(--font-mono);

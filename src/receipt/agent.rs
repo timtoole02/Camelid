@@ -7,7 +7,8 @@
 //! - `agent-syscap-eval` → `camelid.agent-syscap-receipt/v1`
 //! - `agent-orchestration-eval` → `camelid.agent-orchestration-receipt/v1`
 //! - `agent-orchestration-bench` → `camelid.agent-orchestration-bench/v1`
-//! - `agent-eval` → `camelid.agent_eval/v1` (the tool-capable promotion gate)
+//! - `agent-eval` → `camelid.agent_eval/v2` (the tool-capable promotion gate;
+//!   legacy v1 remains verifiable under its stricter complete-battery rule)
 //!
 //! Unlike a parity receipt there is no model to re-run: verification is a
 //! self-contained **tamper-evidence + honest-scope** check.
@@ -18,9 +19,10 @@
 //! 2. *Honest-scope* — a well-formed but over-claiming receipt is rejected. The
 //!    syscap / orchestration / bench gates promote no capability (and
 //!    orchestration claims no speedup); the eval gate is the one
-//!    promotion-bearing receipt, so its scope check is internal consistency —
-//!    `promotion_eligible` must equal `outcome == "PASS"`. A receipt whose scope
-//!    fields say otherwise is not a valid artifact of the gate that produced it.
+//!    promotion-bearing receipt. New receipts distinguish a complete
+//!    `full_battery` from diagnostic `single_case` runs; only a passing complete
+//!    battery may set `promotion_eligible=true`. Sealed legacy receipts retain
+//!    their original PASS/eligibility consistency rule.
 //!
 //! Verifying a receipt attests only that the document is intact and internally
 //! honest; it changes no support-ledger row. Agent-eval receipts minted before
@@ -50,13 +52,17 @@ pub const ORCHESTRATION_RECEIPT_SCHEMA_V1: &str = "camelid.agent-orchestration-r
 pub const ORCHESTRATION_BENCH_SCHEMA_V1: &str = "camelid.agent-orchestration-bench/v1";
 /// Schema stamped into an `agent-eval` receipt (the tool-capable promotion gate).
 pub const EVAL_RECEIPT_SCHEMA_V1: &str = "camelid.agent_eval/v1";
+/// Scope- and artifact-bound agent-eval receipt. Unlike legacy v1, v2 requires
+/// an explicit evaluation scope plus the exact GGUF filename and SHA-256.
+pub const EVAL_RECEIPT_SCHEMA_V2: &str = "camelid.agent_eval/v2";
 
 /// Every agent-family schema this verifier understands.
-pub const RECOGNIZED_SCHEMAS: [&str; 4] = [
+pub const RECOGNIZED_SCHEMAS: [&str; 5] = [
     SYSCAP_RECEIPT_SCHEMA_V1,
     ORCHESTRATION_RECEIPT_SCHEMA_V1,
     ORCHESTRATION_BENCH_SCHEMA_V1,
     EVAL_RECEIPT_SCHEMA_V1,
+    EVAL_RECEIPT_SCHEMA_V2,
 ];
 
 /// True when `schema` names an agent-family receipt this module can verify.
@@ -86,7 +92,7 @@ impl AgentReceiptClass {
             SYSCAP_RECEIPT_SCHEMA_V1 => Some(Self::Syscap),
             ORCHESTRATION_RECEIPT_SCHEMA_V1 => Some(Self::Orchestration),
             ORCHESTRATION_BENCH_SCHEMA_V1 => Some(Self::OrchestrationBench),
-            EVAL_RECEIPT_SCHEMA_V1 => Some(Self::Eval),
+            EVAL_RECEIPT_SCHEMA_V1 | EVAL_RECEIPT_SCHEMA_V2 => Some(Self::Eval),
             _ => None,
         }
     }
@@ -132,6 +138,56 @@ impl AgentReceiptClass {
                 Ok(format!("speedup_claimed_for={claimed:?}"))
             }
             Self::Eval => {
+                let schema = obj
+                    .get("schema")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if schema == EVAL_RECEIPT_SCHEMA_V1 {
+                    let cases = obj.get("cases").and_then(Value::as_array).ok_or_else(|| {
+                        AgentVerifyError {
+                            phase: "honest-scope",
+                            reason: "legacy v1 agent_eval receipt is missing `cases`".to_string(),
+                        }
+                    })?;
+                    if !eval_case_set_status(cases).0 {
+                        return Err(AgentVerifyError {
+                            phase: "honest-scope",
+                            reason: "legacy v1 agent_eval receipts are accepted only with each pinned case exactly once"
+                                .to_string(),
+                        });
+                    }
+                }
+                if schema == EVAL_RECEIPT_SCHEMA_V2 {
+                    let filename = obj
+                        .get("gguf_filename")
+                        .and_then(Value::as_str)
+                        .filter(|filename| !filename.trim().is_empty())
+                        .ok_or_else(|| AgentVerifyError {
+                            phase: "honest-scope",
+                            reason: "v2 agent_eval receipt is missing `gguf_filename`".to_string(),
+                        })?;
+                    let sha256 = obj
+                        .get("gguf_sha256")
+                        .and_then(Value::as_str)
+                        .filter(|sha256| is_sha256_hex(sha256))
+                        .ok_or_else(|| AgentVerifyError {
+                            phase: "honest-scope",
+                            reason: "v2 agent_eval receipt requires a lowercase hexadecimal `gguf_sha256`"
+                                .to_string(),
+                        })?;
+                    if obj
+                        .get("evaluation_scope")
+                        .and_then(Value::as_str)
+                        .is_none()
+                    {
+                        return Err(AgentVerifyError {
+                            phase: "honest-scope",
+                            reason: "v2 agent_eval receipt requires an explicit `evaluation_scope`; it cannot fall back to legacy promotion rules"
+                                .to_string(),
+                        });
+                    }
+                    let _artifact_identity = (filename, sha256);
+                }
                 // The eval gate is the ONE agent receipt that may justify a
                 // promotion: a PASS is `promotion_eligible`. Honest-scope here is
                 // internal consistency — `promotion_eligible` must equal
@@ -154,21 +210,145 @@ impl AgentReceiptClass {
                                  `promotion_eligible` field"
                             .to_string(),
                     })?;
-                if eligible != (outcome == "PASS") {
+                if let Some(scope) = obj.get("evaluation_scope").and_then(Value::as_str) {
+                    match scope {
+                        "full_battery" => {
+                            let cases =
+                                obj.get("cases").and_then(Value::as_array).ok_or_else(|| {
+                                    AgentVerifyError {
+                                        phase: "honest-scope",
+                                        reason:
+                                            "full-battery agent_eval receipt is missing `cases`"
+                                                .to_string(),
+                                    }
+                                })?;
+                            let (complete, all_passed) = eval_case_set_status(cases);
+                            if !complete
+                                || (outcome == "PASS") != all_passed
+                                || eligible != (outcome == "PASS" && all_passed)
+                            {
+                                return Err(AgentVerifyError {
+                                    phase: "honest-scope",
+                                    reason: format!(
+                                        "full_battery requires each pinned case exactly once, a \
+                                         PASS only when all cases passed, and matching promotion \
+                                         eligibility; got promotion_eligible={eligible}, \
+                                         outcome={outcome:?}"
+                                    ),
+                                });
+                            }
+                        }
+                        "single_case" => {
+                            if eligible {
+                                return Err(AgentVerifyError {
+                                    phase: "honest-scope",
+                                    reason: format!(
+                                        "evaluation_scope={scope:?} is diagnostic only and cannot \
+                                         be promotion_eligible"
+                                    ),
+                                });
+                            }
+                            let cases = obj.get("cases").and_then(Value::as_array);
+                            let one_valid_case = cases.is_some_and(|cases| {
+                                cases.len() == 1
+                                    && cases[0].get("case").and_then(Value::as_str).is_some_and(
+                                        |name| {
+                                            ["read_and_count", "list_dir_find", "write_greeting"]
+                                                .contains(&name)
+                                        },
+                                    )
+                            });
+                            if !one_valid_case {
+                                return Err(AgentVerifyError {
+                                    phase: "honest-scope",
+                                    reason: "single_case scope requires exactly one pinned case"
+                                        .to_string(),
+                                });
+                            }
+                            let passed = cases
+                                .and_then(|cases| cases[0].get("passed"))
+                                .and_then(Value::as_bool);
+                            if passed != Some(outcome == "PASS") {
+                                return Err(AgentVerifyError {
+                                    phase: "honest-scope",
+                                    reason: format!(
+                                        "single_case outcome {outcome:?} is inconsistent with \
+                                         passed={passed:?}"
+                                    ),
+                                });
+                            }
+                        }
+                        "incomplete_or_not_run" => {
+                            if eligible {
+                                return Err(AgentVerifyError {
+                                    phase: "honest-scope",
+                                    reason: "incomplete agent_eval evidence cannot be promotion_eligible"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        other => {
+                            return Err(AgentVerifyError {
+                                phase: "honest-scope",
+                                reason: format!("unknown agent_eval evaluation_scope={other:?}"),
+                            })
+                        }
+                    }
+                    return Ok(format!(
+                        "evaluation_scope={scope:?}, promotion_eligible={eligible}, \
+                         outcome={outcome:?}"
+                    ));
+                }
+                // Legacy v1 receipts had no scope field. Because the self-digest
+                // is deliberately unkeyed, accepting `PASS => eligible` here
+                // lets a one-case diagnostic strip its scope, flip eligibility,
+                // and reseal. Legacy promotion is therefore accepted only when
+                // the receipt itself contains the exact complete pinned battery.
+                let cases =
+                    obj.get("cases")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| AgentVerifyError {
+                            phase: "honest-scope",
+                            reason: "legacy v1 agent_eval receipt is missing `cases`".to_string(),
+                        })?;
+                let (complete, all_passed) = eval_case_set_status(cases);
+                if schema != EVAL_RECEIPT_SCHEMA_V1
+                    || !complete
+                    || (outcome == "PASS") != all_passed
+                    || eligible != (outcome == "PASS" && all_passed)
+                {
                     return Err(AgentVerifyError {
                         phase: "honest-scope",
                         reason: format!(
-                            "promotion_eligible={eligible} is inconsistent with \
-                             outcome={outcome:?} (only a PASS is promotion-eligible)"
+                            "legacy v1 agent_eval promotion requires each pinned case exactly \
+                             once, a PASS only when all passed, and matching eligibility; got \
+                             promotion_eligible={eligible}, outcome={outcome:?}"
                         ),
                     });
                 }
                 Ok(format!(
-                    "promotion_eligible={eligible} (consistent with outcome={outcome:?})"
+                    "legacy_full_battery=true, promotion_eligible={eligible}, outcome={outcome:?}"
                 ))
             }
         }
     }
+}
+
+fn eval_case_set_status(cases: &[Value]) -> (bool, bool) {
+    const REQUIRED: [&str; 3] = ["read_and_count", "list_dir_find", "write_greeting"];
+    let complete = cases.len() == REQUIRED.len()
+        && REQUIRED.iter().all(|name| {
+            cases
+                .iter()
+                .filter(|case| case.get("case").and_then(Value::as_str) == Some(*name))
+                .count()
+                == 1
+        });
+    let all_passed = complete
+        && cases
+            .iter()
+            .all(|case| case.get("passed").and_then(Value::as_bool) == Some(true));
+    (complete, all_passed)
 }
 
 /// A boolean scope field that every honest receipt of the family pins to
@@ -466,27 +646,35 @@ mod tests {
     /// Mirrors the fields `agent_eval::finish` emits (a PASS is promotion-eligible).
     fn eval_body() -> Value {
         json!({
-            "schema": EVAL_RECEIPT_SCHEMA_V1,
+            "schema": EVAL_RECEIPT_SCHEMA_V2,
             "receipt_id": "",
             "outcome": "PASS",
             "model_id": "qwen3-4b",
             "gguf": "C:\\models\\Qwen3-4B-Q8_0.gguf",
+            "gguf_filename": "Qwen3-4B-Q8_0.gguf",
+            "gguf_sha256": "ab".repeat(32),
             "gguf_bytes": 4_000_000_000u64,
             "quantization": "Q8_0",
             "note": "full 3-case battery",
-            "cases": [ { "name": "read_notes", "tool": "read_file", "pass": true } ],
+            "cases": [
+                {"case":"read_and_count", "passed":true},
+                {"case":"list_dir_find", "passed":true},
+                {"case":"write_greeting", "passed":true}
+            ],
             "host_loadavg_1m": null,
             "timestamp_unix": 1_784_747_762u64,
+            "evaluation_scope": "full_battery",
             "promotion_eligible": true
         })
     }
 
     #[test]
-    fn recognizes_exactly_the_four_agent_schemas() {
+    fn recognizes_exactly_the_agent_schemas() {
         assert!(is_agent_schema(SYSCAP_RECEIPT_SCHEMA_V1));
         assert!(is_agent_schema(ORCHESTRATION_RECEIPT_SCHEMA_V1));
         assert!(is_agent_schema(ORCHESTRATION_BENCH_SCHEMA_V1));
         assert!(is_agent_schema(EVAL_RECEIPT_SCHEMA_V1));
+        assert!(is_agent_schema(EVAL_RECEIPT_SCHEMA_V2));
         assert!(!is_agent_schema("camelid.parity-receipt/v1"));
         // The eval schema uses an underscore; the hyphenated spelling is not it.
         assert!(!is_agent_schema("camelid.agent-eval/v1"));
@@ -499,10 +687,10 @@ mod tests {
         let summary = check(&receipt).expect("verifies");
         assert_eq!(summary.class, AgentReceiptClass::Eval);
         assert_eq!(summary.result, "PASS");
-        assert_eq!(
-            summary.scope_note,
-            "promotion_eligible=true (consistent with outcome=\"PASS\")"
-        );
+        assert!(summary
+            .scope_note
+            .contains("evaluation_scope=\"full_battery\""));
+        assert!(summary.scope_note.contains("promotion_eligible=true"));
         assert_eq!(summary.host, None);
         assert_eq!(verify_value(&receipt), AgentVerifyOutcome::Verified);
     }
@@ -522,10 +710,118 @@ mod tests {
     }
 
     #[test]
+    fn scoped_single_case_pass_is_diagnostic_not_promotion_eligible() {
+        let mut body = eval_body();
+        body["evaluation_scope"] = json!("single_case");
+        body["promotion_eligible"] = json!(false);
+        body["cases"] = json!([{"case":"read_and_count", "passed":true}]);
+        let receipt = seal(body);
+        let summary = check(&receipt).expect("diagnostic PASS remains a valid receipt");
+        assert!(summary.scope_note.contains("single_case"));
+        assert!(summary.scope_note.contains("promotion_eligible=false"));
+    }
+
+    #[test]
+    fn v2_single_case_cannot_strip_scope_reseal_and_promote() {
+        let mut body = eval_body();
+        body["evaluation_scope"] = json!("single_case");
+        body["promotion_eligible"] = json!(false);
+        body["cases"] = json!([{"case":"read_and_count", "passed":true}]);
+        let diagnostic = seal(body.clone());
+        assert!(check(&diagnostic).is_ok());
+
+        body.as_object_mut().unwrap().remove("evaluation_scope");
+        body["promotion_eligible"] = json!(true);
+        let resealed = seal(body);
+        let err = check(&resealed).expect_err("v2 may never use the legacy scope fallback");
+        assert_eq!(err.phase, "honest-scope");
+        assert!(err.reason.contains("explicit `evaluation_scope`"));
+    }
+
+    #[test]
+    fn v2_eval_requires_exact_artifact_identity() {
+        for field in ["gguf_filename", "gguf_sha256"] {
+            let mut body = eval_body();
+            body.as_object_mut().unwrap().remove(field);
+            let receipt = seal(body);
+            let err = check(&receipt).expect_err("v2 artifact identity is mandatory");
+            assert_eq!(err.phase, "honest-scope");
+            assert!(err.reason.contains(field), "{}", err.reason);
+        }
+    }
+
+    #[test]
+    fn legacy_v1_without_scope_requires_the_exact_full_battery() {
+        let mut body = eval_body();
+        body["schema"] = json!(EVAL_RECEIPT_SCHEMA_V1);
+        body.as_object_mut().unwrap().remove("evaluation_scope");
+        body.as_object_mut().unwrap().remove("gguf_filename");
+        body.as_object_mut().unwrap().remove("gguf_sha256");
+        let receipt = seal(body.clone());
+        let summary = check(&receipt).expect("complete legacy battery remains verifiable");
+        assert!(summary.scope_note.contains("legacy_full_battery=true"));
+
+        body["cases"] = json!([{"case":"read_and_count", "passed":true}]);
+        let resealed = seal(body);
+        let err = check(&resealed).expect_err("one-case legacy receipt cannot promote");
+        assert!(err.reason.contains("each pinned case exactly once"));
+    }
+
+    #[test]
+    fn scoped_full_battery_requires_all_pinned_passing_cases() {
+        let mut body = eval_body();
+        body["evaluation_scope"] = json!("full_battery");
+        body["cases"] = json!([
+            {"case":"read_and_count", "passed":true},
+            {"case":"list_dir_find", "passed":true}
+        ]);
+        let receipt = seal(body);
+        let err = check(&receipt).expect_err("an incomplete battery must not promote");
+        assert_eq!(err.phase, "honest-scope");
+        assert!(err.reason.contains("each pinned case exactly once"));
+    }
+
+    #[test]
+    fn scoped_full_battery_pass_can_promote() {
+        let mut body = eval_body();
+        body["evaluation_scope"] = json!("full_battery");
+        body["cases"] = json!([
+            {"case":"read_and_count", "passed":true},
+            {"case":"list_dir_find", "passed":true},
+            {"case":"write_greeting", "passed":true}
+        ]);
+        let receipt = seal(body);
+        let summary = check(&receipt).expect("complete battery verifies");
+        assert!(summary.scope_note.contains("full_battery"));
+        assert!(summary.scope_note.contains("promotion_eligible=true"));
+    }
+
+    #[test]
+    fn scoped_full_battery_failure_is_valid_but_cannot_promote() {
+        let mut body = eval_body();
+        body["outcome"] = json!("FAIL");
+        body["promotion_eligible"] = json!(false);
+        body["evaluation_scope"] = json!("full_battery");
+        body["cases"] = json!([
+            {"case":"read_and_count", "passed":true},
+            {"case":"list_dir_find", "passed":false},
+            {"case":"write_greeting", "passed":true}
+        ]);
+        let receipt = seal(body);
+        let summary = check(&receipt).expect("a complete failing battery is honest evidence");
+        assert_eq!(summary.result, "FAIL");
+        assert!(summary.scope_note.contains("promotion_eligible=false"));
+    }
+
+    #[test]
     fn an_unsealed_legacy_eval_receipt_is_reported_as_such() {
         // The 9 committed agent_eval receipts predate sealing: no `receipt_id`.
         // They must be reported as unsealed legacy, not as a malformed body.
         let mut legacy = eval_body();
+        legacy["schema"] = json!(EVAL_RECEIPT_SCHEMA_V1);
+        legacy.as_object_mut().unwrap().remove("evaluation_scope");
+        legacy.as_object_mut().unwrap().remove("gguf_filename");
+        legacy.as_object_mut().unwrap().remove("gguf_sha256");
         legacy.as_object_mut().unwrap().remove("receipt_id");
         let err = check(&legacy).expect_err("must fail");
         assert_eq!(err.phase, "self-digest");
@@ -540,13 +836,14 @@ mod tests {
         let mut body = eval_body();
         body["outcome"] = json!("INCONCLUSIVE");
         body["promotion_eligible"] = json!(false);
+        body["evaluation_scope"] = json!("incomplete_or_not_run");
+        body["cases"] = json!([]);
         let receipt = seal(body);
         let summary = check(&receipt).expect("verifies");
         assert_eq!(summary.result, "INCONCLUSIVE");
-        assert_eq!(
-            summary.scope_note,
-            "promotion_eligible=false (consistent with outcome=\"INCONCLUSIVE\")"
-        );
+        assert!(summary
+            .scope_note
+            .contains("evaluation_scope=\"incomplete_or_not_run\""));
         assert_eq!(verify_value(&receipt), AgentVerifyOutcome::Verified);
     }
 

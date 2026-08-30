@@ -23,6 +23,14 @@ pub struct Health {
     pub generation_ready: bool,
     #[serde(default)]
     pub api_surface: Option<String>,
+    /// Operator-enforced prompt ceiling for this exact server process. A zero
+    /// value means an older server omitted the field; agent mode treats that as
+    /// unavailable and fails closed instead of guessing a budget.
+    #[serde(default)]
+    pub max_prompt_tokens: usize,
+    /// Operator-enforced generation ceiling for this exact server process.
+    #[serde(default)]
+    pub max_generation_tokens: u32,
 }
 
 /// One supported/planned row from `/api/capabilities` → `model_compatibility`
@@ -67,6 +75,10 @@ struct ModelList {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadedInfo {
     pub id: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub gguf_sha256: String,
     #[serde(default)]
     pub meta: Option<LoadedMeta>,
 }
@@ -132,6 +144,10 @@ pub struct StreamStats {
     /// when the request opted in via `stream_options.include_usage` (the agent
     /// lane's calibration signal); `None` otherwise.
     pub prompt_tokens: Option<u32>,
+    /// Server-reported completion tokens from the terminal usage chunk. This
+    /// remains accurate when a tool-enabled server intentionally releases a
+    /// buffered natural-language answer as one visible SSE delta.
+    pub completion_tokens: Option<u32>,
     /// Structured tool calls lifted from `delta.tool_calls` (OpenAI shape).
     ///
     /// A tool-enabled stream HOLDS BACK every content delta until the turn is
@@ -148,6 +164,7 @@ pub struct StreamStats {
 struct StreamAccumulator {
     tool_calls: Vec<ToolCallOut>,
     prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 impl StreamAccumulator {
@@ -187,6 +204,12 @@ impl StreamAccumulator {
             .and_then(Value::as_u64)
         {
             self.prompt_tokens = Some(pt as u32);
+        }
+        if let Some(ct) = chunk
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.completion_tokens = Some(ct as u32);
         }
         chunk
             .pointer("/choices/0/delta/content")
@@ -550,6 +573,7 @@ impl Client {
                 total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 ttft_ms: None,
                 prompt_tokens: None,
+                completion_tokens: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -582,12 +606,14 @@ impl Client {
             SseControl::Continue
         })?;
         let prompt_tokens = acc.prompt_tokens;
+        let completion_tokens = acc.completion_tokens;
         Ok(StreamStats {
             end,
             deltas,
             total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             ttft_ms,
             prompt_tokens,
+            completion_tokens,
             tool_calls: acc.into_tool_calls(),
         })
     }
@@ -620,14 +646,7 @@ impl Client {
             Some(request),
             Duration::from_secs(30),
         )?;
-        if status != 200 {
-            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
-        }
-        let count = body
-            .get("prompt_token_count")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
-        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
+        parse_generation_preflight(status, &body)
     }
 
     pub fn generation_preflight_with_control(
@@ -643,14 +662,7 @@ impl Client {
             cancel,
             timeout,
         )?;
-        if status != 200 {
-            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
-        }
-        let count = body
-            .get("prompt_token_count")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
-        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
+        parse_generation_preflight(status, &body)
     }
 
     /// Text-only convenience over [`chat_turn`] for the plain chat UI (which never
@@ -729,6 +741,26 @@ fn envelope_message(body: &Value) -> Option<String> {
     body.pointer("/error/message")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Decode a generation-preflight result. A normal 200 returns its count. The
+/// sole non-200 exception is the server's typed prompt-ceiling rejection when
+/// it also carries the authoritative rendered count: fitting may safely trim
+/// optional context and retry. Artifact, template, tokenization, cancellation,
+/// and every other error remain errors and are never mistaken for size signals.
+fn parse_generation_preflight(status: u16, body: &Value) -> anyhow::Result<u32> {
+    let count_is_authoritative = status == 200
+        || (status == 413
+            && body.pointer("/error/code").and_then(Value::as_str)
+                == Some("prompt_token_limit_exceeded"));
+    if !count_is_authoritative {
+        anyhow::bail!(envelope_message(body).unwrap_or_else(|| format!("HTTP {status}")));
+    }
+    let count = body
+        .get("prompt_token_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
+    u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
 }
 
 /// Build the request head (bytes up to and including the blank line) and the
@@ -1107,6 +1139,55 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
+    #[test]
+    fn health_deserializes_runtime_prompt_and_generation_ceilings() {
+        let health: Health = serde_json::from_value(json!({
+            "ok": true,
+            "generation_ready": true,
+            "api_surface": "local",
+            "max_prompt_tokens": 384,
+            "max_generation_tokens": 96
+        }))
+        .unwrap();
+        assert_eq!(health.max_prompt_tokens, 384);
+        assert_eq!(health.max_generation_tokens, 96);
+
+        let legacy: Health = serde_json::from_value(json!({"ok": true})).unwrap();
+        assert_eq!(legacy.max_prompt_tokens, 0);
+        assert_eq!(legacy.max_generation_tokens, 0);
+    }
+
+    #[test]
+    fn preflight_prompt_ceiling_error_returns_authoritative_count_for_trimming() {
+        let body = json!({
+            "error": {
+                "message": "prompt encoded to 110 tokens, above the server ceiling of 100",
+                "type": "invalid_request",
+                "code": "prompt_token_limit_exceeded",
+                "param": "prompt"
+            },
+            "prompt_token_count": 110
+        });
+        assert_eq!(parse_generation_preflight(413, &body).unwrap(), 110);
+
+        let unrelated = json!({
+            "error": {
+                "message": "chat template rejected system role",
+                "code": "unsupported_chat_template"
+            },
+            "prompt_token_count": 110
+        });
+        assert!(parse_generation_preflight(422, &unrelated).is_err());
+
+        let missing_count = json!({
+            "error": {
+                "message": "over limit",
+                "code": "prompt_token_limit_exceeded"
+            }
+        });
+        assert!(parse_generation_preflight(413, &missing_count).is_err());
+    }
+
     /// Drive a canned SSE transcript through the production chunk decoder and
     /// the production [`StreamAccumulator`], returning what the caller of
     /// `chat_stream_timed_with_timeout` would observe: forwarded content and
@@ -1168,6 +1249,20 @@ mod tests {
             }],
             "the call must survive as structured output"
         );
+    }
+
+    #[test]
+    fn stream_accumulator_keeps_terminal_completion_usage() {
+        let mut acc = StreamAccumulator::default();
+        assert_eq!(
+            acc.absorb(&json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 1234, "completion_tokens": 77}
+            })),
+            None
+        );
+        assert_eq!(acc.prompt_tokens, Some(1234));
+        assert_eq!(acc.completion_tokens, Some(77));
     }
 
     /// Two calls in one turn keep their order and stay separate.

@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Avatar } from '../ui/Avatar'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconCopy, IconCheck, IconRefresh, IconEdit } from '../ui/icons'
+import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
 import { capabilityStatusLabel } from '../../lib/capabilities'
 import { formatModelLabel } from '../../lib/formatters'
@@ -40,6 +40,64 @@ const formatFullTimestamp = (value) => {
   return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
 }
 
+const safeWebSourceUrl = (value) => {
+  try {
+    const parsed = new URL(String(value || ''))
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.toString() : null
+  } catch {
+    return null
+  }
+}
+
+function WebResearchSources({ research }) {
+  if (!research) return null
+  const sources = (Array.isArray(research.sources) ? research.sources : [])
+    .map((source) => ({ ...source, safeUrl: safeWebSourceUrl(source?.url) }))
+    .filter((source) => source.safeUrl)
+  const warnings = (Array.isArray(research.warnings) ? research.warnings : [])
+    .map(String)
+    .filter(Boolean)
+  if (!sources.length && !warnings.length) return null
+
+  if (!sources.length) {
+    return (
+      <div className="cxturn__web-warning" role="status">
+        <IconSearch size={15} />
+        <span>
+          Web research was unavailable for this reply. Camelid answered without web sources.
+          {warnings.map((warning, index) => <small key={`${warning}:${index}`}>{warning}</small>)}
+        </span>
+      </div>
+    )
+  }
+
+  return (
+    <details className="cxturn__web-sources">
+      <summary>
+        <IconSearch size={15} />
+        <span>Web sources</span>
+        <span className="cxturn__web-count">{sources.length}</span>
+        {warnings.length > 0 && <span className="cxturn__web-partial">Partial</span>}
+      </summary>
+      <ol>
+        {sources.map((source, index) => (
+          <li key={`${source.safeUrl}:${index}`}>
+            <a href={source.safeUrl} target="_blank" rel="noopener noreferrer">
+              <span>{source.title || source.safeUrl}</span>
+              <IconExternal size={13} />
+            </a>
+          </li>
+        ))}
+      </ol>
+      {warnings.length > 0 && (
+        <div className="cxturn__web-source-warning" role="status">
+          {warnings.map((warning, index) => <div key={`${warning}:${index}`}>{warning}</div>)}
+        </div>
+      )}
+    </details>
+  )
+}
+
 /* Per-message metadata footer. Token counts are labeled by source (backend
    usage vs client estimate); TTFT and tok/s are always client-measured and say
    so — operational telemetry, never support evidence (I4). The Evidence Chip
@@ -59,7 +117,7 @@ function MessageMetaFooter({ message }) {
           {formatModelLabel(message.model_id)}
         </span>
       )}
-      {message.support_row && (
+      {message.support_row && !message.experimental_lane && (
         <EvidenceChip
           status={message.support_row.status}
           state={message.support_row.supported ? 'supported' : null}
@@ -91,7 +149,7 @@ function MessageMetaFooter({ message }) {
       {/* "TTFT" is the term of art; under a reply it just needs to say what it
           measures. The abbreviation stays in the tooltip for anyone comparing. */}
       {ttft && <span className="cxturn__meta-item" title="Time to first content (TTFT), measured in this browser">first token {ttft}</span>}
-      {rate && <span className="cxturn__meta-item" title="End-to-end output rate, measured in this browser">{rate}</span>}
+      {rate && <span className="cxturn__meta-item" title="Decode rate, measured in this browser">{rate}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
       {sentAt && <time className="cxturn__meta-item" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>}
       <span className="cxturn__meta-item cxturn__meta-note">client-measured</span>
@@ -244,6 +302,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
       <div className="cxturn__body">
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
+        <WebResearchSources research={message.web_research} />
         {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
 
         {noVisibleResponse && (
@@ -273,7 +332,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
               </button>
             )}
             {showMessageActions && onRegenerate && (
-              <button type="button" className="cxturn__action" onClick={() => onRegenerate()} title="Resend the prompt that produced this reply, with the same parameters">
+              <button type="button" className="cxturn__action" onClick={() => onRegenerate()} title="Resend the prompt that produced this reply with the current Chat and Web Auto settings">
                 <IconRefresh size={16} /> <span>Regenerate</span>
               </button>
             )}
