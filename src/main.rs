@@ -9065,8 +9065,11 @@ fn eagle3_token_recycling_telemetry_splits_e9_tr_and_cold_seed_rounds() {
 const EAGLE3_ADAPTIVE_EXPANSION_WINDOW: usize = 4;
 const EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS: usize = 4;
 const EAGLE3_ADAPTIVE_DEEP_EXPANSIONS: usize = 7;
-const EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM: u32 = 12;
+const EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM: u32 = 14;
 const EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM: u32 = 16;
+const EAGLE3_ADAPTIVE_PROMOTION_WINDOWS: u8 = 2;
+const EAGLE3_ADAPTIVE_DEMOTION_WINDOWS: u8 = 2;
+const EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN: u8 = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Eagle3AdaptiveExpansionMode {
@@ -9099,6 +9102,12 @@ struct Eagle3AdaptiveExpansionTelemetry {
     deep_accepted_drafts: u64,
     shallow_to_deep_transitions: u64,
     deep_to_shallow_transitions: u64,
+    shallow_qualifying_windows: u64,
+    shallow_cooldown_rounds: u64,
+    shallow_cooldown_qualifying_windows: u64,
+    shallow_qualification_resets: u64,
+    deep_rejecting_windows: u64,
+    deep_rejection_resets: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9108,6 +9117,10 @@ struct Eagle3AdaptiveExpansionDecision {
     accepted_drafts: u32,
     window_count: usize,
     window_sum: u32,
+    qualifying_window: bool,
+    qualifying_streak: u8,
+    deep_rejection_streak: u8,
+    cooldown_remaining: u8,
 }
 
 /// Causal controller for the benchmark-only EAGLE expansion experiment.
@@ -9115,12 +9128,18 @@ struct Eagle3AdaptiveExpansionDecision {
 /// A round reads [`Self::expansions`] before target verification, then reports only that
 /// completed round's target-authoritative accepted-draft count. Therefore a transition can
 /// affect the next round but never the proposal that produced its own observation.
+/// Promotion and demotion both require two consecutive qualifying rolling windows. A confirmed
+/// demotion also starts two completed shallow cooldown rounds; qualifying cooldown windows never
+/// contribute to the next promotion streak.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Eagle3AdaptiveExpansionController {
     mode: Eagle3AdaptiveExpansionMode,
     last_accepted: [u8; EAGLE3_ADAPTIVE_EXPANSION_WINDOW],
     history_len: usize,
     history_cursor: usize,
+    shallow_qualifying_streak: u8,
+    deep_rejection_streak: u8,
+    cooldown_remaining: u8,
     telemetry: Eagle3AdaptiveExpansionTelemetry,
 }
 
@@ -9165,21 +9184,56 @@ impl Eagle3AdaptiveExpansionController {
             .map(|&value| u32::from(value))
             .sum();
 
+        let qualifying_window = self.history_len == EAGLE3_ADAPTIVE_EXPANSION_WINDOW
+            && window_sum >= EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM;
         if self.history_len == EAGLE3_ADAPTIVE_EXPANSION_WINDOW {
             match used_mode {
-                Eagle3AdaptiveExpansionMode::Shallow
-                    if window_sum >= EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM =>
-                {
-                    self.mode = Eagle3AdaptiveExpansionMode::Deep;
-                    self.telemetry.shallow_to_deep_transitions += 1;
+                Eagle3AdaptiveExpansionMode::Shallow => {
+                    if qualifying_window {
+                        self.telemetry.shallow_qualifying_windows += 1;
+                    }
+                    if self.cooldown_remaining > 0 {
+                        self.telemetry.shallow_cooldown_rounds += 1;
+                        if qualifying_window {
+                            self.telemetry.shallow_cooldown_qualifying_windows += 1;
+                        }
+                        self.cooldown_remaining -= 1;
+                        self.shallow_qualifying_streak = 0;
+                    } else if qualifying_window {
+                        self.shallow_qualifying_streak += 1;
+                        if self.shallow_qualifying_streak
+                            >= EAGLE3_ADAPTIVE_PROMOTION_WINDOWS
+                        {
+                            self.mode = Eagle3AdaptiveExpansionMode::Deep;
+                            self.shallow_qualifying_streak = 0;
+                            self.deep_rejection_streak = 0;
+                            self.telemetry.shallow_to_deep_transitions += 1;
+                        }
+                    } else {
+                        if self.shallow_qualifying_streak > 0 {
+                            self.telemetry.shallow_qualification_resets += 1;
+                        }
+                        self.shallow_qualifying_streak = 0;
+                    }
                 }
-                Eagle3AdaptiveExpansionMode::Deep
-                    if window_sum < EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM =>
-                {
-                    self.mode = Eagle3AdaptiveExpansionMode::Shallow;
-                    self.telemetry.deep_to_shallow_transitions += 1;
+                Eagle3AdaptiveExpansionMode::Deep => {
+                    if window_sum < EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM {
+                        self.telemetry.deep_rejecting_windows += 1;
+                        self.deep_rejection_streak += 1;
+                        if self.deep_rejection_streak >= EAGLE3_ADAPTIVE_DEMOTION_WINDOWS {
+                            self.mode = Eagle3AdaptiveExpansionMode::Shallow;
+                            self.shallow_qualifying_streak = 0;
+                            self.deep_rejection_streak = 0;
+                            self.cooldown_remaining = EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN;
+                            self.telemetry.deep_to_shallow_transitions += 1;
+                        }
+                    } else {
+                        if self.deep_rejection_streak > 0 {
+                            self.telemetry.deep_rejection_resets += 1;
+                        }
+                        self.deep_rejection_streak = 0;
+                    }
                 }
-                _ => {}
             }
         }
 
@@ -9189,6 +9243,10 @@ impl Eagle3AdaptiveExpansionController {
             accepted_drafts: u32::from(accepted_drafts),
             window_count: self.history_len,
             window_sum,
+            qualifying_window,
+            qualifying_streak: self.shallow_qualifying_streak,
+            deep_rejection_streak: self.deep_rejection_streak,
+            cooldown_remaining: self.cooldown_remaining,
         }
     }
 }
@@ -9199,44 +9257,102 @@ fn eagle3_adaptive_expansions_are_causal_and_start_shallow() {
     let mut controller = Eagle3AdaptiveExpansionController::default();
     for round in 0..4 {
         assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS);
-        let decision = controller.note_completed_round(3);
+        let decision = controller.note_completed_round(4);
         assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Shallow);
-        if round < 3 {
-            assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
-        }
+        assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        assert_eq!(decision.qualifying_streak, u8::from(round == 3));
     }
-    // The fourth completed shallow result changes only round five.
+    // One qualifying window is insufficient. The fifth round itself remains shallow; its
+    // second consecutive qualifying result changes only round six.
+    assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_SHALLOW_EXPANSIONS);
+    let decision = controller.note_completed_round(4);
+    assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Deep);
     assert_eq!(controller.expansions(), EAGLE3_ADAPTIVE_DEEP_EXPANSIONS);
-    assert_eq!(controller.telemetry().shallow_rounds, 4);
-    assert_eq!(controller.telemetry().shallow_accepted_drafts, 12);
+    assert_eq!(controller.telemetry().shallow_rounds, 5);
+    assert_eq!(controller.telemetry().shallow_accepted_drafts, 20);
+    assert_eq!(controller.telemetry().shallow_qualifying_windows, 2);
     assert_eq!(controller.telemetry().shallow_to_deep_transitions, 1);
 }
 
 #[cfg(test)]
 #[test]
-fn eagle3_adaptive_expansions_use_last_four_with_asymmetric_thresholds() {
+fn eagle3_adaptive_expansions_confirm_deep_rejection_and_cool_down() {
     let mut controller = Eagle3AdaptiveExpansionController::default();
-    for accepted in [4, 4, 4, 4] {
+    for accepted in [4, 4, 4, 4, 4] {
         controller.note_completed_round(accepted);
     }
     assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Deep);
 
-    // A deep round is allowed to complete before its result can move the next round shallow.
-    let decision = controller.note_completed_round(3);
-    assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Deep);
-    assert_eq!(decision.window_count, 4);
-    assert_eq!(decision.window_sum, 15);
-    assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
-    assert_eq!(controller.telemetry().deep_rounds, 1);
-    assert_eq!(controller.telemetry().deep_accepted_drafts, 3);
+    // One rejecting deep window is probationary. A recovered next window clears it without
+    // changing the following round's depth.
+    let first_rejection = controller.note_completed_round(3);
+    assert_eq!(first_rejection.used_mode, Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(first_rejection.window_count, 4);
+    assert_eq!(first_rejection.window_sum, 15);
+    assert_eq!(first_rejection.deep_rejection_streak, 1);
+    assert_eq!(first_rejection.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    let recovery = controller.note_completed_round(7);
+    assert_eq!(recovery.window_sum, 18);
+    assert_eq!(recovery.deep_rejection_streak, 0);
+    assert_eq!(recovery.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    assert_eq!(controller.telemetry().deep_rejection_resets, 1);
+
+    // Two consecutive rejecting deep windows confirm a sustained decline. Both deep rounds
+    // complete before the second result changes only the next round to shallow.
+    let probation = controller.note_completed_round(0);
+    assert_eq!(probation.window_sum, 14);
+    assert_eq!(probation.deep_rejection_streak, 1);
+    assert_eq!(probation.next_mode, Eagle3AdaptiveExpansionMode::Deep);
+    let demotion = controller.note_completed_round(0);
+    assert_eq!(demotion.window_sum, 10);
+    assert_eq!(demotion.deep_rejection_streak, 0);
+    assert_eq!(demotion.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(
+        demotion.cooldown_remaining,
+        EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN
+    );
+    assert_eq!(controller.telemetry().deep_rounds, 4);
+    assert_eq!(controller.telemetry().deep_accepted_drafts, 10);
+    assert_eq!(controller.telemetry().deep_rejecting_windows, 3);
     assert_eq!(controller.telemetry().deep_to_shallow_transitions, 1);
 
-    // The sliding window, not lifetime history, controls re-entry at mean >= 3.0.
-    for accepted in [0, 4, 4, 4] {
-        controller.note_completed_round(accepted);
+    // Two fully completed shallow rounds are ineligible even when both windows qualify.
+    for remaining in (0..EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN).rev() {
+        let decision = controller.note_completed_round(7);
+        assert_eq!(decision.used_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+        assert_eq!(decision.cooldown_remaining, remaining);
     }
+    assert_eq!(controller.telemetry().shallow_cooldown_rounds, 2);
+    assert_eq!(controller.telemetry().shallow_cooldown_qualifying_windows, 2);
+
+    // Once cooldown is complete, two new consecutive qualifying windows are required.
+    let first = controller.note_completed_round(7);
+    assert_eq!(first.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(first.qualifying_streak, 1);
+    let second = controller.note_completed_round(7);
+    assert_eq!(second.next_mode, Eagle3AdaptiveExpansionMode::Deep);
     assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Deep);
     assert_eq!(controller.telemetry().shallow_to_deep_transitions, 2);
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_adaptive_expansions_reject_one_window_prose_bursts() {
+    let mut controller = Eagle3AdaptiveExpansionController::default();
+    for accepted in [3, 3, 4, 4] {
+        controller.note_completed_round(accepted);
+    }
+    assert_eq!(controller.mode(), Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(controller.shallow_qualifying_streak, 1);
+
+    let decision = controller.note_completed_round(0);
+    assert!(!decision.qualifying_window);
+    assert_eq!(decision.qualifying_streak, 0);
+    assert_eq!(decision.next_mode, Eagle3AdaptiveExpansionMode::Shallow);
+    assert_eq!(controller.telemetry().shallow_to_deep_transitions, 0);
+    assert_eq!(controller.telemetry().shallow_qualification_resets, 1);
 }
 
 #[derive(Default)]
@@ -9879,7 +9995,8 @@ fn run_eagle3_resident_greedy(
             if std::env::var_os("CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE").is_some() {
                 eprintln!(
                     "[eagle3-adaptive-expansions] round={} used={} expansions={} accepted={} \
-                     window={}/{} sum={} next={} transition={}",
+                     window={}/{} sum={} qualifies={} promote_streak={}/{} \
+                     reject_streak={}/{} cooldown={} next={} transition={}",
                     run.rounds,
                     decision.used_mode.label(),
                     decision.used_mode.expansions(),
@@ -9887,6 +10004,12 @@ fn run_eagle3_resident_greedy(
                     decision.window_count,
                     EAGLE3_ADAPTIVE_EXPANSION_WINDOW,
                     decision.window_sum,
+                    decision.qualifying_window,
+                    decision.qualifying_streak,
+                    EAGLE3_ADAPTIVE_PROMOTION_WINDOWS,
+                    decision.deep_rejection_streak,
+                    EAGLE3_ADAPTIVE_DEMOTION_WINDOWS,
+                    decision.cooldown_remaining,
                     decision.next_mode.label(),
                     if decision.used_mode == decision.next_mode {
                         "none"
@@ -10005,6 +10128,12 @@ struct BenchEagle3Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_deep_to_shallow_below_accepted_sum: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_promotion_consecutive_windows: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_demotion_consecutive_windows: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_post_demotion_cooldown_rounds: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_shallow_rounds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_shallow_accepted_drafts: Option<u64>,
@@ -10016,6 +10145,18 @@ struct BenchEagle3Record {
     adaptive_shallow_to_deep_transitions: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_deep_to_shallow_transitions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_qualifying_windows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_cooldown_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_cooldown_qualifying_windows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_shallow_qualification_resets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_rejecting_windows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adaptive_deep_rejection_resets: Option<u64>,
     token_recycling_hybrid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     hybrid_admission_decisions: Option<u64>,
@@ -10558,6 +10699,12 @@ fn run_bench_eagle3(
             .then_some(EAGLE3_ADAPTIVE_SHALLOW_TO_DEEP_SUM),
         adaptive_deep_to_shallow_below_accepted_sum: adaptive_expansions
             .then_some(EAGLE3_ADAPTIVE_DEEP_TO_SHALLOW_SUM),
+        adaptive_promotion_consecutive_windows: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_PROMOTION_WINDOWS),
+        adaptive_demotion_consecutive_windows: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_DEMOTION_WINDOWS),
+        adaptive_post_demotion_cooldown_rounds: adaptive_expansions
+            .then_some(EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN),
         adaptive_shallow_rounds: adaptive_expansions
             .then_some(eagle.adaptive_expansions.shallow_rounds),
         adaptive_shallow_accepted_drafts: adaptive_expansions
@@ -10570,6 +10717,18 @@ fn run_bench_eagle3(
             .then_some(eagle.adaptive_expansions.shallow_to_deep_transitions),
         adaptive_deep_to_shallow_transitions: adaptive_expansions
             .then_some(eagle.adaptive_expansions.deep_to_shallow_transitions),
+        adaptive_shallow_qualifying_windows: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_qualifying_windows),
+        adaptive_shallow_cooldown_rounds: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_cooldown_rounds),
+        adaptive_shallow_cooldown_qualifying_windows: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_cooldown_qualifying_windows),
+        adaptive_shallow_qualification_resets: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.shallow_qualification_resets),
+        adaptive_deep_rejecting_windows: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_rejecting_windows),
+        adaptive_deep_rejection_resets: adaptive_expansions
+            .then_some(eagle.adaptive_expansions.deep_rejection_resets),
         token_recycling_hybrid,
         hybrid_admission_decisions: token_recycling_hybrid
             .then_some(eagle.token_recycling.admission_decisions),
@@ -10730,13 +10889,21 @@ fn run_bench_eagle3(
     if adaptive_expansions {
         eprintln!(
             "[bench-eagle3-adaptive-expansions] shallow rounds={} accepted={} | \
-             deep rounds={} accepted={} | transitions shallow->deep={} deep->shallow={}",
+             deep rounds={} accepted={} | transitions shallow->deep={} deep->shallow={} | \
+             shallow_qualifying={} cooldown_rounds={} cooldown_qualifying={} \
+             shallow_resets={} | deep_rejecting={} deep_resets={}",
             eagle.adaptive_expansions.shallow_rounds,
             eagle.adaptive_expansions.shallow_accepted_drafts,
             eagle.adaptive_expansions.deep_rounds,
             eagle.adaptive_expansions.deep_accepted_drafts,
             eagle.adaptive_expansions.shallow_to_deep_transitions,
             eagle.adaptive_expansions.deep_to_shallow_transitions,
+            eagle.adaptive_expansions.shallow_qualifying_windows,
+            eagle.adaptive_expansions.shallow_cooldown_rounds,
+            eagle.adaptive_expansions.shallow_cooldown_qualifying_windows,
+            eagle.adaptive_expansions.shallow_qualification_resets,
+            eagle.adaptive_expansions.deep_rejecting_windows,
+            eagle.adaptive_expansions.deep_rejection_resets,
         );
     }
     anyhow::ensure!(
