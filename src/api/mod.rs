@@ -119,6 +119,10 @@ const EAGLE3_SHAREGPT_E8_SHA256: &str =
     "0694d52a4c7ebf3d4f9bb833cf5f2610f0cc0d30bf62a2376e0b2ee06cbe3662";
 const EAGLE3_SHAREGPT_E8_CONFIG_SHA256: &str =
     "1f6f8e7dcf67648757016925e28b09c40461e22b0ffe522b9abc9802ec14eff8";
+const EAGLE3_SHAREGPT_E9_SHA256: &str =
+    "0192ee37dff4b7a86d13011d40e9cf622b331fe76f637d7d1ea24c4b81574304";
+const EAGLE3_SHAREGPT_E9_CONFIG_SHA256: &str =
+    "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
 const STREAM_POLL_YIELD_ENV: &str = "CAMELID_STREAM_POLL_YIELD";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
@@ -2183,12 +2187,20 @@ fn load_eagle3_checkpoint_cached(
             weights_path.display()
         ))
     })?;
-    if sha256 != EAGLE3_THOUGHTWORKS_SHA256 && sha256 != EAGLE3_SHAREGPT_E8_SHA256 {
+    if sha256 != EAGLE3_THOUGHTWORKS_SHA256
+        && sha256 != EAGLE3_SHAREGPT_E8_SHA256
+        && sha256 != EAGLE3_SHAREGPT_E9_SHA256
+    {
         return Err(BackendError::InvalidModelMetadata(format!(
-            "EAGLE-3 checkpoint SHA-256 {sha256} is not one of the two pinned serving artifacts ({EAGLE3_THOUGHTWORKS_SHA256}, {EAGLE3_SHAREGPT_E8_SHA256})"
+            "EAGLE-3 checkpoint SHA-256 {sha256} is not one of the three pinned serving artifacts ({EAGLE3_THOUGHTWORKS_SHA256}, {EAGLE3_SHAREGPT_E8_SHA256}, {EAGLE3_SHAREGPT_E9_SHA256})"
         )));
     }
-    if sha256 == EAGLE3_SHAREGPT_E8_SHA256 {
+    let pinned_sharegpt_config = match sha256.as_str() {
+        EAGLE3_SHAREGPT_E8_SHA256 => Some(("ShareGPT-E8", EAGLE3_SHAREGPT_E8_CONFIG_SHA256)),
+        EAGLE3_SHAREGPT_E9_SHA256 => Some(("ShareGPT-E9", EAGLE3_SHAREGPT_E9_CONFIG_SHA256)),
+        _ => None,
+    };
+    if let Some((label, expected_config_sha256)) = pinned_sharegpt_config {
         let config_path = path.join("config.json");
         let config_sha256 = receipt::sha256_file_hex_cached(&config_path).map_err(|error| {
             BackendError::InvalidModelMetadata(format!(
@@ -2196,9 +2208,9 @@ fn load_eagle3_checkpoint_cached(
                 config_path.display()
             ))
         })?;
-        if config_sha256 != EAGLE3_SHAREGPT_E8_CONFIG_SHA256 {
+        if config_sha256 != expected_config_sha256 {
             return Err(BackendError::InvalidModelMetadata(format!(
-                "ShareGPT-E8 EAGLE-3 config SHA-256 is {config_sha256}, expected {EAGLE3_SHAREGPT_E8_CONFIG_SHA256}"
+                "{label} EAGLE-3 config SHA-256 is {config_sha256}, expected {expected_config_sha256}"
             )));
         }
     }
@@ -2220,14 +2232,20 @@ fn load_eagle3_checkpoint_cached(
     let config_variant_matches = if sha256 == EAGLE3_THOUGHTWORKS_SHA256 {
         model.config.architectures == ["LlamaForCausalLM"]
             && model.config.rope_theta == crate::eagle3::ROPE_THETA
+            && model.config.sliding_window.is_none()
+    } else if sha256 == EAGLE3_SHAREGPT_E8_SHA256 {
+        model.config.architectures == ["LlamaForCausalLMEagle3"]
+            && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
+            && model.config.sliding_window.is_none()
     } else {
         model.config.architectures == ["LlamaForCausalLMEagle3"]
             && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
+            && model.config.sliding_window == Some(256)
     };
     if !config_variant_matches {
         return Err(BackendError::InvalidModelMetadata(format!(
-            "EAGLE-3 checkpoint/config pairing is invalid for model SHA-256 {sha256}: architectures={:?}, rope_theta={}",
-            model.config.architectures, model.config.rope_theta
+            "EAGLE-3 checkpoint/config pairing is invalid for model SHA-256 {sha256}: architectures={:?}, rope_theta={}, sliding_window={:?}",
+            model.config.architectures, model.config.rope_theta, model.config.sliding_window
         )));
     }
     *cache

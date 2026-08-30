@@ -9396,6 +9396,12 @@ fn run_bench_eagle3(
         "f3d27a2ec37a7b9807e0ed106f249c727b61d931";
     const PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256: &str =
         "1f6f8e7dcf67648757016925e28b09c40461e22b0ffe522b9abc9802ec14eff8";
+    const PINNED_EAGLE3_SHAREGPT_E9_SHA256: &str =
+        "0192ee37dff4b7a86d13011d40e9cf622b331fe76f637d7d1ea24c4b81574304";
+    const PINNED_EAGLE3_SHAREGPT_E9_REVISION: &str =
+        "03ea9aeacd593c07d9f55e0a64e161e69f71a6cd";
+    const PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256: &str =
+        "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -9445,11 +9451,23 @@ fn run_bench_eagle3(
     let eagle3_revision = match eagle3_sha256.as_str() {
         PINNED_EAGLE3_THOUGHTWORKS_SHA256 => PINNED_EAGLE3_THOUGHTWORKS_REVISION,
         PINNED_EAGLE3_SHAREGPT_E8_SHA256 => PINNED_EAGLE3_SHAREGPT_E8_REVISION,
+        PINNED_EAGLE3_SHAREGPT_E9_SHA256 => PINNED_EAGLE3_SHAREGPT_E9_REVISION,
         _ => anyhow::bail!(
-            "EAGLE-3 SHA-256 {eagle3_sha256} is not one of the two pinned checkpoint artifacts ({PINNED_EAGLE3_THOUGHTWORKS_SHA256}, {PINNED_EAGLE3_SHAREGPT_E8_SHA256})"
+            "EAGLE-3 SHA-256 {eagle3_sha256} is not one of the three pinned checkpoint artifacts ({PINNED_EAGLE3_THOUGHTWORKS_SHA256}, {PINNED_EAGLE3_SHAREGPT_E8_SHA256}, {PINNED_EAGLE3_SHAREGPT_E9_SHA256})"
         ),
     };
-    if eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E8_SHA256 {
+    let pinned_sharegpt_config = match eagle3_sha256.as_str() {
+        PINNED_EAGLE3_SHAREGPT_E8_SHA256 => Some((
+            "ShareGPT-E8",
+            PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256,
+        )),
+        PINNED_EAGLE3_SHAREGPT_E9_SHA256 => Some((
+            "ShareGPT-E9",
+            PINNED_EAGLE3_SHAREGPT_E9_CONFIG_SHA256,
+        )),
+        _ => None,
+    };
+    if let Some((label, expected_config_sha256)) = pinned_sharegpt_config {
         let config_path = eagle3_dir.join("config.json");
         let config_sha256 = camelid::receipt::sha256_file_hex(&config_path).map_err(|error| {
             anyhow::anyhow!(
@@ -9458,8 +9476,8 @@ fn run_bench_eagle3(
             )
         })?;
         anyhow::ensure!(
-            config_sha256 == PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256,
-            "ShareGPT-E8 config SHA-256 is {config_sha256}, expected {PINNED_EAGLE3_SHAREGPT_E8_CONFIG_SHA256}"
+            config_sha256 == expected_config_sha256,
+            "{label} config SHA-256 is {config_sha256}, expected {expected_config_sha256}"
         );
     }
     let current_exe = std::env::current_exe()?;

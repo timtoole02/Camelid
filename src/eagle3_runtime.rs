@@ -24,6 +24,17 @@ fn metal<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(|message| invalid(format!("EAGLE-3 Metal runtime: {message}")))
 }
 
+fn validate_drafter_capacity(sliding_window: Option<usize>, max_positions: usize) -> Result<()> {
+    if let Some(window) = sliding_window {
+        if max_positions > window {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "EAGLE-3 checkpoint uses a {window}-position sliding attention window; the full-causal draft runtime is faithful only when max_positions <= {window}, got {max_positions}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Interleave three target layer-input captures from `[tap][row][hidden]` into the
 /// checkpoint encoder's required `[row][low || middle || high]` layout.
 pub fn interleave_target_layer_inputs(captures: &[CpuTensor]) -> Result<Vec<f32>> {
@@ -724,6 +735,7 @@ impl Eagle3Drafter {
     /// copies, so serving may retain and share one host checkpoint across
     /// requests without cloning its hundreds of megabytes of buffers.
     pub fn new(model: &Eagle3DraftModel, max_positions: usize) -> Result<Self> {
+        validate_drafter_capacity(model.config.sliding_window, max_positions)?;
         let matrices = &model.matrices;
         let norms = &model.norms;
         let weights = Eagle3MetalWeights {
@@ -1005,6 +1017,19 @@ impl Eagle3Drafter {
 mod tests {
     use super::*;
     use crate::metal::Eagle3DraftCandidate;
+
+    #[test]
+    fn sliding_window_drafter_capacity_is_inclusive_and_fails_closed() {
+        validate_drafter_capacity(Some(256), 255).unwrap();
+        validate_drafter_capacity(Some(256), 256).unwrap();
+
+        let error = validate_drafter_capacity(Some(256), 257).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("max_positions <= 256"), "{message}");
+        assert!(message.contains("got 257"), "{message}");
+
+        validate_drafter_capacity(None, usize::MAX).unwrap();
+    }
 
     fn capture(name: &str, rows: usize, base: f32) -> CpuTensor {
         let data = (0..rows * HIDDEN_SIZE)

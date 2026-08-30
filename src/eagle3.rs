@@ -1,13 +1,13 @@
 //! Strict loader for the Llama 3.2 3B Instruct EAGLE-3 draft head.
 //!
-//! This module deliberately admits the two known 15-tensor Llama-3.2-3B EAGLE-3
+//! This module deliberately admits the known 15-tensor Llama-3.2-3B EAGLE-3
 //! checkpoint layouts. Artifact identity is pinned by the benchmark and serving
 //! entry points; this loader independently pins their geometry, config variants,
 //! and tensor encodings. Keeping loading separate makes the runtime fail closed
 //! on the mistakes that most severely damage acceptance: silently accepting a
-//! head for a different target model, using the wrong per-head RoPE base, and
-//! interpreting the checkpoint's delta-coded `d2t` values as absolute target
-//! token ids.
+//! head for a different target model, using the wrong per-head RoPE base or
+//! attention window, and interpreting the checkpoint's delta-coded `d2t` values
+//! as absolute target token ids.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -73,6 +73,10 @@ pub struct Eagle3Config {
     pub rms_norm_eps: f32,
     pub torch_dtype: String,
     pub tie_word_embeddings: bool,
+    /// `None` means ordinary full causal attention. A finite window may use the
+    /// full-causal runtime only while every possible draft-head position remains
+    /// within the window, where the two masks are mathematically identical.
+    pub sliding_window: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +98,10 @@ struct ConfigFile {
     #[serde(default)]
     dtype: Option<String>,
     tie_word_embeddings: bool,
+    #[serde(default)]
+    sliding_window: Option<usize>,
+    #[serde(default)]
+    use_sliding_window: Option<bool>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_json::Value>,
 }
@@ -352,30 +360,32 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
             ),
             ("use_cache".to_string(), serde_json::json!(true)),
         ]);
-    let expected_extra = if raw.architectures == ["LlamaForCausalLMEagle3"] {
-        sharegpt_extra.clone()
+    let is_sharegpt = raw.architectures == ["LlamaForCausalLMEagle3"];
+    let expected_extra = if is_sharegpt {
+        sharegpt_extra
     } else {
         BTreeMap::new()
     };
-    let e9_sliding_window = raw.architectures == ["LlamaForCausalLMEagle3"]
-        && raw.extra.len() == sharegpt_extra.len() + 2
-        && raw.extra
-            .iter()
-            .all(|(key, value)| sharegpt_extra.get(key).is_some_and(|expected| expected == value)
-                || (key == "sliding_window" && value == &serde_json::json!(256))
-                || (key == "use_sliding_window" && value == &serde_json::json!(true)));
-    if e9_sliding_window {
-        return Err(BackendError::UnsupportedModelArchitecture(
-            "EAGLE-3 checkpoint requests sliding-window head attention, but the Metal draft head currently implements full causal attention only; refusing rather than using an unfaithful mask"
-                .to_string(),
-        ));
-    }
     if raw.extra != expected_extra {
         return Err(invalid(format!(
             "EAGLE-3 config extra fields are {:?}, expected {:?} for architecture {}",
             raw.extra, expected_extra, raw.architectures[0]
         )));
     }
+    let sliding_window = match (
+        is_sharegpt,
+        raw.sliding_window,
+        raw.use_sliding_window,
+    ) {
+        (true, None, None) => None,
+        (true, Some(256), Some(true)) => Some(256),
+        (false, None, None) => None,
+        (_, window, enabled) => {
+            return Err(invalid(format!(
+                "EAGLE-3 config sliding-window fields are sliding_window={window:?}, use_sliding_window={enabled:?}; expected both absent, or exactly sliding_window=256 and use_sliding_window=true for LlamaForCausalLMEagle3"
+            )))
+        }
+    };
     require_equal("model_type", &raw.model_type, &"llama".to_string())?;
     require_equal("hidden_size", &raw.hidden_size, &HIDDEN_SIZE)?;
     require_equal(
@@ -441,6 +451,7 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
         rms_norm_eps: raw.rms_norm_eps as f32,
         torch_dtype: dtype.to_string(),
         tie_word_embeddings: raw.tie_word_embeddings,
+        sliding_window,
     })
 }
 
@@ -1032,6 +1043,7 @@ mod tests {
         assert_eq!(config.hidden_size, HIDDEN_SIZE);
         assert_eq!(config.draft_vocab_size, DRAFT_VOCAB_SIZE);
         assert_eq!(config.rope_theta, ROPE_THETA);
+        assert_eq!(config.sliding_window, None);
         assert_eq!(TARGET_LAYER_INPUT_IDS, [2, 14, 25]);
 
         let wrong_width = PINNED_CONFIG.replace("\"hidden_size\": 3072", "\"hidden_size\": 4096");
@@ -1047,11 +1059,12 @@ mod tests {
     }
 
     #[test]
-    fn sharegpt_e9_config_fails_closed_on_unsupported_sliding_window() {
-        let error = parse_and_validate_config(SHAREGPT_CONFIG.as_bytes()).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("sliding-window"), "{message}");
-        assert!(message.contains("full causal"), "{message}");
+    fn sharegpt_e9_and_e8_configs_pin_the_attention_window() {
+        let e9 = parse_and_validate_config(SHAREGPT_CONFIG.as_bytes()).unwrap();
+        assert_eq!(e9.architectures, ["LlamaForCausalLMEagle3"]);
+        assert_eq!(e9.rope_theta, SHAREGPT_ROPE_THETA);
+        assert_eq!(e9.torch_dtype, "bfloat16");
+        assert_eq!(e9.sliding_window, Some(256));
 
         let e8 = SHAREGPT_CONFIG
             .replace("        \"sliding_window\": 256,\n", "")
@@ -1061,6 +1074,12 @@ mod tests {
         assert_eq!(config.architectures, ["LlamaForCausalLMEagle3"]);
         assert_eq!(config.rope_theta, SHAREGPT_ROPE_THETA);
         assert_eq!(config.torch_dtype, "bfloat16");
+        assert_eq!(config.sliding_window, None);
+
+        let wrong_window =
+            SHAREGPT_CONFIG.replace("\"sliding_window\": 256", "\"sliding_window\": 255");
+        let error = parse_and_validate_config(wrong_window.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("sliding-window"));
     }
 
     #[test]
