@@ -7821,6 +7821,45 @@ fn run_bench_generate_vision(
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TargetTopKBenchTelemetry {
+    seed_probes: u64,
+    speculative_rounds: u64,
+    candidate_rows: u64,
+    candidate_ids: u64,
+}
+
+impl TargetTopKBenchTelemetry {
+    fn note_seed_probe(&mut self, candidate_ids: usize) {
+        self.seed_probes += 1;
+        self.candidate_rows += 1;
+        self.candidate_ids += candidate_ids as u64;
+    }
+
+    fn note_speculative(&mut self, rows: usize, candidate_ids: usize) {
+        self.speculative_rounds += 1;
+        self.candidate_rows += rows as u64;
+        self.candidate_ids += candidate_ids as u64;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn target_topk_bench_telemetry_distinguishes_seed_and_speculative_rounds() {
+    let mut telemetry = TargetTopKBenchTelemetry::default();
+    telemetry.note_seed_probe(8);
+    telemetry.note_speculative(3, 24);
+    assert_eq!(
+        telemetry,
+        TargetTopKBenchTelemetry {
+            seed_probes: 1,
+            speculative_rounds: 1,
+            candidate_rows: 4,
+            candidate_ids: 32,
+        }
+    );
+}
+
 /// One full speculative generation, instrumented for SPEC_RECHECK economics. Mirrors the
 /// server's accept/verify/rollback loop (`api::generate`): a normal greedy first step seeds
 /// the resident engine, then each round drafts ≤γ tokens, verifies them in ONE batched
@@ -7849,6 +7888,7 @@ struct SpeculativeRun {
     normal_steps: u64,
     gpu_verify_rounds: u64,
     cpu_verify_rounds: u64,
+    target_topk: TargetTopKBenchTelemetry,
 }
 
 /// Flatten a [`TokenTree`]'s PRIMARY chain (first-child path from the root):
@@ -7936,6 +7976,7 @@ fn generate_run_speculative(
         normal_steps: 0,
         gpu_verify_rounds: 0,
         cpu_verify_rounds: 0,
+        target_topk: TargetTopKBenchTelemetry::default(),
     };
 
     // Tree-speculation lane (CAMELID_SPEC_TREE): a branching drafter proposes a tree of
@@ -8093,12 +8134,49 @@ fn generate_run_speculative(
             };
 
             let draft_started = Instant::now();
-            let tree = if bench_token_recycling_topk {
+            let mut tree = if bench_token_recycling_topk {
                 recycling_tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth)
             } else {
                 suffix_tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth)
             };
             run.draft_us += draft_started.elapsed().as_micros();
+
+            // A sparse cold-start TR row cannot produce a child. Probe that anchor without
+            // committing KV/logical position, install its exact latest target row, then redraft
+            // at the SAME base. The committing tree verify below emits the authoritative target
+            // token(s). This avoids both failure modes: plain decode would never expose top-k,
+            // while committing the one-row probe would merely move the missing-row problem to
+            // the newly emitted anchor.
+            if bench_token_recycling_topk && tree.nodes() == 1 && !cpu_verify_pinned {
+                let seed_started = Instant::now();
+                let seed = session.probe_tree_metal_target_top_k(&tree)?;
+                run.verify_us += seed_started.elapsed().as_micros();
+                if let Some((predictions, target_top_k)) = seed {
+                    debug_assert_eq!(predictions.len(), 1);
+                    debug_assert_eq!(target_top_k.len(), 1);
+                    debug_assert_eq!(target_top_k[0][0], predictions[0]);
+                    let candidate_ids = recycling_tree_drafter
+                        .replace_target_candidates(anchor, &target_top_k[0]);
+                    run.gpu_verify_rounds += 1;
+                    run.target_topk.note_seed_probe(candidate_ids);
+                    if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                        eprintln!(
+                            "[spec-tree-target-topk] kind=seed-probe rows=1 \
+                             candidate_ids={candidate_ids} committed=0"
+                        );
+                    }
+                    let redraft_started = Instant::now();
+                    // Do not relearn the same accepted-stream edge on this second draft call.
+                    tree = recycling_tree_drafter.draft_tree(
+                        &[],
+                        anchor,
+                        max_nodes,
+                        max_depth,
+                    );
+                    run.draft_us += redraft_started.elapsed().as_micros();
+                    debug_assert!(candidate_ids == 0 || tree.nodes() > 1);
+                }
+            }
             if tree.nodes() > 1 {
                 let verify_started = Instant::now();
                 let gpu_emitted = if cpu_verify_pinned {
@@ -8118,12 +8196,14 @@ fn generate_run_speculative(
                             {
                                 debug_assert_eq!(candidates[0], prediction);
                                 candidate_observations += recycling_tree_drafter
-                                    .observe_target_candidates(from, candidates);
+                                    .replace_target_candidates(from, candidates);
                             }
+                            run.target_topk
+                                .note_speculative(tree.nodes(), candidate_observations);
                             if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
                                 eprintln!(
-                                    "[spec-tree-target-topk] rows={} candidate_observations={} \
-                                     emitted_len={}",
+                                    "[spec-tree-target-topk] kind=speculative rows={} \
+                                     candidate_ids={} emitted_len={} committed=1",
                                     tree.nodes(),
                                     candidate_observations,
                                     verified.emitted.len()
@@ -8251,13 +8331,10 @@ fn generate_run_speculative(
                 // miss, not a drafter miss — so leave the latch untouched.
                 run.verify_us += verify_started.elapsed().as_micros();
             } else {
-                // The drafter found NO recurrence (anchor-only tree). This is TRANSIENT and common
-                // early in a stream (the recurrence hasn't built up yet), so it must NOT crash the
-                // EWMA into the LOW band before the stream's true acceptance is ever observed. Treat
-                // it exactly like the ungated path does: take a cheap plain step and try again next
-                // round. The suffix scan that produced it is O(window) and cheap, and crucially NO
-                // batched verify or KV compaction ran (the expensive part) — so on purely novel
-                // text this costs essentially the same as plain decode. Leave the EWMA untouched.
+                // Suffix found no recurrence, or the experimental TR seed probe was unavailable.
+                // This is not evidence of poor draft acceptance, so leave the latch untouched and
+                // take the lossless plain step below. A successful TR seed always installs at least
+                // one valid candidate and redrafts a nontrivial tree before reaching this branch.
             }
             // No usable tree this round → one plain resident greedy step.
             let step_started = Instant::now();
@@ -8437,6 +8514,10 @@ struct BenchSpeculativeRecord {
     normal_steps: u64,
     gpu_verify_rounds: u64,
     cpu_verify_rounds: u64,
+    target_topk_seed_probes: u64,
+    target_topk_speculative_rounds: u64,
+    target_topk_candidate_rows: u64,
+    target_topk_candidate_ids: u64,
 
     // Lossless gate (intra-Camelid: spec stream vs this run's plain greedy stream).
     first_divergent_generated_token_index: i64,
@@ -8528,6 +8609,16 @@ fn run_bench_speculative(
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    let bench_token_recycling_topk = std::env::var_os("CAMELID_BENCH_TOKEN_RECYCLING_TOPK")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let tree_requested = std::env::var_os("CAMELID_SPEC_TREE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    anyhow::ensure!(
+        !bench_token_recycling_topk || tree_requested,
+        "CAMELID_BENCH_TOKEN_RECYCLING_TOPK=1 requires CAMELID_SPEC_TREE=1"
+    );
     configure_rayon_threads(threads)?;
     camelid::capability::HardwareProfile::detect().log();
 
@@ -8782,7 +8873,13 @@ fn run_bench_speculative(
         draft_model: draft_model.as_ref().map(|p| p.display().to_string()),
         draft_model_sha256,
         quantization: camelid::receipt::quantization_label(&gguf),
-        drafter: drafter_kind,
+        drafter: if bench_token_recycling_topk {
+            "token-recycling-target-topk".to_string()
+        } else if tree_requested {
+            "suffix-tree".to_string()
+        } else {
+            drafter_kind
+        },
         cpu_draft,
         spec_only,
         draft_tokens: gamma,
@@ -8809,6 +8906,10 @@ fn run_bench_speculative(
         normal_steps: spec.normal_steps,
         gpu_verify_rounds: spec.gpu_verify_rounds,
         cpu_verify_rounds: spec.cpu_verify_rounds,
+        target_topk_seed_probes: spec.target_topk.seed_probes,
+        target_topk_speculative_rounds: spec.target_topk.speculative_rounds,
+        target_topk_candidate_rows: spec.target_topk.candidate_rows,
+        target_topk_candidate_ids: spec.target_topk.candidate_ids,
         first_divergent_generated_token_index: first_divergent,
         lossless: first_divergent < 0,
         plain_token_ids: plain.generated,
@@ -8830,7 +8931,8 @@ fn run_bench_speculative(
     }
     eprintln!(
         "[bench-speculative] {} | {} γ={}{} | accept {:.1}% | tok/round {:.2} | f_draft {:.3} | \
-         draft {:.1} ms/tok | plain {:.2} t/s → spec {:.2} t/s | S_sync {:.2}x | {} | gpu/cpu verify {}/{} | drafted {} rounds {}",
+         draft {:.1} ms/tok | plain {:.2} t/s → spec {:.2} t/s | S_sync {:.2}x | {} | \
+         gpu/cpu verify {}/{} | TR seed/spec {}/{} rows={} ids={} | drafted {} rounds {}",
         record.workload,
         record.drafter,
         record.draft_tokens,
@@ -8849,6 +8951,10 @@ fn run_bench_speculative(
         },
         record.gpu_verify_rounds,
         record.cpu_verify_rounds,
+        record.target_topk_seed_probes,
+        record.target_topk_speculative_rounds,
+        record.target_topk_candidate_rows,
+        record.target_topk_candidate_ids,
         record.drafted,
         record.rounds,
     );

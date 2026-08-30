@@ -12,7 +12,7 @@
 //!
 //! Learning scope: the default drafter learns from the *accepted token stream*
 //! alone — `observe`/`learn` feed realized history transitions. The experimental
-//! benchmark lane can additionally call `observe_target_candidates` with the
+//! benchmark lane can additionally call `replace_target_candidates` with the
 //! resident verifier's compact target top-k rows. No logits are read back and
 //! the target verifier remains authoritative in either mode.
 
@@ -26,6 +26,12 @@ use crate::inference::spec_tree::{TokenTree, TreeDrafter};
 pub struct TokenRecyclingDrafter {
     /// token -> (successor token -> count).
     succ: HashMap<u32, HashMap<u32, u32>>,
+    /// Latest verifier top-k row for a token, preserving target rank order.
+    ///
+    /// The Token Recycling update is row replacement (`matrix[input] = top_k(logits)`), not a
+    /// frequency accumulator. Keeping this separate from `succ` preserves the accepted-stream
+    /// fallback while making verifier evidence deterministic and immediately authoritative.
+    target_rows: HashMap<u32, Vec<u32>>,
     /// Successors kept per token when building a tree.
     pub topk: usize,
     /// Branching factor at each tree node (≤ topk).
@@ -38,6 +44,7 @@ impl TokenRecyclingDrafter {
     pub fn new() -> Self {
         Self {
             succ: HashMap::new(),
+            target_rows: HashMap::new(),
             topk: 4,
             branch: 2,
             max_succ_per_token: 16,
@@ -57,22 +64,30 @@ impl TokenRecyclingDrafter {
         }
     }
 
-    /// Record one verified row's target candidate set as outgoing adjacency for `from`.
+    /// Replace `from`'s adjacency with one verified target candidate row.
     ///
-    /// Candidates are set-valued evidence: duplicates within a row are counted once, and the
-    /// verifier's `u32::MAX` exhausted-rank sentinel is ignored. Across rows, repeated candidate
-    /// membership accumulates frequency exactly like [`Self::observe`]. Returns the number of
-    /// valid distinct candidates consumed, which is useful for benchmark telemetry.
-    pub fn observe_target_candidates(&mut self, from: u32, candidates: &[u32]) -> usize {
-        let mut observed = 0;
+    /// This matches Token Recycling's adjacency-matrix update: the latest target row overwrites
+    /// the previous row and retains target rank order. Duplicates are removed, the verifier's
+    /// `u32::MAX` exhausted-rank sentinel is ignored, and the configured per-token cap is applied.
+    /// Returns the number of valid distinct candidates stored for benchmark telemetry.
+    pub fn replace_target_candidates(&mut self, from: u32, candidates: &[u32]) -> usize {
+        let mut row = Vec::with_capacity(candidates.len().min(self.max_succ_per_token));
         for (rank, &to) in candidates.iter().enumerate() {
             if to == u32::MAX || candidates[..rank].contains(&to) {
                 continue;
             }
-            self.observe(from, to);
-            observed += 1;
+            if row.len() == self.max_succ_per_token {
+                break;
+            }
+            row.push(to);
         }
-        observed
+        let stored = row.len();
+        if row.is_empty() {
+            self.target_rows.remove(&from);
+        } else {
+            self.target_rows.insert(from, row);
+        }
+        stored
     }
 
     /// Learn every adjacent transition in an observed token stream (the
@@ -87,6 +102,9 @@ impl TokenRecyclingDrafter {
     /// Top successors of `token`, most-frequent first (ties by lower id), up to
     /// `n`.
     fn top_successors(&self, token: u32, n: usize) -> Vec<u32> {
+        if let Some(row) = self.target_rows.get(&token) {
+            return row.iter().copied().take(n).collect();
+        }
         match self.succ.get(&token) {
             None => Vec::new(),
             Some(map) => {
@@ -197,21 +215,31 @@ mod tests {
     }
 
     #[test]
-    fn target_candidate_rows_feed_deterministic_adjacency() {
+    fn latest_target_row_bootstraps_and_overwrites_deterministically() {
         let mut d = TokenRecyclingDrafter::new();
         d.branch = 3;
+        let cold = d.draft_tree(&[], 10, 4, 1);
+        assert_eq!(cold.nodes(), 1, "cold row starts anchor-only");
         assert_eq!(
-            d.observe_target_candidates(10, &[5, 3, 5, u32::MAX, 7]),
+            d.replace_target_candidates(10, &[5, 3, 5, u32::MAX, 7]),
             3,
             "duplicate ids and exhausted-rank sentinels are not double-counted"
         );
         let tree = d.draft_tree(&[], 10, 4, 1);
-        assert_eq!(tree.tokens, [10, 3, 5, 7], "equal support ties by token id");
+        assert_eq!(
+            tree.tokens,
+            [10, 5, 3, 7],
+            "a seed row immediately drafts in target rank order"
+        );
         assert_eq!(tree.parent, [-1, 0, 0, 0]);
 
-        assert_eq!(d.observe_target_candidates(10, &[7]), 1);
+        assert_eq!(d.replace_target_candidates(10, &[7, 9]), 2);
         let tree = d.draft_tree(&[], 10, 4, 1);
-        assert_eq!(tree.tokens, [10, 7, 3, 5], "cross-row support wins");
+        assert_eq!(
+            tree.tokens,
+            [10, 7, 9],
+            "latest target evidence replaces, rather than accumulates with, the old row"
+        );
     }
 
     #[test]

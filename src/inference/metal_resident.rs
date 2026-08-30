@@ -1423,7 +1423,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], false)?
+            .verify_tree_metal_inner(tree, &[], false, true)?
             .map(|(emitted, _capture, _target_top_k)| emitted))
     }
 
@@ -1438,7 +1438,7 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, false)?
+            .verify_tree_metal_inner(tree, capture_layer_ids, false, true)?
             .map(|(_emitted, capture, _target_top_k)| capture))
     }
 
@@ -1452,7 +1452,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<LlamaTargetTopKVerify>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true)?
+            .verify_tree_metal_inner(tree, &[], true, true)?
             .map(|(emitted, capture, target_top_k)| LlamaTargetTopKVerify {
                 predictions: capture.predictions,
                 target_top_k,
@@ -1461,12 +1461,29 @@ impl super::LlamaInferenceSession {
             }))
     }
 
+    /// Non-committing target top-k probe used to bootstrap an empty Token Recycling row.
+    ///
+    /// The resident target executes the same exact tree forward, but logical/Metal `filled` and
+    /// host KV position remain at the input base. A subsequent committing verify may therefore
+    /// redraft from the newly installed row and overwrite these provisional slots. This method is
+    /// benchmark-only by reachability; ordinary verification never calls it.
+    #[cfg(target_os = "macos")]
+    pub fn probe_tree_metal_target_top_k(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+    ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, &[], true, false)?
+            .map(|(_emitted, capture, target_top_k)| (capture.predictions, target_top_k)))
+    }
+
     #[cfg(target_os = "macos")]
     fn verify_tree_metal_inner(
         &mut self,
         tree: &spec_tree::TokenTree,
         capture_layer_ids: &[usize],
         read_target_top_k: bool,
+        commit: bool,
     ) -> Result<
         Option<(
             Vec<u32>,
@@ -1635,17 +1652,23 @@ impl super::LlamaInferenceSession {
             (captured.0, captured.1, Vec::new())
         };
 
-        // Host accept: longest greedy-exact path through the tree, then COMPACT the accepted
-        // path's KV into contiguous slots base..base+L-1 so the cache matches a linear decode of
-        // that path (no-op for a single-branch tree). Identical accept rule to the CUDA arm.
+        // Host accept: longest greedy-exact path through the tree. A committing call compacts the
+        // accepted path's KV into contiguous slots base..base+L-1 and advances both positions.
+        // The benchmark cold-start probe deliberately leaves the provisional slots uncommitted;
+        // the immediately following full-tree verify starts at the same base and overwrites them.
         let (emitted, leaf) = tree.accept_longest_path(&predicted);
-        let path = tree.path_to(leaf); // includes the anchor (node 0); root first
-        session.compact_tree_kv_path(&path, position).map_err(|e| {
-            BackendError::RuntimeShapeMismatch(format!("tree KV compaction failed: {e}"))
-        })?;
-        let new_position = position + emitted.len();
-        session.set_filled(new_position);
-        self.kv_cache.position = new_position;
+        if commit {
+            let path = tree.path_to(leaf); // includes the anchor (node 0); root first
+            session.compact_tree_kv_path(&path, position).map_err(|e| {
+                BackendError::RuntimeShapeMismatch(format!("tree KV compaction failed: {e}"))
+            })?;
+            let new_position = position + emitted.len();
+            session.set_filled(new_position);
+            self.kv_cache.position = new_position;
+        } else {
+            debug_assert_eq!(session.filled(), position);
+            debug_assert_eq!(self.kv_cache.position, position);
+        }
         if std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some() {
             // Max fan-out = the most children any node has (1 == single-branch / linear).
             let mut child_count = vec![0u32; n];
@@ -1657,7 +1680,9 @@ impl super::LlamaInferenceSession {
             }
             let max_fanout = child_count.iter().copied().max().unwrap_or(0);
             eprintln!(
-                "[metal-tree-verify] base={position} n={n} emitted_len={} max_fanout={max_fanout}",
+                "[metal-tree-verify] mode={} base={position} n={n} emitted_len={} \
+                 max_fanout={max_fanout}",
+                if commit { "commit" } else { "probe" },
                 emitted.len()
             );
         }
@@ -1739,6 +1764,16 @@ impl super::LlamaInferenceSession {
         &mut self,
         _tree: &spec_tree::TokenTree,
     ) -> Result<Option<LlamaTargetTopKVerify>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: resident target top-k probing is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn probe_tree_metal_target_top_k(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+    ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
         Ok(None)
     }
 }
