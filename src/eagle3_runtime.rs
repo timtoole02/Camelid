@@ -206,6 +206,7 @@ pub struct Eagle3DynamicFrontierConfig {
     pub max_depth: usize,
     pub candidates_per_parent: usize,
     pub max_head_expansions: usize,
+    pub adaptive_branching: bool,
 }
 
 impl Default for Eagle3DynamicFrontierConfig {
@@ -216,6 +217,7 @@ impl Default for Eagle3DynamicFrontierConfig {
             max_depth: 6,
             candidates_per_parent: 8,
             max_head_expansions: 8,
+            adaptive_branching: false,
         }
     }
 }
@@ -501,9 +503,26 @@ impl Eagle3DynamicFrontier {
         let normalizer = Eagle3FullVocabularyLogsumexp::from_output(output)?;
         let scores = normalize_draft_top_logits(&top_logits, normalizer.get())
             .map_err(|message| invalid(format!("EAGLE-3 dynamic frontier: {message}")))?;
+        let filtered_scores = if scores.len() > 1 && self.config.adaptive_branching {
+            let p0 = scores[0].log_probability.exp();
+            let mut retained = vec![scores[0]];
+            let mut cum_p = p0;
+            if p0 < 0.70 {
+                for candidate in &scores[1..] {
+                    let p = candidate.log_probability.exp();
+                    if p >= 0.08 && cum_p < 0.85 {
+                        cum_p += p;
+                        retained.push(*candidate);
+                    }
+                }
+            }
+            retained
+        } else {
+            scores
+        };
         let children = self
             .lattice
-            .expand(parent, &scores)
+            .expand(parent, &filtered_scores)
             .map_err(|message| invalid(format!("EAGLE-3 dynamic frontier: {message}")))?;
         self.expanded[parent] = true;
         self.expanded
@@ -1249,7 +1268,28 @@ mod tests {
             max_depth: 6,
             candidates_per_parent: 8,
             max_head_expansions,
+            adaptive_branching: false,
         }
+    }
+
+    #[test]
+    fn adaptive_branching_prunes_weak_siblings_when_top1_is_dominant() {
+        let mut config = frontier_config(8, 16, 4);
+        config.adaptive_branching = true;
+        let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
+        // Candidate 0 has probability ~0.80 (dominant). Weak siblings (0.05, 0.03, ...) should be pruned.
+        let exp = output(
+            &[
+                (11, 0.80),
+                (12, 0.05),
+                (13, 0.03),
+                (14, 0.02),
+            ],
+            1.0,
+        );
+        let children = frontier.record_expansion(0, &exp).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(frontier.lattice().nodes().len(), 2);
     }
 
     #[test]

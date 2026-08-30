@@ -9913,6 +9913,7 @@ fn run_eagle3_resident_greedy(
         history.push(first);
         history
     });
+    let adaptive_branching = eagle3_adaptive_branching_enabled();
 
     let decode_started = Instant::now();
     while run.generated.len() < max_tokens
@@ -10033,6 +10034,7 @@ fn run_eagle3_resident_greedy(
                             max_depth: budget,
                             candidates_per_parent: tree_topk,
                             max_head_expansions: tree_expansions,
+                            adaptive_branching,
                         },
                     )?,
                     DualEagleHead::Sw512 => secondary.draft_dynamic_frontier(
@@ -10045,6 +10047,7 @@ fn run_eagle3_resident_greedy(
                             max_depth: budget,
                             candidates_per_parent: tree_topk,
                             max_head_expansions: tree_expansions,
+                            adaptive_branching,
                         },
                     )?,
                 };
@@ -10344,6 +10347,7 @@ fn run_eagle3_resident_greedy(
                             max_depth: budget,
                             candidates_per_parent: tree_topk,
                             max_head_expansions: round_tree_expansions,
+                            adaptive_branching,
                         },
                     )?;
                     let materialized_head_forwards = frontier.materialized_head_forwards();
@@ -10460,6 +10464,7 @@ fn run_eagle3_resident_greedy(
                         max_depth: budget,
                         candidates_per_parent: tree_topk,
                         max_head_expansions: round_tree_expansions,
+                        adaptive_branching,
                     },
                 )?;
                 let materialized_head_forwards = frontier.materialized_head_forwards();
@@ -10919,6 +10924,11 @@ struct BenchEagle3Record {
     peak_memory_bytes: u64,
 }
 
+fn eagle3_adaptive_branching_enabled() -> bool {
+    std::env::var_os("CAMELID_EAGLE3_ADAPTIVE_BRANCHING")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 fn eagle3_token_recycling_hybrid_enabled() -> bool {
     std::env::var_os("CAMELID_BENCH_EAGLE3_TR_HYBRID")
         .is_some_and(|value| !value.is_empty() && value != "0")
@@ -11002,6 +11012,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_EAGLE3_BODY_Q8",
         "CAMELID_EAGLE3_LM_HEAD_Q8",
         "CAMELID_EAGLE3_LM_HEAD_ROWS",
+        "CAMELID_EAGLE3_ADAPTIVE_BRANCHING",
         "CAMELID_METAL_LINEAR",
         "CAMELID_METAL_Q8",
         "CAMELID_METAL_RESIDENT_DECODE",
@@ -11019,6 +11030,8 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_V4",
         "CAMELID_KQUANT_V4_DIRECT_FRAGMENT",
         "CAMELID_KQUANT_V4_SHARED_PREP",
+        "CAMELID_KQUANT_V4_STRICT_PREP_FUSION",
+        "CAMELID_METAL_VERIFY_BATCH_ROPE_SCATTER",
         "CAMELID_KQUANT_V4_TRACE",
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
