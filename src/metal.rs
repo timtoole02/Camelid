@@ -36408,6 +36408,345 @@ mod tests {
         }
     }
 
+    /// The dense Gemma 4 verifier batches row-separable Q/K/V setup by flattening
+    /// `[token][head]` into one per-head RMS grid and by widening the established
+    /// RoPE/scatter kernels across the token grid's Y axis.  Pin every resulting
+    /// f32 bit (and every cache byte, including untouched positions) against the
+    /// original eight offset dispatches at both production attention geometries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_row_ops_k8_batch_matches_scalar_bits() {
+        use super::*;
+
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal row-op pipelines");
+        let opts = MTLResourceOptions::StorageModeShared;
+        const K: usize = 8;
+        const Q_HEADS: usize = 16;
+        const BASE_POSITION: usize = 3;
+        const MAX_POSITIONS: usize = 16;
+
+        let f32_buffer = |values: &[f32]| {
+            let buffer = kernel.device.new_buffer(
+                std::mem::size_of_val(values) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&buffer, values);
+            buffer
+        };
+        let u32_buffer = |value: u32| {
+            let buffer = kernel.device.new_buffer(4, opts);
+            unsafe {
+                *buffer.contents().cast::<u32>() = value;
+            }
+            buffer
+        };
+
+        for (head_dim, kv_heads, geometry) in [
+            (256usize, 8usize, "sliding"),
+            (512usize, 1usize, "global"),
+        ] {
+            let weight: Vec<f32> = (0..head_dim)
+                .map(|index| {
+                    let magnitude = (1 + (index * 13 + head_dim) % 37) as f32 / 32.0;
+                    if index % 5 == 0 { -magnitude } else { magnitude }
+                })
+                .collect();
+            let weight_buffer = f32_buffer(&weight);
+
+            // Exercise all three production calls: weighted Q, weighted K, and
+            // weightless V.  The flat batched head index must restart the shared
+            // per-dimension weight at every head exactly as the offset dispatch did.
+            for (heads, use_weight, role) in [
+                (Q_HEADS, true, "q-weighted"),
+                (kv_heads, true, "k-weighted"),
+                (kv_heads, false, "v-weightless"),
+            ] {
+                let elements = K * heads * head_dim;
+                let input: Vec<f32> = (0..elements)
+                    .map(|index| match index % 257 {
+                        0 => 0.0,
+                        1 => -0.0,
+                        _ => {
+                            let signed = ((index * 29 + head_dim + heads) % 2_003) as f32 - 1_001.0;
+                            signed / 257.0
+                        }
+                    })
+                    .collect();
+                let input_buffer = f32_buffer(&input);
+                let scalar_output = f32_buffer(&vec![f32::from_bits(0x7fc0_1234); elements]);
+                let batch_output = f32_buffer(&vec![f32::from_bits(0x7fc0_5678); elements]);
+                let args = kernel.device.new_buffer(12, opts);
+                unsafe {
+                    let values = args.contents().cast::<u8>();
+                    *values.cast::<u32>() = head_dim as u32;
+                    *values.add(4).cast::<f32>() = 1.0e-6;
+                    *values.add(8).cast::<u32>() = u32::from(use_weight);
+                }
+
+                let command = kernel.queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                let row_bytes = (heads * head_dim * std::mem::size_of::<f32>()) as u64;
+                for row in 0..K {
+                    encode_rms_norm_per_head(
+                        encoder,
+                        kernel,
+                        &input_buffer,
+                        &weight_buffer,
+                        &scalar_output,
+                        &args,
+                        heads,
+                        row as u64 * row_bytes,
+                    );
+                }
+                encode_rms_norm_per_head(
+                    encoder,
+                    kernel,
+                    &input_buffer,
+                    &weight_buffer,
+                    &batch_output,
+                    &args,
+                    K * heads,
+                    0,
+                );
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(
+                    command.status(),
+                    metal::MTLCommandBufferStatus::Completed,
+                    "{geometry} {role} RMS command"
+                );
+
+                let mut scalar = vec![0.0f32; elements];
+                let mut batch = vec![0.0f32; elements];
+                read_buffer_f32(&scalar_output, &mut scalar);
+                read_buffer_f32(&batch_output, &mut batch);
+                for (index, (&expected, &actual)) in scalar.iter().zip(&batch).enumerate() {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{geometry} {role} RMS index={index}"
+                    );
+                }
+            }
+
+            // The verifier rotates Q and K independently, with different row
+            // strides but the same position-major split-half tables.
+            let half_rope = head_dim / 2;
+            let mut cos = Vec::with_capacity(K * half_rope);
+            let mut sin = Vec::with_capacity(K * half_rope);
+            for row in 0..K {
+                for pair in 0..half_rope {
+                    let angle = ((row * half_rope + pair) as f32 + 0.5) / 1_024.0;
+                    let (sine, cosine) = angle.sin_cos();
+                    cos.push(cosine);
+                    sin.push(sine);
+                }
+            }
+            let cos_buffer = f32_buffer(&cos);
+            let sin_buffer = f32_buffer(&sin);
+            for (heads, role) in [(Q_HEADS, "q"), (kv_heads, "k")] {
+                let elements = K * heads * head_dim;
+                let input: Vec<f32> = (0..elements)
+                    .map(|index| {
+                        let signed =
+                            ((index * 43 + heads * 17 + head_dim) % 4_093) as f32 - 2_046.0;
+                        signed / 509.0
+                    })
+                    .collect();
+                let scalar_data = f32_buffer(&input);
+                let batch_data = f32_buffer(&input);
+                let args = kernel.device.new_buffer(16, opts);
+                unsafe {
+                    let values = args.contents().cast::<u32>();
+                    *values = heads as u32;
+                    *values.add(1) = head_dim as u32;
+                    *values.add(2) = half_rope as u32;
+                    *values.add(3) = 1;
+                }
+
+                let command = kernel.queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                let row_bytes = (heads * head_dim * std::mem::size_of::<f32>()) as u64;
+                let table_bytes = (half_rope * std::mem::size_of::<f32>()) as u64;
+                for row in 0..K {
+                    encode_rope(
+                        encoder,
+                        kernel,
+                        &scalar_data,
+                        &cos_buffer,
+                        &sin_buffer,
+                        &args,
+                        heads,
+                        half_rope,
+                        row as u64 * row_bytes,
+                        row as u64 * table_bytes,
+                    );
+                }
+                encoder.set_compute_pipeline_state(&kernel.rope_rotate_batch_pipeline);
+                encoder.set_buffer(0, Some(&batch_data), 0);
+                encoder.set_buffer(1, Some(&cos_buffer), 0);
+                encoder.set_buffer(2, Some(&sin_buffer), 0);
+                for index in 0..4u64 {
+                    encoder.set_buffer(3 + index, Some(&args), index * 4);
+                }
+                dispatch_2d_rows(
+                    encoder,
+                    &kernel.rope_rotate_batch_pipeline,
+                    heads * half_rope,
+                    K,
+                );
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(
+                    command.status(),
+                    metal::MTLCommandBufferStatus::Completed,
+                    "{geometry} {role} RoPE command"
+                );
+
+                let mut scalar = vec![0.0f32; elements];
+                let mut batch = vec![0.0f32; elements];
+                read_buffer_f32(&scalar_data, &mut scalar);
+                read_buffer_f32(&batch_data, &mut batch);
+                for (index, (&expected, &actual)) in scalar.iter().zip(&batch).enumerate() {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{geometry} {role} RoPE index={index}"
+                    );
+                }
+            }
+
+            let kv_dim = kv_heads * head_dim;
+            let source_elements = K * kv_dim;
+            let src_k: Vec<f32> = (0..source_elements)
+                .map(|index| ((index * 47 + head_dim) % 1_021) as f32 / 127.0 - 4.0)
+                .collect();
+            let src_v: Vec<f32> = (0..source_elements)
+                .map(|index| 3.0 - ((index * 61 + kv_heads) % 997) as f32 / 131.0)
+                .collect();
+            let src_k_buffer = f32_buffer(&src_k);
+            let src_v_buffer = f32_buffer(&src_v);
+            let cache_elements = kv_heads * MAX_POSITIONS * head_dim;
+            let initial_k: Vec<f32> = (0..cache_elements)
+                .map(|index| 50.0 + (index % 113) as f32 / 256.0)
+                .collect();
+            let initial_v: Vec<f32> = (0..cache_elements)
+                .map(|index| -50.0 - (index % 109) as f32 / 256.0)
+                .collect();
+            let scalar_k = f32_buffer(&initial_k);
+            let scalar_v = f32_buffer(&initial_v);
+            let batch_k = f32_buffer(&initial_k);
+            let batch_v = f32_buffer(&initial_v);
+            let write_kv16 = u32_buffer(0);
+            let mut scalar_args = Vec::with_capacity(K);
+
+            let command = kernel.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            let source_row_bytes = (kv_dim * std::mem::size_of::<f32>()) as u64;
+            for row in 0..K {
+                let args = kernel.device.new_buffer(16, opts);
+                unsafe {
+                    let values = args.contents().cast::<u32>();
+                    *values = head_dim as u32;
+                    *values.add(1) = MAX_POSITIONS as u32;
+                    *values.add(2) = (BASE_POSITION + row) as u32;
+                    *values.add(3) = kv_dim as u32;
+                }
+                encoder.set_compute_pipeline_state(&kernel.kv_scatter_pipeline);
+                encoder.set_buffer(0, Some(&src_k_buffer), row as u64 * source_row_bytes);
+                encoder.set_buffer(1, Some(&src_v_buffer), row as u64 * source_row_bytes);
+                encoder.set_buffer(2, Some(&scalar_k), 0);
+                encoder.set_buffer(3, Some(&scalar_v), 0);
+                for index in 0..4u64 {
+                    encoder.set_buffer(4 + index, Some(&args), index * 4);
+                }
+                encoder.set_buffer(8, Some(&args), 0);
+                encoder.set_buffer(9, Some(&args), 0);
+                encoder.set_buffer(10, Some(&write_kv16), 0);
+                dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
+                scalar_args.push(args);
+            }
+
+            let batch_args = kernel.device.new_buffer(16, opts);
+            unsafe {
+                let values = batch_args.contents().cast::<u32>();
+                *values = head_dim as u32;
+                *values.add(1) = MAX_POSITIONS as u32;
+                *values.add(2) = BASE_POSITION as u32;
+                *values.add(3) = kv_dim as u32;
+            }
+            encoder.set_compute_pipeline_state(&kernel.kv_scatter_batch_pipeline);
+            encoder.set_buffer(0, Some(&src_k_buffer), 0);
+            encoder.set_buffer(1, Some(&src_v_buffer), 0);
+            encoder.set_buffer(2, Some(&batch_k), 0);
+            encoder.set_buffer(3, Some(&batch_v), 0);
+            for index in 0..4u64 {
+                encoder.set_buffer(4 + index, Some(&batch_args), index * 4);
+            }
+            encoder.set_buffer(8, Some(&batch_args), 0);
+            encoder.set_buffer(9, Some(&batch_args), 0);
+            encoder.set_buffer(10, Some(&write_kv16), 0);
+            dispatch_2d_rows(encoder, &kernel.kv_scatter_batch_pipeline, kv_dim, K);
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+            assert_eq!(
+                command.status(),
+                metal::MTLCommandBufferStatus::Completed,
+                "{geometry} KV scatter command"
+            );
+
+            let cache_bytes = cache_elements * std::mem::size_of::<f32>();
+            let bytes = |buffer: &Buffer| unsafe {
+                std::slice::from_raw_parts(buffer.contents().cast::<u8>(), cache_bytes).to_vec()
+            };
+            assert_eq!(bytes(&batch_k), bytes(&scalar_k), "{geometry} full K cache");
+            assert_eq!(bytes(&batch_v), bytes(&scalar_v), "{geometry} full V cache");
+
+            // The full-cache equality above includes these boundaries; pin them
+            // explicitly so a future fixture change cannot accidentally make a
+            // zero-base or whole-cache overwrite vacuous.
+            let mut actual_k = vec![0.0f32; cache_elements];
+            let mut actual_v = vec![0.0f32; cache_elements];
+            read_buffer_f32(&batch_k, &mut actual_k);
+            read_buffer_f32(&batch_v, &mut actual_v);
+            for head in 0..kv_heads {
+                for position in 0..MAX_POSITIONS {
+                    let range_start = (head * MAX_POSITIONS + position) * head_dim;
+                    let range = range_start..range_start + head_dim;
+                    if (BASE_POSITION..BASE_POSITION + K).contains(&position) {
+                        assert_ne!(
+                            &actual_k[range.clone()],
+                            &initial_k[range.clone()],
+                            "{geometry} K head={head} position={position} must be written"
+                        );
+                        assert_ne!(
+                            &actual_v[range.clone()],
+                            &initial_v[range],
+                            "{geometry} V head={head} position={position} must be written"
+                        );
+                    } else {
+                        assert_eq!(
+                            &actual_k[range.clone()],
+                            &initial_k[range.clone()],
+                            "{geometry} K head={head} position={position} must stay untouched"
+                        );
+                        assert_eq!(
+                            &actual_v[range.clone()],
+                            &initial_v[range],
+                            "{geometry} V head={head} position={position} must stay untouched"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_kquant_prefill_captures_requested_layer_inputs() {
