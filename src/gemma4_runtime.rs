@@ -7048,7 +7048,9 @@ pub struct Gemma4Mtp12MetalRoundReceipt {
     pub schedule_state_after: Gemma4Mtp12WidthScheduleState,
     pub schedule_transition: Gemma4Mtp12WidthScheduleTransition,
     pub drafts: Vec<u32>,
-    /// Target argmax after every row in `[anchor, drafts..]`.
+    /// Target argmax after every physical candidate row. Acceptance and commit
+    /// consume only the prefix identified by `logical_verify_width`; any later
+    /// entries correspond to causally-later padding and remain audit evidence.
     pub target_greedy_ids: Vec<u32>,
     /// Agreed, non-stop drafts emitted after the anchor.
     pub accepted_drafts: usize,
