@@ -229,6 +229,10 @@ pub(crate) struct MetalLinearKernel {
     /// Q4 and Q8 MMA operands through each lane's two fragment elements.
     q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline: Option<ComputePipelineState>,
     q4_0_q8_ordered_columns_mma_register_fragment_pipeline: Option<ComputePipelineState>,
+    /// Default-off K=16 register-fed sibling. A one-SIMDgroup row tile reuses
+    /// one decoded Q4 fragment across two independent 8-column accumulators.
+    q4_0_q8_ordered_columns_mma_stage16_pipeline: Option<ComputePipelineState>,
+    q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline: Option<ComputePipelineState>,
     /// Fixed-geometry Gemma 4 26B routed-expert lane. These three strict
     /// pipelines consume caller-owned, persistent expert slot slabs: no weight
     /// buffer is allocated or copied on the token hot path.
@@ -3469,6 +3473,24 @@ kernel void q4_0_q8_ordered_columns_mma_stage(
     staged_quants[gid] = half(value);
 }
 
+// Fixed-width K=16 sibling of the padded-eight panel. Keeping this separate
+// prevents a default-off experiment from changing the scratch contract or
+// dispatch geometry of the qualified K<=8 kernels.
+kernel void q4_0_q8_ordered_columns_mma_stage16(
+    device const char* input_quants [[buffer(0)]],
+    device half* staged_quants [[buffer(1)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint width = blocks_per_row * 32u;
+    const ulong total = ulong(width) * 16ul;
+    if (ulong(gid) >= total) return;
+    const uint position = gid >> 4;
+    const uint column = gid & 15u;
+    staged_quants[gid] = half(int(
+        input_quants[ulong(column) * width + position]));
+}
+
 // Exact Q4_0 x Q8_0 padded-eight verifier on simdgroup matrix hardware.
 // One 32-lane threadgroup owns eight output rows. For every 32-value Q4_0
 // block it decodes an 8x32 integer weight tile into exact half values, performs
@@ -4368,6 +4390,111 @@ kernel void q4_0_q8_ordered_columns_mma_register_fragment(
         const uint column = fragment_column0 + cell;
         if (output_row < rows && column < columns) {
             output[ulong(column) * rows + output_row] = accum[cell];
+        }
+    }
+}
+
+// Decode-once K=16 sibling. One simdgroup still owns eight output rows, but
+// each lane retains two independent accumulator fragments: columns 0..7 and
+// 8..15. The Q4 fragment is populated once per k-tile and consumed by both
+// MMAs. Four scalar accumulators per lane preserve each output column's exact
+// increasing-block f32 fold without cross-SIMDgroup sharing or barriers.
+kernel void q4_0_q8_ordered_columns_mma_register_fragment_k16(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (columns != 16u) return;
+    const uint row0 = tile * 8u;
+    if (row0 >= rows) return;
+
+    const uint2 fragment_coord = q4_mma_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+    const uint output_row = row0 + fragment_row;
+    float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+        float weight_scale = 0.0f;
+        uchar2 packed_first = uchar2(0);
+        uchar2 packed_second = uchar2(0);
+        if (output_row < rows) {
+            device const uchar* block = weight_bytes
+                + (ulong(output_row) * blocks_per_row + block_index) * 18ul;
+            weight_scale =
+                float(*reinterpret_cast<device const half*>(block));
+            packed_first = uchar2(
+                *reinterpret_cast<device const packed_uchar2*>(
+                    block + 2ul + fragment_column0));
+            packed_second = uchar2(
+                *reinterpret_cast<device const packed_uchar2*>(
+                    block + 10ul + fragment_column0));
+        }
+
+        simdgroup_float8x8 dots0 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 dots1 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#pragma clang loop unroll(full)
+        for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+            const uchar2 packed = (k_tile & 1u) == 0u
+                ? packed_first
+                : packed_second;
+            const bool high_nibble = k_tile >= 2u;
+            simdgroup_half8x8 weights;
+            weights.thread_elements()[0] = high_nibble
+                ? half(int(packed.x >> 4) - 8)
+                : half(int(packed.x & 0x0fu) - 8);
+            weights.thread_elements()[1] = high_nibble
+                ? half(int(packed.y >> 4) - 8)
+                : half(int(packed.y & 0x0fu) - 8);
+
+            const ulong activation_row =
+                (ulong(block_index) * 32ul + k_tile * 8ul + fragment_row) * 16ul;
+            simdgroup_half8x8 activations0;
+            activations0.thread_elements()[0] =
+                staged_quants[activation_row + fragment_column0];
+            activations0.thread_elements()[1] =
+                staged_quants[activation_row + fragment_column0 + 1u];
+            simdgroup_half8x8 activations1;
+            activations1.thread_elements()[0] =
+                staged_quants[activation_row + 8ul + fragment_column0];
+            activations1.thread_elements()[1] =
+                staged_quants[activation_row + 8ul + fragment_column0 + 1u];
+            simdgroup_multiply_accumulate(dots0, weights, activations0, dots0);
+            simdgroup_multiply_accumulate(dots1, weights, activations1, dots1);
+        }
+
+        for (uint cell = 0; cell < 2u; ++cell) {
+            const uint column0 = fragment_column0 + cell;
+            const uint column1 = column0 + 8u;
+            if (output_row < rows) {
+                float term0 =
+                    dots0.thread_elements()[cell] * weight_scale;
+                term0 = term0 * input_scales[
+                    ulong(column0) * blocks_per_row + block_index];
+                accum[cell] = accum[cell] + term0;
+                float term1 =
+                    dots1.thread_elements()[cell] * weight_scale;
+                term1 = term1 * input_scales[
+                    ulong(column1) * blocks_per_row + block_index];
+                accum[2u + cell] = accum[2u + cell] + term1;
+            }
+        }
+    }
+
+    if (output_row < rows) {
+        for (uint cell = 0; cell < 2u; ++cell) {
+            const uint column0 = fragment_column0 + cell;
+            output[ulong(column0) * rows + output_row] = accum[cell];
+            output[ulong(column0 + 8u) * rows + output_row] =
+                accum[2u + cell];
         }
     }
 }
@@ -12163,6 +12290,26 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let q4_0_q8_ordered_columns_mma_stage16_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_stage16", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline =
+                strict_q8k_library
+                    .get_function(
+                        "q4_0_q8_ordered_columns_mma_register_fragment_k16",
+                        None,
+                    )
+                    .ok()
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    });
             let gemma4_q4_expert_gate_up_geglu_function = strict_q8k_library
                 .get_function("gemma4_q4_expert_gate_up_geglu", None)
                 .ok()?;
@@ -12369,6 +12516,8 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4_0_q8_ordered_columns_mma_serial4_pipeline,
                 q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline,
                 q4_0_q8_ordered_columns_mma_register_fragment_pipeline,
+                q4_0_q8_ordered_columns_mma_stage16_pipeline,
+                q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
                 gemma4_q4_expert_gate_up_geglu_simd_pipeline,
                 gemma4_q4_expert_gate_up_split_pipeline,
@@ -13677,6 +13826,7 @@ pub(crate) struct Gemma4Q4ColumnDispatchCounts {
     pub(crate) k2: u64,
     pub(crate) k4: u64,
     pub(crate) k8: u64,
+    pub(crate) k16: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -13691,6 +13841,9 @@ static GEMMA4_Q4_COLUMN_K4_DISPATCHES: std::sync::atomic::AtomicU64 =
 #[cfg(target_os = "macos")]
 static GEMMA4_Q4_COLUMN_K8_DISPATCHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static GEMMA4_Q4_COLUMN_K16_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
@@ -13701,6 +13854,7 @@ pub(crate) fn gemma4_q4_column_dispatch_counts() -> Gemma4Q4ColumnDispatchCounts
         k2: GEMMA4_Q4_COLUMN_K2_DISPATCHES.load(Ordering::Relaxed),
         k4: GEMMA4_Q4_COLUMN_K4_DISPATCHES.load(Ordering::Relaxed),
         k8: GEMMA4_Q4_COLUMN_K8_DISPATCHES.load(Ordering::Relaxed),
+        k16: GEMMA4_Q4_COLUMN_K16_DISPATCHES.load(Ordering::Relaxed),
     }
 }
 
@@ -13712,6 +13866,7 @@ fn record_gemma4_q4_column_dispatch(columns: usize) {
         2 => &GEMMA4_Q4_COLUMN_K2_DISPATCHES,
         4 => &GEMMA4_Q4_COLUMN_K4_DISPATCHES,
         8 => &GEMMA4_Q4_COLUMN_K8_DISPATCHES,
+        16 => &GEMMA4_Q4_COLUMN_K16_DISPATCHES,
         _ => return,
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -13746,6 +13901,15 @@ pub(crate) fn gemma4_q4_mma_stage_bytes(blocks_per_row: usize) -> Option<usize> 
     blocks_per_row
         .checked_mul(32)?
         .checked_mul(8)?
+        .checked_mul(std::mem::size_of::<u16>())
+}
+
+/// Position-major half panel for the default-off K=16 dual-fragment kernel.
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_q4_mma_stage16_bytes(blocks_per_row: usize) -> Option<usize> {
+    blocks_per_row
+        .checked_mul(32)?
+        .checked_mul(16)?
         .checked_mul(std::mem::size_of::<u16>())
 }
 
@@ -13817,6 +13981,18 @@ fn gemma4_q4_native_register_fragment_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Default-off K=16 decode-once sibling. This does not broaden the parent MMA
+/// gate and any missing pipeline, scratch, or fixed-width invariant fails
+/// closed to the pre-existing unsupported-K result.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_mma_register_fragment_k16_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
 }
@@ -14144,6 +14320,22 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment(
     )
 }
 
+/// Fixed-width K=16 decode-once register-fragment experiment.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment_k16(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_columns_impl(
+        inputs,
+        weight_wire,
+        rows,
+        Gemma4Q4ColumnsTestPath::MmaRegisterFragmentK16,
+    )
+}
+
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma_serial(
@@ -14186,6 +14378,7 @@ enum Gemma4Q4ColumnsTestPath {
     MmaRegisterFragment,
     MmaNative,
     MmaNativeRegister,
+    MmaRegisterFragmentK16,
     MmaSerial2,
     MmaSerial4,
     MmaSerial2Fragment,
@@ -14201,7 +14394,12 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
     const WIRE: usize = 18;
     let blocks_per_row = inputs.first()?.len();
     let columns = inputs.len();
-    if !matches!(columns, 1 | 2 | 4 | 8)
+    let valid_width = if path == Gemma4Q4ColumnsTestPath::MmaRegisterFragmentK16 {
+        columns == 16
+    } else {
+        matches!(columns, 1 | 2 | 4 | 8)
+    };
+    if !valid_width
         || (path == Gemma4Q4ColumnsTestPath::Threadgroup && columns == 1)
         || rows == 0
         || blocks_per_row == 0
@@ -14234,6 +14432,9 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
         | Gemma4Q4ColumnsTestPath::MmaSerial4
         | Gemma4Q4ColumnsTestPath::MmaSerial2Fragment => {
             gemma4_q4_mma_stage_bytes(blocks_per_row)?
+        }
+        Gemma4Q4ColumnsTestPath::MmaRegisterFragmentK16 => {
+            gemma4_q4_mma_stage16_bytes(blocks_per_row)?
         }
     };
 
@@ -14372,6 +14573,21 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
         ),
         Gemma4Q4ColumnsTestPath::MmaNativeRegister => {
             encode_gemma4_q4_0_q8_ordered_columns_mma_native_register(
+                encoder,
+                kernel,
+                &scales_buf,
+                &quants_buf,
+                &weight_buf,
+                0,
+                &output_buf,
+                terms_buf.as_ref()?,
+                rows,
+                blocks_per_row,
+                columns,
+            )
+        }
+        Gemma4Q4ColumnsTestPath::MmaRegisterFragmentK16 => {
+            encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment_k16(
                 encoder,
                 kernel,
                 &scales_buf,
@@ -20326,6 +20542,121 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register(
     )
 }
 
+/// Encode the default-off one-SIMDgroup K=16 dual-fragment experiment.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment_k16(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if rows == 0
+        || blocks_per_row == 0
+        || rows > u32::MAX as usize
+        || blocks_per_row > u32::MAX as usize
+        || columns != 16
+    {
+        return false;
+    }
+    let Some(input_width) = blocks_per_row.checked_mul(32) else {
+        return false;
+    };
+    if input_width > (u32::MAX as usize) / 16 {
+        return false;
+    }
+    let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
+        return false;
+    };
+    let Some(scale_bytes) = input_blocks.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(quant_bytes) = input_blocks.checked_mul(32) else {
+        return false;
+    };
+    let Some(weight_bytes) = rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(18))
+    else {
+        return false;
+    };
+    let Some(weight_end) = weight_offset.checked_add(weight_bytes as u64) else {
+        return false;
+    };
+    let Some(output_bytes) = rows
+        .checked_mul(columns)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(stage_bytes) = gemma4_q4_mma_stage16_bytes(blocks_per_row) else {
+        return false;
+    };
+    if input_scales.length() < scale_bytes as u64
+        || input_quants.length() < quant_bytes as u64
+        || weight.length() < weight_end
+        || output.length() < output_bytes as u64
+        || staged_quants.length() < stage_bytes as u64
+    {
+        return false;
+    }
+    let Some(stage_pipeline) = kernel
+        .q4_0_q8_ordered_columns_mma_stage16_pipeline
+        .as_ref()
+    else {
+        return false;
+    };
+    let Some(mma_pipeline) = admitted_32_lane_pipeline(
+        kernel
+            .q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline
+            .as_ref(),
+    ) else {
+        return false;
+    };
+
+    let blocks_u32 = blocks_per_row as u32;
+    let rows_u32 = rows as u32;
+    let columns_u32 = columns as u32;
+    let Some(stage_values) = input_width.checked_mul(16) else {
+        return false;
+    };
+    encoder.set_compute_pipeline_state(stage_pipeline);
+    encoder.set_buffer(0, Some(input_quants), 0);
+    encoder.set_buffer(1, Some(staged_quants), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    dispatch_1d(encoder, stage_pipeline, stage_values);
+
+    encoder.set_compute_pipeline_state(mma_pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    encoder.set_buffer(7, Some(staged_quants), 0);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(8) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    record_gemma4_q4_column_dispatch(columns);
+    true
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
@@ -20679,8 +21010,10 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial_impl(
 /// `CAMELID_GEMMA4_Q4_MMA_ROWMAJOR=1` selects row-major A staging;
 /// `CAMELID_GEMMA4_Q4_MMA_FRAGMENT=1` selects the direct-accumulator sibling;
 /// and `CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT=1` selects the separate fully
-/// register-fed diagnostic. Leaving them unset retains the qualified
-/// serial2/SG1 control. The call only encodes commands--the
+/// register-fed diagnostic. Fixed K=16 additionally requires
+/// `CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16=1`; otherwise K=16 retains its
+/// pre-existing unsupported result. Leaving all selectors unset retains the
+/// qualified serial2/SG1 control. The call only encodes commands--the
 /// caller owns encoder end, commit, wait, and buffer lifetimes. Any
 /// unsupported/undersized shape refuses without dispatching or touching
 /// counters.
@@ -20770,6 +21103,33 @@ fn encode_gemma4_q4_0_q8_ordered_columns_with_layout(
         || output.length() < output_bytes as u64
     {
         return false;
+    }
+
+    // K=16 is a wire-layout-only experiment with no established slab fallback.
+    // Admit it only under both opt-in gates, and leave every refusal to the
+    // existing unsupported-width result below. Native sidecar bytes retain
+    // their independent baseline/register-B routing and are never reinterpreted.
+    if weight_layout == Gemma4Q4WeightLayout::WireRowMajor
+        && columns == 16
+        && gemma4_q4_mma_enabled()
+        && gemma4_q4_mma_register_fragment_k16_enabled()
+        && terms.is_some_and(|staged| {
+            encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment_k16(
+                encoder,
+                kernel,
+                input_scales,
+                input_quants,
+                weight,
+                weight_offset,
+                output,
+                staged,
+                rows,
+                blocks_per_row,
+                columns,
+            )
+        })
+    {
+        return true;
     }
     let Some(required_term_bytes) = gemma4_q4_column_term_slab_bytes(rows, blocks_per_row, columns)
     else {
@@ -42938,6 +43298,7 @@ mod tests {
                     after.k2 - before.k2,
                     after.k4 - before.k4,
                     after.k8 - before.k8,
+                    after.k16 - before.k16,
                 ];
                 let selected = match columns {
                     1 => 0,
@@ -43110,6 +43471,126 @@ mod tests {
                 "K=3 must fail closed"
             );
             assert_eq!(gemma4_q4_column_dispatch_counts(), before);
+        }
+    }
+
+    // Default-off K=16 decode-once sibling. Every result is compared to an
+    // independent invocation of the established exact K=1 comparator so the
+    // dual-fragment implementation cannot hide cross-column reassociation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q4_0_q8_register_fragment_k16_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::tensor::Q8_0Block;
+
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        assert!(kernel
+            .q4_0_q8_ordered_columns_mma_stage16_pipeline
+            .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert_eq!(gemma4_q4_mma_stage16_bytes(120), Some(122_880));
+        assert_eq!(gemma4_q4_mma_stage16_bytes(480), Some(491_520));
+
+        let half_scales = [
+            0x0000u16, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3555, 0x3c00, 0xbc00, 0x7bff, 0xfbff,
+        ];
+        let input_scales = [
+            0.0f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            0.000_000_119_209_29,
+            -0.03125,
+            0.333_333_34,
+            -17.0,
+            2_048.0,
+        ];
+        let packed_patterns = [0x00u8, 0xff, 0x08, 0x80, 0x17, 0x71, 0x3c, 0xc3, 0x5a, 0xa5];
+
+        for &(blocks_per_row, rows, label) in &[
+            (1usize, 9usize, "edge-1"),
+            (31, 9, "edge-31"),
+            (32, 9, "edge-32"),
+            (33, 35, "edge-33-ragged"),
+            (120, 11, "gemma4-12b-hidden-3840"),
+            (480, 7, "gemma4-12b-ffn-15360"),
+        ] {
+            let inputs: Vec<Vec<Q8_0Block>> = (0..16)
+                .map(|column| {
+                    (0..blocks_per_row)
+                        .map(|block| Q8_0Block {
+                            scale: input_scales[(column * 5 + block * 3) % input_scales.len()],
+                            quants: std::array::from_fn(|j| match (column + block + j) % 10 {
+                                0 => -128,
+                                1 => 127,
+                                2 => -127,
+                                3 => 126,
+                                4 => -1,
+                                5 => 0,
+                                6 => 1,
+                                _ => {
+                                    (((column * 67 + block * 29 + j * 13) % 255) as i16 - 127)
+                                        as i8
+                                }
+                            }),
+                        })
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[Q8_0Block]> = inputs.iter().map(Vec::as_slice).collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = half_scales[(row * 7 + block * 3) % half_scales.len()];
+                    wire.extend_from_slice(&scale.to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(
+                            packed_patterns
+                                [(row * 11 + block * 7 + j * 3) % packed_patterns.len()],
+                        );
+                    }
+                }
+            }
+
+            let before = gemma4_q4_column_dispatch_counts();
+            let got = try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment_k16(
+                &refs, &wire, rows,
+            )
+            .unwrap_or_else(|| panic!("register-fed K=16: {label}"));
+            let after = gemma4_q4_column_dispatch_counts();
+            assert_eq!(after.k16 - before.k16, 1, "one K=16 dispatch: {label}");
+            assert_eq!(after.k1 - before.k1, 0, "no hidden K=1 dispatch: {label}");
+            assert_eq!(after.k2 - before.k2, 0, "no hidden K=2 dispatch: {label}");
+            assert_eq!(after.k4 - before.k4, 0, "no hidden K=4 dispatch: {label}");
+            assert_eq!(after.k8 - before.k8, 0, "no hidden K=8 dispatch: {label}");
+
+            for (column, input) in refs.iter().enumerate() {
+                let expected = try_gemma4_q4_0_matmul_q8_batch(&[*input], &wire, rows)
+                    .unwrap_or_else(|| panic!("K=1 comparator: {label} column={column}"));
+                for row in 0..rows {
+                    assert_eq!(
+                        got[column][row].to_bits(),
+                        expected[0][row].to_bits(),
+                        "K16-vs-K1 shape={label} column={column} row={row}"
+                    );
+                }
+            }
+
+            assert!(
+                try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment_k16(
+                    &refs[..8],
+                    &wire,
+                    rows,
+                )
+                .is_none(),
+                "fixed K=16 helper must reject K=8: {label}"
+            );
         }
     }
 
@@ -43976,6 +44457,228 @@ mod tests {
                  accumulator_vs_control={accumulator_speedup:.4}x \
                  register_vs_control={register_speedup:.4}x samples=9 exact_bits=true",
                 control_us[4], accumulator_us[4], register_us[4],
+            );
+        }
+    }
+
+    /// Decode-once K=16 versus two exact register-fed K=8 dispatches. Both
+    /// sides include their activation-panel staging, share the same Q4 wire,
+    /// and must match at every output bit before alternating GPU medians are
+    /// printed for the seven production contractions.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "full Gemma 4 12B K=16 dual-fragment production receipt"]
+    fn metal_gemma4_q4_0_q8_mma_register_fragment_k16_production_receipt() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_register_fragment_pipeline
+                .as_ref()
+        )
+        .is_some());
+        assert!(kernel
+            .q4_0_q8_ordered_columns_mma_stage16_pipeline
+            .is_some());
+        assert!(admitted_32_lane_pipeline(
+            kernel
+                .q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline
+                .as_ref()
+        )
+        .is_some());
+
+        const COLUMNS: usize = 16;
+        const HALF_COLUMNS: usize = 8;
+        #[derive(Clone, Copy)]
+        enum Variant {
+            TwoK8,
+            DualFragmentK16,
+        }
+
+        for &(blocks_per_row, rows, label) in &[
+            (120usize, 4_096usize, "3840-to-4096"),
+            (120, 8_192, "3840-to-8192"),
+            (120, 2_048, "3840-to-2048"),
+            (120, 512, "3840-to-512"),
+            (120, 15_360, "3840-to-15360-gate-up"),
+            (480, 3_840, "15360-to-3840-down"),
+            (128, 3_840, "4096-attention-to-3840"),
+        ] {
+            let input_blocks = COLUMNS * blocks_per_row;
+            let scales: Vec<f32> = (0..input_blocks)
+                .map(|index| 0.000_7 * (1 + index % 37) as f32)
+                .collect();
+            let quants: Vec<u8> = (0..input_blocks * 32)
+                .map(|index| (((index * 29 + index / 31) % 255) as i16 - 127) as i8 as u8)
+                .collect();
+            let scale_split = HALF_COLUMNS * blocks_per_row;
+            let quant_split = scale_split * 32;
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = 0.000_11 * (1 + (row * 7 + block * 13) % 101) as f32;
+                    wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(((row * 43 + block * 19 + j * 11 + 5) % 256) as u8);
+                    }
+                }
+            }
+
+            let shared_f32 = |values: &[f32]| {
+                kernel.device.new_buffer(
+                    std::mem::size_of_val(values) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let shared_u8 = |values: &[u8]| {
+                kernel
+                    .device
+                    .new_buffer(values.len() as u64, MTLResourceOptions::StorageModeShared)
+            };
+            let scales16_buf = shared_f32(&scales);
+            let scales0_buf = shared_f32(&scales[..scale_split]);
+            let scales1_buf = shared_f32(&scales[scale_split..]);
+            let quants16_buf = shared_u8(&quants);
+            let quants0_buf = shared_u8(&quants[..quant_split]);
+            let quants1_buf = shared_u8(&quants[quant_split..]);
+            let weight_buf = shared_u8(&wire);
+            write_buffer_f32(&scales16_buf, &scales);
+            write_buffer_f32(&scales0_buf, &scales[..scale_split]);
+            write_buffer_f32(&scales1_buf, &scales[scale_split..]);
+            write_buffer_u8(&quants16_buf, &quants);
+            write_buffer_u8(&quants0_buf, &quants[..quant_split]);
+            write_buffer_u8(&quants1_buf, &quants[quant_split..]);
+            write_buffer_u8(&weight_buf, &wire);
+
+            let stage8_bytes = gemma4_q4_mma_stage_bytes(blocks_per_row).unwrap() as u64;
+            let stage16_bytes = gemma4_q4_mma_stage16_bytes(blocks_per_row).unwrap() as u64;
+            let stage0_buf = kernel
+                .device
+                .new_buffer(stage8_bytes, MTLResourceOptions::StorageModePrivate);
+            let stage1_buf = kernel
+                .device
+                .new_buffer(stage8_bytes, MTLResourceOptions::StorageModePrivate);
+            let stage16_buf = kernel
+                .device
+                .new_buffer(stage16_bytes, MTLResourceOptions::StorageModePrivate);
+            let output8_bytes = HALF_COLUMNS * rows * std::mem::size_of::<f32>();
+            let output16_bytes = COLUMNS * rows * std::mem::size_of::<f32>();
+            let control0_buf = kernel
+                .device
+                .new_buffer(output8_bytes as u64, MTLResourceOptions::StorageModeShared);
+            let control1_buf = kernel
+                .device
+                .new_buffer(output8_bytes as u64, MTLResourceOptions::StorageModeShared);
+            let k16_buf = kernel
+                .device
+                .new_buffer(output16_bytes as u64, MTLResourceOptions::StorageModeShared);
+
+            let run = |variant: Variant| -> u128 {
+                let cb = kernel.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                let encoded = match variant {
+                    Variant::TwoK8 => {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment(
+                            encoder,
+                            kernel,
+                            &scales0_buf,
+                            &quants0_buf,
+                            &weight_buf,
+                            0,
+                            &control0_buf,
+                            &stage0_buf,
+                            rows,
+                            blocks_per_row,
+                            HALF_COLUMNS,
+                        ) && encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment(
+                            encoder,
+                            kernel,
+                            &scales1_buf,
+                            &quants1_buf,
+                            &weight_buf,
+                            0,
+                            &control1_buf,
+                            &stage1_buf,
+                            rows,
+                            blocks_per_row,
+                            HALF_COLUMNS,
+                        )
+                    }
+                    Variant::DualFragmentK16 => {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment_k16(
+                            encoder,
+                            kernel,
+                            &scales16_buf,
+                            &quants16_buf,
+                            &weight_buf,
+                            0,
+                            &k16_buf,
+                            &stage16_buf,
+                            rows,
+                            blocks_per_row,
+                            COLUMNS,
+                        )
+                    }
+                };
+                if !encoded {
+                    encoder.end_encoding();
+                    panic!(
+                        "K=16 production encoder rejected shape={label} rows={rows} blocks_per_row={blocks_per_row}"
+                    );
+                }
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                command_buffer_gpu_times_us(&cb.to_owned()).0
+            };
+
+            for _ in 0..2 {
+                run(Variant::TwoK8);
+                run(Variant::DualFragmentK16);
+            }
+            let mut control0 = vec![0.0f32; HALF_COLUMNS * rows];
+            let mut control1 = vec![0.0f32; HALF_COLUMNS * rows];
+            let mut k16 = vec![0.0f32; COLUMNS * rows];
+            read_buffer_f32(&control0_buf, &mut control0);
+            read_buffer_f32(&control1_buf, &mut control1);
+            read_buffer_f32(&k16_buf, &mut k16);
+            for column in 0..COLUMNS {
+                let control = if column < HALF_COLUMNS {
+                    &control0[column * rows..(column + 1) * rows]
+                } else {
+                    let half_column = column - HALF_COLUMNS;
+                    &control1[half_column * rows..(half_column + 1) * rows]
+                };
+                for row in 0..rows {
+                    assert_eq!(
+                        k16[column * rows + row].to_bits(),
+                        control[row].to_bits(),
+                        "K16-vs-two-K8 shape={label} column={column} row={row}"
+                    );
+                }
+            }
+
+            let mut two_k8_us = [0u128; 9];
+            let mut k16_us = [0u128; 9];
+            for repeat in 0..9 {
+                if repeat % 2 == 0 {
+                    two_k8_us[repeat] = run(Variant::TwoK8);
+                    k16_us[repeat] = run(Variant::DualFragmentK16);
+                } else {
+                    k16_us[repeat] = run(Variant::DualFragmentK16);
+                    two_k8_us[repeat] = run(Variant::TwoK8);
+                }
+            }
+            two_k8_us.sort_unstable();
+            k16_us.sort_unstable();
+            let speedup = two_k8_us[4] as f64 / k16_us[4] as f64;
+            eprintln!(
+                "gemma4-q4-mma-register-k16 shape={label} K={COLUMNS} rows={rows} \
+                 blocks_per_row={blocks_per_row} two_k8_gpu_us={} k16_gpu_us={} \
+                 k16_vs_two_k8={speedup:.4}x samples=9 exact_bits=true",
+                two_k8_us[4], k16_us[4],
             );
         }
     }
