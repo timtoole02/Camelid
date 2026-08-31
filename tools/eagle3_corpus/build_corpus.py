@@ -230,7 +230,9 @@ def expand_family(family: Mapping[str, Any], catalog: Mapping[str, Any]) -> list
     license_info = catalog["license"]
     records: list[dict[str, Any]] = []
     for ordinal, values in enumerate(combinations):
-        substitutions = dict(zip(axis_names, values, strict=True))
+        # Python 3.9 is the oldest supported Mini2 runtime. ``itertools.product``
+        # guarantees one value per axis here, so ordinary zip is length-safe.
+        substitutions = dict(zip(axis_names, values))
         user_text = family["template"].format(**substitutions)
         messages = [
             {"role": "system", "content": family["system"]},
@@ -239,7 +241,7 @@ def expand_family(family: Mapping[str, Any], catalog: Mapping[str, Any]) -> list
         digest = content_digest(messages)
         source_record_key = ".".join(
             f"{name[0]}{axes[name].index(value):02d}"
-            for name, value in zip(axis_names, values, strict=True)
+            for name, value in zip(axis_names, values)
         )
         category_short = {
             "technical_instructional": "tech",
