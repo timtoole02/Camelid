@@ -13,7 +13,7 @@ import numpy as np
 from .contract import DRAFT_VOCAB_SIZE, HIDDEN_SIZE, TARGET_VOCAB_SIZE
 
 SCHEMA_ID = "camelid-eagle3-q4-features-v1"
-POSITIONAL_CONTRACT = "eagle3-aux-p-next-token-teacher-p1-v1"
+POSITIONAL_CONTRACT = "eagle3-aux-p-next-token-teacher-p1-runtime-mask-p2-v1"
 INVALID_TOKEN_ID = np.uint32(0xFFFF_FFFF)
 AUX_WIDTH = 3 * HIDDEN_SIZE
 TARGET_LAYER_INPUT_IDS = [2, 14, 25]
@@ -92,6 +92,7 @@ class TttDepthView:
     embedding: np.ndarray
     target_ids: np.ndarray
     target_draft_ids: np.ndarray
+    eligible: np.ndarray
     supervised: np.ndarray
     hard_supervised: np.ndarray
     teacher_draft_logits_bf16: np.ndarray
@@ -120,14 +121,15 @@ def build_ttt_batch(
     *,
     ttt_length: int = 7,
 ) -> TttBatch:
-    """Build the exact teacher-forced EAGLE-3 shift views.
+    """Build runtime-aligned teacher-forced EAGLE-3 shift views.
 
-    The exporter has already applied SpecForge's initial left shift.  Base row
-    ``P`` is auxiliary state from target capture row ``P``, the embedding of
-    token ``P+1``, and the teacher distribution captured after row ``P+1``
-    (predicting token ``P+2``).  At unroll depth ``d``, row ``P`` therefore
-    uses the base embedding, teacher and mask at ``P+d``.  A common prefix
-    avoids padded tail rows without changing any retained causal computation.
+    Base row ``P`` is auxiliary state from target capture row ``P``, the
+    embedding of token ``P+1``, and the teacher distribution captured after
+    row ``P+1`` (predicting token ``P+2``).  Its exported mask is deliberately
+    aligned with that predicted token.  At unroll depth ``d``, row ``P`` uses
+    the base embedding, teacher and runtime mask at ``P+d``.  This differs from
+    SpecForge only in assistant-span boundary selection.  A common prefix
+    preserves every retained causal computation while excluding padded tails.
     """
 
     if ttt_length <= 0:
@@ -153,14 +155,19 @@ def build_ttt_batch(
             bad = int(safe_target[safe_target >= TARGET_VOCAB_SIZE][0])
             raise FeatureFormatError(f"target_argmax contains out-of-vocabulary id {bad}")
         draft_ids = target_to_draft[safe_target]
-        supervised = source_mask & valid_target
-        hard_supervised = supervised & (draft_ids >= 0)
+        eligible = source_mask & valid_target
+        # A target whose exact greedy top-1 is outside the fixed draft
+        # vocabulary cannot be accepted. Match SpecForge's target-mask rule for
+        # the training objective instead of teaching an impossible row.
+        supervised = eligible & (draft_ids >= 0)
+        hard_supervised = supervised
         depths.append(
             TttDepthView(
                 depth=depth,
                 embedding=np.ascontiguousarray(embedding),
                 target_ids=np.ascontiguousarray(target_ids),
                 target_draft_ids=np.ascontiguousarray(draft_ids.astype(np.int32)),
+                eligible=np.ascontiguousarray(eligible),
                 supervised=np.ascontiguousarray(supervised),
                 hard_supervised=np.ascontiguousarray(hard_supervised),
                 teacher_draft_logits_bf16=sample.teacher_draft_logits_bf16[
@@ -437,7 +444,7 @@ class FeatureStore:
             if (
                 length < 2
                 or np.any(labels[-2:] != INVALID_TOKEN_ID)
-                or loss_mask[-1] != 0
+                or np.any(loss_mask[-2:] != 0)
                 or target_argmax[-1] != INVALID_TOKEN_ID
                 or np.any(np.asarray(teacher_logits_bf16[-1]) != 0)
                 or np.any(next_embedding[-1] != 0)

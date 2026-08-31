@@ -269,10 +269,13 @@ if nn is not None:
             depth: int,
         ):
             row_count = int(hidden_state.shape[1])
-            if self._sliding_window is not None and row_count > self._sliding_window:
+            if (
+                self._sliding_window is not None
+                and row_count + depth > self._sliding_window
+            ):
                 raise ValueError(
-                    f"training rows {row_count} exceed checkpoint sliding window "
-                    f"{self._sliding_window}; chunk the sample before training"
+                    f"training logical span {row_count + depth} exceeds checkpoint "
+                    f"sliding window {self._sliding_window}; chunk the sample before training"
                 )
             return self.midlayer(
                 input_embedding,
@@ -428,11 +431,13 @@ def ttt_soft_target_loss(
     row_chunk: int = 16,
     loss_kind: str = "cross_entropy",
 ) -> Any:
-    """Official seven-depth soft teacher objective with bounded logit rows.
+    """Seven-depth soft teacher objective with bounded logit rows.
 
     The Q4 exporter has already gathered teacher logits into the immutable
     checkpoint ``d2t`` row order.  Only supervised rows are decoded from BF16,
     and each 32K projection is chunked to bound unified-memory activations.
+    The soft-target kernel and depth weighting match SpecForge; assistant-span
+    boundaries use Camelid's explicit runtime-target mask contract.
     """
 
     require_mlx()
@@ -472,8 +477,8 @@ def ttt_soft_target_loss(
             else:
                 chunk_sum = soft_target_kl(logits, teacher, reduction="sum")
             depth_sum = chunk_sum if depth_sum is None else depth_sum + chunk_sum
-        # SpecForge's masked loss means over the full retained backbone length,
-        # not only the supervised rows. Chunking must preserve that denominator.
+        # Match SpecForge's mean-over-backbone normalization on Camelid's
+        # retained overlap prefix, rather than averaging only supervised rows.
         losses.append(depth_sum / float(batch.row_count))
         weights.append(0.8**view.depth)
     if not losses:
@@ -524,7 +529,7 @@ def ttt_hard_ce_loss(model: Eagle3Head, batch) -> Any:
 
 
 def ttt_hard_ce_metrics(model: Eagle3Head, batch) -> dict[str, Any]:
-    """Evaluate mapped top-1 accuracy at every TTT depth."""
+    """Evaluate conditional mapped and unconditional runtime top-1 accuracy."""
 
     require_mlx()
     compute_dtype = model.fc.weight.dtype
@@ -536,6 +541,7 @@ def ttt_hard_ce_metrics(model: Eagle3Head, batch) -> dict[str, Any]:
     depth_metrics: list[dict[str, float | int]] = []
     total_correct = 0
     total_rows = 0
+    total_mapped_rows = 0
     for view in batch.depths:
         hidden_state = model.recurrent_step(
             mx.array(view.embedding).astype(compute_dtype)[None, ...],
@@ -544,11 +550,20 @@ def ttt_hard_ce_metrics(model: Eagle3Head, batch) -> dict[str, Any]:
             value_cache,
             depth=view.depth,
         )
+        eligible_rows = int(np.count_nonzero(view.eligible))
         positions_np = np.flatnonzero(view.hard_supervised).astype(np.int32)
         if positions_np.size == 0:
             depth_metrics.append(
-                {"depth": view.depth, "correct": 0, "rows": 0, "accuracy": 0.0}
+                {
+                    "depth": view.depth,
+                    "correct": 0,
+                    "rows": eligible_rows,
+                    "accuracy": 0.0,
+                    "mapped_rows": 0,
+                    "mapped_accuracy": 0.0,
+                }
             )
+            total_rows += eligible_rows
             continue
         targets_np = view.target_draft_ids[positions_np].astype(np.int32)
         logits = model.logits_at(hidden_state, mx.array(positions_np))
@@ -556,15 +571,18 @@ def ttt_hard_ce_metrics(model: Eagle3Head, batch) -> dict[str, Any]:
         correct_array = mx.sum(predicted == mx.array(targets_np))
         mx.eval(correct_array)
         correct = int(correct_array.item())
-        rows = int(positions_np.size)
+        mapped_rows = int(positions_np.size)
         total_correct += correct
-        total_rows += rows
+        total_rows += eligible_rows
+        total_mapped_rows += mapped_rows
         depth_metrics.append(
             {
                 "depth": view.depth,
                 "correct": correct,
-                "rows": rows,
-                "accuracy": correct / rows,
+                "rows": eligible_rows,
+                "accuracy": correct / max(eligible_rows, 1),
+                "mapped_rows": mapped_rows,
+                "mapped_accuracy": correct / mapped_rows,
             }
         )
     return {
@@ -572,4 +590,6 @@ def ttt_hard_ce_metrics(model: Eagle3Head, batch) -> dict[str, Any]:
         "correct": total_correct,
         "rows": total_rows,
         "accuracy": total_correct / max(total_rows, 1),
+        "mapped_rows": total_mapped_rows,
+        "mapped_accuracy": total_correct / max(total_mapped_rows, 1),
     }

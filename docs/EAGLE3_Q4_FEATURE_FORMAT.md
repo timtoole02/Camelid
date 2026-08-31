@@ -44,7 +44,7 @@ quantization, fixed target geometry and an ordered `{id,path,length}` sample ind
 writes each complete record independently and atomically republishes the manifest afterward, so
 a trainer can consume completed records without retaining the corpus in memory. Both the dataset
 and sample metadata pin `positional_contract` to
-`eagle3-aux-p-next-token-teacher-p1-v1`. The manifest also pins the SW512 checkpoint SHA-256,
+`eagle3-aux-p-next-token-teacher-p1-runtime-mask-p2-v1`. The manifest also pins the SW512 checkpoint SHA-256,
 `draft_mapping_sha256`, `draft_vocab_size: 32000`, and the hashed mapping payload.
 
 | File | Dtype | Shape | Meaning |

@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
+import math
 import os
 from pathlib import Path
 import shutil
-import sys
 from typing import Any
 import uuid
 
 import numpy as np
+
+EXPECTED_MLX_VERSION = "0.29.3"
+STATE_SCHEMA = "camelid-eagle3-mlx-state-v2"
+OPTIMIZER_BETAS = (0.9, 0.999)
+OPTIMIZER_EPS = 1.0e-8
+OPTIMIZER_BIAS_CORRECTION = True
 
 from .contract import (
     TENSOR_SPECS,
@@ -46,6 +54,43 @@ def _json_line(event: str, **values: Any) -> None:
     print(json.dumps({"event": event, **values}, sort_keys=True), flush=True)
 
 
+def _mlx_version() -> str:
+    try:
+        return package_version("mlx")
+    except PackageNotFoundError as error:
+        raise RuntimeError("the pinned mlx package is not installed") from error
+
+
+def _training_tool_sha256() -> str:
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for name in ("contract.py", "features.py", "model.py", "train.py"):
+        path = root / name
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _scheduled_learning_rate(
+    *, step: int, base: float, warmup_steps: int, total_steps: int
+) -> float:
+    if step <= 0 or total_steps <= 0 or step > total_steps:
+        raise ValueError("scheduler step must be within 1..total_steps")
+    if warmup_steps > 0 and step <= warmup_steps:
+        return base * step / warmup_steps
+    decay_steps = max(total_steps - warmup_steps, 1)
+    progress = min(max((step - warmup_steps) / decay_steps, 0.0), 1.0)
+    return base * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _tensor_specs(flat: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        name: {"shape": [int(value) for value in array.shape], "dtype": str(array.dtype)}
+        for name, array in sorted(flat.items())
+    }
+
+
 def _load_mapping(contract):
     weights_path = contract.checkpoint_dir / "model.safetensors"
     draft_to_target, _mask, _fingerprint = read_and_validate_mapping(
@@ -66,7 +111,8 @@ def _evaluate(
     model.eval()
     total_correct = 0
     total_rows = 0
-    per_depth = [dict(correct=0, rows=0) for _ in range(ttt_length)]
+    total_mapped_rows = 0
+    per_depth = [dict(correct=0, rows=0, mapped_rows=0) for _ in range(ttt_length)]
     limit = len(store) if max_samples is None else min(len(store), max_samples)
     for index in range(limit):
         sample = store.load(index, max_length=max_length)
@@ -74,19 +120,26 @@ def _evaluate(
         metrics = ttt_hard_ce_metrics(model, batch)
         total_correct += metrics["correct"]
         total_rows += metrics["rows"]
+        total_mapped_rows += metrics["mapped_rows"]
         for depth in metrics["depths"]:
             target = per_depth[depth["depth"]]
             target["correct"] += depth["correct"]
             target["rows"] += depth["rows"]
+            target["mapped_rows"] += depth["mapped_rows"]
     for depth, counts in enumerate(per_depth):
         counts["depth"] = depth
         counts["accuracy"] = counts["correct"] / max(counts["rows"], 1)
+        counts["mapped_accuracy"] = counts["correct"] / max(
+            counts["mapped_rows"], 1
+        )
     model.train()
     return {
         "samples": limit,
         "correct": total_correct,
         "rows": total_rows,
         "accuracy": total_correct / max(total_rows, 1),
+        "mapped_rows": total_mapped_rows,
+        "mapped_accuracy": total_correct / max(total_mapped_rows, 1),
         "depths": per_depth,
     }
 
@@ -149,7 +202,8 @@ def _load_training_state(model, optimizer, state_dir: Path, source_contract) -> 
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"cannot load training state {metadata_path}: {error}") from error
     expected = {
-        "schema": "camelid-eagle3-mlx-state-v1",
+        "schema": STATE_SCHEMA,
+        "source_weights_sha256": source_contract.weights_sha256,
         "source_config_sha256": source_contract.config_sha256,
         "source_mapping_sha256": source_contract.mapping_sha256,
     }
@@ -167,11 +221,25 @@ def _load_training_state(model, optimizer, state_dir: Path, source_contract) -> 
     if sha256_file(optimizer_path) != metadata.get("optimizer_sha256"):
         raise RuntimeError("optimizer state SHA-256 mismatch")
     model.load_weights(str(model_path), strict=True)
-    optimizer.state = tree_unflatten(mx.load(str(optimizer_path)))
+    loaded_optimizer = mx.load(str(optimizer_path))
+    if not isinstance(loaded_optimizer, dict):
+        raise RuntimeError("optimizer state is not a flat Safetensors mapping")
+    if _tensor_specs(loaded_optimizer) != metadata.get("optimizer_tensor_specs"):
+        raise RuntimeError("optimizer tensor names, shapes, or dtypes do not match state.json")
+    optimizer.state = tree_unflatten(loaded_optimizer)
     mx.eval(model.parameters(), optimizer.state)
     global_step = metadata.get("global_step")
     if not isinstance(global_step, int) or global_step < 0:
         raise RuntimeError("training state global_step is invalid")
+    optimizer_step = optimizer.state.get("step")
+    if optimizer_step is None:
+        raise RuntimeError("optimizer state has no step counter")
+    mx.eval(optimizer_step)
+    if int(optimizer_step.item()) != global_step:
+        raise RuntimeError(
+            f"optimizer step {int(optimizer_step.item())} does not match "
+            f"state global_step {global_step}"
+        )
     return global_step, metadata
 
 
@@ -204,13 +272,14 @@ def _save_training_state(
     from .contract import sha256_file
 
     metadata = {
-        "schema": "camelid-eagle3-mlx-state-v1",
+        "schema": STATE_SCHEMA,
         "global_step": global_step,
         "source_weights_sha256": source_contract.weights_sha256,
         "source_config_sha256": source_contract.config_sha256,
         "source_mapping_sha256": source_contract.mapping_sha256,
         "model_sha256": sha256_file(model_path),
         "optimizer_sha256": sha256_file(optimizer_path),
+        "optimizer_tensor_specs": _tensor_specs(optimizer_flat),
         "rng_state": rng_state,
         "training_contract": training_contract,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -238,13 +307,22 @@ def _parser() -> argparse.ArgumentParser:
         help="state directory from an earlier serialized feature shard",
     )
     parser.add_argument("--max-steps", type=int, default=1_000)
+    parser.add_argument(
+        "--total-training-steps",
+        type=int,
+        required=True,
+        help="global optimizer-step horizon used by the warmup+cosine schedule",
+    )
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--ttt-length", type=int, default=7)
     parser.add_argument(
         "--objective",
         choices=("soft_ce", "soft_kl", "hard_ce"),
         default="soft_ce",
-        help="soft_ce matches SpecForge; soft_kl differs by teacher entropy; hard_ce is an ablation",
+        help=(
+            "soft_ce uses SpecForge's soft-target kernel with Camelid's runtime-aligned "
+            "mask; soft_kl differs by teacher entropy; hard_ce is an ablation"
+        ),
     )
     parser.add_argument(
         "--loss-row-chunk",
@@ -253,13 +331,13 @@ def _parser() -> argparse.ArgumentParser:
         help="maximum supervised [rows,32000] projection per loss chunk",
     )
     parser.add_argument("--learning-rate", type=float, default=1.0e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--eval-max-samples", type=int)
-    parser.add_argument("--parameter-dtype", choices=("float32", "bfloat16"), default="float32")
+    parser.add_argument("--parameter-dtype", choices=("float32",), default="float32")
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--skip-feature-hashes", action="store_true")
     parser.add_argument(
@@ -274,10 +352,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if (
         args.max_steps <= 0
+        or args.total_training_steps <= 0
         or args.max_length <= args.ttt_length
         or args.loss_row_chunk <= 0
     ):
-        raise ValueError("max_steps must be positive and max_length must exceed ttt_length")
+        raise ValueError(
+            "max_steps/total_training_steps must be positive and max_length must exceed ttt_length"
+        )
     if args.warmup_steps < 0 or args.learning_rate <= 0:
         raise ValueError("warmup_steps must be non-negative and learning_rate positive")
     if (
@@ -288,6 +369,11 @@ def main(argv: list[str] | None = None) -> int:
     ):
         raise ValueError("intervals/grad norm must be positive and weight decay non-negative")
     require_mlx()
+    installed_mlx = _mlx_version()
+    if installed_mlx != EXPECTED_MLX_VERSION:
+        raise RuntimeError(
+            f"mlx {installed_mlx} is installed, expected pinned {EXPECTED_MLX_VERSION}"
+        )
     if not mx.metal.is_available():
         raise RuntimeError("this training path requires MLX Metal on Apple Silicon")
 
@@ -329,10 +415,36 @@ def main(argv: list[str] | None = None) -> int:
     rng = np.random.default_rng(args.seed)
     optimizer = optim.AdamW(
         learning_rate=args.learning_rate,
-        betas=(0.9, 0.95),
-        eps=1.0e-8,
+        betas=OPTIMIZER_BETAS,
+        eps=OPTIMIZER_EPS,
         weight_decay=args.weight_decay,
+        bias_correction=OPTIMIZER_BIAS_CORRECTION,
     )
+    training_contract = {
+        "ttt_length": args.ttt_length,
+        "max_length": args.max_length,
+        "parameter_dtype": args.parameter_dtype,
+        "objective": args.objective,
+        "loss_row_chunk": args.loss_row_chunk,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
+        "warmup_steps": args.warmup_steps,
+        "total_training_steps": args.total_training_steps,
+        "optimizer": "mlx.optimizers.AdamW",
+        "optimizer_betas": list(OPTIMIZER_BETAS),
+        "optimizer_eps": OPTIMIZER_EPS,
+        "optimizer_bias_correction": OPTIMIZER_BIAS_CORRECTION,
+        "schedule": "linear_warmup_then_cosine_v1",
+        "seed": args.seed,
+        "mlx_version": installed_mlx,
+        "training_tool_sha256": _training_tool_sha256(),
+        "feature_positional_contract": train_store.manifest["positional_contract"],
+        "feature_draft_mapping_sha256": train_store.manifest[
+            "draft_mapping_sha256"
+        ],
+        "target_model_sha256": train_store.manifest["target_model_sha256"],
+    }
     global_step_start = 0
     resumed_metadata = None
     if args.resume_state:
@@ -340,16 +452,7 @@ def main(argv: list[str] | None = None) -> int:
             model, optimizer, args.resume_state, source
         )
         prior_contract = resumed_metadata.get("training_contract", {})
-        invariant = {
-            "ttt_length": args.ttt_length,
-            "parameter_dtype": args.parameter_dtype,
-            "objective": args.objective,
-            "loss_row_chunk": args.loss_row_chunk,
-            "feature_draft_mapping_sha256": train_store.manifest[
-                "draft_mapping_sha256"
-            ],
-        }
-        for key, value in invariant.items():
+        for key, value in training_contract.items():
             if prior_contract.get(key) != value:
                 raise RuntimeError(
                     f"resume training contract {key}={prior_contract.get(key)!r}, "
@@ -357,6 +460,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
         if isinstance(resumed_metadata.get("rng_state"), dict):
             rng.bit_generator.state = resumed_metadata["rng_state"]
+    if global_step_start + args.max_steps > args.total_training_steps:
+        raise RuntimeError(
+            "this invocation would step beyond --total-training-steps: "
+            f"{global_step_start}+{args.max_steps}>{args.total_training_steps}"
+        )
     permutation = rng.permutation(len(train_store))
 
     def loss_fn(active_model, active_batch):
@@ -406,8 +514,12 @@ def main(argv: list[str] | None = None) -> int:
         sample_index = int(permutation[(local_step - 1) % len(permutation)])
         sample = train_store.load(sample_index, max_length=args.max_length)
         batch = build_ttt_batch(sample, target_to_draft, ttt_length=args.ttt_length)
-        warmup_scale = min(1.0, step / max(args.warmup_steps, 1))
-        optimizer.learning_rate = args.learning_rate * warmup_scale
+        optimizer.learning_rate = _scheduled_learning_rate(
+            step=step,
+            base=args.learning_rate,
+            warmup_steps=args.warmup_steps,
+            total_steps=args.total_training_steps,
+        )
         loss, gradients = loss_and_grad(model, batch)
         gradients, gradient_norm = optim.clip_grad_norm(gradients, args.max_grad_norm)
         optimizer.update(model, gradients)
@@ -468,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
             else None
         ),
         "max_steps": args.max_steps,
+        "total_training_steps": args.total_training_steps,
         "global_step_start": global_step_start,
         "global_step_end": global_step_start + args.max_steps,
         "max_length": args.max_length,
@@ -475,6 +588,10 @@ def main(argv: list[str] | None = None) -> int:
         "loss_row_chunk": args.loss_row_chunk,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "optimizer_betas": list(OPTIMIZER_BETAS),
+        "optimizer_eps": OPTIMIZER_EPS,
+        "optimizer_bias_correction": OPTIMIZER_BIAS_CORRECTION,
+        "schedule": "linear_warmup_then_cosine_v1",
         "max_grad_norm": args.max_grad_norm,
         "seed": args.seed,
         "parameter_dtype": args.parameter_dtype,
@@ -486,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         "pilot_quality_gate_passed": (
             relative_accuracy_gain is not None and relative_accuracy_gain >= 0.10
         ),
-        "mlx_version": getattr(sys.modules.get("mlx"), "__version__", "unknown"),
+        "mlx_version": installed_mlx,
         "pid": os.getpid(),
     }
     exported = _export_serving_checkpoint(
@@ -500,15 +617,7 @@ def main(argv: list[str] | None = None) -> int:
             source,
             global_step=global_step_start + args.max_steps,
             rng_state=rng.bit_generator.state,
-            training_contract={
-                "ttt_length": args.ttt_length,
-                "parameter_dtype": args.parameter_dtype,
-                "objective": args.objective,
-                "loss_row_chunk": args.loss_row_chunk,
-                "feature_draft_mapping_sha256": train_store.manifest[
-                    "draft_mapping_sha256"
-                ],
-            },
+            training_contract=training_contract,
         )
         _json_line(
             "state",

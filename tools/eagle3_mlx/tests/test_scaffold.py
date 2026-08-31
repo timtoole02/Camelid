@@ -38,6 +38,7 @@ from tools.eagle3_mlx.model import (
     soft_target_kl,
     soft_target_kl_numpy,
 )
+from tools.eagle3_mlx.train import _scheduled_learning_rate
 
 try:
     import mlx.core as mx
@@ -104,6 +105,22 @@ class ContractTests(unittest.TestCase):
             path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"\0" * 5)
             with self.assertRaisesRegex(ContractError, "dense payload offset"):
                 parse_safetensors_header(path)
+
+    def test_warmup_cosine_schedule_is_global_and_bounded(self):
+        values = [
+            _scheduled_learning_rate(
+                step=step, base=1.0, warmup_steps=2, total_steps=6
+            )
+            for step in range(1, 7)
+        ]
+        self.assertEqual(values[:2], [0.5, 1.0])
+        self.assertGreater(values[2], values[3])
+        self.assertGreater(values[3], values[4])
+        self.assertEqual(values[-1], 0.0)
+        with self.assertRaises(ValueError):
+            _scheduled_learning_rate(
+                step=7, base=1.0, warmup_steps=2, total_steps=6
+            )
 
 
 class FeatureStoreTests(unittest.TestCase):
@@ -252,11 +269,39 @@ class FeatureStoreTests(unittest.TestCase):
                 float(batch.depths[2].teacher_logits_at(np.array([1]))[0, 0]),
                 23.0,
             )
-            # Source loss mask shifts once per TTT depth, exactly like SpecForge.
+            # The exported mask is already aligned to the token predicted by
+            # each base teacher row; TTT shifts that runtime-aligned mask once
+            # per recurrent depth.
             self.assertFalse(bool(batch.depths[0].supervised[2]))
             self.assertTrue(bool(batch.depths[0].supervised[3]))
             self.assertTrue(bool(batch.depths[2].supervised[1]))
             self.assertEqual(int(batch.depths[2].target_draft_ids[1]), 203)
+
+    def test_unmapped_target_is_eligible_but_never_trainable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_store(root)
+            store = FeatureStore(root)
+            sample = store.load(0)
+            inverse = np.full(TARGET_VOCAB_SIZE, -1, dtype=np.int32)
+            inverse[:DRAFT_VOCAB_SIZE] = np.arange(DRAFT_VOCAB_SIZE, dtype=np.int32)
+            inverse[203] = -1
+            batch = build_ttt_batch(sample, inverse, ttt_length=3)
+            self.assertTrue(bool(batch.depths[0].eligible[3]))
+            self.assertFalse(bool(batch.depths[0].supervised[3]))
+            self.assertFalse(bool(batch.depths[0].hard_supervised[3]))
+
+    def test_reader_requires_two_runtime_mask_sentinels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample_dir = self._write_store(root)
+            path = sample_dir / "loss_mask.u8"
+            data = bytearray(path.read_bytes())
+            data[-2] = 1
+            path.write_bytes(data)
+            store = FeatureStore(root, verify_hashes=False)
+            with self.assertRaisesRegex(FeatureFormatError, "sentinel/masked"):
+                store.load(0)
 
     def test_checksum_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

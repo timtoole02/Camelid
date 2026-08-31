@@ -5,12 +5,13 @@ EAGLE-3 head. It does not load the 3B target into the MLX process and it does no
 prepared Pitch response. The teacher signal is captured by Camelid's production Q4 target and
 the trainer learns from a broad corpus of target-authoritative continuations.
 
-The default objective is SpecForge's official seven-depth soft-target cross entropy after
-renormalizing the exact Q4 teacher logits over the checkpoint's fixed 32K `d2t` rows. It is KL
-distillation up to the teacher-entropy constant. `--objective soft_kl` subtracts that constant and
-has identical gradients when a true KL scalar is desired. `target_argmax` is used only for mapped
-top-1 accuracy. Hard-label cross entropy remains the explicit `--objective hard_ce` ablation; it
-is not the default.
+The default objective uses SpecForge's seven-depth soft-target cross-entropy kernel and depth
+weights after renormalizing the exact Q4 teacher logits over the checkpoint's fixed 32K `d2t`
+rows. It is KL distillation up to the teacher-entropy constant. `--objective soft_kl` subtracts
+that constant and has identical gradients when a true KL scalar is desired. Camelid deliberately
+aligns supervision to the token each runtime EAGLE row predicts; that assistant-span boundary
+choice is explicit in the positional contract and differs from SpecForge's raw mask convention.
+Hard-label cross entropy remains the explicit `--objective hard_ce` ablation.
 
 ## Pinned serving contract
 
@@ -31,23 +32,31 @@ mapping, and records all SHA-256 values.
 ## Training alignment
 
 The required positional contract is named
-`eagle3-aux-p-next-token-teacher-p1-v1`. Exporter base row `P` contains target auxiliary state
+`eagle3-aux-p-next-token-teacher-p1-runtime-mask-p2-v1`. Exporter base row `P` contains target auxiliary state
 from capture row `P`, the embedding of token `P+1`, and the target distribution captured after
 row `P+1` (the distribution predicting token `P+2`). Thus at TTT step `j`, backbone row `P` uses
 base embedding, teacher distribution and loss mask at `P+j`, while recurrence begins from
 `aux[P]`. The loader rejects stores without this versioned contract.
 
-The trainer implements the same recurrence as the official EAGLE-3 SDPA path:
+The trainer implements the same cell recurrence as the EAGLE-3 SDPA path:
 
 1. Fuse pre-layer residual taps `[2,14,25]` with `fc.weight`.
 2. At depth zero, use ordinary causal attention over the first EAGLE K/V stream.
 3. At later depths, attend to that causal stream plus one same-position recurrent K/V entry per
    earlier depth.
-4. Shift the already-left-shifted embedding, teacher and loss-mask rows once per depth.
+4. Shift the next-token embedding, P+1 teacher, and runtime-P+2 mask rows once per depth.
 5. Apply SpecForge's depth weights `0.8 ** d`.
 
-The common retained prefix has `T - ttt_length` rows. Dropping only the padded tail is exactly
-equivalent for those causal rows and avoids wasting unified memory on invalid logits.
+Training keeps FP32 master weights and FP32 Adam moments. The pinned recipe is AdamW with
+betas `(0.9, 0.999)`, epsilon `1e-8`, bias correction enabled, zero default weight decay, and a
+global linear-warmup/cosine schedule. `--total-training-steps` is required and is part of the
+resume contract, so serialized shards cannot silently restart or change the schedule.
+
+The common retained prefix has `T - ttt_length` rows. Every retained causal row is equivalent to
+the corresponding full recurrence row, but the last seven possible anchors are intentionally
+excluded and the loss denominator is the retained prefix length. This overlap-prefix choice avoids
+wasting unified memory on padded logits and is not claimed to be a bit-identical full-length
+SpecForge objective.
 
 ## Feature schema
 
@@ -90,14 +99,13 @@ Use a dedicated environment on the Apple-Silicon training host. The scaffold tar
 documented MLX API and pins it for reproducibility:
 
 ```bash
-python3.12 -m venv .venv-eagle3-mlx
+python3 -m venv .venv-eagle3-mlx
 source .venv-eagle3-mlx/bin/activate
 python -m pip install --upgrade pip
-python -m pip install 'mlx==0.32.2' 'numpy==2.3.2'
+python -m pip install 'mlx==0.29.3' 'numpy==2.0.2' 'safetensors==0.7.0' 'pytest==8.4.2'
 ```
 
-No package was installed while developing this branch. The current host did not already contain
-MLX, so the device training step still needs its first controlled smoke run. The format, mapping,
+These are the exact versions used by the controlled Mini2 device smoke. The format, mapping,
 shift, checksum, BF16 and independent NumPy KL parity tests run without MLX. One additional MLX
 versus NumPy parity test automatically runs when MLX is present and is skipped otherwise.
 
@@ -140,6 +148,7 @@ PYTHONPATH=. python -m tools.eagle3_mlx.train \
   --output-dir /path/to/exports/smoke-0000 \
   --state-output /path/to/states/state-0000 \
   --max-steps 2 \
+  --total-training-steps 2400 \
   --max-length 256 \
   --ttt-length 7 \
   --objective soft_ce \
@@ -175,6 +184,7 @@ PYTHONPATH=. python -m tools.eagle3_mlx.train \
   --output-dir /path/to/exports/shard-0001 \
   --state-output /path/to/states/state-0001 \
   --max-steps 8 \
+  --total-training-steps 2400 \
   --max-length 512 \
   --ttt-length 7 \
   --objective soft_ce \
@@ -204,8 +214,10 @@ Exclude the Pitch prompt, its repository URLs, distinctive requirement list, res
 paraphrases. Hash the split before target capture. The exact Pitch prompt remains a final canary,
 not a model-selection metric.
 
-The MLX pilot gate is at least 10% relative mapped top-1 improvement with no material general/code
-regression. That metric is not a throughput claim. The decisive Camelid gates are:
+The MLX pilot gate is at least 10% relative improvement in unconditional eligible-row top-1
+accuracy with no material general/code regression. Conditional mapped accuracy is reported only
+as a diagnostic; an unmapped target top-1 is counted as the guaranteed runtime rejection it is.
+Neither training metric is a throughput claim. The decisive Camelid gates are:
 
 - ordered output token equality against target-only decode;
 - no increase in EAGLE round latency;
