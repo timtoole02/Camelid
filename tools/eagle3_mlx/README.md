@@ -109,6 +109,50 @@ These are the exact versions used by the controlled Mini2 device smoke. The form
 shift, checksum, BF16 and independent NumPy KL parity tests run without MLX. One additional MLX
 versus NumPy parity test automatically runs when MLX is present and is skipped otherwise.
 
+## Mandatory EAGLE cell parity gate
+
+Before a full training run, compare the MLX training cell directly with Camelid's dense-BF16
+Metal serving cell. This synthetic gate loads only the 15-tensor draft head: it never loads the
+3B target or reads a prompt. It covers FC feature fusion, a four-row causal depth-zero pass, two
+same-row recurrent depths, RoPE positions, the private KV path, raw hidden states, the 32K head,
+and ordered top-8 rankings.
+
+First write a new Camelid fixture under the Mini2 workload lock. Approximate EAGLE environment
+variables are deliberately unset; the fixture command refuses them if they leak in:
+
+```bash
+CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh env \
+  -u CAMELID_EAGLE3_LM_HEAD_ROWS \
+  -u CAMELID_EAGLE3_LM_HEAD_Q8 \
+  -u CAMELID_EAGLE3_BODY_Q8 \
+  cargo run --release --example eagle3_cell_fixture -- \
+  --eagle3 /path/to/Llama-3.2-3B-Instruct-Eagle3-ShareGPT-SW512 \
+  --output /path/to/parity/camelid-cell-v1 \
+  --rows 4 \
+  --depths 3
+```
+
+After that process exits, run MLX against the hash-pinned fixture and write a new receipt:
+
+```bash
+CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh env \
+  PYTHONPATH=. \
+  .venv-eagle3-mlx/bin/python -m tools.eagle3_mlx.cell_parity \
+  --warm-start /path/to/Llama-3.2-3B-Instruct-Eagle3-ShareGPT-SW512 \
+  --fixture /path/to/parity/camelid-cell-v1 \
+  --parameter-dtype float32 \
+  --receipt /path/to/parity/mlx-cell-v1.json
+```
+
+The default gate requires identical greedy and ordered top-8 draft IDs at every depth, FC
+max-absolute error at most `0.02`, hidden max/mean error at most `0.08/0.008`, hidden cosine at
+least `0.9999`, and retained-logit max error at most `0.1`. These bounds accommodate Camelid's
+F16 serving KV cache versus MLX's training cache without accepting an obvious architectural
+mismatch. They are predeclared engineering bounds, not post-hoc calibration: no real-device
+receipt existed when the harness was added. Treat a failure as a blocker and inspect the
+per-depth receipt; do not widen thresholds merely to make a run pass. The first real-device
+receipt remains necessary because the development host may not have MLX installed.
+
 ## One-shard smoke test
 
 Build the feature-export branch first, then serialize target capture under the Mini2 lock. The
