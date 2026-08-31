@@ -2187,14 +2187,15 @@ fn load_eagle3_checkpoint_cached(
             weights_path.display()
         ))
     })?;
-    if sha256 != EAGLE3_THOUGHTWORKS_SHA256
-        && sha256 != EAGLE3_SHAREGPT_E8_SHA256
-        && sha256 != EAGLE3_SHAREGPT_E9_SHA256
-    {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "EAGLE-3 checkpoint SHA-256 {sha256} is not one of the three pinned serving artifacts ({EAGLE3_THOUGHTWORKS_SHA256}, {EAGLE3_SHAREGPT_E8_SHA256}, {EAGLE3_SHAREGPT_E9_SHA256})"
-        )));
-    }
+    let is_pinned_serving_artifact = sha256 == EAGLE3_THOUGHTWORKS_SHA256
+        || sha256 == EAGLE3_SHAREGPT_E8_SHA256
+        || sha256 == EAGLE3_SHAREGPT_E9_SHA256;
+    let derived_provenance = if is_pinned_serving_artifact {
+        None
+    } else {
+        crate::eagle3::require_derived_opt_in()?;
+        Some(crate::eagle3::validate_derived_checkpoint(path, &sha256)?)
+    };
     let pinned_sharegpt_config = match sha256.as_str() {
         EAGLE3_SHAREGPT_E8_SHA256 => Some(("ShareGPT-E8", EAGLE3_SHAREGPT_E8_CONFIG_SHA256)),
         EAGLE3_SHAREGPT_E9_SHA256 => Some(("ShareGPT-E9", EAGLE3_SHAREGPT_E9_CONFIG_SHA256)),
@@ -2229,18 +2230,26 @@ fn load_eagle3_checkpoint_cached(
     }
 
     let model = Arc::new(Eagle3DraftModel::load(path)?);
-    let config_variant_matches = if sha256 == EAGLE3_THOUGHTWORKS_SHA256 {
+    let config_contract_sha256 = derived_provenance
+        .as_ref()
+        .map(|provenance| provenance.source_weights_sha256.as_str())
+        .unwrap_or(sha256.as_str());
+    let config_variant_matches = if config_contract_sha256 == EAGLE3_THOUGHTWORKS_SHA256 {
         model.config.architectures == ["LlamaForCausalLM"]
             && model.config.rope_theta == crate::eagle3::ROPE_THETA
             && model.config.sliding_window.is_none()
-    } else if sha256 == EAGLE3_SHAREGPT_E8_SHA256 {
+    } else if config_contract_sha256 == EAGLE3_SHAREGPT_E8_SHA256 {
         model.config.architectures == ["LlamaForCausalLMEagle3"]
             && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
             && model.config.sliding_window.is_none()
-    } else {
+    } else if config_contract_sha256 == EAGLE3_SHAREGPT_E9_SHA256 {
         model.config.architectures == ["LlamaForCausalLMEagle3"]
             && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
             && model.config.sliding_window == Some(256)
+    } else {
+        model.config.architectures == ["LlamaForCausalLMEagle3"]
+            && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
+            && model.config.sliding_window == Some(512)
     };
     if !config_variant_matches {
         return Err(BackendError::InvalidModelMetadata(format!(

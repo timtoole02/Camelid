@@ -38,8 +38,34 @@ pub const TARGET_LAYER_INPUT_IDS: [usize; 3] = [2, 14, 25];
 
 const CONFIG_FILE: &str = "config.json";
 const WEIGHTS_FILE: &str = "model.safetensors";
+const TRAINING_RECEIPT_FILE: &str = "training-receipt.json";
 const EXPECTED_TENSOR_COUNT: usize = 15;
 const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+
+pub const DERIVED_ALLOW_ENV: &str = "CAMELID_EAGLE3_ALLOW_DERIVED";
+pub const DERIVED_TRAINING_RECEIPT_SCHEMA: &str =
+    "camelid-eagle3-mlx-training-receipt-v1";
+pub const THOUGHTWORKS_WEIGHTS_SHA256: &str =
+    "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
+pub const SHAREGPT_E8_WEIGHTS_SHA256: &str =
+    "0694d52a4c7ebf3d4f9bb833cf5f2610f0cc0d30bf62a2376e0b2ee06cbe3662";
+pub const SHAREGPT_E8_CONFIG_SHA256: &str =
+    "1f6f8e7dcf67648757016925e28b09c40461e22b0ffe522b9abc9802ec14eff8";
+pub const SHAREGPT_E9_WEIGHTS_SHA256: &str =
+    "0192ee37dff4b7a86d13011d40e9cf622b331fe76f637d7d1ea24c4b81574304";
+pub const SHAREGPT_E9_CONFIG_SHA256: &str =
+    "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
+pub const SHAREGPT_SW512_E9_WEIGHTS_SHA256: &str =
+    "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
+pub const SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
+    "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
+
+pub const PINNED_WEIGHTS_SHA256: [&str; 4] = [
+    THOUGHTWORKS_WEIGHTS_SHA256,
+    SHAREGPT_E8_WEIGHTS_SHA256,
+    SHAREGPT_E9_WEIGHTS_SHA256,
+    SHAREGPT_SW512_E9_WEIGHTS_SHA256,
+];
 
 const D2T: &str = "d2t";
 const FC: &str = "fc.weight";
@@ -77,6 +103,34 @@ pub struct Eagle3Config {
     /// full-causal runtime only while every possible draft-head position remains
     /// within the window, where the two masks are mathematically identical.
     pub sliding_window: Option<usize>,
+}
+
+/// Cryptographically validated provenance for an explicitly admitted derived EAGLE head.
+/// The full checkpoint loader still validates every config field and all 15 tensor descriptors
+/// before the head can execute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Eagle3DerivedProvenance {
+    pub schema: String,
+    pub receipt_sha256: String,
+    pub output_weights_sha256: String,
+    pub output_config_sha256: String,
+    pub output_mapping_sha256: String,
+    pub source_weights_sha256: String,
+    pub source_config_sha256: String,
+    pub source_mapping_sha256: String,
+    pub tensor_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct Eagle3TrainingReceipt {
+    schema: String,
+    output_weights_sha256: String,
+    output_config_sha256: String,
+    output_mapping_sha256: String,
+    source_weights_sha256: String,
+    source_config_sha256: String,
+    source_mapping_sha256: String,
+    tensor_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +362,231 @@ fn io_error(path: &Path, source: std::io::Error) -> BackendError {
         path: path.to_path_buf(),
         source,
     }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_derived_opt_in_value(value: Option<&std::ffi::OsStr>) -> Result<()> {
+    if value == Some(std::ffi::OsStr::new("1")) {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "derived EAGLE-3 checkpoints are disabled; set {DERIVED_ALLOW_ENV}=1 explicitly (got {value:?})"
+        )))
+    }
+}
+
+/// Require the one exact process-level opt-in accepted for non-pinned EAGLE checkpoints.
+pub fn require_derived_opt_in() -> Result<()> {
+    let value = std::env::var_os(DERIVED_ALLOW_ENV);
+    validate_derived_opt_in_value(value.as_deref())
+}
+
+fn mapping_sha256(d2t_dtype: &str, raw_d2t: &[u8], raw_t2d: &[u8]) -> String {
+    // This is the exact mapping contract emitted by tools/eagle3_mlx/contract.py.
+    // Include the encoded d2t dtype and both validated payloads so a receipt cannot
+    // silently authorize a representation change that merely decodes to the same IDs.
+    let mut bytes = Vec::with_capacity(d2t_dtype.len() + raw_d2t.len() + raw_t2d.len());
+    bytes.extend_from_slice(d2t_dtype.as_bytes());
+    bytes.extend_from_slice(raw_d2t);
+    bytes.extend_from_slice(raw_t2d);
+    crate::receipt::sha256_hex(&bytes)
+}
+
+fn config_matches_pinned_source(config: &Eagle3Config, source_weights_sha256: &str) -> bool {
+    match source_weights_sha256 {
+        THOUGHTWORKS_WEIGHTS_SHA256 => {
+            config.architectures == ["LlamaForCausalLM"]
+                && config.rope_theta == ROPE_THETA
+                && config.sliding_window.is_none()
+        }
+        SHAREGPT_E8_WEIGHTS_SHA256 => {
+            config.architectures == ["LlamaForCausalLMEagle3"]
+                && config.rope_theta == SHAREGPT_ROPE_THETA
+                && config.sliding_window.is_none()
+        }
+        SHAREGPT_E9_WEIGHTS_SHA256 => {
+            config.architectures == ["LlamaForCausalLMEagle3"]
+                && config.rope_theta == SHAREGPT_ROPE_THETA
+                && config.sliding_window == Some(256)
+        }
+        SHAREGPT_SW512_E9_WEIGHTS_SHA256 => {
+            config.architectures == ["LlamaForCausalLMEagle3"]
+                && config.rope_theta == SHAREGPT_ROPE_THETA
+                && config.sliding_window == Some(512)
+        }
+        _ => false,
+    }
+}
+
+fn validate_derived_receipt_fields(
+    receipt_bytes: &[u8],
+    receipt_sha256: String,
+    actual_weights_sha256: &str,
+    actual_config_sha256: &str,
+    actual_mapping_sha256: &str,
+    config: &Eagle3Config,
+) -> Result<Eagle3DerivedProvenance> {
+    let receipt: Eagle3TrainingReceipt = serde_json::from_slice(receipt_bytes).map_err(|error| {
+        invalid(format!(
+            "invalid derived EAGLE-3 {TRAINING_RECEIPT_FILE}: {error}"
+        ))
+    })?;
+    if receipt.schema != DERIVED_TRAINING_RECEIPT_SCHEMA {
+        return Err(invalid(format!(
+            "derived EAGLE-3 receipt schema is {:?}, expected {DERIVED_TRAINING_RECEIPT_SCHEMA:?}",
+            receipt.schema
+        )));
+    }
+    for (field, value) in [
+        ("output_weights_sha256", &receipt.output_weights_sha256),
+        ("output_config_sha256", &receipt.output_config_sha256),
+        ("output_mapping_sha256", &receipt.output_mapping_sha256),
+        ("source_weights_sha256", &receipt.source_weights_sha256),
+        ("source_config_sha256", &receipt.source_config_sha256),
+        ("source_mapping_sha256", &receipt.source_mapping_sha256),
+    ] {
+        if !is_lowercase_sha256(value) {
+            return Err(invalid(format!(
+                "derived EAGLE-3 receipt field {field} must be exactly 64 lowercase hexadecimal characters"
+            )));
+        }
+    }
+    if receipt.tensor_count != EXPECTED_TENSOR_COUNT {
+        return Err(invalid(format!(
+            "derived EAGLE-3 receipt tensor_count is {}, expected {EXPECTED_TENSOR_COUNT}",
+            receipt.tensor_count
+        )));
+    }
+    for (field, declared, actual) in [
+        (
+            "output_weights_sha256",
+            receipt.output_weights_sha256.as_str(),
+            actual_weights_sha256,
+        ),
+        (
+            "output_config_sha256",
+            receipt.output_config_sha256.as_str(),
+            actual_config_sha256,
+        ),
+        (
+            "output_mapping_sha256",
+            receipt.output_mapping_sha256.as_str(),
+            actual_mapping_sha256,
+        ),
+    ] {
+        if declared != actual {
+            return Err(invalid(format!(
+                "derived EAGLE-3 receipt {field} is {declared}, actual artifact is {actual}"
+            )));
+        }
+    }
+    if !PINNED_WEIGHTS_SHA256.contains(&receipt.source_weights_sha256.as_str()) {
+        return Err(invalid(format!(
+            "derived EAGLE-3 source_weights_sha256 {} is not a pinned source checkpoint",
+            receipt.source_weights_sha256
+        )));
+    }
+    if receipt.source_config_sha256 != receipt.output_config_sha256 {
+        return Err(invalid(format!(
+            "derived EAGLE-3 changed the source config contract: source={} output={}",
+            receipt.source_config_sha256, receipt.output_config_sha256
+        )));
+    }
+    if receipt.source_mapping_sha256 != receipt.output_mapping_sha256 {
+        return Err(invalid(format!(
+            "derived EAGLE-3 changed the source d2t/t2d mapping contract: source={} output={}",
+            receipt.source_mapping_sha256, receipt.output_mapping_sha256
+        )));
+    }
+    let pinned_source_config = match receipt.source_weights_sha256.as_str() {
+        SHAREGPT_E8_WEIGHTS_SHA256 => Some(SHAREGPT_E8_CONFIG_SHA256),
+        SHAREGPT_E9_WEIGHTS_SHA256 => Some(SHAREGPT_E9_CONFIG_SHA256),
+        SHAREGPT_SW512_E9_WEIGHTS_SHA256 => Some(SHAREGPT_SW512_E9_CONFIG_SHA256),
+        _ => None,
+    };
+    if let Some(expected) = pinned_source_config {
+        if receipt.source_config_sha256 != expected {
+            return Err(invalid(format!(
+                "derived EAGLE-3 source config SHA-256 is {}, expected {expected} for source weights {}",
+                receipt.source_config_sha256, receipt.source_weights_sha256
+            )));
+        }
+    }
+    if !config_matches_pinned_source(config, &receipt.source_weights_sha256) {
+        return Err(invalid(format!(
+            "derived EAGLE-3 config variant does not match pinned source weights {}",
+            receipt.source_weights_sha256
+        )));
+    }
+    Ok(Eagle3DerivedProvenance {
+        schema: receipt.schema,
+        receipt_sha256,
+        output_weights_sha256: receipt.output_weights_sha256,
+        output_config_sha256: receipt.output_config_sha256,
+        output_mapping_sha256: receipt.output_mapping_sha256,
+        source_weights_sha256: receipt.source_weights_sha256,
+        source_config_sha256: receipt.source_config_sha256,
+        source_mapping_sha256: receipt.source_mapping_sha256,
+        tensor_count: receipt.tensor_count,
+    })
+}
+
+/// Validate the standard MLX training receipt and the immutable contract surfaces of a derived
+/// checkpoint. Callers must separately require `CAMELID_EAGLE3_ALLOW_DERIVED=1` before invoking
+/// this function. The ordinary full loader remains authoritative for matrix payload loading.
+pub fn validate_derived_checkpoint(
+    dir: &Path,
+    actual_weights_sha256: &str,
+) -> Result<Eagle3DerivedProvenance> {
+    if !is_lowercase_sha256(actual_weights_sha256) {
+        return Err(invalid(
+            "actual derived EAGLE-3 weights SHA-256 is not lowercase hexadecimal",
+        ));
+    }
+    let config_path = dir.join(CONFIG_FILE);
+    let weights_path = dir.join(WEIGHTS_FILE);
+    let receipt_path = dir.join(TRAINING_RECEIPT_FILE);
+    let config_bytes = fs::read(&config_path).map_err(|source| io_error(&config_path, source))?;
+    let config = parse_and_validate_config(&config_bytes)?;
+    let actual_config_sha256 = crate::receipt::sha256_hex(&config_bytes);
+
+    // Validate the complete 15-tensor header and byte layout, but read only the mapping tensors
+    // here. The full loader repeats this gate before loading matrices into the runtime.
+    let (mut file, payload_start, descriptors) = open_weights(&weights_path)?;
+    let d2t_descriptor = descriptor(&descriptors, D2T)?;
+    let raw_d2t = read_tensor(
+        &mut file,
+        &weights_path,
+        payload_start,
+        d2t_descriptor,
+    )?;
+    let (_, draft_to_target) = decode_d2t(&raw_d2t, DRAFT_VOCAB_SIZE, TARGET_VOCAB_SIZE)?;
+    let raw_t2d = read_tensor(
+        &mut file,
+        &weights_path,
+        payload_start,
+        descriptor(&descriptors, T2D)?,
+    )?;
+    decode_and_validate_t2d(&raw_t2d, TARGET_VOCAB_SIZE, &draft_to_target)?;
+    let actual_mapping_sha256 = mapping_sha256(d2t_descriptor.dtype, &raw_d2t, &raw_t2d);
+
+    let receipt_bytes =
+        fs::read(&receipt_path).map_err(|source| io_error(&receipt_path, source))?;
+    let receipt_sha256 = crate::receipt::sha256_hex(&receipt_bytes);
+    validate_derived_receipt_fields(
+        &receipt_bytes,
+        receipt_sha256,
+        actual_weights_sha256,
+        &actual_config_sha256,
+        &actual_mapping_sha256,
+        &config,
+    )
 }
 
 fn require_equal<T: Debug + PartialEq>(field: &str, actual: &T, expected: &T) -> Result<()> {
@@ -566,6 +845,7 @@ struct HeaderTensor {
 struct TensorDescriptor {
     start: u64,
     end: u64,
+    dtype: &'static str,
 }
 
 impl TensorDescriptor {
@@ -698,7 +978,8 @@ fn parse_and_validate_header(
                 end - start
             )));
         }
-        let descriptor = TensorDescriptor { start, end };
+        let dtype = if tensor.dtype == "I64" { "I64" } else { spec.dtype };
+        let descriptor = TensorDescriptor { start, end, dtype };
         descriptors.insert(spec.name, descriptor);
         ranges.push((start, end, spec.name));
     }
@@ -1035,6 +1316,105 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    fn derived_receipt_json(
+        output_weights_sha256: &str,
+        output_config_sha256: &str,
+        output_mapping_sha256: &str,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema": DERIVED_TRAINING_RECEIPT_SCHEMA,
+            "output_weights_sha256": output_weights_sha256,
+            "output_config_sha256": output_config_sha256,
+            "output_mapping_sha256": output_mapping_sha256,
+            "source_weights_sha256": THOUGHTWORKS_WEIGHTS_SHA256,
+            "source_config_sha256": output_config_sha256,
+            "source_mapping_sha256": output_mapping_sha256,
+            "tensor_count": EXPECTED_TENSOR_COUNT,
+            "objective": "official-specforge-soft-ce",
+            "metrics": {"steps": 0},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn derived_checkpoint_is_rejected_without_exact_opt_in() {
+        assert!(validate_derived_opt_in_value(None).is_err());
+        assert!(validate_derived_opt_in_value(Some(std::ffi::OsStr::new("0"))).is_err());
+        assert!(validate_derived_opt_in_value(Some(std::ffi::OsStr::new("true"))).is_err());
+        validate_derived_opt_in_value(Some(std::ffi::OsStr::new("1"))).unwrap();
+    }
+
+    #[test]
+    fn derived_receipt_accepts_standard_provenance_and_extra_audit_fields() {
+        let weights = "aa".repeat(32);
+        let config_hash = "bb".repeat(32);
+        let mapping = "cc".repeat(32);
+        let config = parse_and_validate_config(PINNED_CONFIG.as_bytes()).unwrap();
+        let receipt = derived_receipt_json(&weights, &config_hash, &mapping);
+        let provenance = validate_derived_receipt_fields(
+            &receipt,
+            "dd".repeat(32),
+            &weights,
+            &config_hash,
+            &mapping,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(provenance.schema, DERIVED_TRAINING_RECEIPT_SCHEMA);
+        assert_eq!(provenance.source_weights_sha256, THOUGHTWORKS_WEIGHTS_SHA256);
+        assert_eq!(provenance.tensor_count, EXPECTED_TENSOR_COUNT);
+    }
+
+    #[test]
+    fn derived_receipt_rejects_hash_and_contract_tampering() {
+        let weights = "aa".repeat(32);
+        let config_hash = "bb".repeat(32);
+        let mapping = "cc".repeat(32);
+        let config = parse_and_validate_config(PINNED_CONFIG.as_bytes()).unwrap();
+
+        let wrong_actual = validate_derived_receipt_fields(
+            &derived_receipt_json(&weights, &config_hash, &mapping),
+            "dd".repeat(32),
+            &"ee".repeat(32),
+            &config_hash,
+            &mapping,
+            &config,
+        )
+        .unwrap_err();
+        assert!(wrong_actual.to_string().contains("output_weights_sha256"));
+
+        let mut changed_mapping: Value =
+            serde_json::from_slice(&derived_receipt_json(&weights, &config_hash, &mapping))
+                .unwrap();
+        changed_mapping["source_mapping_sha256"] = Value::String("ee".repeat(32));
+        let changed_mapping = serde_json::to_vec(&changed_mapping).unwrap();
+        let error = validate_derived_receipt_fields(
+            &changed_mapping,
+            "dd".repeat(32),
+            &weights,
+            &config_hash,
+            &mapping,
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mapping contract"));
+
+        let mut wrong_count: Value =
+            serde_json::from_slice(&derived_receipt_json(&weights, &config_hash, &mapping))
+                .unwrap();
+        wrong_count["tensor_count"] = json!(14);
+        let error = validate_derived_receipt_fields(
+            &serde_json::to_vec(&wrong_count).unwrap(),
+            "dd".repeat(32),
+            &weights,
+            &config_hash,
+            &mapping,
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tensor_count"));
     }
 
     #[test]

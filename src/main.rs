@@ -11083,6 +11083,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_EAGLE3_LM_HEAD_Q8",
         "CAMELID_EAGLE3_LM_HEAD_ROWS",
         "CAMELID_EAGLE3_ADAPTIVE_BRANCHING",
+        "CAMELID_EAGLE3_ALLOW_DERIVED",
         "CAMELID_METAL_LINEAR",
         "CAMELID_METAL_Q8",
         "CAMELID_METAL_RESIDENT_DECODE",
@@ -11113,6 +11114,55 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
     KEYS.iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
         .collect()
+}
+
+fn eagle3_effective_env_with_derived_provenance(
+    provenance: Option<&camelid::eagle3::Eagle3DerivedProvenance>,
+) -> BTreeMap<String, Option<String>> {
+    let mut values = eagle3_effective_env();
+    if let Some(provenance) = provenance {
+        for (key, value) in [
+            (
+                "CAMELID_EAGLE3_DERIVED_PROVENANCE_SCHEMA",
+                provenance.schema.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_RECEIPT_SHA256",
+                provenance.receipt_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_OUTPUT_WEIGHTS_SHA256",
+                provenance.output_weights_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_OUTPUT_CONFIG_SHA256",
+                provenance.output_config_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_OUTPUT_MAPPING_SHA256",
+                provenance.output_mapping_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_SOURCE_WEIGHTS_SHA256",
+                provenance.source_weights_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_SOURCE_CONFIG_SHA256",
+                provenance.source_config_sha256.as_str(),
+            ),
+            (
+                "CAMELID_EAGLE3_DERIVED_SOURCE_MAPPING_SHA256",
+                provenance.source_mapping_sha256.as_str(),
+            ),
+        ] {
+            values.insert(key.to_string(), Some(value.to_string()));
+        }
+        values.insert(
+            "CAMELID_EAGLE3_DERIVED_TENSOR_COUNT".to_string(),
+            Some(provenance.tensor_count.to_string()),
+        );
+    }
+    values
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11472,16 +11522,19 @@ fn run_bench_eagle3(
             eagle3_weights.display()
         )
     })?;
-    let eagle3_revision = match eagle3_sha256.as_str() {
-        PINNED_EAGLE3_THOUGHTWORKS_SHA256 => PINNED_EAGLE3_THOUGHTWORKS_REVISION,
-        PINNED_EAGLE3_SHAREGPT_E8_SHA256 => PINNED_EAGLE3_SHAREGPT_E8_REVISION,
-        PINNED_EAGLE3_SHAREGPT_E9_SHA256 => PINNED_EAGLE3_SHAREGPT_E9_REVISION,
+    let (eagle3_revision, eagle3_derived_provenance) = match eagle3_sha256.as_str() {
+        PINNED_EAGLE3_THOUGHTWORKS_SHA256 => (PINNED_EAGLE3_THOUGHTWORKS_REVISION, None),
+        PINNED_EAGLE3_SHAREGPT_E8_SHA256 => (PINNED_EAGLE3_SHAREGPT_E8_REVISION, None),
+        PINNED_EAGLE3_SHAREGPT_E9_SHA256 => (PINNED_EAGLE3_SHAREGPT_E9_REVISION, None),
         PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256 => {
-            PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION
+            (PINNED_EAGLE3_SHAREGPT_SW512_E9_REVISION, None)
         }
-        _ => anyhow::bail!(
-            "EAGLE-3 SHA-256 {eagle3_sha256} is not one of the four pinned checkpoint artifacts ({PINNED_EAGLE3_THOUGHTWORKS_SHA256}, {PINNED_EAGLE3_SHAREGPT_E8_SHA256}, {PINNED_EAGLE3_SHAREGPT_E9_SHA256}, {PINNED_EAGLE3_SHAREGPT_SW512_E9_SHA256})"
-        ),
+        _ => {
+            camelid::eagle3::require_derived_opt_in()?;
+            let provenance =
+                camelid::eagle3::validate_derived_checkpoint(&eagle3_dir, &eagle3_sha256)?;
+            ("derived-mlx-training-receipt-v1", Some(provenance))
+        }
     };
     anyhow::ensure!(
         !token_recycling_hybrid || eagle3_sha256 == PINNED_EAGLE3_SHAREGPT_E9_SHA256,
@@ -11944,7 +11997,9 @@ fn run_bench_eagle3(
         eagle3_drafted_token_ids: eagle.drafted_token_ids,
         metal_device: camelid::metal::detect_metal_device().device_name,
         host_isa: camelid::receipt::host_isa_marker(),
-        effective_env: eagle3_effective_env(),
+        effective_env: eagle3_effective_env_with_derived_provenance(
+            eagle3_derived_provenance.as_ref(),
+        ),
         planner_env_updates,
         execution_plan: plan_outcome.plan,
         peak_memory_bytes: peak_rss_bytes(),

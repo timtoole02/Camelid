@@ -83,3 +83,22 @@ are no missing bootstrap activations. The one-row teacher shift is applied only 
 rows have been validated; the final base row is the sole invalid teacher sentinel. The gathered
 32K logits are sufficient for SpecForge's restricted-and-renormalized KL objective. Full-vocab
 log-sum-exp is included for acceptance/LK metrics, but no full-vocab logits are retained.
+
+## Derived-head admission
+
+Camelid continues to admit the original pinned EAGLE artifacts without any opt-in. A trained or
+no-update reserialized head has a different `model.safetensors` hash and is admitted only when
+`CAMELID_EAGLE3_ALLOW_DERIVED=1` is set exactly and a sibling `training-receipt.json` validates.
+The receipt schema is `camelid-eagle3-mlx-training-receipt-v1` and must contain integer
+`tensor_count: 15` plus lowercase SHA-256 strings for `output_weights_sha256`,
+`output_config_sha256`, `output_mapping_sha256`, `source_weights_sha256`,
+`source_config_sha256`, and `source_mapping_sha256`. Additional trainer audit fields are accepted
+for evidence and ignored by the runtime parser.
+
+The output hashes must match the files and validated d2t/t2d mapping in the derived artifact. The
+mapping digest is the trainer's exact encoded contract:
+`SHA256(d2t_dtype_ascii || raw_d2t_payload || raw_t2d_payload)`. The source weights must be one of
+Camelid's pinned checkpoints, while config and mapping hashes must remain identical across source
+and output. Config parsing and the complete 15-tensor SafeTensors layout are still validated
+normally. Benchmark receipts record the explicit opt-in and validated provenance under
+`effective_env`.
