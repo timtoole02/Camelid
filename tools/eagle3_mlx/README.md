@@ -157,6 +157,10 @@ PYTHONPATH=. python -m tools.eagle3_mlx.train \
   --parameter-dtype float32
 ```
 
+Training and evaluation sample IDs must be disjoint. A plumbing-only run may explicitly pass
+`--allow-eval-overlap-for-smoke`; its receipt records the overlap and can never pass the pilot
+quality gate.
+
 The run prints JSONL memory, loss, gradient-norm and per-depth evaluation metrics. It emits both:
 
 - a strict 15-tensor BF16 serving checkpoint in `--output-dir`;

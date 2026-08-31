@@ -341,6 +341,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--skip-feature-hashes", action="store_true")
     parser.add_argument(
+        "--allow-eval-overlap-for-smoke",
+        action="store_true",
+        help=(
+            "allow train/eval sample-ID overlap for a plumbing smoke only; "
+            "the resulting receipt is ineligible for the quality gate"
+        ),
+    )
+    parser.add_argument(
         "--allow-shard-reuse",
         action="store_true",
         help="permit more optimizer updates than feature records in this invocation",
@@ -389,6 +397,15 @@ def main(argv: list[str] | None = None) -> int:
     eval_store = FeatureStore(
         args.eval_features, verify_hashes=not args.skip_feature_hashes
     )
+    train_ids = {str(sample["id"]) for sample in train_store.manifest["samples"]}
+    eval_ids = {str(sample["id"]) for sample in eval_store.manifest["samples"]}
+    evaluation_overlap = sorted(train_ids & eval_ids)
+    if evaluation_overlap and not args.allow_eval_overlap_for_smoke:
+        raise RuntimeError(
+            "training and evaluation feature stores overlap by "
+            f"{len(evaluation_overlap)} sample IDs; use a locked disjoint evaluation split"
+        )
+    quality_gate_eligible = not evaluation_overlap
     target_to_draft, draft_to_target = _load_mapping(source)
     for name, store in (("training", train_store), ("evaluation", eval_store)):
         if store.manifest["eagle3_checkpoint_sha256"] != source.weights_sha256:
@@ -601,8 +618,12 @@ def main(argv: list[str] | None = None) -> int:
         "eval_accuracy_absolute_gain": final_accuracy - baseline_accuracy,
         "eval_accuracy_relative_gain": relative_accuracy_gain,
         "pilot_quality_gate_passed": (
-            relative_accuracy_gain is not None and relative_accuracy_gain >= 0.10
+            quality_gate_eligible
+            and relative_accuracy_gain is not None
+            and relative_accuracy_gain >= 0.10
         ),
+        "quality_gate_eligible": quality_gate_eligible,
+        "evaluation_overlap_count": len(evaluation_overlap),
         "mlx_version": installed_mlx,
         "pid": os.getpid(),
     }
