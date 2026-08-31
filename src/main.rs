@@ -8,6 +8,8 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Context;
+
 #[cfg(target_os = "macos")]
 extern "C" {
     fn pthread_set_qos_class_self_np(
@@ -85,6 +87,48 @@ mod ghost_moe_cli_tests {
                     expert_cache_mib, ..
                 }) => assert_eq!(expert_cache_mib, 1024),
                 other => panic!("expected GhostRun, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn eagle3_corpus_materializer_cli_pins_target_and_resume_shape() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "materialize-eagle3-corpus",
+                "target.gguf",
+                "--target-sha256",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "--jobs",
+                "train.jobs.jsonl",
+                "--jobs-sha256",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "--output",
+                "materialized",
+                "--resume",
+                "--max-shards",
+                "1",
+            ])
+            .expect("parse materializer flags");
+            match cli.command {
+                Some(Command::MaterializeEagle3Corpus {
+                    model,
+                    jobs,
+                    output,
+                    shard_size,
+                    resume,
+                    max_shards,
+                    ..
+                }) => {
+                    assert_eq!(model, PathBuf::from("target.gguf"));
+                    assert_eq!(jobs, PathBuf::from("train.jobs.jsonl"));
+                    assert_eq!(output, PathBuf::from("materialized"));
+                    assert_eq!(shard_size, 64);
+                    assert!(resume);
+                    assert_eq!(max_shards, Some(1));
+                }
+                other => panic!("expected MaterializeEagle3Corpus, got {other:?}"),
             }
         });
     }
@@ -2784,6 +2828,39 @@ enum Command {
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
     },
+    /// Hidden: render deterministic prose-corpus jobs, generate each assistant
+    /// continuation with the exact Q4 target, and emit canonical token-aligned
+    /// exporter input shards plus tamper-evident provenance.
+    #[command(hide = true)]
+    MaterializeEagle3Corpus {
+        /// Exact Llama-3.2-3B-Instruct Q4_K_M GGUF target.
+        model: PathBuf,
+        /// Lowercase SHA-256 pin for the exact target GGUF.
+        #[arg(long)]
+        target_sha256: String,
+        /// Deterministic corpus job JSONL produced by tools/eagle3_corpus.
+        #[arg(long)]
+        jobs: PathBuf,
+        /// Optional lowercase SHA-256 pin for the job JSONL.
+        #[arg(long)]
+        jobs_sha256: Option<String>,
+        /// New output directory, or the exact sealed directory with --resume.
+        #[arg(long)]
+        output: PathBuf,
+        /// Records committed together as one atomic shard.
+        #[arg(long, default_value_t = 64)]
+        shard_size: usize,
+        /// Resume only when every run-identity field and completed shard hash matches.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
+        /// Process at most this many new shards, then exit cleanly for serialized
+        /// export/train workflows on a 16 GB host.
+        #[arg(long)]
+        max_shards: Option<usize>,
+        /// Override Rayon worker threads for the target.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// Hidden: end-to-end Prism Qwen3-VL image encode plus Qwen3.5 Metal/CUDA decode.
     #[command(hide = true)]
     BenchGenerateVision {
@@ -5350,6 +5427,29 @@ async fn main() -> anyhow::Result<()> {
                 threads,
             )?;
         }
+        Command::MaterializeEagle3Corpus {
+            model,
+            target_sha256,
+            jobs,
+            jobs_sha256,
+            output,
+            shard_size,
+            resume,
+            max_shards,
+            threads,
+        } => {
+            run_materialize_eagle3_corpus(
+                model,
+                target_sha256,
+                jobs,
+                jobs_sha256,
+                output,
+                shard_size,
+                resume,
+                max_shards,
+                threads,
+            )?;
+        }
         Command::BenchGenerateVision {
             model,
             mmproj,
@@ -7591,6 +7691,248 @@ fn run_bench_owner_sweep(
     for k in owner_keys {
         std::env::remove_var(k);
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_materialize_eagle3_corpus(
+    model: PathBuf,
+    expected_target_sha256: String,
+    jobs_path: PathBuf,
+    expected_jobs_sha256: Option<String>,
+    output: PathBuf,
+    shard_size: usize,
+    resume: bool,
+    max_shards: Option<usize>,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    use camelid::eagle3_corpus_materializer::{
+        build_run_manifest, read_jobs, sha256_bytes, sha256_file,
+        validate_llama3_generation_boundary, MaterializationStore, MaterializationSummary,
+        MaterializedSample, TargetSeal,
+    };
+    const PINNED_LLAMA32_3B_Q4KM_SHA256: &str =
+        "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
+
+    let valid_sha = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    anyhow::ensure!(
+        valid_sha(&expected_target_sha256),
+        "--target-sha256 must be 64 lowercase hexadecimal characters"
+    );
+    anyhow::ensure!(
+        expected_target_sha256 == PINNED_LLAMA32_3B_Q4KM_SHA256,
+        "materializer admits only the campaign's pinned exact-Q4 target SHA-256 {PINNED_LLAMA32_3B_Q4KM_SHA256}"
+    );
+    if let Some(expected) = expected_jobs_sha256.as_deref() {
+        anyhow::ensure!(
+            valid_sha(expected),
+            "--jobs-sha256 must be 64 lowercase hexadecimal characters"
+        );
+    }
+    anyhow::ensure!(shard_size > 0, "--shard-size must be at least 1");
+    if let Some(limit) = max_shards {
+        anyhow::ensure!(limit > 0, "--max-shards must be at least 1");
+    }
+    configure_rayon_threads(threads)?;
+    apply_serve_nocopy_default();
+    // The materializer is deliberately a one-target path. Disable the optional
+    // prompt n-gram shortcut even though it is lossless, so the provenance has
+    // exactly one causal implementation and no environment-selected drafter.
+    std::env::remove_var("CAMELID_SPEC_NGRAM");
+
+    let jobs_sha256 = sha256_file(&jobs_path)?;
+    if let Some(expected) = expected_jobs_sha256.as_deref() {
+        anyhow::ensure!(
+            jobs_sha256 == expected,
+            "jobs SHA-256 is {jobs_sha256}, expected {expected}"
+        );
+    }
+    let jobs = read_jobs(&jobs_path)?;
+
+    let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::ViaSessionDecode)?;
+    let quantization = camelid::receipt::quantization_label(&gguf);
+    anyhow::ensure!(
+        quantization == "Q4_K_M",
+        "EAGLE corpus materialization requires exact target quantization Q4_K_M, got {quantization}"
+    );
+    let target_sha256 = sha256_file(&model)?;
+    anyhow::ensure!(
+        target_sha256 == expected_target_sha256,
+        "target GGUF SHA-256 is {target_sha256}, expected {expected_target_sha256}"
+    );
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    anyhow::ensure!(
+        config.architecture == "llama"
+            && config.embedding_length == 3_072
+            && config.block_count == 28
+            && config.feed_forward_length == 8_192
+            && config.attention_head_count == 24
+            && config.attention_head_count_kv == 8
+            && config.vocab_size == Some(128_256),
+        "materializer requires exact Llama-3.2-3B geometry; got arch={} hidden={} layers={} ffn={} heads={}/{} vocab={:?}",
+        config.architecture,
+        config.embedding_length,
+        config.block_count,
+        config.feed_forward_length,
+        config.attention_head_count,
+        config.attention_head_count_kv,
+        config.vocab_size,
+    );
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let chat_template = tokenizer
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("target tokenizer has no chat template"))?;
+    let target_file = model
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("target path has no UTF-8 filename"))?
+        .to_string();
+    let current_exe = std::env::current_exe()?;
+    let binary_sha256 = sha256_file(&current_exe)?;
+    let target = TargetSeal {
+        file: target_file,
+        gguf_sha256: target_sha256,
+        quantization,
+        architecture: config.architecture.clone(),
+        tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
+        chat_template_sha256: sha256_bytes(chat_template.as_bytes()),
+        context_length: config.context_length,
+        embedding_length: config.embedding_length as usize,
+        block_count: config.block_count,
+        feed_forward_length: config.feed_forward_length as usize,
+        attention_heads: config.attention_head_count,
+        attention_kv_heads: config.attention_head_count_kv,
+        vocab_size: config.vocab_size.expect("geometry checked"),
+    };
+    let planner_env = camelid::execution_plan::PlannerEnv::capture();
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    let execution_plan = serde_json::to_value(&plan_outcome.plan)?;
+    let run = build_run_manifest(
+        &jobs_path,
+        &jobs,
+        jobs_sha256,
+        target,
+        binary_sha256,
+        execution_plan,
+        shard_size,
+    )?;
+    let mut store = MaterializationStore::open(&output, run, &jobs, resume)?;
+    if store.completed_shards() == store.shard_count() {
+        store.finalize()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&MaterializationSummary::from_store(&store))?
+        );
+        return Ok(());
+    }
+    let pending = store.pending_shards(max_shards);
+
+    // Match bench-generate's exact target load: plan before loading K-quant
+    // weights, reuse one target weight set, and create a fresh causal session per
+    // job. No model other than this target is loaded in the process.
+    planner_env.apply(&plan_outcome.env_updates);
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store_tensor = TensorStore::open(&model, &gguf);
+    let weights = Arc::new(LlamaLoadedWeights::load(&store_tensor, &binding, None)?);
+    let sampler = LlamaSampler::Greedy;
+
+    let bos_token_id = tokenizer
+        .special
+        .bos
+        .ok_or_else(|| anyhow::anyhow!("target tokenizer has no BOS token"))?;
+    let assistant_marker = "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    let assistant_marker_ids = tokenizer.encode(assistant_marker, false, true)?;
+    let eog_token_ids = tokenizer.special.eog.clone();
+    anyhow::ensure!(!eog_token_ids.is_empty(), "target tokenizer has no EOG tokens");
+    let mut framing_token_ids = eog_token_ids.clone();
+    for token in &tokenizer.tokens {
+        let chat_marker = token.kind == camelid::tokenizer::TokenKind::UserDefined
+            && token.text.starts_with("<|")
+            && token.text.ends_with("|>");
+        if matches!(
+            token.kind,
+            camelid::tokenizer::TokenKind::Control | camelid::tokenizer::TokenKind::Unused
+        ) || chat_marker
+        {
+            framing_token_ids.insert(token.id);
+        }
+    }
+
+    for shard_index in pending {
+        let samples = {
+            let shard_jobs = store.jobs_for_shard(shard_index);
+            let mut samples = Vec::with_capacity(shard_jobs.len());
+            for job in shard_jobs {
+                let (rendered_prompt, add_special, parse_special) =
+                    camelid::api::render_llama3_training_chat_prompt(
+                        &job.render_messages(),
+                        &tokenizer,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("rendering corpus job {}: {error}", job.id)
+                    })?;
+                let prompt_token_ids =
+                    tokenizer.encode(&rendered_prompt, add_special, parse_special)?;
+                validate_llama3_generation_boundary(
+                    &prompt_token_ids,
+                    bos_token_id,
+                    &assistant_marker_ids,
+                    &eog_token_ids,
+                )
+                .with_context(|| format!("validating chat boundary for job {}", job.id))?;
+                anyhow::ensure!(
+                    prompt_token_ids.len() + job.generation.max_new_tokens
+                        <= config.context_length as usize,
+                    "job {} prompt ({}) + max completion ({}) exceeds target context {}",
+                    job.id,
+                    prompt_token_ids.len(),
+                    job.generation.max_new_tokens,
+                    config.context_length
+                );
+                let generated = generate_run(
+                    &config,
+                    &weights,
+                    &tokenizer,
+                    &prompt_token_ids,
+                    &sampler,
+                    job.generation.max_new_tokens,
+                )?
+                .generated;
+                samples.push(MaterializedSample::from_target_generation(
+                    job,
+                    &rendered_prompt,
+                    add_special,
+                    parse_special,
+                    &prompt_token_ids,
+                    &generated,
+                    &eog_token_ids,
+                    &framing_token_ids,
+                )?);
+            }
+            samples
+        };
+        store.write_shard(shard_index, &samples)?;
+        eprintln!(
+            "[eagle3-materialize] committed shard {}/{} ({} records)",
+            shard_index + 1,
+            store.shard_count(),
+            samples.len()
+        );
+    }
+    if store.completed_shards() == store.shard_count() {
+        store.finalize()?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&MaterializationSummary::from_store(&store))?
+    );
     Ok(())
 }
 

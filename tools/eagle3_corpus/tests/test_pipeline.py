@@ -146,19 +146,19 @@ class CorpusPipelineTests(unittest.TestCase):
             self.assertEqual(record["supervision"]["materialization"], "exact_q4_target_required")
 
     def test_raw_mask_to_exported_p_plus_two_boundary(self) -> None:
-        # Two prompt tokens followed by two exact target-generated assistant tokens.
-        input_ids = [101, 102, 201, 202]
+        # Two prompt tokens, two target-generated assistant content tokens, then EOT.
+        input_ids = [101, 102, 201, 202, 128009]
         raw_mask = corpus.raw_assistant_loss_mask(
-            total_tokens=len(input_ids), assistant_start=2
+            total_tokens=len(input_ids), assistant_start=2, assistant_end=4
         )
-        self.assertEqual(raw_mask, [0, 1, 1, 0])
+        self.assertEqual(raw_mask, [0, 0, 1, 1, 0])
 
         # Final exporter base row P pairs aux[P], embedding(token[P+1]), and a
-        # teacher/label for token[P+2].  Its mask must be the raw P+1 row.
+        # teacher/label for token[P+2]. Its mask must describe token P+2.
         base_mask = corpus.expected_exported_base_mask(raw_mask)
         labels = input_ids[2:] + [0xFFFF_FFFF, 0xFFFF_FFFF]
-        self.assertEqual(base_mask, [1, 1, 0, 0])
-        self.assertEqual(labels, [201, 202, 0xFFFF_FFFF, 0xFFFF_FFFF])
+        self.assertEqual(base_mask, [1, 1, 0, 0, 0])
+        self.assertEqual(labels, [201, 202, 128009, 0xFFFF_FFFF, 0xFFFF_FFFF])
         self.assertEqual(
             [labels[index] for index, active in enumerate(base_mask) if active],
             [201, 202],
@@ -223,8 +223,8 @@ class CorpusPipelineTests(unittest.TestCase):
             contract = manifest["materialization_contract"]
             self.assertEqual(contract["status"], "required_not_performed")
             self.assertEqual(contract["exporter_input"], "one JSONL object per job: {id,input_ids,loss_mask}")
-            self.assertIn("input_ids[Q+1]", contract["raw_loss_mask"])
-            self.assertIn("raw_loss_mask[P+1]", contract["exported_loss_mask"])
+            self.assertIn("input_ids[i]", contract["raw_loss_mask"])
+            self.assertIn("raw_loss_mask[P+2]", contract["exported_loss_mask"])
             self.assertIn("token P+2", contract["exported_loss_mask"])
             self.assertEqual(manifest["forbidden_reference"]["status"], "not_supplied_policy_only")
             self.assertEqual(

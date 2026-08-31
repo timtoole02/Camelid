@@ -25,8 +25,8 @@ only:
 {"id":"...","input_ids":[128000,128006],"loss_mask":[0,0]}
 ```
 
-It does not currently render a chat or generate the target completion. A target-authoritative
-bridge must therefore perform these steps for each job:
+Materialize it with Camelid's target-authoritative bridge. The bridge performs these steps for
+each job:
 
 1. Render the two messages with the pinned Llama 3.2 Instruct chat template and its generation
    prompt. Preserve the rendered-byte hash and prompt token IDs.
@@ -34,18 +34,64 @@ bridge must therefore perform these steps for each job:
    zero and the job's `max_new_tokens`. Preserve generated IDs and stop reason. Do not use a
    reference answer, another teacher, or a prepared continuation.
 3. Concatenate the exact prompt and generated IDs. In the raw exporter input, set
-   `raw_loss_mask[Q]` to one exactly when `input_ids[Q+1]` is a generated assistant token; set
-   every other row to zero. This includes the final prompt row that predicts the first assistant
-   token.
+   `raw_loss_mask[i]` to one exactly when `input_ids[i]` is target-generated assistant content;
+   prompt tokens and assistant framing/control tokens remain zero. This mask is canonical and
+   token-aligned; the materializer must not pre-shift it. A final content token produced at the
+   max-token limit remains one.
 4. Submit `{id,input_ids,loss_mask:raw_loss_mask}` to `export-eagle3-features`. The exporter
-   shifts the mask exactly once into its finalized base-row contract:
-   `base_loss_mask[P]=raw_loss_mask[P+1]`, matching `labels[P]=input_ids[P+2]`, and zeros the final
-   base row. If feature capture was not fused into generation, one teacher-forced replay is
-   legitimate solely to capture the exact target activations.
+   alone maps the mask into its finalized base-row contract:
+   `base_loss_mask[P]=raw_loss_mask[P+2]`, matching `labels[P]=input_ids[P+2]`, and supplies two
+   trailing zero sentinels. If feature capture was not fused into generation, one teacher-forced
+   replay is legitimate solely to capture the exact target activations.
 
-The bridge remains an explicit integration item. A corpus manifest reports
-`required_not_performed`; it never implies that raw messages are already accepted by the current
-exporter.
+The corpus-build manifest reports `required_not_performed` because building jobs alone still does
+not generate an answer. A successful materializer run produces a separate sealed run manifest,
+atomic shards, per-record audit evidence, and `COMPLETE.json`.
+
+## Exact-Q4 materialization
+
+The hidden engineering command reuses Camelid's production tokenizer, metadata-Jinja renderer,
+`LlamaInferenceSession`, and greedy generation loop. It loads only the pinned Q4 target; there is
+no reference answer, alternate teacher, response cache, or second inference implementation.
+
+```bash
+camelid materialize-eagle3-corpus /models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  --target-sha256 6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff \
+  --jobs target/eagle3-corpus/pilot/train.jobs.jsonl \
+  --jobs-sha256 <exact-lowercase-jobs-jsonl-sha256> \
+  --output target/eagle3-materialized/pilot-train \
+  --shard-size 64 \
+  --max-shards 1
+```
+
+Resume the exact run after exporting/training/deleting the consumed feature shard:
+
+```bash
+camelid materialize-eagle3-corpus /models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  --target-sha256 6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff \
+  --jobs target/eagle3-corpus/pilot/train.jobs.jsonl \
+  --jobs-sha256 <same-jobs-sha256> \
+  --output target/eagle3-materialized/pilot-train \
+  --shard-size 64 \
+  --max-shards 1 \
+  --resume
+```
+
+Resume fails closed if the job bytes, target/tokenizer/template, Camelid binary, shard size, job
+ordering, or any completed shard differs. A shard is committed by atomically renaming a complete
+directory containing `records.jsonl`, `audit.jsonl`, and `manifest.json`; a crash can leave only a
+scoped `.shard-*.tmp` directory, which the matching resume safely discards and regenerates.
+
+Each `records.jsonl` line has exactly the exporter shape:
+
+```json
+{"id":"...","input_ids":[128000,128006],"loss_mask":[0,0]}
+```
+
+The corresponding audit line seals the rendered-prompt bytes, prompt/generated/combined token
+IDs, canonical raw mask, source content, stop reason, and exporter record. Prompt token IDs are
+the prefix of `input_ids`; generated IDs are the suffix beginning at `assistant_generation_start`.
+`assistant_content_start` and `assistant_content_end_exclusive` bound the actual trainable content.
 
 ## Build
 

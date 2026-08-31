@@ -22123,6 +22123,47 @@ pub fn render_single_user_chat_prompt_for_benchmark(
     Ok((rendered.text, rendered.add_special, rendered.parse_special))
 }
 
+/// Render a deterministic Llama 3.x no-tools training conversation through the
+/// tokenizer's own pinned metadata template.
+///
+/// Unlike the general serving entry, this narrow offline-corpus entry is not
+/// controlled by `CAMELID_METADATA_CHAT_TEMPLATE`: materialization must produce
+/// the same bytes after a restart, so the GGUF template is always authoritative.
+/// The caller is responsible for pinning the GGUF/tokenizer hashes in its run
+/// manifest. Only the Llama header/EOT grammar is admitted; a neighboring model
+/// cannot silently borrow this prompt shape.
+pub fn render_llama3_training_chat_prompt(
+    messages: &[(String, String)],
+    tokenizer: &Tokenizer,
+) -> std::result::Result<(String, bool, bool), String> {
+    if messages.is_empty() {
+        return Err("Llama 3 training chat requires at least one message".to_string());
+    }
+    let template = tokenizer
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| "Llama 3 training chat requires tokenizer.chat_template".to_string())?;
+    if !is_llama3_instruct_template(template) {
+        return Err(
+            "Llama 3 training chat requires start-header, end-header, and EOT markers"
+                .to_string(),
+        );
+    }
+    let messages = messages
+        .iter()
+        .map(|(role, content)| ChatMessage {
+            role: role.clone(),
+            content: content.clone(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let rendered =
+        render_metadata_jinja_chat_template_prompt(&messages, tokenizer, template, None)
+            .map_err(|error| error.to_string())?;
+    Ok((rendered.text, rendered.add_special, rendered.parse_special))
+}
+
 const SMOLLM3_EXACT_CHAT_TEMPLATE_UTF8_BYTES: usize = 5_493;
 const SMOLLM3_EXACT_CHAT_TEMPLATE_SHA256: &str =
     "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e";
@@ -30470,6 +30511,30 @@ mod tests {
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+    }
+
+    #[test]
+    fn eagle3_corpus_renderer_pins_full_llama32_template_and_generation_boundary() {
+        let _guard = crate::test_support::env_lock();
+        // The offline materializer must ignore this serving toggle and always
+        // execute the exact GGUF metadata template.
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+        let messages = vec![
+            ("system".to_string(), "  Be brief.  ".to_string()),
+            ("user".to_string(), "  hello  ".to_string()),
+        ];
+        let (rendered, add_special, parse_special) =
+            render_llama3_training_chat_prompt(&messages, &tokenizer).unwrap();
+        assert!(!add_special, "the metadata template already emits BOS");
+        assert!(parse_special);
+        assert_eq!(
+            rendered,
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+        assert!(rendered.ends_with(
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        ));
     }
 
     #[test]

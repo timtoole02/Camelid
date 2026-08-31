@@ -130,36 +130,37 @@ def content_digest(messages: Sequence[Mapping[str, str]]) -> str:
     return sha256_bytes(canonical_json(payload).encode("utf-8"))
 
 
-def raw_assistant_loss_mask(total_tokens: int, assistant_start: int) -> list[int]:
-    """Build the causal next-token mask expected by the raw exporter input.
+def raw_assistant_loss_mask(
+    total_tokens: int, assistant_start: int, assistant_end: int
+) -> list[int]:
+    """Build the canonical token-aligned mask expected by the exporter.
 
-    Raw row ``Q`` predicts ``input_ids[Q+1]``.  The final row has no next token and is always
-    zero.  The exporter, not this function, later shifts this raw mask into its P+2 EAGLE base
-    rows.
+    ``raw_mask[i]`` describes ``input_ids[i]`` itself.  The materializer never pre-shifts a
+    mask for a model objective; the exporter alone maps canonical corpus positions onto its
+    P+2 EAGLE base rows.  A final max-length assistant content token therefore remains one.
     """
 
     if total_tokens < 2:
         raise CorpusError("raw assistant mask needs at least two input tokens")
-    if assistant_start <= 0 or assistant_start >= total_tokens:
+    if assistant_start <= 0 or not assistant_start < assistant_end <= total_tokens:
         raise CorpusError(
-            f"assistant_start must be in 1..{total_tokens - 1}, got {assistant_start}"
+            "assistant content bounds must satisfy "
+            f"0 < start ({assistant_start}) < end ({assistant_end}) <= {total_tokens}"
         )
-    return [
-        int(row + 1 >= assistant_start) if row + 1 < total_tokens else 0
-        for row in range(total_tokens)
-    ]
+    return [int(assistant_start <= row < assistant_end) for row in range(total_tokens)]
 
 
 def expected_exported_base_mask(raw_loss_mask: Sequence[int]) -> list[int]:
     """Mirror the pinned exporter boundary for an integration-contract test.
 
     This is not a second implementation of feature export.  It makes the corpus-side expectation
-    executable: base row ``P`` predicts token ``P+2`` and therefore consumes raw mask ``P+1``.
+    executable: base row ``P`` predicts token ``P+2`` and therefore consumes canonical raw mask
+    ``P+2``.  The final two base rows have no corpus label and are sentinel zeros.
     """
 
     if len(raw_loss_mask) < 2 or any(value not in (0, 1) for value in raw_loss_mask):
         raise CorpusError("raw loss mask must contain at least two boolean rows")
-    return list(raw_loss_mask[1:]) + [0]
+    return list(raw_loss_mask[2:]) + [0, 0]
 
 
 def placeholders(template: str) -> tuple[str, ...]:
@@ -709,8 +710,8 @@ def build(
             "temperature": 0.0,
             "chat_rendering": "target-native template; record exact rendered bytes and token ids",
             "exporter_input": "one JSONL object per job: {id,input_ids,loss_mask}",
-            "raw_loss_mask": "raw_loss_mask[Q]=1 exactly when input_ids[Q+1] is a target-generated assistant token; otherwise 0",
-            "exported_loss_mask": "exporter shifts once: base_loss_mask[P]=raw_loss_mask[P+1], then zeros the final row because base row P predicts token P+2",
+            "raw_loss_mask": "raw_loss_mask[i] describes input_ids[i] itself: 1 exactly for target-generated assistant content tokens; prompt and chat-control tokens are 0",
+            "exported_loss_mask": "exporter maps base_loss_mask[P]=raw_loss_mask[P+2] and writes two trailing zero sentinels because base row P predicts token P+2",
             "capture_replay": "a teacher-forced replay is permitted only to capture exact-Q4 features when capture was not fused into generation",
             "prohibition": "no reference answer, cached response, prepared continuation, alternate teacher, or protected-canary material",
         },
