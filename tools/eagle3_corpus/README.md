@@ -112,6 +112,18 @@ generator, catalog, leakage policy, schema, ordered record digest, payload hashe
 license, family assignments, split method, and audit result. It contains no absolute source or
 canary path.
 
+On a storage-constrained validation host, seal a deterministic 100-record subset of the already
+locked evaluation split before training. Allocation is proportional by category and then by
+held-out family, with no randomness; the output manifest pins the full eval hash, source manifest
+hash, exact quotas, selected-ID digest, and protected-reference hash:
+
+```bash
+python3 -m tools.eagle3_corpus.select_eval_subset \
+  --corpus-dir target/eagle3-corpus/standard-protected \
+  --output target/eagle3-corpus/standard-eval-100 \
+  --count 100
+```
+
 ## Protected-canary audit
 
 The default policy rejects URLs and curated distinctive terms. A production build must also
