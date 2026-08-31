@@ -118,7 +118,22 @@ fn embed_build_provenance() {
     // Re-run when HEAD or the index moves so the embedded commit stays current.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
-    if let Some(commit) = git_stdout(&["rev-parse", "HEAD"]) {
+    // Mini2 campaign builds use a sealed source copy without a .git directory.
+    // Permit the orchestrator to provide that copy's exact commit, and make the
+    // value part of Cargo's build-script fingerprint so stale provenance cannot
+    // survive an incremental rebuild.
+    println!("cargo:rerun-if-env-changed=CAMELID_BUILD_COMMIT");
+    let supplied_commit = env::var("CAMELID_BUILD_COMMIT").ok().map(|value| {
+        if value.len() != 40
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            panic!("CAMELID_BUILD_COMMIT must be exactly 40 lowercase hexadecimal characters");
+        }
+        value
+    });
+    if let Some(commit) = supplied_commit.or_else(|| git_stdout(&["rev-parse", "HEAD"])) {
         println!("cargo:rustc-env=CAMELID_GIT_COMMIT={commit}");
     }
     if let Some(describe) = git_stdout(&["describe", "--tags", "--dirty"]) {
