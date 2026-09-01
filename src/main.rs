@@ -10506,8 +10506,10 @@ struct Eagle3IndexedHeadShadowRowReceipt {
 struct Eagle3IndexedHeadShadowReceipt {
     /// Pinned identity of the library compile option used by the production V4 kernels.
     metal_fast_math_enabled: bool,
-    /// Always false: this receipt measures evidence and never replaces the full head.
+    /// True only for full-head-confirmed direct emission with exact row-wise fallback.
     authorizes_token_emission: bool,
+    direct_emission_rows: usize,
+    full_head_fallback_rows: usize,
     scored: bool,
     fallback_reason: Option<&'static str>,
     candidate_union_size: usize,
@@ -10530,6 +10532,9 @@ fn eagle3_indexed_head_shadow_receipt(
     candidate_union: &[u32],
     authoritative_argmax_tokens: &[u32],
     shadow: &camelid::metal::ResidentIndexedHeadShadow,
+    authorizes_token_emission: bool,
+    direct_emission_rows: usize,
+    full_head_fallback_rows: usize,
 ) -> anyhow::Result<Eagle3IndexedHeadShadowReceipt> {
     anyhow::ensure!(
         shadow.candidate_union == candidate_union,
@@ -10554,6 +10559,16 @@ fn eagle3_indexed_head_shadow_receipt(
     } else {
         anyhow::ensure!(shadow.rows.is_empty(), "indexed-head fallback returned rows");
     }
+    anyhow::ensure!(
+        (!authorizes_token_emission
+            && direct_emission_rows == 0
+            && full_head_fallback_rows == 0)
+            || (authorizes_token_emission
+                && shadow.scored()
+                && direct_emission_rows + full_head_fallback_rows
+                    == authoritative_argmax_tokens.len()),
+        "indexed-head direct-emission accounting is inconsistent"
+    );
     let rows = shadow
         .rows
         .iter()
@@ -10598,7 +10613,9 @@ fn eagle3_indexed_head_shadow_receipt(
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(Eagle3IndexedHeadShadowReceipt {
         metal_fast_math_enabled: shadow.compile_fast_math_enabled,
-        authorizes_token_emission: false,
+        authorizes_token_emission,
+        direct_emission_rows,
+        full_head_fallback_rows,
         scored: shadow.scored(),
         fallback_reason: shadow.fallback_reason.map(|reason| reason.label()),
         candidate_union_size: candidate_union.len(),
@@ -10621,6 +10638,72 @@ fn eagle3_indexed_head_shadow_receipt(
             .filter(|row| row.top1_matches_authoritative)
             .count(),
         rows,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Eagle3IndexedHeadDirectEmission {
+    predictions: Vec<u32>,
+    direct_emission_rows: usize,
+    full_head_fallback_rows: usize,
+}
+
+fn eagle3_indexed_head_direct_emission_predictions(
+    enabled: bool,
+    authoritative_predictions: &[u32],
+    shadow: Option<&camelid::metal::ResidentIndexedHeadShadow>,
+) -> anyhow::Result<Eagle3IndexedHeadDirectEmission> {
+    if !enabled {
+        return Ok(Eagle3IndexedHeadDirectEmission {
+            predictions: authoritative_predictions.to_vec(),
+            direct_emission_rows: 0,
+            full_head_fallback_rows: 0,
+        });
+    }
+    let shadow = shadow.ok_or_else(|| {
+        anyhow::anyhow!("indexed-head direct emission requires a completed shadow result")
+    })?;
+    anyhow::ensure!(
+        shadow.scored()
+            && !shadow.compile_fast_math_enabled
+            && shadow.rows.len() == authoritative_predictions.len(),
+        "indexed-head direct emission requires strict, scored evidence for every verifier row"
+    );
+    let mut predictions = Vec::with_capacity(authoritative_predictions.len());
+    let mut direct_emission_rows = 0usize;
+    for (row, (&authoritative, evidence)) in authoritative_predictions
+        .iter()
+        .zip(&shadow.rows)
+        .enumerate()
+    {
+        anyhow::ensure!(
+            evidence.verifier_row == row
+                && evidence.authoritative_argmax_token == authoritative
+                && evidence.all_candidate_logits_exact,
+            "indexed-head direct-emission row {row} lacks exact authoritative evidence"
+        );
+        if evidence.top1_matches_authoritative {
+            let candidate = evidence.candidate_top1_token.ok_or_else(|| {
+                anyhow::anyhow!("indexed-head direct-emission row {row} lost its candidate top-1")
+            })?;
+            anyhow::ensure!(
+                candidate == authoritative,
+                "indexed-head direct-emission row {row} candidate/authority mismatch"
+            );
+            predictions.push(candidate);
+            direct_emission_rows += 1;
+        } else {
+            predictions.push(authoritative);
+        }
+    }
+    anyhow::ensure!(
+        predictions.as_slice() == authoritative_predictions,
+        "full-head-confirmed indexed emission changed the authoritative token sequence"
+    );
+    Ok(Eagle3IndexedHeadDirectEmission {
+        full_head_fallback_rows: predictions.len() - direct_emission_rows,
+        predictions,
+        direct_emission_rows,
     })
 }
 
@@ -10834,12 +10917,14 @@ fn eagle3_indexed_head_shadow_candidate_union(
 fn record_eagle3_argmax_shadow_round(
     enabled: bool,
     indexed_head_enabled: bool,
+    indexed_head_direct_emission_enabled: bool,
     round: u64,
     forest: &camelid::eagle3_runtime::Eagle3DraftForest,
     verifier_token_ids: &[u32],
     authoritative_argmax_tokens: &[u32],
     indexed_head_candidates: Option<&Eagle3IndexedHeadCandidateSet>,
     indexed_head_shadow: Option<&camelid::metal::ResidentIndexedHeadShadow>,
+    direct_emission: &Eagle3IndexedHeadDirectEmission,
     receipts: &mut Vec<Eagle3ArgmaxShadowRoundReceipt>,
 ) -> anyhow::Result<()> {
     let Some(shadow) = forest.certified_argmax_shadow.as_ref() else {
@@ -10897,6 +10982,17 @@ fn record_eagle3_argmax_shadow_round(
         "indexed-head gate/receipt presence diverged"
     );
     anyhow::ensure!(
+        direct_emission.predictions.as_slice() == authoritative_argmax_tokens
+            && ((!indexed_head_direct_emission_enabled
+                && direct_emission.direct_emission_rows == 0
+                && direct_emission.full_head_fallback_rows == 0)
+                || (indexed_head_direct_emission_enabled
+                    && direct_emission.direct_emission_rows
+                        + direct_emission.full_head_fallback_rows
+                        == authoritative_argmax_tokens.len())),
+        "indexed-head direct-emission gate/selection diverged"
+    );
+    anyhow::ensure!(
         indexed_head_enabled == indexed_head_candidates.is_some(),
         "indexed-head gate/candidate-set presence diverged"
     );
@@ -10924,6 +11020,9 @@ fn record_eagle3_argmax_shadow_round(
                 &candidate_union,
                 authoritative_argmax_tokens,
                 receipt,
+                indexed_head_direct_emission_enabled,
+                direct_emission.direct_emission_rows,
+                direct_emission.full_head_fallback_rows,
             )
         })
         .transpose()?;
@@ -11092,6 +11191,7 @@ fn run_eagle3_resident_greedy(
     target_row_lattice_prior_log_bonus: f32,
     certified_argmax_shadow: bool,
     indexed_head_shadow: bool,
+    indexed_head_direct_emission: bool,
     indexed_head_target_top8_history_rounds: usize,
     indexed_head_candidate_recency_rounds: usize,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
@@ -11868,19 +11968,26 @@ fn run_eagle3_resident_greedy(
                     "target-row hedge target returned {} predictions for {actual_nodes} verifier rows",
                     predictions.len(),
                 );
+                let direct_emission = eagle3_indexed_head_direct_emission_predictions(
+                    indexed_head_direct_emission,
+                    &predictions,
+                    indexed_head_result.as_ref(),
+                )?;
                 record_eagle3_argmax_shadow_round(
                     certified_argmax_shadow,
                     indexed_head_shadow,
+                    indexed_head_direct_emission,
                     run.rounds + 1,
                     &eagle_forest,
                     &fused.tree.tokens,
                     &predictions,
                     indexed_head_candidates.as_ref(),
                     indexed_head_result.as_ref(),
+                    &direct_emission,
                     &mut run.argmax_shadow_rounds,
                 )?;
                 let fused_acceptance = fused
-                    .accept_target_predictions(&predictions)
+                    .accept_target_predictions(&direct_emission.predictions)
                     .map_err(anyhow::Error::msg)?;
                 // Authoritative EAGLE refresh consumes verifier capture rows, not draft-lattice
                 // token mappings. An inserted target token therefore remains valid even when it
@@ -11923,7 +12030,7 @@ fn run_eagle3_resident_greedy(
                 // head update. A one-element row is the complete evidence needed by this policy.
                 if let Some(history) = indexed_head_target_top8_history.as_mut() {
                     history.publish(
-                        &predictions,
+                        &direct_emission.predictions,
                         current_target_top_k.as_deref().ok_or_else(|| {
                             anyhow::anyhow!(
                                 "indexed-head causal target-top-8 history lost the current verifier rows"
@@ -11945,7 +12052,12 @@ fn run_eagle3_resident_greedy(
                     );
                 }
                 let mut candidate_ids = 0usize;
-                for (&from, &prediction) in fused.tree.tokens.iter().zip(&predictions) {
+                for (&from, &prediction) in fused
+                    .tree
+                    .tokens
+                    .iter()
+                    .zip(&direct_emission.predictions)
+                {
                     candidate_ids += target_rows
                         .replace_target_candidates(from, std::slice::from_ref(&prediction));
                 }
@@ -11956,7 +12068,7 @@ fn run_eagle3_resident_greedy(
                         &fused,
                         &fused_acceptance,
                         &eagle_forest.scored,
-                        &predictions,
+                        &direct_emission.predictions,
                     )
                     .map_err(anyhow::Error::msg)?;
                 if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
@@ -12398,7 +12510,16 @@ fn run_eagle3_resident_greedy(
                         == indexed_head_candidate_recency_rounds
                     && receipt.causal_candidate_recency_rounds_available
                         <= receipt.causal_candidate_recency_rounds_configured
-                    && indexed_head_shadow == receipt.indexed_head.is_some(),
+                    && indexed_head_shadow == receipt.indexed_head.is_some()
+                    && receipt.indexed_head.as_ref().is_none_or(|indexed| {
+                        indexed.authorizes_token_emission == indexed_head_direct_emission
+                            && ((!indexed_head_direct_emission
+                                && indexed.direct_emission_rows == 0
+                                && indexed.full_head_fallback_rows == 0)
+                                || indexed.direct_emission_rows
+                                    + indexed.full_head_fallback_rows
+                                    == indexed.verifier_rows)
+                    }),
                 "argmax shadow round {} has incomplete evidence",
                 receipt.round,
             );
@@ -12706,6 +12827,14 @@ struct BenchEagle3Record {
     certified_argmax_shadow_round_evidence: Option<Vec<Eagle3ArgmaxShadowRoundReceipt>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_head_shadow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission_full_head_confirmed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_direct_emission_full_head_fallback_rows: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_head_shadow_causal_target_top8_history_rounds: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13054,6 +13183,7 @@ fn eagle3_indexed_head_candidate_recency_rounds() -> anyhow::Result<usize> {
 fn validate_eagle3_argmax_shadow_config(
     certified_argmax_shadow: bool,
     indexed_head_shadow: bool,
+    indexed_head_direct_emission: bool,
     target_row_lattice_promotion: bool,
     tree_nodes: Option<usize>,
     tree_expansions: usize,
@@ -13064,6 +13194,10 @@ fn validate_eagle3_argmax_shadow_config(
     anyhow::ensure!(
         !indexed_head_shadow || certified_argmax_shadow,
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW requires CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW=1"
+    );
+    anyhow::ensure!(
+        !indexed_head_direct_emission || indexed_head_shadow,
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION requires CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW=1"
     );
     anyhow::ensure!(
         !certified_argmax_shadow
@@ -13369,15 +13503,16 @@ fn eagle3_argmax_shadow_gates_are_default_off_and_fail_closed() {
         assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", value).unwrap());
     }
     assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", Some("maybe")).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 128, 8, 2).is_ok());
-    assert!(validate_eagle3_argmax_shadow_config(false, true, true, Some(8), 4, 8, 0, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, false, Some(8), 4, 8, 0, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(7), 4, 8, 0, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 16, 0, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 256, 1, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(8), 4, 8, 1, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 8, 0, 2).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 8, 0, 0).is_ok());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, true, true, Some(8), 4, 128, 8, 2).is_ok());
+    assert!(validate_eagle3_argmax_shadow_config(false, true, false, true, Some(8), 4, 8, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, false, false, Some(8), 4, 8, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, false, true, Some(7), 4, 8, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(false, false, false, false, None, 4, 16, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, false, true, Some(8), 4, 256, 1, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, false, true, Some(8), 4, 8, 1, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, false, true, Some(8), 4, 8, 0, 2).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, true, true, Some(8), 4, 8, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(false, false, false, false, None, 4, 8, 0, 0).is_ok());
 
     for value in [None, Some(""), Some("0")] {
         assert_eq!(
@@ -13489,7 +13624,8 @@ fn indexed_head_receipt_preserves_exact_bits_timing_and_compile_identity() {
             first_logit_mismatch: None,
         }],
     };
-    let receipt = eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &shadow).unwrap();
+    let receipt =
+        eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &shadow, false, 0, 0).unwrap();
     assert!(!receipt.metal_fast_math_enabled);
     assert!(!receipt.authorizes_token_emission);
     assert_eq!(receipt.compared_logits, 2);
@@ -13497,9 +13633,31 @@ fn indexed_head_receipt_preserves_exact_bits_timing_and_compile_identity() {
     assert_eq!(receipt.kernel_window_us, 20);
     assert_eq!(receipt.candidate_top1_matches, 1);
 
+    let direct =
+        eagle3_indexed_head_direct_emission_predictions(true, &[7], Some(&shadow)).unwrap();
+    assert_eq!(direct.predictions, vec![7]);
+    assert_eq!(direct.direct_emission_rows, 1);
+    assert_eq!(direct.full_head_fallback_rows, 0);
+    let direct_receipt =
+        eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &shadow, true, 1, 0).unwrap();
+    assert!(direct_receipt.authorizes_token_emission);
+
+    let mut miss = shadow.clone();
+    miss.rows[0].authoritative_argmax_token = 9;
+    miss.rows[0].authoritative_argmax_logit_bits = None;
+    miss.rows[0].top1_matches_authoritative = false;
+    let fallback =
+        eagle3_indexed_head_direct_emission_predictions(true, &[9], Some(&miss)).unwrap();
+    assert_eq!(fallback.predictions, vec![9]);
+    assert_eq!(fallback.direct_emission_rows, 0);
+    assert_eq!(fallback.full_head_fallback_rows, 1);
+
     let mut malformed = shadow;
     malformed.rows[0].exact_logit_agreements = 1;
-    assert!(eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &malformed).is_err());
+    assert!(
+        eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &malformed, false, 0, 0).is_err()
+    );
+    assert!(eagle3_indexed_head_direct_emission_predictions(true, &[7], Some(&malformed)).is_err());
 }
 
 fn eagle3_adaptive_expansions_enabled() -> bool {
@@ -14303,6 +14461,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION",
         "CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE",
         "CAMELID_BENCH_DUAL_EAGLE_SELECTOR",
@@ -14660,6 +14819,8 @@ fn run_bench_eagle3(
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW")?;
     let indexed_head_shadow =
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW")?;
+    let indexed_head_direct_emission =
+        eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION")?;
     let indexed_head_target_top8_history_rounds =
         eagle3_indexed_head_target_top8_history_rounds()?;
     let indexed_head_candidate_recency_rounds =
@@ -14804,6 +14965,7 @@ fn run_bench_eagle3(
     validate_eagle3_argmax_shadow_config(
         certified_argmax_shadow,
         indexed_head_shadow,
+        indexed_head_direct_emission,
         target_row_lattice_promotion,
         tree_nodes,
         tree_expansions,
@@ -15055,6 +15217,7 @@ fn run_bench_eagle3(
         target_row_lattice_prior_log_bonus,
         certified_argmax_shadow,
         indexed_head_shadow,
+        indexed_head_direct_emission,
         indexed_head_target_top8_history_rounds,
         indexed_head_candidate_recency_rounds,
         primary_drafter,
@@ -15144,6 +15307,27 @@ fn run_bench_eagle3(
         .iter()
         .filter(|receipt| receipt.scored)
         .count() as u64;
+    let indexed_direct_emission_rows = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.direct_emission_rows as u64)
+        .sum::<u64>();
+    let indexed_full_head_fallback_rows = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.full_head_fallback_rows as u64)
+        .sum::<u64>();
+    let indexed_verifier_rows = indexed_receipts
+        .iter()
+        .map(|receipt| receipt.verifier_rows as u64)
+        .sum::<u64>();
+    anyhow::ensure!(
+        (!indexed_head_direct_emission
+            && indexed_direct_emission_rows == 0
+            && indexed_full_head_fallback_rows == 0)
+            || (indexed_head_direct_emission
+                && indexed_direct_emission_rows + indexed_full_head_fallback_rows
+                    == indexed_verifier_rows),
+        "indexed-head direct-emission aggregate accounting diverged"
+    );
     let indexed_target_top8_candidate_additions = eagle
         .argmax_shadow_rounds
         .iter()
@@ -15404,6 +15588,13 @@ fn run_bench_eagle3(
         certified_argmax_shadow_round_evidence: certified_argmax_shadow
             .then(|| eagle.argmax_shadow_rounds.clone()),
         indexed_head_shadow: indexed_head_shadow.then_some(true),
+        indexed_head_direct_emission: indexed_head_direct_emission.then_some(true),
+        indexed_head_direct_emission_full_head_confirmed:
+            indexed_head_direct_emission.then_some(true),
+        indexed_head_direct_emission_rows: indexed_head_direct_emission
+            .then_some(indexed_direct_emission_rows),
+        indexed_head_direct_emission_full_head_fallback_rows: indexed_head_direct_emission
+            .then_some(indexed_full_head_fallback_rows),
         indexed_head_shadow_causal_target_top8_history_rounds:
             (indexed_head_target_top8_history_rounds > 0)
                 .then_some(indexed_head_target_top8_history_rounds),
