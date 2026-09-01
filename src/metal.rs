@@ -5423,6 +5423,216 @@ kernel void q6k_linear_mma_combined_direct_v4(
     }
 }
 
+// Single-SIMD-group twins of the narrow direct-fragment kernels above. These
+// entry points are dispatched with exactly 32 threads and never share their
+// staging with a second SIMD group. The arithmetic, decode order, MMA order,
+// and f32 superblock fold are deliberately copied verbatim; only the two
+// producer/consumer fences around the single-buffered threadgroup staging use
+// simdgroup_barrier instead of threadgroup_barrier.
+kernel void q4k_linear_mma_combined_direct_simdbarrier_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    device const half* ysums [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint k_pad = 8;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+
+    threadgroup half stage_a[256 * 8];
+    threadgroup half mn_a[8 * 16];
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        const uint r = lane & 7u;
+        const uint g = lane >> 3;
+        const uint rr = r0 + r;
+        if (rr < rows) {
+            device const uchar* block = weight_blocks + (rr * n_sb + sb) * 144;
+            uchar sc[8], mn[8];
+            q4k_scale_min_v2(block, sc, mn);
+            device const uint4* wq =
+                reinterpret_cast<device const uint4*>(block + 16 + g * 32);
+            const uint4 wv[2] = {wq[0], wq[1]};
+            const half slo = half(int(sc[2 * g]));
+            const half shi = half(int(sc[2 * g + 1]));
+            for (uint h = 0; h < 2; ++h) {
+                for (uint c = 0; c < 4; ++c) {
+                    const uint w = wv[h][c];
+                    for (uint j = 0; j < 4; ++j) {
+                        const uint pl = (h * 4 + c) * 4 + j;
+                        const uint byte = (w >> (8 * j)) & 0xffu;
+                        stage_a[(g * 64 + pl) * 8 + r] = slo * half(int(byte & 0x0fu));
+                        stage_a[(g * 64 + 32 + pl) * 8 + r] = shi * half(int(byte >> 4));
+                    }
+                }
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) {
+                    const uint j16 = g * 8 + i;
+                    mn_a[r * 16 + j16] =
+                        half(int(mn[((j16 >> 2) * 2) + ((j16 >> 1) & 1u)]));
+                }
+            }
+        } else {
+            for (uint pl = 0; pl < 64; ++pl) {
+                stage_a[(g * 64 + pl) * 8 + r] = half(0.0f);
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) mn_a[r * 16 + g * 8 + i] = half(0.0f);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+        simdgroup_float8x8 c_min = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint m = 0; m < 2; ++m) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, mn_a + m * 8, 16);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, ysums + (sb * 16 + m * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_min, a, b, c_min);
+        }
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint token = fragment_column0 + cell;
+            const uint out_row = r0 + fragment_row;
+            if (out_row < rows && token < n_tokens) {
+                device const uchar* block =
+                    weight_blocks + (out_row * n_sb + sb) * 144;
+                const float dw = float(*reinterpret_cast<device const half*>(block));
+                const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+                const float da = input_scales[token * n_sb + sb];
+                accum[cell] += (dw * da) * c_main.thread_elements()[cell]
+                             - (dm * da) * c_min.thread_elements()[cell];
+            }
+        }
+        // Preserve the established superblock boundary: no lane may overwrite
+        // single-buffered A/min staging until every lane has consumed it.
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint token = fragment_column0 + cell;
+        const uint out_row = r0 + fragment_row;
+        if (out_row < rows && token < n_tokens) {
+            output[token * rows + out_row] = accum[cell];
+        }
+    }
+}
+
+kernel void q6k_linear_mma_combined_direct_simdbarrier_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint k_pad = 8;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+
+    threadgroup half stage_a[256 * 8];
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        const uint r = lane & 7u;
+        const uint q = lane >> 3;
+        const uint h = q >> 1;
+        const uint s = q & 1u;
+        const uint rr = r0 + r;
+        const uint base = h * 128 + s * 16;
+        if (rr < rows) {
+            device const uchar* block = weight_blocks + (rr * n_sb + sb) * 210;
+            device const char* scales = reinterpret_cast<device const char*>(block + 192);
+            const int s0 = int(scales[8 * h + s]);
+            const int s1 = int(scales[8 * h + s + 2]);
+            const int s2 = int(scales[8 * h + s + 4]);
+            const int s3 = int(scales[8 * h + s + 6]);
+            device const ushort* wl =
+                reinterpret_cast<device const ushort*>(block + h * 64 + s * 16);
+            device const ushort* wh =
+                reinterpret_cast<device const ushort*>(block + h * 64 + 32 + s * 16);
+            device const ushort* wq =
+                reinterpret_cast<device const ushort*>(block + 128 + h * 32 + s * 16);
+            for (uint l = 0; l < 16; ++l) {
+                const uint albyte = (uint(wl[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const uint ahbyte = (uint(wh[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const uint hbyte = (uint(wq[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                const int a1 = int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
+                const int a2 = int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
+                const int a3 = int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
+                stage_a[(base + l) * 8 + r] = half(s0 * a0);
+                stage_a[(base + l + 32) * 8 + r] = half(s1 * a1);
+                stage_a[(base + l + 64) * 8 + r] = half(s2 * a2);
+                stage_a[(base + l + 96) * 8 + r] = half(s3 * a3);
+            }
+        } else {
+            for (uint l = 0; l < 16; ++l) {
+                stage_a[(base + l) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 32) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 64) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 96) * 8 + r] = half(0.0f);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint token = fragment_column0 + cell;
+            const uint out_row = r0 + fragment_row;
+            if (out_row < rows && token < n_tokens) {
+                device const uchar* block =
+                    weight_blocks + (out_row * n_sb + sb) * 210;
+                const float dw = float(*reinterpret_cast<device const half*>(block + 208));
+                const float da = input_scales[token * n_sb + sb];
+                accum[cell] += (dw * da) * c_main.thread_elements()[cell];
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint token = fragment_column0 + cell;
+        const uint out_row = r0 + fragment_row;
+        if (out_row < rows && token < n_tokens) {
+            output[token * rows + out_row] = accum[cell];
+        }
+    }
+}
+
 // Benchmark-only cooperative output-row V4 prototypes. Kbench defines the
 // guard explicitly; production compilation and routing never see them.
 #if defined(KBENCH_COOP_ROWS_V4)
@@ -16975,6 +17185,7 @@ fn encode_kquant_v4_strict_fused_stage(
 enum KquantV4ProjectionRoute {
     Synchronized,
     DirectFragment,
+    DirectSimdBarrier,
     Soa8,
 }
 
@@ -16983,13 +17194,13 @@ fn kquant_v4_projection_requests(
     narrow: bool,
     soa8_enabled: bool,
     has_soa8_sidecar: bool,
-    direct_fragment_enabled: bool,
+    direct_route_enabled: bool,
 ) -> (bool, bool) {
     let soa8_requested = narrow && soa8_enabled && has_soa8_sidecar;
-    // The process-wide SOA8 gate suppresses direct-fragment even for weights
+    // The process-wide SOA8 gate suppresses both direct routes even for weights
     // without sidecars and on a candidate-pipeline failure. That keeps the
     // verifier in synchronized arithmetic throughout the experiment.
-    let direct_requested = narrow && !soa8_enabled && direct_fragment_enabled;
+    let direct_requested = narrow && !soa8_enabled && direct_route_enabled;
     (soa8_requested, direct_requested)
 }
 
@@ -17019,7 +17230,18 @@ fn encode_kquant_v4_prepared_projection_route(
         (true, false, KquantV4ProjectionRoute::DirectFragment) => {
             v4.q6k_v4_direct.as_ref()
         }
-        (_, true, KquantV4ProjectionRoute::DirectFragment) => None,
+        (false, false, KquantV4ProjectionRoute::DirectSimdBarrier) => {
+            v4.q4k_v4_direct_simdbarrier.as_ref()
+        }
+        (true, false, KquantV4ProjectionRoute::DirectSimdBarrier) => {
+            v4.q6k_v4_direct_simdbarrier.as_ref()
+        }
+        (
+            _,
+            true,
+            KquantV4ProjectionRoute::DirectFragment
+            | KquantV4ProjectionRoute::DirectSimdBarrier,
+        ) => None,
         (false, false, KquantV4ProjectionRoute::Soa8) => v4.q4k_v4_soa8.as_ref(),
         (true, false, KquantV4ProjectionRoute::Soa8) => v4.q6k_v4_soa8.as_ref(),
         (_, true, KquantV4ProjectionRoute::Soa8) => None,
@@ -17031,6 +17253,14 @@ fn encode_kquant_v4_prepared_projection_route(
     let Some(pipeline) = pipeline else {
         return false;
     };
+    // The relaxed barrier is sound only when this dispatch is exactly one
+    // Apple-width SIMD group. Keep the invariant executable rather than
+    // relying solely on the kernel name and the narrow-route match above.
+    if route == KquantV4ProjectionRoute::DirectSimdBarrier
+        && pipeline.thread_execution_width() != 32
+    {
+        return false;
+    }
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(scales), 0);
     let weight_buffer = match route {
@@ -17040,9 +17270,9 @@ fn encode_kquant_v4_prepared_projection_route(
             };
             buffer
         }
-        KquantV4ProjectionRoute::Synchronized | KquantV4ProjectionRoute::DirectFragment => {
-            &weight.buffer
-        }
+        KquantV4ProjectionRoute::Synchronized
+        | KquantV4ProjectionRoute::DirectFragment
+        | KquantV4ProjectionRoute::DirectSimdBarrier => &weight.buffer,
     };
     e.set_buffer(2, Some(weight_buffer), 0);
     e.set_buffer(3, Some(out), 0);
@@ -17091,11 +17321,17 @@ fn encode_kquant_v4_prepared_projection(
 ) {
     let narrow = stage.n_tokens <= 8;
     let soa8_enabled = kquant_v4_soa8_enabled();
+    let simd_barrier_enabled = kquant_v4_direct_simd_barrier_enabled();
+    let direct_route = if simd_barrier_enabled {
+        KquantV4ProjectionRoute::DirectSimdBarrier
+    } else {
+        KquantV4ProjectionRoute::DirectFragment
+    };
     let (soa8_requested, direct_requested) = kquant_v4_projection_requests(
         narrow,
         soa8_enabled,
         weight.soa8_buffer.is_some(),
-        !soa8_enabled && kquant_v4_direct_fragment_enabled(),
+        !soa8_enabled && (simd_barrier_enabled || kquant_v4_direct_fragment_enabled()),
     );
     let used_soa8 = soa8_requested
         && encode_kquant_v4_prepared_projection_route(
@@ -17119,8 +17355,8 @@ fn encode_kquant_v4_prepared_projection(
         }
     }
     // SOA8 is an arithmetic twin of synchronized V4. Once its process-wide
-    // gate is set, suppress direct-fragment for every projection, including
-    // canonical Q/K/V/O weights without sidecars. This prevents a mixed
+    // gate is set, suppress both direct-fragment routes for every projection,
+    // including canonical Q/K/V/O weights without sidecars. This prevents a mixed
     // direct/synchronized verifier and keeps plain N=1 and SOA N<=8 in the
     // same exact arithmetic universe when both environment flags are present.
     let used_direct = direct_requested
@@ -17133,14 +17369,15 @@ fn encode_kquant_v4_prepared_projection(
             out,
             scalar,
             rows,
-            KquantV4ProjectionRoute::DirectFragment,
+            direct_route,
         );
     if direct_requested && !used_direct {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
-                "[metal] CAMELID_KQUANT_V4_DIRECT_FRAGMENT requested, but its pipeline is \
-                 unavailable; retaining synchronized V4 materialization"
+                "[metal] experimental narrow V4 route {direct_route:?} requested, but its \
+                 pipeline or 32-thread SIMD invariant is unavailable; retaining synchronized \
+                 V4 materialization"
             );
         }
     }
@@ -17160,7 +17397,7 @@ fn encode_kquant_v4_prepared_projection(
     let route = if used_soa8 {
         KquantV4ProjectionRoute::Soa8
     } else if used_direct {
-        KquantV4ProjectionRoute::DirectFragment
+        direct_route
     } else {
         KquantV4ProjectionRoute::Synchronized
     };
@@ -18317,10 +18554,12 @@ struct KquantV2Kernels {
     q6k_mma_stage_y: ComputePipelineState,
     q4k_v4: ComputePipelineState,
     q4k_v4_direct: Option<ComputePipelineState>,
+    q4k_v4_direct_simdbarrier: Option<ComputePipelineState>,
     q4k_v4_soa8: Option<ComputePipelineState>,
     q4k_v4_w16: ComputePipelineState,
     q6k_v4: ComputePipelineState,
     q6k_v4_direct: Option<ComputePipelineState>,
+    q6k_v4_direct_simdbarrier: Option<ComputePipelineState>,
     q6k_v4_soa8: Option<ComputePipelineState>,
     q6k_v4_w16: ComputePipelineState,
 }
@@ -18361,10 +18600,16 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q6k_mma_stage_y: pipeline("q6k_mma_stage_y_f32")?,
                 q4k_v4: pipeline("q4k_linear_mma_combined_v4")?,
                 q4k_v4_direct: pipeline("q4k_linear_mma_combined_direct_v4"),
+                q4k_v4_direct_simdbarrier: pipeline(
+                    "q4k_linear_mma_combined_direct_simdbarrier_v4",
+                ),
                 q4k_v4_soa8: pipeline("q4k_linear_mma_combined_soa8_v4"),
                 q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
                 q6k_v4_direct: pipeline("q6k_linear_mma_combined_direct_v4"),
+                q6k_v4_direct_simdbarrier: pipeline(
+                    "q6k_linear_mma_combined_direct_simdbarrier_v4",
+                ),
                 q6k_v4_soa8: pipeline("q6k_linear_mma_combined_soa8_v4"),
                 q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
@@ -18415,6 +18660,22 @@ fn kquant_v4_direct_fragment_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("CAMELID_KQUANT_V4_DIRECT_FRAGMENT")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Opt in to the single-SIMD-group barrier twin of the narrow direct-fragment
+/// Q4_K/Q6_K kernels. This gate is intentionally independent: enabling it
+/// selects direct fragment ownership plus the narrower fence, while flag-off
+/// preserves the prior direct-fragment or synchronized route byte-for-byte.
+fn kquant_v4_direct_simd_barrier_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn kquant_v4_direct_simd_barrier_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_KQUANT_V4_DIRECT_SIMDGROUP_BARRIER").ok();
+        kquant_v4_direct_simd_barrier_from_env(value.as_deref())
     })
 }
 
@@ -18494,6 +18755,7 @@ fn trace_kquant_v4_dispatch(
         KquantV4ProjectionRoute::Synchronized => 0u32,
         KquantV4ProjectionRoute::DirectFragment => 1,
         KquantV4ProjectionRoute::Soa8 => 2,
+        KquantV4ProjectionRoute::DirectSimdBarrier => 3,
     };
     let bit = 1u32 << (shape + route_index * 6);
     let previous = SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
@@ -18501,6 +18763,9 @@ fn trace_kquant_v4_dispatch(
         let pipeline = match route {
             KquantV4ProjectionRoute::Synchronized => "combined-mma-v4",
             KquantV4ProjectionRoute::DirectFragment => "combined-mma-v4-direct-fragment",
+            KquantV4ProjectionRoute::DirectSimdBarrier => {
+                "combined-mma-v4-direct-fragment-simdgroup-barrier"
+            }
             KquantV4ProjectionRoute::Soa8 => "combined-mma-v4-soa8",
         };
         eprintln!(
@@ -40428,6 +40693,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kquant_v4_direct_simd_barrier_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+        ] {
+            assert!(!kquant_v4_direct_simd_barrier_from_env(value));
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(kquant_v4_direct_simd_barrier_from_env(Some(value)));
+        }
+    }
+
     /// SOA8 must be a pure address-layout change. Compare it against the
     /// synchronized canonical V4 kernels for adversarial Q4_K/Q6_K bytes,
     /// every representative narrow verifier width, a ragged output tile, and
@@ -40679,6 +40961,206 @@ mod tests {
         }
     }
 
+    /// Projection-only A/B for the three Llama 3.2 3B verifier shapes. Each
+    /// sample is one real narrow V4 dispatch at N=8; the established
+    /// threadgroup-barrier direct kernel and the candidate single-SIMD barrier
+    /// twin alternate order every round to limit thermal/order bias. Reported
+    /// times are Metal GPUStartTime..GPUEndTime, not host wall time.
+    ///
+    /// cargo test --release --lib metal_kquant_v4_direct_simd_barrier_projection_microbench -- --ignored --nocapture --test-threads=1
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_kquant_v4_direct_simd_barrier_projection_microbench() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        let device = &kernel.device;
+
+        fn median_us(samples: &mut [u128]) -> f64 {
+            samples.sort_unstable();
+            let middle = samples.len() / 2;
+            if samples.len().is_multiple_of(2) {
+                (samples[middle - 1] + samples[middle]) as f64 * 0.5
+            } else {
+                samples[middle] as f64
+            }
+        }
+
+        for (label, format, rows, input_width) in [
+            (
+                "Q4 gate/up 8192x3072",
+                ResidentWeightFormat::Q4K,
+                8192usize,
+                3072usize,
+            ),
+            ("Q6 down 3072x8192", ResidentWeightFormat::Q6K, 3072, 8192),
+            (
+                "Q6 head 128256x3072",
+                ResidentWeightFormat::Q6K,
+                128_256,
+                3072,
+            ),
+        ] {
+            let n_tokens = 8usize;
+            let n_sb = input_width / 256;
+            let block_bytes = format.wire_bytes_per_block();
+            let mut wire = vec![0u8; rows * n_sb * block_bytes];
+            for (index, byte) in wire.iter_mut().enumerate() {
+                *byte = index
+                    .wrapping_mul(29)
+                    .wrapping_add(index / 97)
+                    .wrapping_add(17) as u8;
+            }
+            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                let d = 0.003 + (block_index % 31) as f32 * 0.00007;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.375).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let weight_buffer =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&weight_buffer, &wire);
+            drop(wire);
+            let weight = ResidentLinearWeight {
+                format,
+                buffer: weight_buffer,
+                soa8_buffer: None,
+                q8_wire: false,
+            };
+
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|index| {
+                    let token = index / input_width;
+                    let column = index % input_width;
+                    ((((column * 43 + token * 137) % 257) as f32) - 128.0) * 0.011
+                })
+                .collect();
+            let input_buffer = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buffer, &input);
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let output = device.new_buffer(
+                (n_tokens * rows * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let prepare_cb = kernel.queue.new_command_buffer();
+            let prepare_encoder = prepare_cb.new_compute_command_encoder();
+            let prepared = encode_shared_kquant_v4_activation(
+                prepare_encoder,
+                kernel,
+                v4,
+                &input_buffer,
+                input_width,
+                n_tokens,
+            );
+            prepare_encoder.end_encoding();
+            prepare_cb.commit();
+            prepare_cb.wait_until_completed();
+
+            let dispatch = |route| {
+                let cb = kernel.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                assert!(encode_kquant_v4_prepared_projection_route(
+                    e,
+                    v4,
+                    &prepared.scales,
+                    &prepared.stage,
+                    &weight,
+                    &output,
+                    &scalar,
+                    rows,
+                    route,
+                ));
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                command_buffer_gpu_times_us(&cb.to_owned()).0
+            };
+
+            // Compile, fault, and populate caches before collecting timestamps.
+            for round in 0..4 {
+                let routes = if round % 2 == 0 {
+                    [
+                        KquantV4ProjectionRoute::DirectFragment,
+                        KquantV4ProjectionRoute::DirectSimdBarrier,
+                    ]
+                } else {
+                    [
+                        KquantV4ProjectionRoute::DirectSimdBarrier,
+                        KquantV4ProjectionRoute::DirectFragment,
+                    ]
+                };
+                for route in routes {
+                    let _ = dispatch(route);
+                }
+            }
+
+            let mut threadgroup_samples = Vec::with_capacity(12);
+            let mut simdgroup_samples = Vec::with_capacity(12);
+            eprintln!("[v4-simd-barrier] ==== {label}, N=8 ====");
+            for round in 0..12 {
+                let routes = if round % 2 == 0 {
+                    [
+                        KquantV4ProjectionRoute::DirectFragment,
+                        KquantV4ProjectionRoute::DirectSimdBarrier,
+                    ]
+                } else {
+                    [
+                        KquantV4ProjectionRoute::DirectSimdBarrier,
+                        KquantV4ProjectionRoute::DirectFragment,
+                    ]
+                };
+                for route in routes {
+                    let busy_us = dispatch(route);
+                    eprintln!(
+                        "[v4-simd-barrier] round={round:02} route={route:?} gpu_busy_us={busy_us}"
+                    );
+                    match route {
+                        KquantV4ProjectionRoute::DirectFragment => {
+                            threadgroup_samples.push(busy_us)
+                        }
+                        KquantV4ProjectionRoute::DirectSimdBarrier => {
+                            simdgroup_samples.push(busy_us)
+                        }
+                        KquantV4ProjectionRoute::Synchronized | KquantV4ProjectionRoute::Soa8 => {
+                            unreachable!()
+                        }
+                    }
+                }
+            }
+            let threadgroup_median = median_us(&mut threadgroup_samples);
+            let simdgroup_median = median_us(&mut simdgroup_samples);
+            let delta_percent =
+                (threadgroup_median - simdgroup_median) * 100.0 / threadgroup_median;
+            eprintln!(
+                "[v4-simd-barrier] summary={label} threadgroup_median_us={threadgroup_median:.1} \
+                 simdgroup_median_us={simdgroup_median:.1} candidate_delta_percent={delta_percent:+.3}"
+            );
+            drop(prepared);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_kquant_v4_soa8_cache_is_byte_neutral_and_immutable_on_alias() {
@@ -40904,13 +41386,73 @@ mod tests {
         );
     }
 
-    /// Corrected direct-fragment qualification. The oracle is the established
-    /// synchronized V4 materialization over the exact same prepared activation
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_simd_barrier_twins_only_change_fence_kind() {
+        fn kernel_source<'a>(source: &'a str, name: &str) -> &'a str {
+            let signature = format!("kernel void {name}(");
+            let start = source
+                .find(&signature)
+                .unwrap_or_else(|| panic!("missing shader kernel {name}"));
+            let open = start
+                + source[start..]
+                    .find('{')
+                    .unwrap_or_else(|| panic!("missing body for shader kernel {name}"));
+            let mut depth = 0usize;
+            for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[start..=open + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated shader kernel {name}");
+        }
+
+        for (baseline, candidate) in [
+            (
+                "q4k_linear_mma_combined_direct_v4",
+                "q4k_linear_mma_combined_direct_simdbarrier_v4",
+            ),
+            (
+                "q6k_linear_mma_combined_direct_v4",
+                "q6k_linear_mma_combined_direct_simdbarrier_v4",
+            ),
+        ] {
+            let expected = kernel_source(KQUANT_V2_SHADER, baseline);
+            let normalized = kernel_source(KQUANT_V2_SHADER, candidate)
+                .replace(candidate, baseline)
+                .replace(
+                    "simdgroup_barrier(mem_flags::mem_threadgroup)",
+                    "threadgroup_barrier(mem_flags::mem_threadgroup)",
+                );
+            assert_eq!(
+                normalized, expected,
+                "{candidate} must differ from {baseline} only in its two barrier intrinsics"
+            );
+            assert_eq!(
+                kernel_source(KQUANT_V2_SHADER, candidate)
+                    .matches("simdgroup_barrier(mem_flags::mem_threadgroup)")
+                    .count(),
+                2,
+                "{candidate} must replace exactly the producer and reuse fences"
+            );
+        }
+    }
+
+    /// Corrected direct-fragment and single-SIMD-barrier qualification. The
+    /// oracles are both the established synchronized V4 materialization and the
+    /// threadgroup-barrier direct kernel over the exact same prepared activation
     /// and weights. Ragged output rows plus N=1/3/7 exercise both dimensions of
     /// the Apple fragment map; N=8 covers the production verifier window.
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_kquant_v4_direct_fragment_is_bit_identical_and_guarded() {
+    fn metal_kquant_v4_direct_fragment_and_simd_barrier_are_bit_identical_and_guarded() {
         if !detect_metal_device().available {
             return;
         }
@@ -40920,6 +41462,24 @@ mod tests {
         };
         assert!(v4.q4k_v4_direct.is_some(), "Q4 direct-fragment pipeline");
         assert!(v4.q6k_v4_direct.is_some(), "Q6 direct-fragment pipeline");
+        assert!(
+            v4.q4k_v4_direct_simdbarrier.is_some(),
+            "Q4 direct-fragment SIMD-barrier pipeline"
+        );
+        assert!(
+            v4.q6k_v4_direct_simdbarrier.is_some(),
+            "Q6 direct-fragment SIMD-barrier pipeline"
+        );
+        for (label, pipeline) in [
+            ("Q4", v4.q4k_v4_direct_simdbarrier.as_ref().unwrap()),
+            ("Q6", v4.q6k_v4_direct_simdbarrier.as_ref().unwrap()),
+        ] {
+            assert_eq!(
+                pipeline.thread_execution_width(),
+                32,
+                "{label} relaxed barrier requires exactly one 32-thread SIMD group"
+            );
+        }
         let device = &kernel.device;
         let rows = 19usize;
         let n_sb = 3usize;
@@ -40988,8 +41548,10 @@ mod tests {
             };
             let q4_control = make_output();
             let q4_direct = make_output();
+            let q4_simd_barrier = make_output();
             let q6_control = make_output();
             let q6_direct = make_output();
+            let q6_simd_barrier = make_output();
 
             let cb = kernel.queue.new_command_buffer();
             let e = cb.new_compute_command_encoder();
@@ -41031,6 +41593,11 @@ mod tests {
                     KquantV4ProjectionRoute::DirectFragment,
                 ),
                 (
+                    &q4_weight,
+                    &q4_simd_barrier,
+                    KquantV4ProjectionRoute::DirectSimdBarrier,
+                ),
+                (
                     &q6_weight,
                     &q6_control,
                     KquantV4ProjectionRoute::Synchronized,
@@ -41039,6 +41606,11 @@ mod tests {
                     &q6_weight,
                     &q6_direct,
                     KquantV4ProjectionRoute::DirectFragment,
+                ),
+                (
+                    &q6_weight,
+                    &q6_simd_barrier,
+                    KquantV4ProjectionRoute::DirectSimdBarrier,
                 ),
             ] {
                 assert!(encode_kquant_v4_prepared_projection_route(
@@ -41057,14 +41629,16 @@ mod tests {
             cb.commit();
             cb.wait_until_completed();
 
-            for (format, control, direct) in [
-                ("Q4", &q4_control, &q4_direct),
-                ("Q6", &q6_control, &q6_direct),
+            for (format, control, direct, simd_barrier) in [
+                ("Q4", &q4_control, &q4_direct, &q4_simd_barrier),
+                ("Q6", &q6_control, &q6_direct, &q6_simd_barrier),
             ] {
                 let mut control_values = vec![0.0f32; physical_columns * rows];
                 let mut direct_values = vec![0.0f32; physical_columns * rows];
+                let mut simd_barrier_values = vec![0.0f32; physical_columns * rows];
                 read_buffer_f32(control, &mut control_values);
                 read_buffer_f32(direct, &mut direct_values);
+                read_buffer_f32(simd_barrier, &mut simd_barrier_values);
                 let active = n_tokens * rows;
                 assert_no_sentinel(
                     &control_values[..active],
@@ -41074,6 +41648,11 @@ mod tests {
                 assert_no_sentinel(
                     &direct_values[..active],
                     &format!("{format} direct"),
+                    n_tokens,
+                );
+                assert_no_sentinel(
+                    &simd_barrier_values[..active],
+                    &format!("{format} SIMD barrier"),
                     n_tokens,
                 );
                 for i in 0..active {
@@ -41087,8 +41666,23 @@ mod tests {
                         control_values[i],
                         control_values[i].to_bits(),
                     );
+                    assert_eq!(
+                        simd_barrier_values[i].to_bits(),
+                        direct_values[i].to_bits(),
+                        "{format} SIMD barrier n={n_tokens} element={i}: {} ({:#010x}) \
+                         != threadgroup-barrier direct {} ({:#010x})",
+                        simd_barrier_values[i],
+                        simd_barrier_values[i].to_bits(),
+                        direct_values[i],
+                        direct_values[i].to_bits(),
+                    );
                 }
                 for i in active..physical_columns * rows {
+                    assert_eq!(
+                        simd_barrier_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} SIMD barrier wrote padded output n={n_tokens} element={i}"
+                    );
                     assert_eq!(
                         direct_values[i].to_bits(),
                         KQUANT_TEST_SENTINEL.to_bits(),
