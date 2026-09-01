@@ -1237,7 +1237,8 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
-        || contains_as_of_year(&lower);
+        || contains_as_of_year(&lower)
+        || has_live_lookup(&lower);
 
     if !urls.is_empty() || explicit || current {
         let query_requested =
@@ -1622,8 +1623,184 @@ fn search_query_from_prompt(prompt: &str) -> String {
         cursor = end;
     }
     query.push_str(&prompt[cursor..]);
-    let compact = query.split_whitespace().collect::<Vec<_>>().join(" ");
-    clip_chars(compact.trim(), MAX_SEARCH_QUERY_CHARS, false)
+    let compact = query
+        .replace('’', "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rewritten = strip_lookup_question_fluff(&compact);
+    let chosen = if rewritten.is_empty() {
+        compact
+    } else {
+        rewritten
+    };
+    clip_chars(chosen.trim(), MAX_SEARCH_QUERY_CHARS, false)
+}
+
+fn strip_lookup_question_fluff(query: &str) -> String {
+    let mut text = query
+        .trim()
+        .trim_end_matches(['?', '!', '.'])
+        .trim()
+        .to_string();
+    const PREFIXES: &[&str] = &[
+        "please tell me about",
+        "please tell me the",
+        "please tell me",
+        "can you tell me about",
+        "could you tell me about",
+        "can you tell me",
+        "could you tell me",
+        "tell me about",
+        "tell me the",
+        "tell me",
+        "what is the",
+        "what's the",
+        "what is",
+        "what's",
+        "how is the",
+        "how's the",
+        "how is",
+        "how's",
+        "please",
+    ];
+    loop {
+        let lower = text.to_ascii_lowercase();
+        let mut stripped = false;
+        for prefix in PREFIXES {
+            if !lower.starts_with(prefix) {
+                continue;
+            }
+            let rest = text[prefix.len()..].trim_start();
+            if rest.is_empty() {
+                continue;
+            }
+            text = rest.trim_end_matches(['?', '!', '.']).trim().to_string();
+            stripped = true;
+            break;
+        }
+        if !stripped {
+            break;
+        }
+    }
+    text
+}
+
+fn has_live_lookup(lower: &str) -> bool {
+    const LOCATED_CONDITIONS: &[&str] = &[
+        "weather in",
+        "weather for",
+        "weather at",
+        "weather like in",
+        "weather like for",
+        "weather like at",
+        "forecast in",
+        "forecast for",
+        "forecast at",
+        "temperature in",
+        "temperature for",
+        "temperature at",
+    ];
+    if LOCATED_CONDITIONS
+        .iter()
+        .any(|phrase| contains_word_bounded(lower, phrase))
+        || has_direct_condition_question(lower)
+    {
+        return true;
+    }
+
+    const SPORTS: &[&str] = &["who won", "score of", "final score"];
+    const MARKETS: &[&str] = &[
+        "stock price",
+        "stock prices",
+        "share price",
+        "share prices",
+        "trading at",
+    ];
+    const ROLES: &[&str] = &[
+        "who is the ceo",
+        "who is ceo",
+        "who is the president",
+        "who is the prime minister",
+    ];
+    SPORTS
+        .iter()
+        .chain(MARKETS)
+        .chain(ROLES)
+        .any(|phrase| contains_word_bounded(lower, phrase))
+        || has_price_of_lookup(lower)
+        || has_latest_lts_lookup(lower)
+}
+
+fn has_direct_condition_question(lower: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "what is the weather",
+        "what is weather",
+        "what's the weather",
+        "what's weather",
+        "what is the current weather",
+        "what's the current weather",
+        "what is the forecast",
+        "what is forecast",
+        "what's the forecast",
+        "what's forecast",
+        "what is the current forecast",
+        "what's the current forecast",
+        "what is the temperature",
+        "what is temperature",
+        "what's the temperature",
+        "what's temperature",
+        "what is the current temperature",
+        "what's the current temperature",
+        "how is the weather",
+        "how is weather",
+        "how's the weather",
+        "how's weather",
+        "how is the forecast",
+        "how's the forecast",
+        "how is the temperature",
+        "how's the temperature",
+        "tell me the weather",
+        "tell me about the weather",
+        "tell me about weather",
+        "tell me weather",
+        "tell me the current weather",
+        "tell me the forecast",
+        "tell me about the forecast",
+        "tell me the temperature",
+        "tell me about the temperature",
+    ];
+    PHRASES
+        .iter()
+        .any(|phrase| contains_word_bounded(lower, phrase))
+}
+
+fn has_price_of_lookup(lower: &str) -> bool {
+    const STOP: &[&str] = &["this", "that", "the", "a", "an", "using", "doing", "being"];
+    const MARKER: &str = "price of";
+    lower.match_indices(MARKER).any(|(index, _)| {
+        if !word_bounds_at(lower, index, MARKER.len()) {
+            return false;
+        }
+        let after = lower[index + MARKER.len()..].trim_start();
+        after
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .find(|word| !word.is_empty())
+            .is_some_and(|word| !STOP.contains(&word))
+    })
+}
+
+fn has_latest_lts_lookup(lower: &str) -> bool {
+    const MODIFIERS: &[&str] = &["latest", "newest", "current"];
+    MODIFIERS.iter().any(|modifier| {
+        lower.match_indices(modifier).any(|(index, _)| {
+            if !word_bounds_at(lower, index, modifier.len()) {
+                return false;
+            }
+            let end = lower.len().min(index + modifier.len() + 40);
+            contains_word_bounded(&lower[index..end], "lts")
+        })
+    })
 }
 
 fn contains_as_of_year(text: &str) -> bool {
@@ -4441,6 +4618,12 @@ mod tests {
             "What's new with Xcode?",
             "Explain this release and cite your sources",
             "Summarize the state as of 1999",
+            "What is the weather in Seattle",
+            "What's the weather in Austin?",
+            "Forecast for Tokyo this weekend",
+            "Who won the Super Bowl",
+            "NVDA stock price",
+            "Latest Node.js LTS",
         ] {
             assert!(
                 matches!(
@@ -4458,6 +4641,35 @@ mod tests {
             classify_prompt("Build a lookup table from this text."),
             ResearchDecision::Skip
         ));
+        for prompt in [
+            "Implement a weather widget",
+            "What is the best way to implement a weather widget",
+            "How do I write a Rust iterator",
+            "Explain ownership",
+            "What is the capital of France?",
+        ] {
+            assert!(
+                matches!(classify_prompt(prompt), ResearchDecision::Skip),
+                "local prompt unexpectedly searched: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_lookup_prompts_rewrite_to_focused_search_queries() {
+        assert_eq!(
+            search_query_from_prompt("What is the weather in Seattle?"),
+            "weather in Seattle"
+        );
+        assert_eq!(
+            search_query_from_prompt("Tell me the forecast for Tokyo this weekend"),
+            "forecast for Tokyo this weekend"
+        );
+        let linked = search_query_from_prompt(
+            "Read https://example.com/spec and look up competing libraries too.",
+        );
+        assert!(!linked.contains("http"));
+        assert!(linked.contains("look up competing libraries"));
     }
 
     #[test]
@@ -5844,17 +6056,18 @@ mod tests {
     fn ddg_202_or_captcha_is_a_provider_warning_not_no_results() {
         let fake = FakeTransport::default();
         let prompt = "What is the latest Xcode release?";
+        let query = search_query_from_prompt(prompt);
         let mut brave_url = Url::parse(BRAVE_SEARCH_ENDPOINT).unwrap();
         brave_url
             .query_pairs_mut()
-            .append_pair("q", prompt)
+            .append_pair("q", &query)
             .append_pair("source", "web");
         fake.insert(
             brave_url,
             FetchResponse::text(503, "text/html", "temporarily unavailable"),
         );
         let mut search_url = Url::parse(DDG_SEARCH_ENDPOINT).unwrap();
-        search_url.query_pairs_mut().append_pair("q", prompt);
+        search_url.query_pairs_mut().append_pair("q", &query);
         fake.insert(
             search_url,
             FetchResponse::text(
@@ -5884,10 +6097,11 @@ mod tests {
     fn bing_fallback_survives_brave_and_ddg_challenges() {
         let fake = FakeTransport::default();
         let prompt = "What is the latest Xcode release?";
+        let query = search_query_from_prompt(prompt);
         let mut brave_url = Url::parse(BRAVE_SEARCH_ENDPOINT).unwrap();
         brave_url
             .query_pairs_mut()
-            .append_pair("q", prompt)
+            .append_pair("q", &query)
             .append_pair("source", "web");
         fake.insert(
             brave_url,
@@ -5898,7 +6112,7 @@ mod tests {
             ),
         );
         let mut ddg_url = Url::parse(DDG_SEARCH_ENDPOINT).unwrap();
-        ddg_url.query_pairs_mut().append_pair("q", prompt);
+        ddg_url.query_pairs_mut().append_pair("q", &query);
         fake.insert(
             ddg_url,
             FetchResponse::text(
@@ -5908,7 +6122,7 @@ mod tests {
             ),
         );
         let mut bing_url = Url::parse(BING_SEARCH_ENDPOINT).unwrap();
-        bing_url.query_pairs_mut().append_pair("q", prompt);
+        bing_url.query_pairs_mut().append_pair("q", &query);
         fake.insert(
             bing_url,
             FetchResponse::text(

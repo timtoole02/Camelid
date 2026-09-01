@@ -10,6 +10,7 @@ import {
   boundWebResearchResult,
   canEnableNativeModelTools,
   classifyWebResearchNeed,
+  searchQueryFromPrompt,
   deriveFittedWebResearchReplyBudget,
   deriveWebResearchPromptBudget,
   effectiveGenerationTokenLimit,
@@ -154,9 +155,32 @@ for (const ordinary of [
   'Turn this checklist into ordered steps.',
   'Today I went to the store.',
   'Use the current fitness setup from my draft.',
+  'Implement a weather widget',
+  'What is the best way to implement a weather widget',
+  'How do I write a Rust iterator',
+  'Explain ownership',
+  'What is the capital of France?',
 ]) {
   assert.equal(classifyWebResearchNeed(ordinary).needed, false, `ordinary local prompt should not browse: ${ordinary}`)
 }
+
+for (const liveLookup of [
+  'What is the weather in Seattle',
+  "What's the weather in Austin?",
+  'Forecast for Tokyo this weekend',
+  'Who won the Super Bowl',
+  'NVDA stock price',
+  'Latest Node.js LTS',
+]) {
+  const plan = classifyWebResearchNeed(liveLookup)
+  assert.equal(plan.needed, true, `live lookup must search: ${liveLookup}`)
+  assert.ok(plan.query, `live lookup must produce a search query: ${liveLookup}`)
+}
+assert.equal(searchQueryFromPrompt('What is the weather in Seattle?'), 'weather in Seattle')
+assert.equal(
+  searchQueryFromPrompt('Tell me the forecast for Tokyo this weekend'),
+  'forecast for Tokyo this weekend',
+)
 
 const currentPlan = classifyWebResearchNeed('Search the web for the current Xcode release and cite sources.')
 assert.equal(currentPlan.needed, true)
@@ -239,6 +263,8 @@ const enriched = applyWebResearchContext(originalMessages, {
   ],
 })
 assert.equal(enriched[0].role, 'system', 'research evidence should be a leading system message')
+assert.match(enriched[0].content, /^Today is [A-Za-z]+,/)
+assert.doesNotMatch(enriched[0].content, /real-time (?:web search|internet)|live internet/i)
 assert.match(enriched[0].content, /UNTRUSTED EXTERNAL DATA/)
 assert.match(enriched[0].content, /UNIQUE_GATT_MARKER/)
 assert.match(enriched[0].content, /UNIQUE_ADVERTISEMENT_MARKER/)

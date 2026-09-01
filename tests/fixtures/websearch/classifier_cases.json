@@ -166,5 +166,71 @@
     "needed": true,
     "has_query": true,
     "url_count": 0
+  },
+  {
+    "prompt": "What is the weather in Seattle",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "What's the weather in Austin?",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Forecast for Tokyo this weekend",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Who won the Super Bowl",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "NVDA stock price",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Latest Node.js LTS",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Implement a weather widget",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "What is the best way to implement a weather widget",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "How do I write a Rust iterator",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "Explain ownership",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
+  },
+  {
+    "prompt": "What is the capital of France?",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
   }
 ]
