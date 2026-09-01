@@ -641,6 +641,7 @@ use camelid::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
     eagle3_runtime::Eagle3AuthoritativeFusionTelemetry,
+    eagle3_serving::cap_verify_nodes_for_position,
     gguf::{read_metadata, read_metadata_with_len, GgufTensorType},
     ghost::{GhostFile, GhostPipelinePrefetcher, GhostPrefetcher},
     inference::{
@@ -10549,7 +10550,10 @@ fn run_eagle3_resident_greedy(
             .as_ref()
             .map_or(tree_expansions, Eagle3AdaptiveExpansionController::expansions);
         let (emitted, offered, verify_nodes) = if let Some(node_budget) = tree_nodes {
-            let round_node_budget = node_budget.min(context_room);
+            let round_node_budget = cap_verify_nodes_for_position(
+                target_before,
+                node_budget.min(context_room),
+            );
             let suffix_drafts = if let (Some(suffix), Some(history)) =
                 (suffix_drafter.as_mut(), suffix_history.as_ref())
             {

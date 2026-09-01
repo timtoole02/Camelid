@@ -112,12 +112,24 @@ fn clamp_max_tokens_to_logical_budget_at_limit(
     Ok(max_tokens.min(logical_token_limit - prompt_tokens))
 }
 
-fn suffix_verify_node_limit(target_position: usize) -> usize {
-    if target_position.saturating_add(TREE_MAX_NODES) > WIDE_VERIFY_POSITION_LIMIT {
+/// Keep verifier requests on Metal's checked row-count/position contract.
+/// N8 is valid at every supported 4K position; widths 9..=16 are retained only
+/// when their final row remains inside the receipted 2K wide-attention lane.
+pub fn cap_verify_nodes_for_position(
+    target_position: usize,
+    requested_nodes: usize,
+) -> usize {
+    if requested_nodes > DEEP_CONTEXT_VERIFY_NODES
+        && target_position.saturating_add(requested_nodes) > WIDE_VERIFY_POSITION_LIMIT
+    {
         DEEP_CONTEXT_VERIFY_NODES
     } else {
-        TREE_MAX_NODES
+        requested_nodes
     }
+}
+
+fn suffix_verify_node_limit(target_position: usize) -> usize {
+    cap_verify_nodes_for_position(target_position, TREE_MAX_NODES)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,5 +519,8 @@ mod tests {
         assert_eq!(suffix_verify_node_limit(2_032), TREE_MAX_NODES);
         assert_eq!(suffix_verify_node_limit(2_033), DEEP_CONTEXT_VERIFY_NODES);
         assert_eq!(suffix_verify_node_limit(4_000), DEEP_CONTEXT_VERIFY_NODES);
+        assert_eq!(cap_verify_nodes_for_position(4_000, 8), 8);
+        assert_eq!(cap_verify_nodes_for_position(2_039, 9), 8);
+        assert_eq!(cap_verify_nodes_for_position(2_039, 6), 6);
     }
 }
