@@ -384,6 +384,7 @@ struct MetalLinearKernel {
     attention_decode_splitk_kv16_direct_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_batch_pipeline: ComputePipelineState,
+    attention_decode_splitk_kv16_direct_shared_pipeline: ComputePipelineState,
     attention_decode_splitk_merge_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
     kv_dequant_q8_to_h_pipeline: ComputePipelineState,
@@ -11494,6 +11495,129 @@ kernel void attention_decode_splitk_kv16_direct_batch(
     }
 }
 
+// Prefix-shared sibling of attention_decode_splitk_kv16_direct_batch (head_dim == 128,
+// rows <= 8).  The grid drops the row dimension: one threadgroup per (kv-head, split)
+// carries every verifier row as its own simdgroup, and each simdgroup owns all `group`
+// query heads of that kv head.  A K/V position is therefore fetched once per simdgroup
+// (shared by its heads) and the eight row simdgroups walk the same chunk on one core, so
+// the prefix streams from memory once per threadgroup instead of once per (row, head)
+// threadgroup.  Every row keeps its own (position_count, n_splits) partition, its own
+// packed tail slots, and the unchanged four-position flash recurrence per head, so the
+// partial written for each (row, head, split) is bit-identical to the row-wise kernels.
+kernel void attention_decode_splitk_kv16_direct_shared(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* partials [[buffer(3)]], // [row][n_heads][max_splits][130]
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& max_splits [[buffer(13)]],
+    device const uint2* row_meta [[buffer(14)]],
+    device const uint* tail_offsets [[buffer(15)]],
+    device const uint* tail_slots [[buffer(16)]],
+    constant uint& tree_base [[buffer(17)]],
+    constant uint& tree_mode [[buffer(18)]],
+    constant uint& rows [[buffer(19)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint MAX_GROUP = 4;
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint row = sg;
+    if (row >= rows) return;
+    const uint position_count = row_meta[row].x;
+    const uint n_splits = row_meta[row].y;
+    if (split >= n_splits) return;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+    const uint tail_off = (tree_mode != 0) ? tail_offsets[row] : 0u;
+
+    float4 q4[MAX_GROUP];
+    float m[MAX_GROUP];
+    float l[MAX_GROUP];
+    float4 acc[MAX_GROUP];
+    for (uint h = 0; h < MAX_GROUP; ++h) {
+        q4[h] = float4(0.0f);
+        m[h] = -INFINITY;
+        l[h] = 0.0f;
+        acc[h] = float4(0.0f);
+        const uint qh = kvh * group + h;
+        if (h < group && qh < n_heads) {
+            const ulong q_base = ((ulong)row * n_heads + qh) * 128;
+            q4[h] = *reinterpret_cast<device const float4*>(query + q_base + lane * 4) * scale;
+        }
+    }
+    for (uint j0 = p0; j0 < p1; j0 += 4) {
+        half4 k4[4];
+        half4 v4[4];
+        for (uint jj = 0; jj < 4; ++jj) {
+            const uint j = j0 + jj;
+            if (j < p1) {
+                const uint slot = (tree_mode != 0 && j >= tree_base)
+                    ? tail_slots[tail_off + j - tree_base]
+                    : j;
+                const uint off = kv_base + slot * position_stride + lane * 4;
+                k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+            } else {
+                k4[jj] = half4(0.0h);
+                v4[jj] = half4(0.0h);
+            }
+        }
+        for (uint h = 0; h < MAX_GROUP; ++h) {
+            if (h < group && kvh * group + h < n_heads) {
+                float s4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    if (j0 + jj < p1) {
+                        s4[jj] = simd_sum(dot(float4(k4[jj]), q4[h]));
+                    } else {
+                        s4[jj] = -INFINITY;
+                    }
+                }
+                const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+                const float m_new = max(m[h], m4);
+                const float corr = exp(m[h] - m_new);
+                float w4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+                }
+                acc[h] *= corr;
+                for (uint jj = 0; jj < 4; ++jj) {
+                    if (j0 + jj < p1) {
+                        acc[h] += w4[jj] * float4(v4[jj]);
+                    }
+                }
+                l[h] = l[h] * corr + w4[0] + w4[1] + w4[2] + w4[3];
+                m[h] = m_new;
+            }
+        }
+    }
+    for (uint h = 0; h < MAX_GROUP; ++h) {
+        const uint qh = kvh * group + h;
+        if (h < group && qh < n_heads) {
+            device float* dst = partials
+                + ((((ulong)row * n_heads + qh) * max_splits + split) * (128 + 2));
+            dst[lane * 4] = acc[h].x;
+            dst[lane * 4 + 1] = acc[h].y;
+            dst[lane * 4 + 2] = acc[h].z;
+            dst[lane * 4 + 3] = acc[h].w;
+            if (lane == 0) {
+                dst[128] = m[h];
+                dst[129] = l[h];
+            }
+        }
+    }
+}
+
 // Row-dimensional merge twin. Each (row, head) threadgroup executes the original
 // split merge loops in the same split order; max_splits only defines row stride.
 kernel void attention_decode_splitk_merge_batch_f32(
@@ -12492,6 +12616,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                     &attention_decode_splitk_kv16_direct_batch_function,
                 )
                 .ok()?;
+            let attention_decode_splitk_kv16_direct_shared_function = elementwise_library
+                .get_function("attention_decode_splitk_kv16_direct_shared", None)
+                .ok()?;
+            let attention_decode_splitk_kv16_direct_shared_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &attention_decode_splitk_kv16_direct_shared_function,
+                )
+                .ok()?;
             let attention_decode_splitk_merge_batch_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_batch_f32", None)
                 .ok()?;
@@ -13015,6 +13147,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_kv16_direct_pipeline,
                 attention_decode_splitk_kv16_batch_pipeline,
                 attention_decode_splitk_kv16_direct_batch_pipeline,
+                attention_decode_splitk_kv16_direct_shared_pipeline,
                 attention_decode_splitk_merge_batch_pipeline,
                 attention_decode_splitk_kvq8_pipeline,
                 kv_dequant_q8_to_h_pipeline,
@@ -22220,6 +22353,25 @@ fn verify_attention_batch_enabled() -> bool {
     })
 }
 
+/// Experimental verifier-only prefix-shared F16 split-K attention: one threadgroup per
+/// (kv-head, split) carries every verifier row (`k <= 8`, head_dim 128) so the K/V prefix
+/// chunk streams once per threadgroup instead of once per (row, head).  Arming it also
+/// admits the row-dimensional batch route it refines (ineligible shapes fall back to the
+/// row-dimensional kernel, then to the row-wise path); all three are bit-identical.
+#[cfg(target_os = "macos")]
+fn verify_attention_shared_prefix_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_ATTN_SHARED_PREFIX")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn attention_splitk_kv16_shared_prefix_shape_allowed(rows: usize, head_dim: usize) -> bool {
+    (2..=8).contains(&rows) && head_dim == 128
+}
+
 #[cfg(target_os = "macos")]
 fn verify_batch_rope_scatter_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -22557,6 +22709,19 @@ fn try_attention_splitk_kv16_for_test(
     Some(result)
 }
 
+/// Which verifier attention encode `try_attention_splitk_kv16_rows_for_test` drives.
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SplitkRowsEncode {
+    /// One partial + one merge dispatch per row (the production row-wise kernels).
+    RowWise,
+    /// Row in the grid: `attention_decode_splitk_kv16[_direct]_batch`.
+    Batch,
+    /// Simdgroup == row, one threadgroup per (kv-head, split):
+    /// `attention_decode_splitk_kv16_direct_shared` (head_dim 128, rows <= 8).
+    SharedPrefix,
+}
+
 /// Low-level row-wise-vs-row-dimensional F16 split-K driver.  `tree` is the
 /// committed-prefix length plus one absolute tail-slot list per verifier row.
 #[cfg(all(test, target_os = "macos"))]
@@ -22572,7 +22737,7 @@ fn try_attention_splitk_kv16_rows_for_test(
     position_counts: &[usize],
     scale: f32,
     tree: Option<(usize, &[Vec<u32>])>,
-    batched: bool,
+    encode: SplitkRowsEncode,
     direct: bool,
     repeats: usize,
 ) -> Option<(Vec<f32>, u128, u128)> {
@@ -22583,9 +22748,12 @@ fn try_attention_splitk_kv16_rows_for_test(
         || keys.len() != n_kv_heads * max_positions * head_dim
         || values.len() != keys.len()
         || tree.is_some_and(|(_, slots)| slots.len() != rows)
+        || (encode == SplitkRowsEncode::SharedPrefix
+            && !(direct && attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim)))
     {
         return None;
     }
+    let batched = encode != SplitkRowsEncode::RowWise;
     let kernel = metal_linear_kernel()?;
     let device = &kernel.device;
     let opts = MTLResourceOptions::StorageModeShared;
@@ -22625,7 +22793,7 @@ fn try_attention_splitk_kv16_rows_for_test(
     }
 
     let row_meta = device.new_buffer((rows * 8) as u64, opts);
-    let batch_scalars = device.new_buffer(12, opts);
+    let batch_scalars = device.new_buffer(16, opts);
     let (tree_base, tree_rows) = tree.unwrap_or((0, &[]));
     let mut flat_slots = Vec::new();
     let mut flat_offsets = vec![0u32; rows];
@@ -22647,6 +22815,7 @@ fn try_attention_splitk_kv16_rows_for_test(
         *s = max_splits as u32;
         *s.add(1) = tree_base as u32;
         *s.add(2) = u32::from(tree.is_some());
+        *s.add(3) = rows as u32;
         let offsets = tail_offsets.contents() as *mut u32;
         for (i, &offset) in flat_offsets.iter().enumerate() {
             *offsets.add(i) = offset;
@@ -22708,8 +22877,11 @@ fn try_attention_splitk_kv16_rows_for_test(
             (rows * n_heads * max_splits * (head_dim + 2) * 4) as u64,
             opts,
         );
+        let shared = encode == SplitkRowsEncode::SharedPrefix;
         for _ in 0..repeats {
-            e.set_compute_pipeline_state(if direct {
+            e.set_compute_pipeline_state(if shared {
+                &kernel.attention_decode_splitk_kv16_direct_shared_pipeline
+            } else if direct {
                 &kernel.attention_decode_splitk_kv16_direct_batch_pipeline
             } else {
                 &kernel.attention_decode_splitk_kv16_batch_pipeline
@@ -22731,18 +22903,34 @@ fn try_attention_splitk_kv16_rows_for_test(
             e.set_buffer(16, Some(&tail_flat), 0);
             e.set_buffer(17, Some(&batch_scalars), 4);
             e.set_buffer(18, Some(&batch_scalars), 8);
-            e.dispatch_thread_groups(
-                metal::MTLSize {
-                    width: n_kv_heads as u64,
-                    height: max_splits as u64,
-                    depth: rows as u64,
-                },
-                metal::MTLSize {
-                    width: 128,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            if shared {
+                e.set_buffer(19, Some(&batch_scalars), 12);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: n_kv_heads as u64,
+                        height: max_splits as u64,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: (rows * 32) as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else {
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: n_kv_heads as u64,
+                        height: max_splits as u64,
+                        depth: rows as u64,
+                    },
+                    metal::MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
             e.set_compute_pipeline_state(&kernel.attention_decode_splitk_merge_batch_pipeline);
             e.set_buffer(0, Some(&partials), 0);
             e.set_buffer(1, Some(&out), 0);
@@ -23344,6 +23532,9 @@ static TREE_KV16_SPLITK_ENCODES: std::sync::atomic::AtomicUsize =
 #[cfg(all(test, target_os = "macos"))]
 static VERIFY_BATCH_KV16_ENCODES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(test, target_os = "macos"))]
+static VERIFY_SHARED_KV16_ENCODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// WIN2METAL Phase 4 — tree twin of `encode_attention`. Routes (v2 / split-K kv16 /
 /// split-K kv16 direct / f32) EXACTLY like `encode_attention` at the same `position_count`,
@@ -23558,12 +23749,18 @@ fn encode_attention_splitk_kv16_batch(
         .map(|&pc| pc.div_ceil(64).clamp(2, 64))
         .collect();
     let max_splits = split_counts.iter().copied().max().unwrap_or(0);
+    let shared_prefix = verify_attention_shared_prefix_enabled()
+        && attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim);
+    #[cfg(test)]
+    if shared_prefix {
+        VERIFY_SHARED_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let partials = pool_get(
         k,
         (rows * n_heads * max_splits * (head_dim + 2) * 4) as u64,
     );
     let row_meta = pool_get(k, (rows * 8) as u64);
-    let batch_scalars = pool_get(k, 12);
+    let batch_scalars = pool_get(k, 16);
 
     let mut flat_slots = Vec::new();
     let mut tail_offsets = vec![0u32; rows];
@@ -23585,6 +23782,7 @@ fn encode_attention_splitk_kv16_batch(
         *scalars = max_splits as u32;
         *scalars.add(1) = tree.map_or(0, |t| t.base) as u32;
         *scalars.add(2) = u32::from(tree.is_some());
+        *scalars.add(3) = rows as u32;
         let offsets = tail_offsets_buf.contents() as *mut u32;
         for (i, &offset) in tail_offsets.iter().enumerate() {
             *offsets.add(i) = offset;
@@ -23595,7 +23793,9 @@ fn encode_attention_splitk_kv16_batch(
         }
     }
 
-    e.set_compute_pipeline_state(if head_dim == 128 {
+    e.set_compute_pipeline_state(if shared_prefix {
+        &k.attention_decode_splitk_kv16_direct_shared_pipeline
+    } else if head_dim == 128 {
         &k.attention_decode_splitk_kv16_direct_batch_pipeline
     } else {
         &k.attention_decode_splitk_kv16_batch_pipeline
@@ -23617,18 +23817,35 @@ fn encode_attention_splitk_kv16_batch(
     e.set_buffer(16, Some(&tail_slots_buf), 0);
     e.set_buffer(17, Some(&batch_scalars), 4); // tree_base
     e.set_buffer(18, Some(&batch_scalars), 8); // tree_mode
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: n_kv_heads as u64,
-            height: max_splits as u64,
-            depth: rows as u64,
-        },
-        metal::MTLSize {
-            width: 128,
-            height: 1,
-            depth: 1,
-        },
-    );
+    if shared_prefix {
+        // One threadgroup per (kv-head, split); simdgroup == verifier row.
+        e.set_buffer(19, Some(&batch_scalars), 12); // rows
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_kv_heads as u64,
+                height: max_splits as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: (rows * 32) as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
+    } else {
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_kv_heads as u64,
+                height: max_splits as u64,
+                depth: rows as u64,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
 
     e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_batch_pipeline);
     e.set_buffer(0, Some(&partials), 0);
@@ -36828,6 +37045,7 @@ impl ResidentDecodeState {
         let mut first_commit_started: Option<std::time::Instant> = None;
         let mut from_a = true;
         let mut batched_attention_layers = 0usize;
+        let mut shared_attention_layers = 0usize;
         let mut batched_rope_scatter_layers = 0usize;
         for l in 0..layers.len() {
             let e = &encoder;
@@ -37049,7 +37267,8 @@ impl ResidentDecodeState {
             //    the exact split count and tree tail slots its row-wise encode used. Any
             //    ineligible shape or storage mode falls through to the unchanged per-row path.
             let omit_attention = verify_ablate("attn");
-            let want_batched_attention = !omit_attention && verify_attention_batch_enabled();
+            let want_batched_attention = !omit_attention
+                && (verify_attention_batch_enabled() || verify_attention_shared_prefix_enabled());
             let f16_kv = if !want_batched_attention {
                 None
             } else if self.kv16 {
@@ -37081,6 +37300,11 @@ impl ResidentDecodeState {
                     )
                 });
             batched_attention_layers += usize::from(batched_attention);
+            shared_attention_layers += usize::from(
+                batched_attention
+                    && verify_attention_shared_prefix_enabled()
+                    && attention_splitk_kv16_shared_prefix_shape_allowed(k, head_dim),
+            );
             if !omit_attention && !batched_attention {
                 for (i, attn_scalar) in attn_scalars.iter().enumerate() {
                     match tree {
@@ -37333,6 +37557,7 @@ impl ResidentDecodeState {
                  encode={encode_us}us commit_wait={wall_us}us tail_commit_wait={tail_wait_us}us \
                  command_buffers={command_buffers} gpu_busy={gpu_busy_us}us \
                  kernel_window={kernel_window_us}us attn_batch_layers={batched_attention_layers} \
+                 attn_shared_layers={shared_attention_layers} \
                  rope_scatter_batch_layers={batched_rope_scatter_layers}"
             );
         }
@@ -44997,7 +45222,10 @@ mod tests {
             .map(|i| ((i * 19 % 37) as f32 - 18.0) * 0.03125)
             .collect();
 
-        for rows in [8usize, 16] {
+        // rows=5 leaves three simdgroups of the prefix-shared threadgroup unused and
+        // exercises a partial (rows * 32)-thread dispatch; 8 is the EAGLE width; 16 is
+        // batch-only (the shared kernel refuses it and the driver returns None).
+        for rows in [5usize, 8, 16] {
             let query: Vec<f32> = (0..rows * n_heads * head_dim)
                 .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
                 .collect();
@@ -45016,35 +45244,47 @@ mod tests {
                         position_counts,
                         scale,
                         tree,
-                        false,
+                        SplitkRowsEncode::RowWise,
                         direct,
                         1,
                     )
                     .expect("row-wise split-K attention");
-                    let (batched, _, _) = try_attention_splitk_kv16_rows_for_test(
-                        &query,
-                        &keys,
-                        &values,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        max_positions,
-                        position_counts,
-                        scale,
-                        tree,
-                        true,
-                        direct,
-                        1,
-                    )
-                    .expect("row-dimensional split-K attention");
-                    assert_eq!(rowwise.len(), batched.len());
-                    for (i, (&expected, &actual)) in rowwise.iter().zip(&batched).enumerate() {
-                        assert_eq!(
-                            actual.to_bits(),
-                            expected.to_bits(),
-                            "{label} direct={direct} element {i}: batch={actual} ({:#010x}) != row={expected} ({:#010x})",
-                            actual.to_bits(),
-                            expected.to_bits(),
+                    let mut encodes = vec![SplitkRowsEncode::Batch];
+                    if direct && attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim)
+                    {
+                        encodes.push(SplitkRowsEncode::SharedPrefix);
+                    }
+                    for encode in encodes {
+                        let (batched, _, _) = try_attention_splitk_kv16_rows_for_test(
+                            &query,
+                            &keys,
+                            &values,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_positions,
+                            position_counts,
+                            scale,
+                            tree,
+                            encode,
+                            direct,
+                            1,
+                        )
+                        .expect("row-dimensional split-K attention");
+                        assert_eq!(rowwise.len(), batched.len());
+                        for (i, (&expected, &actual)) in rowwise.iter().zip(&batched).enumerate()
+                        {
+                            assert_eq!(
+                                actual.to_bits(),
+                                expected.to_bits(),
+                                "{label} direct={direct} {encode:?} element {i}: {actual} ({:#010x}) != row={expected} ({:#010x})",
+                                actual.to_bits(),
+                                expected.to_bits(),
+                            );
+                        }
+                        eprintln!(
+                            "metal_attention_splitk_kv16_batch_matches_rowwise: {label} direct={direct} {encode:?} BIT-IDENTICAL ({} words)",
+                            batched.len()
                         );
                     }
                 }
@@ -45083,9 +45323,11 @@ mod tests {
         }
     }
 
-    /// Production-shape lower bound for the host-loop collapse: 28 Llama-3.2-3B
-    /// layers, base ~= 4,137, k=8, 24q/8kv heads, head_dim 128. GPU busy excludes
+    /// Production-shape lower bound for the host-loop collapse and the prefix-shared
+    /// kernel: 28 Llama-3.2-3B layers, k=8, 24q/8kv heads, head_dim 128, at the Pitch
+    /// verify depths (543, 800) and the 4k stress depth (4,137). GPU busy excludes
     /// allocations and CPU encoding; wall/encode savings in a full verifier can only help.
+    /// Every variant is asserted bit-identical to the row-wise encode before timing.
     ///
     /// Run:
     /// `cargo test --release --lib attention_splitk_kv16_batch_k8_depth4137_probe \
@@ -45100,76 +45342,85 @@ mod tests {
         let n_heads = 24usize;
         let n_kv_heads = 8usize;
         let head_dim = 128usize;
-        let base = 4_137usize;
         let rows = 8usize;
-        let max_positions = base + rows;
+        let layers = 28usize;
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let position_counts: Vec<usize> = (1..=rows).map(|row| base + row).collect();
         let query: Vec<f32> = (0..rows * n_heads * head_dim)
             .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
             .collect();
-        let keys: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
-            .map(|i| ((i * 13 % 31) as f32 - 15.0) * 0.03125)
-            .collect();
-        let values: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
-            .map(|i| ((i * 19 % 37) as f32 - 18.0) * 0.03125)
-            .collect();
+        for base in [543usize, 800, 4_137] {
+            let max_positions = base + rows;
+            let position_counts: Vec<usize> = (1..=rows).map(|row| base + row).collect();
+            let keys: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
+                .map(|i| ((i * 13 % 31) as f32 - 15.0) * 0.03125)
+                .collect();
+            let values: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
+                .map(|i| ((i * 19 % 37) as f32 - 18.0) * 0.03125)
+                .collect();
 
-        let run = |batched| {
-            try_attention_splitk_kv16_rows_for_test(
-                &query,
-                &keys,
-                &values,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_positions,
-                &position_counts,
-                scale,
-                None,
-                batched,
-                true,
-                28,
-            )
-            .expect("production-shape F16 split-K probe")
-        };
-        let (row_warm, _, _) = run(false);
-        let (batch_warm, _, _) = run(true);
-        for (i, (&expected, &actual)) in row_warm.iter().zip(&batch_warm).enumerate() {
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "k8 probe element {i} is not bit-identical"
-            );
-        }
-        let mut row_best = u128::MAX;
-        let mut batch_best = u128::MAX;
-        let mut row_encode_best = u128::MAX;
-        let mut batch_encode_best = u128::MAX;
-        for round in 0..3 {
-            let (_, row_us, row_encode_us) = run(false);
-            let (_, batch_us, batch_encode_us) = run(true);
-            row_best = row_best.min(row_us);
-            batch_best = batch_best.min(batch_us);
-            row_encode_best = row_encode_best.min(row_encode_us);
-            batch_encode_best = batch_encode_best.min(batch_encode_us);
+            let run = |encode| {
+                try_attention_splitk_kv16_rows_for_test(
+                    &query,
+                    &keys,
+                    &values,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_positions,
+                    &position_counts,
+                    scale,
+                    None,
+                    encode,
+                    true,
+                    layers,
+                )
+                .expect("production-shape F16 split-K probe")
+            };
+            let variants = [
+                ("row", SplitkRowsEncode::RowWise),
+                ("batch", SplitkRowsEncode::Batch),
+                ("shared", SplitkRowsEncode::SharedPrefix),
+            ];
+            let (row_warm, _, _) = run(SplitkRowsEncode::RowWise);
+            for (label, encode) in variants {
+                let (warm, _, _) = run(encode);
+                for (i, (&expected, &actual)) in row_warm.iter().zip(&warm).enumerate() {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "k8 base={base} {label} element {i} is not bit-identical"
+                    );
+                }
+            }
+            let mut best = [u128::MAX; 3];
+            let mut encode_best = [u128::MAX; 3];
+            for round in 0..3 {
+                let mut line = format!("F16 split-K k8 base={base} round={round}:");
+                for (idx, (label, encode)) in variants.iter().enumerate() {
+                    let (_, gpu_us, encode_us) = run(*encode);
+                    best[idx] = best[idx].min(gpu_us);
+                    encode_best[idx] = encode_best[idx].min(encode_us);
+                    line.push_str(&format!(
+                        " {label}=GPU {:.3}ms/enc {:.3}ms",
+                        gpu_us as f64 / 1000.0,
+                        encode_us as f64 / 1000.0
+                    ));
+                }
+                eprintln!("{line}");
+            }
+            let bytes_once = (n_kv_heads * (base + rows) * head_dim * 2 * 2 * layers) as f64;
             eprintln!(
-                "F16 split-K k8 base={base} round={round}: GPU row={:.3}ms batch={:.3}ms speedup={:.3}x; encode row={:.3}ms batch={:.3}ms",
-                row_us as f64 / 1000.0,
-                batch_us as f64 / 1000.0,
-                row_us as f64 / batch_us as f64,
-                row_encode_us as f64 / 1000.0,
-                batch_encode_us as f64 / 1000.0,
+                "F16 split-K k8 base={base} layers={layers} best GPU: row={:.3}ms batch={:.3}ms shared={:.3}ms; \
+                 batch/shared={:.3}x row/shared={:.3}x; shared effective rate (K/V read once, {:.1} MB) = {:.1} GB/s",
+                best[0] as f64 / 1000.0,
+                best[1] as f64 / 1000.0,
+                best[2] as f64 / 1000.0,
+                best[1] as f64 / best[2] as f64,
+                best[0] as f64 / best[2] as f64,
+                bytes_once / 1.0e6,
+                bytes_once / (best[2] as f64 * 1.0e-6) / 1.0e9,
             );
         }
-        eprintln!(
-            "F16 split-K k8 base={base} best: GPU row={:.3}ms batch={:.3}ms speedup={:.3}x; encode row={:.3}ms batch={:.3}ms",
-            row_best as f64 / 1000.0,
-            batch_best as f64 / 1000.0,
-            row_best as f64 / batch_best as f64,
-            row_encode_best as f64 / 1000.0,
-            batch_encode_best as f64 / 1000.0,
-        );
     }
 
     /// Probe: decode-attention kernel rate at depth, production-shaped (Llama-3.2-3B:
