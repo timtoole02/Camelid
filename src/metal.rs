@@ -6637,6 +6637,338 @@ kernel void q6k_linear_mma_combined_w16_v4(
         }
     }
 }
+// ---- Opt-in register-exact V4 candidates ----------------------------------
+template <bool YREG>
+inline void kquant_v4_load_b(
+    thread simdgroup_half8x8& b,
+    device const half* y_half,
+    const thread uint4 (&yq)[8],
+    uint sb,
+    uint kk
+) {
+    if (YREG) {
+        const half2 bh = as_type<half2>(yq[kk >> 2][kk & 3u]);
+        b.thread_elements()[0] = bh.x;
+        b.thread_elements()[1] = bh.y;
+    } else {
+        simdgroup_load(b, y_half + (sb * 256 + kk * 8) * 8, 8);
+    }
+}
+
+template <uint PANELS, bool YREG>
+inline void q4k_linear_mma_combined_reg_v4_body(
+    device const float* input_scales,
+    device const uchar* weight_blocks,
+    device float* output,
+    uint n_sb,
+    uint rows,
+    uint n_tokens,
+    device const half* y_half,
+    device const half* ysums,
+    uint tile,
+    uint lane
+) {
+    const uint k_pad = 8;
+    const uint group_r0 = tile * 8 * PANELS;
+    if (group_r0 >= rows) return;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fcol0 = fragment_coord.x;
+    const uint frow = fragment_coord.y;
+    device const uint4* y4 = reinterpret_cast<device const uint4*>(y_half);
+    device const uint2* ys2 = reinterpret_cast<device const uint2*>(ysums);
+
+    float accum[PANELS][2];
+    for (uint p = 0; p < PANELS; ++p) {
+        accum[p][0] = 0.0f;
+        accum[p][1] = 0.0f;
+    }
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        half slo[PANELS][4];
+        half shi[PANELS][4];
+        half mnl[PANELS][2];
+        ushort wq[PANELS][16];
+        float dw[PANELS];
+        float dm[PANELS];
+        for (uint p = 0; p < PANELS; ++p) {
+            const uint rr = group_r0 + p * 8 + frow;
+            if (rr < rows) {
+                device const uchar* block = weight_blocks + (rr * n_sb + sb) * 144;
+                uchar sc[8], mn[8];
+                q4k_scale_min_v2(block, sc, mn);
+                for (uint g = 0; g < 4; ++g) {
+                    slo[p][g] = half(int(sc[2 * g]));
+                    shi[p][g] = half(int(sc[2 * g + 1]));
+                }
+                // mn_a[r][j16] = mn[j16 >> 1]; this lane owns j16 = m*8 + fcol0, +1.
+                mnl[p][0] = half(int(mn[fcol0 >> 1]));
+                mnl[p][1] = half(int(mn[4 + (fcol0 >> 1)]));
+                // Bytes m*8 + fcol0, +1 of quarter g hold the low nibbles for
+                // K-chunk g*8+m and the high nibbles for K-chunk g*8+4+m.
+                device const ushort* w16 =
+                    reinterpret_cast<device const ushort*>(block + 16 + fcol0);
+                for (uint g = 0; g < 4; ++g) {
+                    for (uint m = 0; m < 4; ++m) {
+                        wq[p][g * 4 + m] = w16[g * 16 + m * 4];
+                    }
+                }
+                dw[p] = float(*reinterpret_cast<device const half*>(block));
+                dm[p] = float(*reinterpret_cast<device const half*>(block + 2));
+            } else {
+                for (uint g = 0; g < 4; ++g) {
+                    slo[p][g] = half(0.0f);
+                    shi[p][g] = half(0.0f);
+                }
+                mnl[p][0] = half(0.0f);
+                mnl[p][1] = half(0.0f);
+                for (uint i = 0; i < 16; ++i) wq[p][i] = 0;
+                dw[p] = 0.0f;
+                dm[p] = 0.0f;
+            }
+        }
+        uint4 yq[8];
+        uint2 ysq = uint2(0u);
+        if (YREG) {
+            for (uint q = 0; q < 8; ++q) yq[q] = y4[(sb * 8 + q) * 32 + lane];
+            ysq = ys2[sb * 32 + lane];
+        }
+
+        simdgroup_float8x8 c_main[PANELS];
+        for (uint p = 0; p < PANELS; ++p) {
+            c_main[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (uint g = 0; g < 4; ++g) {
+            for (uint m = 0; m < 4; ++m) {
+                const uint kk = g * 8 + m;
+                simdgroup_half8x8 b;
+                kquant_v4_load_b<YREG>(b, y_half, yq, sb, kk);
+                for (uint p = 0; p < PANELS; ++p) {
+                    const uint w = uint(wq[p][g * 4 + m]);
+                    simdgroup_half8x8 a;
+                    a.thread_elements()[0] = slo[p][g] * half(int(w & 0x0fu));
+                    a.thread_elements()[1] = slo[p][g] * half(int((w >> 8) & 0x0fu));
+                    simdgroup_multiply_accumulate(c_main[p], a, b, c_main[p]);
+                }
+            }
+            for (uint m = 0; m < 4; ++m) {
+                const uint kk = g * 8 + 4 + m;
+                simdgroup_half8x8 b;
+                kquant_v4_load_b<YREG>(b, y_half, yq, sb, kk);
+                for (uint p = 0; p < PANELS; ++p) {
+                    const uint w = uint(wq[p][g * 4 + m]);
+                    simdgroup_half8x8 a;
+                    a.thread_elements()[0] = shi[p][g] * half(int((w >> 4) & 0x0fu));
+                    a.thread_elements()[1] = shi[p][g] * half(int((w >> 12) & 0x0fu));
+                    simdgroup_multiply_accumulate(c_main[p], a, b, c_main[p]);
+                }
+            }
+        }
+        simdgroup_float8x8 c_min[PANELS];
+        for (uint p = 0; p < PANELS; ++p) {
+            c_min[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (uint m = 0; m < 2; ++m) {
+            simdgroup_half8x8 b;
+            if (YREG) {
+                const half2 bh = as_type<half2>(m == 0 ? ysq.x : ysq.y);
+                b.thread_elements()[0] = bh.x;
+                b.thread_elements()[1] = bh.y;
+            } else {
+                simdgroup_load(b, ysums + (sb * 16 + m * 8) * k_pad, k_pad);
+            }
+            for (uint p = 0; p < PANELS; ++p) {
+                simdgroup_half8x8 a;
+                a.thread_elements()[0] = mnl[p][m];
+                a.thread_elements()[1] = mnl[p][m];
+                simdgroup_multiply_accumulate(c_min[p], a, b, c_min[p]);
+            }
+        }
+
+        for (uint p = 0; p < PANELS; ++p) {
+            const uint out_row = group_r0 + p * 8 + frow;
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint token = fcol0 + cell;
+                if (out_row < rows && token < n_tokens) {
+                    const float da = input_scales[token * n_sb + sb];
+                    accum[p][cell] += (dw[p] * da) * c_main[p].thread_elements()[cell]
+                                    - (dm[p] * da) * c_min[p].thread_elements()[cell];
+                }
+            }
+        }
+    }
+
+    for (uint p = 0; p < PANELS; ++p) {
+        const uint out_row = group_r0 + p * 8 + frow;
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint token = fcol0 + cell;
+            if (out_row < rows && token < n_tokens) {
+                output[token * rows + out_row] = accum[p][cell];
+            }
+        }
+    }
+}
+
+#define DEFINE_Q4K_REG_V4(NAME, PANELS, YREG)                                  \
+kernel void NAME(                                                              \
+    device const float* input_scales [[buffer(0)]],                            \
+    device const uchar* weight_blocks [[buffer(2)]],                           \
+    device float* output [[buffer(3)]],                                        \
+    constant uint& n_sb [[buffer(4)]],                                         \
+    constant uint& rows [[buffer(5)]],                                         \
+    constant uint& n_tokens [[buffer(6)]],                                     \
+    device const half* y_half [[buffer(7)]],                                   \
+    device const half* ysums [[buffer(8)]],                                    \
+    uint tile [[threadgroup_position_in_grid]],                                \
+    uint lane [[thread_index_in_simdgroup]]) {                                 \
+    q4k_linear_mma_combined_reg_v4_body<PANELS, YREG>(                         \
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_half,     \
+        ysums, tile, lane);                                                    \
+}
+
+DEFINE_Q4K_REG_V4(q4k_linear_mma_combined_reg2_v4, 2, false)
+#undef DEFINE_Q4K_REG_V4
+// Register-fragment Q6_K sibling of q6k_linear_mma_combined_direct_v4. Every
+// lane decodes exactly the two A-operand elements it natively owns in each
+// 8x8 K chunk (the same Apple ownership coordinates the direct kernel uses to
+// read its C fragment), so the half weight tile never touches threadgroup
+// memory and the superblock loop carries no barrier at all. The decoded half
+// values, the 32-chunk MMA order per superblock, the zero-initialised C per
+// superblock, and the increasing-superblock f32 tail are unchanged, so each
+// output word is the same bit pattern the direct kernel produces.
+//
+// PANELS output-row panels of eight rows share every B (activation) fragment
+// load: one threadgroup covers 8*PANELS rows and reads the activation tile
+// once per superblock instead of once per eight rows.
+template <uint PANELS>
+inline void q6k_linear_mma_combined_afrag_v4_body(
+    device const float* input_scales,
+    device const uchar* weight_blocks,
+    device float* output,
+    uint n_sb,
+    uint rows,
+    uint n_tokens,
+    device const half* y_half,
+    uint tile,
+    uint lane
+) {
+    const uint group_r0 = tile * (8u * PANELS);
+    if (group_r0 >= rows) return;
+    const uint k_pad = 8;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+
+    uint out_row[PANELS];
+    uint safe_row[PANELS];
+    float accum[PANELS][2];
+    for (uint p = 0; p < PANELS; ++p) {
+        out_row[p] = group_r0 + p * 8u + fragment_row;
+        // Rows past the tensor decode a valid neighbour and are never written;
+        // C rows are independent, so they cannot influence a live output word.
+        safe_row[p] = min(out_row[p], rows - 1u);
+        accum[p][0] = 0.0f;
+        accum[p][1] = 0.0f;
+    }
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        simdgroup_float8x8 c_main[PANELS];
+        // Raw wire words this lane needs for the whole superblock: for each
+        // half h and octet j, the ushort pair (ql[8j+c0], ql[8j+c0+1]) at +0
+        // and +32, the matching qh pair, plus the sixteen int8 scales and d.
+        ushort wl[PANELS][8];
+        ushort wh[PANELS][8];
+        ushort wq[PANELS][8];
+        ushort ws[PANELS][8];
+        for (uint p = 0; p < PANELS; ++p) {
+            c_main[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            device const uchar* block =
+                weight_blocks + (safe_row[p] * n_sb + sb) * 210;
+            for (uint h = 0; h < 2; ++h) {
+                for (uint j = 0; j < 4; ++j) {
+                    const uint o = h * 64 + 8 * j + fragment_column0;
+                    wl[p][h * 4 + j] =
+                        *reinterpret_cast<device const ushort*>(block + o);
+                    wh[p][h * 4 + j] =
+                        *reinterpret_cast<device const ushort*>(block + o + 32);
+                    wq[p][h * 4 + j] = *reinterpret_cast<device const ushort*>(
+                        block + 128 + h * 32 + 8 * j + fragment_column0
+                    );
+                }
+            }
+            for (uint i = 0; i < 8; ++i) {
+                ws[p][i] =
+                    *reinterpret_cast<device const ushort*>(block + 192 + 2 * i);
+            }
+        }
+
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 b;
+            simdgroup_load(b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad);
+            const uint h = kk >> 4;
+            const uint quarter = (kk >> 2) & 3u;
+            const uint j = kk & 3u;
+            const uint idx = h * 4 + j;
+            for (uint p = 0; p < PANELS; ++p) {
+                const uint src = (quarter & 1u) ? uint(wh[p][idx]) : uint(wl[p][idx]);
+                const uint nib = (quarter & 2u) ? ((src >> 4) & 0x0f0fu) : (src & 0x0f0fu);
+                const uint hb = ((uint(wq[p][idx]) >> (2 * quarter)) & 0x0303u) << 4;
+                const uint v = nib | hb;
+                const uint sword = uint(ws[p][kk >> 2]);
+                const int sc = int(char((sword >> (8 * ((kk >> 1) & 1u))) & 0xffu));
+                const int a0 = int(v & 0xffu) - 32;
+                const int a1 = int(v >> 8) - 32;
+                simdgroup_half8x8 a;
+                a.thread_elements()[0] = half(sc * a0);
+                a.thread_elements()[1] = half(sc * a1);
+                simdgroup_multiply_accumulate(c_main[p], a, b, c_main[p]);
+            }
+        }
+
+        for (uint p = 0; p < PANELS; ++p) {
+            if (out_row[p] < rows) {
+                device const uchar* block =
+                    weight_blocks + (out_row[p] * n_sb + sb) * 210;
+                const float dw = float(*reinterpret_cast<device const half*>(block + 208));
+                for (uint cell = 0; cell < 2; ++cell) {
+                    const uint token = fragment_column0 + cell;
+                    if (token < n_tokens) {
+                        const float da = input_scales[token * n_sb + sb];
+                        accum[p][cell] += (dw * da) * c_main[p].thread_elements()[cell];
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint p = 0; p < PANELS; ++p) {
+        if (out_row[p] < rows) {
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint token = fragment_column0 + cell;
+                if (token < n_tokens) {
+                    output[token * rows + out_row[p]] = accum[p][cell];
+                }
+            }
+        }
+    }
+}
+
+kernel void q6k_linear_mma_combined_afrag_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    q6k_linear_mma_combined_afrag_v4_body<1>(
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_half, tile, lane
+    );
+}
+
+
 "#;
 
 // Direct-f32 K-quant GEMV lane, ported from llama.cpp's current Metal
@@ -17284,6 +17616,7 @@ enum KquantV4ProjectionRoute {
     Synchronized,
     DirectFragment,
     DirectSimdBarrier,
+    RegisterExact,
     Soa8,
 }
 
@@ -17300,6 +17633,33 @@ fn kquant_v4_projection_requests(
     // verifier in synchronized arithmetic throughout the experiment.
     let direct_requested = narrow && !soa8_enabled && direct_route_enabled;
     (soa8_requested, direct_requested)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn kquant_v4_register_exact_requested(
+    narrow: bool,
+    soa8_enabled: bool,
+    register_exact_enabled: bool,
+) -> bool {
+    narrow && !soa8_enabled && register_exact_enabled
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn kquant_v4_direct_route_attempted(
+    used_soa8: bool,
+    used_register_exact: bool,
+    direct_requested: bool,
+) -> bool {
+    !used_soa8 && !used_register_exact && direct_requested
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn kquant_v4_synchronized_fallback_required(
+    used_soa8: bool,
+    used_register_exact: bool,
+    used_direct: bool,
+) -> bool {
+    !used_soa8 && !used_register_exact && !used_direct
 }
 
 #[cfg(target_os = "macos")]
@@ -17320,25 +17680,29 @@ fn encode_kquant_v4_prepared_projection_route(
         ResidentWeightFormat::Q6K => true,
         _ => unreachable!("V4 prepared projection requires Q4_K or Q6_K"),
     };
+    if route == KquantV4ProjectionRoute::RegisterExact
+        && !kquant_v4_register_exact_pair_admitted(v4)
+    {
+        return false;
+    }
     let wide = stage.n_tokens > 8;
     let pipeline = match (is_q6k, wide, route) {
-        (false, false, KquantV4ProjectionRoute::DirectFragment) => {
-            v4.q4k_v4_direct.as_ref()
-        }
-        (true, false, KquantV4ProjectionRoute::DirectFragment) => {
-            v4.q6k_v4_direct.as_ref()
-        }
+        (false, false, KquantV4ProjectionRoute::DirectFragment) => v4.q4k_v4_direct.as_ref(),
+        (true, false, KquantV4ProjectionRoute::DirectFragment) => v4.q6k_v4_direct.as_ref(),
         (false, false, KquantV4ProjectionRoute::DirectSimdBarrier) => {
             v4.q4k_v4_direct_simdbarrier.as_ref()
         }
         (true, false, KquantV4ProjectionRoute::DirectSimdBarrier) => {
             v4.q6k_v4_direct_simdbarrier.as_ref()
         }
+        (false, false, KquantV4ProjectionRoute::RegisterExact) => v4.q4k_v4_register_exact.as_ref(),
+        (true, false, KquantV4ProjectionRoute::RegisterExact) => v4.q6k_v4_register_exact.as_ref(),
         (
             _,
             true,
             KquantV4ProjectionRoute::DirectFragment
-            | KquantV4ProjectionRoute::DirectSimdBarrier,
+            | KquantV4ProjectionRoute::DirectSimdBarrier
+            | KquantV4ProjectionRoute::RegisterExact,
         ) => None,
         (false, false, KquantV4ProjectionRoute::Soa8) => v4.q4k_v4_soa8.as_ref(),
         (true, false, KquantV4ProjectionRoute::Soa8) => v4.q6k_v4_soa8.as_ref(),
@@ -17351,11 +17715,13 @@ fn encode_kquant_v4_prepared_projection_route(
     let Some(pipeline) = pipeline else {
         return false;
     };
-    // The relaxed barrier is sound only when this dispatch is exactly one
-    // Apple-width SIMD group. Keep the invariant executable rather than
-    // relying solely on the kernel name and the narrow-route match above.
-    if route == KquantV4ProjectionRoute::DirectSimdBarrier
-        && pipeline.thread_execution_width() != 32
+    // Both experimental one-group routes are sound only when this dispatch is
+    // exactly one Apple-width SIMD group. Keep the invariant executable at the
+    // final encoder boundary rather than relying on compile-time kernel names.
+    if matches!(
+        route,
+        KquantV4ProjectionRoute::DirectSimdBarrier | KquantV4ProjectionRoute::RegisterExact
+    ) && admitted_32_lane_pipeline(Some(pipeline)).is_none()
     {
         return false;
     }
@@ -17370,7 +17736,8 @@ fn encode_kquant_v4_prepared_projection_route(
         }
         KquantV4ProjectionRoute::Synchronized
         | KquantV4ProjectionRoute::DirectFragment
-        | KquantV4ProjectionRoute::DirectSimdBarrier => &weight.buffer,
+        | KquantV4ProjectionRoute::DirectSimdBarrier
+        | KquantV4ProjectionRoute::RegisterExact => &weight.buffer,
     };
     e.set_buffer(2, Some(weight_buffer), 0);
     e.set_buffer(3, Some(out), 0);
@@ -17392,7 +17759,13 @@ fn encode_kquant_v4_prepared_projection_route(
     }
     e.dispatch_thread_groups(
         metal::MTLSize {
-            width: rows.div_ceil(8) as u64,
+            width: rows.div_ceil(
+                if route == KquantV4ProjectionRoute::RegisterExact && !is_q6k {
+                    16
+                } else {
+                    8
+                },
+            ) as u64,
             height: 1,
             depth: 1,
         },
@@ -17431,6 +17804,11 @@ fn encode_kquant_v4_prepared_projection(
         weight.soa8_buffer.is_some(),
         !soa8_enabled && (simd_barrier_enabled || kquant_v4_direct_fragment_enabled()),
     );
+    let register_exact_requested = kquant_v4_register_exact_requested(
+        narrow,
+        soa8_enabled,
+        kquant_v4_register_exact_enabled(),
+    );
     let used_soa8 = soa8_requested
         && encode_kquant_v4_prepared_projection_route(
             e,
@@ -17452,12 +17830,35 @@ fn encode_kquant_v4_prepared_projection(
             );
         }
     }
+    let used_register_exact = register_exact_requested
+        && encode_kquant_v4_prepared_projection_route(
+            e,
+            v4,
+            scales,
+            stage,
+            weight,
+            out,
+            scalar,
+            rows,
+            KquantV4ProjectionRoute::RegisterExact,
+        );
+    if register_exact_requested && !used_register_exact {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[metal] CAMELID_KQUANT_V4_REGISTER_EXACT requested, but its narrow strict-math \
+                 pipeline is unavailable; retaining the established V4 route"
+            );
+        }
+    }
     // SOA8 is an arithmetic twin of synchronized V4. Once its process-wide
-    // gate is set, suppress both direct-fragment routes for every projection,
-    // including canonical Q/K/V/O weights without sidecars. This prevents a mixed
+    // gate is set, suppress the register-exact and both direct-fragment routes
+    // for every projection, including canonical Q/K/V/O weights without sidecars. This prevents a mixed
     // direct/synchronized verifier and keeps plain N=1 and SOA N<=8 in the
     // same exact arithmetic universe when both environment flags are present.
-    let used_direct = direct_requested
+    let direct_attempted =
+        kquant_v4_direct_route_attempted(used_soa8, used_register_exact, direct_requested);
+    let used_direct = direct_attempted
         && encode_kquant_v4_prepared_projection_route(
             e,
             v4,
@@ -17469,7 +17870,7 @@ fn encode_kquant_v4_prepared_projection(
             rows,
             direct_route,
         );
-    if direct_requested && !used_direct {
+    if direct_attempted && !used_direct {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
@@ -17479,7 +17880,7 @@ fn encode_kquant_v4_prepared_projection(
             );
         }
     }
-    if !used_soa8 && !used_direct {
+    if kquant_v4_synchronized_fallback_required(used_soa8, used_register_exact, used_direct) {
         assert!(encode_kquant_v4_prepared_projection_route(
             e,
             v4,
@@ -17494,6 +17895,8 @@ fn encode_kquant_v4_prepared_projection(
     }
     let route = if used_soa8 {
         KquantV4ProjectionRoute::Soa8
+    } else if used_register_exact {
+        KquantV4ProjectionRoute::RegisterExact
     } else if used_direct {
         direct_route
     } else {
@@ -18653,13 +19056,21 @@ struct KquantV2Kernels {
     q4k_v4: ComputePipelineState,
     q4k_v4_direct: Option<ComputePipelineState>,
     q4k_v4_direct_simdbarrier: Option<ComputePipelineState>,
+    q4k_v4_register_exact: Option<ComputePipelineState>,
     q4k_v4_soa8: Option<ComputePipelineState>,
     q4k_v4_w16: ComputePipelineState,
     q6k_v4: ComputePipelineState,
     q6k_v4_direct: Option<ComputePipelineState>,
     q6k_v4_direct_simdbarrier: Option<ComputePipelineState>,
+    q6k_v4_register_exact: Option<ComputePipelineState>,
     q6k_v4_soa8: Option<ComputePipelineState>,
     q6k_v4_w16: ComputePipelineState,
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_register_exact_pair_admitted(v4: &KquantV2Kernels) -> bool {
+    admitted_32_lane_pipeline(v4.q4k_v4_register_exact.as_ref()).is_some()
+        && admitted_32_lane_pipeline(v4.q6k_v4_register_exact.as_ref()).is_some()
 }
 
 /// Lazily compile the v2 library on first use. A compile failure disables only
@@ -18701,6 +19112,7 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q4k_v4_direct_simdbarrier: pipeline(
                     "q4k_linear_mma_combined_direct_simdbarrier_v4",
                 ),
+                q4k_v4_register_exact: pipeline("q4k_linear_mma_combined_reg2_v4"),
                 q4k_v4_soa8: pipeline("q4k_linear_mma_combined_soa8_v4"),
                 q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
@@ -18708,6 +19120,7 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q6k_v4_direct_simdbarrier: pipeline(
                     "q6k_linear_mma_combined_direct_simdbarrier_v4",
                 ),
+                q6k_v4_register_exact: pipeline("q6k_linear_mma_combined_afrag_v4"),
                 q6k_v4_soa8: pipeline("q6k_linear_mma_combined_soa8_v4"),
                 q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
@@ -18758,6 +19171,24 @@ fn kquant_v4_direct_fragment_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("CAMELID_KQUANT_V4_DIRECT_FRAGMENT")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Opt in to the measured narrow V4 register-exact pair. Q4_K uses two
+/// independent eight-row panels with fragment-owned weight decode; Q6_K uses
+/// fragment-owned decode for one eight-row panel. Both preserve the direct V4
+/// half operands, MMA order, and increasing-superblock f32 fold. The same
+/// route is selected for plain N=1 and verifier N<=8; wider windows retain the
+/// established synchronized V4 kernels.
+fn kquant_v4_register_exact_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn kquant_v4_register_exact_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_KQUANT_V4_REGISTER_EXACT").ok();
+        kquant_v4_register_exact_from_env(value.as_deref())
     })
 }
 
@@ -18854,17 +19285,25 @@ fn trace_kquant_v4_dispatch(
         KquantV4ProjectionRoute::DirectFragment => 1,
         KquantV4ProjectionRoute::Soa8 => 2,
         KquantV4ProjectionRoute::DirectSimdBarrier => 3,
+        KquantV4ProjectionRoute::RegisterExact => 4,
     };
     let bit = 1u32 << (shape + route_index * 6);
     let previous = SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
     if previous & bit == 0 {
-        let pipeline = match route {
-            KquantV4ProjectionRoute::Synchronized => "combined-mma-v4",
-            KquantV4ProjectionRoute::DirectFragment => "combined-mma-v4-direct-fragment",
-            KquantV4ProjectionRoute::DirectSimdBarrier => {
+        let pipeline = match (route, format) {
+            (KquantV4ProjectionRoute::RegisterExact, ResidentWeightFormat::Q4K) => {
+                "combined-mma-v4-register-exact-q4-reg2"
+            }
+            (KquantV4ProjectionRoute::RegisterExact, ResidentWeightFormat::Q6K) => {
+                "combined-mma-v4-register-exact-q6-afrag"
+            }
+            (KquantV4ProjectionRoute::Synchronized, _) => "combined-mma-v4",
+            (KquantV4ProjectionRoute::DirectFragment, _) => "combined-mma-v4-direct-fragment",
+            (KquantV4ProjectionRoute::DirectSimdBarrier, _) => {
                 "combined-mma-v4-direct-fragment-simdgroup-barrier"
             }
-            KquantV4ProjectionRoute::Soa8 => "combined-mma-v4-soa8",
+            (KquantV4ProjectionRoute::Soa8, _) => "combined-mma-v4-soa8",
+            (KquantV4ProjectionRoute::RegisterExact, _) => unreachable!(),
         };
         eprintln!(
             "[metal-kquant-v4] dispatch={label} n_tokens={n_tokens} rows={rows} pipeline={pipeline}"
@@ -41554,6 +41993,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kquant_v4_register_exact_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("garbage"),
+        ] {
+            assert!(!kquant_v4_register_exact_from_env(value));
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(kquant_v4_register_exact_from_env(Some(value)));
+        }
+
+        for n_tokens in [1usize, 8] {
+            assert!(kquant_v4_register_exact_requested(
+                n_tokens <= 8,
+                false,
+                true
+            ));
+        }
+        for n_tokens in [9usize, 16] {
+            assert!(!kquant_v4_register_exact_requested(
+                n_tokens <= 8,
+                false,
+                true
+            ));
+        }
+        assert!(!kquant_v4_register_exact_requested(true, false, false));
+        assert!(!kquant_v4_register_exact_requested(true, true, true));
+
+        let used_soa8 = false;
+        let used_register_exact = true;
+        let direct_requested = true;
+        let direct_attempted =
+            kquant_v4_direct_route_attempted(used_soa8, used_register_exact, direct_requested);
+        let fallback =
+            kquant_v4_synchronized_fallback_required(used_soa8, used_register_exact, false);
+        assert!(!direct_attempted, "register-exact must suppress direct V4");
+        assert!(!fallback, "register-exact must suppress synchronized V4");
+        assert_eq!(
+            usize::from(used_soa8)
+                + usize::from(used_register_exact)
+                + usize::from(direct_attempted)
+                + usize::from(fallback),
+            1,
+            "a projection must encode exactly one route"
+        );
+        assert!(kquant_v4_synchronized_fallback_required(
+            false, false, false
+        ));
+    }
+
     /// SOA8 must be a pure address-layout change. Compare it against the
     /// synchronized canonical V4 kernels for adversarial Q4_K/Q6_K bytes,
     /// every representative narrow verifier width, a ragged output tile, and
@@ -42131,7 +42626,9 @@ mod tests {
                         KquantV4ProjectionRoute::DirectSimdBarrier => {
                             simdgroup_samples.push(busy_us)
                         }
-                        KquantV4ProjectionRoute::Synchronized | KquantV4ProjectionRoute::Soa8 => {
+                        KquantV4ProjectionRoute::Synchronized
+                        | KquantV4ProjectionRoute::RegisterExact
+                        | KquantV4ProjectionRoute::Soa8 => {
                             unreachable!()
                         }
                     }
@@ -42430,6 +42927,230 @@ mod tests {
                 2,
                 "{candidate} must replace exactly the producer and reuse fences"
             );
+        }
+    }
+
+    /// The production register-exact pair must remain in the established V4
+    /// arithmetic universe for both plain decode and every narrow verifier
+    /// width. Ragged rows exercise Q4's 16-row register panel and Q6's 8-row
+    /// tail without allowing padded output writes to hide behind parity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_register_exact_is_bit_identical_and_guarded() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        assert!(
+            v4.q4k_v4_register_exact.is_some(),
+            "Q4 register-exact pipeline"
+        );
+        assert!(
+            v4.q6k_v4_register_exact.is_some(),
+            "Q6 register-exact pipeline"
+        );
+        assert!(v4.q4k_v4_direct.is_some(), "Q4 direct V4 oracle");
+        assert!(v4.q6k_v4_direct.is_some(), "Q6 direct V4 oracle");
+        for (label, pipeline) in [
+            ("Q4", v4.q4k_v4_register_exact.as_ref().unwrap()),
+            ("Q6", v4.q6k_v4_register_exact.as_ref().unwrap()),
+        ] {
+            assert_eq!(
+                pipeline.thread_execution_width(),
+                32,
+                "{label} register-exact route requires one Apple-width SIMD group"
+            );
+            assert!(
+                pipeline.max_total_threads_per_threadgroup() >= 32,
+                "{label} register-exact route must admit a 32-thread group"
+            );
+        }
+
+        let device = &kernel.device;
+        let rows = 19usize;
+        let n_sb = 3usize;
+        let input_width = n_sb * 256;
+        let physical_columns = 8usize;
+        let make_weight = |format: ResidentWeightFormat, salt: usize| {
+            let block_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                .map(|i| ((i * 53 + i / 23 + salt * 31) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                let d = 0.005 + block_index as f32 * 0.00009;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.4).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let buffer =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&buffer, &wire);
+            ResidentLinearWeight {
+                format,
+                buffer,
+                soa8_buffer: None,
+                q8_wire: false,
+            }
+        };
+        let q4_weight = make_weight(ResidentWeightFormat::Q4K, 5);
+        let q6_weight = make_weight(ResidentWeightFormat::Q6K, 13);
+
+        for n_tokens in [1usize, 3, 7, 8] {
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| {
+                    let token = i / input_width;
+                    let col = i % input_width;
+                    ((((token * 149 + col * 37) % 263) as f32) - 131.0) * 0.013
+                        + token as f32 * 0.0007
+                })
+                .collect();
+            let input_buf = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let make_output = || {
+                let output = device.new_buffer(
+                    (physical_columns * rows * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                fill_buffer_sentinel(&output, physical_columns * rows);
+                output
+            };
+            let q4_control = make_output();
+            let q4_direct = make_output();
+            let q4_candidate = make_output();
+            let q6_control = make_output();
+            let q6_direct = make_output();
+            let q6_candidate = make_output();
+
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            let prepared = encode_shared_kquant_v4_activation(
+                e,
+                kernel,
+                v4,
+                &input_buf,
+                input_width,
+                n_tokens,
+            );
+            for (weight, output, route) in [
+                (
+                    &q4_weight,
+                    &q4_control,
+                    KquantV4ProjectionRoute::Synchronized,
+                ),
+                (
+                    &q4_weight,
+                    &q4_direct,
+                    KquantV4ProjectionRoute::DirectFragment,
+                ),
+                (
+                    &q4_weight,
+                    &q4_candidate,
+                    KquantV4ProjectionRoute::RegisterExact,
+                ),
+                (
+                    &q6_weight,
+                    &q6_control,
+                    KquantV4ProjectionRoute::Synchronized,
+                ),
+                (
+                    &q6_weight,
+                    &q6_direct,
+                    KquantV4ProjectionRoute::DirectFragment,
+                ),
+                (
+                    &q6_weight,
+                    &q6_candidate,
+                    KquantV4ProjectionRoute::RegisterExact,
+                ),
+            ] {
+                assert!(encode_kquant_v4_prepared_projection_route(
+                    e,
+                    v4,
+                    &prepared.scales,
+                    &prepared.stage,
+                    weight,
+                    output,
+                    &scalar,
+                    rows,
+                    route,
+                ));
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            for (format, control, direct, candidate) in [
+                ("Q4", &q4_control, &q4_direct, &q4_candidate),
+                ("Q6", &q6_control, &q6_direct, &q6_candidate),
+            ] {
+                let mut control_values = vec![0.0f32; physical_columns * rows];
+                let mut direct_values = vec![0.0f32; physical_columns * rows];
+                let mut candidate_values = vec![0.0f32; physical_columns * rows];
+                read_buffer_f32(control, &mut control_values);
+                read_buffer_f32(direct, &mut direct_values);
+                read_buffer_f32(candidate, &mut candidate_values);
+                let active = n_tokens * rows;
+                assert_no_sentinel(
+                    &candidate_values[..active],
+                    &format!("{format} register exact"),
+                    n_tokens,
+                );
+                for i in 0..active {
+                    assert_eq!(
+                        candidate_values[i].to_bits(),
+                        control_values[i].to_bits(),
+                        "{format} register exact n={n_tokens} element={i}: {} ({:#010x}) \
+                         != synchronized {} ({:#010x})",
+                        candidate_values[i],
+                        candidate_values[i].to_bits(),
+                        control_values[i],
+                        control_values[i].to_bits(),
+                    );
+                    assert_eq!(
+                        candidate_values[i].to_bits(),
+                        direct_values[i].to_bits(),
+                        "{format} register exact n={n_tokens} element={i} differs from direct V4"
+                    );
+                }
+                for i in active..physical_columns * rows {
+                    assert_eq!(
+                        candidate_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} register exact wrote padded output n={n_tokens} element={i}"
+                    );
+                    assert_eq!(
+                        control_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} synchronized control wrote padded output n={n_tokens} element={i}"
+                    );
+                    assert_eq!(
+                        direct_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} direct oracle wrote padded output n={n_tokens} element={i}"
+                    );
+                }
+            }
+            drop(prepared);
         }
     }
 
