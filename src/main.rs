@@ -10673,7 +10673,7 @@ fn eagle3_indexed_head_shadow_candidate_union(
         !union.is_empty()
             && union
                 .iter()
-                .all(|&token| token as usize < camelid::eagle3::TARGET_VOCAB_SIZE)
+                .all(|&token| (token as usize) < camelid::eagle3::TARGET_VOCAB_SIZE)
             && union.windows(2).all(|pair| pair[0] < pair[1]),
         "indexed-head candidate union must be non-empty, in-vocabulary, sorted, and unique"
     );
