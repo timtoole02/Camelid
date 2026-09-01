@@ -24,9 +24,9 @@ pub const RESIDENT_VERIFY_TARGET_TOP_K: usize = 8;
 /// existing Q6_K V4 kernel replay the full-head arithmetic bit for bit.
 pub const RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS: usize = 8;
 
-/// Defensive diagnostic allocation cap. The current EAGLE frontier retains at most a few dozen
-/// ids; accepting an unbounded caller-supplied union would turn a shadow into a second full head.
-pub const RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES: usize = 512;
+/// Defensive diagnostic allocation cap. Four explicitly gated 256-wide EAGLE expansions fit,
+/// while an unbounded caller-supplied union still cannot turn the shadow into a second full head.
+pub const RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidentIndexedHeadShadowFallbackReason {
@@ -29003,10 +29003,13 @@ pub const EAGLE3_DRAFT_VOCAB: usize = 32_000;
 pub const EAGLE3_TARGET_VOCAB: usize = 128_256;
 pub const EAGLE3_ROPE_THETA: f32 = 500_000.0;
 pub const EAGLE3_RMS_EPS: f32 = 1.0e-5;
-/// Number of ranked draft-head alternatives retained for telemetry and future tree drafting.
-/// Keeping this fixed and small bounds the host scan's output without changing the existing
-/// single-token forward API or its GPU-selected top-1 result.
+/// Default number of ranked draft-head alternatives retained for telemetry and tree drafting.
+/// The benchmark-only argmax shadow may request a wider diagnostic list, but ordinary serving
+/// remains byte-for-byte on this fixed width when the override is absent.
 pub const EAGLE3_TOP_K_CANDIDATES: usize = 8;
+pub const EAGLE3_ARGMAX_SHADOW_CANDIDATES_MAX: usize = 256;
+pub const EAGLE3_ARGMAX_SHADOW_CANDIDATES_ENV: &str =
+    "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES";
 
 /// Borrowed view of one admitted 15-tensor Llama-3.2-3B EAGLE-3 checkpoint.
 ///
@@ -29325,7 +29328,49 @@ fn eagle3_map_draft_token(
     Ok(target as u32)
 }
 
-fn eagle3_rank_top_candidates(
+fn parse_eagle3_argmax_shadow_candidate_limit(
+    value: Option<&str>,
+) -> std::result::Result<usize, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(EAGLE3_TOP_K_CANDIDATES);
+    };
+    let limit = value.parse::<usize>().map_err(|error| {
+        format!("{EAGLE3_ARGMAX_SHADOW_CANDIDATES_ENV} must be an integer: {error}")
+    })?;
+    if limit < EAGLE3_TOP_K_CANDIDATES
+        || limit > EAGLE3_ARGMAX_SHADOW_CANDIDATES_MAX
+        || !limit.is_power_of_two()
+    {
+        return Err(format!(
+            "{EAGLE3_ARGMAX_SHADOW_CANDIDATES_ENV} must be a power of two in {}..={}, got {limit}",
+            EAGLE3_TOP_K_CANDIDATES, EAGLE3_ARGMAX_SHADOW_CANDIDATES_MAX
+        ));
+    }
+    Ok(limit)
+}
+
+/// Process-stable diagnostic width. The ordinary route remains at eight unless the caller
+/// explicitly arms the benchmark gate before the first EAGLE head evaluation.
+pub fn eagle3_argmax_shadow_candidate_limit() -> std::result::Result<usize, String> {
+    static LIMIT: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    LIMIT
+        .get_or_init(|| {
+            let raw = std::env::var_os(EAGLE3_ARGMAX_SHADOW_CANDIDATES_ENV);
+            let value = raw
+                .as_ref()
+                .map(|value| {
+                    value.to_str().ok_or_else(|| {
+                        format!("{EAGLE3_ARGMAX_SHADOW_CANDIDATES_ENV} is not valid UTF-8")
+                    })
+                })
+                .transpose()?;
+            parse_eagle3_argmax_shadow_candidate_limit(value)
+        })
+        .clone()
+}
+
+fn eagle3_rank_top_candidates_legacy(
     logits: &[f32],
     d2t_offsets: &[i32],
 ) -> std::result::Result<Vec<Eagle3DraftCandidate>, String> {
@@ -29342,34 +29387,35 @@ fn eagle3_rank_top_candidates(
         }
         let draft_token =
             u32::try_from(draft).map_err(|_| format!("EAGLE-3 draft row {draft} exceeds u32"))?;
-
         if count < limit {
             let mut insert_idx = count;
             for i in 0..count {
-                let (l, t) = top_logits[i];
-                if logit > l || (logit == l && draft_token < t) {
+                let (ranked_logit, ranked_token) = top_logits[i];
+                if logit > ranked_logit || (logit == ranked_logit && draft_token < ranked_token) {
                     insert_idx = i;
                     break;
                 }
             }
-            for j in (insert_idx..count).rev() {
-                top_logits[j + 1] = top_logits[j];
+            for index in (insert_idx..count).rev() {
+                top_logits[index + 1] = top_logits[index];
             }
             top_logits[insert_idx] = (logit, draft_token);
             count += 1;
         } else {
-            let (min_l, min_t) = top_logits[limit - 1];
-            if logit > min_l || (logit == min_l && draft_token < min_t) {
+            let (minimum_logit, minimum_token) = top_logits[limit - 1];
+            if logit > minimum_logit || (logit == minimum_logit && draft_token < minimum_token) {
                 let mut insert_idx = limit - 1;
                 for i in 0..limit - 1 {
-                    let (l, t) = top_logits[i];
-                    if logit > l || (logit == l && draft_token < t) {
+                    let (ranked_logit, ranked_token) = top_logits[i];
+                    if logit > ranked_logit
+                        || (logit == ranked_logit && draft_token < ranked_token)
+                    {
                         insert_idx = i;
                         break;
                     }
                 }
-                for j in (insert_idx..limit - 1).rev() {
-                    top_logits[j + 1] = top_logits[j];
+                for index in (insert_idx..limit - 1).rev() {
+                    top_logits[index + 1] = top_logits[index];
                 }
                 top_logits[insert_idx] = (logit, draft_token);
             }
@@ -29377,8 +29423,7 @@ fn eagle3_rank_top_candidates(
     }
 
     let mut ranked = Vec::with_capacity(count);
-    for i in 0..count {
-        let (logit, draft_token) = top_logits[i];
+    for &(logit, draft_token) in &top_logits[..count] {
         ranked.push(Eagle3DraftCandidate {
             draft_token,
             target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
@@ -29386,6 +29431,67 @@ fn eagle3_rank_top_candidates(
         });
     }
     Ok(ranked)
+}
+
+fn eagle3_rank_top_candidates_with_limit(
+    logits: &[f32],
+    d2t_offsets: &[i32],
+    requested_limit: usize,
+) -> std::result::Result<Vec<Eagle3DraftCandidate>, String> {
+    if requested_limit == 0 || requested_limit > EAGLE3_ARGMAX_SHADOW_CANDIDATES_MAX {
+        return Err(format!(
+            "EAGLE-3 top-candidate limit must be in 1..={}, got {requested_limit}",
+            EAGLE3_ARGMAX_SHADOW_CANDIDATES_MAX
+        ));
+    }
+    if requested_limit == EAGLE3_TOP_K_CANDIDATES {
+        return eagle3_rank_top_candidates_legacy(logits, d2t_offsets);
+    }
+    let limit = requested_limit.min(logits.len());
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut top_logits = Vec::with_capacity(logits.len());
+    for (draft, &logit) in logits.iter().enumerate() {
+        if logit.is_nan() {
+            continue;
+        }
+        let draft_token =
+            u32::try_from(draft).map_err(|_| format!("EAGLE-3 draft row {draft} exceeds u32"))?;
+        top_logits.push((logit, draft_token));
+    }
+    let rank = |left: &(f32, u32), right: &(f32, u32)| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .expect("NaNs were removed before draft candidate ranking")
+            .then_with(|| left.1.cmp(&right.1))
+    };
+    if top_logits.len() > limit {
+        top_logits.select_nth_unstable_by(limit, rank);
+        top_logits.truncate(limit);
+    }
+    top_logits.sort_unstable_by(rank);
+
+    top_logits
+        .into_iter()
+        .map(|(logit, draft_token)| {
+            Ok(Eagle3DraftCandidate {
+                draft_token,
+                target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
+                logit,
+            })
+        })
+        .collect()
+}
+
+fn eagle3_rank_top_candidates(
+    logits: &[f32],
+    d2t_offsets: &[i32],
+) -> std::result::Result<Vec<Eagle3DraftCandidate>, String> {
+    let limit = eagle3_argmax_shadow_candidate_limit()?;
+    eagle3_rank_top_candidates_with_limit(logits, d2t_offsets, limit)
 }
 
 /// Parse the benchmark-only scheduling gate. Unknown spellings fail closed to the serial lane.
@@ -30900,6 +31006,20 @@ mod eagle3_metal_contract_tests {
 
     #[test]
     fn eagle3_top_candidates_are_bounded_ranked_and_tie_deterministic() {
+        assert_eq!(
+            parse_eagle3_argmax_shadow_candidate_limit(None).unwrap(),
+            EAGLE3_TOP_K_CANDIDATES
+        );
+        for limit in [8usize, 16, 32, 64, 128, 256] {
+            assert_eq!(
+                parse_eagle3_argmax_shadow_candidate_limit(Some(&limit.to_string())).unwrap(),
+                limit
+            );
+        }
+        for invalid in ["7", "24", "257", "garbage"] {
+            assert!(parse_eagle3_argmax_shadow_candidate_limit(Some(invalid)).is_err());
+        }
+
         let logits = [
             1.0,
             5.0,
@@ -30933,6 +31053,43 @@ mod eagle3_metal_contract_tests {
                 .collect::<Vec<_>>(),
             (0..EAGLE3_TOP_K_CANDIDATES as u32).collect::<Vec<_>>()
         );
+
+        let mut wide_logits = (0..1_024)
+            .map(|index| (((index * 97 + index / 11) % 211) as f32) - 105.0)
+            .collect::<Vec<_>>();
+        wide_logits[3] = f32::NAN;
+        wide_logits[19] = f32::INFINITY;
+        wide_logits[23] = f32::INFINITY;
+        wide_logits[29] = -0.0;
+        wide_logits[31] = 0.0;
+        let wide_offsets = vec![0; wide_logits.len()];
+        let mut expected = wide_logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, logit)| !logit.is_nan())
+            .collect::<Vec<_>>();
+        expected.sort_unstable_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap()
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for limit in [8usize, 32, 128, 256] {
+            let actual =
+                eagle3_rank_top_candidates_with_limit(&wide_logits, &wide_offsets, limit).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|candidate| (candidate.draft_token as usize, candidate.logit.to_bits()))
+                    .collect::<Vec<_>>(),
+                expected[..limit]
+                    .iter()
+                    .map(|&(token, logit)| (token, logit.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

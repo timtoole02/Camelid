@@ -10705,10 +10705,15 @@ fn record_eagle3_argmax_shadow_round(
         "argmax shadow round ids are not strictly increasing"
     );
     let candidate_union = shadow.target_token_union();
+    let expected_candidates_per_expansion =
+        camelid::metal::eagle3_argmax_shadow_candidate_limit().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         !candidate_union.is_empty()
-            && candidate_union.windows(2).all(|pair| pair[0] < pair[1]),
-        "argmax shadow candidate union is empty or not strictly increasing"
+            && candidate_union.windows(2).all(|pair| pair[0] < pair[1])
+            && shadow.expansions.iter().all(|expansion| {
+                expansion.candidate_target_tokens.len() == expected_candidates_per_expansion
+            }),
+        "argmax shadow candidate union or per-expansion width is incomplete"
     );
     let row_evidence = verifier_token_ids
         .iter()
@@ -12424,6 +12429,8 @@ struct BenchEagle3Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     certified_argmax_shadow_candidate_observations: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    certified_argmax_shadow_candidates_per_expansion: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     certified_argmax_shadow_candidate_union_hits: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     certified_argmax_shadow_candidate_union_misses: Option<u64>,
@@ -12704,6 +12711,8 @@ fn validate_eagle3_argmax_shadow_config(
     indexed_head_shadow: bool,
     target_row_lattice_promotion: bool,
     tree_nodes: Option<usize>,
+    tree_expansions: usize,
+    candidate_limit: usize,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !indexed_head_shadow || certified_argmax_shadow,
@@ -12715,6 +12724,19 @@ fn validate_eagle3_argmax_shadow_config(
                 && tree_nodes
                     == Some(camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES)),
         "EAGLE-3 argmax shadow requires the fixed N8 target-row lattice benchmark"
+    );
+    anyhow::ensure!(
+        certified_argmax_shadow || candidate_limit == camelid::metal::EAGLE3_TOP_K_CANDIDATES,
+        "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES requires CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW=1"
+    );
+    anyhow::ensure!(
+        !indexed_head_shadow
+            || candidate_limit
+                .checked_mul(tree_expansions)
+                .is_some_and(|maximum_union| maximum_union
+                    <= camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES),
+        "indexed-head shadow candidate width {candidate_limit} x {tree_expansions} expansions exceeds the diagnostic union cap {}",
+        camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
     );
     Ok(())
 }
@@ -12982,11 +13004,13 @@ fn eagle3_argmax_shadow_gates_are_default_off_and_fail_closed() {
         assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", value).unwrap());
     }
     assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", Some("maybe")).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8)).is_ok());
-    assert!(validate_eagle3_argmax_shadow_config(false, true, true, Some(8)).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, false, Some(8)).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(7)).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None).is_ok());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 256).is_ok());
+    assert!(validate_eagle3_argmax_shadow_config(false, true, true, Some(8), 4, 8).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, false, Some(8), 4, 8).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(7), 4, 8).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 16).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 5, 256).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 8).is_ok());
 }
 
 #[cfg(test)]
@@ -13853,6 +13877,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_PARALLEL_LSE",
         "CAMELID_BENCH_EAGLE3_VERIFY_LAYER0_EARLY_COMMIT",
         "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS",
+        "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES",
     ] {
         if std::env::var_os(key).is_some() {
             values.insert(key.to_string(), std::env::var(key).ok());
@@ -14184,6 +14209,8 @@ fn run_bench_eagle3(
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_CERTIFIED_ARGMAX_SHADOW")?;
     let indexed_head_shadow =
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW")?;
+    let argmax_shadow_candidate_limit =
+        camelid::metal::eagle3_argmax_shadow_candidate_limit().map_err(anyhow::Error::msg)?;
     let target_row_lattice_prior_log_bonus_override =
         eagle3_target_row_lattice_prior_log_bonus_override()?;
     anyhow::ensure!(
@@ -14324,6 +14351,8 @@ fn run_bench_eagle3(
         indexed_head_shadow,
         target_row_lattice_promotion,
         tree_nodes,
+        tree_expansions,
+        argmax_shadow_candidate_limit,
     )?;
     validate_eagle3_terminal_head_skip_config(
         terminal_head_skip,
@@ -14897,6 +14926,8 @@ fn run_bench_eagle3(
             .then_some(eagle.argmax_shadow_rounds.len() as u64),
         certified_argmax_shadow_candidate_observations: certified_argmax_shadow
             .then_some(argmax_candidate_observations),
+        certified_argmax_shadow_candidates_per_expansion: certified_argmax_shadow
+            .then_some(argmax_shadow_candidate_limit),
         certified_argmax_shadow_candidate_union_hits: certified_argmax_shadow
             .then_some(argmax_union_hits),
         certified_argmax_shadow_candidate_union_misses: certified_argmax_shadow
