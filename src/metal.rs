@@ -384,7 +384,7 @@ struct MetalLinearKernel {
     attention_decode_splitk_kv16_direct_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_batch_pipeline: ComputePipelineState,
-    attention_decode_splitk_kv16_direct_shared_pipeline: ComputePipelineState,
+    attention_decode_splitk_kv16_direct_shared_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_merge_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
     kv_dequant_q8_to_h_pipeline: ComputePipelineState,
@@ -11498,10 +11498,10 @@ kernel void attention_decode_splitk_kv16_direct_batch(
 // Prefix-shared sibling of attention_decode_splitk_kv16_direct_batch (head_dim == 128,
 // rows <= 8).  The grid drops the row dimension: one threadgroup per (kv-head, split)
 // carries every verifier row as its own simdgroup, and each simdgroup owns all `group`
-// query heads of that kv head.  A K/V position is therefore fetched once per simdgroup
-// (shared by its heads) and the eight row simdgroups walk the same chunk on one core, so
-// the prefix streams from memory once per threadgroup instead of once per (row, head)
-// threadgroup.  Every row keeps its own (position_count, n_splits) partition, its own
+// query heads of that kv head.  A K/V position is fetched once per row simdgroup and
+// reused across that row's query heads.  Sibling row simdgroups walk nearby prefix data
+// in the same threadgroup, allowing cache locality without assuming cross-simdgroup
+// broadcast.  Every row keeps its own (position_count, n_splits) partition, its own
 // packed tail slots, and the unchanged four-position flash recurrence per head, so the
 // partial written for each (row, head, split) is bit-identical to the row-wise kernels.
 kernel void attention_decode_splitk_kv16_direct_shared(
@@ -12616,14 +12616,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                     &attention_decode_splitk_kv16_direct_batch_function,
                 )
                 .ok()?;
-            let attention_decode_splitk_kv16_direct_shared_function = elementwise_library
+            let attention_decode_splitk_kv16_direct_shared_pipeline = elementwise_library
                 .get_function("attention_decode_splitk_kv16_direct_shared", None)
-                .ok()?;
-            let attention_decode_splitk_kv16_direct_shared_pipeline = device
-                .new_compute_pipeline_state_with_function(
-                    &attention_decode_splitk_kv16_direct_shared_function,
-                )
-                .ok()?;
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let attention_decode_splitk_merge_batch_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_batch_f32", None)
                 .ok()?;
@@ -22354,22 +22354,46 @@ fn verify_attention_batch_enabled() -> bool {
 }
 
 /// Experimental verifier-only prefix-shared F16 split-K attention: one threadgroup per
-/// (kv-head, split) carries every verifier row (`k <= 8`, head_dim 128) so the K/V prefix
-/// chunk streams once per threadgroup instead of once per (row, head).  Arming it also
+/// (kv-head, split) carries every verifier row (`k <= 8`, head_dim 128), reuses each K/V
+/// load across the query heads owned by one row simdgroup, and improves locality across
+/// sibling row simdgroups. Arming it also
 /// admits the row-dimensional batch route it refines (ineligible shapes fall back to the
 /// row-dimensional kernel, then to the row-wise path); all three are bit-identical.
+#[cfg(target_os = "macos")]
+fn verify_attention_shared_prefix_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 #[cfg(target_os = "macos")]
 fn verify_attention_shared_prefix_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_METAL_ATTN_SHARED_PREFIX")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        let value = std::env::var("CAMELID_METAL_ATTN_SHARED_PREFIX").ok();
+        verify_attention_shared_prefix_from_env(value.as_deref())
     })
 }
 
 #[cfg(target_os = "macos")]
-fn attention_splitk_kv16_shared_prefix_shape_allowed(rows: usize, head_dim: usize) -> bool {
-    (2..=8).contains(&rows) && head_dim == 128
+fn attention_splitk_kv16_shared_prefix_shape_allowed(
+    rows: usize,
+    head_dim: usize,
+    group: usize,
+) -> bool {
+    (2..=8).contains(&rows) && head_dim == 128 && group == 3
+}
+
+#[cfg(target_os = "macos")]
+fn attention_splitk_kv16_shared_prefix_pipeline(
+    k: &MetalLinearKernel,
+    rows: usize,
+    head_dim: usize,
+    group: usize,
+) -> Option<&ComputePipelineState> {
+    if !attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim, group) {
+        return None;
+    }
+    admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_shared_pipeline.as_ref())
+        .filter(|pipeline| pipeline.max_total_threads_per_threadgroup() >= (rows * 32) as u64)
 }
 
 #[cfg(target_os = "macos")]
@@ -22742,25 +22766,41 @@ fn try_attention_splitk_kv16_rows_for_test(
     repeats: usize,
 ) -> Option<(Vec<f32>, u128, u128)> {
     let rows = position_counts.len();
+    let group = n_heads.checked_div(n_kv_heads)?;
     if rows == 0
         || repeats == 0
+        || n_heads % n_kv_heads != 0
         || query.len() != rows * n_heads * head_dim
         || keys.len() != n_kv_heads * max_positions * head_dim
         || values.len() != keys.len()
         || tree.is_some_and(|(_, slots)| slots.len() != rows)
         || (encode == SplitkRowsEncode::SharedPrefix
-            && !(direct && attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim)))
+            && !(direct
+                && attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim, group)))
     {
         return None;
     }
     let batched = encode != SplitkRowsEncode::RowWise;
     let kernel = metal_linear_kernel()?;
+    let shared_pipeline = (encode == SplitkRowsEncode::SharedPrefix)
+        .then(|| attention_splitk_kv16_shared_prefix_pipeline(kernel, rows, head_dim, group))
+        .flatten();
+    if encode == SplitkRowsEncode::SharedPrefix && shared_pipeline.is_none() {
+        return None;
+    }
     let device = &kernel.device;
     let opts = MTLResourceOptions::StorageModeShared;
     let q = device.new_buffer(std::mem::size_of_val(query) as u64, opts);
     let k = device.new_buffer((keys.len() * 2) as u64, opts);
     let v = device.new_buffer((values.len() * 2) as u64, opts);
-    let out = device.new_buffer((rows * n_heads * head_dim * 4) as u64, opts);
+    const OUTPUT_GUARD_WORDS: usize = 32;
+    const OUTPUT_SENTINEL: f32 = -1.0e30;
+    let output_words = rows * n_heads * head_dim;
+    let out = device.new_buffer(((output_words + OUTPUT_GUARD_WORDS) * 4) as u64, opts);
+    write_buffer_f32(
+        &out,
+        &vec![OUTPUT_SENTINEL; output_words + OUTPUT_GUARD_WORDS],
+    );
     write_buffer_f32(&q, query);
     unsafe {
         let kp = k.contents() as *mut u16;
@@ -22773,7 +22813,6 @@ fn try_attention_splitk_kv16_rows_for_test(
         }
     }
 
-    let group = n_heads / n_kv_heads;
     let split_counts: Vec<usize> = position_counts
         .iter()
         .map(|&pc| pc.div_ceil(64).clamp(2, 64))
@@ -22880,7 +22919,7 @@ fn try_attention_splitk_kv16_rows_for_test(
         let shared = encode == SplitkRowsEncode::SharedPrefix;
         for _ in 0..repeats {
             e.set_compute_pipeline_state(if shared {
-                &kernel.attention_decode_splitk_kv16_direct_shared_pipeline
+                shared_pipeline.expect("shared-prefix pipeline admitted above")
             } else if direct {
                 &kernel.attention_decode_splitk_kv16_direct_batch_pipeline
             } else {
@@ -23016,8 +23055,21 @@ fn try_attention_splitk_kv16_rows_for_test(
     cb.commit();
     cb.wait_until_completed();
     let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
-    let mut result = vec![0.0f32; rows * n_heads * head_dim];
-    read_buffer_f32(&out, &mut result);
+    let mut physical_output = vec![0.0f32; output_words + OUTPUT_GUARD_WORDS];
+    read_buffer_f32(&out, &mut physical_output);
+    assert!(
+        physical_output[output_words..]
+            .iter()
+            .all(|value| value.to_bits() == OUTPUT_SENTINEL.to_bits()),
+        "split-K attention wrote beyond its logical output"
+    );
+    assert!(
+        physical_output[..output_words]
+            .iter()
+            .all(|value| value.to_bits() != OUTPUT_SENTINEL.to_bits()),
+        "split-K attention left part of its logical output unwritten"
+    );
+    let result = physical_output[..output_words].to_vec();
     Some((result, busy_us, encode_us))
 }
 
@@ -23697,11 +23749,18 @@ fn encode_attention_tree(
 ///
 /// This changes only the dispatch geometry. Each row retains its own position count,
 /// split count, query slice, partial-state slice, and (for trees) packed ancestor-slot
-/// list. The MSL twins execute the row-wise flash and merge loops in the same order, so
-/// collapsing the host encode loop cannot change accepted target bits.
+/// list. The MSL twins execute the row-wise flash and merge loops in the same order; the
+/// bit-identity and protected model gates are required before this route is promoted.
 #[cfg(target_os = "macos")]
 fn attention_splitk_kv16_wide_depth_allowed(position_counts: &[usize]) -> bool {
     position_counts.len() <= 8 || position_counts.iter().all(|&pc| pc <= 2048)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AttentionSplitkKv16BatchRoute {
+    encoded: bool,
+    shared_prefix: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -23720,10 +23779,12 @@ fn encode_attention_splitk_kv16_batch(
     head_dim: usize,
     position_counts: &[usize],
     tree: Option<&TreeAttn>,
-) -> bool {
+) -> AttentionSplitkKv16BatchRoute {
     let rows = position_counts.len();
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
     if !(2..=16).contains(&rows)
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
         || !attn2_enabled()
         || !splitk_attention_enabled()
         || !head_dim.is_multiple_of(32)
@@ -23739,7 +23800,7 @@ fn encode_attention_splitk_kv16_batch(
                     .any(|(&pc, slots)| pc != t.base + slots.len())
         })
     {
-        return false;
+        return AttentionSplitkKv16BatchRoute::default();
     }
     #[cfg(test)]
     VERIFY_BATCH_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -23749,8 +23810,10 @@ fn encode_attention_splitk_kv16_batch(
         .map(|&pc| pc.div_ceil(64).clamp(2, 64))
         .collect();
     let max_splits = split_counts.iter().copied().max().unwrap_or(0);
-    let shared_prefix = verify_attention_shared_prefix_enabled()
-        && attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim);
+    let shared_pipeline = verify_attention_shared_prefix_enabled()
+        .then(|| attention_splitk_kv16_shared_prefix_pipeline(k, rows, head_dim, group))
+        .flatten();
+    let shared_prefix = shared_pipeline.is_some();
     #[cfg(test)]
     if shared_prefix {
         VERIFY_SHARED_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -23793,8 +23856,8 @@ fn encode_attention_splitk_kv16_batch(
         }
     }
 
-    e.set_compute_pipeline_state(if shared_prefix {
-        &k.attention_decode_splitk_kv16_direct_shared_pipeline
+    e.set_compute_pipeline_state(if let Some(pipeline) = shared_pipeline {
+        pipeline
     } else if head_dim == 128 {
         &k.attention_decode_splitk_kv16_direct_batch_pipeline
     } else {
@@ -23873,7 +23936,10 @@ fn encode_attention_splitk_kv16_batch(
         tail_offsets_buf,
         tail_slots_buf,
     ]);
-    true
+    AttentionSplitkKv16BatchRoute {
+        encoded: true,
+        shared_prefix,
+    }
 }
 
 /// Encode the FFN block op-chain into `cb` with no commit/readback: reads `in_buf`, writes
@@ -37281,30 +37347,33 @@ impl ResidentDecodeState {
             } else {
                 None
             };
-            let batched_attention = want_batched_attention
-                && f16_kv.is_some_and(|(batch_k, batch_v)| {
-                    encode_attention_splitk_kv16_batch(
-                        e,
-                        kern,
-                        &mut keep,
-                        &q_buf,
-                        batch_k,
-                        batch_v,
-                        &ctx_buf,
-                        &attn_scalars[0],
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        &attn_position_counts,
-                        tree,
-                    )
-                });
+            let attention_route = if want_batched_attention {
+                f16_kv.map_or_else(
+                    AttentionSplitkKv16BatchRoute::default,
+                    |(batch_k, batch_v)| {
+                        encode_attention_splitk_kv16_batch(
+                            e,
+                            kern,
+                            &mut keep,
+                            &q_buf,
+                            batch_k,
+                            batch_v,
+                            &ctx_buf,
+                            &attn_scalars[0],
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            &attn_position_counts,
+                            tree,
+                        )
+                    },
+                )
+            } else {
+                AttentionSplitkKv16BatchRoute::default()
+            };
+            let batched_attention = attention_route.encoded;
             batched_attention_layers += usize::from(batched_attention);
-            shared_attention_layers += usize::from(
-                batched_attention
-                    && verify_attention_shared_prefix_enabled()
-                    && attention_splitk_kv16_shared_prefix_shape_allowed(k, head_dim),
-            );
+            shared_attention_layers += usize::from(attention_route.shared_prefix);
             if !omit_attention && !batched_attention {
                 for (i, attn_scalar) in attn_scalars.iter().enumerate() {
                     match tree {
@@ -45206,6 +45275,35 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn attention_shared_prefix_gate_and_shape_are_fail_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some(" true "),
+        ] {
+            assert!(!verify_attention_shared_prefix_from_env(value));
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(verify_attention_shared_prefix_from_env(Some(value)));
+        }
+        for rows in 2..=8 {
+            assert!(attention_splitk_kv16_shared_prefix_shape_allowed(
+                rows, 128, 3
+            ));
+        }
+        for (rows, head_dim, group) in [(1, 128, 3), (9, 128, 3), (8, 64, 3), (8, 128, 2)] {
+            assert!(!attention_splitk_kv16_shared_prefix_shape_allowed(
+                rows, head_dim, group
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn metal_attention_splitk_kv16_batch_matches_rowwise_linear_and_tree() {
         if !detect_metal_device().available {
             return;
@@ -45222,10 +45320,9 @@ mod tests {
             .map(|i| ((i * 19 % 37) as f32 - 18.0) * 0.03125)
             .collect();
 
-        // rows=5 leaves three simdgroups of the prefix-shared threadgroup unused and
-        // exercises a partial (rows * 32)-thread dispatch; 8 is the EAGLE width; 16 is
-        // batch-only (the shared kernel refuses it and the driver returns None).
-        for rows in [5usize, 8, 16] {
+        // Every admitted shared width is covered; 16 remains batch-only (the
+        // shared kernel refuses it and the driver does not add that candidate).
+        for rows in [2usize, 3, 4, 5, 6, 7, 8, 16] {
             let query: Vec<f32> = (0..rows * n_heads * head_dim)
                 .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
                 .collect();
@@ -45250,7 +45347,12 @@ mod tests {
                     )
                     .expect("row-wise split-K attention");
                     let mut encodes = vec![SplitkRowsEncode::Batch];
-                    if direct && attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim)
+                    if direct
+                        && attention_splitk_kv16_shared_prefix_shape_allowed(
+                            rows,
+                            head_dim,
+                            n_heads / n_kv_heads,
+                        )
                     {
                         encodes.push(SplitkRowsEncode::SharedPrefix);
                     }
