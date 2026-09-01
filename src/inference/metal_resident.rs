@@ -521,6 +521,7 @@ impl super::LlamaInferenceSession {
             final_norm: &weights.output_norm.data,
             output_weight_blocks: resident_weight_bytes(weights.output_projection()),
             vocab_size: dims.vocab_size,
+            output_is_tied_embedding: false,
         };
         let session = self
             .resident_decode
@@ -1031,6 +1032,7 @@ impl super::LlamaInferenceSession {
                 final_norm: &weights.output_norm.data,
                 output_weight_blocks: resident_weight_bytes(weights.output_projection()),
                 vocab_size: vocab,
+                output_is_tied_embedding: false,
             })
         } else {
             None
@@ -1370,6 +1372,7 @@ impl super::LlamaInferenceSession {
             final_norm: &weights.output_norm.data,
             output_weight_blocks: resident_weight_bytes(weights.output_projection()),
             vocab_size: vocab,
+            output_is_tied_embedding: false,
         };
 
         let session = self
@@ -1577,6 +1580,7 @@ impl super::LlamaInferenceSession {
             final_norm: &weights.output_norm.data,
             output_weight_blocks: resident_weight_bytes(weights.output_projection()),
             vocab_size: dims.vocab_size,
+            output_is_tied_embedding: false,
         };
 
         let session = self
@@ -1659,8 +1663,8 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], false, true)?
-            .map(|(emitted, _capture, _target_top_k)| emitted))
+            .verify_tree_metal_inner(tree, &[], false, true, None)?
+            .map(|(emitted, _capture, _target_top_k, _indexed_head)| emitted))
     }
 
     /// EAGLE-3 tree target seam: the ordinary target-authoritative tree verify plus snapshots
@@ -1674,8 +1678,8 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, false, true)?
-            .map(|(_emitted, capture, _target_top_k)| capture))
+            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None)?
+            .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
     }
 
     /// Experimental target-candidate seam for benchmark Token Recycling. This is opt-in and
@@ -1688,8 +1692,8 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<LlamaTargetTopKVerify>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, true)?
-            .map(|(emitted, capture, target_top_k)| LlamaTargetTopKVerify {
+            .verify_tree_metal_inner(tree, &[], true, true, None)?
+            .map(|(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerify {
                 predictions: capture.predictions,
                 target_top_k,
                 emitted,
@@ -1709,9 +1713,9 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, true, true)?
+            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None)?
             .map(
-                |(emitted, capture, target_top_k)| LlamaTargetTopKVerifyCapture {
+                |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerifyCapture {
                     predictions: capture.predictions,
                     target_top_k,
                     emitted,
@@ -1719,6 +1723,74 @@ impl super::LlamaInferenceSession {
                     timings: capture.timings,
                 },
             ))
+    }
+
+    /// Default-off EAGLE diagnostic: retain the ordinary capture result and replay only the
+    /// proposal-derived output rows after the authoritative full head has emitted its ids.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_and_indexed_head_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        let Some((_emitted, authoritative, _target_top_k, indexed_head)) = self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                false,
+                true,
+                Some(candidate_ids),
+            )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "indexed-head verifier completed without its requested shadow receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative,
+            shadow,
+        }))
+    }
+
+    /// Token-Recycling-capable twin of
+    /// [`Self::verify_tree_metal_with_layer_inputs_and_indexed_head_shadow`].
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_and_indexed_head_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
+        let Some((emitted, capture, target_top_k, indexed_head)) = self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                true,
+                true,
+                Some(candidate_ids),
+            )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "indexed-head verifier completed without its requested shadow receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative: LlamaTargetTopKVerifyCapture {
+                predictions: capture.predictions,
+                target_top_k,
+                emitted,
+                layer_inputs: capture.layer_inputs,
+                timings: capture.timings,
+            },
+            shadow,
+        }))
     }
 
     /// Non-committing target top-k probe used to bootstrap an empty Token Recycling row.
@@ -1733,8 +1805,10 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, false)?
-            .map(|(_emitted, capture, target_top_k)| (capture.predictions, target_top_k)))
+            .verify_tree_metal_inner(tree, &[], true, false, None)?
+            .map(|(_emitted, capture, target_top_k, _indexed_head)| {
+                (capture.predictions, target_top_k)
+            }))
     }
 
     #[cfg(target_os = "macos")]
@@ -1744,11 +1818,13 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
         read_target_top_k: bool,
         commit: bool,
+        indexed_head_shadow_candidates: Option<&[u32]>,
     ) -> Result<
         Option<(
             Vec<u32>,
             LlamaGreedyVerifyCapture,
             Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>,
+            Option<metal::ResidentIndexedHeadShadow>,
         )>,
     > {
         use spec_tree::TREE_MAX_NODES;
@@ -1849,15 +1925,47 @@ impl super::LlamaInferenceSession {
             final_norm: &weights.output_norm.data,
             output_weight_blocks: resident_weight_bytes(weights.output_projection()),
             vocab_size: vocab,
+            output_is_tied_embedding: indexed_head_shadow_candidates.is_some()
+                && weights.output_projection_is_tied_embedding(),
         };
 
         let session = self
             .resident_decode
             .as_mut()
             .expect("resident session present (readiness checked above)");
-        // Keep the existing no-capture entry point byte-for-byte on its original Metal API.
-        // Only the new EAGLE seam asks verify_batch_inner to retain layer-input buffers.
-        let (predicted, raw_layer_inputs, target_top_k) = if read_target_top_k {
+        // Established entry points remain on their original Metal APIs. Only the explicit
+        // benchmark request reaches the post-authoritative indexed-head replay.
+        let (predicted, raw_layer_inputs, target_top_k, indexed_head_shadow) = if let Some(
+            candidate_ids,
+        ) = indexed_head_shadow_candidates
+        {
+            let Some((predicted, raw_layer_inputs, target_top_k, indexed_head_shadow)) = session
+                .verify_batch_tree_with_indexed_head_shadow(
+                    &embeddings.data,
+                    &cos_all,
+                    &sin_all,
+                    &layer_views,
+                    &logits_stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    position,
+                    n,
+                    scale,
+                    capture_layer_ids,
+                    read_target_top_k,
+                    candidate_ids,
+                )
+            else {
+                return Ok(None);
+            };
+            (
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                Some(indexed_head_shadow),
+            )
+        } else if read_target_top_k {
             if capture_layer_ids.is_empty() {
                 let Some((predicted, target_top_k)) = session.verify_batch_tree_with_target_top_k(
                     &embeddings.data,
@@ -1874,7 +1982,7 @@ impl super::LlamaInferenceSession {
                 ) else {
                     return Ok(None);
                 };
-                (predicted, Vec::new(), target_top_k)
+                (predicted, Vec::new(), target_top_k, None)
             } else {
                 let Some((predicted, raw_layer_inputs, target_top_k)) = session
                     .verify_batch_tree_with_layer_inputs_and_target_top_k(
@@ -1894,7 +2002,7 @@ impl super::LlamaInferenceSession {
                 else {
                     return Ok(None);
                 };
-                (predicted, raw_layer_inputs, target_top_k)
+                (predicted, raw_layer_inputs, target_top_k, None)
             }
         } else if capture_layer_ids.is_empty() {
             let Some(predicted) = session.verify_batch_tree(
@@ -1912,7 +2020,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (predicted, Vec::new(), Vec::new())
+            (predicted, Vec::new(), Vec::new(), None)
         } else {
             let Some(captured) = session.verify_batch_tree_with_layer_inputs(
                 &embeddings.data,
@@ -1930,7 +2038,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (captured.0, captured.1, Vec::new())
+            (captured.0, captured.1, Vec::new(), None)
         };
 
         // Host accept: longest greedy-exact path through the tree. A committing call compacts the
@@ -1989,6 +2097,7 @@ impl super::LlamaInferenceSession {
                 timings: LlamaForwardTimings::default(),
             },
             target_top_k,
+            indexed_head_shadow,
         )))
     }
 
@@ -2074,6 +2183,30 @@ impl super::LlamaInferenceSession {
         _tree: &spec_tree::TokenTree,
         _capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: indexed Metal output-head diagnostics are unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_and_indexed_head_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: combined target-top-k/indexed-head diagnostics are unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_and_indexed_head_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
         Ok(None)
     }
 

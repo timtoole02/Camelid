@@ -558,6 +558,33 @@ impl LlamaLoadedWeights {
         self.output.as_ref().unwrap_or(&self.token_embedding)
     }
 
+    /// Whether the output projection reuses the token-embedding tensor's physical backing.
+    ///
+    /// The first indexed-output-head diagnostic is deliberately restricted to tied Q6_K. A
+    /// separately loaded but byte-equal output tensor is declined: physical Arc identity is a
+    /// simple fail-closed proof that the candidate token ids index the embedding/output rows.
+    pub fn output_projection_is_tied_embedding(&self) -> bool {
+        let Some(output) = self.output.as_ref() else {
+            return true;
+        };
+        match (
+            output.kquant_wire_pages.as_ref(),
+            self.token_embedding.kquant_wire_pages.as_ref(),
+        ) {
+            (Some(output), Some(embedding)) if std::sync::Arc::ptr_eq(output, embedding) => {
+                return true;
+            }
+            _ => {}
+        }
+        matches!(
+            (
+                output.q6_k_wire_bytes.as_ref(),
+                self.token_embedding.q6_k_wire_bytes.as_ref(),
+            ),
+            (Some(output), Some(embedding)) if std::sync::Arc::ptr_eq(output, embedding)
+        )
+    }
+
     /// Audit where this node's Q8_0 weights physically live. Every owned dense Q8_0 linear
     /// must hold plain RAM-resident blocks (`q8_0_blocks`); anything file-backed or
     /// runtime-repacked-without-blocks is reported as a violation so callers (the
@@ -1557,6 +1584,14 @@ pub struct LlamaTargetTopKVerifyCapture {
     pub emitted: Vec<u32>,
     pub layer_inputs: Vec<CpuTensor>,
     pub timings: LlamaForwardTimings,
+}
+
+/// Benchmark-only wrapper pairing the unchanged authoritative verifier result with indexed-head
+/// diagnostics computed after the full output head has already selected the target predictions.
+#[derive(Debug, Clone)]
+pub struct LlamaIndexedHeadShadowVerify<T> {
+    pub authoritative: T,
+    pub shadow: crate::metal::ResidentIndexedHeadShadow,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

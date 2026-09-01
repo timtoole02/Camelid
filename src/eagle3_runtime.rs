@@ -4,7 +4,9 @@
 //! private one-layer KV cache; every proposed token is still checked by the target model's
 //! existing greedy speculative verifier before it can be emitted.
 
-use crate::eagle3::{Eagle3DraftModel, HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS};
+use std::collections::BTreeSet;
+
+use crate::eagle3::{Eagle3DraftModel, HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS, TARGET_VOCAB_SIZE};
 use crate::error::{BackendError, Result};
 use crate::inference::spec_tree::{
     normalize_draft_top_logits, DynamicDraftLattice, PackedForestPlan, ScoredTokenTree,
@@ -245,6 +247,11 @@ pub struct Eagle3DynamicFrontierConfig {
     pub candidates_per_parent: usize,
     pub max_head_expansions: usize,
     pub adaptive_branching: bool,
+    /// Retain every full-target-vocabulary candidate id observed at each learned-head
+    /// expansion, including candidates later removed by lattice/adaptive admission. This is
+    /// diagnostic evidence only: it never participates in scheduling, reranking, verification,
+    /// acceptance, or token emission.
+    pub certified_argmax_shadow: bool,
 }
 
 impl Default for Eagle3DynamicFrontierConfig {
@@ -256,6 +263,7 @@ impl Default for Eagle3DynamicFrontierConfig {
             candidates_per_parent: 8,
             max_head_expansions: 8,
             adaptive_branching: false,
+            certified_argmax_shadow: false,
         }
     }
 }
@@ -306,6 +314,55 @@ struct Eagle3PathTransition {
     retained_rows: usize,
     /// First index in the next root-first path that must be replayed.
     replay_from: usize,
+}
+
+/// Candidate ids observed at one learned-head expansion before any lattice admission.
+///
+/// `parent_source_node` is the stable expansion-lattice id, not a verifier BFS row. The
+/// verifier-ready forest carries the corresponding `ScoredTokenTree::source_node` mapping, so
+/// diagnostics can recover the candidates associated with selected verifier rows without
+/// changing tree selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3ArgmaxCandidateExpansion {
+    pub parent_source_node: usize,
+    /// Full head output in deterministic draft-rank order, before lattice/adaptive truncation.
+    pub candidate_target_tokens: Vec<u32>,
+    /// The subset actually admitted as lattice children, in the same deterministic order.
+    pub lattice_admitted_target_tokens: Vec<u32>,
+}
+
+/// Default-off, read-only candidate evidence for a possible future certified target head.
+///
+/// This type is intentionally named `Shadow`: candidate coverage alone is not an argmax proof.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Eagle3ArgmaxCandidateShadow {
+    pub expansions: Vec<Eagle3ArgmaxCandidateExpansion>,
+}
+
+impl Eagle3ArgmaxCandidateShadow {
+    /// Stable ascending union suitable for one diagnostic indexed-head scoring dispatch.
+    pub fn target_token_union(&self) -> Vec<u32> {
+        self.expansions
+            .iter()
+            .flat_map(|expansion| expansion.candidate_target_tokens.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn candidate_observations(&self) -> usize {
+        self.expansions
+            .iter()
+            .map(|expansion| expansion.candidate_target_tokens.len())
+            .sum()
+    }
+
+    pub fn lattice_admitted_observations(&self) -> usize {
+        self.expansions
+            .iter()
+            .map(|expansion| expansion.lattice_admitted_target_tokens.len())
+            .sum()
+    }
 }
 
 fn eagle3_path_transition(
@@ -359,6 +416,8 @@ pub struct Eagle3DynamicFrontier {
     /// Successful non-root `forward_token` calls used to materialize this lattice. The root
     /// distribution comes from `stable_seed` and therefore costs no call here.
     materialized_head_forwards: usize,
+    /// Completely target-blind observation sidecar. `None` is the byte-preserving default.
+    certified_argmax_shadow: Option<Eagle3ArgmaxCandidateShadow>,
 }
 
 /// Target-blind evidence available immediately before one dynamic-frontier head expansion.
@@ -401,13 +460,22 @@ pub struct Eagle3ForestSelection {
 
 impl Eagle3DynamicFrontier {
     pub fn new(anchor: u32, config: Eagle3DynamicFrontierConfig) -> Result<Self> {
+        let config = config.validate()?;
+        if config.certified_argmax_shadow && anchor as usize >= TARGET_VOCAB_SIZE {
+            return Err(invalid(format!(
+                "EAGLE-3 certified-argmax shadow anchor id {anchor} is outside target 0..{TARGET_VOCAB_SIZE}"
+            )));
+        }
         Ok(Self {
-            config: config.validate()?,
+            config,
             lattice: DynamicDraftLattice::new(anchor),
             expanded: vec![false],
             recurrent_g: vec![None],
             head_expansions: 0,
             materialized_head_forwards: 0,
+            certified_argmax_shadow: config
+                .certified_argmax_shadow
+                .then(Eagle3ArgmaxCandidateShadow::default),
         })
     }
 
@@ -425,6 +493,10 @@ impl Eagle3DynamicFrontier {
 
     pub fn materialized_head_forwards(&self) -> usize {
         self.materialized_head_forwards
+    }
+
+    pub fn certified_argmax_shadow(&self) -> Option<&Eagle3ArgmaxCandidateShadow> {
+        self.certified_argmax_shadow.as_ref()
     }
 
     /// Read the target-blind evidence for the next scheduled expansion without mutating the
@@ -536,6 +608,29 @@ impl Eagle3DynamicFrontier {
             )));
         }
 
+        // Keep the stronger target-vocabulary validation scoped to the shadow. With the gate
+        // off, the established frontier validation and mutation order remain unchanged.
+        if self.certified_argmax_shadow.is_some() {
+            if output.draft_token as usize >= EAGLE3_DRAFT_VOCAB
+                || output.target_token as usize >= TARGET_VOCAB_SIZE
+            {
+                return Err(invalid(format!(
+                    "EAGLE-3 certified-argmax shadow top-1 ids draft={} target={} are outside draft 0..{EAGLE3_DRAFT_VOCAB} / target 0..{TARGET_VOCAB_SIZE}",
+                    output.draft_token, output.target_token
+                )));
+            }
+            for (slot, candidate) in output.top_candidates.iter().enumerate() {
+                if candidate.draft_token as usize >= EAGLE3_DRAFT_VOCAB
+                    || candidate.target_token as usize >= TARGET_VOCAB_SIZE
+                {
+                    return Err(invalid(format!(
+                        "EAGLE-3 certified-argmax shadow candidate {slot} ids draft={} target={} are outside draft 0..{EAGLE3_DRAFT_VOCAB} / target 0..{TARGET_VOCAB_SIZE}",
+                        candidate.draft_token, candidate.target_token
+                    )));
+                }
+            }
+        }
+
         for (slot, candidate) in output.top_candidates.iter().enumerate() {
             if !candidate.logit.is_finite() {
                 return Err(invalid(format!(
@@ -601,6 +696,22 @@ impl Eagle3DynamicFrontier {
             .lattice
             .expand(parent, &filtered_scores)
             .map_err(|message| invalid(format!("EAGLE-3 dynamic frontier: {message}")))?;
+        if let Some(shadow) = self.certified_argmax_shadow.as_mut() {
+            let lattice_admitted_target_tokens = filtered_scores
+                .iter()
+                .map(|candidate| candidate.token)
+                .collect::<Vec<_>>();
+            debug_assert_eq!(lattice_admitted_target_tokens.len(), children.len());
+            shadow.expansions.push(Eagle3ArgmaxCandidateExpansion {
+                parent_source_node: parent,
+                candidate_target_tokens: output
+                    .top_candidates
+                    .iter()
+                    .map(|candidate| candidate.target_token)
+                    .collect(),
+                lattice_admitted_target_tokens,
+            });
+        }
         self.expanded[parent] = true;
         self.expanded
             .extend(std::iter::repeat_n(false, children.len()));
@@ -626,6 +737,7 @@ impl Eagle3DynamicFrontier {
         Ok(Eagle3DraftForest {
             scored,
             packed_plan,
+            certified_argmax_shadow: self.certified_argmax_shadow.clone(),
         })
     }
 
@@ -679,6 +791,7 @@ impl Eagle3DynamicFrontier {
                 forest: Eagle3DraftForest {
                     scored,
                     packed_plan,
+                    certified_argmax_shadow: self.certified_argmax_shadow.clone(),
                 },
                 admitted_node_budget: cost.max_nodes,
                 estimated_emitted_tokens,
@@ -705,6 +818,8 @@ impl Eagle3DynamicFrontier {
 pub struct Eagle3DraftForest {
     pub scored: ScoredTokenTree,
     pub packed_plan: PackedForestPlan,
+    /// Present only when the default-off shadow gate was enabled while building this frontier.
+    pub certified_argmax_shadow: Option<Eagle3ArgmaxCandidateShadow>,
 }
 
 impl Eagle3DraftForest {
@@ -1487,6 +1602,7 @@ mod tests {
             candidates_per_parent: 8,
             max_head_expansions,
             adaptive_branching: false,
+            certified_argmax_shadow: false,
         }
     }
 
@@ -1608,6 +1724,89 @@ mod tests {
         // turns that into one: the two depth-one scores remain exactly .50 and .30.
         assert!((forest.scored.cumulative_log_probability[1].exp() - 0.50).abs() < 1.0e-6);
         assert!((forest.scored.cumulative_log_probability[2].exp() - 0.30).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn certified_argmax_shadow_retains_unadmitted_candidates_without_changing_the_tree() {
+        let mut off_config = frontier_config(2, 2, 1);
+        off_config.candidates_per_parent = 1;
+        let mut on_config = off_config;
+        on_config.certified_argmax_shadow = true;
+        let root = output(&[(13, 0.50), (11, 0.30), (12, 0.10)], 1.0);
+
+        let mut off = Eagle3DynamicFrontier::new(10, off_config).unwrap();
+        off.record_expansion(0, &root).unwrap();
+        let off_forest = off.finish().unwrap();
+
+        let mut on = Eagle3DynamicFrontier::new(10, on_config).unwrap();
+        on.record_expansion(0, &root).unwrap();
+        let selected = on
+            .select_for_verifier_costs(&[Eagle3VerifierBudgetCost {
+                max_nodes: 2,
+                round_cost: 1.0,
+            }])
+            .unwrap();
+        let on_forest = on.finish().unwrap();
+
+        assert_eq!(off_forest.scored, on_forest.scored);
+        assert_eq!(off_forest.packed_plan, on_forest.packed_plan);
+        assert_eq!(
+            off_forest.accept_target_predictions(&[13, 99]).unwrap(),
+            on_forest.accept_target_predictions(&[13, 99]).unwrap()
+        );
+        assert!(off_forest.certified_argmax_shadow.is_none());
+        assert_eq!(
+            selected.forest.certified_argmax_shadow,
+            on_forest.certified_argmax_shadow
+        );
+        let shadow = on_forest.certified_argmax_shadow.unwrap();
+        assert_eq!(shadow.target_token_union(), vec![11, 12, 13]);
+        assert_eq!(shadow.candidate_observations(), 3);
+        assert_eq!(shadow.lattice_admitted_observations(), 1);
+        assert_eq!(shadow.expansions.len(), 1);
+        assert_eq!(shadow.expansions[0].parent_source_node, 0);
+        assert_eq!(
+            shadow.expansions[0].candidate_target_tokens,
+            vec![13, 11, 12]
+        );
+        assert_eq!(
+            shadow.expansions[0].lattice_admitted_target_tokens,
+            vec![13]
+        );
+        assert_eq!(on_forest.scored.tree.tokens, vec![10, 13]);
+    }
+
+    #[test]
+    fn certified_argmax_shadow_rejects_malformed_ids_before_mutating_the_frontier() {
+        let mut config = frontier_config(2, 2, 1);
+        config.candidates_per_parent = 1;
+        config.certified_argmax_shadow = true;
+
+        assert!(Eagle3DynamicFrontier::new(TARGET_VOCAB_SIZE as u32, config).is_err());
+
+        let mut invalid_target = output(&[(11, 0.60), (12, 0.30)], 1.0);
+        invalid_target.top_candidates[1].target_token = TARGET_VOCAB_SIZE as u32;
+        let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
+        assert!(frontier.record_expansion(0, &invalid_target).is_err());
+        assert_eq!(frontier.lattice().nodes().len(), 1);
+        assert_eq!(frontier.head_expansions(), 0);
+        assert!(frontier
+            .certified_argmax_shadow()
+            .unwrap()
+            .expansions
+            .is_empty());
+
+        let mut invalid_draft = output(&[(11, 0.60), (12, 0.30)], 1.0);
+        invalid_draft.draft_token = EAGLE3_DRAFT_VOCAB as u32;
+        let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
+        assert!(frontier.record_expansion(0, &invalid_draft).is_err());
+        assert_eq!(frontier.lattice().nodes().len(), 1);
+        assert_eq!(frontier.head_expansions(), 0);
+        assert!(frontier
+            .certified_argmax_shadow()
+            .unwrap()
+            .expansions
+            .is_empty());
     }
 
     #[test]

@@ -396,6 +396,7 @@ impl Eagle3ServingState {
                     candidates_per_parent: self.config.dynamic_top_k,
                     max_head_expansions: self.config.dynamic_expansions,
                     adaptive_branching: false,
+                    certified_argmax_shadow: false,
                 },
             )?;
             let forest = frontier.finish()?;

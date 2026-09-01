@@ -17,6 +17,104 @@ use std::{
 /// with the same lower-id tie break as the production greedy argmax.
 pub const RESIDENT_VERIFY_TARGET_TOP_K: usize = 8;
 
+/// Physical output rows consumed by one V4 K-quant MMA tile.
+///
+/// The indexed-head shadow copies a candidate's complete aligned tile instead of densely
+/// repacking individual rows. Keeping the candidate in its original physical lane lets the
+/// existing Q6_K V4 kernel replay the full-head arithmetic bit for bit.
+pub const RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS: usize = 8;
+
+/// Defensive diagnostic allocation cap. The current EAGLE frontier retains at most a few dozen
+/// ids; accepting an unbounded caller-supplied union would turn a shadow into a second full head.
+pub const RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentIndexedHeadShadowFallbackReason {
+    UntiedOutputHead,
+    OutputHeadFormat,
+    KquantV4Disabled,
+    KquantV4PipelinesUnavailable,
+    Soa8RouteUnsupported,
+    UnsupportedVerifierWidth,
+    UnsupportedHiddenWidth,
+    CandidateBudgetExceeded,
+    PartialVocabTile,
+    ShapeOverflow,
+    WeightBufferTooSmall,
+    CommandBufferFailed,
+}
+
+impl ResidentIndexedHeadShadowFallbackReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UntiedOutputHead => "output_head_not_tied_embedding",
+            Self::OutputHeadFormat => "output_head_not_q6k",
+            Self::KquantV4Disabled => "kquant_v4_disabled",
+            Self::KquantV4PipelinesUnavailable => "kquant_v4_pipelines_unavailable",
+            Self::Soa8RouteUnsupported => "soa8_route_not_proven_for_indexed_shadow",
+            Self::UnsupportedVerifierWidth => "unsupported_verifier_width",
+            Self::UnsupportedHiddenWidth => "unsupported_hidden_width",
+            Self::CandidateBudgetExceeded => "candidate_budget_exceeded",
+            Self::PartialVocabTile => "candidate_occupies_partial_vocab_tile",
+            Self::ShapeOverflow => "candidate_slab_shape_overflow",
+            Self::WeightBufferTooSmall => "output_weight_buffer_too_small",
+            Self::CommandBufferFailed => "indexed_head_command_buffer_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentIndexedHeadShadowLogitMismatch {
+    pub token_id: u32,
+    pub indexed_logit_bits: u32,
+    pub full_head_logit_bits: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentIndexedHeadShadowRow {
+    pub verifier_row: usize,
+    /// `None` mirrors production argmax's UINT_MAX sentinel when every retained score is NaN or
+    /// negative infinity.
+    pub candidate_top1_token: Option<u32>,
+    pub candidate_top1_logit_bits: Option<u32>,
+    pub authoritative_argmax_token: u32,
+    pub authoritative_argmax_logit_bits: Option<u32>,
+    pub top1_matches_authoritative: bool,
+    pub compared_logits: usize,
+    pub exact_logit_agreements: usize,
+    pub all_candidate_logits_exact: bool,
+    pub first_logit_mismatch: Option<ResidentIndexedHeadShadowLogitMismatch>,
+}
+
+/// Result of the default-off indexed output-head replay.
+///
+/// The ordinary full-vocabulary projection and argmax always complete before this diagnostic
+/// starts. `rows` is populated only when the exact Q6 V4 lane is available; otherwise
+/// `fallback_reason` records why the authoritative full head remained the sole observation.
+/// This is not an argmax certificate and must never authorize token emission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentIndexedHeadShadow {
+    /// Mirrors the `CompileOptions` used for the shared V4 library that scores both heads.
+    pub compile_fast_math_enabled: bool,
+    pub candidate_union: Vec<u32>,
+    pub candidate_tile_rows: usize,
+    pub candidate_weight_bytes: usize,
+    pub output_weight_format: &'static str,
+    pub encode_us: u128,
+    pub commit_wait_us: u128,
+    pub gpu_busy_us: u128,
+    pub kernel_window_us: u128,
+    pub fallback_reason: Option<ResidentIndexedHeadShadowFallbackReason>,
+    pub rows: Vec<ResidentIndexedHeadShadowRow>,
+}
+
+impl ResidentIndexedHeadShadow {
+    /// Means only that the diagnostic scorer ran; it does not mean all-vocabulary certification.
+    pub fn scored(&self) -> bool {
+        self.fallback_reason.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetalDeviceInfo {
     pub available: bool,
@@ -27521,6 +27619,254 @@ impl ResidentWeightFormat {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn resident_indexed_head_format_label(format: ResidentWeightFormat) -> &'static str {
+    match format {
+        ResidentWeightFormat::Q6K => "Q6_K",
+        ResidentWeightFormat::Q4K => "Q4_K",
+        ResidentWeightFormat::Q5K => "Q5_K",
+        ResidentWeightFormat::Q8_0 => "Q8_0",
+        ResidentWeightFormat::DenseF32 => "F32",
+        ResidentWeightFormat::DenseF16 => "F16",
+        ResidentWeightFormat::DenseBF16 => "BF16",
+        ResidentWeightFormat::Q1_0 => "Q1_0",
+        ResidentWeightFormat::Q2_0G64 => "Q2_0_G64",
+        ResidentWeightFormat::Q2_0G128 => "Q2_0_G128",
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resident_indexed_head_candidate_union_valid(candidate_ids: &[u32], vocab: usize) -> bool {
+    !candidate_ids.is_empty()
+        && candidate_ids
+            .iter()
+            .all(|&token| (token as usize) < vocab)
+        && candidate_ids.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResidentIndexedHeadTileCopy {
+    token_id: u32,
+    source_byte_offset: usize,
+    destination_byte_offset: usize,
+    selected_slab_row: usize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResidentIndexedHeadTilePlan {
+    row_bytes: usize,
+    tile_bytes: usize,
+    slab_rows: usize,
+    slab_bytes: usize,
+    copies: Vec<ResidentIndexedHeadTileCopy>,
+}
+
+/// Plan an exact Q6 V4 replay by preserving every candidate's physical row inside an aligned
+/// eight-row tile. Candidates that share a source tile intentionally receive independent slab
+/// tiles: this diagnostic favors an obvious one-candidate/one-lane map over packing.
+#[cfg(any(target_os = "macos", test))]
+fn resident_indexed_head_tile_plan(
+    format: ResidentWeightFormat,
+    input_width: usize,
+    vocab: usize,
+    source_buffer_bytes: usize,
+    candidate_ids: &[u32],
+) -> Result<ResidentIndexedHeadTilePlan, ResidentIndexedHeadShadowFallbackReason> {
+    if candidate_ids.len() > RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES {
+        return Err(ResidentIndexedHeadShadowFallbackReason::CandidateBudgetExceeded);
+    }
+    if input_width == 0 || !input_width.is_multiple_of(256) {
+        return Err(ResidentIndexedHeadShadowFallbackReason::UnsupportedHiddenWidth);
+    }
+    if format != ResidentWeightFormat::Q6K {
+        return Err(ResidentIndexedHeadShadowFallbackReason::OutputHeadFormat);
+    }
+    let n_sb = input_width / 256;
+    let row_bytes = n_sb
+        .checked_mul(210usize)
+        .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+    let tile_bytes = row_bytes
+        .checked_mul(RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS)
+        .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+    let expected_source_bytes = vocab
+        .checked_mul(row_bytes)
+        .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+    if source_buffer_bytes < expected_source_bytes {
+        return Err(ResidentIndexedHeadShadowFallbackReason::WeightBufferTooSmall);
+    }
+    let slab_rows = candidate_ids
+        .len()
+        .checked_mul(RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS)
+        .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+    let slab_bytes = candidate_ids
+        .len()
+        .checked_mul(tile_bytes)
+        .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+    let mut copies = Vec::with_capacity(candidate_ids.len());
+    for (candidate_index, &token_id) in candidate_ids.iter().enumerate() {
+        let token = token_id as usize;
+        let source_tile_row = token / RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS
+            * RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS;
+        if source_tile_row
+            .checked_add(RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS)
+            .is_none_or(|tile_end| tile_end > vocab)
+        {
+            return Err(ResidentIndexedHeadShadowFallbackReason::PartialVocabTile);
+        }
+        let source_byte_offset = source_tile_row
+            .checked_mul(row_bytes)
+            .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+        let destination_byte_offset = candidate_index
+            .checked_mul(tile_bytes)
+            .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+        if source_byte_offset
+            .checked_add(tile_bytes)
+            .is_none_or(|end| end > expected_source_bytes || end > source_buffer_bytes)
+        {
+            return Err(ResidentIndexedHeadShadowFallbackReason::WeightBufferTooSmall);
+        }
+        let selected_slab_row = candidate_index
+            .checked_mul(RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS)
+            .and_then(|row| row.checked_add(token % RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS))
+            .ok_or(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow)?;
+        copies.push(ResidentIndexedHeadTileCopy {
+            token_id,
+            source_byte_offset,
+            destination_byte_offset,
+            selected_slab_row,
+        });
+    }
+    Ok(ResidentIndexedHeadTilePlan {
+        row_bytes,
+        tile_bytes,
+        slab_rows,
+        slab_bytes,
+        copies,
+    })
+}
+
+/// Host mirror of `argmax_f32_greedy` for a strictly increasing candidate-id list. A strict
+/// comparison keeps the first (therefore lowest-id) exact tie, while NaN and negative infinity
+/// remain unselected just as they do in the production shader.
+#[cfg(any(target_os = "macos", test))]
+fn resident_indexed_head_strict_argmax_sorted(
+    candidate_scores: &[(u32, f32)],
+) -> Option<(u32, f32)> {
+    debug_assert!(candidate_scores
+        .windows(2)
+        .all(|pair| pair[0].0 < pair[1].0));
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_token = None;
+    for &(token, score) in candidate_scores {
+        if score > best_score {
+            best_score = score;
+            best_token = Some(token);
+        }
+    }
+    best_token.map(|token| (token, best_score))
+}
+
+#[cfg(test)]
+mod resident_indexed_head_shadow_contract_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_union_is_strictly_sorted_and_in_vocabulary() {
+        assert!(resident_indexed_head_candidate_union_valid(&[0, 7, 19], 20));
+        assert!(!resident_indexed_head_candidate_union_valid(&[], 20));
+        assert!(!resident_indexed_head_candidate_union_valid(&[7, 7], 20));
+        assert!(!resident_indexed_head_candidate_union_valid(&[8, 7], 20));
+        assert!(!resident_indexed_head_candidate_union_valid(&[20], 20));
+    }
+
+    #[test]
+    fn q6_aligned_tile_plan_preserves_each_tokens_original_v4_lane() {
+        let row_bytes = (3072 / 256) * 210;
+        let plan = resident_indexed_head_tile_plan(
+            ResidentWeightFormat::Q6K,
+            3072,
+            128_256,
+            128_256 * row_bytes,
+            &[8, 15, 24],
+        )
+        .unwrap();
+        assert_eq!(plan.row_bytes, row_bytes);
+        assert_eq!(plan.tile_bytes, row_bytes * 8);
+        assert_eq!(plan.slab_rows, 24);
+        assert_eq!(plan.slab_bytes, row_bytes * 24);
+        assert_eq!(plan.copies[0].source_byte_offset, row_bytes * 8);
+        assert_eq!(plan.copies[1].source_byte_offset, row_bytes * 8);
+        assert_eq!(plan.copies[0].destination_byte_offset, 0);
+        assert_eq!(plan.copies[1].destination_byte_offset, row_bytes * 8);
+        assert_eq!(plan.copies[0].selected_slab_row, 0);
+        assert_eq!(plan.copies[1].selected_slab_row, 15);
+        assert_eq!(plan.copies[2].selected_slab_row, 16);
+    }
+
+    #[test]
+    fn tile_plan_rejects_non_q6_partial_tail_budget_and_short_storage() {
+        let row_bytes = (3072 / 256) * 210;
+        assert_eq!(
+            resident_indexed_head_tile_plan(
+                ResidentWeightFormat::Q4K,
+                3072,
+                16,
+                16 * ((3072 / 256) * 144),
+                &[7],
+            ),
+            Err(ResidentIndexedHeadShadowFallbackReason::OutputHeadFormat)
+        );
+        assert_eq!(
+            resident_indexed_head_tile_plan(
+                ResidentWeightFormat::Q6K,
+                3072,
+                10,
+                10 * row_bytes,
+                &[9],
+            ),
+            Err(ResidentIndexedHeadShadowFallbackReason::PartialVocabTile)
+        );
+        assert_eq!(
+            resident_indexed_head_tile_plan(
+                ResidentWeightFormat::Q6K,
+                3072,
+                16,
+                16 * row_bytes - 1,
+                &[7],
+            ),
+            Err(ResidentIndexedHeadShadowFallbackReason::WeightBufferTooSmall)
+        );
+        let too_many = vec![0; RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES + 1];
+        assert_eq!(
+            resident_indexed_head_tile_plan(
+                ResidentWeightFormat::Q6K,
+                3072,
+                128_256,
+                128_256 * row_bytes,
+                &too_many,
+            ),
+            Err(ResidentIndexedHeadShadowFallbackReason::CandidateBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn strict_argmax_keeps_lower_token_ties_and_ignores_non_selectable_values() {
+        assert_eq!(
+            resident_indexed_head_strict_argmax_sorted(&[(3, 1.0), (7, 2.0), (9, 2.0)]),
+            Some((7, 2.0))
+        );
+        assert_eq!(
+            resident_indexed_head_strict_argmax_sorted(&[
+                (3, f32::NAN),
+                (7, f32::NEG_INFINITY),
+            ]),
+            None
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum ResidentWeightBytes<'a> {
     /// 36-byte f32-scale CPU blocks; uploaded (and wire-converted when wire mode is
@@ -28334,6 +28680,9 @@ pub struct LogitsStage<'a> {
     pub final_norm: &'a [f32],
     pub output_weight_blocks: ResidentWeightBytes<'a>,
     pub vocab_size: usize,
+    /// True only when the output projection is the same physical tensor as token embeddings.
+    /// The first indexed-head diagnostic is deliberately restricted to that Pitch-model shape.
+    pub output_is_tied_embedding: bool,
 }
 
 /// GPU-side sampling operation attached to a resident token graph.
@@ -30983,6 +31332,256 @@ struct TreeAttn {
     /// from the ancestor bitset. `tail_slots[i].len()` is the node's `tail_count`; its
     /// attention `position_count` is `base + tail_count`.
     tail_slots: Vec<Vec<u32>>,
+}
+
+#[cfg(target_os = "macos")]
+fn resident_indexed_head_shadow_fallback(
+    format: ResidentWeightFormat,
+    candidate_ids: &[u32],
+    reason: ResidentIndexedHeadShadowFallbackReason,
+) -> ResidentIndexedHeadShadow {
+    ResidentIndexedHeadShadow {
+        compile_fast_math_enabled: false,
+        candidate_union: candidate_ids.to_vec(),
+        candidate_tile_rows: 0,
+        candidate_weight_bytes: 0,
+        output_weight_format: resident_indexed_head_format_label(format),
+        encode_us: 0,
+        commit_wait_us: 0,
+        gpu_busy_us: 0,
+        kernel_window_us: 0,
+        fallback_reason: Some(reason),
+        rows: Vec::new(),
+    }
+}
+
+/// Replay only retained target-output rows after the authoritative full head has completed.
+///
+/// Each candidate gets a complete copy of its original aligned eight-row Q6 wire tile. The
+/// existing resident matmul helper therefore sees the same bytes at the same local matrix row,
+/// runs the same strict Q8_K quantization, half staging, active V4 route, and increasing-
+/// superblock f32 fold, and writes a score that can be compared directly with the full logits.
+/// No score from this function is allowed to feed target acceptance or token emission.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_resident_indexed_head_shadow(
+    kern: &MetalLinearKernel,
+    final_norm: &Buffer,
+    full_logits: &Buffer,
+    authoritative_predictions: &Buffer,
+    output_weight: &ResidentLinearWeight,
+    output_is_tied_embedding: bool,
+    hidden: usize,
+    vocab: usize,
+    n_tokens: usize,
+    candidate_ids: &[u32],
+) -> ResidentIndexedHeadShadow {
+    let format = output_weight.format;
+    if !output_is_tied_embedding {
+        return resident_indexed_head_shadow_fallback(
+            format,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::UntiedOutputHead,
+        );
+    }
+    if format != ResidentWeightFormat::Q6K {
+        return resident_indexed_head_shadow_fallback(
+            format,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::OutputHeadFormat,
+        );
+    }
+    if !kquant_v4_enabled() {
+        return resident_indexed_head_shadow_fallback(
+            format,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::KquantV4Disabled,
+        );
+    }
+    if !(1..=8).contains(&n_tokens) {
+        return resident_indexed_head_shadow_fallback(
+            format,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::UnsupportedVerifierWidth,
+        );
+    }
+    // The current SOA experiment owns an independently validated sidecar and route precedence.
+    // This first diagnostic has no compact SOA sidecar, so decline it instead of silently mixing
+    // arithmetic routes. The authoritative full head above remains unchanged.
+    if kquant_v4_soa8_enabled() {
+        return resident_indexed_head_shadow_fallback(
+            format,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::Soa8RouteUnsupported,
+        );
+    }
+    // The full projection resolves this same lazy library. A miss means it fell through to an
+    // older arithmetic universe, so replaying V4 would not be an exact comparison.
+    if kquant_v2_kernels().is_none() {
+        return resident_indexed_head_shadow_fallback(
+            format,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::KquantV4PipelinesUnavailable,
+        );
+    }
+    let source_buffer_bytes = match usize::try_from(output_weight.buffer.length()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return resident_indexed_head_shadow_fallback(
+                format,
+                candidate_ids,
+                ResidentIndexedHeadShadowFallbackReason::ShapeOverflow,
+            );
+        }
+    };
+    let plan = match resident_indexed_head_tile_plan(
+        format,
+        hidden,
+        vocab,
+        source_buffer_bytes,
+        candidate_ids,
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            return resident_indexed_head_shadow_fallback(format, candidate_ids, reason);
+        }
+    };
+    let candidate_logits_bytes = match n_tokens
+        .checked_mul(plan.slab_rows)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+    {
+        Some(bytes) => bytes,
+        None => {
+            return resident_indexed_head_shadow_fallback(
+                format,
+                candidate_ids,
+                ResidentIndexedHeadShadowFallbackReason::ShapeOverflow,
+            );
+        }
+    };
+
+    let weight_slab = pool_get(kern, plan.slab_bytes as u64);
+    let candidate_logits = pool_get(kern, candidate_logits_bytes as u64);
+    let projection_scalar = pool_get(kern, 12);
+    let candidate_weight = ResidentLinearWeight {
+        format,
+        buffer: weight_slab.to_owned(),
+        soa8_buffer: None,
+        q8_wire: false,
+    };
+    let mut keep = Vec::new();
+    let encode_started = std::time::Instant::now();
+    let cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
+    {
+        let blit = cb.new_blit_command_encoder();
+        for copy in &plan.copies {
+            blit.copy_from_buffer(
+                &output_weight.buffer,
+                copy.source_byte_offset as u64,
+                &weight_slab,
+                copy.destination_byte_offset as u64,
+                plan.tile_bytes as u64,
+            );
+        }
+        blit.end_encoding();
+    }
+    {
+        let encoder = cb.new_compute_command_encoder();
+        // Use the production helper, not a lookalike candidate kernel. With the gates above it
+        // selects the same synchronized/direct/SIMD-barrier V4 route at the same verifier width.
+        encode_resident_matmul_f32(
+            encoder,
+            kern,
+            &mut keep,
+            final_norm,
+            &candidate_weight,
+            &candidate_logits,
+            &projection_scalar,
+            hidden,
+            plan.slab_rows,
+            n_tokens,
+        );
+        encoder.end_encoding();
+    }
+    let encode_us = encode_started.elapsed().as_micros();
+    let commit_started = std::time::Instant::now();
+    cb.commit();
+    cb.wait_until_completed();
+    let commit_wait_us = commit_started.elapsed().as_micros();
+    if cb.status() != metal::MTLCommandBufferStatus::Completed {
+        keep.extend([weight_slab, candidate_logits, projection_scalar]);
+        pool_recycle(kern, keep);
+        return resident_indexed_head_shadow_fallback(
+            format,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::CommandBufferFailed,
+        );
+    }
+    let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb);
+
+    let mut replay_logits = vec![0.0f32; n_tokens * plan.slab_rows];
+    read_buffer_f32(&candidate_logits, &mut replay_logits);
+    let full_logits_ptr = full_logits.contents() as *const f32;
+    let predictions_ptr = authoritative_predictions.contents() as *const u32;
+    let mut rows = Vec::with_capacity(n_tokens);
+    for verifier_row in 0..n_tokens {
+        let mut scores = Vec::with_capacity(candidate_ids.len());
+        let mut exact_logit_agreements = 0usize;
+        let mut first_logit_mismatch = None;
+        for copy in &plan.copies {
+            let indexed_score = replay_logits[verifier_row * plan.slab_rows + copy.selected_slab_row];
+            let full_score = unsafe {
+                *full_logits_ptr.add(verifier_row * vocab + copy.token_id as usize)
+            };
+            if indexed_score.to_bits() == full_score.to_bits() {
+                exact_logit_agreements += 1;
+            } else if first_logit_mismatch.is_none() {
+                first_logit_mismatch = Some(ResidentIndexedHeadShadowLogitMismatch {
+                    token_id: copy.token_id,
+                    indexed_logit_bits: indexed_score.to_bits(),
+                    full_head_logit_bits: full_score.to_bits(),
+                });
+            }
+            scores.push((copy.token_id, indexed_score));
+        }
+        let top1 = resident_indexed_head_strict_argmax_sorted(&scores);
+        let authoritative_argmax_token = unsafe { *predictions_ptr.add(verifier_row) };
+        let authoritative_argmax_logit_bits = ((authoritative_argmax_token as usize) < vocab)
+            .then(|| unsafe {
+                (*full_logits_ptr
+                    .add(verifier_row * vocab + authoritative_argmax_token as usize))
+                .to_bits()
+            });
+        rows.push(ResidentIndexedHeadShadowRow {
+            verifier_row,
+            candidate_top1_token: top1.map(|(token, _)| token),
+            candidate_top1_logit_bits: top1.map(|(_, score)| score.to_bits()),
+            authoritative_argmax_token,
+            authoritative_argmax_logit_bits,
+            top1_matches_authoritative: top1
+                .is_some_and(|(token, _)| token == authoritative_argmax_token),
+            compared_logits: candidate_ids.len(),
+            exact_logit_agreements,
+            all_candidate_logits_exact: exact_logit_agreements == candidate_ids.len(),
+            first_logit_mismatch,
+        });
+    }
+
+    keep.extend([weight_slab, candidate_logits, projection_scalar]);
+    pool_recycle(kern, keep);
+    ResidentIndexedHeadShadow {
+        compile_fast_math_enabled: false,
+        candidate_union: candidate_ids.to_vec(),
+        candidate_tile_rows: plan.slab_rows,
+        candidate_weight_bytes: plan.slab_bytes,
+        output_weight_format: resident_indexed_head_format_label(format),
+        encode_us,
+        commit_wait_us,
+        gpu_busy_us,
+        kernel_window_us,
+        fallback_reason: None,
+        rows,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -34443,8 +35042,9 @@ impl ResidentDecodeState {
             false,
             None,
             &[],
+            None,
         )
-        .map(|(preds, _, _, _, _)| preds)
+        .map(|(preds, _, _, _, _, _)| preds)
     }
 
     /// Resident speculative verify with snapshots of selected target decoder layer inputs.
@@ -34482,8 +35082,9 @@ impl ResidentDecodeState {
             false,
             None,
             capture_layer_ids,
+            None,
         )
-        .map(|(preds, _, layer_inputs, _, _)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _, _, _)| (preds, layer_inputs))
     }
 
     /// Teacher-forcing twin of [`Self::verify_batch_with_layer_inputs`] used by the
@@ -34519,8 +35120,9 @@ impl ResidentDecodeState {
             true,
             None,
             capture_layer_ids,
+            None,
         )
-        .map(|(preds, logits, layer_inputs, _, output_norm)| {
+        .map(|(preds, logits, layer_inputs, _, output_norm, _)| {
             (preds, layer_inputs, output_norm, logits)
         })
     }
@@ -34555,8 +35157,9 @@ impl ResidentDecodeState {
             false,
             None,
             &[],
+            None,
         )
-        .map(|(preds, _, _, target_top_k, _)| (preds, target_top_k))
+        .map(|(preds, _, _, target_top_k, _, _)| (preds, target_top_k))
     }
 
     /// `verify_batch` that also reads back the `k * vocab` pre-argmax logits (the byte-exact
@@ -34589,8 +35192,9 @@ impl ResidentDecodeState {
             false,
             None,
             &[],
+            None,
         )
-        .map(|(preds, logits, _, _, _)| (preds, logits))
+        .map(|(preds, logits, _, _, _, _)| (preds, logits))
     }
 
     /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
@@ -34616,12 +35220,14 @@ impl ResidentDecodeState {
         read_output_norm: bool,
         tree: Option<&TreeAttn>,
         capture_layer_ids: &[usize],
+        indexed_head_shadow_candidates: Option<&[u32]>,
     ) -> Option<(
         Vec<u32>,
         Vec<f32>,
         Vec<Vec<f32>>,
         Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>,
         Vec<f32>,
+        Option<ResidentIndexedHeadShadow>,
     )> {
         // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
         // The tree path widens the node cap to TREE_MAX_NODES (a tree of N nodes has at most
@@ -34729,6 +35335,14 @@ impl ResidentDecodeState {
                 .output_weight_blocks
                 .matches_shape(self.hidden, vocab)
         {
+            return None;
+        }
+        // Never normalize, truncate, or partially score a malformed diagnostic request. Valid
+        // but unsupported Q6/tied/width shapes get an explicit fallback receipt after the
+        // authoritative verification has completed.
+        if indexed_head_shadow_candidates.is_some_and(|candidate_ids| {
+            !resident_indexed_head_candidate_union_valid(candidate_ids, vocab)
+        }) {
             return None;
         }
 
@@ -35520,6 +36134,22 @@ impl ResidentDecodeState {
                  rope_scatter_batch_layers={batched_rope_scatter_layers}"
             );
         }
+        // Strictly post-authoritative diagnostic. The full head, production argmax, and their
+        // completed command buffer above remain the sole source of predictions.
+        let indexed_head_shadow = indexed_head_shadow_candidates.map(|candidate_ids| {
+            run_resident_indexed_head_shadow(
+                kern,
+                &fnorm_buf,
+                &logits_buf,
+                &pred_buf,
+                &ow_buf,
+                logits.output_is_tied_embedding,
+                hidden,
+                vocab,
+                k,
+                candidate_ids,
+            )
+        });
         // Note: `filled` is intentionally NOT advanced — the host accept loop sets it.
         let preds: Vec<u32> = (0..k)
             .map(|i| unsafe { *(pred_buf.contents() as *const u32).add(i) })
@@ -35624,6 +36254,7 @@ impl ResidentDecodeState {
             layer_inputs,
             target_top_k,
             output_norm,
+            indexed_head_shadow,
         ))
     }
 
@@ -35671,8 +36302,9 @@ impl ResidentDecodeState {
             false,
             Some(&tree),
             &[],
+            None,
         )
-        .map(|(preds, _, _, _, _)| preds)
+        .map(|(preds, _, _, _, _, _)| preds)
     }
 
     /// Capture-capable twin of [`Self::verify_batch_tree`].  The forward, tree-attention
@@ -35711,8 +36343,9 @@ impl ResidentDecodeState {
             false,
             Some(&tree),
             capture_layer_ids,
+            None,
         )
-        .map(|(preds, _, layer_inputs, _, _)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _, _, _)| (preds, layer_inputs))
     }
 
     /// Tree-attention twin of [`Self::verify_batch_with_target_top_k`]. Candidate rows retain
@@ -35748,8 +36381,9 @@ impl ResidentDecodeState {
             false,
             Some(&tree),
             &[],
+            None,
         )
-        .map(|(preds, _, _, target_top_k, _)| (preds, target_top_k))
+        .map(|(preds, _, _, target_top_k, _, _)| (preds, target_top_k))
     }
 
     /// Benchmark-only EAGLE/Token-Recycling twin that retains both selected decoder-layer
@@ -35791,10 +36425,62 @@ impl ResidentDecodeState {
             false,
             Some(&tree),
             capture_layer_ids,
+            None,
         )
-        .map(|(preds, _, layer_inputs, target_top_k, _)| {
+        .map(|(preds, _, layer_inputs, target_top_k, _, _)| {
             (preds, layer_inputs, target_top_k)
         })
+    }
+
+    /// Benchmark-only tree verifier with an exact tied-Q6 indexed-output-head replay.
+    ///
+    /// The full projection and production argmax execute first and remain authoritative. Once
+    /// that command buffer completes, the retained candidate union is replayed through aligned
+    /// Q6_K V4 tiles and compared with the full logits. `read_target_top_k` only controls the
+    /// pre-existing compact target-candidate sibling used by Token Recycling; neither diagnostic
+    /// result is permitted to affect target acceptance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_tree_with_indexed_head_shadow(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+        capture_layer_ids: &[usize],
+        read_target_top_k: bool,
+        candidate_ids: &[u32],
+    ) -> Option<(
+        Vec<u32>,
+        Vec<Vec<f32>>,
+        Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>,
+        ResidentIndexedHeadShadow,
+    )> {
+        let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
+        let (preds, _, layer_inputs, target_top_k, _, indexed_head_shadow) = self
+            .verify_batch_inner(
+                embeddings,
+                cos_all,
+                sin_all,
+                layers,
+                logits,
+                base_position,
+                n,
+                scale,
+                false,
+                read_target_top_k,
+                false,
+                Some(&tree),
+                capture_layer_ids,
+                Some(candidate_ids),
+            )?;
+        Some((preds, layer_inputs, target_top_k, indexed_head_shadow?))
     }
 
     /// `verify_batch_tree` that also reads back the `n * vocab` pre-argmax logits (the gate
@@ -35830,8 +36516,9 @@ impl ResidentDecodeState {
             false,
             Some(&tree),
             &[],
+            None,
         )
-        .map(|(preds, logits, _, _, _)| (preds, logits))
+        .map(|(preds, logits, _, _, _, _)| (preds, logits))
     }
 
     /// Build the per-node `TreeAttn` descriptor from the ancestor bitset. For node `i`, scan
@@ -40958,6 +41645,150 @@ mod tests {
                 }
             }
             drop(prepared);
+        }
+    }
+
+    /// Real-Metal seam for the diagnostic scorer. It compares every retained Q6_K row against
+    /// the already-completed full projection at each verifier width 1..=8. The candidate slab is
+    /// built only by the production shadow helper, so this exercises its blits, original-lane
+    /// mapping, shared V4 dispatch, strict tie behavior, and bit-equality receipts end to end.
+    ///
+    /// `CAMELID_KQUANT_V4=1 cargo test --release --lib \
+    /// metal::tests::metal_q6k_indexed_head_shadow_exactness_microtest --exact --ignored \
+    /// --nocapture --test-threads=1`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_q6k_indexed_head_shadow_exactness_microtest() {
+        if !detect_metal_device().available {
+            return;
+        }
+        assert!(kquant_v4_enabled(), "set CAMELID_KQUANT_V4=1");
+        assert!(
+            !kquant_v4_soa8_enabled(),
+            "the first indexed-head shadow intentionally declines SOA8"
+        );
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let _v4 = kquant_v2_kernels().expect("strict V4 library compiles");
+        let device = &kernel.device;
+        let hidden = 3 * 256usize;
+        let vocab = 24usize;
+        let n_sb = hidden / 256;
+        let row_bytes = n_sb * 210;
+        let candidate_ids = [0u32, 7, 9, 14, 23];
+        let mut wire = (0..vocab * row_bytes)
+            .map(|i| ((i * 197 + i / 13 + 0xa7) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        for (block_index, block) in wire.chunks_exact_mut(210).enumerate() {
+            let magnitude = 0.0025 + (block_index % 29) as f32 * 0.00031;
+            let d = if block_index & 1 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            };
+            block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        }
+        let mut cache = MetalLinearCache::new();
+        let output_weight = ResidentLinearWeight {
+            format: ResidentWeightFormat::Q6K,
+            buffer: cache.raw_wire_weight_buffer(device, &wire),
+            soa8_buffer: None,
+            q8_wire: false,
+        };
+
+        for n_tokens in 1..=8usize {
+            let input = (0..n_tokens * hidden)
+                .map(|i| {
+                    let token = i / hidden;
+                    let col = i % hidden;
+                    let base = ((((token * 211 + col * 71) % 521) as f32) - 260.0) * 0.009;
+                    if (token + col) % 17 == 0 {
+                        0.0
+                    } else {
+                        base + token as f32 * 0.00013
+                    }
+                })
+                .collect::<Vec<_>>();
+            let input_buf = device.new_buffer(
+                std::mem::size_of_val(input.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+            let full_logits = device.new_buffer(
+                (n_tokens * vocab * std::mem::size_of::<f32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let projection_scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            let mut keep = Vec::new();
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_resident_matmul_f32(
+                encoder,
+                kernel,
+                &mut keep,
+                &input_buf,
+                &output_weight,
+                &full_logits,
+                &projection_scalar,
+                hidden,
+                vocab,
+                n_tokens,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert!(cb.status() == metal::MTLCommandBufferStatus::Completed);
+
+            let mut full = vec![0.0f32; n_tokens * vocab];
+            read_buffer_f32(&full_logits, &mut full);
+            let predictions = (0..n_tokens)
+                .map(|row| {
+                    let mut best_score = f32::NEG_INFINITY;
+                    let mut best_token = u32::MAX;
+                    for token in 0..vocab {
+                        let score = full[row * vocab + token];
+                        if score > best_score {
+                            best_score = score;
+                            best_token = token as u32;
+                        }
+                    }
+                    best_token
+                })
+                .collect::<Vec<_>>();
+            let predictions_buf = device.new_buffer(
+                (n_tokens * std::mem::size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    predictions.as_ptr(),
+                    predictions_buf.contents() as *mut u32,
+                    n_tokens,
+                );
+            }
+
+            let shadow = run_resident_indexed_head_shadow(
+                kernel,
+                &input_buf,
+                &full_logits,
+                &predictions_buf,
+                &output_weight,
+                true,
+                hidden,
+                vocab,
+                n_tokens,
+                &candidate_ids,
+            );
+            assert!(shadow.scored(), "N{n_tokens}: {:?}", shadow.fallback_reason);
+            assert!(!shadow.compile_fast_math_enabled);
+            assert_eq!(shadow.rows.len(), n_tokens);
+            for row in &shadow.rows {
+                assert_eq!(row.compared_logits, candidate_ids.len());
+                assert_eq!(row.exact_logit_agreements, candidate_ids.len());
+                assert!(row.all_candidate_logits_exact);
+                assert!(row.first_logit_mismatch.is_none());
+            }
+            pool_recycle(kernel, keep);
         }
     }
 
@@ -50851,6 +51682,7 @@ mod tests {
                 final_norm: &output_norm,
                 output_weight_blocks: ResidentWeightBytes::Blocks36(&token_embd),
                 vocab_size: vocab,
+                output_is_tied_embedding: false,
             });
             match session
                 .forward_token(
@@ -52923,6 +53755,7 @@ mod tests {
                     final_norm: &row.output_norm,
                     output_weight_blocks: ResidentWeightBytes::Blocks36(&row.token_embd),
                     vocab_size: row.vocab,
+                    output_is_tied_embedding: false,
                 });
                 match session
                     .forward_token(
@@ -53924,6 +54757,7 @@ mod tests {
             final_norm: &final_norm,
             output_weight_blocks: ResidentWeightBytes::Blocks36(&out_w),
             vocab_size: vocab,
+            output_is_tied_embedding: false,
         };
 
         // Deterministic synthetic K/V seeding the `base` history positions (identical for
@@ -54358,6 +55192,7 @@ mod tests {
             final_norm: &final_norm,
             output_weight_blocks: ResidentWeightBytes::Blocks36(&out_w),
             vocab_size: vocab,
+            output_is_tied_embedding: false,
         };
         let synth_kv = |base: usize, layer: usize, is_v: bool| -> Vec<f32> {
             let mut out = vec![0.0f32; n_kv * base * head_dim];
