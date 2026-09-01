@@ -29524,10 +29524,55 @@ fn eagle3_bf16_bytes(rows: usize, cols: usize) -> Option<usize> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Eagle3LmHeadPlan {
     rows: usize,
-    q8: bool,
-    /// Quantize the eight non-LM-head draft matrices at load time. This is a
-    /// proposal-only approximation: the target verifier remains authoritative.
-    body_q8: bool,
+    /// Resident wire format of the draft language-model head.
+    lm_head: Eagle3DraftWire,
+    /// Resident wire format of the eight non-LM-head draft matrices, quantized
+    /// at load time. This is a proposal-only approximation: the target verifier
+    /// remains authoritative.
+    body: Eagle3DraftWire,
+}
+
+/// Load-time wire format for one group of draft-head matrices. Every option is
+/// proposal-only: it can change which tokens the draft proposes, never which
+/// tokens the target accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Eagle3DraftWire {
+    /// Checkpoint bytes as stored (16 bits per weight).
+    Bf16,
+    /// GGUF Q8_0 wire blocks (8.5 bits per weight).
+    Q8,
+    /// GGUF Q4_K super-blocks (4.5 bits per weight). Matrices whose shape the
+    /// K-quant kernels cannot address fall back to Q8 per matrix.
+    Q4K,
+}
+
+impl Eagle3DraftWire {
+    fn from_flags(
+        group: &str,
+        q8: Option<&str>,
+        q4: Option<&str>,
+    ) -> std::result::Result<Self, String> {
+        let q8_name = format!("CAMELID_EAGLE3_{group}_Q8");
+        let q4_name = format!("CAMELID_EAGLE3_{group}_Q4");
+        let q8 = eagle3_parse_env_bool(&q8_name, q8)?;
+        let q4 = eagle3_parse_env_bool(&q4_name, q4)?;
+        match (q8, q4) {
+            (true, true) => Err(format!(
+                "EAGLE-3 {q8_name} and {q4_name} are mutually exclusive; set at most one"
+            )),
+            (true, false) => Ok(Self::Q8),
+            (false, true) => Ok(Self::Q4K),
+            (false, false) => Ok(Self::Bf16),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Q8 => "q8_0",
+            Self::Q4K => "q4_k",
+        }
+    }
 }
 
 fn eagle3_parse_env_bool(name: &str, value: Option<&str>) -> std::result::Result<bool, String> {
@@ -29545,6 +29590,8 @@ fn eagle3_lm_head_plan_from(
     rows: Option<&str>,
     q8: Option<&str>,
     body_q8: Option<&str>,
+    q4: Option<&str>,
+    body_q4: Option<&str>,
 ) -> std::result::Result<Eagle3LmHeadPlan, String> {
     let rows = match rows.map(str::trim) {
         None | Some("") => EAGLE3_DRAFT_VOCAB,
@@ -29559,8 +29606,8 @@ fn eagle3_lm_head_plan_from(
     }
     Ok(Eagle3LmHeadPlan {
         rows,
-        q8: eagle3_parse_env_bool("CAMELID_EAGLE3_LM_HEAD_Q8", q8)?,
-        body_q8: eagle3_parse_env_bool("CAMELID_EAGLE3_BODY_Q8", body_q8)?,
+        lm_head: Eagle3DraftWire::from_flags("LM_HEAD", q8, q4)?,
+        body: Eagle3DraftWire::from_flags("BODY", body_q8, body_q4)?,
     })
 }
 
@@ -29568,7 +29615,238 @@ fn eagle3_lm_head_plan() -> std::result::Result<Eagle3LmHeadPlan, String> {
     let rows = std::env::var("CAMELID_EAGLE3_LM_HEAD_ROWS").ok();
     let q8 = std::env::var("CAMELID_EAGLE3_LM_HEAD_Q8").ok();
     let body_q8 = std::env::var("CAMELID_EAGLE3_BODY_Q8").ok();
-    eagle3_lm_head_plan_from(rows.as_deref(), q8.as_deref(), body_q8.as_deref())
+    let q4 = std::env::var("CAMELID_EAGLE3_LM_HEAD_Q4").ok();
+    let body_q4 = std::env::var("CAMELID_EAGLE3_BODY_Q4").ok();
+    eagle3_lm_head_plan_from(
+        rows.as_deref(),
+        q8.as_deref(),
+        body_q8.as_deref(),
+        q4.as_deref(),
+        body_q4.as_deref(),
+    )
+}
+
+/// Bytes of one GGUF Q4_K super-block: `d` f16, `dmin` f16, twelve bytes of packed
+/// 6-bit sub-block scales/mins, and 128 bytes of 4-bit codes for 256 weights.
+const EAGLE3_Q4K_SUPERBLOCK_BYTES: usize = 144;
+const EAGLE3_Q4K_SUPERBLOCK_VALUES: usize = 256;
+
+/// The Q4_K resident kernels address weights in 256-column super-blocks and the
+/// narrow verifier tiles rows in groups of eight; a matrix outside that lattice
+/// keeps the Q8 wire instead.
+fn eagle3_q4k_shape_eligible(rows: usize, cols: usize) -> bool {
+    rows > 0
+        && cols > 0
+        && rows.is_multiple_of(8)
+        && cols.is_multiple_of(EAGLE3_Q4K_SUPERBLOCK_VALUES)
+}
+
+/// Fit one affine 4-bit code book `x ~= scale * q - min` to 32 weights, returning
+/// `(scale, min)` with `min >= 0`. The search sweeps a small family of candidate
+/// step sizes and refines each with a weighted least-squares solve, keeping the
+/// lowest weighted squared error.
+fn eagle3_q4k_fit_subblock(x: &[f32]) -> (f32, f32) {
+    debug_assert_eq!(x.len(), 32);
+    let mut min_x = x[0];
+    let mut max_x = x[0];
+    let mut sum_sq = 0.0f32;
+    for &v in x {
+        min_x = min_x.min(v);
+        max_x = max_x.max(v);
+        sum_sq += v * v;
+    }
+    if min_x > 0.0 {
+        min_x = 0.0;
+    }
+    if max_x == min_x {
+        return (0.0, -min_x);
+    }
+    let av_x = (sum_sq / x.len() as f32).sqrt();
+    let weights: Vec<f32> = x.iter().map(|v| av_x + v.abs()).collect();
+    let sum_w: f32 = weights.iter().sum();
+    let sum_x: f32 = weights.iter().zip(x).map(|(w, v)| w * v).sum();
+
+    let mut codes = [0u8; 32];
+    let assign = |iscale: f32, codes: &mut [u8; 32]| {
+        for (code, &v) in codes.iter_mut().zip(x) {
+            let l = (iscale * (v - min_x)).round();
+            *code = l.clamp(0.0, 15.0) as u8;
+        }
+    };
+    // Weighted least squares for (scale, min) given fixed codes. Returns `None`
+    // when the codes are degenerate (all equal) and the system is singular.
+    let solve = |codes: &[u8; 32]| -> Option<(f32, f32, f32)> {
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        for ((w, &v), &l) in weights.iter().zip(x).zip(codes.iter()) {
+            let l = l as f32;
+            sum_l += w * l;
+            sum_l2 += w * l * l;
+            sum_xl += w * l * v;
+        }
+        let det = sum_w * sum_l2 - sum_l * sum_l;
+        if det <= 0.0 {
+            return None;
+        }
+        let mut scale = (sum_w * sum_xl - sum_x * sum_l) / det;
+        let mut min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+        if min > 0.0 {
+            min = 0.0;
+            scale = sum_xl / sum_l2;
+        }
+        let mut err = 0.0f32;
+        for ((w, &v), &l) in weights.iter().zip(x).zip(codes.iter()) {
+            let diff = scale * l as f32 + min - v;
+            err += w * diff * diff;
+        }
+        Some((scale, min, err))
+    };
+
+    let range = max_x - min_x;
+    let base_iscale = 15.0 / range;
+    assign(base_iscale, &mut codes);
+    let (mut best_scale, mut best_min) = match solve(&codes) {
+        Some((scale, min, _)) => (scale, min),
+        None => (1.0 / base_iscale, min_x),
+    };
+    let mut best_err = {
+        let mut err = 0.0f32;
+        for ((w, &v), &l) in weights.iter().zip(x).zip(codes.iter()) {
+            let diff = best_scale * l as f32 + best_min - v;
+            err += w * diff * diff;
+        }
+        err
+    };
+    for step in 0..=20 {
+        let iscale = (-1.0 + 0.1 * step as f32 + 15.0) / range;
+        assign(iscale, &mut codes);
+        if let Some((scale, min, err)) = solve(&codes) {
+            if err < best_err {
+                best_err = err;
+                best_scale = scale;
+                best_min = min;
+            }
+        }
+    }
+    (best_scale, -best_min)
+}
+
+/// Quantize 256 consecutive weights of one row into a GGUF Q4_K super-block.
+fn eagle3_quantize_q4k_superblock(x: &[f32], out: &mut [u8]) {
+    debug_assert_eq!(x.len(), EAGLE3_Q4K_SUPERBLOCK_VALUES);
+    debug_assert_eq!(out.len(), EAGLE3_Q4K_SUPERBLOCK_BYTES);
+    let mut scales = [0.0f32; 8];
+    let mut mins = [0.0f32; 8];
+    let mut max_scale = 0.0f32;
+    let mut max_min = 0.0f32;
+    for j in 0..8 {
+        let (scale, min) = eagle3_q4k_fit_subblock(&x[j * 32..(j + 1) * 32]);
+        scales[j] = scale;
+        mins[j] = min;
+        max_scale = max_scale.max(scale);
+        max_min = max_min.max(min);
+    }
+    let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+    let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+    let mut ls = [0u8; 8];
+    let mut lm = [0u8; 8];
+    let mut packed = [0u8; 12];
+    for j in 0..8 {
+        ls[j] = ((inv_scale * scales[j]).round().clamp(0.0, 63.0)) as u8;
+        lm[j] = ((inv_min * mins[j]).round().clamp(0.0, 63.0)) as u8;
+        if j < 4 {
+            packed[j] = ls[j];
+            packed[j + 4] = lm[j];
+        } else {
+            packed[j + 4] = (ls[j] & 0xF) | ((lm[j] & 0xF) << 4);
+            packed[j - 4] |= (ls[j] >> 4) << 6;
+            packed[j] |= (lm[j] >> 4) << 6;
+        }
+    }
+    let d_bits = crate::tensor::f32_to_f16_bits(max_scale / 63.0);
+    let dmin_bits = crate::tensor::f32_to_f16_bits(max_min / 63.0);
+    let d = crate::tensor::f16_bits_to_f32(d_bits);
+    let dmin = crate::tensor::f16_bits_to_f32(dmin_bits);
+    out[..2].copy_from_slice(&d_bits.to_le_bytes());
+    out[2..4].copy_from_slice(&dmin_bits.to_le_bytes());
+    out[4..16].copy_from_slice(&packed);
+    let mut codes = [0u8; EAGLE3_Q4K_SUPERBLOCK_VALUES];
+    for j in 0..8 {
+        let dl = d * ls[j] as f32;
+        if dl == 0.0 {
+            continue;
+        }
+        let dm = dmin * lm[j] as f32;
+        for i in 0..32 {
+            let l = ((x[j * 32 + i] + dm) / dl).round();
+            codes[j * 32 + i] = l.clamp(0.0, 15.0) as u8;
+        }
+    }
+    let qs = &mut out[16..];
+    for pair in 0..4 {
+        for l in 0..32 {
+            qs[pair * 32 + l] = codes[pair * 64 + l] | (codes[pair * 64 + 32 + l] << 4);
+        }
+    }
+}
+
+/// Quantize row-major BF16 weights to GGUF Q4_K wire super-blocks (144 bytes per 256
+/// weights). Like the Q8 transform this is a load-time, proposal-only approximation:
+/// the resident K-quant kernels then stream 4.5 bits per weight for the draft head.
+fn eagle3_bf16_to_q4k_wire(
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    if !eagle3_q4k_shape_eligible(rows, cols) {
+        return Err(format!(
+            "EAGLE-3 Q4_K wire needs rows to be a nonzero multiple of 8 and columns a nonzero \
+             multiple of {EAGLE3_Q4K_SUPERBLOCK_VALUES}, got [{rows}, {cols}]"
+        ));
+    }
+    let expected = eagle3_bf16_bytes(rows, cols)
+        .ok_or_else(|| "EAGLE-3 Q4_K BF16 size overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "EAGLE-3 Q4_K wire got {} BF16 bytes, expected {expected} for [{rows}, {cols}]",
+            bytes.len()
+        ));
+    }
+    let n_sb = cols / EAGLE3_Q4K_SUPERBLOCK_VALUES;
+    let row_wire_bytes = n_sb * EAGLE3_Q4K_SUPERBLOCK_BYTES;
+    let wire_bytes = rows
+        .checked_mul(row_wire_bytes)
+        .ok_or_else(|| "EAGLE-3 Q4_K byte size overflow".to_string())?;
+    let mut wire = Vec::new();
+    wire.try_reserve_exact(wire_bytes)
+        .map_err(|error| format!("could not allocate {wire_bytes} EAGLE-3 Q4_K bytes: {error}"))?;
+    wire.resize(wire_bytes, 0);
+
+    let row_bytes = cols * std::mem::size_of::<u16>();
+    {
+        use rayon::prelude::*;
+        wire.par_chunks_exact_mut(row_wire_bytes)
+            .zip(bytes.par_chunks_exact(row_bytes))
+            .for_each(|(wire_row, source_row)| {
+                let mut decoded_row = vec![0.0f32; cols];
+                for (value, pair) in decoded_row.iter_mut().zip(source_row.chunks_exact(2)) {
+                    let bits = u16::from_le_bytes([pair[0], pair[1]]);
+                    *value = f32::from_bits(u32::from(bits) << 16);
+                }
+                for (sb, out) in wire_row
+                    .chunks_exact_mut(EAGLE3_Q4K_SUPERBLOCK_BYTES)
+                    .enumerate()
+                {
+                    let start = sb * EAGLE3_Q4K_SUPERBLOCK_VALUES;
+                    eagle3_quantize_q4k_superblock(
+                        &decoded_row[start..start + EAGLE3_Q4K_SUPERBLOCK_VALUES],
+                        out,
+                    );
+                }
+            });
+    }
+    Ok(wire)
 }
 
 /// Quantize row-major BF16 weights to GGUF's compact 34-byte Q8_0 wire blocks.  This is
@@ -30194,18 +30472,117 @@ fn eagle3_upload_q8_wire(
 }
 
 #[cfg(target_os = "macos")]
-fn eagle3_upload_matrix(
+fn eagle3_upload_q4k_wire(
     k: &MetalLinearKernel,
     bf16: &[u8],
     rows: usize,
     cols: usize,
-    q8: bool,
 ) -> std::result::Result<ResidentLinearWeight, String> {
-    if q8 {
-        eagle3_upload_q8_wire(k, bf16, rows, cols)
-    } else {
-        Ok(eagle3_upload_bf16(k, bf16))
+    let wire = eagle3_bf16_to_q4k_wire(bf16, rows, cols)?;
+    if wire.len() as u64 > k.device.max_buffer_length() {
+        return Err(format!(
+            "EAGLE-3 Q4_K allocation {} exceeds Metal maxBufferLength {}",
+            wire.len(),
+            k.device.max_buffer_length()
+        ));
     }
+    let buffer = k
+        .device
+        .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+    write_buffer_u8(&buffer, &wire);
+    Ok(ResidentLinearWeight {
+        format: ResidentWeightFormat::Q4K,
+        buffer,
+        soa8_buffer: None,
+        q8_wire: false,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_upload_matrix(
+    k: &MetalLinearKernel,
+    name: &str,
+    bf16: &[u8],
+    rows: usize,
+    cols: usize,
+    wire: Eagle3DraftWire,
+) -> std::result::Result<ResidentLinearWeight, String> {
+    match wire {
+        Eagle3DraftWire::Bf16 => Ok(eagle3_upload_bf16(k, bf16)),
+        Eagle3DraftWire::Q8 => eagle3_upload_q8_wire(k, bf16, rows, cols),
+        Eagle3DraftWire::Q4K if eagle3_q4k_shape_eligible(rows, cols) => {
+            eagle3_upload_q4k_wire(k, bf16, rows, cols)
+        }
+        Eagle3DraftWire::Q4K => {
+            eprintln!(
+                "[eagle3] {name} [{rows}, {cols}] is outside the Q4_K row/column lattice; \
+                 keeping the Q8 wire for this matrix"
+            );
+            eagle3_upload_q8_wire(k, bf16, rows, cols)
+        }
+    }
+}
+
+/// Draft-head projection dispatch. Q4_K weights at a single token take the
+/// direct-f32 single-column K-quant GEMV: the draft has no exactness contract
+/// with the target, and the eight-column verifier kernel pads a lone token to
+/// the full window, which would cost more than the Q8 wire it replaces. Every
+/// other shape and format uses the shared resident dispatcher unchanged.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_eagle3_matmul_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    y: &Buffer,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    input_width: usize,
+    rows: usize,
+    n_tokens: usize,
+) {
+    if weight.format == ResidentWeightFormat::Q4K && n_tokens == 1 {
+        if let Some(v3) = kquant_v3_kernels() {
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = (input_width / EAGLE3_Q4K_SUPERBLOCK_VALUES) as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = 1;
+            }
+            e.set_compute_pipeline_state(&v3.q4k_single);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(2, Some(&weight.buffer), 0);
+            e.set_buffer(3, Some(out), 0);
+            e.set_buffer(4, Some(scalar), 0);
+            e.set_buffer(5, Some(scalar), 4);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: rows.div_ceil(4) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return;
+        }
+    }
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        y,
+        weight,
+        out,
+        scalar,
+        input_width,
+        rows,
+        n_tokens,
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -30286,67 +30663,80 @@ impl Eagle3MetalState {
         let lm_head_bytes = eagle3_bf16_bytes(lm_head_plan.rows, EAGLE3_HIDDEN)
             .ok_or_else(|| "EAGLE-3 language-model head byte size overflow".to_string())?;
         let lm_head_bf16 = &weights.lm_head_bf16[..lm_head_bytes];
-        let lm_head = if lm_head_plan.q8 {
-            eagle3_upload_q8_wire(k, lm_head_bf16, lm_head_plan.rows, EAGLE3_HIDDEN)?
-        } else {
-            eagle3_upload_bf16(k, lm_head_bf16)
-        };
-        Ok(Self {
+        let upload_started = std::time::Instant::now();
+        let lm_head = eagle3_upload_matrix(
+            k,
+            "lm_head.weight",
+            lm_head_bf16,
+            lm_head_plan.rows,
+            EAGLE3_HIDDEN,
+            lm_head_plan.lm_head,
+        )?;
+        let body = lm_head_plan.body;
+        let state = Self {
             fc: eagle3_upload_matrix(
                 k,
+                "fc.weight",
                 weights.fc_bf16,
                 EAGLE3_HIDDEN,
                 EAGLE3_AUX_WIDTH,
-                lm_head_plan.body_q8,
+                body,
             )?,
             q_proj: eagle3_upload_matrix(
                 k,
+                "midlayer.self_attn.q_proj.weight",
                 weights.q_proj_bf16,
                 EAGLE3_HIDDEN,
                 EAGLE3_ATTN_INPUT,
-                lm_head_plan.body_q8,
+                body,
             )?,
             k_proj: eagle3_upload_matrix(
                 k,
+                "midlayer.self_attn.k_proj.weight",
                 weights.k_proj_bf16,
                 EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
                 EAGLE3_ATTN_INPUT,
-                lm_head_plan.body_q8,
+                body,
             )?,
             v_proj: eagle3_upload_matrix(
                 k,
+                "midlayer.self_attn.v_proj.weight",
                 weights.v_proj_bf16,
                 EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
                 EAGLE3_ATTN_INPUT,
-                lm_head_plan.body_q8,
+                body,
             )?,
             o_proj: eagle3_upload_matrix(
                 k,
+                "midlayer.self_attn.o_proj.weight",
                 weights.o_proj_bf16,
                 EAGLE3_HIDDEN,
                 EAGLE3_HIDDEN,
-                lm_head_plan.body_q8,
+                body,
             )?,
             gate_proj: eagle3_upload_matrix(
                 k,
+                "midlayer.mlp.gate_proj.weight",
                 weights.gate_proj_bf16,
                 EAGLE3_FFN,
                 EAGLE3_HIDDEN,
-                lm_head_plan.body_q8,
+                body,
             )?,
             up_proj: eagle3_upload_matrix(
                 k,
+                "midlayer.mlp.up_proj.weight",
                 weights.up_proj_bf16,
                 EAGLE3_FFN,
                 EAGLE3_HIDDEN,
-                lm_head_plan.body_q8,
+                body,
             )?,
             down_proj: eagle3_upload_matrix(
                 k,
+                "midlayer.mlp.down_proj.weight",
                 weights.down_proj_bf16,
                 EAGLE3_HIDDEN,
                 EAGLE3_FFN,
-                lm_head_plan.body_q8,
+                body,
             )?,
             lm_head,
             lm_head_rows: lm_head_plan.rows,
@@ -30361,7 +30751,19 @@ impl Eagle3MetalState {
             filled: 0,
             rope_theta: weights.rope_theta,
             sliding_window: weights.sliding_window,
-        })
+        };
+        if lm_head_plan.body != Eagle3DraftWire::Bf16
+            || lm_head_plan.lm_head != Eagle3DraftWire::Bf16
+        {
+            eprintln!(
+                "[eagle3] draft wire body={} lm_head={} rows={} (uploaded in {:.1} ms)",
+                lm_head_plan.body.label(),
+                lm_head_plan.lm_head.label(),
+                lm_head_plan.rows,
+                upload_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(state)
     }
 
     pub fn max_positions(&self) -> usize {
@@ -30412,7 +30814,7 @@ impl Eagle3MetalState {
         let cb = k.queue.new_command_buffer();
         let e = cb.new_compute_command_encoder();
         let mut keep = Vec::new();
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             &mut keep,
@@ -30507,7 +30909,7 @@ impl Eagle3MetalState {
             (EAGLE3_HIDDEN * 4) as u64,
             &rms_scalar,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30519,7 +30921,7 @@ impl Eagle3MetalState {
             EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
             1,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30828,7 +31230,7 @@ impl Eagle3MetalState {
             (EAGLE3_HIDDEN * 4) as u64,
             &rms_scalar,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30840,7 +31242,7 @@ impl Eagle3MetalState {
             EAGLE3_HIDDEN,
             1,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30852,7 +31254,7 @@ impl Eagle3MetalState {
             EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
             1,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30922,7 +31324,7 @@ impl Eagle3MetalState {
             0,
             0,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30954,7 +31356,7 @@ impl Eagle3MetalState {
             &post_norm,
             &rms_scalar,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30966,7 +31368,7 @@ impl Eagle3MetalState {
             EAGLE3_FFN,
             1,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -30987,7 +31389,7 @@ impl Eagle3MetalState {
             &silu_n,
             EAGLE3_FFN,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -31016,7 +31418,7 @@ impl Eagle3MetalState {
             &output_normed,
             &rms_scalar,
         );
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             keep,
@@ -31214,7 +31616,7 @@ impl Eagle3MetalState {
         let e = cb.new_compute_command_encoder();
         let mut keep = Vec::new();
         // Preserve `fuse_features`' exact batched projection geometry.
-        encode_resident_matmul_f32(
+        encode_eagle3_matmul_f32(
             e,
             k,
             &mut keep,
@@ -31626,28 +32028,232 @@ mod eagle3_metal_contract_tests {
     #[test]
     fn eagle3_lm_head_plan_is_default_off_and_fail_closed() {
         assert_eq!(
-            eagle3_lm_head_plan_from(None, None, None).unwrap(),
+            eagle3_lm_head_plan_from(None, None, None, None, None).unwrap(),
             Eagle3LmHeadPlan {
                 rows: EAGLE3_DRAFT_VOCAB,
-                q8: false,
-                body_q8: false,
+                lm_head: Eagle3DraftWire::Bf16,
+                body: Eagle3DraftWire::Bf16,
             }
         );
         assert_eq!(
-            eagle3_lm_head_plan_from(Some("16000"), Some("yes"), Some("1")).unwrap(),
+            eagle3_lm_head_plan_from(Some("16000"), Some("yes"), Some("1"), None, None).unwrap(),
             Eagle3LmHeadPlan {
                 rows: 16_000,
-                q8: true,
-                body_q8: true,
+                lm_head: Eagle3DraftWire::Q8,
+                body: Eagle3DraftWire::Q8,
             }
         );
-        assert!(eagle3_lm_head_plan_from(Some("0"), None, None).is_err());
-        assert!(eagle3_lm_head_plan_from(Some("32001"), None, None).is_err());
+        assert!(eagle3_lm_head_plan_from(Some("0"), None, None, None, None).is_err());
+        assert!(eagle3_lm_head_plan_from(Some("32001"), None, None, None, None).is_err());
         assert!(
-            eagle3_lm_head_plan_from(Some("sixteen-thousand"), None, None).is_err()
+            eagle3_lm_head_plan_from(Some("sixteen-thousand"), None, None, None, None).is_err()
         );
-        assert!(eagle3_lm_head_plan_from(None, Some("maybe"), None).is_err());
-        assert!(eagle3_lm_head_plan_from(None, None, Some("maybe")).is_err());
+        assert!(eagle3_lm_head_plan_from(None, Some("maybe"), None, None, None).is_err());
+        assert!(eagle3_lm_head_plan_from(None, None, Some("maybe"), None, None).is_err());
+    }
+
+    #[test]
+    fn eagle3_q4k_plan_flags_are_independent_and_exclusive_with_q8() {
+        // Q4 alone selects the K-quant wire per group; groups are independent.
+        assert_eq!(
+            eagle3_lm_head_plan_from(None, None, None, Some("1"), None).unwrap(),
+            Eagle3LmHeadPlan {
+                rows: EAGLE3_DRAFT_VOCAB,
+                lm_head: Eagle3DraftWire::Q4K,
+                body: Eagle3DraftWire::Bf16,
+            }
+        );
+        assert_eq!(
+            eagle3_lm_head_plan_from(None, Some("0"), None, Some("0"), Some("true")).unwrap(),
+            Eagle3LmHeadPlan {
+                rows: EAGLE3_DRAFT_VOCAB,
+                lm_head: Eagle3DraftWire::Bf16,
+                body: Eagle3DraftWire::Q4K,
+            }
+        );
+        // Mixed groups are legal: a Q8 head with a Q4 body and vice versa.
+        assert_eq!(
+            eagle3_lm_head_plan_from(None, Some("1"), None, None, Some("1")).unwrap(),
+            Eagle3LmHeadPlan {
+                rows: EAGLE3_DRAFT_VOCAB,
+                lm_head: Eagle3DraftWire::Q8,
+                body: Eagle3DraftWire::Q4K,
+            }
+        );
+        // Both flags on the same group fail closed instead of picking one.
+        assert!(eagle3_lm_head_plan_from(None, Some("1"), None, Some("1"), None).is_err());
+        assert!(eagle3_lm_head_plan_from(None, None, Some("1"), None, Some("1")).is_err());
+        // Malformed Q4 spellings fail closed like the Q8 ones.
+        assert!(eagle3_lm_head_plan_from(None, None, None, Some("maybe"), None).is_err());
+        assert!(eagle3_lm_head_plan_from(None, None, None, None, Some("2")).is_err());
+    }
+
+    #[test]
+    fn eagle3_q4k_lattice_admits_every_checkpoint_matrix_and_refuses_odd_shapes() {
+        for (rows, cols) in [
+            (EAGLE3_HIDDEN, EAGLE3_AUX_WIDTH),
+            (EAGLE3_HIDDEN, EAGLE3_ATTN_INPUT),
+            (EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM, EAGLE3_ATTN_INPUT),
+            (EAGLE3_HIDDEN, EAGLE3_HIDDEN),
+            (EAGLE3_FFN, EAGLE3_HIDDEN),
+            (EAGLE3_HIDDEN, EAGLE3_FFN),
+            (EAGLE3_DRAFT_VOCAB, EAGLE3_HIDDEN),
+        ] {
+            assert!(eagle3_q4k_shape_eligible(rows, cols), "[{rows}, {cols}]");
+        }
+        // A reduced head that is not a multiple of eight rows keeps the Q8 wire.
+        assert!(!eagle3_q4k_shape_eligible(16_001, EAGLE3_HIDDEN));
+        assert!(!eagle3_q4k_shape_eligible(0, EAGLE3_HIDDEN));
+        assert!(!eagle3_q4k_shape_eligible(8, 255));
+        assert!(!eagle3_q4k_shape_eligible(8, 0));
+        let bf16 = vec![0u8; 8 * 256 * 2];
+        assert!(eagle3_bf16_to_q4k_wire(&bf16, 8, 256).is_ok());
+        assert!(eagle3_bf16_to_q4k_wire(&bf16, 4, 512).is_err());
+        assert!(eagle3_bf16_to_q4k_wire(&bf16, 16, 128).is_err());
+        assert!(eagle3_bf16_to_q4k_wire(&bf16[..bf16.len() - 2], 8, 256).is_err());
+    }
+
+    fn eagle3_q4k_dequantize_wire(wire: &[u8], cols: usize) -> Vec<f32> {
+        let n_sb = cols / EAGLE3_Q4K_SUPERBLOCK_VALUES;
+        let mut out = Vec::with_capacity(wire.len() / EAGLE3_Q4K_SUPERBLOCK_BYTES * 256);
+        for row_wire in wire.chunks_exact(n_sb * EAGLE3_Q4K_SUPERBLOCK_BYTES) {
+            for block in row_wire.chunks_exact(EAGLE3_Q4K_SUPERBLOCK_BYTES) {
+                let block: &[u8; crate::tensor::Q4_K_BLOCK_BYTES] = block.try_into().unwrap();
+                let mut values = [0.0f32; crate::tensor::QK_K_BLOCK_SIZE];
+                crate::tensor::Q4KBlock::from_bytes(block).dequantize(&mut values);
+                out.extend_from_slice(&values);
+            }
+        }
+        out
+    }
+
+    fn eagle3_bf16_bytes_from_f32(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn eagle3_q4k_superblock_layout_round_trips_through_the_gguf_reader() {
+        // Deterministic pseudo-random weights with a per-row spread so both the
+        // shared super-block scale and the per-32 sub-block scales are exercised.
+        let rows = 8;
+        let cols = 512;
+        let mut state = 0x9E37_79B9u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|index| {
+                let row_scale = 0.01 + 0.03 * (index / cols) as f32;
+                let bf16_bits = ((next() * row_scale).to_bits() >> 16) as u16;
+                f32::from_bits(u32::from(bf16_bits) << 16)
+            })
+            .collect();
+        let bf16 = eagle3_bf16_bytes_from_f32(&values);
+        let wire = eagle3_bf16_to_q4k_wire(&bf16, rows, cols).unwrap();
+        assert_eq!(wire.len(), rows * (cols / 256) * EAGLE3_Q4K_SUPERBLOCK_BYTES);
+
+        // The packed 6-bit scales/mins read back through the shared unpacker
+        // must be what the encoder used to requantize: every sub-block with a
+        // nonzero scale reconstructs its own maximum within one code step.
+        let decoded = eagle3_q4k_dequantize_wire(&wire, cols);
+        assert_eq!(decoded.len(), values.len());
+        let mut sq_err = 0.0f64;
+        let mut sq_ref = 0.0f64;
+        for (block_index, (block, block_ref)) in
+            wire.chunks_exact(EAGLE3_Q4K_SUPERBLOCK_BYTES).zip(values.chunks_exact(256)).enumerate()
+        {
+            let (scales, mins) = crate::tensor::q4_k_unpack_kmask_scales(&block[4..16]);
+            let d = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            assert!(scales.iter().any(|&scale| scale == 63), "block {block_index} has no 63 scale");
+            for j in 0..8 {
+                let step = d * scales[j] as f32;
+                assert!(step >= 0.0 && dmin * mins[j] as f32 >= 0.0);
+                let sub = &block_ref[j * 32..(j + 1) * 32];
+                let sub_dec = &decoded[block_index * 256 + j * 32..block_index * 256 + (j + 1) * 32];
+                let sub_min = sub.iter().cloned().fold(f32::INFINITY, f32::min);
+                let sub_max = sub.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                // Half a code step plus room for the weighted fit to clip an
+                // outlier; a 4-bit grid step is one fifteenth of the spread.
+                let tolerance = 0.15 * (sub_max - sub_min) + 1e-6;
+                for (x, y) in sub.iter().zip(sub_dec) {
+                    assert!(
+                        (x - y).abs() <= tolerance,
+                        "block {block_index} sub {j}: {x} vs {y} (step {step})"
+                    );
+                    sq_err += ((x - y) as f64).powi(2);
+                    sq_ref += (*x as f64).powi(2);
+                }
+            }
+        }
+        let rel_rmse = (sq_err / sq_ref).sqrt();
+        assert!(rel_rmse < 0.12, "relative RMSE {rel_rmse}");
+    }
+
+    #[test]
+    fn eagle3_q4k_grid_values_keep_their_codes_and_round_trip_within_f16_scale_rounding() {
+        // Every sub-block holds the full 0..15 code range on a power-of-two step, so
+        // the fitted scale is the step itself. The only rounding left is the f16
+        // super-block scale `d = step / 63`, which perturbs the reconstruction by
+        // at most one f16 ulp relative; the 4-bit codes themselves must be exact.
+        let cols = 256;
+        let step = 2f32.powi(-6);
+        let grid: [u8; 32] = [
+            0, 1, 2, 4, 8, 15, 8, 4, 2, 1, 0, 15, 1, 0, 8, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13,
+            14, 15, 0, 15, 0, 1, 14,
+        ];
+        let values: Vec<f32> = (0..8 * cols)
+            .map(|index| step * grid[index % grid.len()] as f32)
+            .collect();
+        for value in &values {
+            assert_eq!(f32::from_bits((value.to_bits() >> 16) << 16), *value);
+        }
+        let bf16 = eagle3_bf16_bytes_from_f32(&values);
+        let wire = eagle3_bf16_to_q4k_wire(&bf16, 8, cols).unwrap();
+        for block in wire.chunks_exact(EAGLE3_Q4K_SUPERBLOCK_BYTES) {
+            let (scales, mins) = crate::tensor::q4_k_unpack_kmask_scales(&block[4..16]);
+            assert_eq!(scales, [63u8; 8], "every sub-block shares the same step");
+            assert_eq!(mins, [0u8; 8], "the grid has no offset");
+            let qs = &block[16..];
+            for pair in 0..4 {
+                for l in 0..32 {
+                    let low = qs[pair * 32 + l] & 0x0f;
+                    let high = qs[pair * 32 + l] >> 4;
+                    assert_eq!(low, grid[(pair * 64 + l) % 32]);
+                    assert_eq!(high, grid[(pair * 64 + 32 + l) % 32]);
+                }
+            }
+        }
+        let decoded = eagle3_q4k_dequantize_wire(&wire, cols);
+        for (x, y) in values.iter().zip(&decoded) {
+            assert!((x - y).abs() <= 2e-3 * x.abs() + 1e-9, "{x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn eagle3_q4k_zero_and_constant_blocks_are_well_defined() {
+        let zeros = vec![0.0f32; 8 * 256];
+        let wire = eagle3_bf16_to_q4k_wire(&eagle3_bf16_bytes_from_f32(&zeros), 8, 256).unwrap();
+        assert!(eagle3_q4k_dequantize_wire(&wire, 256).iter().all(|v| *v == 0.0));
+        // A constant negative block is carried entirely by the min term.
+        let constant = vec![-0.5f32; 8 * 256];
+        let wire =
+            eagle3_bf16_to_q4k_wire(&eagle3_bf16_bytes_from_f32(&constant), 8, 256).unwrap();
+        for v in eagle3_q4k_dequantize_wire(&wire, 256) {
+            assert!((v + 0.5).abs() < 1e-3, "{v}");
+        }
+        // A constant positive block has no spread to fit: its single code must
+        // still reconstruct the value with a zero offset.
+        let (scale, min) = eagle3_q4k_fit_subblock(&[0.25f32; 32]);
+        assert_eq!(min, 0.0);
+        assert!((scale * 15.0 - 0.25).abs() < 1e-6, "{scale}");
+        assert_eq!(eagle3_q4k_fit_subblock(&[-0.5f32; 32]), (0.0, 0.5));
     }
 
     #[test]
