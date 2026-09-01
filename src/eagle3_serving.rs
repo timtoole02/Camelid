@@ -520,7 +520,12 @@ mod tests {
         assert_eq!(suffix_verify_node_limit(2_033), DEEP_CONTEXT_VERIFY_NODES);
         assert_eq!(suffix_verify_node_limit(4_000), DEEP_CONTEXT_VERIFY_NODES);
         assert_eq!(cap_verify_nodes_for_position(4_000, 8), 8);
-        assert_eq!(cap_verify_nodes_for_position(2_039, 9), 8);
+        // Nine rows from base 2,039 have position-counts 2,040..=2,048,
+        // exactly the inclusive wide-batch boundary proved by Metal.
+        assert_eq!(cap_verify_nodes_for_position(2_039, 9), 9);
+        // Advancing the base once makes the final position-count 2,049, so
+        // the same request must narrow to the deep-safe eight-row lane.
+        assert_eq!(cap_verify_nodes_for_position(2_040, 9), 8);
         assert_eq!(cap_verify_nodes_for_position(2_039, 6), 6);
     }
 }
