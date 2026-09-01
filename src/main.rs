@@ -11204,14 +11204,12 @@ fn run_eagle3_resident_greedy(
                     .extend_from_slice(&fused.tree.tokens[1..]);
                 run.draft_us += draft_started.elapsed().as_micros();
 
-                // Full target-head execution and resident longest-path commit are unchanged. The
-                // compact target top-k readback is receipt/cache evidence only.
+                // Full target-head execution and resident longest-path commit are unchanged.
+                // The ordinary greedy predictions already are the exact target top-1 rows used
+                // by this policy, so do not pay for a redundant full-vocabulary top-k dispatch.
                 let verify_started = Instant::now();
                 let verified = session
-                    .verify_tree_metal_with_layer_inputs_and_target_top_k(
-                        &fused.tree,
-                        &TARGET_LAYER_INPUT_IDS,
-                    )?
+                    .verify_tree_metal_with_layer_inputs(&fused.tree, &TARGET_LAYER_INPUT_IDS)?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "resident Metal target-row hedge verification became unavailable at position {target_before}"
@@ -11219,11 +11217,9 @@ fn run_eagle3_resident_greedy(
                     })?;
                 run.verify_us += verify_started.elapsed().as_micros();
                 anyhow::ensure!(
-                    verified.predictions.len() == actual_nodes
-                        && verified.target_top_k.len() == actual_nodes,
-                    "target-row hedge target returned predictions/top-k rows {}/{} for {actual_nodes} verifier rows",
+                    verified.predictions.len() == actual_nodes,
+                    "target-row hedge target returned {} predictions for {actual_nodes} verifier rows",
                     verified.predictions.len(),
-                    verified.target_top_k.len(),
                 );
                 let fused_acceptance = fused
                     .accept_target_predictions(&verified.predictions)
@@ -11269,22 +11265,12 @@ fn run_eagle3_resident_greedy(
                 }
 
                 // Causal publication barrier: no row from this verify was visible to `fuse`.
-                // Install every exact target row only after target acceptance and head update.
+                // Install every exact greedy target top-1 row only after target acceptance and
+                // head update. A one-element row is the complete evidence needed by this policy.
                 let mut candidate_ids = 0usize;
-                for ((&from, candidates), &prediction) in fused
-                    .tree
-                    .tokens
-                    .iter()
-                    .zip(&verified.target_top_k)
-                    .zip(&verified.predictions)
-                {
-                    anyhow::ensure!(
-                        candidates[0] == prediction,
-                        "target-row hedge top-1 candidate {} disagrees with greedy prediction {prediction} for verifier token {from}",
-                        candidates[0]
-                    );
-                    candidate_ids +=
-                        target_rows.replace_target_candidates(from, &candidates[..1]);
+                for (&from, &prediction) in fused.tree.tokens.iter().zip(&verified.predictions) {
+                    candidate_ids += target_rows
+                        .replace_target_candidates(from, std::slice::from_ref(&prediction));
                 }
                 run.target_row_hedge
                     .note_candidates(actual_nodes, candidate_ids);
