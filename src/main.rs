@@ -10449,6 +10449,38 @@ mod dual_eagle_selector_tests {
     }
 }
 
+const KQUANT_V4_SOA8_ENV: &str = "CAMELID_KQUANT_V4_SOA8";
+
+fn kquant_v4_soa8_prewarm_admitted(value: Option<&str>, prewarm_succeeded: bool) -> bool {
+    let enabled = value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    !enabled || prewarm_succeeded
+}
+
+fn require_kquant_v4_soa8_prewarm(prewarm_succeeded: bool) -> anyhow::Result<()> {
+    let value = std::env::var(KQUANT_V4_SOA8_ENV).ok();
+    anyhow::ensure!(
+        kquant_v4_soa8_prewarm_admitted(value.as_deref(), prewarm_succeeded),
+        "{KQUANT_V4_SOA8_ENV}=1 requires every target FFN/head SOA8 pipeline and sidecar"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod kquant_v4_soa8_prewarm_gate_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_soa8_opt_in_requires_successful_prewarm() {
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(kquant_v4_soa8_prewarm_admitted(disabled, false));
+        }
+        for enabled in [Some("1"), Some("true"), Some("TRUE")] {
+            assert!(!kquant_v4_soa8_prewarm_admitted(enabled, false));
+            assert!(kquant_v4_soa8_prewarm_admitted(enabled, true));
+        }
+    }
+}
+
 #[derive(Default)]
 struct Eagle3BenchRun {
     generated: Vec<u32>,
@@ -10512,7 +10544,8 @@ fn run_plain_resident_greedy(
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
     // Populate the shared resident weight cache outside the measured decode span. This is a
     // model-load cost, not a per-token cost, and the EAGLE run below reuses the same cache.
-    let _ = session.prewarm_resident_weights();
+    let prewarmed = session.prewarm_resident_weights();
+    require_kquant_v4_soa8_prewarm(prewarmed)?;
     let ttft_started = Instant::now();
     let first = session
         .generate_next_token_with_history_diagnostics(
@@ -10582,7 +10615,8 @@ fn run_eagle3_resident_greedy(
     use camelid::inference::token_recycling::TokenRecyclingDrafter;
 
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
-    let _ = session.prewarm_resident_weights();
+    let prewarmed = session.prewarm_resident_weights();
+    require_kquant_v4_soa8_prewarm(prewarmed)?;
     // EAGLE alternates target and head command buffers on Metal's shared serial queue.
     // Do not leave a pre-committed target graph waiting ahead of a head update.
     session.set_resident_encode_ahead_enabled(false);
@@ -13452,7 +13486,8 @@ fn run_export_eagle3_features(
             .unwrap_or_else(|| format!("line-{:08}", line_index + 1));
         let rows = record.input_ids.len();
         let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(&weights))?;
-        let _ = session.prewarm_resident_weights();
+        let prewarmed = session.prewarm_resident_weights();
+        require_kquant_v4_soa8_prewarm(prewarmed)?;
         session.set_resident_encode_ahead_enabled(false);
         anyhow::ensure!(
             session.begin_eagle3_training_metal()?,

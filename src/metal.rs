@@ -27332,6 +27332,204 @@ fn kquant_soa8_packed_len(
         .checked_mul(format.wire_bytes_per_block())
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KquantSoa8PipelineSupport {
+    q4k: bool,
+    q6k: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl KquantSoa8PipelineSupport {
+    fn supports(self, format: ResidentWeightFormat) -> bool {
+        match format {
+            ResidentWeightFormat::Q4K => self.q4k,
+            ResidentWeightFormat::Q6K => self.q6k,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_soa8_pipeline_support() -> KquantSoa8PipelineSupport {
+    let Some(v4) = kquant_v2_kernels() else {
+        return KquantSoa8PipelineSupport::default();
+    };
+    KquantSoa8PipelineSupport {
+        q4k: v4.q4k_v4_soa8.is_some(),
+        q6k: v4.q6k_v4_soa8.is_some(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KquantSoa8Requirement {
+    format: ResidentWeightFormat,
+    rows: usize,
+    n_sb: usize,
+    bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct KquantSoa8PrewarmCandidate<'a> {
+    resolved_index: usize,
+    wire: &'a [u8],
+    requirement: KquantSoa8Requirement,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KquantSoa8PrewarmAudit {
+    buffers: usize,
+    bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KquantSoa8PrewarmFailure {
+    Prerequisite(&'static str),
+    NoRequiredSidecars,
+    InvalidLayout(ResidentWeightFormat),
+    PipelineUnavailable(ResidentWeightFormat),
+    BufferTooLarge {
+        index: usize,
+        bytes: u64,
+        max: u64,
+    },
+    ByteCountOverflow,
+    BuildFailed {
+        index: usize,
+        prepared: KquantSoa8PrewarmAudit,
+    },
+}
+
+#[cfg(target_os = "macos")]
+impl KquantSoa8PrewarmFailure {
+    fn prepared(self) -> KquantSoa8PrewarmAudit {
+        match self {
+            Self::BuildFailed { prepared, .. } => prepared,
+            _ => KquantSoa8PrewarmAudit::default(),
+        }
+    }
+}
+
+/// Preflight every required format and size before the first build, then report
+/// the exact successfully built prefix if allocation/repack fails. Callers only
+/// attach the returned buffers after this returns `Ok`.
+#[cfg(target_os = "macos")]
+fn execute_kquant_soa8_prewarm<T>(
+    requirements: &[KquantSoa8Requirement],
+    support: KquantSoa8PipelineSupport,
+    max_buffer_length: u64,
+    mut build: impl FnMut(usize, &KquantSoa8Requirement) -> Option<T>,
+    mut buffer_len: impl FnMut(&T) -> u64,
+) -> std::result::Result<(Vec<T>, KquantSoa8PrewarmAudit), KquantSoa8PrewarmFailure> {
+    if requirements.is_empty() {
+        return Err(KquantSoa8PrewarmFailure::NoRequiredSidecars);
+    }
+    let mut expected = KquantSoa8PrewarmAudit::default();
+    for (index, requirement) in requirements.iter().enumerate() {
+        if !support.supports(requirement.format) {
+            return Err(KquantSoa8PrewarmFailure::PipelineUnavailable(
+                requirement.format,
+            ));
+        }
+        if requirement.bytes > max_buffer_length {
+            return Err(KquantSoa8PrewarmFailure::BufferTooLarge {
+                index,
+                bytes: requirement.bytes,
+                max: max_buffer_length,
+            });
+        }
+        expected.buffers = expected
+            .buffers
+            .checked_add(1)
+            .ok_or(KquantSoa8PrewarmFailure::ByteCountOverflow)?;
+        expected.bytes = expected
+            .bytes
+            .checked_add(requirement.bytes)
+            .ok_or(KquantSoa8PrewarmFailure::ByteCountOverflow)?;
+    }
+
+    let mut prepared = KquantSoa8PrewarmAudit::default();
+    let mut buffers = Vec::with_capacity(expected.buffers);
+    for (index, requirement) in requirements.iter().enumerate() {
+        let Some(buffer) = build(index, requirement) else {
+            return Err(KquantSoa8PrewarmFailure::BuildFailed { index, prepared });
+        };
+        let actual = buffer_len(&buffer);
+        if actual != requirement.bytes {
+            return Err(KquantSoa8PrewarmFailure::BuildFailed { index, prepared });
+        }
+        prepared.buffers += 1;
+        prepared.bytes += actual;
+        buffers.push(buffer);
+    }
+    debug_assert_eq!(prepared, expected);
+    Ok((buffers, prepared))
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_soa8_prewarm_candidate<'a>(
+    weight: &'a ResidentWeightBytes<'_>,
+    input_width: usize,
+    rows: usize,
+    resolved_index: usize,
+) -> std::result::Result<Option<KquantSoa8PrewarmCandidate<'a>>, KquantSoa8PrewarmFailure> {
+    let format = weight.format();
+    if !matches!(
+        format,
+        ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+    ) {
+        return Ok(None);
+    }
+    if input_width == 0
+        || !input_width.is_multiple_of(256)
+        || !weight.matches_shape(input_width, rows)
+    {
+        return Err(KquantSoa8PrewarmFailure::InvalidLayout(format));
+    }
+    let n_sb = input_width / 256;
+    let bytes = kquant_soa8_packed_len(format, rows, n_sb)
+        .ok_or(KquantSoa8PrewarmFailure::InvalidLayout(format))?;
+    let wire = weight
+        .canonical_wire_bytes()
+        .ok_or(KquantSoa8PrewarmFailure::InvalidLayout(format))?;
+    if wire.len() != bytes {
+        return Err(KquantSoa8PrewarmFailure::InvalidLayout(format));
+    }
+    Ok(Some(KquantSoa8PrewarmCandidate {
+        resolved_index,
+        wire,
+        requirement: KquantSoa8Requirement {
+            format,
+            rows,
+            n_sb,
+            bytes: bytes as u64,
+        },
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn emit_kquant_soa8_prewarm_failure(
+    error: KquantSoa8PrewarmFailure,
+    requirements: &[KquantSoa8Requirement],
+) {
+    let actual = error.prepared();
+    let required_bytes = requirements
+        .iter()
+        .fold(0u64, |sum, requirement| sum.saturating_add(requirement.bytes));
+    eprintln!(
+        "[metal-kquant-v4-soa8-prewarm] status=failed scope=ffn_head \
+         actual_buffers={} actual_bytes={} required_buffers={} required_bytes={} reason={error:?}",
+        actual.buffers,
+        actual.bytes,
+        requirements.len(),
+        required_bytes,
+    );
+}
+
 /// Exact word-plane repack for the optional narrow V4 verifier sidecar.
 ///
 /// A full output-row octet is `[superblock][word][row][byte]`. Q6_K's last
@@ -27460,15 +27658,19 @@ fn resolve_resident_weight_for_shape(
     {
         return Some(resident);
     }
-    if let Some(wire) = weight.canonical_wire_bytes() {
-        resident.soa8_buffer = cache.kquant_soa8_weight_buffer(
-            device,
-            wire,
-            resident.format,
-            rows,
-            input_width / 256,
-        );
+    // The SOA8 gate changes route precedence, so once explicitly selected its
+    // pipeline and sidecar are required rather than a silent canonical fallback.
+    if !kquant_v4_soa8_pipeline_support().supports(resident.format) {
+        return None;
     }
+    let wire = weight.canonical_wire_bytes()?;
+    resident.soa8_buffer = Some(cache.kquant_soa8_weight_buffer(
+        device,
+        wire,
+        resident.format,
+        rows,
+        input_width / 256,
+    )?);
     Some(resident)
 }
 
@@ -27520,7 +27722,25 @@ pub fn prewarm_resident_weights_cache(
         return false;
     };
     let wire = f32y_gemv_enabled() && wire_weights_enabled();
+    let soa8_requested = prepare_soa8_sidecars && kquant_v4_soa8_enabled();
+    if soa8_requested && !wire {
+        emit_kquant_soa8_prewarm_failure(
+            KquantSoa8PrewarmFailure::Prerequisite("wire weights"),
+            &[],
+        );
+        return false;
+    }
+    if soa8_requested && !kquant_v4_enabled() {
+        emit_kquant_soa8_prewarm_failure(
+            KquantSoa8PrewarmFailure::Prerequisite("KQUANT V4"),
+            &[],
+        );
+        return false;
+    }
+    let soa8_support = soa8_requested.then(kquant_v4_soa8_pipeline_support);
     let mut resolved: Vec<ResidentLinearWeight> = Vec::with_capacity(layers.len() * 7 + 2);
+    let mut soa8_candidates = Vec::with_capacity(layers.len() * 3 + 1);
+    let mut soa8_audit = None;
     {
         let Ok(mut cache) = metal_linear_cache().lock() else {
             return false;
@@ -27550,32 +27770,43 @@ pub fn prewarm_resident_weights_cache(
                     true,
                 ),
             ] {
-                match resolve_resident_weight_for_shape(
-                    &mut cache,
-                    &k.device,
-                    w,
-                    wire,
-                    input_width,
-                    rows,
-                    prepare_soa8_sidecars && ffn_or_head,
-                ) {
-                    Some(r) => resolved.push(r),
-                    None => return false,
+                let Some(r) = resolve_resident_weight(&mut cache, &k.device, w, wire) else {
+                    return false;
+                };
+                let resolved_index = resolved.len();
+                resolved.push(r);
+                if soa8_requested && ffn_or_head {
+                    match kquant_soa8_prewarm_candidate(w, input_width, rows, resolved_index) {
+                        Ok(Some(candidate)) => soa8_candidates.push(candidate),
+                        Ok(None) => {}
+                        Err(error) => {
+                            emit_kquant_soa8_prewarm_failure(error, &[]);
+                            return false;
+                        }
+                    }
                 }
             }
         }
         if let Some(w) = output_projection {
-            match resolve_resident_weight_for_shape(
-                &mut cache,
-                &k.device,
-                w,
-                wire,
-                geometry.hidden,
-                geometry.vocab,
-                prepare_soa8_sidecars,
-            ) {
-                Some(r) => resolved.push(r),
-                None => return false,
+            let Some(r) = resolve_resident_weight(&mut cache, &k.device, w, wire) else {
+                return false;
+            };
+            let resolved_index = resolved.len();
+            resolved.push(r);
+            if soa8_requested {
+                match kquant_soa8_prewarm_candidate(
+                    w,
+                    geometry.hidden,
+                    geometry.vocab,
+                    resolved_index,
+                ) {
+                    Ok(Some(candidate)) => soa8_candidates.push(candidate),
+                    Ok(None) => {}
+                    Err(error) => {
+                        emit_kquant_soa8_prewarm_failure(error, &[]);
+                        return false;
+                    }
+                }
             }
         }
         // The sampling tail's embedding gather only exists in wire mode
@@ -27587,6 +27818,39 @@ pub fn prewarm_resident_weights_cache(
                     resolved.push(r);
                 }
             }
+        }
+        if soa8_requested {
+            let requirements: Vec<_> = soa8_candidates
+                .iter()
+                .map(|candidate| candidate.requirement)
+                .collect();
+            let result = execute_kquant_soa8_prewarm(
+                &requirements,
+                soa8_support.expect("SOA8 support resolved before cache lock"),
+                k.device.max_buffer_length(),
+                |index, _| {
+                    let candidate = &soa8_candidates[index];
+                    cache.kquant_soa8_weight_buffer(
+                        &k.device,
+                        candidate.wire,
+                        candidate.requirement.format,
+                        candidate.requirement.rows,
+                        candidate.requirement.n_sb,
+                    )
+                },
+                |buffer: &Buffer| buffer.length(),
+            );
+            let (buffers, audit) = match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    emit_kquant_soa8_prewarm_failure(error, &requirements);
+                    return false;
+                }
+            };
+            for (candidate, buffer) in soa8_candidates.iter().zip(buffers) {
+                resolved[candidate.resolved_index].soa8_buffer = Some(buffer);
+            }
+            soa8_audit = Some(audit);
         }
     }
     // A NoCopy buffer wraps the mmap'd GGUF pages directly, so resolving it uploads
@@ -27616,23 +27880,13 @@ pub fn prewarm_resident_weights_cache(
     e.end_encoding();
     cb.commit();
     cb.wait_until_completed();
-    if prepare_soa8_sidecars
-        && kquant_v4_enabled()
-        && kquant_v4_soa8_enabled()
-        && std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()
-    {
-        let buffers = resolved
-            .iter()
-            .filter(|r| r.soa8_buffer.is_some())
-            .count();
-        let bytes: u64 = resolved
-            .iter()
-            .filter_map(|r| r.soa8_buffer.as_ref())
-            .map(|b| b.length())
-            .sum();
-        eprintln!(
-            "[metal-kquant-v4-soa8-prewarm] scope=ffn_head buffers={buffers} bytes={bytes}"
-        );
+    if let Some(audit) = soa8_audit {
+        if std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some() {
+            eprintln!(
+                "[metal-kquant-v4-soa8-prewarm] status=ready scope=ffn_head buffers={} bytes={}",
+                audit.buffers, audit.bytes,
+            );
+        }
     }
     true
 }
@@ -40018,6 +40272,135 @@ mod tests {
         let bytes = 28 * (2 * q4_gate_or_up + q6_down) + q6_head;
         assert_eq!(buffers, 85);
         assert_eq!(bytes, 1_693_956_096);
+
+        let mut requirements = Vec::with_capacity(buffers);
+        for _ in 0..28 {
+            for (format, rows, n_sb, bytes) in [
+                (ResidentWeightFormat::Q4K, 8192, 3072 / 256, q4_gate_or_up),
+                (ResidentWeightFormat::Q4K, 8192, 3072 / 256, q4_gate_or_up),
+                (ResidentWeightFormat::Q6K, 3072, 8192 / 256, q6_down),
+            ] {
+                requirements.push(KquantSoa8Requirement {
+                    format,
+                    rows,
+                    n_sb,
+                    bytes: bytes as u64,
+                });
+            }
+        }
+        requirements.push(KquantSoa8Requirement {
+            format: ResidentWeightFormat::Q6K,
+            rows: 128256,
+            n_sb: 3072 / 256,
+            bytes: q6_head as u64,
+        });
+        let (prepared, audit) = execute_kquant_soa8_prewarm(
+            &requirements,
+            KquantSoa8PipelineSupport { q4k: true, q6k: true },
+            u64::MAX,
+            |_, requirement| Some(requirement.bytes),
+            |prepared| *prepared,
+        )
+        .expect("exact Llama 3.2 3B FFN/head plan");
+        assert_eq!(prepared.len(), 85);
+        assert_eq!(
+            audit,
+            KquantSoa8PrewarmAudit {
+                buffers: 85,
+                bytes: 1_693_956_096,
+            }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kquant_v4_soa8_prewarm_preflights_pipeline_and_size_before_building() {
+        let requirements = [
+            KquantSoa8Requirement {
+                format: ResidentWeightFormat::Q4K,
+                rows: 8,
+                n_sb: 1,
+                bytes: 144 * 8,
+            },
+            KquantSoa8Requirement {
+                format: ResidentWeightFormat::Q6K,
+                rows: 8,
+                n_sb: 1,
+                bytes: 210 * 8,
+            },
+        ];
+        let mut builds = 0;
+        let mut run = |support, max| {
+            execute_kquant_soa8_prewarm(
+                &requirements,
+                support,
+                max,
+                |_, requirement| {
+                    builds += 1;
+                    Some(requirement.bytes)
+                },
+                |prepared| *prepared,
+            )
+        };
+        assert_eq!(
+            run(KquantSoa8PipelineSupport { q4k: true, q6k: false }, u64::MAX),
+            Err(KquantSoa8PrewarmFailure::PipelineUnavailable(
+                ResidentWeightFormat::Q6K
+            ))
+        );
+        assert_eq!(
+            run(
+                KquantSoa8PipelineSupport { q4k: true, q6k: true },
+                requirements[1].bytes - 1,
+            ),
+            Err(KquantSoa8PrewarmFailure::BufferTooLarge {
+                index: 1,
+                bytes: requirements[1].bytes,
+                max: requirements[1].bytes - 1,
+            })
+        );
+        assert_eq!(builds, 0, "all admission checks precede every build");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kquant_v4_soa8_prewarm_reports_partial_allocation_as_failure() {
+        let requirements = [
+            KquantSoa8Requirement {
+                format: ResidentWeightFormat::Q4K,
+                rows: 8,
+                n_sb: 1,
+                bytes: 144 * 8,
+            },
+            KquantSoa8Requirement {
+                format: ResidentWeightFormat::Q6K,
+                rows: 8,
+                n_sb: 1,
+                bytes: 210 * 8,
+            },
+        ];
+        let mut builds = 0;
+        let result = execute_kquant_soa8_prewarm(
+            &requirements,
+            KquantSoa8PipelineSupport { q4k: true, q6k: true },
+            u64::MAX,
+            |index, requirement| {
+                builds += 1;
+                (index == 0).then_some(requirement.bytes)
+            },
+            |prepared| *prepared,
+        );
+        assert_eq!(
+            result,
+            Err(KquantSoa8PrewarmFailure::BuildFailed {
+                index: 1,
+                prepared: KquantSoa8PrewarmAudit {
+                    buffers: 1,
+                    bytes: requirements[0].bytes,
+                },
+            })
+        );
+        assert_eq!(builds, 2);
     }
 
     #[cfg(target_os = "macos")]
