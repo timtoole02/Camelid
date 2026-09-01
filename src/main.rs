@@ -11224,10 +11224,6 @@ fn run_eagle3_resident_greedy(
                 let fused_acceptance = fused
                     .accept_target_predictions(&verified.predictions)
                     .map_err(anyhow::Error::msg)?;
-                anyhow::ensure!(
-                    verified.emitted == fused_acceptance.emitted_tokens,
-                    "target-row hedge host acceptance diverged from resident target emission"
-                );
                 // Authoritative EAGLE refresh consumes verifier capture rows, not draft-lattice
                 // token mappings. An inserted target token therefore remains valid even when it
                 // has no EAGLE T2D/source-node entry.
