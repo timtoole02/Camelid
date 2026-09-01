@@ -12105,6 +12105,7 @@ fn validate_eagle3_target_row_hedge_config(
     enabled: bool,
     tree_nodes: Option<usize>,
     draft_tokens: usize,
+    tree_topk: usize,
     adaptive_branching: bool,
     adaptive_expansions: bool,
     suffix_first: bool,
@@ -12127,6 +12128,10 @@ fn validate_eagle3_target_row_hedge_config(
     anyhow::ensure!(
         draft_tokens >= 2,
         "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        tree_topk >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires --tree-topk >= 2 so a neural hedge is available"
     );
     anyhow::ensure!(
         !adaptive_branching
@@ -12155,6 +12160,7 @@ fn eagle3_target_row_hedge_gate_is_default_off_and_fixed_n8() {
         true,
         Some(8),
         15,
+        4,
         false,
         false,
         false,
@@ -12165,19 +12171,20 @@ fn eagle3_target_row_hedge_gate_is_default_off_and_fixed_n8() {
     )
     .is_ok());
     for invalid in [
-        (Some(7), 15, false, false, false, false, false, false, false),
-        (Some(8), 1, false, false, false, false, false, false, false),
-        (Some(8), 15, true, false, false, false, false, false, false),
-        (Some(8), 15, false, true, false, false, false, false, false),
-        (Some(8), 15, false, false, true, false, false, false, false),
-        (Some(8), 15, false, false, false, true, false, false, false),
-        (Some(8), 15, false, false, false, false, true, false, false),
-        (Some(8), 15, false, false, false, false, false, true, false),
-        (Some(8), 15, false, false, false, false, false, false, true),
+        (Some(7), 15, 4, false, false, false, false, false, false, false),
+        (Some(8), 1, 4, false, false, false, false, false, false, false),
+        (Some(8), 15, 1, false, false, false, false, false, false, false),
+        (Some(8), 15, 4, true, false, false, false, false, false, false),
+        (Some(8), 15, 4, false, true, false, false, false, false, false),
+        (Some(8), 15, 4, false, false, true, false, false, false, false),
+        (Some(8), 15, 4, false, false, false, true, false, false, false),
+        (Some(8), 15, 4, false, false, false, false, true, false, false),
+        (Some(8), 15, 4, false, false, false, false, false, true, false),
+        (Some(8), 15, 4, false, false, false, false, false, false, true),
     ] {
         assert!(validate_eagle3_target_row_hedge_config(
             true, invalid.0, invalid.1, invalid.2, invalid.3, invalid.4, invalid.5, invalid.6,
-            invalid.7, invalid.8,
+            invalid.7, invalid.8, invalid.9,
         )
         .is_err());
     }
@@ -13426,6 +13433,7 @@ fn run_bench_eagle3(
         target_row_hedge,
         tree_nodes,
         draft_tokens,
+        tree_topk,
         adaptive_branching,
         adaptive_expansions,
         suffix_first,
