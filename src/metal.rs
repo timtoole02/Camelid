@@ -6969,6 +6969,96 @@ kernel void q6k_linear_mma_combined_afrag_v4(
     );
 }
 
+// Segmented twins of the register-exact pair above. Up to three row-aligned
+// weight tensors that consume one prepared activation panel (the verifier's
+// Q/K/V and gate/up groups) are covered by a single grid. A tile first resolves
+// the segment that owns it, then runs the very same templated register-exact
+// body against that segment's weights, row count, and output buffer, with its
+// tile index rebased to the segment. Every segment row count is a multiple of
+// the tile height (16 rows for the two-panel Q4_K body, 8 for the Q6_K body),
+// so no tile straddles two tensors; an unused trailing segment carries zero
+// rows. The body is shared source compiled under the same strict-math options,
+// so each segment's output words are the bit patterns its own separate
+// dispatch of the unsegmented kernel produces.
+kernel void q4k_linear_mma_combined_reg2_seg3_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks0 [[buffer(2)]],
+    device float* output0 [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint* segment_rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    device const half* ysums [[buffer(8)]],
+    device const uchar* weight_blocks1 [[buffer(9)]],
+    device float* output1 [[buffer(10)]],
+    device const uchar* weight_blocks2 [[buffer(11)]],
+    device float* output2 [[buffer(12)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint tile_rows = 16u;
+    uint r0 = tile * tile_rows;
+    uint rows = segment_rows[0];
+    device const uchar* weight_blocks = weight_blocks0;
+    device float* output = output0;
+    if (r0 >= rows) {
+        r0 -= rows;
+        rows = segment_rows[1];
+        weight_blocks = weight_blocks1;
+        output = output1;
+        if (r0 >= rows) {
+            r0 -= rows;
+            rows = segment_rows[2];
+            weight_blocks = weight_blocks2;
+            output = output2;
+            if (r0 >= rows) return;
+        }
+    }
+    q4k_linear_mma_combined_reg_v4_body<2, false>(
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_half, ysums,
+        r0 / tile_rows, lane
+    );
+}
+
+kernel void q6k_linear_mma_combined_afrag_seg3_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks0 [[buffer(2)]],
+    device float* output0 [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint* segment_rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    device const uchar* weight_blocks1 [[buffer(9)]],
+    device float* output1 [[buffer(10)]],
+    device const uchar* weight_blocks2 [[buffer(11)]],
+    device float* output2 [[buffer(12)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint tile_rows = 8u;
+    uint r0 = tile * tile_rows;
+    uint rows = segment_rows[0];
+    device const uchar* weight_blocks = weight_blocks0;
+    device float* output = output0;
+    if (r0 >= rows) {
+        r0 -= rows;
+        rows = segment_rows[1];
+        weight_blocks = weight_blocks1;
+        output = output1;
+        if (r0 >= rows) {
+            r0 -= rows;
+            rows = segment_rows[2];
+            weight_blocks = weight_blocks2;
+            output = output2;
+            if (r0 >= rows) return;
+        }
+    }
+    q6k_linear_mma_combined_afrag_v4_body<1>(
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_half,
+        r0 / tile_rows, lane
+    );
+}
+
 
 "#;
 
@@ -18038,6 +18128,195 @@ fn encode_kquant_v4_prepared_projection(
     trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows, route);
 }
 
+/// Rows one segmented register-exact tile owns: the Q4_K body covers two
+/// eight-row panels per threadgroup, the Q6_K body one.
+#[cfg(target_os = "macos")]
+fn kquant_v4_fused_segment_tile_rows(format: ResidentWeightFormat) -> Option<usize> {
+    match format {
+        ResidentWeightFormat::Q4K => Some(16),
+        ResidentWeightFormat::Q6K => Some(8),
+        _ => None,
+    }
+}
+
+/// Row-aligned segments (weight, output, rows) that one segmented register-
+/// exact dispatch may cover. Returns the shared format when the whole list is
+/// eligible: 2..=3 segments, one K-quant format, a narrow window, and every row
+/// count a positive multiple of that format's tile height so no tile straddles
+/// two tensors.
+#[cfg(target_os = "macos")]
+fn kquant_v4_fused_segments_format(
+    segments: &[(&ResidentLinearWeight, &Buffer, usize)],
+    n_tokens: usize,
+) -> Option<ResidentWeightFormat> {
+    if !(2..=KQUANT_V4_FUSED_MAX_SEGMENTS).contains(&segments.len())
+        || !(1..=8).contains(&n_tokens)
+    {
+        return None;
+    }
+    let format = segments[0].0.format;
+    let tile_rows = kquant_v4_fused_segment_tile_rows(format)?;
+    segments
+        .iter()
+        .all(|(weight, _, rows)| {
+            weight.format == format && *rows > 0 && rows.is_multiple_of(tile_rows)
+        })
+        .then_some(format)
+}
+
+/// Encode one segmented register-exact dispatch over 2..=3 row-aligned
+/// projections that share `stage`. Returns false before emitting anything
+/// unless the segment list, the register-exact pair, and the segmented
+/// pipeline are all eligible, so the caller can fall back to one dispatch per
+/// projection (same arithmetic). `scalar` must hold at least 20 bytes:
+/// n_sb @0, rows0..2 @4..16, n_tokens @16.
+#[cfg(target_os = "macos")]
+fn encode_kquant_v4_prepared_fused_projection(
+    e: &metal::ComputeCommandEncoderRef,
+    v4: &KquantV2Kernels,
+    scales: &Buffer,
+    stage: &KquantV4ActivationStage,
+    segments: &[(&ResidentLinearWeight, &Buffer, usize)],
+    scalar: &Buffer,
+) -> bool {
+    let Some(format) = kquant_v4_fused_segments_format(segments, stage.n_tokens) else {
+        return false;
+    };
+    if stage.k_pad != 8 || !kquant_v4_register_exact_pair_admitted(v4) {
+        return false;
+    }
+    let is_q6k = format == ResidentWeightFormat::Q6K;
+    let pipeline = admitted_32_lane_pipeline(if is_q6k {
+        v4.q6k_v4_register_exact_seg3.as_ref()
+    } else {
+        v4.q4k_v4_register_exact_seg3.as_ref()
+    });
+    let Some(pipeline) = pipeline else {
+        return false;
+    };
+    let ysums = if is_q6k {
+        None
+    } else {
+        match stage.ysums.as_ref() {
+            Some(ysums) => Some(ysums),
+            None => return false,
+        }
+    };
+    let tile_rows = kquant_v4_fused_segment_tile_rows(format).expect("eligible format");
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = stage.n_sb as u32;
+        for slot in 0..KQUANT_V4_FUSED_MAX_SEGMENTS {
+            *p.add(1 + slot) = segments.get(slot).map_or(0, |s| s.2) as u32;
+        }
+        *p.add(1 + KQUANT_V4_FUSED_MAX_SEGMENTS) = stage.n_tokens as u32;
+    }
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(scales), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(
+        6,
+        Some(scalar),
+        (4 * (1 + KQUANT_V4_FUSED_MAX_SEGMENTS)) as u64,
+    );
+    e.set_buffer(7, Some(&stage.y_stage), 0);
+    if let Some(ysums) = ysums {
+        e.set_buffer(8, Some(ysums), 0);
+    }
+    // An unused trailing segment carries zero rows, so no tile ever resolves
+    // to it; alias its buffers to segment 0 to keep every slot bound.
+    const SLOTS: [(u64, u64); KQUANT_V4_FUSED_MAX_SEGMENTS] = [(2, 3), (9, 10), (11, 12)];
+    for (slot, &(weight_slot, out_slot)) in SLOTS.iter().enumerate() {
+        let (weight, out, _) = segments.get(slot).copied().unwrap_or(segments[0]);
+        e.set_buffer(weight_slot, Some(&weight.buffer), 0);
+        e.set_buffer(out_slot, Some(out), 0);
+    }
+    let total_rows: usize = segments.iter().map(|s| s.2).sum();
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (total_rows / tile_rows) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    trace_kquant_v4_fused_dispatch(format, stage.n_tokens, segments);
+    true
+}
+
+/// Encode a prepared projection group, covering each maximal run of adjacent
+/// same-format tile-aligned projections with one segmented dispatch when
+/// `fuse` is set and falling back projection-by-projection otherwise.
+/// Returns the number of segmented dispatches encoded.
+#[cfg(target_os = "macos")]
+fn encode_kquant_v4_prepared_projection_group(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    v4: &KquantV2Kernels,
+    keep: &mut Vec<Buffer>,
+    prepared: &SharedKquantV4Activation,
+    projections: &[(&ResidentLinearWeight, &Buffer, &Buffer, usize)],
+    fuse: bool,
+) -> usize {
+    let mut fused_dispatches = 0usize;
+    let mut i = 0usize;
+    while i < projections.len() {
+        if fuse {
+            let format = projections[i].0.format;
+            if let Some(tile_rows) = kquant_v4_fused_segment_tile_rows(format) {
+                let mut j = i;
+                while j < projections.len()
+                    && j - i < KQUANT_V4_FUSED_MAX_SEGMENTS
+                    && projections[j].0.format == format
+                    && projections[j].3 > 0
+                    && projections[j].3.is_multiple_of(tile_rows)
+                {
+                    j += 1;
+                }
+                if j - i >= 2 {
+                    let run: Vec<(&ResidentLinearWeight, &Buffer, usize)> = projections[i..j]
+                        .iter()
+                        .map(|&(weight, out, _, rows)| (weight, out, rows))
+                        .collect();
+                    let scalar = pool_get(k, (4 * (2 + KQUANT_V4_FUSED_MAX_SEGMENTS)) as u64);
+                    let fused = encode_kquant_v4_prepared_fused_projection(
+                        e,
+                        v4,
+                        &prepared.scales,
+                        &prepared.stage,
+                        &run,
+                        &scalar,
+                    );
+                    keep.push(scalar);
+                    if fused {
+                        fused_dispatches += 1;
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        let (weight, out, scalar, rows) = projections[i];
+        encode_kquant_v4_prepared_projection(
+            e,
+            v4,
+            &prepared.scales,
+            &prepared.stage,
+            weight,
+            out,
+            scalar,
+            rows,
+        );
+        i += 1;
+    }
+    fused_dispatches
+}
+
 #[cfg(target_os = "macos")]
 fn encode_shared_kquant_v4_activation(
     e: &metal::ComputeCommandEncoderRef,
@@ -18202,18 +18481,15 @@ fn encode_resident_kquant_v4_shared_group(
     }
 
     let prepared = encode_shared_kquant_v4_activation(e, k, v4, y, input_width, n_tokens);
-    for &(weight, out, scalar, rows) in projections {
-        encode_kquant_v4_prepared_projection(
-            e,
-            v4,
-            &prepared.scales,
-            &prepared.stage,
-            weight,
-            out,
-            scalar,
-            rows,
-        );
-    }
+    encode_kquant_v4_prepared_projection_group(
+        e,
+        k,
+        v4,
+        keep,
+        &prepared,
+        projections,
+        kquant_v4_fused_segments_route_active(),
+    );
     trace_kquant_v4_shared_prep(
         projections.len(),
         n_tokens,
@@ -19104,6 +19380,10 @@ const KQUANT_MC_MAX_COLUMNS: usize = 16;
 const KQUANT_V3_MAX_COLUMNS: usize = 8;
 /// Combined-chain V4 supports one or two independent N=8 matrix tiles.
 const KQUANT_V4_MAX_COLUMNS: usize = 16;
+/// Largest number of row-aligned tensors one segmented register-exact dispatch
+/// covers (the verifier's Q/K/V group).
+#[cfg(target_os = "macos")]
+const KQUANT_V4_FUSED_MAX_SEGMENTS: usize = 3;
 
 fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
@@ -19190,12 +19470,14 @@ struct KquantV2Kernels {
     q4k_v4_direct: Option<ComputePipelineState>,
     q4k_v4_direct_simdbarrier: Option<ComputePipelineState>,
     q4k_v4_register_exact: Option<ComputePipelineState>,
+    q4k_v4_register_exact_seg3: Option<ComputePipelineState>,
     q4k_v4_soa8: Option<ComputePipelineState>,
     q4k_v4_w16: ComputePipelineState,
     q6k_v4: ComputePipelineState,
     q6k_v4_direct: Option<ComputePipelineState>,
     q6k_v4_direct_simdbarrier: Option<ComputePipelineState>,
     q6k_v4_register_exact: Option<ComputePipelineState>,
+    q6k_v4_register_exact_seg3: Option<ComputePipelineState>,
     q6k_v4_soa8: Option<ComputePipelineState>,
     q6k_v4_w16: ComputePipelineState,
 }
@@ -19246,6 +19528,7 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                     "q4k_linear_mma_combined_direct_simdbarrier_v4",
                 ),
                 q4k_v4_register_exact: pipeline("q4k_linear_mma_combined_reg2_v4"),
+                q4k_v4_register_exact_seg3: pipeline("q4k_linear_mma_combined_reg2_seg3_v4"),
                 q4k_v4_soa8: pipeline("q4k_linear_mma_combined_soa8_v4"),
                 q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
@@ -19254,6 +19537,7 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                     "q6k_linear_mma_combined_direct_simdbarrier_v4",
                 ),
                 q6k_v4_register_exact: pipeline("q6k_linear_mma_combined_afrag_v4"),
+                q6k_v4_register_exact_seg3: pipeline("q6k_linear_mma_combined_afrag_seg3_v4"),
                 q6k_v4_soa8: pipeline("q6k_linear_mma_combined_soa8_v4"),
                 q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
@@ -19323,6 +19607,45 @@ fn kquant_v4_register_exact_enabled() -> bool {
         let value = std::env::var("CAMELID_KQUANT_V4_REGISTER_EXACT").ok();
         kquant_v4_register_exact_from_env(value.as_deref())
     })
+}
+
+/// Opt in to covering the verifier's Q/K/V and gate/up projection groups with
+/// one segmented register-exact dispatch per same-format run instead of one
+/// dispatch per tensor. The segmented kernels run the register-exact tile body
+/// verbatim, so this lane stays inside the established V4 arithmetic universe;
+/// it only changes how many grids the encoder launches. Default off; any value
+/// other than `1`/`true` keeps the per-tensor dispatch sequence.
+fn kquant_v4_fused_segments_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_fused_segments_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_KQUANT_V4_FUSED_SEGMENTS").ok();
+        kquant_v4_fused_segments_from_env(value.as_deref())
+    })
+}
+
+/// The segmented group dispatch is a twin of the register-exact route only. It
+/// stays dormant unless that route is the process route, and the process-wide
+/// SOA8 gate suppresses it exactly as it suppresses register-exact itself.
+fn kquant_v4_fused_segments_route_requested(
+    fused_enabled: bool,
+    register_exact_enabled: bool,
+    soa8_enabled: bool,
+) -> bool {
+    fused_enabled && register_exact_enabled && !soa8_enabled
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_fused_segments_route_active() -> bool {
+    kquant_v4_fused_segments_route_requested(
+        kquant_v4_fused_segments_enabled(),
+        kquant_v4_register_exact_enabled(),
+        kquant_v4_soa8_enabled(),
+    )
 }
 
 /// Opt in to the single-SIMD-group barrier twin of the narrow direct-fragment
@@ -19440,6 +19763,51 @@ fn trace_kquant_v4_dispatch(
         };
         eprintln!(
             "[metal-kquant-v4] dispatch={label} n_tokens={n_tokens} rows={rows} pipeline={pipeline}"
+        );
+    }
+}
+
+/// One-shot trace twin for the segmented group dispatch: prints the first
+/// segmented encode of each (format, segment count) this process observes,
+/// with every segment's row count, so a receipt can prove the verifier ran one
+/// grid per group.
+#[cfg(target_os = "macos")]
+fn trace_kquant_v4_fused_dispatch(
+    format: ResidentWeightFormat,
+    n_tokens: usize,
+    segments: &[(&ResidentLinearWeight, &Buffer, usize)],
+) {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !*TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()) {
+        return;
+    }
+    let (shape, label, pipeline) = match format {
+        ResidentWeightFormat::Q4K => (
+            0u32,
+            "q4-multi-fused",
+            "combined-mma-v4-register-exact-q4-reg2-seg3",
+        ),
+        ResidentWeightFormat::Q6K => (
+            1u32,
+            "q6-multi-fused",
+            "combined-mma-v4-register-exact-q6-afrag-seg3",
+        ),
+        _ => return,
+    };
+    let bit =
+        1u32 << (shape * KQUANT_V4_FUSED_MAX_SEGMENTS as u32 + segments.len() as u32 - 2);
+    if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        let rows = segments
+            .iter()
+            .map(|s| s.2.to_string())
+            .collect::<Vec<_>>()
+            .join("+");
+        let total: usize = segments.iter().map(|s| s.2).sum();
+        eprintln!(
+            "[metal-kquant-v4] dispatch={label} n_tokens={n_tokens} rows={total} \
+             segments={} segment_rows={rows} pipeline={pipeline}",
+            segments.len()
         );
     }
 }
@@ -42949,6 +43317,45 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn kquant_v4_fused_segments_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("on"),
+            Some("2"),
+            Some(" 1"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !kquant_v4_fused_segments_from_env(value),
+                "{value:?} must keep the per-tensor dispatch sequence"
+            );
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(kquant_v4_fused_segments_from_env(Some(value)));
+        }
+
+        // The segmented dispatch is a twin of the register-exact route only.
+        assert!(kquant_v4_fused_segments_route_requested(true, true, false));
+        assert!(
+            !kquant_v4_fused_segments_route_requested(false, true, false),
+            "default off even when register-exact is the process route"
+        );
+        assert!(
+            !kquant_v4_fused_segments_route_requested(true, false, false),
+            "must not fuse when the process route is not register-exact"
+        );
+        assert!(
+            !kquant_v4_fused_segments_route_requested(true, true, true),
+            "the process-wide SOA8 gate suppresses the segmented twin"
+        );
+    }
+
     /// SOA8 must be a pure address-layout change. Compare it against the
     /// synchronized canonical V4 kernels for adversarial Q4_K/Q6_K bytes,
     /// every representative narrow verifier width, a ragged output tile, and
@@ -43827,6 +44234,332 @@ mod tests {
                 2,
                 "{candidate} must replace exactly the producer and reuse fences"
             );
+        }
+    }
+
+    /// Model-free exactness gate for the segmented register-exact group
+    /// dispatch. Control: one prepared activation panel fanned out through the
+    /// register-exact route, one dispatch per tensor. Candidate: the same panel
+    /// through the segmented twin, one dispatch per tile-aligned same-format
+    /// run. Sentinel-filled outputs are compared as exact u32 bits at N in
+    /// {1, 3, 8}. Groups cover the verifier's all-Q4 Q/K/V, Q4 gate/up, a Q6
+    /// pair, the mixed Q4/Q4/Q6 attention group where only Q/K may share a
+    /// grid and V must keep its own dispatch, and a Q4 pair whose second tensor
+    /// is 8-row aligned but not 16-row aligned (must not fuse). The eligibility
+    /// predicate is checked for every reject.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_fused_segments_are_bit_identical_to_separate_register_exact_dispatches() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        assert!(
+            kquant_v4_register_exact_pair_admitted(v4),
+            "register-exact pair must be admitted"
+        );
+        for (label, pipeline) in [
+            ("Q4", v4.q4k_v4_register_exact_seg3.as_ref()),
+            ("Q6", v4.q6k_v4_register_exact_seg3.as_ref()),
+        ] {
+            let pipeline = pipeline.unwrap_or_else(|| panic!("{label} segmented pipeline"));
+            assert_eq!(
+                pipeline.thread_execution_width(),
+                32,
+                "{label} segmented route requires one Apple-width SIMD group"
+            );
+            assert!(pipeline.max_total_threads_per_threadgroup() >= 32);
+        }
+        assert_eq!(
+            kquant_v4_fused_segment_tile_rows(ResidentWeightFormat::Q4K),
+            Some(16)
+        );
+        assert_eq!(
+            kquant_v4_fused_segment_tile_rows(ResidentWeightFormat::Q6K),
+            Some(8)
+        );
+        assert_eq!(
+            kquant_v4_fused_segment_tile_rows(ResidentWeightFormat::Q8_0),
+            None
+        );
+        let device = &kernel.device;
+        let n_sb = 2usize;
+        let input_width = n_sb * 256;
+
+        let make_weight = |format: ResidentWeightFormat, rows: usize, salt: usize| {
+            let wire_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * wire_bytes)
+                .map(|i| ((i * 43 + i / 19 + salt * 31) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(wire_bytes).enumerate() {
+                let d = 0.005 + block_index as f32 * 0.00013;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.41).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let buffer =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&buffer, &wire);
+            ResidentLinearWeight {
+                format,
+                buffer,
+                soa8_buffer: None,
+                q8_wire: false,
+            }
+        };
+
+        let q = make_weight(ResidentWeightFormat::Q4K, 48, 3);
+        let k_w = make_weight(ResidentWeightFormat::Q4K, 16, 7);
+        let v_q4 = make_weight(ResidentWeightFormat::Q4K, 16, 11);
+        let v_q6 = make_weight(ResidentWeightFormat::Q6K, 16, 13);
+        let gate = make_weight(ResidentWeightFormat::Q4K, 32, 17);
+        let up = make_weight(ResidentWeightFormat::Q4K, 32, 19);
+        let q6_a = make_weight(ResidentWeightFormat::Q6K, 24, 23);
+        let q6_b = make_weight(ResidentWeightFormat::Q6K, 16, 29);
+        let half_tile = make_weight(ResidentWeightFormat::Q4K, 24, 31);
+        let ragged = make_weight(ResidentWeightFormat::Q4K, 19, 37);
+
+        // Eligibility predicate: every reject the encoder relies on.
+        let probe = device.new_buffer(48 * 8 * 4, MTLResourceOptions::StorageModeShared);
+        assert_eq!(
+            kquant_v4_fused_segments_format(
+                &[(&q, &probe, 48), (&k_w, &probe, 16), (&v_q4, &probe, 16)],
+                8
+            ),
+            Some(ResidentWeightFormat::Q4K)
+        );
+        assert_eq!(
+            kquant_v4_fused_segments_format(&[(&q6_a, &probe, 24), (&q6_b, &probe, 16)], 1),
+            Some(ResidentWeightFormat::Q6K)
+        );
+        assert_eq!(
+            kquant_v4_fused_segments_format(
+                &[(&q, &probe, 48), (&k_w, &probe, 16), (&v_q6, &probe, 16)],
+                8
+            ),
+            None,
+            "mixed Q4/Q6 segments must not share a kernel"
+        );
+        assert_eq!(
+            kquant_v4_fused_segments_format(&[(&q, &probe, 48), (&half_tile, &probe, 24)], 8),
+            None,
+            "a Q4 tensor that is not 16-row aligned would let a two-panel tile straddle"
+        );
+        assert_eq!(
+            kquant_v4_fused_segments_format(&[(&q, &probe, 48), (&ragged, &probe, 19)], 8),
+            None,
+            "a ragged tensor would let a tile straddle two segments"
+        );
+        assert_eq!(kquant_v4_fused_segments_format(&[(&q, &probe, 48)], 8), None);
+        assert_eq!(
+            kquant_v4_fused_segments_format(
+                &[
+                    (&q, &probe, 48),
+                    (&k_w, &probe, 16),
+                    (&v_q4, &probe, 16),
+                    (&gate, &probe, 32)
+                ],
+                8
+            ),
+            None
+        );
+        assert_eq!(
+            kquant_v4_fused_segments_format(&[(&q, &probe, 48), (&k_w, &probe, 16)], 9),
+            None,
+            "the segmented kernels are k_pad=8 twins only"
+        );
+        assert_eq!(
+            kquant_v4_fused_segments_format(&[(&q, &probe, 48), (&k_w, &probe, 0)], 8),
+            None
+        );
+
+        // (label, projections as (weight, rows, expected to be covered by a
+        // segmented dispatch), expected number of segmented dispatches)
+        let groups: [(&str, Vec<(&ResidentLinearWeight, usize, bool)>, usize); 5] = [
+            (
+                "qkv-q4",
+                vec![(&q, 48, true), (&k_w, 16, true), (&v_q4, 16, true)],
+                1,
+            ),
+            ("gate-up", vec![(&gate, 32, true), (&up, 32, true)], 1),
+            ("q6-pair", vec![(&q6_a, 24, true), (&q6_b, 16, true)], 1),
+            (
+                "qkv-mixed",
+                vec![(&q, 48, true), (&k_w, 16, true), (&v_q6, 16, false)],
+                1,
+            ),
+            (
+                "q4-half-tile",
+                vec![(&q, 48, false), (&half_tile, 24, false)],
+                0,
+            ),
+        ];
+
+        for n_tokens in [1usize, 3, 8] {
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| {
+                    let token = i / input_width;
+                    let col = i % input_width;
+                    ((((token * 137 + col * 23) % 241) as f32) - 120.0) * 0.019
+                        + token as f32 * 0.0013
+                })
+                .collect();
+            let input_buf = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+            let make_scalar = |rows: usize| {
+                let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = scalar.contents() as *mut u32;
+                    *p = n_sb as u32;
+                    *p.add(1) = rows as u32;
+                    *p.add(2) = n_tokens as u32;
+                }
+                scalar
+            };
+            let make_output = |rows: usize| {
+                let out = device.new_buffer(
+                    (n_tokens * rows * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                fill_buffer_sentinel(&out, n_tokens * rows);
+                out
+            };
+
+            for (label, members, expected_fused) in &groups {
+                // Control: one prepared panel, one register-exact dispatch per
+                // tensor. A member the group encoder is expected to leave alone
+                // takes the ordinary per-projection route it will fall back to.
+                let reference: Vec<Buffer> = members.iter().map(|m| make_output(m.1)).collect();
+                let scalars: Vec<Buffer> = members.iter().map(|m| make_scalar(m.1)).collect();
+                let cb = kernel.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                let prep = encode_shared_kquant_v4_activation(
+                    e,
+                    kernel,
+                    v4,
+                    &input_buf,
+                    input_width,
+                    n_tokens,
+                );
+                for (i, &(weight, rows, fused_member)) in members.iter().enumerate() {
+                    if fused_member {
+                        assert!(
+                            encode_kquant_v4_prepared_projection_route(
+                                e,
+                                v4,
+                                &prep.scales,
+                                &prep.stage,
+                                weight,
+                                &reference[i],
+                                &scalars[i],
+                                rows,
+                                KquantV4ProjectionRoute::RegisterExact,
+                            ),
+                            "{label} n={n_tokens}: control register-exact dispatch {i}"
+                        );
+                    } else {
+                        encode_kquant_v4_prepared_projection(
+                            e,
+                            v4,
+                            &prep.scales,
+                            &prep.stage,
+                            weight,
+                            &reference[i],
+                            &scalars[i],
+                            rows,
+                        );
+                    }
+                }
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+
+                // Candidate: identical panel through the group encoder with
+                // fusion on, then once more with fusion off (must be a no-op
+                // twin of the control).
+                for fuse in [true, false] {
+                    let actual: Vec<Buffer> = members.iter().map(|m| make_output(m.1)).collect();
+                    let scalars: Vec<Buffer> = members.iter().map(|m| make_scalar(m.1)).collect();
+                    let projections: Vec<(&ResidentLinearWeight, &Buffer, &Buffer, usize)> =
+                        members
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &(weight, rows, _))| (weight, &actual[i], &scalars[i], rows))
+                            .collect();
+                    let mut keep = Vec::new();
+                    let cb = kernel.queue.new_command_buffer();
+                    let e = cb.new_compute_command_encoder();
+                    let prep = encode_shared_kquant_v4_activation(
+                        e,
+                        kernel,
+                        v4,
+                        &input_buf,
+                        input_width,
+                        n_tokens,
+                    );
+                    let fused = encode_kquant_v4_prepared_projection_group(
+                        e,
+                        kernel,
+                        v4,
+                        &mut keep,
+                        &prep,
+                        &projections,
+                        fuse,
+                    );
+                    e.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    assert_eq!(
+                        fused,
+                        if fuse { *expected_fused } else { 0 },
+                        "{label} n={n_tokens} fuse={fuse}: segmented dispatch count"
+                    );
+                    for (i, &(_, rows, _)) in members.iter().enumerate() {
+                        let mut reference_values = vec![0.0f32; n_tokens * rows];
+                        let mut actual_values = vec![0.0f32; n_tokens * rows];
+                        read_buffer_f32(&reference[i], &mut reference_values);
+                        read_buffer_f32(&actual[i], &mut actual_values);
+                        assert_no_sentinel(
+                            &reference_values,
+                            &format!("{label} member {i} separate"),
+                            n_tokens,
+                        );
+                        assert_no_sentinel(
+                            &actual_values,
+                            &format!("{label} member {i} fuse={fuse}"),
+                            n_tokens,
+                        );
+                        for (j, (&a, &b)) in actual_values.iter().zip(&reference_values).enumerate()
+                        {
+                            assert_eq!(
+                                a.to_bits(),
+                                b.to_bits(),
+                                "{label} n={n_tokens} fuse={fuse} member {i} element {j}: \
+                                 group {a} ({:#010x}) != separate {b} ({:#010x})",
+                                a.to_bits(),
+                                b.to_bits(),
+                            );
+                        }
+                        assert!(
+                            actual_values.iter().any(|v| *v != 0.0),
+                            "{label} n={n_tokens} member {i}: outputs must not all be zero"
+                        );
+                    }
+                }
+            }
         }
     }
 
