@@ -10651,6 +10651,9 @@ struct Eagle3ArgmaxShadowRoundReceipt {
     causal_target_top8_history_rounds_configured: usize,
     causal_target_top8_history_rounds_available: usize,
     causal_target_top8_candidate_additions: usize,
+    causal_candidate_recency_rounds_configured: usize,
+    causal_candidate_recency_rounds_available: usize,
+    causal_candidate_recency_additions: usize,
     candidate_union: Vec<u32>,
     candidate_union_size: usize,
     authoritative_argmax_rows: usize,
@@ -10665,10 +10668,14 @@ struct Eagle3ArgmaxShadowRoundReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Eagle3IndexedHeadCandidateSet {
     candidate_ids: Vec<u32>,
+    base_candidate_ids: Vec<u32>,
     draft_candidate_union_size: usize,
     causal_target_top8_history_rounds_configured: usize,
     causal_target_top8_history_rounds_available: usize,
     causal_target_top8_candidate_additions: usize,
+    causal_candidate_recency_rounds_configured: usize,
+    causal_candidate_recency_rounds_available: usize,
+    causal_candidate_recency_additions: usize,
 }
 
 /// Bounded, per-run, causal verifier evidence for indexed-head diagnostics.
@@ -10678,16 +10685,23 @@ struct Eagle3IndexedHeadCandidateSet {
 /// neither the verifier tree nor the emitted token path consults this history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Eagle3IndexedHeadTargetTop8History {
-    max_rounds: usize,
-    rounds: VecDeque<Vec<[u32; camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K]>>,
+    target_top8_max_rounds: usize,
+    candidate_recency_max_rounds: usize,
+    target_top8_rounds: VecDeque<Vec<[u32; camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K]>>,
+    candidate_rounds: VecDeque<Vec<u32>>,
 }
 
 impl Eagle3IndexedHeadTargetTop8History {
-    fn new(max_rounds: usize) -> anyhow::Result<Self> {
-        anyhow::ensure!(max_rounds > 0, "indexed-head target-top-8 history must be non-zero");
+    fn new(target_top8_max_rounds: usize, candidate_recency_max_rounds: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            target_top8_max_rounds > 0,
+            "indexed-head target-top-8 history must be non-zero"
+        );
         Ok(Self {
-            max_rounds,
-            rounds: VecDeque::with_capacity(max_rounds),
+            target_top8_max_rounds,
+            candidate_recency_max_rounds,
+            target_top8_rounds: VecDeque::with_capacity(target_top8_max_rounds),
+            candidate_rounds: VecDeque::with_capacity(candidate_recency_max_rounds),
         })
     }
 
@@ -10699,7 +10713,7 @@ impl Eagle3IndexedHeadTargetTop8History {
         );
         let mut union = draft_candidates.iter().copied().collect::<BTreeSet<_>>();
         let draft_candidate_union_size = union.len();
-        for round in &self.rounds {
+        for round in &self.target_top8_rounds {
             for row in round {
                 for &token in row {
                     if token != u32::MAX {
@@ -10712,6 +10726,17 @@ impl Eagle3IndexedHeadTargetTop8History {
                 }
             }
         }
+        let base_candidate_ids = union.iter().copied().collect::<Vec<_>>();
+        let causal_target_top8_candidate_additions =
+            base_candidate_ids.len() - draft_candidate_union_size;
+        'history: for prior_candidates in self.candidate_rounds.iter().rev() {
+            for &token in prior_candidates {
+                if union.len() == camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES {
+                    break 'history;
+                }
+                union.insert(token);
+            }
+        }
         anyhow::ensure!(
             union.len() <= camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
             "indexed-head draft/history union has {} candidates, above diagnostic cap {}",
@@ -10720,11 +10745,15 @@ impl Eagle3IndexedHeadTargetTop8History {
         );
         let candidate_ids = union.into_iter().collect::<Vec<_>>();
         Ok(Eagle3IndexedHeadCandidateSet {
-            causal_target_top8_candidate_additions: candidate_ids.len() - draft_candidate_union_size,
+            causal_candidate_recency_additions: candidate_ids.len() - base_candidate_ids.len(),
             candidate_ids,
+            base_candidate_ids,
             draft_candidate_union_size,
-            causal_target_top8_history_rounds_configured: self.max_rounds,
-            causal_target_top8_history_rounds_available: self.rounds.len(),
+            causal_target_top8_history_rounds_configured: self.target_top8_max_rounds,
+            causal_target_top8_history_rounds_available: self.target_top8_rounds.len(),
+            causal_target_top8_candidate_additions,
+            causal_candidate_recency_rounds_configured: self.candidate_recency_max_rounds,
+            causal_candidate_recency_rounds_available: self.candidate_rounds.len(),
         })
     }
 
@@ -10732,6 +10761,7 @@ impl Eagle3IndexedHeadTargetTop8History {
         &mut self,
         predictions: &[u32],
         target_top_k: &[[u32; camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K]],
+        base_candidate_ids: &[u32],
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             !target_top_k.is_empty() && target_top_k.len() == predictions.len(),
@@ -10744,10 +10774,23 @@ impl Eagle3IndexedHeadTargetTop8History {
                 .all(|(row, prediction)| row[0] == *prediction),
             "indexed-head target-top-8 rank zero differs from authoritative prediction"
         );
-        if self.rounds.len() == self.max_rounds {
-            self.rounds.pop_front();
+        anyhow::ensure!(
+            !base_candidate_ids.is_empty()
+                && base_candidate_ids.windows(2).all(|pair| pair[0] < pair[1])
+                && base_candidate_ids.len()
+                    <= camelid::metal::RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
+            "indexed-head causal base candidate publication is malformed"
+        );
+        if self.target_top8_rounds.len() == self.target_top8_max_rounds {
+            self.target_top8_rounds.pop_front();
         }
-        self.rounds.push_back(target_top_k.to_vec());
+        self.target_top8_rounds.push_back(target_top_k.to_vec());
+        if self.candidate_recency_max_rounds > 0 {
+            if self.candidate_rounds.len() == self.candidate_recency_max_rounds {
+                self.candidate_rounds.pop_front();
+            }
+            self.candidate_rounds.push_back(base_candidate_ids.to_vec());
+        }
         Ok(())
     }
 }
@@ -10777,10 +10820,14 @@ fn eagle3_indexed_head_shadow_candidate_union(
     }
     Ok(Some(Eagle3IndexedHeadCandidateSet {
         draft_candidate_union_size: union.len(),
+        base_candidate_ids: union.clone(),
         candidate_ids: union,
         causal_target_top8_history_rounds_configured: 0,
         causal_target_top8_history_rounds_available: 0,
         causal_target_top8_candidate_additions: 0,
+        causal_candidate_recency_rounds_configured: 0,
+        causal_candidate_recency_rounds_available: 0,
+        causal_candidate_recency_additions: 0,
     }))
 }
 
@@ -10857,8 +10904,17 @@ fn record_eagle3_argmax_shadow_round(
         anyhow::ensure!(
             candidates.draft_candidate_union_size == draft_candidate_union.len()
                 && candidates.candidate_ids == candidate_union
+                && candidates.base_candidate_ids.len()
+                    == draft_candidate_union.len()
+                        + candidates.causal_target_top8_candidate_additions
+                && candidates
+                    .base_candidate_ids
+                    .iter()
+                    .all(|token| candidate_union.binary_search(token).is_ok())
                 && candidates.causal_target_top8_candidate_additions
-                    == candidate_union.len() - draft_candidate_union.len(),
+                    == candidates.base_candidate_ids.len() - draft_candidate_union.len()
+                && candidates.causal_candidate_recency_additions
+                    == candidate_union.len() - candidates.base_candidate_ids.len(),
             "indexed-head candidate source accounting diverged"
         );
     }
@@ -10884,6 +10940,12 @@ fn record_eagle3_argmax_shadow_round(
             .map_or(0, |candidates| candidates.causal_target_top8_history_rounds_available),
         causal_target_top8_candidate_additions: indexed_head_candidates
             .map_or(0, |candidates| candidates.causal_target_top8_candidate_additions),
+        causal_candidate_recency_rounds_configured: indexed_head_candidates
+            .map_or(0, |candidates| candidates.causal_candidate_recency_rounds_configured),
+        causal_candidate_recency_rounds_available: indexed_head_candidates
+            .map_or(0, |candidates| candidates.causal_candidate_recency_rounds_available),
+        causal_candidate_recency_additions: indexed_head_candidates
+            .map_or(0, |candidates| candidates.causal_candidate_recency_additions),
         candidate_union_size: candidate_union.len(),
         candidate_union,
         authoritative_argmax_rows: row_evidence.len(),
@@ -11031,6 +11093,7 @@ fn run_eagle3_resident_greedy(
     certified_argmax_shadow: bool,
     indexed_head_shadow: bool,
     indexed_head_target_top8_history_rounds: usize,
+    indexed_head_candidate_recency_rounds: usize,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
     mut secondary_drafter: Option<camelid::eagle3_runtime::Eagle3Drafter>,
     head_upload_ms: f64,
@@ -11113,7 +11176,12 @@ fn run_eagle3_resident_greedy(
         cache
     });
     let mut indexed_head_target_top8_history = (indexed_head_target_top8_history_rounds > 0)
-        .then(|| Eagle3IndexedHeadTargetTop8History::new(indexed_head_target_top8_history_rounds))
+        .then(|| {
+            Eagle3IndexedHeadTargetTop8History::new(
+                indexed_head_target_top8_history_rounds,
+                indexed_head_candidate_recency_rounds,
+            )
+        })
         .transpose()?;
     let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
     let mut adaptive_expansion_controller =
@@ -11861,6 +11929,14 @@ fn run_eagle3_resident_greedy(
                                 "indexed-head causal target-top-8 history lost the current verifier rows"
                             )
                         })?,
+                        &indexed_head_candidates
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "indexed-head causal history lost the current base candidate set"
+                                )
+                            })?
+                            .base_candidate_ids,
                     )?;
                 } else {
                     anyhow::ensure!(
@@ -12312,11 +12388,16 @@ fn run_eagle3_resident_greedy(
                     && receipt.candidate_union_size == receipt.candidate_union.len()
                     && receipt.draft_candidate_union_size
                         + receipt.causal_target_top8_candidate_additions
+                        + receipt.causal_candidate_recency_additions
                         == receipt.candidate_union_size
                     && receipt.causal_target_top8_history_rounds_configured
                         == indexed_head_target_top8_history_rounds
                     && receipt.causal_target_top8_history_rounds_available
                         <= receipt.causal_target_top8_history_rounds_configured
+                    && receipt.causal_candidate_recency_rounds_configured
+                        == indexed_head_candidate_recency_rounds
+                    && receipt.causal_candidate_recency_rounds_available
+                        <= receipt.causal_candidate_recency_rounds_configured
                     && indexed_head_shadow == receipt.indexed_head.is_some(),
                 "argmax shadow round {} has incomplete evidence",
                 receipt.round,
@@ -12630,6 +12711,10 @@ struct BenchEagle3Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_head_shadow_causal_target_top8_candidate_additions: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_causal_candidate_recency_rounds: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_head_shadow_causal_candidate_recency_additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     indexed_head_shadow_scored_rounds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_head_shadow_fallback_rounds: Option<u64>,
@@ -12932,6 +13017,40 @@ fn eagle3_indexed_head_target_top8_history_rounds() -> anyhow::Result<usize> {
     parse_eagle3_indexed_head_target_top8_history_rounds_env(value)
 }
 
+fn parse_eagle3_indexed_head_candidate_recency_rounds_env(
+    value: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(0);
+    };
+    let rounds = value.parse::<usize>().map_err(|error| {
+        anyhow::anyhow!(
+            "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS must be 0, 1, 2, 3, or 4: {error}"
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(rounds, 0 | 1 | 2 | 3 | 4),
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS must be 0, 1, 2, 3, or 4, got {rounds}"
+    );
+    Ok(rounds)
+}
+
+fn eagle3_indexed_head_candidate_recency_rounds() -> anyhow::Result<usize> {
+    let raw =
+        std::env::var_os("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_indexed_head_candidate_recency_rounds_env(value)
+}
+
 fn validate_eagle3_argmax_shadow_config(
     certified_argmax_shadow: bool,
     indexed_head_shadow: bool,
@@ -12940,6 +13059,7 @@ fn validate_eagle3_argmax_shadow_config(
     tree_expansions: usize,
     candidate_limit: usize,
     target_top8_history_rounds: usize,
+    candidate_recency_rounds: usize,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !indexed_head_shadow || certified_argmax_shadow,
@@ -12959,6 +13079,11 @@ fn validate_eagle3_argmax_shadow_config(
     anyhow::ensure!(
         target_top8_history_rounds == 0 || indexed_head_shadow,
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS requires CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW=1"
+    );
+    anyhow::ensure!(
+        candidate_recency_rounds == 0
+            || (indexed_head_shadow && target_top8_history_rounds > 0),
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS requires indexed-head shadow and non-zero target-top-8 history"
     );
     let maximum_history_candidates = target_top8_history_rounds
         .checked_mul(camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES)
@@ -13244,14 +13369,15 @@ fn eagle3_argmax_shadow_gates_are_default_off_and_fail_closed() {
         assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", value).unwrap());
     }
     assert!(parse_eagle3_argmax_shadow_env("TEST_GATE", Some("maybe")).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 128, 8).is_ok());
-    assert!(validate_eagle3_argmax_shadow_config(false, true, true, Some(8), 4, 8, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, false, Some(8), 4, 8, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(7), 4, 8, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 16, 0).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 256, 1).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(8), 4, 8, 1).is_err());
-    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 8, 0).is_ok());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 128, 8, 2).is_ok());
+    assert!(validate_eagle3_argmax_shadow_config(false, true, true, Some(8), 4, 8, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, false, Some(8), 4, 8, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(7), 4, 8, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 16, 0, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 256, 1, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, false, true, Some(8), 4, 8, 1, 0).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(true, true, true, Some(8), 4, 8, 0, 2).is_err());
+    assert!(validate_eagle3_argmax_shadow_config(false, false, false, None, 4, 8, 0, 0).is_ok());
 
     for value in [None, Some(""), Some("0")] {
         assert_eq!(
@@ -13270,39 +13396,70 @@ fn eagle3_argmax_shadow_gates_are_default_off_and_fail_closed() {
     }
     assert!(parse_eagle3_indexed_head_target_top8_history_rounds_env(Some("3")).is_err());
     assert!(parse_eagle3_indexed_head_target_top8_history_rounds_env(Some("many")).is_err());
+    for rounds in [0, 1, 2, 3, 4] {
+        assert_eq!(
+            parse_eagle3_indexed_head_candidate_recency_rounds_env(Some(
+                &rounds.to_string()
+            ))
+            .unwrap(),
+            rounds
+        );
+    }
+    assert!(parse_eagle3_indexed_head_candidate_recency_rounds_env(Some("5")).is_err());
 }
 
 #[cfg(test)]
 #[test]
 fn indexed_head_target_top8_history_is_causal_bounded_and_deterministic() {
-    let mut history = Eagle3IndexedHeadTargetTop8History::new(2).unwrap();
+    let mut history = Eagle3IndexedHeadTargetTop8History::new(2, 2).unwrap();
     let cold = history.merge_with_draft(&[3, 7]).unwrap();
     assert_eq!(cold.candidate_ids, vec![3, 7]);
     assert_eq!(cold.causal_target_top8_history_rounds_available, 0);
     assert_eq!(cold.causal_target_top8_candidate_additions, 0);
 
     let first = [[10, 11, 12, 13, 14, 15, 16, 17]];
-    history.publish(&[10], &first).unwrap();
-    let next = history.merge_with_draft(&[3, 7, 12]).unwrap();
+    assert!(!cold.candidate_ids.contains(&10));
+    history
+        .publish(&[10], &first, &cold.base_candidate_ids)
+        .unwrap();
+    let next = history.merge_with_draft(&[20, 21]).unwrap();
     assert_eq!(
         next.candidate_ids,
-        vec![3, 7, 10, 11, 12, 13, 14, 15, 16, 17]
+        vec![3, 7, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21]
     );
     assert_eq!(next.causal_target_top8_history_rounds_available, 1);
-    assert_eq!(next.causal_target_top8_candidate_additions, 7);
+    assert_eq!(next.causal_target_top8_candidate_additions, 8);
+    assert_eq!(next.causal_candidate_recency_additions, 2);
 
     history
-        .publish(&[20], &[[20, 21, 22, 23, 24, 25, 26, 27]])
+        .publish(
+            &[20],
+            &[[20, 21, 22, 23, 24, 25, 26, 27]],
+            &next.base_candidate_ids,
+        )
         .unwrap();
+    let third = history.merge_with_draft(&[30, 31]).unwrap();
     history
-        .publish(&[30], &[[30, 31, 32, 33, 34, 35, 36, 37]])
+        .publish(
+            &[30],
+            &[[30, 31, 32, 33, 34, 35, 36, 37]],
+            &third.base_candidate_ids,
+        )
         .unwrap();
     let bounded = history.merge_with_draft(&[3, 7]).unwrap();
-    assert!(!bounded.candidate_ids.contains(&10));
+    assert!(!bounded.base_candidate_ids.contains(&10));
+    assert!(bounded.candidate_ids.contains(&10));
     assert!(bounded.candidate_ids.contains(&20));
     assert!(bounded.candidate_ids.contains(&30));
     assert_eq!(bounded.causal_target_top8_history_rounds_available, 2);
-    assert!(history.publish(&[99], &[[98, 99, 1, 2, 3, 4, 5, 6]]).is_err());
+    assert_eq!(bounded.causal_candidate_recency_rounds_available, 2);
+    assert!(history
+        .publish(
+            &[99],
+            &[[98, 99, 1, 2, 3, 4, 5, 6]],
+            &bounded.base_candidate_ids,
+        )
+        .is_err());
 }
 
 #[cfg(test)]
@@ -14171,6 +14328,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS",
         "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS",
+        "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS",
     ] {
         if std::env::var_os(key).is_some() {
             values.insert(key.to_string(), std::env::var(key).ok());
@@ -14504,6 +14662,8 @@ fn run_bench_eagle3(
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW")?;
     let indexed_head_target_top8_history_rounds =
         eagle3_indexed_head_target_top8_history_rounds()?;
+    let indexed_head_candidate_recency_rounds =
+        eagle3_indexed_head_candidate_recency_rounds()?;
     let argmax_shadow_candidate_limit =
         camelid::metal::eagle3_argmax_shadow_candidate_limit().map_err(anyhow::Error::msg)?;
     let target_row_lattice_prior_log_bonus_override =
@@ -14649,6 +14809,7 @@ fn run_bench_eagle3(
         tree_expansions,
         argmax_shadow_candidate_limit,
         indexed_head_target_top8_history_rounds,
+        indexed_head_candidate_recency_rounds,
     )?;
     validate_eagle3_terminal_head_skip_config(
         terminal_head_skip,
@@ -14895,6 +15056,7 @@ fn run_bench_eagle3(
         certified_argmax_shadow,
         indexed_head_shadow,
         indexed_head_target_top8_history_rounds,
+        indexed_head_candidate_recency_rounds,
         primary_drafter,
         secondary_drafter,
         head_upload_ms,
@@ -14986,6 +15148,11 @@ fn run_bench_eagle3(
         .argmax_shadow_rounds
         .iter()
         .map(|round| round.causal_target_top8_candidate_additions as u64)
+        .sum::<u64>();
+    let indexed_candidate_recency_additions = eagle
+        .argmax_shadow_rounds
+        .iter()
+        .map(|round| round.causal_candidate_recency_additions as u64)
         .sum::<u64>();
     let indexed_exact_logit_agreements = indexed_receipts
         .iter()
@@ -15243,6 +15410,12 @@ fn run_bench_eagle3(
         indexed_head_shadow_causal_target_top8_candidate_additions:
             (indexed_head_target_top8_history_rounds > 0)
                 .then_some(indexed_target_top8_candidate_additions),
+        indexed_head_shadow_causal_candidate_recency_rounds:
+            (indexed_head_candidate_recency_rounds > 0)
+                .then_some(indexed_head_candidate_recency_rounds),
+        indexed_head_shadow_causal_candidate_recency_additions:
+            (indexed_head_candidate_recency_rounds > 0)
+                .then_some(indexed_candidate_recency_additions),
         indexed_head_shadow_scored_rounds: indexed_head_shadow
             .then_some(indexed_scored_rounds),
         indexed_head_shadow_fallback_rounds: indexed_head_shadow
