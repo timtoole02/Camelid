@@ -9516,6 +9516,123 @@ const EAGLE3_ADAPTIVE_PROMOTION_WINDOWS: u8 = 2;
 const EAGLE3_ADAPTIVE_DEMOTION_WINDOWS: u8 = 2;
 const EAGLE3_ADAPTIVE_POST_DEMOTION_COOLDOWN: u8 = 2;
 
+const EAGLE3_WIDTH_SELECTOR_NARROW_NODES: usize = 5;
+const EAGLE3_WIDTH_SELECTOR_WIDE_NODES: usize = 6;
+// Mini2 medians from the locked N5/N6 generic screen. Both costs include the shared N6
+// frontier materialization time because the selector runs only after that frontier exists.
+const EAGLE3_WIDTH_SELECTOR_DEFAULT_N5_TOTAL_MS: f64 = 54.233_121_328_3;
+const EAGLE3_WIDTH_SELECTOR_DEFAULT_N6_TOTAL_MS: f64 = 55.375_518_518_6;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Eagle3VerifierWidthSelectorConfig {
+    n5_total_ms: f64,
+    n6_total_ms: f64,
+}
+
+impl Eagle3VerifierWidthSelectorConfig {
+    fn cost_points(self) -> [camelid::eagle3_runtime::Eagle3VerifierBudgetCost; 2] {
+        [
+            camelid::eagle3_runtime::Eagle3VerifierBudgetCost {
+                max_nodes: EAGLE3_WIDTH_SELECTOR_NARROW_NODES,
+                round_cost: self.n5_total_ms,
+            },
+            camelid::eagle3_runtime::Eagle3VerifierBudgetCost {
+                max_nodes: EAGLE3_WIDTH_SELECTOR_WIDE_NODES,
+                round_cost: self.n6_total_ms,
+            },
+        ]
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3VerifierWidthTelemetry {
+    decisions: u64,
+    n5_rounds: u64,
+    n6_rounds: u64,
+}
+
+impl Eagle3VerifierWidthTelemetry {
+    fn note(&mut self, admitted_node_budget: usize) -> anyhow::Result<()> {
+        match admitted_node_budget {
+            EAGLE3_WIDTH_SELECTOR_NARROW_NODES => self.n5_rounds += 1,
+            EAGLE3_WIDTH_SELECTOR_WIDE_NODES => self.n6_rounds += 1,
+            other => {
+                anyhow::bail!("EAGLE-3 width selector admitted unexpected verifier budget {other}")
+            }
+        }
+        self.decisions += 1;
+        Ok(())
+    }
+}
+
+const EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS: usize = 3;
+const EAGLE3_X3_X4_MAX_EXPANSIONS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Eagle3X3X4SelectorConfig {
+    x4_min_next_parent_probability: f64,
+}
+
+impl Eagle3X3X4SelectorConfig {
+    fn use_x4(self, evidence: camelid::eagle3_runtime::Eagle3NextExpansionEvidence) -> bool {
+        // Equality deliberately keeps X4. X3 is admitted only when the already-observed path
+        // probability is strictly below the receipted threshold.
+        f64::from(evidence.next_parent_cumulative_probability)
+            >= self.x4_min_next_parent_probability
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Eagle3X3X4Telemetry {
+    decisions: u64,
+    x3_rounds: u64,
+    x4_rounds: u64,
+    no_fourth_candidate_rounds: u64,
+    next_parent_probability_sum: f64,
+    next_parent_probability_min: Option<f64>,
+    next_parent_probability_max: Option<f64>,
+}
+
+impl Eagle3X3X4Telemetry {
+    fn note_decision(
+        &mut self,
+        evidence: camelid::eagle3_runtime::Eagle3NextExpansionEvidence,
+        use_x4: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            evidence.completed_head_expansions == EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS,
+            "EAGLE-3 X3/X4 selector received evidence after {} expansions, expected {}",
+            evidence.completed_head_expansions,
+            EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS,
+        );
+        let probability = f64::from(evidence.next_parent_cumulative_probability);
+        anyhow::ensure!(
+            probability.is_finite() && (0.0..=1.0).contains(&probability),
+            "EAGLE-3 X3/X4 selector received invalid next-parent probability {probability}"
+        );
+        self.decisions += 1;
+        if use_x4 {
+            self.x4_rounds += 1;
+        } else {
+            self.x3_rounds += 1;
+        }
+        self.next_parent_probability_sum += probability;
+        self.next_parent_probability_min = Some(
+            self.next_parent_probability_min
+                .map_or(probability, |current| current.min(probability)),
+        );
+        self.next_parent_probability_max = Some(
+            self.next_parent_probability_max
+                .map_or(probability, |current| current.max(probability)),
+        );
+        Ok(())
+    }
+
+    fn next_parent_probability_mean(self) -> Option<f64> {
+        (self.decisions != 0).then(|| self.next_parent_probability_sum / self.decisions as f64)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Eagle3AdaptiveExpansionMode {
     #[default]
@@ -10175,6 +10292,8 @@ struct Eagle3BenchRun {
     dynamic_tree_emitted_tokens: u64,
     materialized_head_forwards: u64,
     dynamic_tree_max_depth_sum: u64,
+    verifier_widths: Eagle3VerifierWidthTelemetry,
+    x3_x4_expansions: Eagle3X3X4Telemetry,
     adaptive_expansions: Eagle3AdaptiveExpansionTelemetry,
     token_recycling: Eagle3TokenRecyclingTelemetry,
     dual_eagle_rounds: Vec<DualEagleRoundReceipt>,
@@ -10242,6 +10361,8 @@ fn run_eagle3_resident_greedy(
     tree_topk: usize,
     tree_expansions: usize,
     adaptive_expansions: bool,
+    verifier_width_selector: Option<Eagle3VerifierWidthSelectorConfig>,
+    x3_x4_selector: Option<Eagle3X3X4SelectorConfig>,
     suffix_first: bool,
     token_recycling_hybrid: bool,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
@@ -10326,6 +10447,10 @@ fn run_eagle3_resident_greedy(
         history
     });
     let adaptive_branching = eagle3_adaptive_branching_enabled();
+    let verifier_width_trace = verifier_width_selector.is_some()
+        && std::env::var_os("CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR_TRACE").is_some();
+    let x3_x4_trace = x3_x4_selector.is_some()
+        && std::env::var_os("CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR_TRACE").is_some();
 
     let decode_started = Instant::now();
     while run.generated.len() < max_tokens
@@ -10867,20 +10992,99 @@ fn run_eagle3_resident_greedy(
                     session.kv_position()
                 );
                 let draft_started = Instant::now();
-                let frontier = drafter.draft_dynamic_frontier(
-                    weights,
-                    anchor,
-                    Eagle3DynamicFrontierConfig {
-                        max_verify_nodes: round_node_budget,
-                        max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
-                        max_depth: budget,
-                        candidates_per_parent: tree_topk,
-                        max_head_expansions: round_tree_expansions,
-                        adaptive_branching,
-                    },
-                )?;
+                let frontier_config = Eagle3DynamicFrontierConfig {
+                    max_verify_nodes: round_node_budget,
+                    max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                    max_depth: budget,
+                    candidates_per_parent: tree_topk,
+                    max_head_expansions: round_tree_expansions,
+                    adaptive_branching,
+                };
+                let mut x3_x4_decision = None;
+                let mut duplicate_x3_x4_decision = false;
+                let frontier = if let Some(selector) = x3_x4_selector {
+                    drafter.draft_dynamic_frontier_with_expansion_gate(
+                        weights,
+                        anchor,
+                        frontier_config,
+                        |evidence| {
+                            if evidence.completed_head_expansions
+                                != EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS
+                            {
+                                return true;
+                            }
+                            let use_x4 = selector.use_x4(evidence);
+                            if x3_x4_decision.replace((evidence, use_x4)).is_some() {
+                                duplicate_x3_x4_decision = true;
+                                return false;
+                            }
+                            use_x4
+                        },
+                    )?
+                } else {
+                    drafter.draft_dynamic_frontier(weights, anchor, frontier_config)?
+                };
+                anyhow::ensure!(
+                    !duplicate_x3_x4_decision,
+                    "EAGLE-3 X3/X4 selector was asked to decide twice in one round"
+                );
+                if let Some(selector) = x3_x4_selector {
+                    if let Some((evidence, use_x4)) = x3_x4_decision {
+                        run.x3_x4_expansions.note_decision(evidence, use_x4)?;
+                        if x3_x4_trace {
+                            eprintln!(
+                                "[eagle3-x3-x4-selector] round={} selected=X{} completed={} next-parent={} depth={} probability={:.9} log-probability={:.9} x4-threshold={:.9}",
+                                run.rounds + 1,
+                                if use_x4 { 4 } else { 3 },
+                                evidence.completed_head_expansions,
+                                evidence.next_parent,
+                                evidence.next_parent_depth,
+                                evidence.next_parent_cumulative_probability,
+                                evidence.next_parent_cumulative_log_probability,
+                                selector.x4_min_next_parent_probability,
+                            );
+                        }
+                    } else {
+                        run.x3_x4_expansions.no_fourth_candidate_rounds += 1;
+                        if x3_x4_trace {
+                            eprintln!(
+                                "[eagle3-x3-x4-selector] round={} selected=natural-short completed={} reason=no-fourth-candidate x4-threshold={:.9}",
+                                run.rounds + 1,
+                                frontier.head_expansions(),
+                                selector.x4_min_next_parent_probability,
+                            );
+                        }
+                    }
+                }
                 let materialized_head_forwards = frontier.materialized_head_forwards();
-                let forest = frontier.finish()?;
+                // Benchmark-only admission changes only which connected subset reaches the
+                // verifier. The ordinary target-authoritative acceptance below remains the sole
+                // source of emitted tokens, so choosing N5 cannot change greedy exactness.
+                let forest = if let Some(selector) = verifier_width_selector
+                    .filter(|_| round_node_budget >= EAGLE3_WIDTH_SELECTOR_WIDE_NODES)
+                {
+                    let costs = selector.cost_points();
+                    let selection = frontier.select_for_verifier_costs(&costs)?;
+                    run.verifier_widths.note(selection.admitted_node_budget)?;
+                    if verifier_width_trace {
+                        let n5 = frontier.select_for_verifier_costs(&costs[..1])?;
+                        let n6 = frontier.select_for_verifier_costs(&costs[1..])?;
+                        eprintln!(
+                            "[eagle3-width-selector] round={} selected={} n5_estimated_emitted={:.6} n6_estimated_emitted={:.6} n5_tokens_per_ms={:.9} n6_tokens_per_ms={:.9} n5_total_ms={:.6} n6_total_ms={:.6}",
+                            run.rounds + 1,
+                            selection.admitted_node_budget,
+                            n5.estimated_emitted_tokens,
+                            n6.estimated_emitted_tokens,
+                            n5.estimated_tokens_per_cost,
+                            n6.estimated_tokens_per_cost,
+                            selector.n5_total_ms,
+                            selector.n6_total_ms,
+                        );
+                    }
+                    selection.forest
+                } else {
+                    frontier.finish()?
+                };
                 let actual_nodes = forest.scored.tree.nodes();
                 let actual_max_depth = forest.scored.tree.max_depth();
                 anyhow::ensure!(
@@ -11089,6 +11293,35 @@ fn run_eagle3_resident_greedy(
             secondary_drafter.is_some(),
         );
     }
+    if verifier_width_selector.is_some() {
+        anyhow::ensure!(
+            run.verifier_widths.decisions
+                == run.verifier_widths.n5_rounds + run.verifier_widths.n6_rounds,
+            "EAGLE-3 width-selector telemetry is inconsistent: decisions={} N5={} N6={}",
+            run.verifier_widths.decisions,
+            run.verifier_widths.n5_rounds,
+            run.verifier_widths.n6_rounds,
+        );
+    }
+    if x3_x4_selector.is_some() {
+        anyhow::ensure!(
+            run.x3_x4_expansions.decisions
+                == run.x3_x4_expansions.x3_rounds + run.x3_x4_expansions.x4_rounds,
+            "EAGLE-3 X3/X4 telemetry is inconsistent: decisions={} X3={} X4={}",
+            run.x3_x4_expansions.decisions,
+            run.x3_x4_expansions.x3_rounds,
+            run.x3_x4_expansions.x4_rounds,
+        );
+        anyhow::ensure!(
+            run.x3_x4_expansions.decisions
+                + run.x3_x4_expansions.no_fourth_candidate_rounds
+                == run.dynamic_tree_rounds,
+            "EAGLE-3 X3/X4 telemetry covered {} decisions plus {} natural-short rounds, but ran {} dynamic-tree rounds",
+            run.x3_x4_expansions.decisions,
+            run.x3_x4_expansions.no_fourth_candidate_rounds,
+            run.dynamic_tree_rounds,
+        );
+    }
 
     Ok(run)
 }
@@ -11120,6 +11353,36 @@ struct BenchEagle3Record {
     tree_node_budget: Option<usize>,
     tree_topk: Option<usize>,
     tree_expansions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width_selector: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width5_total_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width6_total_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width_decisions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width5_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_width6_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_selector: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x4_min_next_parent_probability: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_decisions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x4_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_no_fourth_candidate_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_next_parent_probability_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_next_parent_probability_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x3_x4_next_parent_probability_max: Option<f64>,
     adaptive_expansions: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_window_rounds: Option<usize>,
@@ -11351,6 +11614,399 @@ fn eagle3_adaptive_expansions_enabled() -> bool {
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
+fn parse_eagle3_width_selector_env(
+    enabled: Option<&str>,
+    n5_total_ms: Option<&str>,
+    n6_total_ms: Option<&str>,
+) -> anyhow::Result<Option<Eagle3VerifierWidthSelectorConfig>> {
+    let enabled = match enabled
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => false,
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => true,
+        Some(value) => {
+            anyhow::bail!("CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR must be a boolean, got {value:?}")
+        }
+    };
+    if !enabled {
+        return Ok(None);
+    }
+
+    fn total_ms(name: &str, value: Option<&str>, default: f64) -> anyhow::Result<f64> {
+        let value = match value.map(str::trim) {
+            None | Some("") => default,
+            Some(value) => value
+                .parse::<f64>()
+                .map_err(|error| anyhow::anyhow!("{name} must be a number: {error}"))?,
+        };
+        anyhow::ensure!(
+            value.is_finite() && value > 0.0,
+            "{name} must be finite and positive, got {value}"
+        );
+        Ok(value)
+    }
+
+    Ok(Some(Eagle3VerifierWidthSelectorConfig {
+        n5_total_ms: total_ms(
+            "CAMELID_BENCH_EAGLE3_WIDTH5_TOTAL_MS",
+            n5_total_ms,
+            EAGLE3_WIDTH_SELECTOR_DEFAULT_N5_TOTAL_MS,
+        )?,
+        n6_total_ms: total_ms(
+            "CAMELID_BENCH_EAGLE3_WIDTH6_TOTAL_MS",
+            n6_total_ms,
+            EAGLE3_WIDTH_SELECTOR_DEFAULT_N6_TOTAL_MS,
+        )?,
+    }))
+}
+
+fn eagle3_width_selector_config() -> anyhow::Result<Option<Eagle3VerifierWidthSelectorConfig>> {
+    let read_utf8 = |name: &str| -> anyhow::Result<Option<String>> {
+        std::env::var_os(name)
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))
+            })
+            .transpose()
+    };
+    let enabled = read_utf8("CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR")?;
+    let n5_total_ms = read_utf8("CAMELID_BENCH_EAGLE3_WIDTH5_TOTAL_MS")?;
+    let n6_total_ms = read_utf8("CAMELID_BENCH_EAGLE3_WIDTH6_TOTAL_MS")?;
+    parse_eagle3_width_selector_env(
+        enabled.as_deref(),
+        n5_total_ms.as_deref(),
+        n6_total_ms.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_width_selector_config(
+    config: Option<Eagle3VerifierWidthSelectorConfig>,
+    tree_nodes: Option<usize>,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if config.is_none() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes == Some(EAGLE3_WIDTH_SELECTOR_WIDE_NODES),
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR requires --tree-nodes {EAGLE3_WIDTH_SELECTOR_WIDE_NODES}"
+    );
+    anyhow::ensure!(
+        !adaptive_expansions && !suffix_first && !token_recycling_hybrid && !dual_eagle_selector,
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR cannot be combined with adaptive expansions, suffix-first, Token Recycling, or dual-EAGLE selection"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_width_selector_tests {
+    use super::*;
+
+    #[test]
+    fn gate_and_costs_are_strict_with_receipted_defaults() {
+        assert_eq!(
+            parse_eagle3_width_selector_env(None, None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_eagle3_width_selector_env(Some("off"), Some("bad"), Some("bad")).unwrap(),
+            None
+        );
+        let defaults = parse_eagle3_width_selector_env(Some("ON"), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            defaults,
+            Eagle3VerifierWidthSelectorConfig {
+                n5_total_ms: EAGLE3_WIDTH_SELECTOR_DEFAULT_N5_TOTAL_MS,
+                n6_total_ms: EAGLE3_WIDTH_SELECTOR_DEFAULT_N6_TOTAL_MS,
+            }
+        );
+        let custom = parse_eagle3_width_selector_env(Some("1"), Some("54.0"), Some("55.0"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(custom.n5_total_ms, 54.0);
+        assert_eq!(custom.n6_total_ms, 55.0);
+        assert!(parse_eagle3_width_selector_env(Some("maybe"), None, None).is_err());
+        assert!(parse_eagle3_width_selector_env(Some("1"), Some("0"), None).is_err());
+        assert!(parse_eagle3_width_selector_env(Some("1"), None, Some("NaN")).is_err());
+    }
+
+    #[test]
+    fn benchmark_gate_is_isolated_to_plain_n6_dynamic_tree() {
+        let config = Some(Eagle3VerifierWidthSelectorConfig {
+            n5_total_ms: 54.0,
+            n6_total_ms: 55.0,
+        });
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(6), false, false, false, false)
+                .is_ok()
+        );
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(5), false, false, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(6), true, false, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_eagle3_width_selector_config(config, Some(6), false, false, false, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn telemetry_counts_only_valid_n5_n6_decisions() {
+        let mut telemetry = Eagle3VerifierWidthTelemetry::default();
+        telemetry.note(5).unwrap();
+        telemetry.note(6).unwrap();
+        telemetry.note(5).unwrap();
+        assert_eq!(
+            telemetry,
+            Eagle3VerifierWidthTelemetry {
+                decisions: 3,
+                n5_rounds: 2,
+                n6_rounds: 1,
+            }
+        );
+        let before = telemetry;
+        assert!(telemetry.note(4).is_err());
+        assert_eq!(telemetry, before);
+    }
+}
+
+fn parse_eagle3_x3_x4_selector_env(
+    enabled: Option<&str>,
+    x4_min_next_parent_probability: Option<&str>,
+) -> anyhow::Result<Option<Eagle3X3X4SelectorConfig>> {
+    let enabled = match enabled
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => false,
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => true,
+        Some(value) => {
+            anyhow::bail!("CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR must be a boolean, got {value:?}")
+        }
+    };
+    if !enabled {
+        return Ok(None);
+    }
+
+    let raw_threshold = x4_min_next_parent_probability
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB"
+            )
+        })?;
+    let threshold = raw_threshold.parse::<f64>().map_err(|error| {
+        anyhow::anyhow!("CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB must be a number: {error}")
+    })?;
+    anyhow::ensure!(
+        threshold.is_finite() && (0.0..=1.0).contains(&threshold),
+        "CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB must be finite and in 0..=1, got {threshold}"
+    );
+    Ok(Some(Eagle3X3X4SelectorConfig {
+        x4_min_next_parent_probability: threshold,
+    }))
+}
+
+fn eagle3_x3_x4_selector_config() -> anyhow::Result<Option<Eagle3X3X4SelectorConfig>> {
+    let read_utf8 = |name: &str| -> anyhow::Result<Option<String>> {
+        std::env::var_os(name)
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))
+            })
+            .transpose()
+    };
+    let enabled = read_utf8("CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR")?;
+    let threshold = read_utf8("CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB")?;
+    parse_eagle3_x3_x4_selector_env(enabled.as_deref(), threshold.as_deref())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_x3_x4_selector_config(
+    config: Option<Eagle3X3X4SelectorConfig>,
+    tree_nodes: Option<usize>,
+    tree_topk: usize,
+    tree_expansions: usize,
+    draft_tokens: usize,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if config.is_none() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes == Some(EAGLE3_WIDTH_SELECTOR_WIDE_NODES),
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --tree-nodes {EAGLE3_WIDTH_SELECTOR_WIDE_NODES}"
+    );
+    anyhow::ensure!(
+        tree_topk == 4,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --tree-topk 4"
+    );
+    anyhow::ensure!(
+        tree_expansions == EAGLE3_X3_X4_MAX_EXPANSIONS,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --tree-expansions {EAGLE3_X3_X4_MAX_EXPANSIONS}"
+    );
+    anyhow::ensure!(
+        draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector,
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR can be combined only with plain N6 dynamic trees and the N5/N6 width selector"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_x3_x4_selector_tests {
+    use super::*;
+    use camelid::eagle3_runtime::Eagle3NextExpansionEvidence;
+
+    fn evidence(probability: f32) -> Eagle3NextExpansionEvidence {
+        Eagle3NextExpansionEvidence {
+            completed_head_expansions: EAGLE3_X3_X4_DECISION_AFTER_EXPANSIONS,
+            next_parent: 7,
+            next_parent_depth: 3,
+            next_parent_cumulative_log_probability: probability.ln(),
+            next_parent_cumulative_probability: probability,
+        }
+    }
+
+    #[test]
+    fn gate_requires_an_explicit_bounded_threshold() {
+        assert_eq!(parse_eagle3_x3_x4_selector_env(None, None).unwrap(), None);
+        assert_eq!(
+            parse_eagle3_x3_x4_selector_env(Some("off"), Some("bad")).unwrap(),
+            None
+        );
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), None).is_err());
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), Some("NaN")).is_err());
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), Some("-0.1")).is_err());
+        assert!(parse_eagle3_x3_x4_selector_env(Some("on"), Some("1.1")).is_err());
+        assert_eq!(
+            parse_eagle3_x3_x4_selector_env(Some("yes"), Some("0"))
+                .unwrap()
+                .unwrap()
+                .x4_min_next_parent_probability,
+            0.0
+        );
+        assert_eq!(
+            parse_eagle3_x3_x4_selector_env(Some("1"), Some("1"))
+                .unwrap()
+                .unwrap()
+                .x4_min_next_parent_probability,
+            1.0
+        );
+    }
+
+    #[test]
+    fn strict_threshold_keeps_x4_on_equality() {
+        let selector = Eagle3X3X4SelectorConfig {
+            x4_min_next_parent_probability: 0.25,
+        };
+        assert!(selector.use_x4(evidence(0.25)));
+        assert!(!selector.use_x4(evidence(0.249)));
+        assert!(selector.use_x4(evidence(0.251)));
+    }
+
+    #[test]
+    fn benchmark_gate_is_isolated_to_plain_n6_k4_x4() {
+        let config = Some(Eagle3X3X4SelectorConfig {
+            x4_min_next_parent_probability: 0.05,
+        });
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(6),
+            4,
+            4,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(5),
+            4,
+            4,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(6),
+            3,
+            4,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_eagle3_x3_x4_selector_config(
+            config,
+            Some(6),
+            4,
+            4,
+            15,
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn telemetry_captures_counts_and_probability_range() {
+        let mut telemetry = Eagle3X3X4Telemetry::default();
+        telemetry.note_decision(evidence(0.20), false).unwrap();
+        telemetry.note_decision(evidence(0.40), true).unwrap();
+        assert_eq!(telemetry.decisions, 2);
+        assert_eq!(telemetry.x3_rounds, 1);
+        assert_eq!(telemetry.x4_rounds, 1);
+        assert!((telemetry.next_parent_probability_min.unwrap() - 0.20).abs() < 1.0e-6);
+        assert!((telemetry.next_parent_probability_max.unwrap() - 0.40).abs() < 1.0e-6);
+        assert!((telemetry.next_parent_probability_mean().unwrap() - 0.30).abs() < 1.0e-6);
+    }
+}
+
 fn validate_eagle3_adaptive_expansions_config(
     enabled: bool,
     tree_nodes: Option<usize>,
@@ -11453,9 +12109,28 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE",
         "CAMELID_BENCH_DUAL_EAGLE_SELECTOR",
     ];
-    KEYS.iter()
+    let mut values: BTreeMap<String, Option<String>> = KEYS
+        .iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-        .collect()
+        .collect();
+    // Preserve the legacy receipt shape byte-for-byte when the benchmark-only selector is
+    // absent. If any selector knob is set, record every explicitly supplied knob; defaults are
+    // captured in the dedicated receipt fields below.
+    for key in [
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR",
+        "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR_TRACE",
+        "CAMELID_BENCH_EAGLE3_WIDTH5_TOTAL_MS",
+        "CAMELID_BENCH_EAGLE3_WIDTH6_TOTAL_MS",
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR",
+        "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR_TRACE",
+        "CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB",
+        "CAMELID_BENCH_EAGLE3_PARALLEL_LSE",
+    ] {
+        if std::env::var_os(key).is_some() {
+            values.insert(key.to_string(), std::env::var(key).ok());
+        }
+    }
+    values
 }
 
 fn eagle3_effective_env_with_derived_provenance(
@@ -11776,6 +12451,9 @@ fn run_bench_eagle3(
     let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
     let adaptive_expansions = eagle3_adaptive_expansions_enabled();
     let dual_eagle_selector = dual_eagle_selector_enabled()?;
+    let verifier_width_selector = eagle3_width_selector_config()?;
+    let x3_x4_selector = eagle3_x3_x4_selector_config()?;
+    let adaptive_branching = eagle3_adaptive_branching_enabled();
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
         (1..=15).contains(&draft_tokens),
@@ -11843,6 +12521,26 @@ fn run_bench_eagle3(
         tree_expansions,
         suffix_first,
         token_recycling_hybrid,
+    )?;
+    validate_eagle3_width_selector_config(
+        verifier_width_selector,
+        tree_nodes,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+    )?;
+    validate_eagle3_x3_x4_selector_config(
+        x3_x4_selector,
+        tree_nodes,
+        tree_topk,
+        tree_expansions,
+        draft_tokens,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
     )?;
     configure_rayon_threads(threads)?;
     let input_text = match (&prompt_file, &prompt) {
@@ -12054,6 +12752,8 @@ fn run_bench_eagle3(
         tree_topk,
         tree_expansions,
         adaptive_expansions,
+        verifier_width_selector,
+        x3_x4_selector,
         suffix_first,
         token_recycling_hybrid,
         primary_drafter,
@@ -12135,6 +12835,12 @@ fn run_bench_eagle3(
             "dynamic_tree_e9_tr_hybrid"
         } else if adaptive_expansions {
             "dynamic_tree_adaptive_expansions"
+        } else if x3_x4_selector.is_some() && verifier_width_selector.is_some() {
+            "dynamic_tree_x3_x4_width_selector"
+        } else if x3_x4_selector.is_some() {
+            "dynamic_tree_x3_x4_selector"
+        } else if verifier_width_selector.is_some() {
+            "dynamic_tree_width_selector"
         } else if suffix_first {
             "suffix_then_dynamic_tree"
         } else if tree_nodes.is_some() {
@@ -12145,6 +12851,26 @@ fn run_bench_eagle3(
         tree_node_budget: tree_nodes,
         tree_topk: tree_nodes.map(|_| tree_topk),
         tree_expansions: tree_nodes.map(|_| tree_expansions),
+        verifier_width_selector: verifier_width_selector.map(|_| true),
+        verifier_width5_total_ms: verifier_width_selector.map(|config| config.n5_total_ms),
+        verifier_width6_total_ms: verifier_width_selector.map(|config| config.n6_total_ms),
+        verifier_width_decisions: verifier_width_selector.map(|_| eagle.verifier_widths.decisions),
+        verifier_width5_rounds: verifier_width_selector.map(|_| eagle.verifier_widths.n5_rounds),
+        verifier_width6_rounds: verifier_width_selector.map(|_| eagle.verifier_widths.n6_rounds),
+        x3_x4_selector: x3_x4_selector.map(|_| true),
+        x4_min_next_parent_probability: x3_x4_selector
+            .map(|config| config.x4_min_next_parent_probability),
+        x3_x4_decisions: x3_x4_selector.map(|_| eagle.x3_x4_expansions.decisions),
+        x3_rounds: x3_x4_selector.map(|_| eagle.x3_x4_expansions.x3_rounds),
+        x4_rounds: x3_x4_selector.map(|_| eagle.x3_x4_expansions.x4_rounds),
+        x3_x4_no_fourth_candidate_rounds: x3_x4_selector
+            .map(|_| eagle.x3_x4_expansions.no_fourth_candidate_rounds),
+        x3_x4_next_parent_probability_mean: x3_x4_selector
+            .and_then(|_| eagle.x3_x4_expansions.next_parent_probability_mean()),
+        x3_x4_next_parent_probability_min: x3_x4_selector
+            .and(eagle.x3_x4_expansions.next_parent_probability_min),
+        x3_x4_next_parent_probability_max: x3_x4_selector
+            .and(eagle.x3_x4_expansions.next_parent_probability_max),
         adaptive_expansions,
         adaptive_window_rounds: adaptive_expansions
             .then_some(EAGLE3_ADAPTIVE_EXPANSION_WINDOW),
@@ -12394,6 +13120,29 @@ fn run_bench_eagle3(
             eagle.adaptive_expansions.shallow_qualification_resets,
             eagle.adaptive_expansions.deep_rejecting_windows,
             eagle.adaptive_expansions.deep_rejection_resets,
+        );
+    }
+    if let Some(selector) = verifier_width_selector {
+        eprintln!(
+            "[bench-eagle3-width-selector] decisions={} N5-rounds={} N6-rounds={} costs-ms={:.6}/{:.6}",
+            eagle.verifier_widths.decisions,
+            eagle.verifier_widths.n5_rounds,
+            eagle.verifier_widths.n6_rounds,
+            selector.n5_total_ms,
+            selector.n6_total_ms,
+        );
+    }
+    if let Some(selector) = x3_x4_selector {
+        eprintln!(
+            "[bench-eagle3-x3-x4-selector] decisions={} X3-rounds={} X4-rounds={} natural-short={} x4-threshold={:.9} next-parent-probability mean/min/max={:?}/{:?}/{:?}",
+            eagle.x3_x4_expansions.decisions,
+            eagle.x3_x4_expansions.x3_rounds,
+            eagle.x3_x4_expansions.x4_rounds,
+            eagle.x3_x4_expansions.no_fourth_candidate_rounds,
+            selector.x4_min_next_parent_probability,
+            eagle.x3_x4_expansions.next_parent_probability_mean(),
+            eagle.x3_x4_expansions.next_parent_probability_min,
+            eagle.x3_x4_expansions.next_parent_probability_max,
         );
     }
     if dual_eagle_selector {

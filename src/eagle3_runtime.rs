@@ -323,10 +323,28 @@ pub struct Eagle3DynamicFrontier {
     materialized_head_forwards: usize,
 }
 
-/// One measured target-verifier cost point.  Units are arbitrary but must be consistent across
-/// the table (microseconds is convenient).  Keeping the table caller-supplied lets mini2 choose
-/// width 8 when its K-quant k4/k8 kernels are flat without baking one machine's timing into the
-/// checkpoint or the generic scheduler.
+/// Target-blind evidence available immediately before one dynamic-frontier head expansion.
+///
+/// The scheduled parent and its cumulative probability are derived entirely from draft-head
+/// observations already attached to the lattice. In particular, no target-verifier result from
+/// the current round exists when this value is produced. This makes the seam safe for causal,
+/// benchmark-only expansion admission without weakening target-authoritative acceptance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Eagle3NextExpansionEvidence {
+    /// Head observations already recorded, including the root distribution.
+    pub completed_head_expansions: usize,
+    /// Stable expansion-lattice id of the next globally ranked parent.
+    pub next_parent: usize,
+    pub next_parent_depth: usize,
+    pub next_parent_cumulative_log_probability: f32,
+    pub next_parent_cumulative_probability: f32,
+}
+
+/// One measured verification-round cost point. Units are arbitrary but must be consistent across
+/// the table (microseconds is convenient). A whole-run throughput policy should include shared
+/// work already paid before this choice, such as frontier materialization, in every point. Keeping
+/// the table caller-supplied lets mini2 choose width 8 when its K-quant k4/k8 kernels are flat
+/// without baking one machine's timing into the checkpoint or the generic scheduler.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Eagle3VerifierBudgetCost {
     pub max_nodes: usize,
@@ -369,6 +387,27 @@ impl Eagle3DynamicFrontier {
 
     pub fn materialized_head_forwards(&self) -> usize {
         self.materialized_head_forwards
+    }
+
+    /// Read the target-blind evidence for the next scheduled expansion without mutating the
+    /// lattice or model cache.
+    pub fn next_expansion_evidence(&self) -> Option<Eagle3NextExpansionEvidence> {
+        let next_parent = self.next_parent()?;
+        self.expansion_evidence_for_parent(next_parent)
+    }
+
+    fn expansion_evidence_for_parent(
+        &self,
+        next_parent: usize,
+    ) -> Option<Eagle3NextExpansionEvidence> {
+        let node = self.lattice.nodes().get(next_parent)?;
+        Some(Eagle3NextExpansionEvidence {
+            completed_head_expansions: self.head_expansions,
+            next_parent,
+            next_parent_depth: usize::from(node.depth),
+            next_parent_cumulative_log_probability: node.cumulative_log_probability,
+            next_parent_cumulative_probability: node.cumulative_log_probability.exp(),
+        })
     }
 
     /// Globally strongest parent still worth expanding.
@@ -545,7 +584,7 @@ impl Eagle3DynamicFrontier {
         })
     }
 
-    /// Select a verifier width by expected emitted tokens per measured target-round cost.
+    /// Select a verifier width by expected emitted tokens per measured verification-round cost.
     ///
     /// This is a small Sequoia-style admission policy over an already-normalized lattice.  It
     /// does not alter candidate probabilities and cannot affect losslessness: the selected
@@ -887,6 +926,49 @@ impl Eagle3Drafter {
         anchor: u32,
         config: Eagle3DynamicFrontierConfig,
     ) -> Result<Eagle3DynamicFrontier> {
+        self.draft_dynamic_frontier_impl(
+            target_weights,
+            anchor,
+            config,
+            None::<fn(Eagle3NextExpansionEvidence) -> bool>,
+        )
+    }
+
+    /// Explore a dynamic frontier while giving a target-blind caller one causal admission point
+    /// immediately before each non-root head expansion.
+    ///
+    /// Returning `false` stops materialization and returns the lattice accumulated so far. The
+    /// callback receives only [`Eagle3NextExpansionEvidence`], which was computed from prior
+    /// draft-head observations; it cannot inspect current-round target outcomes. The ordinary
+    /// [`Self::draft_dynamic_frontier`] path supplies an always-admit gate and is unchanged.
+    pub fn draft_dynamic_frontier_with_expansion_gate<F>(
+        &mut self,
+        target_weights: &LlamaLoadedWeights,
+        anchor: u32,
+        config: Eagle3DynamicFrontierConfig,
+        mut admit_next_expansion: F,
+    ) -> Result<Eagle3DynamicFrontier>
+    where
+        F: FnMut(Eagle3NextExpansionEvidence) -> bool,
+    {
+        self.draft_dynamic_frontier_impl(
+            target_weights,
+            anchor,
+            config,
+            Some(&mut admit_next_expansion),
+        )
+    }
+
+    fn draft_dynamic_frontier_impl<F>(
+        &mut self,
+        target_weights: &LlamaLoadedWeights,
+        anchor: u32,
+        config: Eagle3DynamicFrontierConfig,
+        mut expansion_gate: Option<F>,
+    ) -> Result<Eagle3DynamicFrontier>
+    where
+        F: FnMut(Eagle3NextExpansionEvidence) -> bool,
+    {
         let stable_seed = self
             .stable_seed
             .clone()
@@ -902,6 +984,19 @@ impl Eagle3Drafter {
         let mut cursor_path = vec![0usize];
         let materialization = (|| -> Result<Eagle3DynamicFrontier> {
             while let Some(parent) = frontier.next_parent() {
+                if let Some(admit_next_expansion) = expansion_gate.as_mut() {
+                    let evidence =
+                        frontier
+                            .expansion_evidence_for_parent(parent)
+                            .ok_or_else(|| {
+                                invalid(
+                                    "EAGLE-3 dynamic expansion evidence lost its scheduled parent",
+                                )
+                            })?;
+                    if !admit_next_expansion(evidence) {
+                        break;
+                    }
+                }
                 // Root was consumed from `stable_seed` above. Every subsequent parent has a
                 // concrete token path that starts one row beyond the authoritative watermark.
                 if parent == 0 {
@@ -1390,6 +1485,38 @@ mod tests {
         // turns that into one: the two depth-one scores remain exactly .50 and .30.
         assert!((forest.scored.cumulative_log_probability[1].exp() - 0.50).abs() < 1.0e-6);
         assert!((forest.scored.cumulative_log_probability[2].exp() - 0.30).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn next_expansion_evidence_is_causal_and_tracks_the_global_parent() {
+        let mut frontier = Eagle3DynamicFrontier::new(10, frontier_config(6, 12, 4)).unwrap();
+        let initial = frontier.next_expansion_evidence().unwrap();
+        assert_eq!(initial.completed_head_expansions, 0);
+        assert_eq!(initial.next_parent, 0);
+        assert_eq!(initial.next_parent_depth, 0);
+        assert_eq!(initial.next_parent_cumulative_probability, 1.0);
+
+        frontier
+            .record_expansion(0, &output(&[(11, 0.50), (12, 0.30)], 1.0))
+            .unwrap();
+        let after_root = frontier.next_expansion_evidence().unwrap();
+        assert_eq!(after_root.completed_head_expansions, 1);
+        assert_eq!(after_root.next_parent, 1);
+        assert_eq!(after_root.next_parent_depth, 1);
+        assert!((after_root.next_parent_cumulative_probability - 0.50).abs() < 1.0e-6);
+
+        frontier
+            .record_expansion(1, &output(&[(13, 0.40), (14, 0.20)], 2.0))
+            .unwrap();
+        frontier
+            .record_expansion(2, &output(&[(15, 0.90)], 3.0))
+            .unwrap();
+        let before_fourth = frontier.next_expansion_evidence().unwrap();
+        assert_eq!(before_fourth.completed_head_expansions, 3);
+        assert_eq!(before_fourth.next_parent, 5);
+        assert_eq!(before_fourth.next_parent_depth, 2);
+        assert!((before_fourth.next_parent_cumulative_probability - 0.27).abs() < 1.0e-6);
+        assert!((before_fourth.next_parent_cumulative_log_probability.exp() - 0.27).abs() < 1.0e-6);
     }
 
     #[test]

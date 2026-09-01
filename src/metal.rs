@@ -5054,6 +5054,653 @@ kernel void q6k_linear_mma_combined_direct_v4(
     }
 }
 
+// Benchmark-only cooperative output-row V4 prototypes. Kbench defines the
+// guard explicitly; production compilation and routing never see them.
+#if defined(KBENCH_COOP_ROWS_V4)
+// Each SIMDgroup owns the exact same synchronized 8-output-row / 8-token
+// accumulator as `*_combined_v4`; several SIMDgroups merely share one copy
+// of the common activation tile.  Weight layout, dequantization, MMA order,
+// and the increasing-superblock f32 fold remain unchanged per output word.
+//
+// Two geometries are exposed to kbench because the trade-off is architectural:
+// Q4 coop2 spends 13.75 KiB of threadgroup memory for 16 output rows, while
+// coop4 spends 23.25 KiB for 32 rows and may reduce occupancy on smaller
+// Apple GPUs.  Neither needs a repacked weight sidecar.
+inline void q4k_linear_mma_combined_coop_rows_v4(
+    device const float* input_scales,
+    device const uchar* weight_blocks,
+    device float* output,
+    constant uint& n_sb,
+    constant uint& rows,
+    constant uint& n_tokens,
+    device const half* y_half,
+    device const half* ysums,
+    uint tile,
+    uint lane,
+    uint sg,
+    uint tid,
+    uint coop_groups,
+    threadgroup half* stage_a_all,
+    threadgroup half* mn_a_all,
+    threadgroup float* c_stage_all,
+    threadgroup float* min_stage_all,
+    threadgroup half* stage_y,
+    threadgroup half* stage_ysums
+) {
+    const uint rows_per_tg = coop_groups * 8;
+    const uint group_r0 = tile * rows_per_tg;
+    // Uniform for the complete threadgroup, so returning cannot strand a
+    // sibling SIMDgroup at a later threadgroup barrier.
+    if (group_r0 >= rows) return;
+
+    const uint r0 = group_r0 + sg * 8;
+    const uint k_pad = 8;
+    const uint tg_threads = coop_groups * 32;
+    threadgroup half* stage_a = stage_a_all + sg * (256 * 8);
+    threadgroup half* mn_a = mn_a_all + sg * (8 * 16);
+    threadgroup float* c_stage = c_stage_all + sg * 64;
+    threadgroup float* min_stage = min_stage_all + sg * 64;
+
+    float accum[2] = {0.0f, 0.0f};
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        // The narrow kernel has every output-row tile reread the same staged
+        // activation panel.  Copy it once for all cooperative row tiles.  A
+        // half load/store is an exact bit copy and changes no arithmetic.
+        for (uint i = tid; i < 256 * 8; i += tg_threads) {
+            stage_y[i] = y_half[sb * 256 * 8 + i];
+        }
+        for (uint i = tid; i < 16 * 8; i += tg_threads) {
+            stage_ysums[i] = ysums[sb * 16 * 8 + i];
+        }
+
+        // Per-SIMDgroup weight decode is copied from the synchronized V4
+        // kernel.  Each group writes a disjoint A/min tile.
+        const uint r = lane & 7u;
+        const uint g = lane >> 3;
+        const uint rr = r0 + r;
+        if (rr < rows) {
+            device const uchar* block = weight_blocks + (rr * n_sb + sb) * 144;
+            uchar sc[8], mn[8];
+            q4k_scale_min_v2(block, sc, mn);
+            device const uint4* wq =
+                reinterpret_cast<device const uint4*>(block + 16 + g * 32);
+            const uint4 wv[2] = {wq[0], wq[1]};
+            const half slo = half(int(sc[2 * g]));
+            const half shi = half(int(sc[2 * g + 1]));
+            for (uint h = 0; h < 2; ++h) {
+                for (uint c = 0; c < 4; ++c) {
+                    const uint w = wv[h][c];
+                    for (uint j = 0; j < 4; ++j) {
+                        const uint pl = (h * 4 + c) * 4 + j;
+                        const uint byte = (w >> (8 * j)) & 0xffu;
+                        stage_a[(g * 64 + pl) * 8 + r] =
+                            slo * half(int(byte & 0x0fu));
+                        stage_a[(g * 64 + 32 + pl) * 8 + r] =
+                            shi * half(int(byte >> 4));
+                    }
+                }
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) {
+                    const uint j16 = g * 8 + i;
+                    mn_a[r * 16 + j16] =
+                        half(int(mn[((j16 >> 2) * 2) + ((j16 >> 1) & 1u)]));
+                }
+            }
+        } else {
+            for (uint pl = 0; pl < 64; ++pl) {
+                stage_a[(g * 64 + pl) * 8 + r] = half(0.0f);
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) {
+                    mn_a[r * 16 + g * 8 + i] = half(0.0f);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, stage_y + kk * 64, 8);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+        simdgroup_float8x8 c_min =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint m = 0; m < 2; ++m) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, mn_a + m * 8, 16);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, stage_ysums + m * 64, 8);
+            simdgroup_multiply_accumulate(c_min, a, b, c_min);
+        }
+        simdgroup_store(c_main, c_stage, 8);
+        simdgroup_store(c_min, min_stage, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint cr = idx >> 3;
+            const uint ct = idx & 7u;
+            const uint out_row = r0 + cr;
+            if (out_row < rows && ct < n_tokens) {
+                device const uchar* block =
+                    weight_blocks + (out_row * n_sb + sb) * 144;
+                const float dw = float(*reinterpret_cast<device const half*>(block));
+                const float dm =
+                    float(*reinterpret_cast<device const half*>(block + 2));
+                const float da = input_scales[ct * n_sb + sb];
+                accum[cell] += (dw * da) * c_stage[cr * 8 + ct]
+                             - (dm * da) * min_stage[cr * 8 + ct];
+            }
+        }
+        // Preserve the synchronized kernel's superblock boundary. This wider
+        // barrier also protects the shared B panel from the other groups.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint idx = lane * 2 + cell;
+        const uint r = idx >> 3;
+        const uint t = idx & 7u;
+        const uint rr = r0 + r;
+        if (rr < rows && t < n_tokens) {
+            output[t * rows + rr] = accum[cell];
+        }
+    }
+}
+
+inline void q6k_linear_mma_combined_coop_rows_v4(
+    device const float* input_scales,
+    device const uchar* weight_blocks,
+    device float* output,
+    constant uint& n_sb,
+    constant uint& rows,
+    constant uint& n_tokens,
+    device const half* y_half,
+    uint tile,
+    uint lane,
+    uint sg,
+    uint tid,
+    uint coop_groups,
+    threadgroup half* stage_a_all,
+    threadgroup float* c_stage_all,
+    threadgroup half* stage_y
+) {
+    const uint rows_per_tg = coop_groups * 8;
+    const uint group_r0 = tile * rows_per_tg;
+    if (group_r0 >= rows) return;
+
+    const uint r0 = group_r0 + sg * 8;
+    const uint tg_threads = coop_groups * 32;
+    threadgroup half* stage_a = stage_a_all + sg * (256 * 8);
+    threadgroup float* c_stage = c_stage_all + sg * 64;
+
+    float accum[2] = {0.0f, 0.0f};
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        for (uint i = tid; i < 256 * 8; i += tg_threads) {
+            stage_y[i] = y_half[sb * 256 * 8 + i];
+        }
+
+        const uint r = lane & 7u;
+        const uint q = lane >> 3;
+        const uint h = q >> 1;
+        const uint s = q & 1u;
+        const uint rr = r0 + r;
+        const uint base = h * 128 + s * 16;
+        if (rr < rows) {
+            device const uchar* block = weight_blocks + (rr * n_sb + sb) * 210;
+            device const char* scales =
+                reinterpret_cast<device const char*>(block + 192);
+            const int s0 = int(scales[8 * h + s]);
+            const int s1 = int(scales[8 * h + s + 2]);
+            const int s2 = int(scales[8 * h + s + 4]);
+            const int s3 = int(scales[8 * h + s + 6]);
+            device const ushort* wl =
+                reinterpret_cast<device const ushort*>(block + h * 64 + s * 16);
+            device const ushort* wh = reinterpret_cast<device const ushort*>(
+                block + h * 64 + 32 + s * 16
+            );
+            device const ushort* wq = reinterpret_cast<device const ushort*>(
+                block + 128 + h * 32 + s * 16
+            );
+            for (uint l = 0; l < 16; ++l) {
+                const uint albyte =
+                    (uint(wl[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const uint ahbyte =
+                    (uint(wh[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const uint hbyte =
+                    (uint(wq[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                const int a1 =
+                    int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
+                const int a2 =
+                    int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
+                const int a3 =
+                    int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
+                stage_a[(base + l) * 8 + r] = half(s0 * a0);
+                stage_a[(base + l + 32) * 8 + r] = half(s1 * a1);
+                stage_a[(base + l + 64) * 8 + r] = half(s2 * a2);
+                stage_a[(base + l + 96) * 8 + r] = half(s3 * a3);
+            }
+        } else {
+            for (uint l = 0; l < 16; ++l) {
+                stage_a[(base + l) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 32) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 64) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 96) * 8 + r] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, stage_y + kk * 64, 8);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+        simdgroup_store(c_main, c_stage, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint cr = idx >> 3;
+            const uint ct = idx & 7u;
+            const uint out_row = r0 + cr;
+            if (out_row < rows && ct < n_tokens) {
+                device const uchar* block =
+                    weight_blocks + (out_row * n_sb + sb) * 210;
+                const float dw =
+                    float(*reinterpret_cast<device const half*>(block + 208));
+                const float da = input_scales[ct * n_sb + sb];
+                accum[cell] += (dw * da) * c_stage[cr * 8 + ct];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint idx = lane * 2 + cell;
+        const uint r = idx >> 3;
+        const uint t = idx & 7u;
+        const uint rr = r0 + r;
+        if (rr < rows && t < n_tokens) {
+            output[t * rows + rr] = accum[cell];
+        }
+    }
+}
+
+#define DEFINE_Q4K_COOP_ROWS_V4(NAME, GROUPS)                                  \
+kernel void NAME(                                                              \
+    device const float* input_scales [[buffer(0)]],                            \
+    device const uchar* weight_blocks [[buffer(2)]],                           \
+    device float* output [[buffer(3)]],                                        \
+    constant uint& n_sb [[buffer(4)]],                                         \
+    constant uint& rows [[buffer(5)]],                                         \
+    constant uint& n_tokens [[buffer(6)]],                                     \
+    device const half* y_half [[buffer(7)]],                                   \
+    device const half* ysums [[buffer(8)]],                                    \
+    uint tile [[threadgroup_position_in_grid]],                                \
+    uint lane [[thread_index_in_simdgroup]],                                   \
+    uint sg [[simdgroup_index_in_threadgroup]],                                \
+    uint tid [[thread_index_in_threadgroup]]) {                                \
+    threadgroup half stage_a[(GROUPS) * 256 * 8];                              \
+    threadgroup half mn_a[(GROUPS) * 8 * 16];                                  \
+    threadgroup float c_stage[(GROUPS) * 64];                                  \
+    threadgroup float min_stage[(GROUPS) * 64];                                \
+    threadgroup half stage_y[256 * 8];                                         \
+    threadgroup half stage_ysums[16 * 8];                                      \
+    q4k_linear_mma_combined_coop_rows_v4(                                     \
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_half,     \
+        ysums, tile, lane, sg, tid, (GROUPS), stage_a, mn_a, c_stage,          \
+        min_stage, stage_y, stage_ysums);                                      \
+}
+
+#define DEFINE_Q6K_COOP_ROWS_V4(NAME, GROUPS)                                  \
+kernel void NAME(                                                              \
+    device const float* input_scales [[buffer(0)]],                            \
+    device const uchar* weight_blocks [[buffer(2)]],                           \
+    device float* output [[buffer(3)]],                                        \
+    constant uint& n_sb [[buffer(4)]],                                         \
+    constant uint& rows [[buffer(5)]],                                         \
+    constant uint& n_tokens [[buffer(6)]],                                     \
+    device const half* y_half [[buffer(7)]],                                   \
+    uint tile [[threadgroup_position_in_grid]],                                \
+    uint lane [[thread_index_in_simdgroup]],                                   \
+    uint sg [[simdgroup_index_in_threadgroup]],                                \
+    uint tid [[thread_index_in_threadgroup]]) {                                \
+    threadgroup half stage_a[(GROUPS) * 256 * 8];                              \
+    threadgroup float c_stage[(GROUPS) * 64];                                  \
+    threadgroup half stage_y[256 * 8];                                         \
+    q6k_linear_mma_combined_coop_rows_v4(                                     \
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_half,     \
+        tile, lane, sg, tid, (GROUPS), stage_a, c_stage, stage_y);              \
+}
+
+DEFINE_Q4K_COOP_ROWS_V4(q4k_linear_mma_combined_coop2_v4, 2)
+DEFINE_Q4K_COOP_ROWS_V4(q4k_linear_mma_combined_coop4_v4, 4)
+DEFINE_Q6K_COOP_ROWS_V4(q6k_linear_mma_combined_coop2_v4, 2)
+DEFINE_Q6K_COOP_ROWS_V4(q6k_linear_mma_combined_coop4_v4, 4)
+
+#undef DEFINE_Q4K_COOP_ROWS_V4
+#undef DEFINE_Q6K_COOP_ROWS_V4
+#endif
+
+// Benchmark-only single-SIMDgroup dual-output-tile V4 prototypes. Each
+// 32-thread threadgroup covers two independent 8-row panels. A device B
+// fragment is loaded once and applied to both A panels, while each panel
+// retains the synchronized C materialization and increasing-superblock f32
+// fold of the current V4 kernel. Canonical weights are consumed directly.
+#if defined(KBENCH_DUAL_ROWS_V4)
+kernel void q4k_linear_mma_combined_dualrow_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    device const half* ysums [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint group_r0 = tile * 16;
+    // Whole-threadgroup uniform: the ragged second panel remains active and
+    // zero-filled so every lane traverses every synchronization point.
+    if (group_r0 >= rows) return;
+    const uint k_pad = 8;
+
+    threadgroup half stage_a[2 * 256 * 8];
+    threadgroup half mn_a[2 * 8 * 16];
+    threadgroup float c_stage[2 * 64];
+    threadgroup float min_stage[2 * 64];
+    float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        for (uint panel = 0; panel < 2; ++panel) {
+            const uint r0 = group_r0 + panel * 8;
+            threadgroup half* panel_a = stage_a + panel * (256 * 8);
+            threadgroup half* panel_mn = mn_a + panel * (8 * 16);
+            const uint r = lane & 7u;
+            const uint g = lane >> 3;
+            const uint rr = r0 + r;
+            if (rr < rows) {
+                device const uchar* block =
+                    weight_blocks + (rr * n_sb + sb) * 144;
+                uchar sc[8], mn[8];
+                q4k_scale_min_v2(block, sc, mn);
+                device const uint4* wq =
+                    reinterpret_cast<device const uint4*>(block + 16 + g * 32);
+                const uint4 wv[2] = {wq[0], wq[1]};
+                const half slo = half(int(sc[2 * g]));
+                const half shi = half(int(sc[2 * g + 1]));
+                for (uint h = 0; h < 2; ++h) {
+                    for (uint c = 0; c < 4; ++c) {
+                        const uint w = wv[h][c];
+                        for (uint j = 0; j < 4; ++j) {
+                            const uint pl = (h * 4 + c) * 4 + j;
+                            const uint byte = (w >> (8 * j)) & 0xffu;
+                            panel_a[(g * 64 + pl) * 8 + r] =
+                                slo * half(int(byte & 0x0fu));
+                            panel_a[(g * 64 + 32 + pl) * 8 + r] =
+                                shi * half(int(byte >> 4));
+                        }
+                    }
+                }
+                if (g < 2) {
+                    for (uint i = 0; i < 8; ++i) {
+                        const uint j16 = g * 8 + i;
+                        panel_mn[r * 16 + j16] =
+                            half(int(mn[((j16 >> 2) * 2) +
+                                        ((j16 >> 1) & 1u)]));
+                    }
+                }
+            } else {
+                for (uint pl = 0; pl < 64; ++pl) {
+                    panel_a[(g * 64 + pl) * 8 + r] = half(0.0f);
+                }
+                if (g < 2) {
+                    for (uint i = 0; i < 8; ++i) {
+                        panel_mn[r * 16 + g * 8 + i] = half(0.0f);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main0 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 c_main1 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 b;
+            simdgroup_load(
+                b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad
+            );
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(c_main0, a, b, c_main0);
+            simdgroup_load(
+                a, stage_a + 256 * 8 + kk * 64,
+                8, ulong2(0, 0), true
+            );
+            simdgroup_multiply_accumulate(c_main1, a, b, c_main1);
+        }
+        // Store the main results before constructing min fragments so only
+        // two C accumulators are live at once.
+        simdgroup_store(c_main0, c_stage, 8);
+        simdgroup_store(c_main1, c_stage + 64, 8);
+
+        simdgroup_float8x8 c_min0 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 c_min1 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint m = 0; m < 2; ++m) {
+            simdgroup_half8x8 b;
+            simdgroup_load(
+                b, ysums + (sb * 16 + m * 8) * k_pad, k_pad
+            );
+            simdgroup_half8x8 a;
+            simdgroup_load(a, mn_a + m * 8, 16);
+            simdgroup_multiply_accumulate(c_min0, a, b, c_min0);
+            simdgroup_load(a, mn_a + 8 * 16 + m * 8, 16);
+            simdgroup_multiply_accumulate(c_min1, a, b, c_min1);
+        }
+        simdgroup_store(c_min0, min_stage, 8);
+        simdgroup_store(c_min1, min_stage + 64, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint panel = 0; panel < 2; ++panel) {
+            const uint r0 = group_r0 + panel * 8;
+            threadgroup float* panel_c = c_stage + panel * 64;
+            threadgroup float* panel_min = min_stage + panel * 64;
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint idx = lane * 2 + cell;
+                const uint cr = idx >> 3;
+                const uint ct = idx & 7u;
+                const uint out_row = r0 + cr;
+                if (out_row < rows && ct < n_tokens) {
+                    device const uchar* block =
+                        weight_blocks + (out_row * n_sb + sb) * 144;
+                    const float dw =
+                        float(*reinterpret_cast<device const half*>(block));
+                    const float dm = float(
+                        *reinterpret_cast<device const half*>(block + 2)
+                    );
+                    const float da = input_scales[ct * n_sb + sb];
+                    accum[panel * 2 + cell] +=
+                        (dw * da) * panel_c[cr * 8 + ct]
+                      - (dm * da) * panel_min[cr * 8 + ct];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint panel = 0; panel < 2; ++panel) {
+        const uint r0 = group_r0 + panel * 8;
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint r = idx >> 3;
+            const uint t = idx & 7u;
+            const uint rr = r0 + r;
+            if (rr < rows && t < n_tokens) {
+                output[t * rows + rr] = accum[panel * 2 + cell];
+            }
+        }
+    }
+}
+
+kernel void q6k_linear_mma_combined_dualrow_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint group_r0 = tile * 16;
+    if (group_r0 >= rows) return;
+    const uint k_pad = 8;
+
+    threadgroup half stage_a[2 * 256 * 8];
+    threadgroup float c_stage[2 * 64];
+    float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        for (uint panel = 0; panel < 2; ++panel) {
+            const uint r0 = group_r0 + panel * 8;
+            threadgroup half* panel_a = stage_a + panel * (256 * 8);
+            const uint r = lane & 7u;
+            const uint q = lane >> 3;
+            const uint h = q >> 1;
+            const uint s = q & 1u;
+            const uint rr = r0 + r;
+            const uint base = h * 128 + s * 16;
+            if (rr < rows) {
+                device const uchar* block =
+                    weight_blocks + (rr * n_sb + sb) * 210;
+                device const char* scales =
+                    reinterpret_cast<device const char*>(block + 192);
+                const int s0 = int(scales[8 * h + s]);
+                const int s1 = int(scales[8 * h + s + 2]);
+                const int s2 = int(scales[8 * h + s + 4]);
+                const int s3 = int(scales[8 * h + s + 6]);
+                device const ushort* wl =
+                    reinterpret_cast<device const ushort*>(
+                        block + h * 64 + s * 16
+                    );
+                device const ushort* wh =
+                    reinterpret_cast<device const ushort*>(
+                        block + h * 64 + 32 + s * 16
+                    );
+                device const ushort* wq =
+                    reinterpret_cast<device const ushort*>(
+                        block + 128 + h * 32 + s * 16
+                    );
+                for (uint l = 0; l < 16; ++l) {
+                    const uint albyte =
+                        (uint(wl[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                    const uint ahbyte =
+                        (uint(wh[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                    const uint hbyte =
+                        (uint(wq[l >> 1]) >> (8 * (l & 1u))) & 0xffu;
+                    const int a0 =
+                        int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                    const int a1 = int(
+                        (ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)
+                    ) - 32;
+                    const int a2 = int(
+                        (albyte >> 4) | (((hbyte >> 4) & 3u) << 4)
+                    ) - 32;
+                    const int a3 = int(
+                        (ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)
+                    ) - 32;
+                    panel_a[(base + l) * 8 + r] = half(s0 * a0);
+                    panel_a[(base + l + 32) * 8 + r] = half(s1 * a1);
+                    panel_a[(base + l + 64) * 8 + r] = half(s2 * a2);
+                    panel_a[(base + l + 96) * 8 + r] = half(s3 * a3);
+                }
+            } else {
+                for (uint l = 0; l < 16; ++l) {
+                    panel_a[(base + l) * 8 + r] = half(0.0f);
+                    panel_a[(base + l + 32) * 8 + r] = half(0.0f);
+                    panel_a[(base + l + 64) * 8 + r] = half(0.0f);
+                    panel_a[(base + l + 96) * 8 + r] = half(0.0f);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main0 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 c_main1 =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 b;
+            simdgroup_load(
+                b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad
+            );
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(c_main0, a, b, c_main0);
+            simdgroup_load(
+                a, stage_a + 256 * 8 + kk * 64,
+                8, ulong2(0, 0), true
+            );
+            simdgroup_multiply_accumulate(c_main1, a, b, c_main1);
+        }
+        simdgroup_store(c_main0, c_stage, 8);
+        simdgroup_store(c_main1, c_stage + 64, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint panel = 0; panel < 2; ++panel) {
+            const uint r0 = group_r0 + panel * 8;
+            threadgroup float* panel_c = c_stage + panel * 64;
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint idx = lane * 2 + cell;
+                const uint cr = idx >> 3;
+                const uint ct = idx & 7u;
+                const uint out_row = r0 + cr;
+                if (out_row < rows && ct < n_tokens) {
+                    device const uchar* block =
+                        weight_blocks + (out_row * n_sb + sb) * 210;
+                    const float dw = float(
+                        *reinterpret_cast<device const half*>(block + 208)
+                    );
+                    const float da = input_scales[ct * n_sb + sb];
+                    accum[panel * 2 + cell] +=
+                        (dw * da) * panel_c[cr * 8 + ct];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint panel = 0; panel < 2; ++panel) {
+        const uint r0 = group_r0 + panel * 8;
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint r = idx >> 3;
+            const uint t = idx & 7u;
+            const uint rr = r0 + r;
+            if (rr < rows && t < n_tokens) {
+                output[t * rows + rr] = accum[panel * 2 + cell];
+            }
+        }
+    }
+}
+#endif
+
 // Width-16 V4 lane. Two simdgroups share one decoded weight tile and each
 // owns an independent N=8 combined-chain accumulator. The per-column MMA and
 // f32 fold order is unchanged from the narrow V4 kernels above.
@@ -27048,13 +27695,40 @@ fn eagle3_rank_top_candidates(
     Ok(ranked)
 }
 
+/// Parse the benchmark-only scheduling gate. Unknown spellings fail closed to the serial lane.
+fn eagle3_parallel_lse_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    })
+}
+
+/// Benchmark-only scheduling gate for the EAGLE full-vocabulary normalizer.
+///
+/// The default stays on the established serial iterator. The opt-in path parallelizes only the
+/// independent scalar `f64::exp` evaluations; their results are still accumulated by the same
+/// serial `Iterator::sum` in vocabulary-row order. In particular, this must never become a
+/// parallel reduction: changing the f64 addition tree can move a frontier probability.
+fn eagle3_parallel_lse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_BENCH_EAGLE3_PARALLEL_LSE").ok();
+        eagle3_parallel_lse_from_env(value.as_deref())
+    })
+}
+
 /// Numerically stable log-sum-exp over every evaluated draft-head row.
 ///
 /// The maximum subtraction prevents overflow for large logits and the exponential sum uses
 /// f64 so 32k near-ties do not lose material probability mass. Negative infinity is a valid
 /// omitted candidate, but NaN, positive infinity, and an all-negative-infinity distribution
 /// fail closed rather than leaking a non-finite normalizer into dynamic-tree admission.
-fn eagle3_evaluated_vocab_logsumexp(logits: &[f32]) -> std::result::Result<f32, String> {
+fn eagle3_evaluated_vocab_logsumexp_with_exp_mode(
+    logits: &[f32],
+    parallel_exp: bool,
+) -> std::result::Result<f32, String> {
     if logits.is_empty() {
         return Err("EAGLE-3 cannot normalize an empty evaluated vocabulary".to_string());
     }
@@ -27070,10 +27744,26 @@ fn eagle3_evaluated_vocab_logsumexp(logits: &[f32]) -> std::result::Result<f32, 
     if maximum == f32::NEG_INFINITY {
         return Err("EAGLE-3 evaluated-vocabulary logits are all negative infinity".to_string());
     }
-    let exponential_sum = logits
-        .iter()
-        .map(|&logit| (f64::from(logit) - f64::from(maximum)).exp())
-        .sum::<f64>();
+    let exponential_sum = if parallel_exp {
+        use rayon::prelude::*;
+
+        // `par_iter_mut` assigns each row its own output slot. The following ordinary iterator
+        // is intentionally the exact established left-to-right f64 reduction; using Rayon's
+        // `sum` here would be faster-looking but numerically different.
+        let maximum = f64::from(maximum);
+        let mut exponential_terms = vec![0.0f64; logits.len()];
+        exponential_terms
+            .par_iter_mut()
+            .zip(logits.par_iter())
+            .for_each(|(term, &logit)| *term = (f64::from(logit) - maximum).exp());
+        exponential_terms.iter().copied().sum::<f64>()
+    } else {
+        // Keep the gate-off arithmetic identical to the established lane.
+        logits
+            .iter()
+            .map(|&logit| (f64::from(logit) - f64::from(maximum)).exp())
+            .sum::<f64>()
+    };
     if !exponential_sum.is_finite() || exponential_sum <= 0.0 {
         return Err(format!(
             "EAGLE-3 evaluated-vocabulary exponential sum is invalid: {exponential_sum}"
@@ -27087,6 +27777,10 @@ fn eagle3_evaluated_vocab_logsumexp(logits: &[f32]) -> std::result::Result<f32, 
         ));
     }
     Ok(logsumexp)
+}
+
+fn eagle3_evaluated_vocab_logsumexp(logits: &[f32]) -> std::result::Result<f32, String> {
+    eagle3_evaluated_vocab_logsumexp_with_exp_mode(logits, eagle3_parallel_lse_enabled())
 }
 
 fn eagle3_validate_batch_shape(
@@ -28350,6 +29044,76 @@ mod eagle3_metal_contract_tests {
             eagle3_evaluated_vocab_logsumexp(&[0.0, f32::NEG_INFINITY]).unwrap(),
             0.0
         );
+    }
+
+    #[test]
+    fn eagle3_parallel_lse_preserves_serial_output_bits() {
+        let representative: Vec<f32> = (0..EAGLE3_DRAFT_VOCAB)
+            .map(|row| match row % 11 {
+                0 => f32::NEG_INFINITY,
+                1 => -100.0,
+                2 => -30.0,
+                3 => -1.0,
+                4 => -0.0,
+                5 => 0.0,
+                6 => f32::from_bits(1), // Smallest positive subnormal.
+                _ => ((row % 257) as f32 - 128.0) * 0.03125,
+            })
+            .collect();
+        let adversarial = [
+            f32::MAX,
+            f32::from_bits(f32::MAX.to_bits() - 1),
+            f32::MIN,
+            -f32::MIN_POSITIVE,
+            -f32::from_bits(1),
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            1.0,
+            f32::from_bits(1.0f32.to_bits() + 1),
+            f32::NEG_INFINITY,
+        ];
+        let near_ties = vec![3.0f32; EAGLE3_DRAFT_VOCAB];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread parity pool");
+
+        for logits in [&representative[..], &adversarial, &near_ties[..]] {
+            let serial = eagle3_evaluated_vocab_logsumexp_with_exp_mode(logits, false).unwrap();
+            let parallel = pool
+                .install(|| eagle3_evaluated_vocab_logsumexp_with_exp_mode(logits, true))
+                .unwrap();
+            assert_eq!(
+                parallel.to_bits(),
+                serial.to_bits(),
+                "parallel exp evaluation changed the ordered f64 result"
+            );
+        }
+    }
+
+    #[test]
+    fn eagle3_parallel_lse_preserves_errors_and_gate_fails_closed() {
+        for logits in [
+            Vec::new(),
+            vec![f32::NAN, 0.0],
+            vec![0.0, f32::INFINITY],
+            vec![f32::NEG_INFINITY; 2],
+        ] {
+            let serial =
+                eagle3_evaluated_vocab_logsumexp_with_exp_mode(&logits, false).unwrap_err();
+            let parallel =
+                eagle3_evaluated_vocab_logsumexp_with_exp_mode(&logits, true).unwrap_err();
+            assert_eq!(parallel, serial);
+        }
+
+        for value in [None, Some(""), Some("0"), Some("false"), Some("garbage")] {
+            assert!(!eagle3_parallel_lse_from_env(value));
+        }
+        for value in ["1", "true", "TRUE", "on", "yes", "enabled"] {
+            assert!(eagle3_parallel_lse_from_env(Some(value)));
+        }
     }
 
     #[test]
