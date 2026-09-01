@@ -51,6 +51,7 @@ pub mod spec_tree;
 mod spec_tree_lossless;
 pub mod speculative;
 pub mod suffix_decoding;
+pub mod target_row_hedge;
 pub mod token_recycling;
 mod win_pin;
 

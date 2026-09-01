@@ -130,6 +130,18 @@ impl TokenRecyclingDrafter {
         self.target_rows.contains_key(&token)
     }
 
+    /// Target greedy top-1 saved by a completed, earlier verifier row.
+    ///
+    /// This accessor is read-only so a caller can snapshot causal hedge proposals before its
+    /// current target verification.  Newly verified rows must still be installed later through
+    /// [`Self::replace_target_candidates`].
+    pub fn prior_target_top1(&self, token: u32) -> Option<u32> {
+        self.target_rows
+            .get(&token)
+            .and_then(|row| row.first())
+            .copied()
+    }
+
     /// Build and assess a tree using only exact target rows already known before this round.
     ///
     /// Unlike [`TreeDrafter::draft_tree`], this is read-only and never consults or mutates the

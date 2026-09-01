@@ -316,6 +316,13 @@ pub struct ScoredTokenTree {
     /// Stable expansion-lattice index for every verifier row.  Useful for gathering the
     /// corresponding recurrent state/KV row without relying on token ids being unique.
     pub source_node: Vec<usize>,
+    /// Verifier rows on the learned head's greedy primary spine, root first.
+    ///
+    /// The dynamic reranker deliberately selects this connected spine before spending its
+    /// remaining verifier budget on hedges.  Keeping the exact rows makes downstream,
+    /// benchmark-only hedge experiments preserve the learned primary proposal instead of trying
+    /// to reconstruct it from token ids or rounded scores.
+    pub primary_spine_rows: Vec<usize>,
 }
 
 impl ScoredTokenTree {
@@ -454,6 +461,10 @@ impl DynamicDraftLattice {
             }
         }
 
+        // Capture the exact learned primary selection before hedge rows are added and before the
+        // verifier's BFS relayout.  Source-lattice ids are stable across both operations.
+        let primary_spine_sources = selected.clone();
+
         // 2. Fill the remaining node budget with highest-scoring candidate nodes whose parents are in selected.
         while selected.len() < max_nodes {
             let next_best = self
@@ -477,7 +488,6 @@ impl DynamicDraftLattice {
                 break;
             }
         }
-
         // Matrix rows may be ranked in any order, but the shared tree substrate promises BFS.
         // Restore level order while retaining stable expansion order inside each level.
         selected.sort_by_key(|&index| (self.nodes[index].depth, index));
@@ -485,6 +495,10 @@ impl DynamicDraftLattice {
         for (row, &source) in selected.iter().enumerate() {
             remap[source] = row;
         }
+        let primary_spine_rows = primary_spine_sources
+            .iter()
+            .map(|&source| remap[source])
+            .collect();
 
         let mut tokens = Vec::with_capacity(selected.len());
         let mut parent = Vec::with_capacity(selected.len());
@@ -509,6 +523,7 @@ impl DynamicDraftLattice {
             },
             cumulative_log_probability,
             source_node: selected,
+            primary_spine_rows,
         })
     }
 }
@@ -830,6 +845,11 @@ mod tests {
         assert_eq!(
             plan.source_node,
             vec![0, first[0], first[1], under_11[0], under_12[0]]
+        );
+        assert_eq!(
+            plan.primary_spine_rows,
+            vec![0, 1, 3],
+            "the reranker must preserve its exact root -> 11 -> 13 primary selection"
         );
         for row in 1..plan.tree.nodes() {
             assert!(plan.tree.parent[row] < row as i32);

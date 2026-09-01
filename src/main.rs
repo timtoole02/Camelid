@@ -9463,6 +9463,114 @@ impl Eagle3TokenRecyclingTelemetry {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Eagle3TargetRowHedgeTelemetry {
+    rounds: u64,
+    insertion_rounds: u64,
+    no_prior_row_rounds: u64,
+    duplicate_only_rounds: u64,
+    no_replaceable_hedge_rounds: u64,
+    supported_primary_rows: u64,
+    full_path_duplicates: u64,
+    target_rows_offered: u64,
+    target_rows_accepted: u64,
+    shared_rows_accepted: u64,
+    neural_hedges_retained_sum: u64,
+    offered_by_depth: [u64; 8],
+    accepted_by_depth: [u64; 8],
+    candidate_rows: u64,
+    candidate_ids: u64,
+}
+
+impl Eagle3TargetRowHedgeTelemetry {
+    fn note_round(
+        &mut self,
+        forest: &camelid::inference::target_row_hedge::TargetRowHedgeForest,
+        acceptance: &camelid::inference::target_row_hedge::TargetRowHedgeAcceptance,
+    ) -> Result<(), String> {
+        use camelid::inference::target_row_hedge::{
+            TargetRowHedgeOutcome, TargetRowHedgeSource,
+        };
+
+        if forest.source.len() != forest.tree.nodes()
+            || acceptance.capture_rows.len() != acceptance.emitted_tokens.len()
+            || acceptance.capture_rows.first() != Some(&0)
+            || acceptance
+                .capture_rows
+                .iter()
+                .any(|&row| row >= forest.tree.nodes())
+        {
+            return Err("target-row hedge telemetry received misaligned forest rows".to_string());
+        }
+        let mut next = *self;
+        next.rounds = next.rounds.saturating_add(1);
+        next.supported_primary_rows = next
+            .supported_primary_rows
+            .saturating_add(forest.decision.supported_primary_rows as u64);
+        next.full_path_duplicates = next
+            .full_path_duplicates
+            .saturating_add(forest.decision.full_path_duplicates as u64);
+        next.neural_hedges_retained_sum = next
+            .neural_hedges_retained_sum
+            .saturating_add(forest.decision.neural_hedges_retained as u64);
+        match forest.decision.outcome {
+            TargetRowHedgeOutcome::Inserted => {
+                next.insertion_rounds = next.insertion_rounds.saturating_add(1);
+                let candidate_row = forest
+                    .source
+                    .iter()
+                    .position(|&source| source == TargetRowHedgeSource::PriorTargetTop1)
+                    .ok_or_else(|| {
+                        "inserted target-row hedge has no candidate provenance".to_string()
+                    })?;
+                let depth = usize::from(forest.tree.depth[candidate_row]);
+                if depth == 0 || depth >= next.offered_by_depth.len() {
+                    return Err(format!(
+                        "target-row hedge candidate depth {depth} is outside 1..=7"
+                    ));
+                }
+                next.target_rows_offered = next.target_rows_offered.saturating_add(1);
+                next.offered_by_depth[depth] = next.offered_by_depth[depth].saturating_add(1);
+                if acceptance.capture_rows.contains(&candidate_row) {
+                    next.target_rows_accepted = next.target_rows_accepted.saturating_add(1);
+                    next.accepted_by_depth[depth] =
+                        next.accepted_by_depth[depth].saturating_add(1);
+                }
+            }
+            TargetRowHedgeOutcome::NoPriorTargetRow => {
+                next.no_prior_row_rounds = next.no_prior_row_rounds.saturating_add(1);
+            }
+            TargetRowHedgeOutcome::DuplicateOnly => {
+                next.duplicate_only_rounds = next.duplicate_only_rounds.saturating_add(1);
+            }
+            TargetRowHedgeOutcome::NoReplaceableNeuralHedge => {
+                next.no_replaceable_hedge_rounds =
+                    next.no_replaceable_hedge_rounds.saturating_add(1);
+            }
+        }
+        next.shared_rows_accepted = next.shared_rows_accepted.saturating_add(
+            acceptance
+                .capture_rows
+                .iter()
+                .filter(|&&row| {
+                    matches!(
+                        forest.source[row],
+                        TargetRowHedgeSource::EaglePrimaryAndPriorTargetTop1
+                            | TargetRowHedgeSource::EagleNeuralHedgeAndPriorTargetTop1
+                    )
+                })
+                .count() as u64,
+        );
+        *self = next;
+        Ok(())
+    }
+
+    fn note_candidates(&mut self, rows: usize, ids: usize) {
+        self.candidate_rows = self.candidate_rows.saturating_add(rows as u64);
+        self.candidate_ids = self.candidate_ids.saturating_add(ids as u64);
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn eagle3_token_recycling_telemetry_splits_e9_tr_and_cold_seed_rounds() {
@@ -10347,6 +10455,7 @@ struct Eagle3BenchRun {
     terminal_head_skip_reason: Option<Eagle3TerminalHeadSkipReason>,
     adaptive_expansions: Eagle3AdaptiveExpansionTelemetry,
     token_recycling: Eagle3TokenRecyclingTelemetry,
+    target_row_hedge: Eagle3TargetRowHedgeTelemetry,
     dual_eagle_rounds: Vec<DualEagleRoundReceipt>,
     dual_eagle_shadow_update_us: u128,
     dual_eagle_selected_head: Option<DualEagleHead>,
@@ -10418,6 +10527,7 @@ fn run_eagle3_resident_greedy(
     terminal_head_skip: bool,
     suffix_first: bool,
     token_recycling_hybrid: bool,
+    target_row_hedge: bool,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
     mut secondary_drafter: Option<camelid::eagle3_runtime::Eagle3Drafter>,
     head_upload_ms: f64,
@@ -10486,6 +10596,17 @@ fn run_eagle3_resident_greedy(
         drafter.topk = camelid::metal::RESIDENT_VERIFY_TARGET_TOP_K;
         drafter.branch = 2;
         drafter
+    });
+    // This cache is independent of the whole-tree EAGLE/TR selector above. The target-row hedge
+    // lane always drafts its ordinary EAGLE forest and reads this table before verification;
+    // current target rows are installed only after the round is fully verified and accepted.
+    let mut target_row_cache = target_row_hedge.then(|| {
+        let mut cache = TokenRecyclingDrafter::default();
+        // The first gate deliberately consumes only exact prior top-1. Wider target-row hedges
+        // remain a separately measurable follow-up rather than silently changing this policy.
+        cache.topk = 1;
+        cache.branch = 1;
+        cache
     });
     let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
     let mut adaptive_expansion_controller =
@@ -10589,8 +10710,9 @@ fn run_eagle3_resident_greedy(
                 anyhow::ensure!(
                     suffix_drafts.is_empty()
                         && recycling_drafter.is_none()
+                        && target_row_cache.is_none()
                         && pending_suffix_head.is_empty(),
-                    "dual-EAGLE selector cannot share a round with suffix or Token Recycling drafting"
+                    "dual-EAGLE selector cannot share a round with suffix, Token Recycling, or target-row hedge drafting"
                 );
                 let secondary = secondary_drafter.as_mut().ok_or_else(|| {
                     anyhow::anyhow!("dual-EAGLE race lost its SW512 shadow head before selection")
@@ -11033,6 +11155,165 @@ fn run_eagle3_resident_greedy(
                     }
                     (acceptance.emitted_tokens, offered, actual_nodes)
                 }
+            } else if let Some(target_rows) = target_row_cache.as_mut() {
+                anyhow::ensure!(
+                    pending_suffix_head.is_empty(),
+                    "EAGLE target-row hedge cannot consume deferred suffix rows"
+                );
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position(),
+                    "EAGLE target-row hedge watermark diverged before drafting: head={} target={}",
+                    drafter.filled(),
+                    session.kv_position()
+                );
+
+                // Always materialize the ordinary EAGLE frontier first. Fusion may exchange only
+                // one of its non-primary leaf slots; it cannot suppress or shorten the learned
+                // primary spine and cannot enlarge the target verifier batch.
+                let draft_started = Instant::now();
+                let frontier = drafter.draft_dynamic_frontier(
+                    weights,
+                    anchor,
+                    Eagle3DynamicFrontierConfig {
+                        max_verify_nodes: round_node_budget,
+                        max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                        max_depth: budget,
+                        candidates_per_parent: tree_topk,
+                        max_head_expansions: round_tree_expansions,
+                        adaptive_branching,
+                    },
+                )?;
+                let materialized_head_forwards = frontier.materialized_head_forwards();
+                let eagle_forest = frontier.finish()?;
+                // The closure is read-only and runs before the current verify. The cache mutation
+                // is intentionally below target acceptance, making same-round leakage impossible.
+                let fused = camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse(
+                    &eagle_forest.scored,
+                    round_node_budget,
+                    budget,
+                    |token| target_rows.prior_target_top1(token),
+                )
+                .map_err(anyhow::Error::msg)?;
+                let actual_nodes = fused.tree.nodes();
+                let actual_max_depth = fused.tree.max_depth();
+                anyhow::ensure!(
+                    (2..=round_node_budget).contains(&actual_nodes),
+                    "target-row fused EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                );
+                run.drafted_token_ids
+                    .extend_from_slice(&fused.tree.tokens[1..]);
+                run.draft_us += draft_started.elapsed().as_micros();
+
+                // Full target-head execution and resident longest-path commit are unchanged. The
+                // compact target top-k readback is receipt/cache evidence only.
+                let verify_started = Instant::now();
+                let verified = session
+                    .verify_tree_metal_with_layer_inputs_and_target_top_k(
+                        &fused.tree,
+                        &TARGET_LAYER_INPUT_IDS,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "resident Metal target-row hedge verification became unavailable at position {target_before}"
+                        )
+                    })?;
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    verified.predictions.len() == actual_nodes
+                        && verified.target_top_k.len() == actual_nodes,
+                    "target-row hedge target returned predictions/top-k rows {}/{} for {actual_nodes} verifier rows",
+                    verified.predictions.len(),
+                    verified.target_top_k.len(),
+                );
+                let fused_acceptance = fused
+                    .accept_target_predictions(&verified.predictions)
+                    .map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    verified.emitted == fused_acceptance.emitted_tokens,
+                    "target-row hedge host acceptance diverged from resident target emission"
+                );
+                // Authoritative EAGLE refresh consumes verifier capture rows, not draft-lattice
+                // token mappings. An inserted target token therefore remains valid even when it
+                // has no EAGLE T2D/source-node entry.
+                let acceptance = Eagle3ForestAcceptance {
+                    emitted_tokens: fused_acceptance.emitted_tokens.clone(),
+                    leaf_row: fused_acceptance.leaf_row,
+                    capture_rows: fused_acceptance.capture_rows.clone(),
+                    source_nodes: Vec::new(),
+                };
+                let terminal_reason = eagle3_terminal_head_skip_reason(
+                    terminal_head_skip,
+                    run.generated.len(),
+                    max_tokens,
+                    &acceptance.emitted_tokens,
+                    &tokenizer.special.eog,
+                    session.remaining_context(),
+                );
+                if let Some(reason) = terminal_reason {
+                    anyhow::ensure!(
+                        run.terminal_head_updates_skipped == 0
+                            && run.terminal_head_skip_reason.is_none(),
+                        "EAGLE-3 terminal head update was skipped more than once"
+                    );
+                    run.terminal_head_updates_skipped = 1;
+                    run.terminal_head_skip_reason = Some(reason);
+                    terminal_head_update_skipped_this_round = true;
+                } else {
+                    let update_started = Instant::now();
+                    drafter.accept_authoritative_forest(
+                        weights,
+                        &verified.layer_inputs,
+                        &acceptance,
+                    )?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+                }
+
+                // Causal publication barrier: no row from this verify was visible to `fuse`.
+                // Install every exact target row only after target acceptance and head update.
+                let mut candidate_ids = 0usize;
+                for ((&from, candidates), &prediction) in fused
+                    .tree
+                    .tokens
+                    .iter()
+                    .zip(&verified.target_top_k)
+                    .zip(&verified.predictions)
+                {
+                    anyhow::ensure!(
+                        candidates[0] == prediction,
+                        "target-row hedge top-1 candidate {} disagrees with greedy prediction {prediction} for verifier token {from}",
+                        candidates[0]
+                    );
+                    candidate_ids +=
+                        target_rows.replace_target_candidates(from, &candidates[..1]);
+                }
+                run.target_row_hedge
+                    .note_candidates(actual_nodes, candidate_ids);
+                run.target_row_hedge
+                    .note_round(&fused, &fused_acceptance)
+                    .map_err(anyhow::Error::msg)?;
+                if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                    eprintln!(
+                        "[eagle3-target-row-hedge] outcome={:?} supported={} duplicates={} \
+                         token={:?} parent_depth={:?} evicted={:?} neural_retained={} rows={} emitted={}",
+                        fused.decision.outcome,
+                        fused.decision.supported_primary_rows,
+                        fused.decision.full_path_duplicates,
+                        fused.decision.candidate_token,
+                        fused.decision.candidate_parent_depth,
+                        fused.decision.evicted_eagle_row,
+                        fused.decision.neural_hedges_retained,
+                        actual_nodes,
+                        acceptance.emitted_tokens.len(),
+                    );
+                }
+                let emitted_count = acceptance.emitted_tokens.len();
+                let offered = actual_nodes.saturating_sub(1);
+                run.dynamic_tree_rounds += 1;
+                run.dynamic_tree_offered += offered as u64;
+                run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                (acceptance.emitted_tokens, offered, actual_nodes)
             } else {
                 if !pending_suffix_head.is_empty() {
                     let update_started = Instant::now();
@@ -11370,6 +11651,39 @@ fn run_eagle3_resident_greedy(
             run.verify_nodes,
         );
     }
+    if target_row_hedge {
+        let hedge = run.target_row_hedge;
+        anyhow::ensure!(
+            hedge.rounds == run.rounds
+                && hedge.insertion_rounds
+                    + hedge.no_prior_row_rounds
+                    + hedge.duplicate_only_rounds
+                    + hedge.no_replaceable_hedge_rounds
+                    == run.rounds,
+            "target-row hedge decisions missed rounds: decisions={} inserted={} cold={} duplicate={} no-slot={} rounds={}",
+            hedge.rounds,
+            hedge.insertion_rounds,
+            hedge.no_prior_row_rounds,
+            hedge.duplicate_only_rounds,
+            hedge.no_replaceable_hedge_rounds,
+            run.rounds,
+        );
+        anyhow::ensure!(
+            hedge.candidate_rows == run.verify_nodes
+                && hedge.target_rows_offered == hedge.insertion_rounds
+                && hedge.offered_by_depth.iter().sum::<u64>() == hedge.target_rows_offered
+                && hedge.accepted_by_depth.iter().sum::<u64>() == hedge.target_rows_accepted
+                && hedge.target_rows_accepted <= hedge.target_rows_offered,
+            "target-row hedge telemetry diverged: candidate_rows={}/{} offered={}/{} accepted={} depth_offered={} depth_accepted={}",
+            hedge.candidate_rows,
+            run.verify_nodes,
+            hedge.target_rows_offered,
+            hedge.insertion_rounds,
+            hedge.target_rows_accepted,
+            hedge.offered_by_depth.iter().sum::<u64>(),
+            hedge.accepted_by_depth.iter().sum::<u64>(),
+        );
+    }
     if adaptive_expansions {
         anyhow::ensure!(
             run.adaptive_expansions.shallow_rounds + run.adaptive_expansions.deep_rounds
@@ -11559,6 +11873,43 @@ struct BenchEagle3Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_deep_rejection_resets: Option<u64>,
     token_recycling_hybrid: bool,
+    target_row_hedge: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_max_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_candidate_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_cache_update_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_insertion_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_no_prior_row_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_duplicate_only_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_no_replaceable_neural_hedge_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_supported_primary_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_full_path_duplicates: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_rows_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_shared_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_neural_hedges_retained_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_offered_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_accepted_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_candidate_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_candidate_ids: Option<u64>,
     dual_eagle_selector: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     dual_eagle_race_rounds: Option<u8>,
@@ -11741,6 +12092,113 @@ fn eagle3_adaptive_branching_enabled() -> bool {
 fn eagle3_token_recycling_hybrid_enabled() -> bool {
     std::env::var_os("CAMELID_BENCH_EAGLE3_TR_HYBRID")
         .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn parse_eagle3_target_row_hedge_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE must be a boolean, got {value:?}"
+        ),
+    }
+}
+
+fn eagle3_target_row_hedge_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_eagle3_target_row_hedge_env(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_target_row_hedge_config(
+    enabled: bool,
+    tree_nodes: Option<usize>,
+    draft_tokens: usize,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+    verifier_width_selector: bool,
+    x3_x4_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes
+            == Some(
+                camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES
+            ),
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires --tree-nodes {}",
+        camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+    );
+    anyhow::ensure!(
+        draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector
+            && !verifier_width_selector
+            && !x3_x4_selector,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE requires fixed ordinary N8 EAGLE drafting and cannot combine with adaptive branching/expansions, suffix-first, whole-tree Token Recycling, dual-EAGLE, width selection, or X3/X4 selection"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_target_row_hedge_gate_is_default_off_and_fixed_n8() {
+    for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+        assert!(!parse_eagle3_target_row_hedge_env(value).unwrap());
+    }
+    for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+        assert!(parse_eagle3_target_row_hedge_env(value).unwrap());
+    }
+    assert!(parse_eagle3_target_row_hedge_env(Some("maybe")).is_err());
+    assert!(validate_eagle3_target_row_hedge_config(
+        true,
+        Some(8),
+        15,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_ok());
+    for invalid in [
+        (Some(7), 15, false, false, false, false, false, false, false),
+        (Some(8), 1, false, false, false, false, false, false, false),
+        (Some(8), 15, true, false, false, false, false, false, false),
+        (Some(8), 15, false, true, false, false, false, false, false),
+        (Some(8), 15, false, false, true, false, false, false, false),
+        (Some(8), 15, false, false, false, true, false, false, false),
+        (Some(8), 15, false, false, false, false, true, false, false),
+        (Some(8), 15, false, false, false, false, false, true, false),
+        (Some(8), 15, false, false, false, false, false, false, true),
+    ] {
+        assert!(validate_eagle3_target_row_hedge_config(
+            true, invalid.0, invalid.1, invalid.2, invalid.3, invalid.4, invalid.5, invalid.6,
+            invalid.7, invalid.8,
+        )
+        .is_err());
+    }
 }
 
 fn eagle3_adaptive_expansions_enabled() -> bool {
@@ -12538,6 +12996,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_MMA",
         "CAMELID_SPEC_TREE",
         "CAMELID_BENCH_EAGLE3_TR_HYBRID",
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE",
         "CAMELID_BENCH_DUAL_EAGLE_SELECTOR",
@@ -12885,6 +13344,7 @@ fn run_bench_eagle3(
     const PINNED_EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
         "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
     let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
+    let target_row_hedge = eagle3_target_row_hedge_enabled()?;
     let adaptive_expansions = eagle3_adaptive_expansions_enabled();
     let dual_eagle_selector = dual_eagle_selector_enabled()?;
     let verifier_width_selector = eagle3_width_selector_config()?;
@@ -12979,6 +13439,18 @@ fn run_bench_eagle3(
         suffix_first,
         token_recycling_hybrid,
         dual_eagle_selector,
+    )?;
+    validate_eagle3_target_row_hedge_config(
+        target_row_hedge,
+        tree_nodes,
+        draft_tokens,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+        verifier_width_selector.is_some(),
+        x3_x4_selector.is_some(),
     )?;
     validate_eagle3_terminal_head_skip_config(
         terminal_head_skip,
@@ -13219,6 +13691,7 @@ fn run_bench_eagle3(
         terminal_head_skip,
         suffix_first,
         token_recycling_hybrid,
+        target_row_hedge,
         primary_drafter,
         secondary_drafter,
         head_upload_ms,
@@ -13296,6 +13769,8 @@ fn run_bench_eagle3(
             "dynamic_tree_dual_eagle_selector"
         } else if token_recycling_hybrid {
             "dynamic_tree_e9_tr_hybrid"
+        } else if target_row_hedge {
+            "dynamic_tree_eagle3_target_row_hedge"
         } else if adaptive_expansions {
             "dynamic_tree_adaptive_expansions"
         } else if x3_x4_selector.is_some() && verifier_width_selector.is_some() {
@@ -13393,6 +13868,43 @@ fn run_bench_eagle3(
         adaptive_deep_rejection_resets: adaptive_expansions
             .then_some(eagle.adaptive_expansions.deep_rejection_resets),
         token_recycling_hybrid,
+        target_row_hedge,
+        target_row_hedge_max_nodes: target_row_hedge.then_some(
+            camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+        ),
+        target_row_hedge_candidate_policy: target_row_hedge
+            .then_some("shallowest_novel_prior_verified_top1_on_eagle_primary_spine"),
+        target_row_hedge_cache_update_policy: target_row_hedge
+            .then_some("post_current_target_verification_and_acceptance"),
+        target_row_hedge_rounds: target_row_hedge.then_some(eagle.target_row_hedge.rounds),
+        target_row_hedge_insertion_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.insertion_rounds),
+        target_row_hedge_no_prior_row_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.no_prior_row_rounds),
+        target_row_hedge_duplicate_only_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.duplicate_only_rounds),
+        target_row_hedge_no_replaceable_neural_hedge_rounds: target_row_hedge
+            .then_some(eagle.target_row_hedge.no_replaceable_hedge_rounds),
+        target_row_hedge_supported_primary_rows: target_row_hedge
+            .then_some(eagle.target_row_hedge.supported_primary_rows),
+        target_row_hedge_full_path_duplicates: target_row_hedge
+            .then_some(eagle.target_row_hedge.full_path_duplicates),
+        target_row_hedge_rows_offered: target_row_hedge
+            .then_some(eagle.target_row_hedge.target_rows_offered),
+        target_row_hedge_rows_accepted: target_row_hedge
+            .then_some(eagle.target_row_hedge.target_rows_accepted),
+        target_row_hedge_shared_rows_accepted: target_row_hedge
+            .then_some(eagle.target_row_hedge.shared_rows_accepted),
+        target_row_hedge_neural_hedges_retained_sum: target_row_hedge
+            .then_some(eagle.target_row_hedge.neural_hedges_retained_sum),
+        target_row_hedge_offered_by_depth: target_row_hedge
+            .then_some(eagle.target_row_hedge.offered_by_depth),
+        target_row_hedge_accepted_by_depth: target_row_hedge
+            .then_some(eagle.target_row_hedge.accepted_by_depth),
+        target_row_hedge_candidate_rows: target_row_hedge
+            .then_some(eagle.target_row_hedge.candidate_rows),
+        target_row_hedge_candidate_ids: target_row_hedge
+            .then_some(eagle.target_row_hedge.candidate_ids),
         dual_eagle_selector,
         dual_eagle_race_rounds: dual_eagle_selector.then_some(DUAL_EAGLE_RACE_ROUNDS),
         dual_eagle_root_ranking: dual_eagle_selector.then_some(DUAL_EAGLE_ROOT_RANKING),
@@ -13580,6 +14092,28 @@ fn run_bench_eagle3(
             eagle.token_recycling.cold_seed_anchors,
             eagle.token_recycling.candidate_rows,
             eagle.token_recycling.candidate_ids,
+        );
+    }
+    if target_row_hedge {
+        eprintln!(
+            "[bench-eagle3-target-row-hedge] rounds={} inserted={} cold={} duplicate-only={} \
+             no-slot={} supported={} deduped={} target offered/accepted={}/{} shared-accepted={} \
+             neural-retained-sum={} cache rows/ids={}/{} depth offered/accepted={:?}/{:?}",
+            eagle.target_row_hedge.rounds,
+            eagle.target_row_hedge.insertion_rounds,
+            eagle.target_row_hedge.no_prior_row_rounds,
+            eagle.target_row_hedge.duplicate_only_rounds,
+            eagle.target_row_hedge.no_replaceable_hedge_rounds,
+            eagle.target_row_hedge.supported_primary_rows,
+            eagle.target_row_hedge.full_path_duplicates,
+            eagle.target_row_hedge.target_rows_offered,
+            eagle.target_row_hedge.target_rows_accepted,
+            eagle.target_row_hedge.shared_rows_accepted,
+            eagle.target_row_hedge.neural_hedges_retained_sum,
+            eagle.target_row_hedge.candidate_rows,
+            eagle.target_row_hedge.candidate_ids,
+            eagle.target_row_hedge.offered_by_depth,
+            eagle.target_row_hedge.accepted_by_depth,
         );
     }
     if adaptive_expansions {
