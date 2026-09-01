@@ -318,6 +318,31 @@ struct DeferredRead {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, PartialEq, Eq)]
+struct KquantSoa8SourceProbe {
+    head: [u8; 32],
+    tail: [u8; 32],
+}
+
+#[cfg(target_os = "macos")]
+impl KquantSoa8SourceProbe {
+    fn new(wire: &[u8]) -> Self {
+        let mut head = [0u8; 32];
+        let mut tail = [0u8; 32];
+        let sample = wire.len().min(32);
+        head[..sample].copy_from_slice(&wire[..sample]);
+        tail[32 - sample..].copy_from_slice(&wire[wire.len() - sample..]);
+        Self { head, tail }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct KquantSoa8CacheEntry {
+    buffer: Buffer,
+    source_probe: KquantSoa8SourceProbe,
+}
+
+#[cfg(target_os = "macos")]
 struct MetalLinearCache {
     // Permanent caches
     weight_buffers: HashMap<(usize, usize), Buffer>,
@@ -330,6 +355,12 @@ struct MetalLinearCache {
     /// is not active. Kept separate from Q8's converted cache because these
     /// bytes are consumed without layout conversion.
     raw_wire_weight_buffers: HashMap<(usize, usize), Buffer>,
+    /// Optional verifier-only Q4_K/Q6_K word-plane sidecars. Each output-row
+    /// octet is stored as `[superblock][word][row][byte]`. Q6_K's final half is
+    /// a two-byte row plane. This is a pure byte permutation with no padded
+    /// tail, so its allocation exactly matches the canonical wire tensor.
+    kquant_soa8_weight_buffers:
+        HashMap<(usize, usize, usize, usize, ResidentWeightFormat), KquantSoa8CacheEntry>,
     /// Offset-0 NoCopy buffers wrapped over page-aligned wire-page allocations
     /// (fast-load). The Arc keeps each allocation alive for as long as the cache
     /// holds its buffer, so a dropped model can never leave the GPU pointing at
@@ -352,6 +383,7 @@ impl MetalLinearCache {
             q8_block_weight_buffers: HashMap::new(),
             q8_wire_weight_buffers: HashMap::new(),
             raw_wire_weight_buffers: HashMap::new(),
+            kquant_soa8_weight_buffers: HashMap::new(),
             q8_wire_nocopy_buffers: HashMap::new(),
             activation_buffers: HashMap::new(),
             scalar_buffers: Vec::new(),
@@ -514,6 +546,46 @@ impl MetalLinearCache {
         write_buffer_u8(&buffer, wire);
         self.raw_wire_weight_buffers.insert(key, buffer.to_owned());
         buffer
+    }
+
+    fn kquant_soa8_weight_buffer(
+        &mut self,
+        device: &Device,
+        wire: &[u8],
+        format: ResidentWeightFormat,
+        rows: usize,
+        n_sb: usize,
+    ) -> Option<Buffer> {
+        let packed_len = kquant_soa8_packed_len(format, rows, n_sb)?;
+        if packed_len as u64 > device.max_buffer_length() {
+            return None;
+        }
+        let key = (wire.as_ptr() as usize, wire.len(), rows, n_sb, format);
+        let source_probe = KquantSoa8SourceProbe::new(wire);
+        if let Some(entry) = self.kquant_soa8_weight_buffers.get(&key) {
+            if entry.source_probe == source_probe {
+                trace_kquant_v4_soa8_pack(format, rows, n_sb, wire.len(), packed_len, true);
+                return Some(entry.buffer.to_owned());
+            }
+        }
+        // Never mutate an existing sidecar: a ResidentLinearWeight or an
+        // in-flight command buffer can retain it after a source pointer alias
+        // is reused. Replacing the cache entry keeps the old buffer immutable.
+        let buffer = device.new_buffer(packed_len as u64, MTLResourceOptions::StorageModeShared);
+        let packed =
+            unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<u8>(), packed_len) };
+        if !repack_kquant_soa8_into(wire, format, rows, n_sb, packed) {
+            return None;
+        }
+        self.kquant_soa8_weight_buffers.insert(
+            key,
+            KquantSoa8CacheEntry {
+                buffer: buffer.to_owned(),
+                source_probe,
+            },
+        );
+        trace_kquant_v4_soa8_pack(format, rows, n_sb, wire.len(), packed_len, false);
+        Some(buffer)
     }
 
     /// Wrap a page-aligned wire-page allocation with an offset-0 NoCopy buffer:
@@ -4818,6 +4890,303 @@ kernel void q6k_linear_mma_combined_v4(
                 device const uchar* block =
                     weight_blocks + (out_row * n_sb + sb) * 210;
                 const float dw = float(*reinterpret_cast<device const half*>(block + 208));
+                const float da = input_scales[ct * n_sb + sb];
+                accum[cell] += (dw * da) * c_stage[cr * 8 + ct];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint idx = lane * 2 + cell;
+        const uint r = idx >> 3;
+        const uint t = idx & 7u;
+        const uint rr = r0 + r;
+        if (rr < rows && t < n_tokens) output[t * rows + rr] = accum[cell];
+    }
+}
+
+// Word-plane sidecars transpose each row octet from eight independent wire
+// blocks into [word][row][byte]. Q6_K's last half is [tail][row][byte]. No byte
+// value changes, and using the actual final-row width keeps the allocation
+// exactly the same size as the canonical tensor.
+
+inline uint kquant_v4_soa8_u32(
+    device const uchar* block_planes,
+    uint tile_rows,
+    uint tile_row,
+    uint byte_offset
+) {
+    // All word-plane starts and per-row entries are four-byte aligned.
+    return *reinterpret_cast<device const uint*>(
+        block_planes + byte_offset * tile_rows + tile_row * 4u);
+}
+
+inline ushort kquant_v4_soa8_tail_u16(
+    device const uchar* tail_plane,
+    uint tile_row
+) {
+    return *reinterpret_cast<device const ushort*>(
+        tail_plane + tile_row * 2u);
+}
+
+inline void q4k_scale_min_soa8_v4(
+    device const uchar* block_planes,
+    uint tile_rows,
+    uint tile_row,
+    thread uchar (&scales)[8],
+    thread uchar (&mins)[8]
+) {
+    const uint kmask1 = 0x3f3f3f3fu;
+    const uint kmask2 = 0x0f0f0f0fu;
+    const uint kmask3 = 0x03030303u;
+    uint u0 = kquant_v4_soa8_u32(block_planes, tile_rows, tile_row, 4u);
+    uint u1 = kquant_v4_soa8_u32(block_planes, tile_rows, tile_row, 8u);
+    uint u2 = kquant_v4_soa8_u32(block_planes, tile_rows, tile_row, 12u);
+    uint u3 = ((u2 >> 4) & kmask2) | (((u1 >> 6) & kmask3) << 4);
+    const uint aux = u1 & kmask1;
+    u1 = (u2 & kmask2) | (((u0 >> 6) & kmask3) << 4);
+    u2 = aux;
+    u0 &= kmask1;
+    for (uint i = 0; i < 4; ++i) {
+        scales[i] = uchar((u0 >> (8 * i)) & 0xffu);
+        scales[4 + i] = uchar((u1 >> (8 * i)) & 0xffu);
+        mins[i] = uchar((u2 >> (8 * i)) & 0xffu);
+        mins[4 + i] = uchar((u3 >> (8 * i)) & 0xffu);
+    }
+}
+
+// Arithmetic twin of q4k_linear_mma_combined_v4 over word-plane weights.
+// Weight values, decode arithmetic, MMA sequence, synchronized materialization,
+// and the increasing-superblock f32 tail remain unchanged.
+kernel void q4k_linear_mma_combined_soa8_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_planes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    device const half* ysums [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint tile_rows = min(8u, rows - r0);
+    const uint k_pad = 8;
+
+    threadgroup half stage_a[256 * 8];
+    threadgroup half mn_a[8 * 16];
+    threadgroup float c_stage[64];
+    threadgroup float min_stage[64];
+
+    float accum[2] = {0.0f, 0.0f};
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        device const uchar* block_planes = weight_planes
+            + ulong(r0) * ulong(n_sb) * 144ul
+            + ulong(sb) * 144ul * ulong(tile_rows);
+        const uint r = lane & 7u;
+        const uint g = lane >> 3;
+        const uint rr = r0 + r;
+        if (rr < rows) {
+            uchar sc[8], mn[8];
+            q4k_scale_min_soa8_v4(block_planes, tile_rows, r, sc, mn);
+            const uint q0 = 16u + g * 32u;
+            const uint4 wv[2] = {
+                uint4(
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0),
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0 + 4u),
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0 + 8u),
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0 + 12u)
+                ),
+                uint4(
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0 + 16u),
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0 + 20u),
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0 + 24u),
+                    kquant_v4_soa8_u32(block_planes, tile_rows, r, q0 + 28u)
+                )
+            };
+            const half slo = half(int(sc[2 * g]));
+            const half shi = half(int(sc[2 * g + 1]));
+            for (uint h = 0; h < 2; ++h) {
+                for (uint c = 0; c < 4; ++c) {
+                    const uint w = wv[h][c];
+                    for (uint j = 0; j < 4; ++j) {
+                        const uint pl = (h * 4 + c) * 4 + j;
+                        const uint byte = (w >> (8 * j)) & 0xffu;
+                        stage_a[(g * 64 + pl) * 8 + r] = slo * half(int(byte & 0x0fu));
+                        stage_a[(g * 64 + 32 + pl) * 8 + r] = shi * half(int(byte >> 4));
+                    }
+                }
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) {
+                    const uint j16 = g * 8 + i;
+                    mn_a[r * 16 + j16] =
+                        half(int(mn[((j16 >> 2) * 2) + ((j16 >> 1) & 1u)]));
+                }
+            }
+        } else {
+            for (uint pl = 0; pl < 64; ++pl) {
+                stage_a[(g * 64 + pl) * 8 + r] = half(0.0f);
+            }
+            if (g < 2) {
+                for (uint i = 0; i < 8; ++i) mn_a[r * 16 + g * 8 + i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+        simdgroup_float8x8 c_min = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint m = 0; m < 2; ++m) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, mn_a + m * 8, 16);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, ysums + (sb * 16 + m * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_min, a, b, c_min);
+        }
+        simdgroup_store(c_main, c_stage, 8);
+        simdgroup_store(c_min, min_stage, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint cr = idx >> 3;
+            const uint ct = idx & 7u;
+            const uint out_row = r0 + cr;
+            if (out_row < rows && ct < n_tokens) {
+                const uint d_word =
+                    kquant_v4_soa8_u32(block_planes, tile_rows, cr, 0u);
+                const float dw = float(as_type<half>(ushort(d_word & 0xffffu)));
+                const float dm = float(as_type<half>(ushort(d_word >> 16)));
+                const float da = input_scales[ct * n_sb + sb];
+                accum[cell] += (dw * da) * c_stage[cr * 8 + ct]
+                             - (dm * da) * min_stage[cr * 8 + ct];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint cell = 0; cell < 2; ++cell) {
+        const uint idx = lane * 2 + cell;
+        const uint r = idx >> 3;
+        const uint t = idx & 7u;
+        const uint rr = r0 + r;
+        if (rr < rows && t < n_tokens) output[t * rows + rr] = accum[cell];
+    }
+}
+
+// Q6_K sibling over the same word-plane layout and unchanged V4 math order.
+kernel void q6k_linear_mma_combined_soa8_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_planes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_half [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint r0 = tile * 8;
+    if (r0 >= rows) return;
+    const uint tile_rows = min(8u, rows - r0);
+    const uint k_pad = 8;
+
+    threadgroup half stage_a[256 * 8];
+    threadgroup float c_stage[64];
+    float accum[2] = {0.0f, 0.0f};
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        device const uchar* tile_planes =
+            weight_planes + ulong(r0) * ulong(n_sb) * 210ul;
+        device const uchar* block_planes =
+            tile_planes + ulong(sb) * 208ul * ulong(tile_rows);
+        device const uchar* tail_plane = tile_planes
+            + ulong(n_sb) * 208ul * ulong(tile_rows)
+            + ulong(sb) * 2ul * ulong(tile_rows);
+        const uint r = lane & 7u;
+        const uint q = lane >> 3;
+        const uint h = q >> 1;
+        const uint s = q & 1u;
+        const uint rr = r0 + r;
+        const uint base = h * 128 + s * 16;
+        if (rr < rows) {
+            const uint scale_lo = kquant_v4_soa8_u32(
+                block_planes, tile_rows, r, 192u + 8u * h);
+            const uint scale_hi = kquant_v4_soa8_u32(
+                block_planes, tile_rows, r, 196u + 8u * h);
+            const int s0 = int(as_type<char>(uchar((scale_lo >> (8u * s)) & 0xffu)));
+            const int s1 = int(as_type<char>(uchar((scale_lo >> (8u * (s + 2u))) & 0xffu)));
+            const int s2 = int(as_type<char>(uchar((scale_hi >> (8u * s)) & 0xffu)));
+            const int s3 = int(as_type<char>(uchar((scale_hi >> (8u * (s + 2u))) & 0xffu)));
+            const uint wl0 = h * 64u + s * 16u;
+            const uint wh0 = h * 64u + 32u + s * 16u;
+            const uint wq0 = 128u + h * 32u + s * 16u;
+            // Keep one 4-byte plane from each quant stream live at a time so
+            // the address-layout experiment does not require twelve quant
+            // words to remain resident across the full decode loop.
+            for (uint word = 0; word < 4; ++word) {
+                const uint word_offset = word * 4u;
+                const uint wl = kquant_v4_soa8_u32(
+                    block_planes, tile_rows, r, wl0 + word_offset);
+                const uint wh = kquant_v4_soa8_u32(
+                    block_planes, tile_rows, r, wh0 + word_offset);
+                const uint wq = kquant_v4_soa8_u32(
+                    block_planes, tile_rows, r, wq0 + word_offset);
+                for (uint j = 0; j < 4; ++j) {
+                    const uint l = word_offset + j;
+                    const uint shift = 8u * j;
+                    const uint albyte = (wl >> shift) & 0xffu;
+                    const uint ahbyte = (wh >> shift) & 0xffu;
+                    const uint hbyte = (wq >> shift) & 0xffu;
+                    const int a0 = int((albyte & 0x0fu) | ((hbyte & 3u) << 4)) - 32;
+                    const int a1 = int((ahbyte & 0x0fu) | (((hbyte >> 2) & 3u) << 4)) - 32;
+                    const int a2 = int((albyte >> 4) | (((hbyte >> 4) & 3u) << 4)) - 32;
+                    const int a3 = int((ahbyte >> 4) | (((hbyte >> 6) & 3u) << 4)) - 32;
+                    stage_a[(base + l) * 8 + r] = half(s0 * a0);
+                    stage_a[(base + l + 32) * 8 + r] = half(s1 * a1);
+                    stage_a[(base + l + 64) * 8 + r] = half(s2 * a2);
+                    stage_a[(base + l + 96) * 8 + r] = half(s3 * a3);
+                }
+            }
+        } else {
+            for (uint l = 0; l < 16; ++l) {
+                stage_a[(base + l) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 32) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 64) * 8 + r] = half(0.0f);
+                stage_a[(base + l + 96) * 8 + r] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 c_main = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kk = 0; kk < 32; ++kk) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, stage_a + kk * 64, 8, ulong2(0, 0), true);
+            simdgroup_half8x8 b;
+            simdgroup_load(b, y_half + (sb * 256 + kk * 8) * k_pad, k_pad);
+            simdgroup_multiply_accumulate(c_main, a, b, c_main);
+        }
+        simdgroup_store(c_main, c_stage, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint cell = 0; cell < 2; ++cell) {
+            const uint idx = lane * 2 + cell;
+            const uint cr = idx >> 3;
+            const uint ct = idx & 7u;
+            const uint out_row = r0 + cr;
+            if (out_row < rows && ct < n_tokens) {
+                const float dw = float(as_type<half>(
+                    kquant_v4_soa8_tail_u16(tail_plane, cr)));
                 const float da = input_scales[ct * n_sb + sb];
                 accum[cell] += (dw * da) * c_stage[cr * 8 + ct];
             }
@@ -16602,6 +16971,29 @@ fn encode_kquant_v4_strict_fused_stage(
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KquantV4ProjectionRoute {
+    Synchronized,
+    DirectFragment,
+    Soa8,
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_projection_requests(
+    narrow: bool,
+    soa8_enabled: bool,
+    has_soa8_sidecar: bool,
+    direct_fragment_enabled: bool,
+) -> (bool, bool) {
+    let soa8_requested = narrow && soa8_enabled && has_soa8_sidecar;
+    // The process-wide SOA8 gate suppresses direct-fragment even for weights
+    // without sidecars and on a candidate-pipeline failure. That keeps the
+    // verifier in synchronized arithmetic throughout the experiment.
+    let direct_requested = narrow && !soa8_enabled && direct_fragment_enabled;
+    (soa8_requested, direct_requested)
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_kquant_v4_prepared_projection_route(
     e: &metal::ComputeCommandEncoderRef,
@@ -16612,7 +17004,7 @@ fn encode_kquant_v4_prepared_projection_route(
     out: &Buffer,
     scalar: &Buffer,
     rows: usize,
-    direct_fragment: bool,
+    route: KquantV4ProjectionRoute,
 ) -> bool {
     let is_q6k = match weight.format {
         ResidentWeightFormat::Q4K => false,
@@ -16620,21 +17012,39 @@ fn encode_kquant_v4_prepared_projection_route(
         _ => unreachable!("V4 prepared projection requires Q4_K or Q6_K"),
     };
     let wide = stage.n_tokens > 8;
-    let pipeline = match (is_q6k, wide, direct_fragment) {
-        (false, false, true) => v4.q4k_v4_direct.as_ref(),
-        (true, false, true) => v4.q6k_v4_direct.as_ref(),
-        (_, true, true) => None,
-        (false, false, false) => Some(&v4.q4k_v4),
-        (false, true, false) => Some(&v4.q4k_v4_w16),
-        (true, false, false) => Some(&v4.q6k_v4),
-        (true, true, false) => Some(&v4.q6k_v4_w16),
+    let pipeline = match (is_q6k, wide, route) {
+        (false, false, KquantV4ProjectionRoute::DirectFragment) => {
+            v4.q4k_v4_direct.as_ref()
+        }
+        (true, false, KquantV4ProjectionRoute::DirectFragment) => {
+            v4.q6k_v4_direct.as_ref()
+        }
+        (_, true, KquantV4ProjectionRoute::DirectFragment) => None,
+        (false, false, KquantV4ProjectionRoute::Soa8) => v4.q4k_v4_soa8.as_ref(),
+        (true, false, KquantV4ProjectionRoute::Soa8) => v4.q6k_v4_soa8.as_ref(),
+        (_, true, KquantV4ProjectionRoute::Soa8) => None,
+        (false, false, KquantV4ProjectionRoute::Synchronized) => Some(&v4.q4k_v4),
+        (false, true, KquantV4ProjectionRoute::Synchronized) => Some(&v4.q4k_v4_w16),
+        (true, false, KquantV4ProjectionRoute::Synchronized) => Some(&v4.q6k_v4),
+        (true, true, KquantV4ProjectionRoute::Synchronized) => Some(&v4.q6k_v4_w16),
     };
     let Some(pipeline) = pipeline else {
         return false;
     };
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(scales), 0);
-    e.set_buffer(2, Some(&weight.buffer), 0);
+    let weight_buffer = match route {
+        KquantV4ProjectionRoute::Soa8 => {
+            let Some(buffer) = weight.soa8_buffer.as_ref() else {
+                return false;
+            };
+            buffer
+        }
+        KquantV4ProjectionRoute::Synchronized | KquantV4ProjectionRoute::DirectFragment => {
+            &weight.buffer
+        }
+    };
+    e.set_buffer(2, Some(weight_buffer), 0);
     e.set_buffer(3, Some(out), 0);
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
@@ -16679,10 +17089,51 @@ fn encode_kquant_v4_prepared_projection(
     scalar: &Buffer,
     rows: usize,
 ) {
-    let direct_requested = stage.n_tokens <= 8 && kquant_v4_direct_fragment_enabled();
+    let narrow = stage.n_tokens <= 8;
+    let soa8_enabled = kquant_v4_soa8_enabled();
+    let (soa8_requested, direct_requested) = kquant_v4_projection_requests(
+        narrow,
+        soa8_enabled,
+        weight.soa8_buffer.is_some(),
+        !soa8_enabled && kquant_v4_direct_fragment_enabled(),
+    );
+    let used_soa8 = soa8_requested
+        && encode_kquant_v4_prepared_projection_route(
+            e,
+            v4,
+            scales,
+            stage,
+            weight,
+            out,
+            scalar,
+            rows,
+            KquantV4ProjectionRoute::Soa8,
+        );
+    if soa8_requested && !used_soa8 {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[metal] CAMELID_KQUANT_V4_SOA8 sidecar is present, but its pipeline is \
+                 unavailable; retaining synchronized V4 materialization"
+            );
+        }
+    }
+    // SOA8 is an arithmetic twin of synchronized V4. Once its process-wide
+    // gate is set, suppress direct-fragment for every projection, including
+    // canonical Q/K/V/O weights without sidecars. This prevents a mixed
+    // direct/synchronized verifier and keeps plain N=1 and SOA N<=8 in the
+    // same exact arithmetic universe when both environment flags are present.
     let used_direct = direct_requested
         && encode_kquant_v4_prepared_projection_route(
-            e, v4, scales, stage, weight, out, scalar, rows, true,
+            e,
+            v4,
+            scales,
+            stage,
+            weight,
+            out,
+            scalar,
+            rows,
+            KquantV4ProjectionRoute::DirectFragment,
         );
     if direct_requested && !used_direct {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -16693,12 +17144,27 @@ fn encode_kquant_v4_prepared_projection(
             );
         }
     }
-    if !used_direct {
+    if !used_soa8 && !used_direct {
         assert!(encode_kquant_v4_prepared_projection_route(
-            e, v4, scales, stage, weight, out, scalar, rows, false,
+            e,
+            v4,
+            scales,
+            stage,
+            weight,
+            out,
+            scalar,
+            rows,
+            KquantV4ProjectionRoute::Synchronized,
         ));
     }
-    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows, used_direct);
+    let route = if used_soa8 {
+        KquantV4ProjectionRoute::Soa8
+    } else if used_direct {
+        KquantV4ProjectionRoute::DirectFragment
+    } else {
+        KquantV4ProjectionRoute::Synchronized
+    };
+    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows, route);
 }
 
 #[cfg(target_os = "macos")]
@@ -17851,9 +18317,11 @@ struct KquantV2Kernels {
     q6k_mma_stage_y: ComputePipelineState,
     q4k_v4: ComputePipelineState,
     q4k_v4_direct: Option<ComputePipelineState>,
+    q4k_v4_soa8: Option<ComputePipelineState>,
     q4k_v4_w16: ComputePipelineState,
     q6k_v4: ComputePipelineState,
     q6k_v4_direct: Option<ComputePipelineState>,
+    q6k_v4_soa8: Option<ComputePipelineState>,
     q6k_v4_w16: ComputePipelineState,
 }
 
@@ -17893,9 +18361,11 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q6k_mma_stage_y: pipeline("q6k_mma_stage_y_f32")?,
                 q4k_v4: pipeline("q4k_linear_mma_combined_v4")?,
                 q4k_v4_direct: pipeline("q4k_linear_mma_combined_direct_v4"),
+                q4k_v4_soa8: pipeline("q4k_linear_mma_combined_soa8_v4"),
                 q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
                 q6k_v4_direct: pipeline("q6k_linear_mma_combined_direct_v4"),
+                q6k_v4_soa8: pipeline("q6k_linear_mma_combined_soa8_v4"),
                 q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
         })
@@ -17948,6 +18418,52 @@ fn kquant_v4_direct_fragment_enabled() -> bool {
     })
 }
 
+/// Opt in to an 8-row structure-of-arrays sidecar for the fixed-width V4
+/// verifier kernels. The canonical GGUF wire buffer remains authoritative and
+/// is still used by the drafter, attention projections, wide windows, and all
+/// fallback paths. The sidecar only changes how the same quantized words are
+/// fetched by target-model FFN/head projections at widths through eight.
+fn kquant_v4_soa8_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_KQUANT_V4_SOA8")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// One-shot proof that a canonical K-quant allocation was repacked into a
+/// detached SOA8 sidecar. The source probe mirrors the canonical resident
+/// cache's head/tail alias guard and is checked on every hit.
+#[cfg(target_os = "macos")]
+fn trace_kquant_v4_soa8_pack(
+    format: ResidentWeightFormat,
+    rows: usize,
+    n_sb: usize,
+    wire_bytes: usize,
+    packed_bytes: usize,
+    cache_hit: bool,
+) {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    if !*TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()) {
+        return;
+    }
+    let bit = match (format, cache_hit) {
+        (ResidentWeightFormat::Q4K, false) => 1,
+        (ResidentWeightFormat::Q6K, false) => 2,
+        (ResidentWeightFormat::Q4K, true) => 4,
+        (ResidentWeightFormat::Q6K, true) => 8,
+        _ => return,
+    };
+    if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        let cache = if cache_hit { "hit" } else { "build" };
+        eprintln!(
+            "[metal-kquant-v4-soa8] cache={cache} format={format:?} rows={rows} n_sb={n_sb} \
+             wire_bytes={wire_bytes} packed_bytes={packed_bytes}"
+        );
+    }
+}
+
 /// One-shot production dispatch proof for the experimental v4 lane. The trace
 /// is completely dormant unless explicitly requested, then prints the first
 /// Q4/Q6 single/narrow/wide encode observed by this process. This closes the gap
@@ -17958,28 +18474,34 @@ fn trace_kquant_v4_dispatch(
     format: ResidentWeightFormat,
     n_tokens: usize,
     rows: usize,
-    direct_fragment: bool,
+    route: KquantV4ProjectionRoute,
 ) {
     static TRACE: OnceLock<bool> = OnceLock::new();
-    static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if !*TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()) {
         return;
     }
-    let (bit, label) = match (format, n_tokens) {
-        (ResidentWeightFormat::Q4K, 1) => (1, "q4-single"),
-        (ResidentWeightFormat::Q4K, 2..=8) => (2, "q4-multi"),
-        (ResidentWeightFormat::Q4K, 9..=16) => (4, "q4-wide"),
-        (ResidentWeightFormat::Q6K, 1) => (8, "q6-single"),
-        (ResidentWeightFormat::Q6K, 2..=8) => (16, "q6-multi"),
-        (ResidentWeightFormat::Q6K, 9..=16) => (32, "q6-wide"),
+    let (shape, label) = match (format, n_tokens) {
+        (ResidentWeightFormat::Q4K, 1) => (0, "q4-single"),
+        (ResidentWeightFormat::Q4K, 2..=8) => (1, "q4-multi"),
+        (ResidentWeightFormat::Q4K, 9..=16) => (2, "q4-wide"),
+        (ResidentWeightFormat::Q6K, 1) => (3, "q6-single"),
+        (ResidentWeightFormat::Q6K, 2..=8) => (4, "q6-multi"),
+        (ResidentWeightFormat::Q6K, 9..=16) => (5, "q6-wide"),
         _ => return,
     };
+    let route_index = match route {
+        KquantV4ProjectionRoute::Synchronized => 0u32,
+        KquantV4ProjectionRoute::DirectFragment => 1,
+        KquantV4ProjectionRoute::Soa8 => 2,
+    };
+    let bit = 1u32 << (shape + route_index * 6);
     let previous = SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
     if previous & bit == 0 {
-        let pipeline = if direct_fragment {
-            "combined-mma-v4-direct-fragment"
-        } else {
-            "combined-mma-v4"
+        let pipeline = match route {
+            KquantV4ProjectionRoute::Synchronized => "combined-mma-v4",
+            KquantV4ProjectionRoute::DirectFragment => "combined-mma-v4-direct-fragment",
+            KquantV4ProjectionRoute::Soa8 => "combined-mma-v4-soa8",
         };
         eprintln!(
             "[metal-kquant-v4] dispatch={label} n_tokens={n_tokens} rows={rows} pipeline={pipeline}"
@@ -26113,16 +26635,19 @@ pub fn try_ffn_block_resident(
     let gate_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, gate_weight_blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let up_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, up_weight_blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let down_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, down_weight_blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let mut keep = Vec::new();
@@ -26210,21 +26735,25 @@ pub fn try_attention_block_resident(
     let q_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, q_weight_blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let k_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, k_weight_blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let v_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, v_weight_blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let o_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, o_weight_blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let cache_k_buf = upload_cache_buffer(k, cache_k);
@@ -26355,6 +26884,7 @@ pub fn try_decode_layer_resident(
     let wrap_q8 = |blocks: &[u8]| ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, blocks),
+        soa8_buffer: None,
         q8_wire: false,
     };
     let q_w = wrap_q8(q_weight_blocks);
@@ -26521,6 +27051,7 @@ pub fn try_decode_forward_resident(
                 let q8 = |buffer| ResidentLinearWeight {
                     format: ResidentWeightFormat::Q8_0,
                     buffer,
+                    soa8_buffer: None,
                     q8_wire: false,
                 };
                 [
@@ -26644,8 +27175,20 @@ pub struct ResidentLayerWeights<'a> {
     pub down_weight_blocks: ResidentWeightBytes<'a>,
 }
 
+/// Exact matrix geometry supplied by the resident model owner while warming
+/// weights. Keeping it explicit avoids guessing a tensor's row count from byte
+/// length when constructing optional layout sidecars.
+#[derive(Clone, Copy, Debug)]
+pub struct ResidentWeightGeometry {
+    pub hidden: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub vocab: usize,
+}
+
 /// Where a resident weight's bytes live on the CPU side.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResidentWeightFormat {
     DenseF32,
     DenseF16,
@@ -26759,12 +27302,98 @@ impl ResidentWeightBytes<'_> {
         input_width.is_multiple_of(format.values_per_block())
             && self.block_count() == rows * (input_width / format.values_per_block())
     }
+
+    #[cfg(target_os = "macos")]
+    fn canonical_wire_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::WirePages { pages, .. } => Some(pages.bytes()),
+            Self::KQuantBytes { bytes, .. } => Some(bytes),
+            Self::Blocks36(_) => None,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_soa8_packed_len(
+    format: ResidentWeightFormat,
+    rows: usize,
+    n_sb: usize,
+) -> Option<usize> {
+    if rows == 0
+        || n_sb == 0
+        || !matches!(
+            format,
+            ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+        )
+    {
+        return None;
+    }
+    rows.checked_mul(n_sb)?
+        .checked_mul(format.wire_bytes_per_block())
+}
+
+/// Exact word-plane repack for the optional narrow V4 verifier sidecar.
+///
+/// A full output-row octet is `[superblock][word][row][byte]`. Q6_K's last
+/// two bytes form `[tail_half][row][byte]`. The final octet uses its actual row
+/// count instead of padding to eight, making this a byte-size-neutral bijection
+/// for every valid shape while retaining aligned uint loads in the shader.
+#[cfg(target_os = "macos")]
+fn repack_kquant_soa8_into(
+    wire: &[u8],
+    format: ResidentWeightFormat,
+    rows: usize,
+    n_sb: usize,
+    packed: &mut [u8],
+) -> bool {
+    let block_bytes = format.wire_bytes_per_block();
+    let Some(expected) = kquant_soa8_packed_len(format, rows, n_sb) else {
+        return false;
+    };
+    if wire.len() != expected || packed.len() != expected {
+        return false;
+    }
+    let word_bytes = block_bytes & !3usize;
+    let tail_bytes = block_bytes - word_bytes;
+    for tile_row0 in (0..rows).step_by(8) {
+        let tile_rows = (rows - tile_row0).min(8);
+        let tile_base = tile_row0 * n_sb * block_bytes;
+        for sb in 0..n_sb {
+            let word_sb_base = tile_base + sb * word_bytes * tile_rows;
+            for word in 0..word_bytes / 4 {
+                let plane_base = word_sb_base + word * tile_rows * 4;
+                for tile_row in 0..tile_rows {
+                    let row = tile_row0 + tile_row;
+                    let src = (row * n_sb + sb) * block_bytes + word * 4;
+                    let dst = plane_base + tile_row * 4;
+                    packed[dst..dst + 4].copy_from_slice(&wire[src..src + 4]);
+                }
+            }
+            if tail_bytes != 0 {
+                let plane_base = tile_base
+                    + n_sb * word_bytes * tile_rows
+                    + sb * tail_bytes * tile_rows;
+                for tile_row in 0..tile_rows {
+                    let row = tile_row0 + tile_row;
+                    let src = (row * n_sb + sb) * block_bytes + word_bytes;
+                    let dst = plane_base + tile_row * tail_bytes;
+                    packed[dst..dst + tail_bytes]
+                        .copy_from_slice(&wire[src..src + tail_bytes]);
+                }
+            }
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "macos")]
 struct ResidentLinearWeight {
     format: ResidentWeightFormat,
     buffer: Buffer,
+    /// Optional byte-size-neutral `[row_octet][superblock][word][row][byte]`
+    /// sidecar for the narrow target verifier. The canonical buffer remains
+    /// authoritative, and the final tile is not padded.
+    soa8_buffer: Option<Buffer>,
     /// Q8_0 has two resident layouts: decoded 36-byte blocks and raw 34-byte
     /// GGUF wire blocks. Carry the physical layout with the buffer instead of
     /// consulting process-global fast-path flags at dispatch time.
@@ -26801,8 +27430,46 @@ fn resolve_resident_weight(
     Some(ResidentLinearWeight {
         format,
         buffer,
+        soa8_buffer: None,
         q8_wire: physical_q8_wire,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_resident_weight_for_shape(
+    cache: &mut MetalLinearCache,
+    device: &Device,
+    weight: &ResidentWeightBytes<'_>,
+    q8_wire: bool,
+    input_width: usize,
+    rows: usize,
+    allow_soa8_sidecar: bool,
+) -> Option<ResidentLinearWeight> {
+    let mut resident = resolve_resident_weight(cache, device, weight, q8_wire)?;
+    if !allow_soa8_sidecar
+        || !q8_wire
+        || !kquant_v4_enabled()
+        || !kquant_v4_soa8_enabled()
+        || !matches!(
+            resident.format,
+            ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+        )
+        || input_width == 0
+        || !input_width.is_multiple_of(256)
+        || !weight.matches_shape(input_width, rows)
+    {
+        return Some(resident);
+    }
+    if let Some(wire) = weight.canonical_wire_bytes() {
+        resident.soa8_buffer = cache.kquant_soa8_weight_buffer(
+            device,
+            wire,
+            resident.format,
+            rows,
+            input_width / 256,
+        );
+    }
+    Some(resident)
 }
 
 /// One volatile read per 4 KiB of the buffer (16 KiB pages on Apple Silicon; the 4 KiB
@@ -26834,16 +27501,20 @@ fn touch_buffer_pages(buffer: &Buffer) {
 /// The resident engines otherwise resolve weights lazily inside the first encoded
 /// graph, which lands the whole convert/upload/page-in cost (multi-second for a
 /// billion-parameter model) in the middle of the first decode step. A caller that
-/// knows it will decode soon — the speculative draft model at construction — calls
-/// this at configure time instead. Idempotent and lossless: it populates the same
-/// (pointer, length)-keyed caches `prepare_token` resolves from, so the first encode
-/// hits instead of uploading. Returns false when Metal is unavailable or any tensor
-/// fails to resolve (the lazy path then proceeds exactly as before).
+/// knows it will decode soon calls this at configure/bootstrap time instead. Exact
+/// projection geometry also lets an opted-in target build byte-neutral SOA8 sidecars
+/// for only its FFN and output-head projections; draft sessions pass
+/// `prepare_soa8_sidecars=false` and retain canonical weights only.
+/// Idempotent and lossless: it populates the same pointer-keyed caches the first
+/// encode resolves from. Returns false when Metal is unavailable or any tensor fails
+/// to resolve (the lazy path then proceeds exactly as before).
 #[cfg(target_os = "macos")]
 pub fn prewarm_resident_weights_cache(
     layers: &[ResidentLayerWeights],
     output_projection: Option<&ResidentWeightBytes>,
     token_embedding: Option<&ResidentWeightBytes>,
+    geometry: ResidentWeightGeometry,
+    prepare_soa8_sidecars: bool,
 ) -> bool {
     let Some(k) = metal_linear_kernel() else {
         return false;
@@ -26855,23 +27526,54 @@ pub fn prewarm_resident_weights_cache(
             return false;
         };
         for l in layers {
-            for w in [
-                &l.q_weight_blocks,
-                &l.k_weight_blocks,
-                &l.v_weight_blocks,
-                &l.o_weight_blocks,
-                &l.gate_weight_blocks,
-                &l.up_weight_blocks,
-                &l.down_weight_blocks,
+            for (w, input_width, rows, ffn_or_head) in [
+                (&l.q_weight_blocks, geometry.hidden, geometry.q_dim, false),
+                (&l.k_weight_blocks, geometry.hidden, geometry.kv_dim, false),
+                (&l.v_weight_blocks, geometry.hidden, geometry.kv_dim, false),
+                (&l.o_weight_blocks, geometry.q_dim, geometry.hidden, false),
+                (
+                    &l.gate_weight_blocks,
+                    geometry.hidden,
+                    geometry.ffn_dim,
+                    true,
+                ),
+                (
+                    &l.up_weight_blocks,
+                    geometry.hidden,
+                    geometry.ffn_dim,
+                    true,
+                ),
+                (
+                    &l.down_weight_blocks,
+                    geometry.ffn_dim,
+                    geometry.hidden,
+                    true,
+                ),
             ] {
-                match resolve_resident_weight(&mut cache, &k.device, w, wire) {
+                match resolve_resident_weight_for_shape(
+                    &mut cache,
+                    &k.device,
+                    w,
+                    wire,
+                    input_width,
+                    rows,
+                    prepare_soa8_sidecars && ffn_or_head,
+                ) {
                     Some(r) => resolved.push(r),
                     None => return false,
                 }
             }
         }
         if let Some(w) = output_projection {
-            match resolve_resident_weight(&mut cache, &k.device, w, wire) {
+            match resolve_resident_weight_for_shape(
+                &mut cache,
+                &k.device,
+                w,
+                wire,
+                geometry.hidden,
+                geometry.vocab,
+                prepare_soa8_sidecars,
+            ) {
                 Some(r) => resolved.push(r),
                 None => return false,
             }
@@ -26893,6 +27595,9 @@ pub fn prewarm_resident_weights_cache(
     // that cost here.
     for r in &resolved {
         touch_buffer_pages(&r.buffer);
+        if let Some(soa8) = r.soa8_buffer.as_ref() {
+            touch_buffer_pages(soa8);
+        }
     }
     // CPU touches fault pages into host RAM but do NOT wire them into the GPU's
     // residency set — the first command buffer referencing the buffers still pays the
@@ -26904,10 +27609,31 @@ pub fn prewarm_resident_weights_cache(
     let e = cb.new_compute_command_encoder();
     for r in &resolved {
         e.use_resource(&r.buffer, MTLResourceUsage::Read);
+        if let Some(soa8) = r.soa8_buffer.as_ref() {
+            e.use_resource(soa8, MTLResourceUsage::Read);
+        }
     }
     e.end_encoding();
     cb.commit();
     cb.wait_until_completed();
+    if prepare_soa8_sidecars
+        && kquant_v4_enabled()
+        && kquant_v4_soa8_enabled()
+        && std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some()
+    {
+        let buffers = resolved
+            .iter()
+            .filter(|r| r.soa8_buffer.is_some())
+            .count();
+        let bytes: u64 = resolved
+            .iter()
+            .filter_map(|r| r.soa8_buffer.as_ref())
+            .map(|b| b.length())
+            .sum();
+        eprintln!(
+            "[metal-kquant-v4-soa8-prewarm] scope=ffn_head buffers={buffers} bytes={bytes}"
+        );
+    }
     true
 }
 
@@ -28022,6 +28748,7 @@ fn eagle3_upload_bf16(k: &MetalLinearKernel, bytes: &[u8]) -> ResidentLinearWeig
     ResidentLinearWeight {
         format: ResidentWeightFormat::DenseBF16,
         buffer,
+        soa8_buffer: None,
         q8_wire: false,
     }
 }
@@ -28048,6 +28775,7 @@ fn eagle3_upload_q8_wire(
     Ok(ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer,
+        soa8_buffer: None,
         q8_wire: true,
     })
 }
@@ -33518,24 +34246,35 @@ impl ResidentDecodeState {
         let final_norm_buf: Buffer;
         {
             let mut cache = metal_linear_cache().lock().ok()?;
-            let mut wb = |w: &ResidentWeightBytes| {
-                resolve_resident_weight(&mut cache, &kern.device, w, true)
+            let mut wb = |w: &ResidentWeightBytes,
+                          input_width: usize,
+                          rows: usize,
+                          allow_soa8_sidecar: bool| {
+                resolve_resident_weight_for_shape(
+                    &mut cache,
+                    &kern.device,
+                    w,
+                    true,
+                    input_width,
+                    rows,
+                    allow_soa8_sidecar,
+                )
             };
             resident = layers
                 .iter()
                 .map(|l| {
                     Some([
-                        wb(&l.q_weight_blocks)?,
-                        wb(&l.k_weight_blocks)?,
-                        wb(&l.v_weight_blocks)?,
-                        wb(&l.o_weight_blocks)?,
-                        wb(&l.gate_weight_blocks)?,
-                        wb(&l.up_weight_blocks)?,
-                        wb(&l.down_weight_blocks)?,
+                        wb(&l.q_weight_blocks, hidden, q_dim, false)?,
+                        wb(&l.k_weight_blocks, hidden, kv_dim, false)?,
+                        wb(&l.v_weight_blocks, hidden, kv_dim, false)?,
+                        wb(&l.o_weight_blocks, q_dim, hidden, false)?,
+                        wb(&l.gate_weight_blocks, hidden, ffn_dim, true)?,
+                        wb(&l.up_weight_blocks, hidden, ffn_dim, true)?,
+                        wb(&l.down_weight_blocks, ffn_dim, hidden, true)?,
                     ])
                 })
                 .collect::<Option<Vec<_>>>()?;
-            ow_buf = wb(&logits.output_weight_blocks)?;
+            ow_buf = wb(&logits.output_weight_blocks, hidden, vocab, true)?;
             attn_norm_bufs = layers
                 .iter()
                 .map(|l| cache.weight_buffer(&kern.device, l.attn_norm))
@@ -36469,6 +37208,7 @@ mod tests {
             let resident = ResidentLinearWeight {
                 format,
                 buffer: weight_buf,
+                soa8_buffer: None,
                 q8_wire: format == ResidentWeightFormat::Q8_0,
             };
             let cb = kernel.queue.new_command_buffer();
@@ -36579,6 +37319,7 @@ mod tests {
                 let resident = ResidentLinearWeight {
                     format,
                     buffer: weight_buf,
+                    soa8_buffer: None,
                     // Page-backed GGUF bytes are 34-byte wire blocks, not the 36-byte
                     // decoded CPU layout.
                     q8_wire: true,
@@ -37210,6 +37951,7 @@ mod tests {
                     let weight = ResidentLinearWeight {
                         format,
                         buffer: weight_buf,
+                        soa8_buffer: None,
                         q8_wire: false,
                     };
                     let mut keep = Vec::new();
@@ -38972,6 +39714,7 @@ mod tests {
             ResidentLinearWeight {
                 format,
                 buffer,
+                soa8_buffer: None,
                 q8_wire: false,
             }
         };
@@ -39186,6 +39929,598 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kquant_v4_soa8_repack_is_a_byte_bijection() {
+        for format in [ResidentWeightFormat::Q4K, ResidentWeightFormat::Q6K] {
+            for rows in [1usize, 7, 8, 9, 19] {
+                let n_sb = 3usize;
+                let block_bytes = format.wire_bytes_per_block();
+                let wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                    .map(|i| ((i * 173 + i / 13 + rows * 7) & 0xff) as u8)
+                    .collect();
+                let packed_len = kquant_soa8_packed_len(format, rows, n_sb).unwrap();
+                assert_eq!(packed_len, wire.len());
+                let mut packed = vec![0u8; packed_len];
+                assert!(repack_kquant_soa8_into(
+                    &wire,
+                    format,
+                    rows,
+                    n_sb,
+                    &mut packed,
+                ));
+                let mut restored = vec![0u8; wire.len()];
+                for tile_row0 in (0..rows).step_by(8) {
+                    let tile_rows = (rows - tile_row0).min(8);
+                    let tile_base = tile_row0 * n_sb * block_bytes;
+                    let word_bytes = block_bytes & !3usize;
+                    let tail_bytes = block_bytes - word_bytes;
+                    for sb in 0..n_sb {
+                        let word_sb_base = tile_base + sb * word_bytes * tile_rows;
+                        for word in 0..word_bytes / 4 {
+                            for tile_row in 0..tile_rows {
+                                let row = tile_row0 + tile_row;
+                                let src = word_sb_base + word * tile_rows * 4 + tile_row * 4;
+                                let dst = (row * n_sb + sb) * block_bytes + word * 4;
+                                restored[dst..dst + 4].copy_from_slice(&packed[src..src + 4]);
+                            }
+                        }
+                        if tail_bytes != 0 {
+                            for tile_row in 0..tile_rows {
+                                let row = tile_row0 + tile_row;
+                                let src = tile_base
+                                    + n_sb * word_bytes * tile_rows
+                                    + sb * tail_bytes * tile_rows
+                                    + tile_row * tail_bytes;
+                                let dst = (row * n_sb + sb) * block_bytes + word_bytes;
+                                restored[dst..dst + tail_bytes]
+                                    .copy_from_slice(&packed[src..src + tail_bytes]);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(restored, wire, "{format:?} rows={rows}");
+
+                let mut wrong = vec![0u8; packed_len.saturating_sub(1)];
+                assert!(!repack_kquant_soa8_into(
+                    &wire,
+                    format,
+                    rows,
+                    n_sb,
+                    &mut wrong,
+                ));
+            }
+        }
+        assert_eq!(
+            kquant_soa8_packed_len(ResidentWeightFormat::Q8_0, 8, 1),
+            None
+        );
+        assert_eq!(
+            kquant_soa8_packed_len(ResidentWeightFormat::Q4K, 0, 1),
+            None
+        );
+        assert_eq!(
+            kquant_soa8_packed_len(ResidentWeightFormat::Q4K, 8, 0),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn llama32_3b_soa8_ffn_head_scope_is_85_buffers_and_byte_exact() {
+        let q4_gate_or_up =
+            kquant_soa8_packed_len(ResidentWeightFormat::Q4K, 8192, 3072 / 256).unwrap();
+        let q6_down =
+            kquant_soa8_packed_len(ResidentWeightFormat::Q6K, 3072, 8192 / 256).unwrap();
+        let q6_head =
+            kquant_soa8_packed_len(ResidentWeightFormat::Q6K, 128256, 3072 / 256).unwrap();
+        let buffers = 28 * 3 + 1;
+        let bytes = 28 * (2 * q4_gate_or_up + q6_down) + q6_head;
+        assert_eq!(buffers, 85);
+        assert_eq!(bytes, 1_693_956_096);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kquant_v4_soa8_precedence_is_fail_closed_and_process_consistent() {
+        assert_eq!(
+            kquant_v4_projection_requests(true, true, true, true),
+            (true, false),
+            "SOA8 wins when both experimental gates are enabled"
+        );
+        assert_eq!(
+            kquant_v4_projection_requests(true, true, false, true),
+            (false, false),
+            "a canonical-only projection must synchronize, never mix in direct-fragment"
+        );
+        assert_eq!(
+            kquant_v4_projection_requests(true, false, true, true),
+            (false, true),
+            "a dormant sidecar cannot change the established direct route"
+        );
+        assert_eq!(
+            kquant_v4_projection_requests(false, true, true, true),
+            (false, false),
+            "wide projections remain synchronized"
+        );
+    }
+
+    /// SOA8 must be a pure address-layout change. Compare it against the
+    /// synchronized canonical V4 kernels for adversarial Q4_K/Q6_K bytes,
+    /// every representative narrow verifier width, a ragged output tile, and
+    /// three superblocks. Output and activation padding are poisoned so a tail
+    /// overrun or missing +0 initialization cannot hide behind numerical parity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_soa8_is_bit_identical_and_guarded() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        assert!(v4.q4k_v4_soa8.is_some(), "Q4 SOA8 pipeline");
+        assert!(v4.q6k_v4_soa8.is_some(), "Q6 SOA8 pipeline");
+        let device = &kernel.device;
+        let rows = 19usize;
+        let n_sb = 3usize;
+        let input_width = n_sb * 256;
+        let physical_columns = 8usize;
+        let mut cache = MetalLinearCache::new();
+
+        let make_weight = |cache: &mut MetalLinearCache,
+                           format: ResidentWeightFormat,
+                           salt: usize| {
+            let block_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                .map(|i| ((i * 197 + i / 11 + salt * 43 + 0xa7) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                let magnitude = 0.0025 + (block_index % 29) as f32 * 0.00031;
+                let d = if block_index & 1 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                };
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        let dm = if block_index % 3 == 0 {
+                            -magnitude * 0.375
+                        } else {
+                            magnitude * 0.625
+                        };
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(dm).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let canonical = cache.raw_wire_weight_buffer(device, &wire);
+            let soa8 = cache
+                .kquant_soa8_weight_buffer(device, &wire, format, rows, n_sb)
+                .expect("valid SOA8 repack");
+            let hit = cache
+                .kquant_soa8_weight_buffer(device, &wire, format, rows, n_sb)
+                .expect("SOA8 cache hit");
+            assert_eq!(soa8.contents(), hit.contents(), "cache must reuse sidecar");
+            assert_eq!(soa8.length() as usize, wire.len());
+            ResidentLinearWeight {
+                format,
+                buffer: canonical,
+                soa8_buffer: Some(soa8),
+                q8_wire: false,
+            }
+        };
+        let q4_weight = make_weight(&mut cache, ResidentWeightFormat::Q4K, 5);
+        let q6_weight = make_weight(&mut cache, ResidentWeightFormat::Q6K, 13);
+
+        for n_tokens in [1usize, 3, 7, 8] {
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| {
+                    let token = i / input_width;
+                    let col = i % input_width;
+                    let base = ((((token * 211 + col * 71) % 521) as f32) - 260.0) * 0.009;
+                    if (token + col) % 17 == 0 {
+                        0.0
+                    } else {
+                        base + token as f32 * 0.00013
+                    }
+                })
+                .collect();
+            let input_buf = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let make_output = || {
+                let output = device.new_buffer(
+                    (physical_columns * rows * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                fill_buffer_sentinel(&output, physical_columns * rows);
+                output
+            };
+            let q4_control = make_output();
+            let q4_soa8 = make_output();
+            let q6_control = make_output();
+            let q6_soa8 = make_output();
+
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            let prepared = encode_shared_kquant_v4_activation(
+                e,
+                kernel,
+                v4,
+                &input_buf,
+                input_width,
+                n_tokens,
+            );
+            unsafe {
+                std::ptr::write_bytes(
+                    prepared.stage.y_stage.contents().cast::<u8>(),
+                    0xff,
+                    input_width * prepared.stage.k_pad * 2,
+                );
+                std::ptr::write_bytes(
+                    prepared
+                        .stage
+                        .ysums
+                        .as_ref()
+                        .expect("shared preparation has ysums")
+                        .contents()
+                        .cast::<u8>(),
+                    0xff,
+                    n_sb * 16 * prepared.stage.k_pad * 2,
+                );
+            }
+            for (weight, output, route) in [
+                (
+                    &q4_weight,
+                    &q4_control,
+                    KquantV4ProjectionRoute::Synchronized,
+                ),
+                (&q4_weight, &q4_soa8, KquantV4ProjectionRoute::Soa8),
+                (
+                    &q6_weight,
+                    &q6_control,
+                    KquantV4ProjectionRoute::Synchronized,
+                ),
+                (&q6_weight, &q6_soa8, KquantV4ProjectionRoute::Soa8),
+            ] {
+                assert!(encode_kquant_v4_prepared_projection_route(
+                    e,
+                    v4,
+                    &prepared.scales,
+                    &prepared.stage,
+                    weight,
+                    output,
+                    &scalar,
+                    rows,
+                    route,
+                ));
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            for (format, control, candidate) in [
+                ("Q4", &q4_control, &q4_soa8),
+                ("Q6", &q6_control, &q6_soa8),
+            ] {
+                let mut control_values = vec![0.0f32; physical_columns * rows];
+                let mut candidate_values = vec![0.0f32; physical_columns * rows];
+                read_buffer_f32(control, &mut control_values);
+                read_buffer_f32(candidate, &mut candidate_values);
+                let active = n_tokens * rows;
+                assert_no_sentinel(
+                    &control_values[..active],
+                    &format!("{format} canonical"),
+                    n_tokens,
+                );
+                assert_no_sentinel(
+                    &candidate_values[..active],
+                    &format!("{format} SOA8"),
+                    n_tokens,
+                );
+                for i in 0..active {
+                    assert_eq!(
+                        candidate_values[i].to_bits(),
+                        control_values[i].to_bits(),
+                        "{format} SOA8 n={n_tokens} element={i}: {} ({:#010x}) != \
+                         canonical {} ({:#010x})",
+                        candidate_values[i],
+                        candidate_values[i].to_bits(),
+                        control_values[i],
+                        control_values[i].to_bits(),
+                    );
+                }
+                for i in active..physical_columns * rows {
+                    assert_eq!(
+                        candidate_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} SOA8 wrote padded output n={n_tokens} element={i}"
+                    );
+                    assert_eq!(
+                        control_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{format} canonical wrote padded output n={n_tokens} element={i}"
+                    );
+                }
+            }
+
+            let y_half = unsafe {
+                std::slice::from_raw_parts(
+                    prepared.stage.y_stage.contents() as *const u16,
+                    input_width * prepared.stage.k_pad,
+                )
+            };
+            let ysums = unsafe {
+                std::slice::from_raw_parts(
+                    prepared
+                        .stage
+                        .ysums
+                        .as_ref()
+                        .expect("shared preparation has ysums")
+                        .contents() as *const u16,
+                    n_sb * 16 * prepared.stage.k_pad,
+                )
+            };
+            for pos in 0..input_width {
+                for token in 0..n_tokens {
+                    assert_ne!(y_half[pos * 8 + token], u16::MAX);
+                }
+                for token in n_tokens..8 {
+                    assert_eq!(y_half[pos * 8 + token], 0);
+                }
+            }
+            for cell in 0..n_sb * 16 {
+                for token in 0..n_tokens {
+                    assert_ne!(ysums[cell * 8 + token], u16::MAX);
+                }
+                for token in n_tokens..8 {
+                    assert_eq!(ysums[cell * 8 + token], 0);
+                }
+            }
+            drop(prepared);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_soa8_cache_is_byte_neutral_and_immutable_on_alias() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let format = ResidentWeightFormat::Q6K;
+        let rows = 11usize;
+        let n_sb = 3usize;
+        let block_bytes = format.wire_bytes_per_block();
+        let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+            .map(|i| ((i * 151 + i / 5 + 0x63) & 0xff) as u8)
+            .collect();
+        let mut cache = MetalLinearCache::new();
+        let first = cache
+            .kquant_soa8_weight_buffer(&kernel.device, &wire, format, rows, n_sb)
+            .expect("initial SOA8 repack");
+        let packed_len = kquant_soa8_packed_len(format, rows, n_sb).unwrap();
+        assert_eq!(packed_len, wire.len());
+        let first_snapshot = unsafe {
+            std::slice::from_raw_parts(first.contents() as *const u8, packed_len).to_vec()
+        };
+
+        wire[0] ^= 0x96;
+        let last = wire.len() - 1;
+        wire[last] ^= 0x69;
+        let second = cache
+            .kquant_soa8_weight_buffer(&kernel.device, &wire, format, rows, n_sb)
+            .expect("replacement SOA8 repack");
+        assert_ne!(first.contents(), second.contents());
+        let first_after =
+            unsafe { std::slice::from_raw_parts(first.contents() as *const u8, packed_len) };
+        assert_eq!(first_after, first_snapshot.as_slice());
+
+        let mut expected = vec![0u8; packed_len];
+        assert!(repack_kquant_soa8_into(
+            &wire,
+            format,
+            rows,
+            n_sb,
+            &mut expected,
+        ));
+        let second_bytes =
+            unsafe { std::slice::from_raw_parts(second.contents() as *const u8, packed_len) };
+        assert_eq!(second_bytes, expected.as_slice());
+        let hit = cache
+            .kquant_soa8_weight_buffer(&kernel.device, &wire, format, rows, n_sb)
+            .expect("replacement SOA8 cache hit");
+        assert_eq!(second.contents(), hit.contents());
+    }
+
+    /// Projection-only A/B for the exact Llama-3.2-3B target shapes covered by
+    /// the production sidecar scope. Activation preparation is completed once
+    /// and excluded; alternating A/B order reduces command-queue order bias.
+    /// The aggregate weights one gate + one up + one down per 28 layers and
+    /// one output head, matching the 85-sidecar target receipt.
+    ///
+    /// `cargo test --release --lib metal_kquant_v4_soa8_projection_microbench \
+    ///     -- --ignored --nocapture --test-threads=1`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_kquant_v4_soa8_projection_microbench() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        let device = &kernel.device;
+        let n_tokens = 8usize;
+        let mut round_canonical_us = 0.0f64;
+        let mut round_soa8_us = 0.0f64;
+
+        for (label, format, rows, input_width, multiplicity) in [
+            (
+                "q4 gate/up 8192x3072",
+                ResidentWeightFormat::Q4K,
+                8192usize,
+                3072usize,
+                56usize,
+            ),
+            (
+                "q6 down 3072x8192",
+                ResidentWeightFormat::Q6K,
+                3072usize,
+                8192usize,
+                28usize,
+            ),
+            (
+                "q6 head 128256x3072",
+                ResidentWeightFormat::Q6K,
+                128256usize,
+                3072usize,
+                1usize,
+            ),
+        ] {
+            let n_sb = input_width / 256;
+            let block_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                .map(|i| ((i * 131 + i / 17 + 0x5d) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                let d = 0.003 + (block_index % 23) as f32 * 0.0002;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.375).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let canonical = device.new_buffer_with_data(
+                wire.as_ptr().cast(),
+                wire.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let mut cache = MetalLinearCache::new();
+            let soa8 = cache
+                .kquant_soa8_weight_buffer(device, &wire, format, rows, n_sb)
+                .expect("valid SOA8 repack");
+            let wire_bytes = wire.len();
+            drop(wire);
+            let weight = ResidentLinearWeight {
+                format,
+                buffer: canonical,
+                soa8_buffer: Some(soa8),
+                q8_wire: false,
+            };
+
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| (((i * 73 + i / 29) % 509) as f32 - 254.0) * 0.008)
+                .collect();
+            let input_buf = device.new_buffer_with_data(
+                input.as_ptr().cast(),
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let prep_cb = kernel.queue.new_command_buffer();
+            let prep_encoder = prep_cb.new_compute_command_encoder();
+            let prepared = encode_shared_kquant_v4_activation(
+                prep_encoder,
+                kernel,
+                v4,
+                &input_buf,
+                input_width,
+                n_tokens,
+            );
+            prep_encoder.end_encoding();
+            prep_cb.commit();
+            prep_cb.wait_until_completed();
+
+            let output = device.new_buffer(
+                (n_tokens * rows * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let measure = |route| {
+                let cb = kernel.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                assert!(encode_kquant_v4_prepared_projection_route(
+                    e,
+                    v4,
+                    &prepared.scales,
+                    &prepared.stage,
+                    &weight,
+                    &output,
+                    &scalar,
+                    rows,
+                    route,
+                ));
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                command_buffer_gpu_times_us(&cb.to_owned()).0
+            };
+
+            let _ = measure(KquantV4ProjectionRoute::Synchronized);
+            let _ = measure(KquantV4ProjectionRoute::Soa8);
+            let mut canonical_us = Vec::with_capacity(10);
+            let mut soa8_us = Vec::with_capacity(10);
+            for sample in 0..10 {
+                if sample & 1 == 0 {
+                    canonical_us.push(measure(KquantV4ProjectionRoute::Synchronized));
+                    soa8_us.push(measure(KquantV4ProjectionRoute::Soa8));
+                } else {
+                    soa8_us.push(measure(KquantV4ProjectionRoute::Soa8));
+                    canonical_us.push(measure(KquantV4ProjectionRoute::Synchronized));
+                }
+            }
+            canonical_us.sort_unstable();
+            soa8_us.sort_unstable();
+            let canonical_median = (canonical_us[4] + canonical_us[5]) as f64 / 2.0;
+            let soa8_median = (soa8_us[4] + soa8_us[5]) as f64 / 2.0;
+            let delta_pct = 100.0 * (1.0 - soa8_median / canonical_median.max(1.0));
+            round_canonical_us += canonical_median * multiplicity as f64;
+            round_soa8_us += soa8_median * multiplicity as f64;
+            eprintln!(
+                "[metal-kquant-v4-soa8-bench] {label}: bytes={wire_bytes} multiplicity={multiplicity} \
+                 canonical_us={canonical_us:?} soa8_us={soa8_us:?} \
+                 median_canonical_us={canonical_median:.1} median_soa8_us={soa8_median:.1} \
+                 delta_pct={delta_pct:.2}"
+            );
+            drop(prepared);
+        }
+        eprintln!(
+            "[metal-kquant-v4-soa8-bench] scope=ffn_head buffers=85 \
+             projected_round_canonical_us={round_canonical_us:.1} \
+             projected_round_soa8_us={round_soa8_us:.1} \
+             projected_round_saved_us={:.1}",
+            round_canonical_us - round_soa8_us
+        );
+    }
+
     /// Corrected direct-fragment qualification. The oracle is the established
     /// synchronized V4 materialization over the exact same prepared activation
     /// and weights. Ragged output rows plus N=1/3/7 exercise both dimensions of
@@ -39232,6 +40567,7 @@ mod tests {
             ResidentLinearWeight {
                 format,
                 buffer,
+                soa8_buffer: None,
                 q8_wire: false,
             }
         };
@@ -39300,11 +40636,27 @@ mod tests {
                     n_sb * 16 * prepared.stage.k_pad * 2,
                 );
             }
-            for (weight, output, direct) in [
-                (&q4_weight, &q4_control, false),
-                (&q4_weight, &q4_direct, true),
-                (&q6_weight, &q6_control, false),
-                (&q6_weight, &q6_direct, true),
+            for (weight, output, route) in [
+                (
+                    &q4_weight,
+                    &q4_control,
+                    KquantV4ProjectionRoute::Synchronized,
+                ),
+                (
+                    &q4_weight,
+                    &q4_direct,
+                    KquantV4ProjectionRoute::DirectFragment,
+                ),
+                (
+                    &q6_weight,
+                    &q6_control,
+                    KquantV4ProjectionRoute::Synchronized,
+                ),
+                (
+                    &q6_weight,
+                    &q6_direct,
+                    KquantV4ProjectionRoute::DirectFragment,
+                ),
             ] {
                 assert!(encode_kquant_v4_prepared_projection_route(
                     e,
@@ -39315,7 +40667,7 @@ mod tests {
                     output,
                     &scalar,
                     rows,
-                    direct,
+                    route,
                 ));
             }
             e.end_encoding();

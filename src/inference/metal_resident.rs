@@ -1170,12 +1170,12 @@ impl super::LlamaInferenceSession {
     /// Resolve + upload this session's full resident weight set into the process-global
     /// Metal cache and fault its pages in (`metal::prewarm_resident_weights_cache`).
     ///
-    /// Built for the speculative DRAFT model: its engine otherwise resolves weights
-    /// lazily inside the FIRST `draft()` call, landing the whole convert/upload/page-in
-    /// cost (multi-second for a 1B draft) as a stall in the middle of the user-visible
-    /// decode — which the per-step draft profile then smears into a uniform-looking
-    /// slowdown. Calling this at drafter construction moves that one-time cost to
-    /// configure time, the same place the CUDA lane pays its coexistence reserve.
+    /// Built for speculative engines: a DRAFT model otherwise resolves canonical
+    /// weights lazily inside the first `draft()` call, while an opted-in V4 TARGET
+    /// otherwise builds its verifier SOA8 sidecars lazily inside the first verify.
+    /// Calling this from serialized bootstrap moves either one-time cost ahead of
+    /// user-visible decode timing. Draft sessions deliberately skip target-only
+    /// sidecars, so coexistence does not duplicate unused weights.
     ///
     /// Lossless and idempotent: it only populates the caches the first encode would
     /// populate anyway. Returns false (warming nothing) when the resident Metal lane is
@@ -1186,9 +1186,13 @@ impl super::LlamaInferenceSession {
         {
             return false;
         }
+        let Ok(dims) = DenseLlamaDims::from_config(&self.config) else {
+            return false;
+        };
         let weights = &self.weights;
         // A pipeline-sharded node owns a layer subrange with no logits stage; the
-        // single-node drafter this serves never shards, so skip rather than special-case.
+        // local speculative target/drafter path never shards, so skip rather than
+        // special-case incomplete geometry.
         if weights.layer_range.is_some() {
             return false;
         }
@@ -1215,7 +1219,19 @@ impl super::LlamaInferenceSession {
             .collect();
         let output = resident_weight_bytes(weights.output_projection());
         let embedding = resident_weight_bytes(&weights.token_embedding);
-        metal::prewarm_resident_weights_cache(&layer_views, Some(&output), Some(&embedding))
+        metal::prewarm_resident_weights_cache(
+            &layer_views,
+            Some(&output),
+            Some(&embedding),
+            metal::ResidentWeightGeometry {
+                hidden: dims.embedding_length,
+                q_dim: dims.q_width,
+                kv_dim: dims.kv_width,
+                ffn_dim: dims.feed_forward_length,
+                vocab: dims.vocab_size,
+            },
+            !self.is_drafter,
+        )
     }
 
     /// Non-macOS stub: there is no resident Metal engine to warm.
