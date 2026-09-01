@@ -10679,7 +10679,9 @@ fn eagle3_indexed_head_direct_emission_predictions(
         anyhow::ensure!(
             evidence.verifier_row == row
                 && evidence.authoritative_argmax_token == authoritative
-                && evidence.all_candidate_logits_exact,
+                && evidence.all_candidate_logits_exact
+                && evidence.exact_logit_agreements == evidence.compared_logits
+                && evidence.first_logit_mismatch.is_none(),
             "indexed-head direct-emission row {row} lacks exact authoritative evidence"
         );
         if evidence.top1_matches_authoritative {
