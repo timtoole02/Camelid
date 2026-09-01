@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -640,6 +640,7 @@ use camelid::{
     cluster::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
+    eagle3_runtime::Eagle3AuthoritativeFusionTelemetry,
     gguf::{read_metadata, read_metadata_with_len, GgufTensorType},
     ghost::{GhostFile, GhostPipelinePrefetcher, GhostPrefetcher},
     inference::{
@@ -9593,6 +9594,52 @@ struct Eagle3X3X4Telemetry {
     next_parent_probability_max: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eagle3TerminalHeadSkipReason {
+    MaxTokens,
+    EndOfGeneration,
+    ContextExhausted,
+}
+
+impl Eagle3TerminalHeadSkipReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::EndOfGeneration => "eog",
+            Self::ContextExhausted => "context_exhausted",
+        }
+    }
+}
+
+/// Decide whether an authoritative head update can be omitted after target verification.
+///
+/// This sees only facts that are already authoritative for the current round: the target's
+/// emitted tokens, the caller's output bound, and the target session's remaining context after
+/// committing the accepted path. An update is skippable only when no later round can consume the
+/// resulting draft state. The empty-emission guard makes the predicate fail closed if a verifier
+/// contract ever changes.
+fn eagle3_terminal_head_skip_reason(
+    enabled: bool,
+    generated_before_round: usize,
+    max_tokens: usize,
+    emitted: &[u32],
+    eog_token_ids: &BTreeSet<u32>,
+    remaining_context_after_verify: usize,
+) -> Option<Eagle3TerminalHeadSkipReason> {
+    if !enabled || emitted.is_empty() {
+        return None;
+    }
+    if generated_before_round.saturating_add(emitted.len()) >= max_tokens {
+        Some(Eagle3TerminalHeadSkipReason::MaxTokens)
+    } else if emitted.iter().any(|token| eog_token_ids.contains(token)) {
+        Some(Eagle3TerminalHeadSkipReason::EndOfGeneration)
+    } else if remaining_context_after_verify == 0 {
+        Some(Eagle3TerminalHeadSkipReason::ContextExhausted)
+    } else {
+        None
+    }
+}
+
 impl Eagle3X3X4Telemetry {
     fn note_decision(
         &mut self,
@@ -10294,6 +10341,9 @@ struct Eagle3BenchRun {
     dynamic_tree_max_depth_sum: u64,
     verifier_widths: Eagle3VerifierWidthTelemetry,
     x3_x4_expansions: Eagle3X3X4Telemetry,
+    authoritative_fusion: Eagle3AuthoritativeFusionTelemetry,
+    terminal_head_updates_skipped: u64,
+    terminal_head_skip_reason: Option<Eagle3TerminalHeadSkipReason>,
     adaptive_expansions: Eagle3AdaptiveExpansionTelemetry,
     token_recycling: Eagle3TokenRecyclingTelemetry,
     dual_eagle_rounds: Vec<DualEagleRoundReceipt>,
@@ -10363,6 +10413,8 @@ fn run_eagle3_resident_greedy(
     adaptive_expansions: bool,
     verifier_width_selector: Option<Eagle3VerifierWidthSelectorConfig>,
     x3_x4_selector: Option<Eagle3X3X4SelectorConfig>,
+    authoritative_cb_fusion: bool,
+    terminal_head_skip: bool,
     suffix_first: bool,
     token_recycling_hybrid: bool,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
@@ -10492,6 +10544,7 @@ fn run_eagle3_resident_greedy(
 
         let anchor = *run.generated.last().expect("generated is seeded");
         let target_before = session.kv_position();
+        let mut terminal_head_update_skipped_this_round = false;
         let round_tree_expansions = adaptive_expansion_controller
             .as_ref()
             .map_or(tree_expansions, Eagle3AdaptiveExpansionController::expansions);
@@ -11119,13 +11172,32 @@ fn run_eagle3_resident_greedy(
                     acceptance.emitted_tokens.len(),
                     acceptance.capture_rows.len()
                 );
-                let update_started = Instant::now();
-                drafter.accept_authoritative_forest(
-                    weights,
-                    &verified.layer_inputs,
-                    &acceptance,
-                )?;
-                run.head_update_us += update_started.elapsed().as_micros();
+                let terminal_reason = eagle3_terminal_head_skip_reason(
+                    terminal_head_skip,
+                    run.generated.len(),
+                    max_tokens,
+                    &acceptance.emitted_tokens,
+                    &tokenizer.special.eog,
+                    session.remaining_context(),
+                );
+                if let Some(reason) = terminal_reason {
+                    anyhow::ensure!(
+                        run.terminal_head_updates_skipped == 0
+                            && run.terminal_head_skip_reason.is_none(),
+                        "EAGLE-3 terminal head update was skipped more than once"
+                    );
+                    run.terminal_head_updates_skipped = 1;
+                    run.terminal_head_skip_reason = Some(reason);
+                    terminal_head_update_skipped_this_round = true;
+                } else {
+                    let update_started = Instant::now();
+                    drafter.accept_authoritative_forest(
+                        weights,
+                        &verified.layer_inputs,
+                        &acceptance,
+                    )?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+                }
                 let emitted_count = acceptance.emitted_tokens.len();
                 let offered = actual_nodes.saturating_sub(1);
                 run.dynamic_tree_rounds += 1;
@@ -11171,13 +11243,26 @@ fn run_eagle3_resident_greedy(
         );
         run.resident_verify_rounds += 1;
         let effective_head_filled = pending_suffix_head.effective_filled(drafter.filled())?;
-        anyhow::ensure!(
-            effective_head_filled == session.kv_position(),
-            "EAGLE-3/target cache watermarks diverged: materialized_head={} pending_head={} target={}",
-            drafter.filled(),
-            pending_suffix_head.pending_rows(),
-            session.kv_position()
-        );
+        if terminal_head_update_skipped_this_round {
+            anyhow::ensure!(
+                pending_suffix_head.is_empty()
+                    && effective_head_filled.checked_add(emitted.len())
+                        == Some(session.kv_position()),
+                "terminal EAGLE-3 head skip left an unexpected watermark: materialized_head={} pending_head={} emitted={} target={}",
+                drafter.filled(),
+                pending_suffix_head.pending_rows(),
+                emitted.len(),
+                session.kv_position()
+            );
+        } else {
+            anyhow::ensure!(
+                effective_head_filled == session.kv_position(),
+                "EAGLE-3/target cache watermarks diverged: materialized_head={} pending_head={} target={}",
+                drafter.filled(),
+                pending_suffix_head.pending_rows(),
+                session.kv_position()
+            );
+        }
 
         run.rounds += 1;
         run.drafted += offered as u64;
@@ -11229,6 +11314,28 @@ fn run_eagle3_resident_greedy(
     // Once generation has stopped, no consumer can observe the learned head again. Deliberately
     // drop a final suffix-only streak instead of paying a useless catch-up in the epilogue.
     run.suffix_head_discarded_rows = pending_suffix_head.pending_rows() as u64;
+    if let Some(reason) = run.terminal_head_skip_reason {
+        let stopped_for_recorded_reason = match reason {
+            Eagle3TerminalHeadSkipReason::MaxTokens => run.generated.len() >= max_tokens,
+            Eagle3TerminalHeadSkipReason::EndOfGeneration => run
+                .generated
+                .last()
+                .is_some_and(|token| tokenizer.special.eog.contains(token)),
+            Eagle3TerminalHeadSkipReason::ContextExhausted => session.remaining_context() == 0,
+        };
+        anyhow::ensure!(
+            terminal_head_skip
+                && run.terminal_head_updates_skipped == 1
+                && stopped_for_recorded_reason,
+            "EAGLE-3 terminal head skip did not terminate for its recorded reason {}",
+            reason.label()
+        );
+    } else {
+        anyhow::ensure!(
+            run.terminal_head_updates_skipped == 0,
+            "EAGLE-3 terminal head skip telemetry recorded a count without a reason"
+        );
+    }
     if let Some(controller) = adaptive_expansion_controller {
         run.adaptive_expansions = controller.telemetry();
     }
@@ -11323,6 +11430,15 @@ fn run_eagle3_resident_greedy(
         );
     }
 
+    // Read the drafter-owned counters only after every authoritative update has completed.
+    // Fusion is deliberately unavailable with dual-EAGLE, so `drafter` is the single head whose
+    // decode-time updates must attest the benchmark lane immediately before the run is returned.
+    run.authoritative_fusion = drafter.authoritative_fusion_telemetry();
+    validate_eagle3_authoritative_cb_fusion_telemetry(
+        authoritative_cb_fusion,
+        run.authoritative_fusion,
+    )?;
+
     Ok(run)
 }
 
@@ -11383,6 +11499,20 @@ struct BenchEagle3Record {
     x3_x4_next_parent_probability_min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     x3_x4_next_parent_probability_max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_cb_fusion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_fused_updates: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_fused_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_update_command_buffers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_head_skip: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_head_updates_skipped: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_head_skip_reason: Option<&'static str>,
     adaptive_expansions: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     adaptive_window_rounds: Option<usize>,
@@ -12007,6 +12137,305 @@ mod eagle3_x3_x4_selector_tests {
     }
 }
 
+const EAGLE3_AUTHORITATIVE_CB_FUSION_ENV: &str = "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION";
+
+fn parse_eagle3_authoritative_cb_fusion_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => {
+            anyhow::bail!("{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV} must be a boolean, got {value:?}")
+        }
+    }
+}
+
+fn eagle3_authoritative_cb_fusion_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os(EAGLE3_AUTHORITATIVE_CB_FUSION_ENV);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV} is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_eagle3_authoritative_cb_fusion_env(value)
+}
+
+fn eagle3_truthy_env_enabled(name: &str) -> anyhow::Result<bool> {
+    let raw = std::env::var_os(name);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("{name} is not valid UTF-8"))
+        })
+        .transpose()?;
+    Ok(value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    }))
+}
+
+fn validate_eagle3_authoritative_cb_fusion_config(
+    enabled: bool,
+    batch_authoritative_kv: bool,
+    full_authoritative: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        batch_authoritative_kv,
+        "{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV}=1 requires CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV=1"
+    );
+    anyhow::ensure!(
+        !full_authoritative,
+        "{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV}=1 cannot be combined with CAMELID_EAGLE3_FULL_AUTHORITATIVE=1"
+    );
+    anyhow::ensure!(
+        !dual_eagle_selector,
+        "{EAGLE3_AUTHORITATIVE_CB_FUSION_ENV}=1 cannot be combined with dual-EAGLE selection"
+    );
+    Ok(())
+}
+
+fn validate_eagle3_authoritative_cb_fusion_telemetry(
+    enabled: bool,
+    telemetry: Eagle3AuthoritativeFusionTelemetry,
+) -> anyhow::Result<()> {
+    if !enabled {
+        anyhow::ensure!(
+            telemetry == Eagle3AuthoritativeFusionTelemetry::default(),
+            "EAGLE-3 authoritative command-buffer fusion ran while its benchmark gate was disabled"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        telemetry.fused_updates > 0,
+        "EAGLE-3 authoritative command-buffer fusion was enabled but recorded no updates"
+    );
+    anyhow::ensure!(
+        telemetry.fused_rows >= telemetry.fused_updates,
+        "EAGLE-3 authoritative command-buffer fusion recorded fewer rows ({}) than updates ({})",
+        telemetry.fused_rows,
+        telemetry.fused_updates,
+    );
+    anyhow::ensure!(
+        telemetry.command_buffers == telemetry.fused_updates,
+        "EAGLE-3 authoritative command-buffer fusion used {} command buffers for {} updates",
+        telemetry.command_buffers,
+        telemetry.fused_updates,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_authoritative_cb_fusion_tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_gate_is_strict_and_default_off() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+            assert!(!parse_eagle3_authoritative_cb_fusion_env(value).unwrap());
+        }
+        for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+            assert!(parse_eagle3_authoritative_cb_fusion_env(value).unwrap());
+        }
+        assert!(parse_eagle3_authoritative_cb_fusion_env(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn dependencies_require_batched_kv_and_isolate_dual_and_full_lanes() {
+        assert!(validate_eagle3_authoritative_cb_fusion_config(false, false, true, true).is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, true, false, false).is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, false, false, false).is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, true, true, false).is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_config(true, true, false, true).is_err());
+    }
+
+    #[test]
+    fn telemetry_attests_exactly_one_command_buffer_per_nonempty_update() {
+        let valid = Eagle3AuthoritativeFusionTelemetry {
+            fused_updates: 2,
+            fused_rows: 5,
+            command_buffers: 2,
+        };
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(true, valid).is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            false,
+            Eagle3AuthoritativeFusionTelemetry::default(),
+        )
+        .is_ok());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            true,
+            Eagle3AuthoritativeFusionTelemetry::default(),
+        )
+        .is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            true,
+            Eagle3AuthoritativeFusionTelemetry {
+                fused_updates: 2,
+                fused_rows: 1,
+                command_buffers: 2,
+            },
+        )
+        .is_err());
+        assert!(validate_eagle3_authoritative_cb_fusion_telemetry(
+            true,
+            Eagle3AuthoritativeFusionTelemetry {
+                fused_updates: 2,
+                fused_rows: 2,
+                command_buffers: 1,
+            },
+        )
+        .is_err());
+    }
+}
+
+fn parse_eagle3_terminal_head_skip_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP must be a boolean, got {value:?}"
+        ),
+    }
+}
+
+fn eagle3_terminal_head_skip_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP is not valid UTF-8")
+            })
+        })
+        .transpose()?;
+    parse_eagle3_terminal_head_skip_env(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_terminal_head_skip_config(
+    enabled: bool,
+    tree_nodes: Option<usize>,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        tree_nodes.is_some(),
+        "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP requires --tree-nodes"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector,
+        "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP can be combined only with fixed-expansion plain dynamic trees (including the N5/N6 and X3/X4 selectors)"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_terminal_head_skip_tests {
+    use super::*;
+
+    fn eog() -> BTreeSet<u32> {
+        BTreeSet::from([128_009, 128_010])
+    }
+
+    #[test]
+    fn benchmark_gate_is_strict_default_off_and_lane_isolated() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+            assert!(!parse_eagle3_terminal_head_skip_env(value).unwrap());
+        }
+        for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+            assert!(parse_eagle3_terminal_head_skip_env(value).unwrap());
+        }
+        assert!(parse_eagle3_terminal_head_skip_env(Some("maybe")).is_err());
+
+        assert!(validate_eagle3_terminal_head_skip_config(
+            true,
+            Some(6),
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(validate_eagle3_terminal_head_skip_config(
+            true, None, false, false, false, false, false,
+        )
+        .is_err());
+        assert!(validate_eagle3_terminal_head_skip_config(
+            true,
+            Some(6),
+            false,
+            false,
+            true,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_eagle3_terminal_head_skip_config(
+            false, None, true, true, true, true, true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn skips_only_for_already_authoritative_terminal_evidence() {
+        let eog = eog();
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(false, 93, 96, &[1, 2, 3], &eog, 10),
+            None
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 93, 96, &[1, 2, 3], &eog, 10),
+            Some(Eagle3TerminalHeadSkipReason::MaxTokens)
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 10, 96, &[1, 128_009, 3], &eog, 10),
+            Some(Eagle3TerminalHeadSkipReason::EndOfGeneration)
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 10, 96, &[1, 2, 3], &eog, 0),
+            Some(Eagle3TerminalHeadSkipReason::ContextExhausted)
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 10, 96, &[1, 2, 3], &eog, 10),
+            None
+        );
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 96, 96, &[], &eog, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn max_tokens_has_stable_precedence_when_terminal_causes_overlap() {
+        assert_eq!(
+            eagle3_terminal_head_skip_reason(true, 95, 96, &[128_009], &eog(), 0),
+            Some(Eagle3TerminalHeadSkipReason::MaxTokens)
+        );
+    }
+}
+
 fn validate_eagle3_adaptive_expansions_config(
     enabled: bool,
     tree_nodes: Option<usize>,
@@ -12124,7 +12553,10 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR",
         "CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR_TRACE",
         "CAMELID_BENCH_EAGLE3_X4_MIN_NEXT_PARENT_PROB",
+        "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION",
+        "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP",
         "CAMELID_BENCH_EAGLE3_PARALLEL_LSE",
+        "CAMELID_BENCH_EAGLE3_VERIFY_LAYER0_EARLY_COMMIT",
     ] {
         if std::env::var_os(key).is_some() {
             values.insert(key.to_string(), std::env::var(key).ok());
@@ -12453,6 +12885,8 @@ fn run_bench_eagle3(
     let dual_eagle_selector = dual_eagle_selector_enabled()?;
     let verifier_width_selector = eagle3_width_selector_config()?;
     let x3_x4_selector = eagle3_x3_x4_selector_config()?;
+    let authoritative_cb_fusion = eagle3_authoritative_cb_fusion_enabled()?;
+    let terminal_head_skip = eagle3_terminal_head_skip_enabled()?;
     let adaptive_branching = eagle3_adaptive_branching_enabled();
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
@@ -12540,6 +12974,29 @@ fn run_bench_eagle3(
         adaptive_expansions,
         suffix_first,
         token_recycling_hybrid,
+        dual_eagle_selector,
+    )?;
+    validate_eagle3_terminal_head_skip_config(
+        terminal_head_skip,
+        tree_nodes,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+    )?;
+    let (batch_authoritative_kv, full_authoritative) = if authoritative_cb_fusion {
+        (
+            eagle3_truthy_env_enabled("CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV")?,
+            eagle3_truthy_env_enabled("CAMELID_EAGLE3_FULL_AUTHORITATIVE")?,
+        )
+    } else {
+        (false, false)
+    };
+    validate_eagle3_authoritative_cb_fusion_config(
+        authoritative_cb_fusion,
+        batch_authoritative_kv,
+        full_authoritative,
         dual_eagle_selector,
     )?;
     configure_rayon_threads(threads)?;
@@ -12754,6 +13211,8 @@ fn run_bench_eagle3(
         adaptive_expansions,
         verifier_width_selector,
         x3_x4_selector,
+        authoritative_cb_fusion,
+        terminal_head_skip,
         suffix_first,
         token_recycling_hybrid,
         primary_drafter,
@@ -12871,6 +13330,23 @@ fn run_bench_eagle3(
             .and(eagle.x3_x4_expansions.next_parent_probability_min),
         x3_x4_next_parent_probability_max: x3_x4_selector
             .and(eagle.x3_x4_expansions.next_parent_probability_max),
+        authoritative_cb_fusion: authoritative_cb_fusion.then_some(true),
+        authoritative_fused_updates: authoritative_cb_fusion
+            .then_some(eagle.authoritative_fusion.fused_updates),
+        authoritative_fused_rows: authoritative_cb_fusion
+            .then_some(eagle.authoritative_fusion.fused_rows),
+        authoritative_update_command_buffers: authoritative_cb_fusion
+            .then_some(eagle.authoritative_fusion.command_buffers),
+        terminal_head_skip: terminal_head_skip.then_some(true),
+        terminal_head_updates_skipped: terminal_head_skip
+            .then_some(eagle.terminal_head_updates_skipped),
+        terminal_head_skip_reason: if terminal_head_skip {
+            eagle
+                .terminal_head_skip_reason
+                .map(Eagle3TerminalHeadSkipReason::label)
+        } else {
+            None
+        },
         adaptive_expansions,
         adaptive_window_rounds: adaptive_expansions
             .then_some(EAGLE3_ADAPTIVE_EXPANSION_WINDOW),
@@ -13143,6 +13619,24 @@ fn run_bench_eagle3(
             eagle.x3_x4_expansions.next_parent_probability_mean(),
             eagle.x3_x4_expansions.next_parent_probability_min,
             eagle.x3_x4_expansions.next_parent_probability_max,
+        );
+    }
+    if terminal_head_skip {
+        eprintln!(
+            "[bench-eagle3-terminal-head-skip] skipped={} reason={}",
+            eagle.terminal_head_updates_skipped,
+            eagle
+                .terminal_head_skip_reason
+                .map(Eagle3TerminalHeadSkipReason::label)
+                .unwrap_or("none"),
+        );
+    }
+    if authoritative_cb_fusion {
+        eprintln!(
+            "[bench-eagle3-authoritative-cb-fusion] updates={} rows={} command-buffers={}",
+            eagle.authoritative_fusion.fused_updates,
+            eagle.authoritative_fusion.fused_rows,
+            eagle.authoritative_fusion.command_buffers,
         );
     }
     if dual_eagle_selector {

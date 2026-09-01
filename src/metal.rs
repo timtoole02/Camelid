@@ -17658,6 +17658,77 @@ fn encode_resident_kquant_matmul_f32(
     }
 }
 
+/// Parse the benchmark-only verifier scheduling gate. Unknown spellings fail closed to the
+/// established one-command-buffer lane.
+#[cfg(any(target_os = "macos", test))]
+fn verify_layer0_early_commit_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    })
+}
+
+/// Benchmark-only exact scheduling experiment for resident target verification, enabled only by
+/// `CAMELID_BENCH_EAGLE3_VERIFY_LAYER0_EARLY_COMMIT=1`.
+///
+/// The arithmetic kernels and their order are unchanged. The first decoder layer is merely
+/// ended and committed as its own command buffer so the serial Metal queue can execute it while
+/// the host encodes the remaining layers. Default-off and process-latched like the other Metal
+/// benchmark gates.
+#[cfg(target_os = "macos")]
+fn verify_layer0_early_commit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_BENCH_EAGLE3_VERIFY_LAYER0_EARLY_COMMIT").ok();
+        verify_layer0_early_commit_from_env(value.as_deref())
+    })
+}
+
+/// Return the only legal split boundary. A one-layer graph has no tail encode to overlap and
+/// stays on the established path; this also prevents creating an empty second command buffer.
+#[cfg(any(target_os = "macos", test))]
+fn verify_layer0_early_commit_split_after(requested: bool, n_layers: usize) -> Option<usize> {
+    (requested && n_layers > 1).then_some(0)
+}
+
+#[cfg(test)]
+mod verify_layer0_early_commit_contract_tests {
+    use super::{
+        verify_layer0_early_commit_from_env, verify_layer0_early_commit_split_after,
+    };
+
+    #[test]
+    fn verify_layer0_early_commit_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("garbage"),
+        ] {
+            assert!(!verify_layer0_early_commit_from_env(value));
+        }
+        for value in ["1", "true", "TRUE", "on", "yes", "enabled"] {
+            assert!(verify_layer0_early_commit_from_env(Some(value)));
+        }
+    }
+
+    #[test]
+    fn verify_layer0_early_commit_splits_once_without_reordering_layers() {
+        assert_eq!(verify_layer0_early_commit_split_after(false, 28), None);
+        assert_eq!(verify_layer0_early_commit_split_after(true, 0), None);
+        assert_eq!(verify_layer0_early_commit_split_after(true, 1), None);
+        assert_eq!(verify_layer0_early_commit_split_after(true, 28), Some(0));
+
+        let split = verify_layer0_early_commit_split_after(true, 28).unwrap();
+        let encoded: Vec<usize> = (0..=split).chain(split + 1..28).collect();
+        assert_eq!(encoded, (0..28).collect::<Vec<_>>());
+    }
+}
+
 /// MEASUREMENT ONLY. `CAMELID_VERIFY_ABLATE=<stage>` omits one per-row stage of
 /// the verify round so its share of the round's wall time can be attributed by
 /// difference. The round then computes GARBAGE -- outputs are meaningless and
@@ -21532,6 +21603,34 @@ fn encode_binary(
     e.set_buffer(0, Some(a), 0);
     e.set_buffer(1, Some(b), 0);
     e.set_buffer(2, Some(out), 0);
+    e.set_buffer(3, Some(n_buf), 0);
+    dispatch_1d(e, pipeline, n);
+}
+
+/// `encode_binary` with explicit byte offsets for all three value buffers.
+///
+/// This is intentionally separate from [`encode_binary_off`], whose offset selects a
+/// different element-count scalar. EAGLE authoritative fusion uses this helper to consume
+/// one row of a GPU-resident `[rows, H]` feature projection without copying that row through
+/// the host or changing the binary kernel's arithmetic.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_binary_buffer_offsets(
+    e: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    a: &Buffer,
+    a_offset: u64,
+    b: &Buffer,
+    b_offset: u64,
+    out: &Buffer,
+    out_offset: u64,
+    n_buf: &Buffer,
+    n: usize,
+) {
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(a), a_offset);
+    e.set_buffer(1, Some(b), b_offset);
+    e.set_buffer(2, Some(out), out_offset);
     e.set_buffer(3, Some(n_buf), 0);
     dispatch_1d(e, pipeline, n);
 }
@@ -27815,6 +27914,44 @@ fn eagle3_validate_batch_shape(
     Ok(rows)
 }
 
+fn eagle3_validate_authoritative_fusion_shape(
+    feature_values: usize,
+    token_embedding_values: usize,
+    start_position: usize,
+    filled: usize,
+    max_positions: usize,
+) -> std::result::Result<usize, String> {
+    if !feature_values.is_multiple_of(EAGLE3_AUX_WIDTH) {
+        return Err(format!(
+            "EAGLE-3 authoritative fusion expected [rows, {EAGLE3_AUX_WIDTH}] features, got {feature_values} values"
+        ));
+    }
+    let rows = feature_values / EAGLE3_AUX_WIDTH;
+    let fused_values = rows
+        .checked_mul(EAGLE3_HIDDEN)
+        .ok_or_else(|| "EAGLE-3 authoritative fused-value count overflow".to_string())?;
+    if token_embedding_values != fused_values {
+        return Err(format!(
+            "EAGLE-3 authoritative fusion expected {fused_values} token-embedding values for {rows} rows, got {token_embedding_values}"
+        ));
+    }
+    eagle3_validate_batch_shape(
+        token_embedding_values,
+        fused_values,
+        start_position,
+        filled,
+        max_positions,
+    )
+}
+
+fn eagle3_row_byte_offset(row: usize) -> std::result::Result<u64, String> {
+    let bytes = row
+        .checked_mul(EAGLE3_HIDDEN)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| format!("EAGLE-3 row {row} byte offset overflow"))?;
+    u64::try_from(bytes).map_err(|_| format!("EAGLE-3 row {row} byte offset exceeds u64"))
+}
+
 fn eagle3_rope_tables(position: usize, rope_theta: f32) -> (Vec<f32>, Vec<f32>) {
     let half = EAGLE3_HEAD_DIM / 2;
     let mut cos = Vec::with_capacity(half);
@@ -27867,6 +28004,13 @@ pub struct Eagle3MetalState {
     filled: usize,
     rope_theta: f32,
     sliding_window: Option<usize>,
+}
+
+#[cfg(target_os = "macos")]
+struct Eagle3EncodedCell {
+    raw_hidden: Buffer,
+    logits: Buffer,
+    selected: Buffer,
 }
 
 #[cfg(target_os = "macos")]
@@ -27943,17 +28087,18 @@ fn eagle3_zero_buffer(k: &MetalLinearKernel, bytes: usize) -> Buffer {
 }
 
 #[cfg(target_os = "macos")]
-fn encode_eagle3_rms_norm(
+fn encode_eagle3_rms_norm_off(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     input: &Buffer,
+    input_offset: u64,
     weight: &Buffer,
     output: &Buffer,
     output_offset: u64,
     scalar: &Buffer,
 ) {
     e.set_compute_pipeline_state(&k.rms_norm_pipeline);
-    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(0, Some(input), input_offset);
     e.set_buffer(1, Some(weight), 0);
     e.set_buffer(2, Some(output), output_offset);
     e.set_buffer(3, Some(scalar), 0);
@@ -28153,22 +28298,19 @@ impl Eagle3MetalState {
     /// This is the single source of truth for both the original one-row path and the opt-in
     /// batched path below. Keeping the very same buffers, scalar values, pipelines, dispatch
     /// order, and F16 scatter makes command-buffer coalescing a synchronization-only change.
-    fn encode_authoritative_kv_row(
+    fn encode_authoritative_kv_row_from_buffers(
         &self,
         e: &metal::ComputeCommandEncoderRef,
         k: &MetalLinearKernel,
         keep: &mut Vec<Buffer>,
-        token_embedding: &[f32],
-        g: &[f32],
+        token_embeddings: &Buffer,
+        token_embedding_offset: u64,
+        g_states: &Buffer,
+        g_state_offset: u64,
         position: usize,
     ) {
         let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
         let f32b = |n: usize| nb(n * std::mem::size_of::<f32>());
-        let embedding = f32b(EAGLE3_HIDDEN);
-        let g_buf = f32b(EAGLE3_HIDDEN);
-        write_buffer_f32(&embedding, token_embedding);
-        write_buffer_f32(&g_buf, g);
-
         let combined = f32b(EAGLE3_ATTN_INPUT);
         let key = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
         let value = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
@@ -28204,19 +28346,21 @@ impl Eagle3MetalState {
 
         // Match `forward_token` byte-for-byte through the K/V scatter.  The cache is F16,
         // so later attention observes exactly the same half-rounded values in either lane.
-        encode_eagle3_rms_norm(
+        encode_eagle3_rms_norm_off(
             e,
             k,
-            &embedding,
+            token_embeddings,
+            token_embedding_offset,
             &self.input_layernorm,
             &combined,
             0,
             &rms_scalar,
         );
-        encode_eagle3_rms_norm(
+        encode_eagle3_rms_norm_off(
             e,
             k,
-            &g_buf,
+            g_states,
+            g_state_offset,
             &self.hidden_norm,
             &combined,
             (EAGLE3_HIDDEN * 4) as u64,
@@ -28273,8 +28417,6 @@ impl Eagle3MetalState {
             EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
         );
         keep.extend([
-            embedding,
-            g_buf,
             combined,
             key,
             value,
@@ -28285,6 +28427,27 @@ impl Eagle3MetalState {
             cos_buf,
             sin_buf,
         ]);
+    }
+
+    /// Host-slice wrapper retained by the established authoritative control paths.
+    fn encode_authoritative_kv_row(
+        &self,
+        e: &metal::ComputeCommandEncoderRef,
+        k: &MetalLinearKernel,
+        keep: &mut Vec<Buffer>,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+    ) {
+        let bytes = (EAGLE3_HIDDEN * std::mem::size_of::<f32>()) as u64;
+        let embedding = pool_get(k, bytes);
+        let g_buf = pool_get(k, bytes);
+        write_buffer_f32(&embedding, token_embedding);
+        write_buffer_f32(&g_buf, g);
+        self.encode_authoritative_kv_row_from_buffers(
+            e, k, keep, &embedding, 0, &g_buf, 0, position,
+        );
+        keep.extend([embedding, g_buf]);
     }
 
     /// Append one or more exact authoritative K/V rows in one Metal command buffer.
@@ -28390,44 +28553,26 @@ impl Eagle3MetalState {
         }
     }
 
-    /// Append one EAGLE cell at exactly the current cache watermark.
+    /// Encode the unchanged full EAGLE cell from GPU-resident input rows.
     ///
-    /// `g` is either an FC-projected authoritative target feature (stable-cache extension)
-    /// or the previous call's raw hidden (ephemeral recursive drafting).  The caller controls
-    /// that distinction; this primitive intentionally does not apply `fc` a second time.
-    pub fn forward_token(
-        &mut self,
-        token_embedding: &[f32],
-        g: &[f32],
+    /// The caller owns the command encoder and every input buffer until completion. This lets
+    /// the benchmark-only authoritative path put feature fusion, prefix K/V scatters, and the
+    /// final cell in one command buffer while the established `forward_token` wrapper below
+    /// retains its original one-cell behavior.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_forward_token_from_buffers(
+        &self,
+        e: &metal::ComputeCommandEncoderRef,
+        k: &MetalLinearKernel,
+        keep: &mut Vec<Buffer>,
+        token_embeddings: &Buffer,
+        token_embedding_offset: u64,
+        g_states: &Buffer,
+        g_state_offset: u64,
         position: usize,
-    ) -> std::result::Result<Eagle3MetalOutput, String> {
-        if token_embedding.len() != EAGLE3_HIDDEN || g.len() != EAGLE3_HIDDEN {
-            return Err(format!(
-                "EAGLE-3 forward expected embedding/g widths {EAGLE3_HIDDEN}, got {}/{}",
-                token_embedding.len(),
-                g.len()
-            ));
-        }
-        if position != self.filled {
-            return Err(format!(
-                "EAGLE-3 forward position {position} does not match KV watermark {}; rollback first",
-                self.filled
-            ));
-        }
-        if position >= self.max_positions {
-            return Err(format!(
-                "EAGLE-3 position {position} exceeds cache capacity {}",
-                self.max_positions
-            ));
-        }
-        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+    ) -> Eagle3EncodedCell {
         let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
         let f32b = |n: usize| nb(n * std::mem::size_of::<f32>());
-        let embedding = f32b(EAGLE3_HIDDEN);
-        let g_buf = f32b(EAGLE3_HIDDEN);
-        write_buffer_f32(&embedding, token_embedding);
-        write_buffer_f32(&g_buf, g);
-
         let combined = f32b(EAGLE3_ATTN_INPUT);
         let query = f32b(EAGLE3_HIDDEN);
         let key = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
@@ -28521,24 +28666,22 @@ impl Eagle3MetalState {
             *(attn.add(28) as *mut u32) = kv_base_offset as u32;
         }
 
-        let cb = k.queue.new_command_buffer();
-        let e = cb.new_compute_command_encoder();
-        let mut keep = Vec::new();
-
         // EAGLE order is [normalized token embedding || normalized g].
-        encode_eagle3_rms_norm(
+        encode_eagle3_rms_norm_off(
             e,
             k,
-            &embedding,
+            token_embeddings,
+            token_embedding_offset,
             &self.input_layernorm,
             &combined,
             0,
             &rms_scalar,
         );
-        encode_eagle3_rms_norm(
+        encode_eagle3_rms_norm_off(
             e,
             k,
-            &g_buf,
+            g_states,
+            g_state_offset,
             &self.hidden_norm,
             &combined,
             (EAGLE3_HIDDEN * 4) as u64,
@@ -28547,7 +28690,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &combined,
             &self.q_proj,
             &query,
@@ -28559,7 +28702,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &combined,
             &self.k_proj,
             &key,
@@ -28571,7 +28714,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &combined,
             &self.v_proj,
             &value,
@@ -28621,7 +28764,7 @@ impl Eagle3MetalState {
         encode_attention(
             e,
             k,
-            &mut keep,
+            keep,
             &query,
             &self.cache_k,
             &self.cache_v,
@@ -28641,7 +28784,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &context,
             &self.o_proj,
             &attention_out,
@@ -28650,12 +28793,15 @@ impl Eagle3MetalState {
             EAGLE3_HIDDEN,
             1,
         );
-        encode_binary(
+        encode_binary_buffer_offsets(
             e,
             &k.residual_add_pipeline,
-            &g_buf,
+            g_states,
+            g_state_offset,
             &attention_out,
+            0,
             &attention_residual,
+            0,
             &residual_n,
             EAGLE3_HIDDEN,
         );
@@ -28670,7 +28816,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &post_norm,
             &self.gate_proj,
             &gate,
@@ -28682,7 +28828,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &post_norm,
             &self.up_proj,
             &up,
@@ -28703,7 +28849,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &activated,
             &self.down_proj,
             &down,
@@ -28732,7 +28878,7 @@ impl Eagle3MetalState {
         encode_resident_matmul_f32(
             e,
             k,
-            &mut keep,
+            keep,
             &output_normed,
             &self.lm_head,
             &logits,
@@ -28757,23 +28903,7 @@ impl Eagle3MetalState {
                 depth: 1,
             },
         );
-        e.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-
-        let draft_token = unsafe { *(selected.contents() as *const u32) };
-        let target_token = eagle3_map_draft_token(draft_token, &self.d2t_offsets);
-        let draft_logits = unsafe {
-            std::slice::from_raw_parts(logits.contents() as *const f32, self.lm_head_rows)
-        };
-        let top_candidates = eagle3_rank_top_candidates(draft_logits, &self.d2t_offsets);
-        let evaluated_vocab_logsumexp = eagle3_evaluated_vocab_logsumexp(draft_logits);
-        let mut raw_hidden_out = vec![0.0f32; EAGLE3_HIDDEN];
-        read_buffer_f32(&raw_hidden, &mut raw_hidden_out);
-
         keep.extend([
-            embedding,
-            g_buf,
             combined,
             query,
             key,
@@ -28786,10 +28916,7 @@ impl Eagle3MetalState {
             up,
             activated,
             down,
-            raw_hidden,
             output_normed,
-            logits,
-            selected,
             rms_scalar,
             q_scalar,
             kv_scalar,
@@ -28808,11 +28935,33 @@ impl Eagle3MetalState {
             cos_buf,
             sin_buf,
         ]);
+        Eagle3EncodedCell {
+            raw_hidden,
+            logits,
+            selected,
+        }
+    }
+
+    fn finish_encoded_cell(
+        &self,
+        k: &MetalLinearKernel,
+        encoded: Eagle3EncodedCell,
+        mut keep: Vec<Buffer>,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        let draft_token = unsafe { *(encoded.selected.contents() as *const u32) };
+        let target_token = eagle3_map_draft_token(draft_token, &self.d2t_offsets);
+        let draft_logits = unsafe {
+            std::slice::from_raw_parts(encoded.logits.contents() as *const f32, self.lm_head_rows)
+        };
+        let top_candidates = eagle3_rank_top_candidates(draft_logits, &self.d2t_offsets);
+        let evaluated_vocab_logsumexp = eagle3_evaluated_vocab_logsumexp(draft_logits);
+        let mut raw_hidden_out = vec![0.0f32; EAGLE3_HIDDEN];
+        read_buffer_f32(&encoded.raw_hidden, &mut raw_hidden_out);
+        keep.extend([encoded.raw_hidden, encoded.logits, encoded.selected]);
         pool_recycle(k, keep);
         let target_token = target_token?;
         let top_candidates = top_candidates?;
         let evaluated_vocab_logsumexp = evaluated_vocab_logsumexp?;
-        self.filled = position + 1;
         Ok(Eagle3MetalOutput {
             draft_token,
             target_token,
@@ -28821,6 +28970,163 @@ impl Eagle3MetalState {
             evaluated_vocab_logsumexp,
             raw_hidden: raw_hidden_out,
         })
+    }
+
+    /// Append one EAGLE cell at exactly the current cache watermark.
+    ///
+    /// `g` is either an FC-projected authoritative target feature (stable-cache extension)
+    /// or the previous call's raw hidden (ephemeral recursive drafting). The caller controls
+    /// that distinction; this primitive intentionally does not apply `fc` a second time.
+    pub fn forward_token(
+        &mut self,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        if token_embedding.len() != EAGLE3_HIDDEN || g.len() != EAGLE3_HIDDEN {
+            return Err(format!(
+                "EAGLE-3 forward expected embedding/g widths {EAGLE3_HIDDEN}, got {}/{}",
+                token_embedding.len(),
+                g.len()
+            ));
+        }
+        if position != self.filled {
+            return Err(format!(
+                "EAGLE-3 forward position {position} does not match KV watermark {}; rollback first",
+                self.filled
+            ));
+        }
+        if position >= self.max_positions {
+            return Err(format!(
+                "EAGLE-3 position {position} exceeds cache capacity {}",
+                self.max_positions
+            ));
+        }
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let bytes = (EAGLE3_HIDDEN * std::mem::size_of::<f32>()) as u64;
+        let embedding = pool_get(k, bytes);
+        let g_buf = pool_get(k, bytes);
+        write_buffer_f32(&embedding, token_embedding);
+        write_buffer_f32(&g_buf, g);
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = Vec::new();
+        let encoded = self
+            .encode_forward_token_from_buffers(e, k, &mut keep, &embedding, 0, &g_buf, 0, position);
+        keep.extend([embedding, g_buf]);
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let output = self.finish_encoded_cell(k, encoded, keep)?;
+        self.filled = position + 1;
+        Ok(output)
+    }
+
+    /// Benchmark-only one-command-buffer authoritative update.
+    ///
+    /// This encodes the established batched feature projection, the unchanged K/V-only
+    /// prefix rows, and the unchanged final full cell into one serial compute encoder. The
+    /// projected `[rows, H]` buffer never returns to the host. Every dispatch, scalar, and
+    /// reduction shape remains the same as the control lane; only synchronization and copies
+    /// between those stages are removed.
+    pub fn forward_authoritative_features_last_output_fused(
+        &mut self,
+        token_embeddings: &[f32],
+        features: &[f32],
+        start_position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        let rows = eagle3_validate_authoritative_fusion_shape(
+            features.len(),
+            token_embeddings.len(),
+            start_position,
+            self.filled,
+            self.max_positions,
+        )?;
+        if rows == 0 {
+            return Err("EAGLE-3 fused authoritative update requires at least one row".to_string());
+        }
+        let fused_values = rows
+            .checked_mul(EAGLE3_HIDDEN)
+            .ok_or_else(|| "EAGLE-3 authoritative fused-value count overflow".to_string())?;
+        let fused_bytes = fused_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "EAGLE-3 authoritative fused-buffer size overflow".to_string())?;
+        let feature_bytes = u64::try_from(std::mem::size_of_val(features))
+            .map_err(|_| "EAGLE-3 authoritative feature buffer exceeds u64".to_string())?;
+        let embedding_bytes = u64::try_from(std::mem::size_of_val(token_embeddings))
+            .map_err(|_| "EAGLE-3 authoritative embedding buffer exceeds u64".to_string())?;
+        let fused_bytes = u64::try_from(fused_bytes)
+            .map_err(|_| "EAGLE-3 authoritative fused buffer exceeds u64".to_string())?;
+        let row_offsets = (0..rows)
+            .map(eagle3_row_byte_offset)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let feature_input = pool_get(k, feature_bytes);
+        let embedding_input = pool_get(k, embedding_bytes);
+        let fused = pool_get(k, fused_bytes);
+        let fc_scalar = pool_get(k, 12);
+        write_buffer_f32(&feature_input, features);
+        write_buffer_f32(&embedding_input, token_embeddings);
+
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = Vec::new();
+        // Preserve `fuse_features`' exact batched projection geometry.
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &feature_input,
+            &self.fc,
+            &fused,
+            &fc_scalar,
+            EAGLE3_AUX_WIDTH,
+            EAGLE3_HIDDEN,
+            rows,
+        );
+
+        // Prefix scatters stay row-serial and keep their per-row n_tokens=1 projection
+        // geometry. Distinct row scalars/tables are retained in `keep` until completion.
+        for row in 0..rows - 1 {
+            let row_offset = row_offsets[row];
+            self.encode_authoritative_kv_row_from_buffers(
+                e,
+                k,
+                &mut keep,
+                &embedding_input,
+                row_offset,
+                &fused,
+                row_offset,
+                start_position + row,
+            );
+        }
+        let final_row = rows - 1;
+        let final_offset = row_offsets[final_row];
+        let encoded = self.encode_forward_token_from_buffers(
+            e,
+            k,
+            &mut keep,
+            &embedding_input,
+            final_offset,
+            &fused,
+            final_offset,
+            start_position + final_row,
+        );
+        keep.extend([feature_input, embedding_input, fused, fc_scalar]);
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        if cb.status() != metal::MTLCommandBufferStatus::Completed {
+            return Err(
+                "EAGLE-3 fused authoritative update command buffer did not complete"
+                    .to_string(),
+            );
+        }
+
+        let output = self.finish_encoded_cell(k, encoded, keep)?;
+        self.filled = start_position + rows;
+        Ok(output)
     }
 
     /// Correctness-first multi-row extension.  Each row is a true autoregressive cell, so
@@ -28942,6 +29248,15 @@ impl Eagle3MetalState {
         _token_embedding: &[f32],
         _g: &[f32],
         _position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn forward_authoritative_features_last_output_fused(
+        &mut self,
+        _token_embeddings: &[f32],
+        _features: &[f32],
+        _start_position: usize,
     ) -> std::result::Result<Eagle3MetalOutput, String> {
         Err("EAGLE-3 Metal is only available on macOS".to_string())
     }
@@ -29259,7 +29574,7 @@ mod eagle3_metal_contract_tests {
     }
 
     #[test]
-    fn authoritative_batch_shape_validation_is_shared_by_both_lanes() {
+    fn authoritative_batch_shape_validation_is_shared_by_all_lanes() {
         assert_eq!(
             eagle3_validate_batch_shape(2 * EAGLE3_HIDDEN, 2 * EAGLE3_HIDDEN, 7, 7, 9,).unwrap(),
             2
@@ -29270,6 +29585,55 @@ mod eagle3_metal_contract_tests {
         assert!(
             eagle3_validate_batch_shape(2 * EAGLE3_HIDDEN, 2 * EAGLE3_HIDDEN, 1, 1, 2,).is_err()
         );
+
+        assert_eq!(
+            eagle3_validate_authoritative_fusion_shape(
+                2 * EAGLE3_AUX_WIDTH,
+                2 * EAGLE3_HIDDEN,
+                7,
+                7,
+                9,
+            )
+            .unwrap(),
+            2
+        );
+        assert!(eagle3_validate_authoritative_fusion_shape(
+            2 * EAGLE3_AUX_WIDTH - 1,
+            2 * EAGLE3_HIDDEN,
+            7,
+            7,
+            9,
+        )
+        .is_err());
+        assert!(eagle3_validate_authoritative_fusion_shape(
+            2 * EAGLE3_AUX_WIDTH,
+            EAGLE3_HIDDEN,
+            7,
+            7,
+            9,
+        )
+        .is_err());
+        assert!(eagle3_validate_authoritative_fusion_shape(
+            2 * EAGLE3_AUX_WIDTH,
+            2 * EAGLE3_HIDDEN,
+            8,
+            7,
+            9,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn authoritative_fusion_row_offsets_are_exact_aligned_and_checked() {
+        assert_eq!(eagle3_row_byte_offset(0).unwrap(), 0);
+        assert_eq!(
+            eagle3_row_byte_offset(1).unwrap(),
+            (EAGLE3_HIDDEN * std::mem::size_of::<f32>()) as u64
+        );
+        for row in [1, 2, 7, 1_024] {
+            assert_eq!(eagle3_row_byte_offset(row).unwrap() % 256, 0);
+        }
+        assert!(eagle3_row_byte_offset(usize::MAX).is_err());
     }
 }
 
@@ -33193,6 +33557,13 @@ impl ResidentDecodeState {
             final_norm_buf = cache.weight_buffer(&kern.device, logits.final_norm);
         }
 
+        // Decide once, after every fail-closed eligibility/shape check and before allocating
+        // command-buffer state. Malformed/absent env values stay on the established lane.
+        let early_commit_split_after = verify_layer0_early_commit_split_after(
+            verify_layer0_early_commit_enabled(),
+            layers.len(),
+        );
+
         // ---- Buffers (row-major [token][dim]; token = verify row) -----------------------
         // Pooled: a verify round was re-allocating ~20 shared buffers
         // (several MB counting the k*vocab logits) on every call; the round
@@ -33238,6 +33609,14 @@ impl ResidentDecodeState {
         let gateup_gemv = nb(12);
         let down_gemv = nb(12);
         let out_gemv = nb(12);
+        // `encode_resident_matmul_f32` writes its geometry into these shared buffers while
+        // encoding. Once layer 0 has been committed, encoding layer 1 must not host-write a
+        // scalar the GPU may still be reading, even when the replacement bits are identical.
+        // Give the early command its own five GEMV scalars; the tail retains the established
+        // shared set. They remain in `keep` until BOTH serial command buffers have completed.
+        let layer0_gemv_scalars: Option<[Buffer; 5]> = early_commit_split_after
+            .is_some()
+            .then(|| [nb(12), nb(12), nb(12), nb(12), nb(12)]);
         let rope_q_scalar = nb(16);
         let rope_k_scalar = nb(16);
         let silu_n = nb(4);
@@ -33260,6 +33639,13 @@ impl ResidentDecodeState {
             set_gemv(&gateup_gemv, bpr_hidden, ffn_dim);
             set_gemv(&down_gemv, bpr_ffn, hidden);
             set_gemv(&out_gemv, bpr_hidden, vocab);
+            if let Some([q, kv, o, gateup, down]) = layer0_gemv_scalars.as_ref() {
+                set_gemv(q, bpr_hidden, q_dim);
+                set_gemv(kv, bpr_hidden, kv_dim);
+                set_gemv(o, bpr_q, hidden);
+                set_gemv(gateup, bpr_hidden, ffn_dim);
+                set_gemv(down, bpr_ffn, hidden);
+            }
             let set_rope = |buf: &Buffer, hc: usize| {
                 let r = buf.contents() as *mut u32;
                 *r = hc as u32;
@@ -33350,7 +33736,7 @@ impl ResidentDecodeState {
             (None, Vec::new())
         };
 
-        // ---- Encode the whole verify window into one serial compute encoder -------------
+        // ---- Encode the verify window on one serial command queue -----------------------
         let mut keep: Vec<Buffer> = Vec::new();
         // Attribution, not decoration (same split the batch-prefill trace uses):
         // `gpu_busy` vs wall separates "the kernels are slow" from "the CPU cannot
@@ -33359,17 +33745,28 @@ impl ResidentDecodeState {
         // wrong means optimizing the wrong half.
         let verify_trace = std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some();
         let encode_started = std::time::Instant::now();
-        let cb = kern.queue.new_command_buffer();
-        let e = cb.new_compute_command_encoder();
+        let mut cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
+        let mut encoder: metal::ComputeCommandEncoder =
+            cb.new_compute_command_encoder().to_owned();
+        // Retaining the early command until the tail completes makes its lifetime explicit;
+        // more importantly, every pooled buffer it references remains in `keep` until then.
+        let mut layer0_cb: Option<metal::CommandBuffer> = None;
+        let mut first_commit_started: Option<std::time::Instant> = None;
         let mut from_a = true;
         let mut batched_attention_layers = 0usize;
         let mut batched_rope_scatter_layers = 0usize;
         for l in 0..layers.len() {
+            let e = &encoder;
             let (cur, nxt) = if from_a {
                 (&act_a, &act_b)
             } else {
                 (&act_b, &act_a)
             };
+            let (layer_q_gemv, layer_kv_gemv, layer_o_gemv, layer_gateup_gemv, layer_down_gemv) =
+                match (l, layer0_gemv_scalars.as_ref()) {
+                    (0, Some([q, kv, o, gateup, down])) => (q, kv, o, gateup, down),
+                    _ => (&q_gemv, &kv_gemv, &o_gemv, &gateup_gemv, &down_gemv),
+                };
             if let Ok(capture_slot) = capture_layer_ids.binary_search(&l) {
                 encode_copy_f32(
                     e,
@@ -33383,7 +33780,15 @@ impl ResidentDecodeState {
             let w = &resident[l];
             // --- Attention block ---
             // 1. input RMSNorm (batched, byte-exact vs single rms_norm_f32 per row)
-            encode_rms_norm_batch(kern, e, cur, &attn_norm_bufs[l], &norm_buf, &rms_scalar, k);
+            encode_rms_norm_batch(
+                kern,
+                e,
+                cur,
+                &attn_norm_bufs[l],
+                &norm_buf,
+                &rms_scalar,
+                k,
+            );
             // 2. Q/K/V projections (batched-column GEMV; column t == single-token row t)
             if !encode_resident_kquant_v4_shared_group(
                 e,
@@ -33391,21 +33796,48 @@ impl ResidentDecodeState {
                 &mut keep,
                 &norm_buf,
                 &[
-                    (&w[0], &q_buf, &q_gemv, q_dim),
-                    (&w[1], &k_buf, &kv_gemv, kv_dim),
-                    (&w[2], &v_buf, &kv_gemv, kv_dim),
+                    (&w[0], &q_buf, layer_q_gemv, q_dim),
+                    (&w[1], &k_buf, layer_kv_gemv, kv_dim),
+                    (&w[2], &v_buf, layer_kv_gemv, kv_dim),
                 ],
                 hidden,
                 k,
             ) {
                 encode_resident_matmul_f32(
-                    e, kern, &mut keep, &norm_buf, &w[0], &q_buf, &q_gemv, hidden, q_dim, k,
+                    e,
+                    kern,
+                    &mut keep,
+                    &norm_buf,
+                    &w[0],
+                    &q_buf,
+                    layer_q_gemv,
+                    hidden,
+                    q_dim,
+                    k,
                 );
                 encode_resident_matmul_f32(
-                    e, kern, &mut keep, &norm_buf, &w[1], &k_buf, &kv_gemv, hidden, kv_dim, k,
+                    e,
+                    kern,
+                    &mut keep,
+                    &norm_buf,
+                    &w[1],
+                    &k_buf,
+                    layer_kv_gemv,
+                    hidden,
+                    kv_dim,
+                    k,
                 );
                 encode_resident_matmul_f32(
-                    e, kern, &mut keep, &norm_buf, &w[2], &v_buf, &kv_gemv, hidden, kv_dim, k,
+                    e,
+                    kern,
+                    &mut keep,
+                    &norm_buf,
+                    &w[2],
+                    &v_buf,
+                    layer_kv_gemv,
+                    hidden,
+                    kv_dim,
+                    k,
                 );
             }
             // 3. per-head Q/K-norm (Qwen3) — per row, in place
@@ -33632,7 +34064,16 @@ impl ResidentDecodeState {
             }
             // 7. O projection (batched), 8. attention residual (batched)
             encode_resident_matmul_f32(
-                e, kern, &mut keep, &ctx_buf, &w[3], &o_buf, &o_gemv, q_dim, hidden, k,
+                e,
+                kern,
+                &mut keep,
+                &ctx_buf,
+                &w[3],
+                &o_buf,
+                layer_o_gemv,
+                q_dim,
+                hidden,
+                k,
             );
             encode_binary(
                 e,
@@ -33651,8 +34092,8 @@ impl ResidentDecodeState {
                 &mut keep,
                 &norm_buf,
                 &[
-                    (&w[4], &gate_buf, &gateup_gemv, ffn_dim),
-                    (&w[5], &up_buf, &gateup_gemv, ffn_dim),
+                    (&w[4], &gate_buf, layer_gateup_gemv, ffn_dim),
+                    (&w[5], &up_buf, layer_gateup_gemv, ffn_dim),
                 ],
                 hidden,
                 k,
@@ -33664,7 +34105,7 @@ impl ResidentDecodeState {
                     &norm_buf,
                     &w[4],
                     &gate_buf,
-                    &gateup_gemv,
+                    layer_gateup_gemv,
                     hidden,
                     ffn_dim,
                     k,
@@ -33676,7 +34117,7 @@ impl ResidentDecodeState {
                     &norm_buf,
                     &w[5],
                     &up_buf,
-                    &gateup_gemv,
+                    layer_gateup_gemv,
                     hidden,
                     ffn_dim,
                     k,
@@ -33692,7 +34133,16 @@ impl ResidentDecodeState {
                 k * ffn_dim,
             );
             encode_resident_matmul_f32(
-                e, kern, &mut keep, &silu_buf, &w[6], &down_buf, &down_gemv, ffn_dim, hidden, k,
+                e,
+                kern,
+                &mut keep,
+                &silu_buf,
+                &w[6],
+                &down_buf,
+                layer_down_gemv,
+                ffn_dim,
+                hidden,
+                k,
             );
             encode_binary(
                 e,
@@ -33704,7 +34154,19 @@ impl ResidentDecodeState {
                 k * hidden,
             );
             from_a = !from_a;
+            if early_commit_split_after == Some(l) {
+                // End/commit only after the COMPLETE layer-0 chain. The next command buffer
+                // is enqueued on the same serial queue, so layer 1 cannot execute before the
+                // layer-0 residual write even though its host-side encoding overlaps layer 0.
+                encoder.end_encoding();
+                first_commit_started = Some(std::time::Instant::now());
+                cb.commit();
+                layer0_cb = Some(cb);
+                cb = kern.queue.new_command_buffer().to_owned();
+                encoder = cb.new_compute_command_encoder().to_owned();
+            }
         }
+        let e = &encoder;
         let final_buf = if from_a { &act_a } else { &act_b };
         // ---- Final stage: norm -> output GEMV -> per-row argmax -------------------------
         encode_rms_norm_batch(
@@ -33772,15 +34234,30 @@ impl ResidentDecodeState {
         }
         e.end_encoding();
         let encode_us = encode_started.elapsed().as_micros();
-        let commit_started = std::time::Instant::now();
+        let tail_commit_started = std::time::Instant::now();
+        let commit_started = first_commit_started.unwrap_or_else(|| tail_commit_started.clone());
         cb.commit();
         cb.wait_until_completed();
+        // Tail completion on this serial queue implies layer 0 completed. Keep the explicit
+        // wait as a lifetime/status fence before any host readback or pool recycle.
+        if let Some(head) = layer0_cb.as_ref() {
+            head.wait_until_completed();
+        }
         if verify_trace {
             let wall_us = commit_started.elapsed().as_micros();
-            let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb.to_owned());
+            let tail_wait_us = tail_commit_started.elapsed().as_micros();
+            let (tail_gpu_busy_us, tail_kernel_window_us) = command_buffer_gpu_times_us(&cb);
+            let (head_gpu_busy_us, head_kernel_window_us) = layer0_cb
+                .as_ref()
+                .map(command_buffer_gpu_times_us)
+                .unwrap_or((0, 0));
+            let gpu_busy_us = head_gpu_busy_us + tail_gpu_busy_us;
+            let kernel_window_us = head_kernel_window_us + tail_kernel_window_us;
+            let command_buffers = if layer0_cb.is_some() { 2 } else { 1 };
             eprintln!(
                 "[metal-verify-phase] base={base_position} k={k} \
-                 encode={encode_us}us commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
+                 encode={encode_us}us commit_wait={wall_us}us tail_commit_wait={tail_wait_us}us \
+                 command_buffers={command_buffers} gpu_busy={gpu_busy_us}us \
                  kernel_window={kernel_window_us}us attn_batch_layers={batched_attention_layers} \
                  rope_scatter_batch_layers={batched_rope_scatter_layers}"
             );
@@ -33834,6 +34311,9 @@ impl ResidentDecodeState {
         // The command buffer completed and every host readback above is
         // done: return the round's scratch (activations, scalars, staging
         // from the batched projections) to the pool.
+        if let Some(scalars) = layer0_gemv_scalars {
+            keep.extend(scalars);
+        }
         keep.extend([
             act_a,
             act_b,

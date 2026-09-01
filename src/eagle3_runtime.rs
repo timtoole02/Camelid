@@ -16,6 +16,8 @@ use crate::metal::{
 };
 use crate::tensor::CpuTensor;
 
+pub const EAGLE3_AUTHORITATIVE_CB_FUSION_ENV: &str = "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION";
+
 fn invalid(message: impl Into<String>) -> BackendError {
     BackendError::RuntimeShapeMismatch(message.into())
 }
@@ -24,7 +26,7 @@ fn metal<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(|message| invalid(format!("EAGLE-3 Metal runtime: {message}")))
 }
 
-fn eagle3_batch_authoritative_kv_enabled_from(value: Option<&str>) -> bool {
+fn eagle3_env_enabled_from(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -33,9 +35,45 @@ fn eagle3_batch_authoritative_kv_enabled_from(value: Option<&str>) -> bool {
     })
 }
 
+fn eagle3_batch_authoritative_kv_enabled_from(value: Option<&str>) -> bool {
+    eagle3_env_enabled_from(value)
+}
+
 fn eagle3_batch_authoritative_kv_enabled() -> bool {
     let value = std::env::var("CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV").ok();
     eagle3_batch_authoritative_kv_enabled_from(value.as_deref())
+}
+
+fn eagle3_full_authoritative_enabled() -> bool {
+    let value = std::env::var("CAMELID_EAGLE3_FULL_AUTHORITATIVE").ok();
+    eagle3_env_enabled_from(value.as_deref())
+}
+
+fn eagle3_authoritative_cb_fusion_enabled_from(value: Option<&str>) -> bool {
+    eagle3_env_enabled_from(value)
+}
+
+fn eagle3_authoritative_cb_fusion_enabled() -> bool {
+    let value = std::env::var(EAGLE3_AUTHORITATIVE_CB_FUSION_ENV).ok();
+    eagle3_authoritative_cb_fusion_enabled_from(value.as_deref())
+}
+
+fn validate_authoritative_cb_fusion_dependencies(
+    enabled: bool,
+    batched_kv: bool,
+    full_authoritative: bool,
+) -> Result<()> {
+    if enabled && !batched_kv {
+        return Err(invalid(
+            "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION=1 requires CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV=1",
+        ));
+    }
+    if enabled && full_authoritative {
+        return Err(invalid(
+            "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION=1 cannot be combined with CAMELID_EAGLE3_FULL_AUTHORITATIVE=1",
+        ));
+    }
+    Ok(())
 }
 
 // Cache capacity and attention span are independent. E9 keeps absolute K/V rows for
@@ -736,11 +774,33 @@ impl Eagle3ForestAcceptance {
     }
 }
 
+/// Receipt-facing counters for the benchmark-only authoritative command-buffer fusion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Eagle3AuthoritativeFusionTelemetry {
+    /// Successful decode-time authoritative updates routed through the experimental lane.
+    pub fused_updates: u64,
+    /// Authoritative rows consumed by those updates.
+    pub fused_rows: u64,
+    /// Metal command buffers used by those updates. The fused lane contributes exactly one
+    /// for every successful update; exposing the count lets a benchmark receipt prove that
+    /// the synchronization experiment actually ran.
+    pub command_buffers: u64,
+}
+
+impl Eagle3AuthoritativeFusionTelemetry {
+    fn note_fused_update(&mut self, rows: usize) {
+        self.fused_updates = self.fused_updates.saturating_add(1);
+        self.fused_rows = self.fused_rows.saturating_add(rows as u64);
+        self.command_buffers = self.command_buffers.saturating_add(1);
+    }
+}
+
 /// Linear top-1 EAGLE-3 drafter. `stable_seed` is the output of the newest
 /// authoritative head-cache row and therefore predicts the first token of the next round.
 pub struct Eagle3Drafter {
     head: Eagle3MetalState,
     stable_seed: Option<Eagle3MetalOutput>,
+    authoritative_fusion: Eagle3AuthoritativeFusionTelemetry,
 }
 
 fn stable_root_target_top_k(output: &Eagle3MetalOutput, count: usize) -> Result<Vec<u32>> {
@@ -792,15 +852,7 @@ impl Eagle3Drafter {
         fused: &[f32],
         start: usize,
     ) -> Result<Eagle3MetalOutput> {
-        if std::env::var("CAMELID_EAGLE3_FULL_AUTHORITATIVE")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "on" | "yes" | "enabled"
-                )
-            })
-        {
+        if eagle3_full_authoritative_enabled() {
             return metal(self.head.forward_batch(embeddings, fused, start))?
                 .pop()
                 .ok_or_else(|| invalid("EAGLE-3 authoritative batch produced no output"));
@@ -840,6 +892,25 @@ impl Eagle3Drafter {
                 "EAGLE-3 verify emitted {} tokens but captured only {rows} target rows",
                 emitted.len()
             )));
+        }
+        if eagle3_authoritative_cb_fusion_enabled() {
+            validate_authoritative_cb_fusion_dependencies(
+                true,
+                eagle3_batch_authoritative_kv_enabled(),
+                eagle3_full_authoritative_enabled(),
+            )?;
+            let embeddings = target_weights
+                .token_embedding
+                .embedding_lookup(emitted, "eagle3_authoritative_next_token_embeddings")?;
+            let start = self.head.filled();
+            let output = metal(self.head.forward_authoritative_features_last_output_fused(
+                &embeddings.data,
+                &features[..emitted.len() * EAGLE3_AUX_WIDTH],
+                start,
+            ))?;
+            self.authoritative_fusion.note_fused_update(emitted.len());
+            self.stable_seed = Some(output);
+            return Ok(());
         }
         let fused = metal(
             self.head
@@ -883,11 +954,18 @@ impl Eagle3Drafter {
         Ok(Self {
             head,
             stable_seed: None,
+            authoritative_fusion: Eagle3AuthoritativeFusionTelemetry::default(),
         })
     }
 
     pub fn filled(&self) -> usize {
         self.head.filled()
+    }
+
+    /// Decode-time telemetry for the benchmark-only authoritative command-buffer fusion.
+    /// Prompt seeding is deliberately excluded and remains on the established control path.
+    pub fn authoritative_fusion_telemetry(&self) -> Eagle3AuthoritativeFusionTelemetry {
+        self.authoritative_fusion
     }
 
     /// Return the current stable root's target-vocabulary ranking without advancing the
@@ -1225,6 +1303,44 @@ mod tests {
             assert!(!eagle3_batch_authoritative_kv_enabled_from(Some(disabled)));
         }
         assert!(!eagle3_batch_authoritative_kv_enabled_from(None));
+    }
+
+    #[test]
+    fn authoritative_cb_fusion_gate_is_default_off_and_dependencies_are_strict() {
+        for enabled in ["1", "true", "TRUE", " on ", "Yes", "enabled"] {
+            assert!(eagle3_authoritative_cb_fusion_enabled_from(Some(enabled)));
+        }
+        for disabled in ["", "0", "false", "off", "no", "fuse", "garbage"] {
+            assert!(!eagle3_authoritative_cb_fusion_enabled_from(Some(disabled)));
+        }
+        assert!(!eagle3_authoritative_cb_fusion_enabled_from(None));
+
+        validate_authoritative_cb_fusion_dependencies(false, false, true).unwrap();
+        validate_authoritative_cb_fusion_dependencies(true, true, false).unwrap();
+        let missing_batch =
+            validate_authoritative_cb_fusion_dependencies(true, false, false).unwrap_err();
+        assert!(
+            missing_batch
+                .to_string()
+                .contains("CAMELID_EAGLE3_BATCH_AUTHORITATIVE_KV=1"),
+            "{missing_batch}"
+        );
+        let full = validate_authoritative_cb_fusion_dependencies(true, true, true).unwrap_err();
+        assert!(
+            full.to_string()
+                .contains("CAMELID_EAGLE3_FULL_AUTHORITATIVE=1"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn authoritative_cb_fusion_telemetry_attests_one_buffer_per_update() {
+        let mut telemetry = Eagle3AuthoritativeFusionTelemetry::default();
+        telemetry.note_fused_update(1);
+        telemetry.note_fused_update(4);
+        assert_eq!(telemetry.fused_updates, 2);
+        assert_eq!(telemetry.fused_rows, 5);
+        assert_eq!(telemetry.command_buffers, telemetry.fused_updates);
     }
 
     #[test]
