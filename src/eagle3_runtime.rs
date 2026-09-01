@@ -611,6 +611,13 @@ impl Eagle3DynamicFrontier {
     }
 
     pub fn finish(self) -> Result<Eagle3DraftForest> {
+        self.finish_borrowed()
+    }
+
+    /// Produce ordinary verifier N without consuming the already-materialized frontier.
+    /// Benchmark-only candidate selectors may inspect the same causal lattice immediately after
+    /// this call, then drop the frontier before target verification.
+    pub fn finish_borrowed(&self) -> Result<Eagle3DraftForest> {
         let scored = self
             .lattice
             .rerank_connected(self.config.max_verify_nodes, self.config.max_depth)

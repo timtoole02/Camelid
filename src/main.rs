@@ -9468,13 +9468,18 @@ struct Eagle3TargetRowHedgeTelemetry {
     rounds: u64,
     insertion_rounds: u64,
     no_prior_row_rounds: u64,
+    no_promotable_lattice_child_rounds: u64,
     duplicate_only_rounds: u64,
+    below_promotion_score_rounds: u64,
     no_replaceable_hedge_rounds: u64,
     supported_primary_rows: u64,
     full_path_duplicates: u64,
+    prior_rows_without_materialized_child: u64,
     target_rows_offered: u64,
     target_rows_accepted: u64,
     shared_rows_accepted: u64,
+    evicted_edges_would_accept: u64,
+    counterfactual_emitted_token_delta: i64,
     neural_hedges_retained_sum: u64,
     offered_by_depth: [u64; 8],
     accepted_by_depth: [u64; 8],
@@ -9487,6 +9492,8 @@ impl Eagle3TargetRowHedgeTelemetry {
         &mut self,
         forest: &camelid::inference::target_row_hedge::TargetRowHedgeForest,
         acceptance: &camelid::inference::target_row_hedge::TargetRowHedgeAcceptance,
+        ordinary_eagle: &camelid::inference::spec_tree::ScoredTokenTree,
+        predictions: &[u32],
     ) -> Result<(), String> {
         use camelid::inference::target_row_hedge::{
             TargetRowHedgeOutcome, TargetRowHedgeSource,
@@ -9510,6 +9517,9 @@ impl Eagle3TargetRowHedgeTelemetry {
         next.full_path_duplicates = next
             .full_path_duplicates
             .saturating_add(forest.decision.full_path_duplicates as u64);
+        next.prior_rows_without_materialized_child = next
+            .prior_rows_without_materialized_child
+            .saturating_add(forest.decision.prior_rows_without_materialized_child as u64);
         next.neural_hedges_retained_sum = next
             .neural_hedges_retained_sum
             .saturating_add(forest.decision.neural_hedges_retained as u64);
@@ -9540,8 +9550,17 @@ impl Eagle3TargetRowHedgeTelemetry {
             TargetRowHedgeOutcome::NoPriorTargetRow => {
                 next.no_prior_row_rounds = next.no_prior_row_rounds.saturating_add(1);
             }
+            TargetRowHedgeOutcome::NoPromotableLatticeChild => {
+                next.no_promotable_lattice_child_rounds = next
+                    .no_promotable_lattice_child_rounds
+                    .saturating_add(1);
+            }
             TargetRowHedgeOutcome::DuplicateOnly => {
                 next.duplicate_only_rounds = next.duplicate_only_rounds.saturating_add(1);
+            }
+            TargetRowHedgeOutcome::BelowPromotionScore => {
+                next.below_promotion_score_rounds =
+                    next.below_promotion_score_rounds.saturating_add(1);
             }
             TargetRowHedgeOutcome::NoReplaceableNeuralHedge => {
                 next.no_replaceable_hedge_rounds =
@@ -9561,6 +9580,28 @@ impl Eagle3TargetRowHedgeTelemetry {
                 })
                 .count() as u64,
         );
+        let counterfactual = forest.exact_counterfactual(
+            ordinary_eagle,
+            predictions,
+            acceptance,
+        )?;
+        if counterfactual.inserted_row_accepted
+            != (forest.decision.outcome == TargetRowHedgeOutcome::Inserted
+                && forest
+                    .source
+                    .iter()
+                    .position(|&source| source == TargetRowHedgeSource::PriorTargetTop1)
+                    .is_some_and(|row| acceptance.capture_rows.contains(&row)))
+        {
+            return Err("target-row counterfactual disagrees with accepted-row telemetry".into());
+        }
+        next.evicted_edges_would_accept = next
+            .evicted_edges_would_accept
+            .saturating_add(counterfactual.evicted_edge_would_accept as u64);
+        next.counterfactual_emitted_token_delta = next
+            .counterfactual_emitted_token_delta
+            .checked_add(i64::from(counterfactual.emitted_token_delta))
+            .ok_or_else(|| "target-row counterfactual delta overflowed i64".to_string())?;
         *self = next;
         Ok(())
     }
@@ -10528,6 +10569,7 @@ fn run_eagle3_resident_greedy(
     suffix_first: bool,
     token_recycling_hybrid: bool,
     target_row_hedge: bool,
+    target_row_lattice_promotion: bool,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
     mut secondary_drafter: Option<camelid::eagle3_runtime::Eagle3Drafter>,
     head_upload_ms: f64,
@@ -10597,13 +10639,13 @@ fn run_eagle3_resident_greedy(
         drafter.branch = 2;
         drafter
     });
-    // This cache is independent of the whole-tree EAGLE/TR selector above. The target-row hedge
-    // lane always drafts its ordinary EAGLE forest and reads this table before verification;
-    // current target rows are installed only after the round is fully verified and accepted.
-    let mut target_row_cache = target_row_hedge.then(|| {
+    // This cache is independent of the whole-tree EAGLE/TR selector above. Both target-row lanes
+    // always draft their ordinary EAGLE frontier and read this table before verification; current
+    // target rows are installed only after the round is fully verified and accepted.
+    let mut target_row_cache = (target_row_hedge || target_row_lattice_promotion).then(|| {
         let mut cache = TokenRecyclingDrafter::default();
-        // The first gate deliberately consumes only exact prior top-1. Wider target-row hedges
-        // remain a separately measurable follow-up rather than silently changing this policy.
+        // Both gates deliberately consume only exact prior top-1. The lattice lane adds current
+        // EAGLE corroboration without silently widening target evidence.
         cache.topk = 1;
         cache.branch = 1;
         cache
@@ -11184,16 +11226,29 @@ fn run_eagle3_resident_greedy(
                     },
                 )?;
                 let materialized_head_forwards = frontier.materialized_head_forwards();
-                let eagle_forest = frontier.finish()?;
+                let eagle_forest = frontier.finish_borrowed()?;
                 // The closure is read-only and runs before the current verify. The cache mutation
                 // is intentionally below target acceptance, making same-round leakage impossible.
-                let fused = camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse(
-                    &eagle_forest.scored,
-                    round_node_budget,
-                    budget,
-                    |token| target_rows.prior_target_top1(token),
-                )
+                let fused = if target_row_lattice_promotion {
+                    camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse_lattice_promoted(
+                        &eagle_forest.scored,
+                        frontier.lattice(),
+                        round_node_budget,
+                        budget,
+                        |token| target_rows.prior_target_top1(token),
+                    )
+                } else {
+                    camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse(
+                        &eagle_forest.scored,
+                        round_node_budget,
+                        budget,
+                        |token| target_rows.prior_target_top1(token),
+                    )
+                }
                 .map_err(anyhow::Error::msg)?;
+                // The current lattice has served its only causal selection purpose. Release its
+                // recurrent branch state before the target verifier allocates/encodes N8.
+                drop(frontier);
                 let actual_nodes = fused.tree.nodes();
                 let actual_max_depth = fused.tree.max_depth();
                 anyhow::ensure!(
@@ -11271,17 +11326,31 @@ fn run_eagle3_resident_greedy(
                 run.target_row_hedge
                     .note_candidates(actual_nodes, candidate_ids);
                 run.target_row_hedge
-                    .note_round(&fused, &fused_acceptance)
+                    .note_round(
+                        &fused,
+                        &fused_acceptance,
+                        &eagle_forest.scored,
+                        &verified.predictions,
+                    )
                     .map_err(anyhow::Error::msg)?;
                 if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
                     eprintln!(
-                        "[eagle3-target-row-hedge] outcome={:?} supported={} duplicates={} \
-                         token={:?} parent_depth={:?} evicted={:?} neural_retained={} rows={} emitted={}",
+                        "[eagle3-target-row-{}] outcome={:?} supported={} duplicates={} \
+                         no-promotable-lattice-child={} token={:?} parent_depth={:?} lattice-source={:?} \
+                         candidate-score={:?} adjusted-score={:?} comparison={:?}/{:?} \
+                         evicted={:?} neural-retained={} rows={} emitted={}",
+                        if target_row_lattice_promotion { "lattice-promotion" } else { "hedge" },
                         fused.decision.outcome,
                         fused.decision.supported_primary_rows,
                         fused.decision.full_path_duplicates,
+                        fused.decision.prior_rows_without_materialized_child,
                         fused.decision.candidate_token,
                         fused.decision.candidate_parent_depth,
+                        fused.decision.candidate_lattice_source_node,
+                        fused.decision.candidate_cumulative_log_probability,
+                        fused.decision.candidate_adjusted_log_score,
+                        fused.decision.comparison_eagle_row,
+                        fused.decision.comparison_cumulative_log_probability,
                         fused.decision.evicted_eagle_row,
                         fused.decision.neural_hedges_retained,
                         actual_nodes,
@@ -11633,20 +11702,24 @@ fn run_eagle3_resident_greedy(
             run.verify_nodes,
         );
     }
-    if target_row_hedge {
+    if target_row_hedge || target_row_lattice_promotion {
         let hedge = run.target_row_hedge;
         anyhow::ensure!(
             hedge.rounds == run.rounds
                 && hedge.insertion_rounds
                     + hedge.no_prior_row_rounds
+                    + hedge.no_promotable_lattice_child_rounds
                     + hedge.duplicate_only_rounds
+                    + hedge.below_promotion_score_rounds
                     + hedge.no_replaceable_hedge_rounds
                     == run.rounds,
-            "target-row hedge decisions missed rounds: decisions={} inserted={} cold={} duplicate={} no-slot={} rounds={}",
+            "target-row decisions missed rounds: decisions={} inserted={} cold={} no-promotable-lattice-child={} duplicate={} below-score={} no-slot={} rounds={}",
             hedge.rounds,
             hedge.insertion_rounds,
             hedge.no_prior_row_rounds,
+            hedge.no_promotable_lattice_child_rounds,
             hedge.duplicate_only_rounds,
+            hedge.below_promotion_score_rounds,
             hedge.no_replaceable_hedge_rounds,
             run.rounds,
         );
@@ -11655,13 +11728,20 @@ fn run_eagle3_resident_greedy(
                 && hedge.target_rows_offered == hedge.insertion_rounds
                 && hedge.offered_by_depth.iter().sum::<u64>() == hedge.target_rows_offered
                 && hedge.accepted_by_depth.iter().sum::<u64>() == hedge.target_rows_accepted
-                && hedge.target_rows_accepted <= hedge.target_rows_offered,
-            "target-row hedge telemetry diverged: candidate_rows={}/{} offered={}/{} accepted={} depth_offered={} depth_accepted={}",
+                && hedge.target_rows_accepted <= hedge.target_rows_offered
+                && hedge.target_rows_accepted + hedge.evicted_edges_would_accept
+                    <= hedge.insertion_rounds
+                && hedge.counterfactual_emitted_token_delta
+                    == hedge.target_rows_accepted as i64
+                        - hedge.evicted_edges_would_accept as i64,
+            "target-row telemetry diverged: candidate_rows={}/{} offered={}/{} accepted={} evicted-would-accept={} delta={} depth_offered={} depth_accepted={}",
             hedge.candidate_rows,
             run.verify_nodes,
             hedge.target_rows_offered,
             hedge.insertion_rounds,
             hedge.target_rows_accepted,
+            hedge.evicted_edges_would_accept,
+            hedge.counterfactual_emitted_token_delta,
             hedge.offered_by_depth.iter().sum::<u64>(),
             hedge.accepted_by_depth.iter().sum::<u64>(),
         );
@@ -11892,6 +11972,61 @@ struct BenchEagle3Record {
     target_row_hedge_candidate_rows: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_row_hedge_candidate_ids: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_evicted_edges_would_accept: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_hedge_counterfactual_emitted_token_delta: Option<i64>,
+    target_row_lattice_promotion: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_max_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_candidate_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_score_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_prior_log_bonus: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_cache_update_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rounds_promoted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_no_prior_row_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_no_promotable_child_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_duplicate_only_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_below_score_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_no_replaceable_hedge_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_supported_primary_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_prior_rows_without_materialized_child: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_full_path_duplicates: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rows_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_shared_rows_accepted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_evicted_edges_would_accept: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_counterfactual_emitted_token_delta: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_neural_hedges_retained_sum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_offered_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_accepted_by_depth: Option<[u64; 8]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_candidate_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_row_lattice_promotion_candidate_ids: Option<u64>,
     dual_eagle_selector: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     dual_eagle_race_rounds: Option<u8>,
@@ -12100,6 +12235,32 @@ fn eagle3_target_row_hedge_enabled() -> anyhow::Result<bool> {
     parse_eagle3_target_row_hedge_env(value)
 }
 
+fn parse_eagle3_target_row_lattice_promotion_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
+        | Some("disabled") => Ok(false),
+        Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION must be a boolean, got {value:?}"
+        ),
+    }
+}
+
+fn eagle3_target_row_lattice_promotion_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os("CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION");
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_target_row_lattice_promotion_env(value)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_eagle3_target_row_hedge_config(
     enabled: bool,
@@ -12146,6 +12307,55 @@ fn validate_eagle3_target_row_hedge_config(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_eagle3_target_row_lattice_promotion_config(
+    enabled: bool,
+    target_row_hedge: bool,
+    tree_nodes: Option<usize>,
+    draft_tokens: usize,
+    tree_topk: usize,
+    adaptive_branching: bool,
+    adaptive_expansions: bool,
+    suffix_first: bool,
+    token_recycling_hybrid: bool,
+    dual_eagle_selector: bool,
+    verifier_width_selector: bool,
+    x3_x4_selector: bool,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !target_row_hedge,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION cannot combine with CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE"
+    );
+    anyhow::ensure!(
+        tree_nodes
+            == Some(camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES),
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires --tree-nodes {}",
+        camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+    );
+    anyhow::ensure!(
+        draft_tokens >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires --draft-tokens >= 2"
+    );
+    anyhow::ensure!(
+        tree_topk >= 2,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires --tree-topk >= 2 so a neural hedge is available"
+    );
+    anyhow::ensure!(
+        !adaptive_branching
+            && !adaptive_expansions
+            && !suffix_first
+            && !token_recycling_hybrid
+            && !dual_eagle_selector
+            && !verifier_width_selector
+            && !x3_x4_selector,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION requires fixed ordinary N8 EAGLE drafting and cannot combine with adaptive branching/expansions, suffix-first, whole-tree Token Recycling, dual-EAGLE, width selection, or X3/X4 selection"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[test]
 fn eagle3_target_row_hedge_gate_is_default_off_and_fixed_n8() {
@@ -12188,6 +12398,63 @@ fn eagle3_target_row_hedge_gate_is_default_off_and_fixed_n8() {
         )
         .is_err());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn eagle3_target_row_lattice_promotion_gate_is_default_off_and_exclusive() {
+    for value in [None, Some(""), Some("0"), Some("false"), Some("OFF")] {
+        assert!(!parse_eagle3_target_row_lattice_promotion_env(value).unwrap());
+    }
+    for value in [Some("1"), Some("true"), Some("ON"), Some("enabled")] {
+        assert!(parse_eagle3_target_row_lattice_promotion_env(value).unwrap());
+    }
+    assert!(parse_eagle3_target_row_lattice_promotion_env(Some("maybe")).is_err());
+    assert!(validate_eagle3_target_row_lattice_promotion_config(
+        true,
+        false,
+        Some(8),
+        15,
+        4,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_ok());
+    assert!(validate_eagle3_target_row_lattice_promotion_config(
+        true,
+        true,
+        Some(8),
+        15,
+        4,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_err());
+    assert!(validate_eagle3_target_row_lattice_promotion_config(
+        true,
+        false,
+        Some(8),
+        15,
+        1,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .is_err());
 }
 
 fn eagle3_adaptive_expansions_enabled() -> bool {
@@ -12987,6 +13254,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_SPEC_TREE",
         "CAMELID_BENCH_EAGLE3_TR_HYBRID",
         "CAMELID_BENCH_EAGLE3_TARGET_ROW_HEDGE",
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS",
         "CAMELID_BENCH_EAGLE3_ADAPTIVE_EXPANSIONS_TRACE",
         "CAMELID_BENCH_DUAL_EAGLE_SELECTOR",
@@ -13335,6 +13603,7 @@ fn run_bench_eagle3(
         "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
     let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
     let target_row_hedge = eagle3_target_row_hedge_enabled()?;
+    let target_row_lattice_promotion = eagle3_target_row_lattice_promotion_enabled()?;
     let adaptive_expansions = eagle3_adaptive_expansions_enabled();
     let dual_eagle_selector = dual_eagle_selector_enabled()?;
     let verifier_width_selector = eagle3_width_selector_config()?;
@@ -13431,6 +13700,20 @@ fn run_bench_eagle3(
         dual_eagle_selector,
     )?;
     validate_eagle3_target_row_hedge_config(
+        target_row_hedge,
+        tree_nodes,
+        draft_tokens,
+        tree_topk,
+        adaptive_branching,
+        adaptive_expansions,
+        suffix_first,
+        token_recycling_hybrid,
+        dual_eagle_selector,
+        verifier_width_selector.is_some(),
+        x3_x4_selector.is_some(),
+    )?;
+    validate_eagle3_target_row_lattice_promotion_config(
+        target_row_lattice_promotion,
         target_row_hedge,
         tree_nodes,
         draft_tokens,
@@ -13683,6 +13966,7 @@ fn run_bench_eagle3(
         suffix_first,
         token_recycling_hybrid,
         target_row_hedge,
+        target_row_lattice_promotion,
         primary_drafter,
         secondary_drafter,
         head_upload_ms,
@@ -13760,6 +14044,8 @@ fn run_bench_eagle3(
             "dynamic_tree_dual_eagle_selector"
         } else if token_recycling_hybrid {
             "dynamic_tree_e9_tr_hybrid"
+        } else if target_row_lattice_promotion {
+            "dynamic_tree_eagle3_target_row_lattice_promotion"
         } else if target_row_hedge {
             "dynamic_tree_eagle3_target_row_hedge"
         } else if adaptive_expansions {
@@ -13895,6 +14181,67 @@ fn run_bench_eagle3(
         target_row_hedge_candidate_rows: target_row_hedge
             .then_some(eagle.target_row_hedge.candidate_rows),
         target_row_hedge_candidate_ids: target_row_hedge
+            .then_some(eagle.target_row_hedge.candidate_ids),
+        target_row_hedge_evicted_edges_would_accept: target_row_hedge
+            .then_some(eagle.target_row_hedge.evicted_edges_would_accept),
+        target_row_hedge_counterfactual_emitted_token_delta: target_row_hedge
+            .then_some(eagle.target_row_hedge.counterfactual_emitted_token_delta),
+        target_row_lattice_promotion,
+        target_row_lattice_promotion_max_nodes: target_row_lattice_promotion.then_some(
+            camelid::inference::target_row_hedge::TARGET_ROW_HEDGE_MAX_NODES,
+        ),
+        target_row_lattice_promotion_candidate_policy: target_row_lattice_promotion.then_some(
+            "highest_current_eagle_score_pruned_child_under_exact_primary_lattice_source_with_prior_verified_top1",
+        ),
+        target_row_lattice_promotion_score_policy: target_row_lattice_promotion.then_some(
+            "candidate_cumulative_log_probability_plus_ln2_must_meet_evicted_leaf_score",
+        ),
+        target_row_lattice_promotion_prior_log_bonus: target_row_lattice_promotion.then_some(
+            camelid::inference::target_row_hedge::TARGET_ROW_LATTICE_PRIOR_LOG_BONUS,
+        ),
+        target_row_lattice_promotion_cache_update_policy: target_row_lattice_promotion
+            .then_some("post_current_target_verification_and_acceptance"),
+        target_row_lattice_promotion_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.rounds),
+        target_row_lattice_promotion_rounds_promoted: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.insertion_rounds),
+        target_row_lattice_promotion_no_prior_row_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.no_prior_row_rounds),
+        target_row_lattice_promotion_no_promotable_child_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.no_promotable_lattice_child_rounds),
+        target_row_lattice_promotion_duplicate_only_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.duplicate_only_rounds),
+        target_row_lattice_promotion_below_score_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.below_promotion_score_rounds),
+        target_row_lattice_promotion_no_replaceable_hedge_rounds: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.no_replaceable_hedge_rounds),
+        target_row_lattice_promotion_supported_primary_rows: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.supported_primary_rows),
+        target_row_lattice_promotion_prior_rows_without_materialized_child:
+            target_row_lattice_promotion
+                .then_some(eagle.target_row_hedge.prior_rows_without_materialized_child),
+        target_row_lattice_promotion_full_path_duplicates: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.full_path_duplicates),
+        target_row_lattice_promotion_rows_offered: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.target_rows_offered),
+        target_row_lattice_promotion_rows_accepted: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.target_rows_accepted),
+        target_row_lattice_promotion_shared_rows_accepted: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.shared_rows_accepted),
+        target_row_lattice_promotion_evicted_edges_would_accept: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.evicted_edges_would_accept),
+        target_row_lattice_promotion_counterfactual_emitted_token_delta:
+            target_row_lattice_promotion
+                .then_some(eagle.target_row_hedge.counterfactual_emitted_token_delta),
+        target_row_lattice_promotion_neural_hedges_retained_sum: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.neural_hedges_retained_sum),
+        target_row_lattice_promotion_offered_by_depth: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.offered_by_depth),
+        target_row_lattice_promotion_accepted_by_depth: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.accepted_by_depth),
+        target_row_lattice_promotion_candidate_rows: target_row_lattice_promotion
+            .then_some(eagle.target_row_hedge.candidate_rows),
+        target_row_lattice_promotion_candidate_ids: target_row_lattice_promotion
             .then_some(eagle.target_row_hedge.candidate_ids),
         dual_eagle_selector,
         dual_eagle_race_rounds: dual_eagle_selector.then_some(DUAL_EAGLE_RACE_ROUNDS),
@@ -14085,21 +14432,29 @@ fn run_bench_eagle3(
             eagle.token_recycling.candidate_ids,
         );
     }
-    if target_row_hedge {
+    if target_row_hedge || target_row_lattice_promotion {
         eprintln!(
-            "[bench-eagle3-target-row-hedge] rounds={} inserted={} cold={} duplicate-only={} \
-             no-slot={} supported={} deduped={} target offered/accepted={}/{} shared-accepted={} \
-             neural-retained-sum={} cache rows/ids={}/{} depth offered/accepted={:?}/{:?}",
+            "[bench-eagle3-target-row-{}] rounds={} inserted={} cold={} no-promotable-lattice-child={} \
+             duplicate-only={} below-score={} no-slot={} supported={} missing-lattice={} \
+             deduped={} target offered/accepted={}/{} shared-accepted={} \
+             evicted-would-accept={} counterfactual-delta={} neural-retained-sum={} \
+             cache rows/ids={}/{} depth offered/accepted={:?}/{:?}",
+            if target_row_lattice_promotion { "lattice-promotion" } else { "hedge" },
             eagle.target_row_hedge.rounds,
             eagle.target_row_hedge.insertion_rounds,
             eagle.target_row_hedge.no_prior_row_rounds,
+            eagle.target_row_hedge.no_promotable_lattice_child_rounds,
             eagle.target_row_hedge.duplicate_only_rounds,
+            eagle.target_row_hedge.below_promotion_score_rounds,
             eagle.target_row_hedge.no_replaceable_hedge_rounds,
             eagle.target_row_hedge.supported_primary_rows,
+            eagle.target_row_hedge.prior_rows_without_materialized_child,
             eagle.target_row_hedge.full_path_duplicates,
             eagle.target_row_hedge.target_rows_offered,
             eagle.target_row_hedge.target_rows_accepted,
             eagle.target_row_hedge.shared_rows_accepted,
+            eagle.target_row_hedge.evicted_edges_would_accept,
+            eagle.target_row_hedge.counterfactual_emitted_token_delta,
             eagle.target_row_hedge.neural_hedges_retained_sum,
             eagle.target_row_hedge.candidate_rows,
             eagle.target_row_hedge.candidate_ids,
