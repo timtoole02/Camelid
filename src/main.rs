@@ -10603,6 +10603,7 @@ fn run_eagle3_resident_greedy(
     token_recycling_hybrid: bool,
     target_row_hedge: bool,
     target_row_lattice_promotion: bool,
+    target_row_lattice_prior_log_bonus: f32,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
     mut secondary_drafter: Option<camelid::eagle3_runtime::Eagle3Drafter>,
     head_upload_ms: f64,
@@ -11264,11 +11265,12 @@ fn run_eagle3_resident_greedy(
                 // The closure is read-only and runs before the current verify. The cache mutation
                 // is intentionally below target acceptance, making same-round leakage impossible.
                 let fused = if target_row_lattice_promotion {
-                    camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse_lattice_promoted(
+                    camelid::inference::target_row_hedge::TargetRowHedgeForest::fuse_lattice_promoted_with_bonus(
                         &eagle_forest.scored,
                         frontier.lattice(),
                         round_node_budget,
                         budget,
+                        target_row_lattice_prior_log_bonus,
                         |token| target_rows.prior_target_top1(token),
                     )
                 } else {
@@ -12295,6 +12297,44 @@ fn eagle3_target_row_lattice_promotion_enabled() -> anyhow::Result<bool> {
     parse_eagle3_target_row_lattice_promotion_env(value)
 }
 
+fn parse_eagle3_target_row_lattice_prior_log_bonus_env(
+    value: Option<&str>,
+) -> anyhow::Result<Option<f32>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let bonus = value.parse::<f32>().map_err(|error| {
+        anyhow::anyhow!(
+            "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS must be a number: {error}"
+        )
+    })?;
+    let maximum =
+        camelid::inference::target_row_hedge::TARGET_ROW_LATTICE_MAX_PRIOR_LOG_BONUS;
+    anyhow::ensure!(
+        bonus.is_finite() && (0.0..=maximum).contains(&bonus),
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS must be finite and in 0..={}, got {value:?}",
+        maximum,
+    );
+    Ok(Some(bonus))
+}
+
+fn eagle3_target_row_lattice_prior_log_bonus_override() -> anyhow::Result<Option<f32>> {
+    let raw = std::env::var_os(
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS",
+    );
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_target_row_lattice_prior_log_bonus_env(value)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_eagle3_target_row_hedge_config(
     enabled: bool,
@@ -12444,6 +12484,25 @@ fn eagle3_target_row_lattice_promotion_gate_is_default_off_and_exclusive() {
         assert!(parse_eagle3_target_row_lattice_promotion_env(value).unwrap());
     }
     assert!(parse_eagle3_target_row_lattice_promotion_env(Some("maybe")).is_err());
+    for value in [None, Some(""), Some("   ")] {
+        assert_eq!(
+            parse_eagle3_target_row_lattice_prior_log_bonus_env(value).unwrap(),
+            None
+        );
+    }
+    for (value, expected) in [
+        ("0", 0.0),
+        ("0.6931472", std::f32::consts::LN_2),
+        ("16", 16.0),
+    ] {
+        assert_eq!(
+            parse_eagle3_target_row_lattice_prior_log_bonus_env(Some(value)).unwrap(),
+            Some(expected)
+        );
+    }
+    for value in ["-0.1", "16.0001", "NaN", "inf", "not-a-number"] {
+        assert!(parse_eagle3_target_row_lattice_prior_log_bonus_env(Some(value)).is_err());
+    }
     assert!(validate_eagle3_target_row_lattice_promotion_config(
         true,
         false,
@@ -13298,9 +13357,8 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         .iter()
         .map(|key| ((*key).to_string(), std::env::var(key).ok()))
         .collect();
-    // Preserve the legacy receipt shape byte-for-byte when the benchmark-only selector is
-    // absent. If any selector knob is set, record every explicitly supplied knob; defaults are
-    // captured in the dedicated receipt fields below.
+    // Preserve the legacy receipt shape byte-for-byte when benchmark-only knobs are absent.
+    // Record explicitly supplied knobs; defaults are captured in dedicated receipt fields.
     for key in [
         "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR",
         "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR_TRACE",
@@ -13313,6 +13371,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_TERMINAL_HEAD_SKIP",
         "CAMELID_BENCH_EAGLE3_PARALLEL_LSE",
         "CAMELID_BENCH_EAGLE3_VERIFY_LAYER0_EARLY_COMMIT",
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS",
     ] {
         if std::env::var_os(key).is_some() {
             values.insert(key.to_string(), std::env::var(key).ok());
@@ -13640,6 +13699,19 @@ fn run_bench_eagle3(
     let token_recycling_hybrid = eagle3_token_recycling_hybrid_enabled();
     let target_row_hedge = eagle3_target_row_hedge_enabled()?;
     let target_row_lattice_promotion = eagle3_target_row_lattice_promotion_enabled()?;
+    let target_row_lattice_prior_log_bonus_override =
+        eagle3_target_row_lattice_prior_log_bonus_override()?;
+    anyhow::ensure!(
+        target_row_lattice_prior_log_bonus_override.is_none() || target_row_lattice_promotion,
+        "CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PRIOR_LOG_BONUS requires CAMELID_BENCH_EAGLE3_TARGET_ROW_LATTICE_PROMOTION=1"
+    );
+    let target_row_lattice_prior_log_bonus = target_row_lattice_prior_log_bonus_override
+        .unwrap_or(camelid::inference::target_row_hedge::TARGET_ROW_LATTICE_PRIOR_LOG_BONUS);
+    let target_row_lattice_score_policy = if target_row_lattice_prior_log_bonus_override.is_some() {
+        "candidate_cumulative_log_probability_plus_configured_bonus_must_meet_evicted_leaf_score"
+    } else {
+        "candidate_cumulative_log_probability_plus_ln2_must_meet_evicted_leaf_score"
+    };
     let adaptive_expansions = eagle3_adaptive_expansions_enabled();
     let dual_eagle_selector = dual_eagle_selector_enabled()?;
     let verifier_width_selector = eagle3_width_selector_config()?;
@@ -14003,6 +14075,7 @@ fn run_bench_eagle3(
         token_recycling_hybrid,
         target_row_hedge,
         target_row_lattice_promotion,
+        target_row_lattice_prior_log_bonus,
         primary_drafter,
         secondary_drafter,
         head_upload_ms,
@@ -14229,11 +14302,10 @@ fn run_bench_eagle3(
         target_row_lattice_promotion_candidate_policy: target_row_lattice_promotion.then_some(
             "highest_current_eagle_score_pruned_child_under_exact_primary_lattice_source_with_prior_verified_top1",
         ),
-        target_row_lattice_promotion_score_policy: target_row_lattice_promotion.then_some(
-            "candidate_cumulative_log_probability_plus_ln2_must_meet_evicted_leaf_score",
-        ),
+        target_row_lattice_promotion_score_policy: target_row_lattice_promotion
+            .then_some(target_row_lattice_score_policy),
         target_row_lattice_promotion_prior_log_bonus: target_row_lattice_promotion.then_some(
-            camelid::inference::target_row_hedge::TARGET_ROW_LATTICE_PRIOR_LOG_BONUS,
+            target_row_lattice_prior_log_bonus,
         ),
         target_row_lattice_promotion_cache_update_policy: target_row_lattice_promotion
             .then_some("post_current_target_verification_and_acceptance"),

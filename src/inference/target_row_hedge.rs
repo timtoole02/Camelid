@@ -20,6 +20,8 @@ use super::spec_tree::{DynamicDraftLattice, ScoredTokenTree, TokenTree};
 pub const TARGET_ROW_HEDGE_MAX_NODES: usize = 8;
 /// One earlier exact target top-1 may at most double a current EAGLE candidate's score.
 pub const TARGET_ROW_LATTICE_PRIOR_LOG_BONUS: f32 = std::f32::consts::LN_2;
+/// Hard cap for benchmark-only score-gate sweeps; enforced again by the public core API.
+pub const TARGET_ROW_LATTICE_MAX_PRIOR_LOG_BONUS: f32 = 16.0;
 
 /// Provenance for one fused verifier row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,11 +207,43 @@ impl TargetRowHedgeForest {
         lattice: &DynamicDraftLattice,
         max_nodes: usize,
         max_depth: usize,
+        prior_target_top1: F,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(u32) -> Option<u32>,
+    {
+        Self::fuse_lattice_promoted_with_bonus(
+            eagle,
+            lattice,
+            max_nodes,
+            max_depth,
+            TARGET_ROW_LATTICE_PRIOR_LOG_BONUS,
+            prior_target_top1,
+        )
+    }
+
+    /// Experimental score-gate sweep for exact lattice promotion. The default entry point above
+    /// remains byte-for-byte equivalent to `ln(2)`; callers must supply a finite bonus within the
+    /// hard sweep cap, and target verification remains authoritative for every inserted row.
+    pub fn fuse_lattice_promoted_with_bonus<F>(
+        eagle: &ScoredTokenTree,
+        lattice: &DynamicDraftLattice,
+        max_nodes: usize,
+        max_depth: usize,
+        prior_log_bonus: f32,
         mut prior_target_top1: F,
     ) -> Result<Self, String>
     where
         F: FnMut(u32) -> Option<u32>,
     {
+        if !prior_log_bonus.is_finite()
+            || !(0.0..=TARGET_ROW_LATTICE_MAX_PRIOR_LOG_BONUS).contains(&prior_log_bonus)
+        {
+            return Err(format!(
+                "target-row lattice prior log bonus must be finite and in 0..={}, got {prior_log_bonus}",
+                TARGET_ROW_LATTICE_MAX_PRIOR_LOG_BONUS,
+            ));
+        }
         validate_eagle(eagle, max_nodes, max_depth)?;
         validate_lattice_alignment(eagle, lattice)?;
         let tree = &eagle.tree;
@@ -251,14 +285,18 @@ impl TargetRowHedgeForest {
                     "current EAGLE lattice source {lattice_source_node} is selected but its full path is absent from N8"
                 ));
             }
+            let adjusted_log_score = lattice_node.cumulative_log_probability + prior_log_bonus;
+            if !adjusted_log_score.is_finite() {
+                return Err(format!(
+                    "target-row lattice adjusted score is not finite for source {lattice_source_node}"
+                ));
+            }
             candidates.push(SelectedTargetRowCandidate {
                 parent_row,
                 token,
                 lattice_source_node: Some(lattice_source_node),
                 cumulative_log_probability: Some(lattice_node.cumulative_log_probability),
-                adjusted_log_score: Some(
-                    lattice_node.cumulative_log_probability + TARGET_ROW_LATTICE_PRIOR_LOG_BONUS,
-                ),
+                adjusted_log_score: Some(adjusted_log_score),
             });
         }
 
@@ -1181,6 +1219,37 @@ mod tests {
         assert_eq!(weak.tree, eagle.tree);
         assert!(weak.decision.comparison_eagle_row.is_some());
         assert!(weak.decision.evicted_eagle_row.is_none());
+
+        let admitted = TargetRowHedgeForest::fuse_lattice_promoted_with_bonus(
+            &eagle,
+            &lattice,
+            8,
+            15,
+            16.0,
+            |token| (token == 10).then_some(77),
+        )
+        .unwrap();
+        assert_eq!(admitted.decision.outcome, TargetRowHedgeOutcome::Inserted);
+        assert_eq!(admitted.decision.candidate_token, Some(77));
+        assert!(admitted.decision.evicted_eagle_row.is_some());
+
+        for invalid in [
+            f32::NEG_INFINITY,
+            -0.1,
+            TARGET_ROW_LATTICE_MAX_PRIOR_LOG_BONUS + 0.001,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            assert!(TargetRowHedgeForest::fuse_lattice_promoted_with_bonus(
+                &eagle,
+                &lattice,
+                8,
+                15,
+                invalid,
+                |_| None,
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1239,6 +1308,16 @@ mod tests {
             (token == 10).then_some(78)
         })
         .unwrap();
+        let explicit_default = TargetRowHedgeForest::fuse_lattice_promoted_with_bonus(
+            &eagle,
+            &lattice,
+            8,
+            15,
+            TARGET_ROW_LATTICE_PRIOR_LOG_BONUS,
+            |token| (token == 10).then_some(78),
+        )
+        .unwrap();
+        assert_eq!(fused, explicit_default);
         assert_eq!(fused.decision.outcome, TargetRowHedgeOutcome::Inserted);
         assert_eq!(
             fused.decision.candidate_adjusted_log_score,
