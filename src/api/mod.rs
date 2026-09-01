@@ -48,6 +48,8 @@ pub use server::{ApiSurface, ServeOptions};
 use crate::{
     eagle3::Eagle3DraftModel,
     eagle3_serving::{
+        clamp_max_tokens_to_logical_budget as clamp_eagle3_max_tokens,
+        configured_logical_token_limit as configured_eagle3_logical_token_limit,
         validate_logical_budget as validate_eagle3_logical_budget, Eagle3ServingConfig,
         Eagle3ServingState, MAX_DRAFT_TOKENS as EAGLE3_MAX_DRAFT_TOKENS,
     },
@@ -123,6 +125,10 @@ const EAGLE3_SHAREGPT_E9_SHA256: &str =
     "0192ee37dff4b7a86d13011d40e9cf622b331fe76f637d7d1ea24c4b81574304";
 const EAGLE3_SHAREGPT_E9_CONFIG_SHA256: &str =
     "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
+const EAGLE3_SHAREGPT_SW512_E9_SHA256: &str =
+    "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
+const EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
+    "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
 const STREAM_POLL_YIELD_ENV: &str = "CAMELID_STREAM_POLL_YIELD";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
@@ -617,6 +623,23 @@ pub struct HealthResponse {
     /// projector and can accept OpenAI `image_url` chat content parts.
     pub vision_ready: bool,
     pub active_model_id: Option<String>,
+    /// Active speculative serving mode. Omitted for ordinary decode so older
+    /// clients retain their existing behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculative_decode: Option<&'static str>,
+    /// Exact prompt-plus-output envelope for serving lanes with a narrower
+    /// verified context than the model metadata advertises.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_token_limit: Option<usize>,
+    /// Effective context exposed for WebUI budgeting. These are present for
+    /// EAGLE-3 because its explicitly selected serving rung can be narrower
+    /// than Llama's model-native metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_context_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_prompt_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_generation_tokens: Option<u32>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
     /// Which backend serves the active model: "gemma4-runtime", "runnable-runtime",
@@ -2091,6 +2114,17 @@ enum SpecDecodeMode {
     Eagle3,
 }
 
+impl SpecDecodeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NGram => "ngram",
+            Self::DraftModel => "draft",
+            Self::Suffix => "suffix",
+            Self::Eagle3 => "eagle3",
+        }
+    }
+}
+
 fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
     match env::var(SPEC_DECODE_ENV) {
         Ok(value) if value.eq_ignore_ascii_case("ngram") => Some(SpecDecodeMode::NGram),
@@ -2189,7 +2223,8 @@ fn load_eagle3_checkpoint_cached(
     })?;
     let is_pinned_serving_artifact = sha256 == EAGLE3_THOUGHTWORKS_SHA256
         || sha256 == EAGLE3_SHAREGPT_E8_SHA256
-        || sha256 == EAGLE3_SHAREGPT_E9_SHA256;
+        || sha256 == EAGLE3_SHAREGPT_E9_SHA256
+        || sha256 == EAGLE3_SHAREGPT_SW512_E9_SHA256;
     let derived_provenance = if is_pinned_serving_artifact {
         None
     } else {
@@ -2199,6 +2234,9 @@ fn load_eagle3_checkpoint_cached(
     let pinned_sharegpt_config = match sha256.as_str() {
         EAGLE3_SHAREGPT_E8_SHA256 => Some(("ShareGPT-E8", EAGLE3_SHAREGPT_E8_CONFIG_SHA256)),
         EAGLE3_SHAREGPT_E9_SHA256 => Some(("ShareGPT-E9", EAGLE3_SHAREGPT_E9_CONFIG_SHA256)),
+        EAGLE3_SHAREGPT_SW512_E9_SHA256 => {
+            Some(("ShareGPT-SW512-E9", EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256))
+        }
         _ => None,
     };
     if let Some((label, expected_config_sha256)) = pinned_sharegpt_config {
@@ -2246,6 +2284,10 @@ fn load_eagle3_checkpoint_cached(
         model.config.architectures == ["LlamaForCausalLMEagle3"]
             && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
             && model.config.sliding_window == Some(256)
+    } else if config_contract_sha256 == EAGLE3_SHAREGPT_SW512_E9_SHA256 {
+        model.config.architectures == ["LlamaForCausalLMEagle3"]
+            && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
+            && model.config.sliding_window == Some(512)
     } else {
         model.config.architectures == ["LlamaForCausalLMEagle3"]
             && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
@@ -2917,6 +2959,14 @@ pub async fn serve(
     models_dir: Option<PathBuf>,
     options: ServeOptions,
 ) -> std::io::Result<()> {
+    // Reject a misspelled or unqualified EAGLE context rung before binding the
+    // listener. Health and request admission must never disagree about the
+    // active logical envelope.
+    if spec_decode_mode_from_env() == Some(SpecDecodeMode::Eagle3) {
+        configured_eagle3_logical_token_limit().map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+    }
     let policy = server::ServerPolicy::resolve(addr, options)?;
     let std_listener = std::net::TcpListener::bind(addr)?;
     std_listener.set_nonblocking(true)?;
@@ -3539,6 +3589,15 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         crate::inference::deterministic_mode_enabled(),
     );
     let slot = state.engine.slot_snapshot();
+    let speculative_decode = spec_decode_mode_from_env();
+    let eagle3_logical_limit = if speculative_decode == Some(SpecDecodeMode::Eagle3) {
+        Some(
+            configured_eagle3_logical_token_limit()
+                .expect("EAGLE-3 logical token rung was validated before server bind"),
+        )
+    } else {
+        None
+    };
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3549,6 +3608,17 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         generation_ready,
         vision_ready,
         active_model_id: active_id_lock.clone(),
+        speculative_decode: speculative_decode.map(SpecDecodeMode::as_str),
+        logical_token_limit: eagle3_logical_limit,
+        active_context_length: eagle3_logical_limit,
+        max_prompt_tokens: eagle3_logical_limit.map(|limit| {
+            state
+                .server_limits
+                .max_prompt_tokens
+                .min(limit.saturating_sub(1))
+        }),
+        max_generation_tokens: eagle3_logical_limit
+            .map(|limit| state.server_limits.max_generation_tokens.min(limit as u32)),
         q8_runtime: q8_runtime_health(),
         execution_plan,
         backend,
@@ -3657,6 +3727,15 @@ async fn purge_kv_cache(State(state): State<AppState>) -> Json<PurgeKvCacheRespo
 /// live. The process is alive and serving, so `ok` remains true.
 fn busy_health_response(state: &AppState) -> HealthResponse {
     let slot = state.engine.slot_snapshot();
+    let speculative_decode = spec_decode_mode_from_env();
+    let eagle3_logical_limit = if speculative_decode == Some(SpecDecodeMode::Eagle3) {
+        Some(
+            configured_eagle3_logical_token_limit()
+                .expect("EAGLE-3 logical token rung was validated before server bind"),
+        )
+    } else {
+        None
+    };
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3667,6 +3746,17 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         generation_ready: false,
         vision_ready: false,
         active_model_id: None,
+        speculative_decode: speculative_decode.map(SpecDecodeMode::as_str),
+        logical_token_limit: eagle3_logical_limit,
+        active_context_length: eagle3_logical_limit,
+        max_prompt_tokens: eagle3_logical_limit.map(|limit| {
+            state
+                .server_limits
+                .max_prompt_tokens
+                .min(limit.saturating_sub(1))
+        }),
+        max_generation_tokens: eagle3_logical_limit
+            .map(|limit| state.server_limits.max_generation_tokens.min(limit as u32)),
         q8_runtime: q8_runtime_health(),
         execution_plan: None,
         backend: health_backend(false, false, false, false),
@@ -18079,6 +18169,25 @@ async fn prepare_generation(
             .default_max_tokens_cap
             .map(|cap| cap.min(available_max_tokens))
             .unwrap_or(available_max_tokens),
+    };
+    // EAGLE-3 has a deliberately narrower verified logical envelope than the
+    // target GGUF's native context metadata. Apply the same API contract as the
+    // generic context clamp above: max_tokens is an upper bound, so shorten it
+    // to the exact room left after authoritative tokenization. Prompts that
+    // already fill the EAGLE envelope still fail closed.
+    let max_tokens = if speculative_mode == Some(SpecDecodeMode::Eagle3) {
+        clamp_eagle3_max_tokens(token_ids.len(), max_tokens as usize)
+            .map(|value| value as u32)
+            .map_err(|error| {
+                api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "eagle3_context_limit_exceeded",
+                    error.to_string(),
+                    Some("prompt"),
+                )
+            })?
+    } else {
+        max_tokens
     };
     // Enforce the operator's ceiling against the effective generation budget,
     // after preserving the existing API contract that max_tokens is clamped to

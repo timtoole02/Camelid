@@ -22,9 +22,17 @@ use crate::{
 
 /// The packed Metal verifier has a hard 16-row ceiling, root included.
 pub const MAX_DRAFT_TOKENS: usize = TREE_MAX_NODES - 1;
-/// Serving refuses a logical prompt + output budget beyond the training and
-/// verified runtime envelope instead of silently dropping to a different lane.
-pub const MAX_LOGICAL_TOKENS: usize = 2_048;
+/// Default serving envelope. Larger rungs are explicit because each one owes
+/// its own exact-token, memory, and throughput receipt on the deployment host.
+pub const DEFAULT_MAX_LOGICAL_TOKENS: usize = 2_048;
+pub const LOGICAL_TOKEN_LIMIT_ENV: &str = "CAMELID_EAGLE3_LOGICAL_TOKENS";
+pub const SUPPORTED_LOGICAL_TOKEN_LIMITS: [usize; 2] = [2_048, 4_096];
+
+/// Widths 9..=16 deliberately leave Metal's row-dimensional F16 attention
+/// path once any verifier row crosses position 2,048. N8 retains the checked
+/// deep-context batch path, so suffix verification narrows before crossing.
+const WIDE_VERIFY_POSITION_LIMIT: usize = 2_048;
+const DEEP_CONTEXT_VERIFY_NODES: usize = 8;
 
 const DEFAULT_DYNAMIC_VERIFY_NODES: usize = 8;
 const DEFAULT_DYNAMIC_TOP_K: usize = 4;
@@ -34,16 +42,82 @@ fn invalid(message: impl Into<String>) -> BackendError {
     BackendError::InvalidModelMetadata(message.into())
 }
 
-pub fn validate_logical_budget(prompt_tokens: usize, max_tokens: usize) -> Result<usize> {
+pub fn logical_token_limit_from_value(value: Option<&str>) -> Result<usize> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_MAX_LOGICAL_TOKENS);
+    };
+    let parsed = raw.parse::<usize>().map_err(|error| {
+        invalid(format!(
+            "{LOGICAL_TOKEN_LIMIT_ENV} must be 2048 or 4096, got {raw:?}: {error}"
+        ))
+    })?;
+    if !SUPPORTED_LOGICAL_TOKEN_LIMITS.contains(&parsed) {
+        return Err(invalid(format!(
+            "{LOGICAL_TOKEN_LIMIT_ENV} must be 2048 or 4096, got {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
+pub fn configured_logical_token_limit() -> Result<usize> {
+    let value = std::env::var(LOGICAL_TOKEN_LIMIT_ENV).ok();
+    logical_token_limit_from_value(value.as_deref())
+}
+
+fn validate_logical_budget_at_limit(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    logical_token_limit: usize,
+) -> Result<usize> {
     let logical_tokens = prompt_tokens
         .checked_add(max_tokens)
         .ok_or_else(|| invalid("EAGLE-3 logical token budget overflow"))?;
-    if logical_tokens > MAX_LOGICAL_TOKENS {
+    if logical_tokens > logical_token_limit {
         return Err(invalid(format!(
-            "EAGLE-3 serving is fail-closed above {MAX_LOGICAL_TOKENS} logical tokens; prompt {prompt_tokens} + max_tokens {max_tokens} = {logical_tokens}"
+            "EAGLE-3 serving is fail-closed above {logical_token_limit} logical tokens; prompt {prompt_tokens} + max_tokens {max_tokens} = {logical_tokens}"
         )));
     }
     Ok(logical_tokens)
+}
+
+pub fn validate_logical_budget(prompt_tokens: usize, max_tokens: usize) -> Result<usize> {
+    validate_logical_budget_at_limit(prompt_tokens, max_tokens, configured_logical_token_limit()?)
+}
+
+/// Treat an API `max_tokens` value as the upper bound it is: shorten it to the
+/// exact room left in EAGLE-3's verified logical envelope. A prompt that has
+/// already filled that envelope still fails closed because there is no valid
+/// token budget to admit.
+pub fn clamp_max_tokens_to_logical_budget(
+    prompt_tokens: usize,
+    max_tokens: usize,
+) -> Result<usize> {
+    clamp_max_tokens_to_logical_budget_at_limit(
+        prompt_tokens,
+        max_tokens,
+        configured_logical_token_limit()?,
+    )
+}
+
+fn clamp_max_tokens_to_logical_budget_at_limit(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    logical_token_limit: usize,
+) -> Result<usize> {
+    if prompt_tokens >= logical_token_limit {
+        return Err(invalid(format!(
+            "EAGLE-3 serving is fail-closed above {logical_token_limit} logical tokens; prompt {prompt_tokens} leaves no room for generation"
+        )));
+    }
+    Ok(max_tokens.min(logical_token_limit - prompt_tokens))
+}
+
+fn suffix_verify_node_limit(target_position: usize) -> usize {
+    if target_position.saturating_add(TREE_MAX_NODES) > WIDE_VERIFY_POSITION_LIMIT {
+        DEEP_CONTEXT_VERIFY_NODES
+    } else {
+        TREE_MAX_NODES
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +293,9 @@ impl Eagle3ServingState {
         }
 
         let target_before = session.kv_position();
-        let suffix_node_budget = (budget + 1).min(context_room).min(TREE_MAX_NODES);
+        let suffix_node_budget = (budget + 1)
+            .min(context_room)
+            .min(suffix_verify_node_limit(target_before));
         let suffix_proposal =
             self.suffix
                 .draft_confident_chain(history, anchor, suffix_node_budget, budget);
@@ -394,9 +470,42 @@ mod tests {
     }
 
     #[test]
-    fn logical_budget_accepts_boundary_and_fails_closed_above_2048() {
-        assert_eq!(validate_logical_budget(1_024, 1_024).unwrap(), 2_048);
-        assert!(validate_logical_budget(1_024, 1_025).is_err());
-        assert!(validate_logical_budget(usize::MAX, 1).is_err());
+    fn logical_budget_ladder_is_explicit_and_fail_closed() {
+        assert_eq!(logical_token_limit_from_value(None).unwrap(), 2_048);
+        for limit in SUPPORTED_LOGICAL_TOKEN_LIMITS {
+            assert_eq!(
+                logical_token_limit_from_value(Some(&limit.to_string())).unwrap(),
+                limit
+            );
+            assert_eq!(
+                validate_logical_budget_at_limit(limit / 2, limit / 2, limit).unwrap(),
+                limit
+            );
+            assert!(validate_logical_budget_at_limit(limit / 2, limit / 2 + 1, limit).is_err());
+        }
+        assert!(logical_token_limit_from_value(Some("4097")).is_err());
+        assert!(validate_logical_budget_at_limit(usize::MAX, 1, 8_192).is_err());
+    }
+
+    #[test]
+    fn api_max_tokens_is_clamped_to_the_verified_logical_room() {
+        for limit in SUPPORTED_LOGICAL_TOKEN_LIMITS {
+            assert_eq!(
+                clamp_max_tokens_to_logical_budget_at_limit(28, 8_192, limit).unwrap(),
+                (limit - 28).min(8_192)
+            );
+            assert_eq!(
+                clamp_max_tokens_to_logical_budget_at_limit(limit - 1, 8_192, limit).unwrap(),
+                1
+            );
+            assert!(clamp_max_tokens_to_logical_budget_at_limit(limit, 1, limit).is_err());
+        }
+    }
+
+    #[test]
+    fn deep_context_suffixes_stay_on_the_eight_row_fast_path() {
+        assert_eq!(suffix_verify_node_limit(2_032), TREE_MAX_NODES);
+        assert_eq!(suffix_verify_node_limit(2_033), DEEP_CONTEXT_VERIFY_NODES);
+        assert_eq!(suffix_verify_node_limit(4_000), DEEP_CONTEXT_VERIFY_NODES);
     }
 }
