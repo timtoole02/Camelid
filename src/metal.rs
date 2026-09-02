@@ -393,6 +393,7 @@ struct MetalLinearKernel {
     attention_decode_splitk_kv16_direct_batch_pfv_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_merge_batch_w32_pipeline: Option<ComputePipelineState>,
+    eagle3_draft_tail_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_merge_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
     kv_dequant_q8_to_h_pipeline: ComputePipelineState,
@@ -11370,6 +11371,182 @@ kernel void argmax_f32_greedy(
     }
 }
 
+// EAGLE-3 draft-cell tail on the GPU: the eight highest draft logits in the host ranking's
+// total order (descending logit, then ascending draft id; NaN never ranked, -INFINITY ranked
+// like any value) and the full-vocabulary log-sum-exp statistics the dynamic frontier's
+// normalizer needs.  One 1024-thread threadgroup: a strided per-thread sorted top-8, five
+// shuffle merges per simdgroup (half-cleaner plus bitonic network, all in registers), one
+// cross-simdgroup merge; then a strided per-thread partial of exp(x - max) in index order,
+// simd_sum, and the 32 simdgroup partials added in order.
+// Every reduction tree is fixed, so the result is run-to-run deterministic.  f32 throughout:
+// the host reduction was f64, so the normalizer differs from it in its last bits — a
+// draft-only quantity (the target verifies every drafted token; the emitted stream cannot
+// move).  Non-finite detection is done on the bit pattern so a fast-math build cannot fold it.
+// out_stats: [0] max (-INFINITY when nothing finite was seen), [1] sum exp(x - max),
+// [2] 1.0 when any NaN or +INFINITY was seen (the host fails closed on it, as before).
+inline bool eagle3_rank_before(float va, uint ia, float vb, uint ib) {
+    return va > vb || (va == vb && ia < ib);
+}
+// Every list below is eight registers wide and only ever indexed by a literal, so it stays in
+// registers: a dynamically indexed thread array is spilled to memory by the Metal compiler
+// and turned the first version of this kernel into a ~100 us dispatch.
+#define EAGLE3_TOP8_INSERT_SLOT(r)                                              \
+    {                                                                            \
+        const bool before = eagle3_rank_before(x, i, v##r, id##r);              \
+        const float tv = v##r;                                                   \
+        const uint ti = id##r;                                                   \
+        v##r = before ? x : tv;                                                  \
+        id##r = before ? i : ti;                                                 \
+        x = before ? tv : x;                                                     \
+        i = before ? ti : i;                                                     \
+    }
+// Bubble (x, i) down a descending-sorted eight-slot list; the worst entry falls off.
+#define EAGLE3_TOP8_INSERT()                                                     \
+    EAGLE3_TOP8_INSERT_SLOT(0) EAGLE3_TOP8_INSERT_SLOT(1) EAGLE3_TOP8_INSERT_SLOT(2) \
+    EAGLE3_TOP8_INSERT_SLOT(3) EAGLE3_TOP8_INSERT_SLOT(4) EAGLE3_TOP8_INSERT_SLOT(5) \
+    EAGLE3_TOP8_INSERT_SLOT(6) EAGLE3_TOP8_INSERT_SLOT(7)
+// Compare-exchange of two slots into descending order.
+#define EAGLE3_TOP8_CMPX(a, b)                                                   \
+    {                                                                            \
+        const bool swap = eagle3_rank_before(v##b, id##b, v##a, id##a);         \
+        const float tv = v##a;                                                   \
+        const uint ti = id##a;                                                   \
+        v##a = swap ? v##b : tv;                                                 \
+        id##a = swap ? id##b : ti;                                               \
+        v##b = swap ? tv : v##b;                                                 \
+        id##b = swap ? ti : id##b;                                               \
+    }
+// Top-8 of the union of two descending-sorted eight-lists (mine v/id, partner p/pi): the
+// half-cleaner max(a[r], b[7-r]) yields a bitonic sequence holding exactly the eight best,
+// which the three-stage bitonic network below sorts.
+#define EAGLE3_TOP8_HALF(r, s)                                                   \
+    {                                                                            \
+        const bool ta = eagle3_rank_before(v##r, id##r, p##s, pi##s);           \
+        v##r = ta ? v##r : p##s;                                                 \
+        id##r = ta ? id##r : pi##s;                                              \
+    }
+#define EAGLE3_TOP8_MERGE()                                                      \
+    EAGLE3_TOP8_HALF(0, 7) EAGLE3_TOP8_HALF(1, 6) EAGLE3_TOP8_HALF(2, 5) EAGLE3_TOP8_HALF(3, 4) \
+    EAGLE3_TOP8_HALF(4, 3) EAGLE3_TOP8_HALF(5, 2) EAGLE3_TOP8_HALF(6, 1) EAGLE3_TOP8_HALF(7, 0) \
+    EAGLE3_TOP8_CMPX(0, 4) EAGLE3_TOP8_CMPX(1, 5) EAGLE3_TOP8_CMPX(2, 6) EAGLE3_TOP8_CMPX(3, 7) \
+    EAGLE3_TOP8_CMPX(0, 2) EAGLE3_TOP8_CMPX(1, 3) EAGLE3_TOP8_CMPX(4, 6) EAGLE3_TOP8_CMPX(5, 7) \
+    EAGLE3_TOP8_CMPX(0, 1) EAGLE3_TOP8_CMPX(2, 3) EAGLE3_TOP8_CMPX(4, 5) EAGLE3_TOP8_CMPX(6, 7)
+// Fetch the partner lane's list through xor shuffles into p/pi, then merge.
+#define EAGLE3_TOP8_SIMD_MERGE(step)                                             \
+    {                                                                            \
+        const float p0 = simd_shuffle_xor(v0, step), p1 = simd_shuffle_xor(v1, step), \
+                    p2 = simd_shuffle_xor(v2, step), p3 = simd_shuffle_xor(v3, step), \
+                    p4 = simd_shuffle_xor(v4, step), p5 = simd_shuffle_xor(v5, step), \
+                    p6 = simd_shuffle_xor(v6, step), p7 = simd_shuffle_xor(v7, step); \
+        const uint pi0 = simd_shuffle_xor(id0, step), pi1 = simd_shuffle_xor(id1, step), \
+                   pi2 = simd_shuffle_xor(id2, step), pi3 = simd_shuffle_xor(id3, step), \
+                   pi4 = simd_shuffle_xor(id4, step), pi5 = simd_shuffle_xor(id5, step), \
+                   pi6 = simd_shuffle_xor(id6, step), pi7 = simd_shuffle_xor(id7, step); \
+        EAGLE3_TOP8_MERGE()                                                      \
+    }
+kernel void eagle3_draft_tail_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* out_ids [[buffer(1)]],
+    device float* out_vals [[buffer(2)]],
+    device float* out_stats [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup float sh_vals[32 * 8];
+    threadgroup uint sh_ids[32 * 8];
+    threadgroup float sh_sum[32];
+    threadgroup uint sh_flag[32];
+    threadgroup float sh_max;
+    const uint n_sg = tg_size / 32;
+    float v0 = -INFINITY, v1 = -INFINITY, v2 = -INFINITY, v3 = -INFINITY;
+    float v4 = -INFINITY, v5 = -INFINITY, v6 = -INFINITY, v7 = -INFINITY;
+    uint id0 = 0xffffffffu, id1 = 0xffffffffu, id2 = 0xffffffffu, id3 = 0xffffffffu;
+    uint id4 = 0xffffffffu, id5 = 0xffffffffu, id6 = 0xffffffffu, id7 = 0xffffffffu;
+    uint flag = 0u;
+    for (uint j = tid; j < count; j += tg_size) {
+        float x = logits[j];
+        uint i = j;
+        const uint bits = as_type<uint>(x);
+        const bool exp_ones = (bits & 0x7f800000u) == 0x7f800000u;
+        const bool is_nan = exp_ones && (bits & 0x007fffffu) != 0u;
+        const bool is_pos_inf = bits == 0x7f800000u;
+        flag |= (is_nan || is_pos_inf) ? 1u : 0u;
+        if (is_nan) continue;
+        // Only an element that beats the current eighth can change the list.
+        if (!eagle3_rank_before(x, i, v7, id7)) continue;
+        EAGLE3_TOP8_INSERT()
+    }
+    EAGLE3_TOP8_SIMD_MERGE(16)
+    EAGLE3_TOP8_SIMD_MERGE(8)
+    EAGLE3_TOP8_SIMD_MERGE(4)
+    EAGLE3_TOP8_SIMD_MERGE(2)
+    EAGLE3_TOP8_SIMD_MERGE(1)
+    flag = simd_max(flag);
+    if (lane == 0) {
+        sh_vals[sg * 8 + 0] = v0; sh_vals[sg * 8 + 1] = v1; sh_vals[sg * 8 + 2] = v2; sh_vals[sg * 8 + 3] = v3;
+        sh_vals[sg * 8 + 4] = v4; sh_vals[sg * 8 + 5] = v5; sh_vals[sg * 8 + 6] = v6; sh_vals[sg * 8 + 7] = v7;
+        sh_ids[sg * 8 + 0] = id0; sh_ids[sg * 8 + 1] = id1; sh_ids[sg * 8 + 2] = id2; sh_ids[sg * 8 + 3] = id3;
+        sh_ids[sg * 8 + 4] = id4; sh_ids[sg * 8 + 5] = id5; sh_ids[sg * 8 + 6] = id6; sh_ids[sg * 8 + 7] = id7;
+        sh_flag[sg] = flag;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const bool have = lane < n_sg;
+        v0 = have ? sh_vals[lane * 8 + 0] : -INFINITY; id0 = have ? sh_ids[lane * 8 + 0] : 0xffffffffu;
+        v1 = have ? sh_vals[lane * 8 + 1] : -INFINITY; id1 = have ? sh_ids[lane * 8 + 1] : 0xffffffffu;
+        v2 = have ? sh_vals[lane * 8 + 2] : -INFINITY; id2 = have ? sh_ids[lane * 8 + 2] : 0xffffffffu;
+        v3 = have ? sh_vals[lane * 8 + 3] : -INFINITY; id3 = have ? sh_ids[lane * 8 + 3] : 0xffffffffu;
+        v4 = have ? sh_vals[lane * 8 + 4] : -INFINITY; id4 = have ? sh_ids[lane * 8 + 4] : 0xffffffffu;
+        v5 = have ? sh_vals[lane * 8 + 5] : -INFINITY; id5 = have ? sh_ids[lane * 8 + 5] : 0xffffffffu;
+        v6 = have ? sh_vals[lane * 8 + 6] : -INFINITY; id6 = have ? sh_ids[lane * 8 + 6] : 0xffffffffu;
+        v7 = have ? sh_vals[lane * 8 + 7] : -INFINITY; id7 = have ? sh_ids[lane * 8 + 7] : 0xffffffffu;
+        EAGLE3_TOP8_SIMD_MERGE(16)
+        EAGLE3_TOP8_SIMD_MERGE(8)
+        EAGLE3_TOP8_SIMD_MERGE(4)
+        EAGLE3_TOP8_SIMD_MERGE(2)
+        EAGLE3_TOP8_SIMD_MERGE(1)
+        if (lane == 0) {
+            uint any_flag = 0u;
+            for (uint s2 = 0; s2 < n_sg; ++s2) any_flag |= sh_flag[s2];
+            out_ids[0] = id0; out_ids[1] = id1; out_ids[2] = id2; out_ids[3] = id3;
+            out_ids[4] = id4; out_ids[5] = id5; out_ids[6] = id6; out_ids[7] = id7;
+            out_vals[0] = v0; out_vals[1] = v1; out_vals[2] = v2; out_vals[3] = v3;
+            out_vals[4] = v4; out_vals[5] = v5; out_vals[6] = v6; out_vals[7] = v7;
+            sh_max = v0;
+            out_stats[2] = any_flag != 0u ? 1.0f : 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mx = sh_max;
+    float part = 0.0f;
+    if (as_type<uint>(mx) != 0xff800000u) {
+        for (uint j = tid; j < count; j += tg_size) {
+            const float x = logits[j];
+            const uint bits = as_type<uint>(x);
+            const bool is_nan = (bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0u;
+            if (!is_nan) part += exp(x - mx);
+        }
+    }
+    const float sg_sum = simd_sum(part);
+    if (lane == 0) sh_sum[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint s2 = 0; s2 < n_sg; ++s2) total += sh_sum[s2];
+        out_stats[0] = mx;
+        out_stats[1] = total;
+    }
+}
+#undef EAGLE3_TOP8_INSERT_SLOT
+#undef EAGLE3_TOP8_INSERT
+#undef EAGLE3_TOP8_CMPX
+#undef EAGLE3_TOP8_HALF
+#undef EAGLE3_TOP8_MERGE
+#undef EAGLE3_TOP8_SIMD_MERGE
+
 // Chunked, row-batched twin of argmax_f32_greedy over a packed [rows, count] logits
 // buffer. Threadgroup (chunk, row) scans the ascending index range
 // [chunk*chunk_len, min(count, (chunk+1)*chunk_len)) of row `row` with the single-row
@@ -14043,6 +14220,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let eagle3_draft_tail_pipeline = elementwise_library
+                .get_function("eagle3_draft_tail_f32", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                })
+                .filter(|pipeline| {
+                    pipeline.max_total_threads_per_threadgroup() >= 256
+                        && pipeline.thread_execution_width() == 32
+                });
             let attention_decode_splitk_merge_batch_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_batch_f32", None)
                 .ok()?;
@@ -14589,6 +14778,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_kv16_direct_batch_pfv_pipeline,
                 attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline,
                 attention_decode_splitk_merge_batch_w32_pipeline,
+                eagle3_draft_tail_pipeline,
                 attention_decode_splitk_merge_batch_pipeline,
                 attention_decode_splitk_kvq8_pipeline,
                 kv_dequant_q8_to_h_pipeline,
@@ -33397,6 +33587,93 @@ fn eagle3_fused_qkv_enabled() -> bool {
     })
 }
 
+/// Opt-in draft-cell tail: `CAMELID_EAGLE3_GPU_TAIL=1` (or `true`) ranks the cell's top-8
+/// draft candidates and reduces the full-vocabulary log-sum-exp statistics on the GPU
+/// (`eagle3_draft_tail_f32`, inside the cell's command buffer) instead of the host's
+/// ~110 us scan of 32k logits after every forward.  The ranking is the host ranking's total
+/// order and therefore identical; the normalizer is an f32 reduction where the host's was
+/// f64, so it differs in its last bits — draft-only numerics (the target verifies every
+/// drafted token).  Any other spelling, a missing kernel, or a candidate limit other than
+/// the legacy eight keeps the host tail.
+fn eagle3_gpu_tail_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_gpu_tail_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_EAGLE3_GPU_TAIL").ok();
+        let requested = eagle3_gpu_tail_from_env(value.as_deref());
+        let legacy_limit = eagle3_argmax_shadow_candidate_limit()
+            .is_ok_and(|limit| limit == EAGLE3_TOP_K_CANDIDATES);
+        let built = metal_linear_kernel().is_some_and(|k| k.eagle3_draft_tail_pipeline.is_some());
+        if requested && !(legacy_limit && built) {
+            eprintln!(
+                "[metal-eagle3] CAMELID_EAGLE3_GPU_TAIL requested but {}; keeping the host tail",
+                if !built {
+                    "eagle3_draft_tail_f32 did not build"
+                } else {
+                    "the candidate limit is not the legacy eight"
+                }
+            );
+        }
+        requested && legacy_limit && built
+    })
+}
+
+/// GPU-side draft tail of one cell (see `eagle3_gpu_tail_enabled`): eight ids, their
+/// logits, and the [max, sum exp(x - max), non-finite flag] statistics.
+#[cfg(target_os = "macos")]
+struct Eagle3EncodedTail {
+    ids: Buffer,
+    vals: Buffer,
+    stats: Buffer,
+}
+
+/// Turn the tail kernel's outputs into the host tail's products, failing closed on the same
+/// conditions the host reductions fail on (NaN or +INFINITY anywhere, nothing finite, an
+/// invalid exponential sum, a non-finite normalizer).
+#[cfg(target_os = "macos")]
+fn eagle3_finish_gpu_tail(
+    ids: &[u32],
+    vals: &[f32],
+    stats: &[f32],
+    d2t_offsets: &[i32],
+) -> std::result::Result<(Vec<Eagle3DraftCandidate>, f32), String> {
+    if stats[2] != 0.0 {
+        return Err("EAGLE-3 evaluated-vocabulary logits contain NaN or +INFINITY".to_string());
+    }
+    let maximum = stats[0];
+    if maximum == f32::NEG_INFINITY {
+        return Err("EAGLE-3 evaluated-vocabulary logits are all negative infinity".to_string());
+    }
+    let exponential_sum = f64::from(stats[1]);
+    if !exponential_sum.is_finite() || exponential_sum <= 0.0 {
+        return Err(format!(
+            "EAGLE-3 evaluated-vocabulary exponential sum is invalid: {exponential_sum}"
+        ));
+    }
+    let logsumexp = (f64::from(maximum) + exponential_sum.ln()) as f32;
+    if !logsumexp.is_finite() {
+        return Err(format!(
+            "EAGLE-3 evaluated-vocabulary logsumexp is not finite: {logsumexp}"
+        ));
+    }
+    let mut ranked = Vec::with_capacity(EAGLE3_TOP_K_CANDIDATES);
+    for (&draft_token, &logit) in ids.iter().zip(vals) {
+        if draft_token == u32::MAX {
+            break;
+        }
+        ranked.push(Eagle3DraftCandidate {
+            draft_token,
+            target_token: eagle3_map_draft_token(draft_token, d2t_offsets)?,
+            logit,
+        });
+    }
+    Ok((ranked, logsumexp))
+}
+
 /// Opt-in authoritative-update twin: `CAMELID_EAGLE3_AUTHORITATIVE_KV_BATCH_PROJ=1` (or
 /// `true`) normalizes every row of one fused authoritative update into a packed buffer and
 /// projects all of their K and V with one `rows`-column V3 dispatch each (weights streamed
@@ -33546,6 +33823,8 @@ struct Eagle3EncodedCell {
     raw_hidden: Buffer,
     logits: Buffer,
     selected: Buffer,
+    /// Present when the cell's tail ran on the GPU (`CAMELID_EAGLE3_GPU_TAIL=1`).
+    tail: Option<Eagle3EncodedTail>,
 }
 
 #[cfg(target_os = "macos")]
@@ -33677,6 +33956,41 @@ fn encode_eagle3_matmul_f32(
         input_width,
         rows,
         n_tokens,
+    );
+}
+
+/// One `eagle3_draft_tail_f32` dispatch over a `count`-row logits buffer (`count_scalar`
+/// holds the u32 row count): a single threadgroup of up to 1024 threads.
+#[cfg(target_os = "macos")]
+fn encode_eagle3_draft_tail(
+    e: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    logits: &Buffer,
+    ids: &Buffer,
+    vals: &Buffer,
+    stats: &Buffer,
+    count_scalar: &Buffer,
+) {
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(logits), 0);
+    e.set_buffer(1, Some(ids), 0);
+    e.set_buffer(2, Some(vals), 0);
+    e.set_buffer(3, Some(stats), 0);
+    e.set_buffer(4, Some(count_scalar), 0);
+    // Up to 32 simdgroups; the kernel sizes its cross-simdgroup merge from the launch width
+    // (a register-limited pipeline may admit fewer than 1024 threads).
+    let threads = (pipeline.max_total_threads_per_threadgroup().min(1024) / 32) * 32;
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
     );
 }
 
@@ -34994,6 +35308,16 @@ impl Eagle3MetalState {
                 depth: 1,
             },
         );
+        let tail = eagle3_gpu_tail_enabled()
+            .then(|| k.eagle3_draft_tail_pipeline.as_ref())
+            .flatten()
+            .map(|pipeline| {
+                let ids = nb(EAGLE3_TOP_K_CANDIDATES * 4);
+                let vals = nb(EAGLE3_TOP_K_CANDIDATES * 4);
+                let stats = nb(4 * 4);
+                encode_eagle3_draft_tail(e, pipeline, &logits, &ids, &vals, &stats, &vocab_n);
+                Eagle3EncodedTail { ids, vals, stats }
+            });
         keep.extend(owned_inputs);
         keep.extend([
             query,
@@ -35028,6 +35352,7 @@ impl Eagle3MetalState {
             raw_hidden,
             logits,
             selected,
+            tail,
         }
     }
 
@@ -35039,14 +35364,45 @@ impl Eagle3MetalState {
     ) -> std::result::Result<Eagle3MetalOutput, String> {
         let draft_token = unsafe { *(encoded.selected.contents() as *const u32) };
         let target_token = eagle3_map_draft_token(draft_token, &self.d2t_offsets);
-        let draft_logits = unsafe {
-            std::slice::from_raw_parts(encoded.logits.contents() as *const f32, self.lm_head_rows)
+        let (top_candidates, evaluated_vocab_logsumexp) = match encoded.tail.as_ref() {
+            Some(tail) => {
+                let (ids, vals, stats) = unsafe {
+                    (
+                        std::slice::from_raw_parts(
+                            tail.ids.contents() as *const u32,
+                            EAGLE3_TOP_K_CANDIDATES,
+                        ),
+                        std::slice::from_raw_parts(
+                            tail.vals.contents() as *const f32,
+                            EAGLE3_TOP_K_CANDIDATES,
+                        ),
+                        std::slice::from_raw_parts(tail.stats.contents() as *const f32, 3),
+                    )
+                };
+                match eagle3_finish_gpu_tail(ids, vals, stats, &self.d2t_offsets) {
+                    Ok((candidates, logsumexp)) => (Ok(candidates), Ok(logsumexp)),
+                    Err(error) => (Err(error.clone()), Err(error)),
+                }
+            }
+            None => {
+                let draft_logits = unsafe {
+                    std::slice::from_raw_parts(
+                        encoded.logits.contents() as *const f32,
+                        self.lm_head_rows,
+                    )
+                };
+                (
+                    eagle3_rank_top_candidates(draft_logits, &self.d2t_offsets),
+                    eagle3_evaluated_vocab_logsumexp(draft_logits),
+                )
+            }
         };
-        let top_candidates = eagle3_rank_top_candidates(draft_logits, &self.d2t_offsets);
-        let evaluated_vocab_logsumexp = eagle3_evaluated_vocab_logsumexp(draft_logits);
         let mut raw_hidden_out = vec![0.0f32; EAGLE3_HIDDEN];
         read_buffer_f32(&encoded.raw_hidden, &mut raw_hidden_out);
         keep.extend([encoded.raw_hidden, encoded.logits, encoded.selected]);
+        if let Some(tail) = encoded.tail {
+            keep.extend([tail.ids, tail.vals, tail.stats]);
+        }
         pool_recycle(k, keep);
         let target_token = target_token?;
         let top_candidates = top_candidates?;
@@ -35998,6 +36354,208 @@ mod eagle3_metal_contract_tests {
             assert!(eagle3_fused_qkv_from_env(Some(value)));
             assert!(eagle3_authoritative_kv_batch_proj_from_env(Some(value)));
         }
+    }
+
+    #[test]
+    fn eagle3_gpu_tail_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("on"),
+            Some("2"),
+            Some(" 1"),
+            Some("garbage"),
+        ] {
+            assert!(!eagle3_gpu_tail_from_env(value), "{value:?} must keep the host tail");
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(eagle3_gpu_tail_from_env(Some(value)));
+        }
+        // The host-side finish fails closed exactly where the host reductions did.
+        let d2t = vec![0i32; 8];
+        let ok = eagle3_finish_gpu_tail(
+            &[3, 1, 7, 0, 2, 4, 5, 6],
+            &[9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0],
+            &[9.0, 1.5, 0.0],
+            &d2t,
+        )
+        .unwrap();
+        assert_eq!(ok.0.len(), 8);
+        assert_eq!(ok.0[0].draft_token, 3);
+        assert_eq!(ok.0[0].logit, 9.0);
+        assert_eq!(ok.1, (9.0f64 + 1.5f64.ln()) as f32);
+        assert!(eagle3_finish_gpu_tail(&[0; 8], &[0.0; 8], &[9.0, 1.5, 1.0], &d2t).is_err());
+        assert!(eagle3_finish_gpu_tail(
+            &[u32::MAX; 8],
+            &[f32::NEG_INFINITY; 8],
+            &[f32::NEG_INFINITY, 0.0, 0.0],
+            &d2t
+        )
+        .is_err());
+        assert!(eagle3_finish_gpu_tail(&[0; 8], &[0.0; 8], &[9.0, 0.0, 0.0], &d2t).is_err());
+        assert!(eagle3_finish_gpu_tail(&[0; 8], &[0.0; 8], &[9.0, f32::INFINITY, 0.0], &d2t).is_err());
+        // Sentinel ids end the candidate list.
+        let short = eagle3_finish_gpu_tail(
+            &[5, 2, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX],
+            &[1.0, 0.5, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
+            &[1.0, 2.0, 0.0],
+            &d2t,
+        )
+        .unwrap();
+        assert_eq!(short.0.len(), 2);
+    }
+
+    /// The GPU tail ranks exactly what the host ranking ranks (ids AND order, ties by lower
+    /// id, NaN skipped, -INFINITY ranked) and its normalizer stays within f32 reduction
+    /// distance of the host's f64 one, over the draft vocabulary shape; also reports the
+    /// kernel's GPU cost next to the host tail's wall time.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_eagle3_draft_tail_matches_host_ranking_and_logsumexp() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let Some(pipeline) = k.eagle3_draft_tail_pipeline.as_ref() else {
+            panic!("eagle3_draft_tail_f32 did not build");
+        };
+        let count = EAGLE3_DRAFT_VOCAB;
+        let d2t = vec![0i32; count];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let opts = MTLResourceOptions::StorageModeShared;
+        let logits_buf = k.device.new_buffer((count * 4) as u64, opts);
+        let ids_buf = k.device.new_buffer(32, opts);
+        let vals_buf = k.device.new_buffer(32, opts);
+        let stats_buf = k.device.new_buffer(16, opts);
+        let count_buf = k.device.new_buffer(4, opts);
+        unsafe { *(count_buf.contents() as *mut u32) = count as u32 };
+        let run = |logits: &[f32], reps: usize| -> (Vec<u32>, Vec<f32>, Vec<f32>, u128) {
+            write_buffer_f32(&logits_buf, logits);
+            let cb = k.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            for _ in 0..reps {
+                encode_eagle3_draft_tail(
+                    e, pipeline, &logits_buf, &ids_buf, &vals_buf, &stats_buf, &count_buf,
+                );
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+            let ids = unsafe { std::slice::from_raw_parts(ids_buf.contents() as *const u32, 8) }.to_vec();
+            let vals = unsafe { std::slice::from_raw_parts(vals_buf.contents() as *const f32, 8) }.to_vec();
+            let stats = unsafe { std::slice::from_raw_parts(stats_buf.contents() as *const f32, 3) }.to_vec();
+            (ids, vals, stats, busy_us)
+        };
+        for case in 0..6 {
+            let mut logits: Vec<f32> = (0..count)
+                .map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32) * 40.0 - 20.0)
+                .collect();
+            match case {
+                0 => {}
+                1 => {
+                    // Eight-way tie at the top spread across the row: ascending id order.
+                    for i in [31_999usize, 17, 16_000, 5, 23_456, 9_999, 1_024, 700] {
+                        logits[i] = 55.0;
+                    }
+                }
+                2 => {
+                    // Ties straddling the eighth place.
+                    for i in (0..count).step_by(3_001) {
+                        logits[i] = 40.0;
+                    }
+                }
+                3 => {
+                    // -INFINITY rows are ranked like any value (they never reach the top-8
+                    // of a finite row) and contribute exp(-inf) = 0.
+                    for i in (0..count).step_by(7) {
+                        logits[i] = f32::NEG_INFINITY;
+                    }
+                }
+                4 => {
+                    // Everything but eight rows is -INFINITY: the eight survive, in order.
+                    for v in &mut logits {
+                        *v = f32::NEG_INFINITY;
+                    }
+                    for (rank, i) in [8_000usize, 1, 31_998, 400, 4_096, 2, 12_345, 30_000].iter().enumerate() {
+                        logits[*i] = 10.0 - rank as f32;
+                    }
+                }
+                _ => {
+                    // A NaN anywhere: flagged, the host tail fails closed identically.
+                    logits[12_345] = f32::NAN;
+                }
+            }
+            let (ids, vals, stats, _) = run(&logits, 1);
+            let host_lse = eagle3_evaluated_vocab_logsumexp(&logits);
+            let gpu = eagle3_finish_gpu_tail(&ids, &vals, &stats, &d2t);
+            if case == 5 {
+                assert!(host_lse.is_err(), "host must fail closed on NaN");
+                assert!(gpu.is_err(), "GPU tail must fail closed on NaN (flag={})", stats[2]);
+                continue;
+            }
+            let host_rank = eagle3_rank_top_candidates_legacy(&logits, &d2t).unwrap();
+            let (gpu_rank, gpu_lse) = gpu.expect("gpu tail");
+            let host_lse = host_lse.unwrap();
+            assert_eq!(gpu_rank.len(), host_rank.len(), "case {case}: candidate count");
+            for (rank, (g, h)) in gpu_rank.iter().zip(&host_rank).enumerate() {
+                assert_eq!(
+                    (g.draft_token, g.logit.to_bits()),
+                    (h.draft_token, h.logit.to_bits()),
+                    "case {case}: rank {rank} differs (gpu {:?} host {:?})",
+                    (g.draft_token, g.logit),
+                    (h.draft_token, h.logit)
+                );
+            }
+            let diff = (f64::from(gpu_lse) - f64::from(host_lse)).abs();
+            assert!(
+                diff <= 2.0e-5 * f64::from(host_lse.abs()).max(1.0),
+                "case {case}: logsumexp gpu {gpu_lse} host {host_lse} differ by {diff}"
+            );
+            eprintln!(
+                "metal_eagle3_draft_tail: case {case} TOP-8 IDENTICAL (ids+logits, {} candidates); lse gpu {gpu_lse:.6} host {host_lse:.6} (|d| {diff:.2e})",
+                gpu_rank.len()
+            );
+        }
+        // Determinism: the same row, the same bits, twenty times.
+        let logits: Vec<f32> = (0..count)
+            .map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32) * 40.0 - 20.0)
+            .collect();
+        let (ids0, vals0, stats0, _) = run(&logits, 1);
+        for repeat in 1..20 {
+            let (ids, vals, stats, _) = run(&logits, 1);
+            assert!(
+                ids == ids0
+                    && vals.iter().zip(&vals0).all(|(a, b)| a.to_bits() == b.to_bits())
+                    && stats.iter().zip(&stats0).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "repeat {repeat}: GPU tail is not deterministic"
+            );
+        }
+        eprintln!("metal_eagle3_draft_tail: 20 runs BIT-IDENTICAL");
+        // Cost: marginal GPU time per dispatch inside a warm command buffer, next to the
+        // host tail (ranking + f64 normalizer) it replaces.
+        let (_, _, _, one) = run(&logits, 1);
+        let (_, _, _, many) = run(&logits, 21);
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            let _ = eagle3_rank_top_candidates_legacy(&logits, &d2t).unwrap();
+            let _ = eagle3_evaluated_vocab_logsumexp(&logits).unwrap();
+        }
+        let host_us = started.elapsed().as_micros() as f64 / 50.0;
+        eprintln!(
+            "metal_eagle3_draft_tail: GPU {:.1} us/dispatch (marginal, 20 reps; single {one} us) vs host tail {host_us:.1} us (rank + f64 lse, 32k rows)",
+            many.saturating_sub(one) as f64 / 20.0
+        );
     }
 
     #[test]
