@@ -33872,6 +33872,8 @@ struct Eagle3EncodedCell {
     /// row's cache bytes again can scatter these through the same F16 kernel instead of
     /// streaming the head weights a second time.
     scored_kv: Option<(Buffer, Buffer)>,
+    /// Present when the cell's tail ran on the GPU (`CAMELID_EAGLE3_GPU_TAIL=1`).
+    tail: Option<Eagle3EncodedTail>,
 }
 
 /// One scored draft cell plus the key/value it wrote, so a later branch switch can restore
@@ -33881,8 +33883,6 @@ pub struct Eagle3MetalScoredRow {
     pub output: Eagle3MetalOutput,
     pub key: Vec<f32>,
     pub value: Vec<f32>,
-    /// Present when the cell's tail ran on the GPU (`CAMELID_EAGLE3_GPU_TAIL=1`).
-    tail: Option<Eagle3EncodedTail>,
 }
 
 #[cfg(target_os = "macos")]
