@@ -21070,8 +21070,9 @@ fn stream_first_content_accounting_json(
 /// SSE layer needs to reproduce the pre-inversion byte stream (chunk shapes
 /// unchanged; only timing VALUES may differ).
 enum StreamDecodeEvent {
-    /// A non-empty text delta (already stop-sequence-truncated and diffed
-    /// against previously streamed text).
+    /// One committed token's non-empty text delta (already stop-sequence-
+    /// truncated and diffed against previously streamed text; a token whose
+    /// UTF-8 bytes are still pending produces none).
     Delta(String),
     /// Clean end of generation; terminal.
     Finished {
@@ -21354,8 +21355,8 @@ fn run_stream_decode_job(
             return;
         }
         // Speculation first. A committed round appends its whole accepted run to
-        // `generated`; the delta below is a text diff of the entire decoded
-        // output, so the client simply receives one larger delta.
+        // `generated`; `stream_step_deltas` below then streams that run as one
+        // delta per committed token.
         let spec_eligible = !collect_dense_for_step
             && prepared.logprobs_top_n.is_none()
             && prepared.constraint.is_none()
@@ -21430,8 +21431,16 @@ fn run_stream_decode_job(
             }
         }
 
-        let mut text = match prepared.tokenizer.decode(&generated, true) {
-            Ok(text) => text,
+        let tokenizer = Arc::clone(&prepared.tokenizer);
+        let deltas = match stream_step_deltas(
+            |ids| tokenizer.decode(ids, true),
+            &generated,
+            generated_index,
+            finish_reason == "stop",
+            &prepared.stop_sequences,
+            &mut streamed_text,
+        ) {
+            Ok(deltas) => deltas,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
                     code: "token_decode_failed".to_string(),
@@ -21440,15 +21449,9 @@ fn run_stream_decode_job(
                 return;
             }
         };
-        if finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
-        let delta = text
-            .strip_prefix(&streamed_text)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
-        streamed_text = text;
-        if !delta.is_empty() {
+        // One event per committed token, sent back to back so a speculative
+        // round still leaves the engine in a single burst.
+        for delta in deltas {
             if first_content_ms.is_none() {
                 first_content_ms = Some(generation_started.elapsed().as_millis());
             }
@@ -21750,8 +21753,8 @@ impl CooperativeStreamDecodeJob {
             LlamaSampler::Sampling(sampling)
         };
         // Speculation first. A committed round appends its whole accepted run to
-        // `generated`; the delta below is a text diff of the entire decoded
-        // output, so the client simply receives one larger delta.
+        // `generated`; `stream_step_deltas` below then streams that run as one
+        // delta per committed token.
         let spec_eligible = !collect_dense_for_step
             && self.prepared.logprobs_top_n.is_none()
             && self.prepared.constraint.is_none()
@@ -21818,8 +21821,16 @@ impl CooperativeStreamDecodeJob {
                 .record_progress(self.generated.len());
         }
 
-        let mut text = match self.prepared.tokenizer.decode(&self.generated, true) {
-            Ok(text) => text,
+        let tokenizer = Arc::clone(&self.prepared.tokenizer);
+        let deltas = match stream_step_deltas(
+            |ids| tokenizer.decode(ids, true),
+            &self.generated,
+            generated_index,
+            self.finish_reason == "stop",
+            &self.prepared.stop_sequences,
+            &mut self.streamed_text,
+        ) {
+            Ok(deltas) => deltas,
             Err(err) => {
                 self.send(StreamDecodeEvent::Failed {
                     code: "token_decode_failed".to_string(),
@@ -21829,15 +21840,9 @@ impl CooperativeStreamDecodeJob {
                 return engine::StepOutcome::Complete;
             }
         };
-        if self.finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &self.prepared.stop_sequences);
-        }
-        let delta = text
-            .strip_prefix(&self.streamed_text)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
-        self.streamed_text = text;
-        if !delta.is_empty() {
+        // One event per committed token, sent back to back so a speculative
+        // round still leaves the engine in a single burst.
+        for delta in deltas {
             if self.first_content_ms.is_none() {
                 self.first_content_ms = Some(self.generation_started.elapsed().as_millis());
             }
@@ -21889,8 +21894,8 @@ fn stream_completion(
     // with it that call's resident-path decision. Forcing both off here meant a
     // spec-enabled server never speculated for streaming clients — i.e. never
     // for the agent traffic the lane exists to speed up. Both streaming jobs
-    // emit an accepted run through the same text-delta path a single token
-    // takes, so a committed round streams as one delta.
+    // stream an accepted run through `stream_step_deltas`, one delta per
+    // committed token, so clients counting events see real tokens.
     //
     // `CAMELID_SPEC_STREAM=0` is the narrow rollback lever: it restores the
     // previous streaming-only behaviour by dropping the drafter AND un-pinning
@@ -22199,6 +22204,81 @@ fn sse_json_event<T: Serialize>(value: &T) -> Result<Event, Infallible> {
         serde_json::to_string(value)
             .expect("OpenAI-compatible SSE chunk serialization cannot fail"),
     ))
+}
+
+/// Per-token SSE deltas for one streaming decode step.
+///
+/// A speculative round commits `generated[committed_before..]` in one step.
+/// Streaming used to diff the whole decoded output once per step, so a round
+/// of ~3.5 accepted tokens reached the client as ONE `delta.content` event;
+/// clients that count events as tokens (this UI's live tok/s counter, most
+/// OpenAI-style clients) then read ~25 tok/s while the receipt said ~97. This
+/// walks the step token by token: each prefix `generated[..k]` is decoded with
+/// the same whole-output decoder the single-token path uses, and each token's
+/// increment over the text streamed so far becomes its own delta, in order. A
+/// token whose UTF-8 bytes are still pending yields no text of its own (the
+/// tokenizer's `flush_bytes` holds an incomplete tail back; a lossy decoder
+/// would end in U+FFFD) and is skipped, so its bytes ride with the token that
+/// completes them.
+///
+/// Byte-exactness is enforced, not assumed: the returned deltas must
+/// concatenate to exactly the single delta the whole-step diff produces, and on
+/// any mismatch that single delta is returned instead. A single-token step is
+/// therefore unchanged, and `streamed_text` always ends up equal to the step's
+/// full (stop-truncated) text.
+fn stream_step_deltas<E>(
+    decode: impl Fn(&[u32]) -> std::result::Result<String, E>,
+    generated: &[u32],
+    committed_before: usize,
+    stop_reached: bool,
+    stop_sequences: &[String],
+    streamed_text: &mut String,
+) -> std::result::Result<Vec<String>, E> {
+    let mut step_text = decode(generated)?;
+    if stop_reached {
+        step_text = truncate_at_stop_sequence(step_text, stop_sequences);
+    }
+    // The whole-step delta: what a single-token step streams, and the exact
+    // text any per-token split below must add up to.
+    let step_delta = step_text
+        .strip_prefix(streamed_text.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| step_text.clone());
+
+    let first_new = committed_before.min(generated.len());
+    let mut deltas = Vec::new();
+    if generated.len() > first_new + 1 {
+        let mut streamed = streamed_text.clone();
+        for prefix_len in first_new + 1..generated.len() {
+            let prefix_text = decode(&generated[..prefix_len])?;
+            if prefix_text.ends_with('\u{FFFD}') {
+                continue;
+            }
+            let increment = prefix_text
+                .strip_prefix(streamed.as_str())
+                .filter(|increment| !increment.is_empty())
+                .map(str::to_owned);
+            if let Some(increment) = increment {
+                deltas.push(increment);
+                streamed = prefix_text;
+            }
+        }
+        match step_text.strip_prefix(streamed.as_str()) {
+            Some(increment) if !increment.is_empty() => deltas.push(increment.to_owned()),
+            Some(_) => {}
+            None => deltas.push(step_text.clone()),
+        }
+        if deltas.concat() != step_delta {
+            deltas.clear();
+            if !step_delta.is_empty() {
+                deltas.push(step_delta);
+            }
+        }
+    } else if !step_delta.is_empty() {
+        deltas.push(step_delta);
+    }
+    *streamed_text = step_text;
+    Ok(deltas)
 }
 
 fn contains_stop_sequence(text: &str, stop_sequences: &[String]) -> bool {
@@ -25259,6 +25339,109 @@ mod tests {
         // The usage frame is omitted from the wire on every non-terminal chunk
         // (stream_options.include_usage off), keeping the baseline byte-identical.
         assert!(value.get("usage").is_none());
+    }
+
+    /// Byte-level decoder stand-in: tokens are byte pieces and decoding follows
+    /// the tokenizer's own `flush_bytes` rule (valid UTF-8 prefix only; an
+    /// incomplete tail is held back for the token that completes it).
+    fn decode_byte_pieces<'a>(
+        pieces: &'a [&'a [u8]],
+    ) -> impl Fn(&[u32]) -> std::result::Result<String, String> + 'a {
+        move |ids: &[u32]| {
+            let bytes: Vec<u8> = ids
+                .iter()
+                .flat_map(|&id| pieces[id as usize].iter().copied())
+                .collect();
+            Ok(match std::str::from_utf8(&bytes) {
+                Ok(text) => text.to_owned(),
+                Err(err) => std::str::from_utf8(&bytes[..err.valid_up_to()])
+                    .unwrap_or("")
+                    .to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn stream_step_deltas_split_a_speculative_round_per_token_and_stay_byte_exact() {
+        // "Hi 😀日本語!" with the emoji and the CJK scalars split across byte
+        // tokens, the way a byte-level BPE vocabulary emits them.
+        let pieces: [&[u8]; 10] = [
+            b"Hi",
+            b" ",
+            &[0xF0, 0x9F],
+            &[0x98, 0x80],
+            &[0xE6, 0x97],
+            &[0xA5],
+            &[0xE6, 0x9C, 0xAC],
+            &[0xE8, 0xAA],
+            &[0x9E],
+            b"!",
+        ];
+        let decode = decode_byte_pieces(&pieces);
+        let generated: Vec<u32> = (0..10).collect();
+        let round_text = decode(&generated).unwrap();
+        assert_eq!(round_text, "Hi 😀日本語!");
+
+        // Token 0 was streamed by an earlier step; this round committed nine.
+        let mut streamed = "Hi".to_string();
+        let whole_round_delta = round_text.strip_prefix("Hi").unwrap().to_owned();
+        let deltas = stream_step_deltas(&decode, &generated, 1, false, &[], &mut streamed)
+            .unwrap();
+        assert_eq!(deltas, vec![" ", "😀", "日", "本", "語", "!"]);
+        assert_eq!(deltas.concat(), whole_round_delta);
+        assert_eq!(deltas.concat(), " 😀日本語!");
+        assert_eq!(streamed, round_text);
+
+        // A single-token step (the non-speculative path) is one delta, unchanged.
+        let mut streamed = "Hi ".to_string();
+        let deltas =
+            stream_step_deltas(&decode, &generated[..4], 3, false, &[], &mut streamed).unwrap();
+        assert_eq!(deltas, vec!["😀"]);
+        assert_eq!(streamed, "Hi 😀");
+        // ...and a single token whose bytes are still pending yields nothing yet.
+        let mut streamed = "Hi ".to_string();
+        let deltas =
+            stream_step_deltas(&decode, &generated[..3], 2, false, &[], &mut streamed).unwrap();
+        assert!(deltas.is_empty(), "{deltas:?}");
+        assert_eq!(streamed, "Hi ");
+    }
+
+    #[test]
+    fn stream_step_deltas_fall_back_to_the_whole_step_delta_when_a_split_would_differ() {
+        // A stop sequence completed by the round's last token truncates text its
+        // earlier tokens produced: the client must see exactly today's " world".
+        let pieces: [&[u8]; 4] = [b"Hello", b" wor", b"ld<", b"/s>"];
+        let decode = decode_byte_pieces(&pieces);
+        let generated: Vec<u32> = (0..4).collect();
+        let stop = vec!["</s>".to_string()];
+        let mut streamed = "Hello".to_string();
+        let deltas =
+            stream_step_deltas(&decode, &generated, 1, true, &stop, &mut streamed).unwrap();
+        assert_eq!(deltas, vec![" world"]);
+        assert_eq!(streamed, "Hello world");
+
+        // A decoder whose prefix text is not a prefix of the step text cannot be
+        // split without changing bytes; the whole-step delta wins.
+        let inconsistent = |ids: &[u32]| -> std::result::Result<String, String> {
+            Ok(match ids.len() {
+                2 => "AZ".to_string(),
+                n => "ABC"[..n].to_string(),
+            })
+        };
+        let generated = [0u32, 1, 2];
+        let mut streamed = "A".to_string();
+        let deltas =
+            stream_step_deltas(inconsistent, &generated, 1, false, &[], &mut streamed).unwrap();
+        assert_eq!(deltas, vec!["BC"]);
+        assert_eq!(streamed, "ABC");
+
+        // Decode errors surface instead of being swallowed into a delta.
+        let failing = |_: &[u32]| -> std::result::Result<String, String> { Err("bad id".into()) };
+        let mut streamed = String::new();
+        assert_eq!(
+            stream_step_deltas(failing, &generated, 0, false, &[], &mut streamed).unwrap_err(),
+            "bad id"
+        );
     }
 
     #[test]
