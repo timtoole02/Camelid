@@ -377,6 +377,8 @@ struct MetalLinearKernel {
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     argmax_f32_greedy_pipeline: ComputePipelineState,
+    argmax_f32_greedy_batch_partial_pipeline: ComputePipelineState,
+    argmax_f32_greedy_batch_merge_pipeline: ComputePipelineState,
     topk8_f32_greedy_pipeline: ComputePipelineState,
     sample_gumbel_f32_pipeline: ComputePipelineState,
     attention_decode_splitk_pipeline: ComputePipelineState,
@@ -7162,6 +7164,123 @@ kernel void q4k_linear_f32_v3(
     }
 }
 
+// Segmented twin of q4k_linear_f32_v3 for 2..3 row-aligned Q4_K projections of ONE
+// input vector (the draft cell's q|k|v of `combined`, its gate|up of `post_norm`).
+// Each 4-row threadgroup resolves once to the segment holding its rows; from there the
+// body is the single-column kernel's, verbatim, on that segment's weights, output and
+// row count. Every segment's row count must be a positive multiple of 4 so no
+// threadgroup straddles two tensors (host-checked). This library compiles with
+// fast-math off, so row r of segment s carries exactly the bits one q4k_linear_f32_v3
+// dispatch over segment s writes at r; only the threadgroup->tensor routing is new.
+kernel void q4k_linear_f32_v3_seg3(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight_blocks0 [[buffer(2)]],
+    device float* output0 [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint* segment_rows [[buffer(5)]],
+    device const uchar* weight_blocks1 [[buffer(9)]],
+    device float* output1 [[buffer(10)]],
+    device const uchar* weight_blocks2 [[buffer(11)]],
+    device float* output2 [[buffer(12)]],
+    uint group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+    constexpr uint rows_per_sg = 2;
+    constexpr uint simdgroups = 2;
+
+    uint r0 = group * simdgroups * rows_per_sg;
+    uint rows = segment_rows[0];
+    device const uchar* weight_blocks = weight_blocks0;
+    device float* output = output0;
+    if (r0 >= rows) {
+        r0 -= rows;
+        rows = segment_rows[1];
+        weight_blocks = weight_blocks1;
+        output = output1;
+        if (r0 >= rows) {
+            r0 -= rows;
+            rows = segment_rows[2];
+            weight_blocks = weight_blocks2;
+            output = output2;
+            if (r0 >= rows) return;
+        }
+    }
+    const uint first_row = r0 + uint(sg) * rows_per_sg;
+    if (first_row >= rows) return;
+
+    const short ix = lane / 8;
+    const short it = lane % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    float sumf[rows_per_sg] = {0.0f, 0.0f};
+    float yl[16];
+    float yh[16];
+    ushort sc16[4];
+    thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+
+    for (uint ib = uint(ix); ib < n_sb; ib += 4) {
+        device const float* y4 = input + ib * 256 + 64 * uint(iq) + 8 * uint(ir);
+        float4 sumy = float4(0.0f);
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+            const uint row = first_row + uint(rr);
+            if (row >= rows) break;
+            device const uchar* block = weight_blocks + (row * n_sb + ib) * 144;
+            device const ushort* sc = reinterpret_cast<device const ushort*>(block + 4) + iq;
+            device const ushort* q1 = reinterpret_cast<device const ushort*>(block + 16)
+                                      + 16 * iq + 4 * ir;
+            device const ushort* q2 = q1 + 32;
+            device const half* dh = reinterpret_cast<device const half*>(block);
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[rr] += float(dh[0]) * (
+                    (acc1[0] + (1.0f/256.0f) * acc1[1]) * float(sc8[0])
+                  + (acc1[2] + (1.0f/256.0f) * acc1[3]) * float(sc8[1]) * (1.0f/16.0f)
+                  + (acc2[0] + (1.0f/256.0f) * acc2[1]) * float(sc8[4])
+                  + (acc2[2] + (1.0f/256.0f) * acc2[3]) * float(sc8[5]) * (1.0f/16.0f))
+                - float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3])
+                  + sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+    }
+
+    for (short rr = 0; rr < short(rows_per_sg); ++rr) {
+        const uint row = first_row + uint(rr);
+        if (row < rows) {
+            const float total = simd_sum(sumf[rr]);
+            if (lane == 0) output[row] = total;
+        }
+    }
+}
+
 kernel void q4k_linear_f32_mc_v3(
     device const float* input [[buffer(0)]],
     device const uchar* weight_blocks [[buffer(2)]],
@@ -10788,6 +10907,96 @@ kernel void argmax_f32_greedy(
     }
 }
 
+// Chunked, row-batched twin of argmax_f32_greedy over a packed [rows, count] logits
+// buffer. Threadgroup (chunk, row) scans the ascending index range
+// [chunk*chunk_len, min(count, (chunk+1)*chunk_len)) of row `row` with the single-row
+// kernel's strided scan and shared-memory tree copied verbatim (strict `>`, then the LOWER
+// index; NaN and -INFINITY are never selected), and writes its chunk winner to
+// part_val/part_idx[row * chunks + chunk]; UINT_MAX marks a chunk with no selectable
+// value. Argmax is comparison-only, so any partition of the index range followed by the
+// same tie rule (argmax_f32_greedy_batch_merge) selects exactly the id one
+// argmax_f32_greedy dispatch over the whole row selects. The single-row kernel is one
+// threadgroup walking ~125 dependent 4 KB round trips per 513 KB row; this spreads a
+// row over `chunks` threadgroups and all rows over the grid.
+kernel void argmax_f32_greedy_batch_partial(
+    device const float* logits [[buffer(0)]],
+    device float* part_val [[buffer(1)]],
+    device uint* part_idx [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 grid [[threadgroups_per_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 tg_size2 [[threads_per_threadgroup]]
+) {
+    threadgroup float sh_val[1024];
+    threadgroup uint sh_idx[1024];
+    // MSL requires every grid attribute of one kernel to share a rank; the threadgroup is
+    // 1-D, so unpack the x components and keep the scan/tree text identical to
+    // argmax_f32_greedy.
+    const uint tid = tid2.x;
+    const uint tg_size = tg_size2.x;
+    const uint chunk = tg.x;
+    const uint chunks = grid.x;
+    const uint row = tg.y;
+    const uint chunk_len = (count + chunks - 1) / chunks;
+    const uint begin = chunk * chunk_len;
+    const uint end = min(count, begin + chunk_len);
+    device const float* row_logits = logits + (ulong)row * count;
+    float best = -INFINITY;
+    uint best_i = 0xffffffffu;
+    for (uint i = begin + tid; i < end; i += tg_size) {
+        const float v = row_logits[i];
+        if (v > best) {
+            best = v;
+            best_i = i;
+        }
+    }
+    sh_val[tid] = best;
+    sh_idx[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float ov = sh_val[tid + s];
+            const uint oi = sh_idx[tid + s];
+            if (ov > sh_val[tid] || (ov == sh_val[tid] && oi < sh_idx[tid])) {
+                sh_val[tid] = ov;
+                sh_idx[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        part_val[row * chunks + chunk] = sh_val[0];
+        part_idx[row * chunks + chunk] = sh_idx[0];
+    }
+}
+
+// Second stage of the chunked batch argmax: one threadgroup per row folds that row's
+// `chunks` partial winners in ascending chunk order with the same strict-`>` / lower-index
+// rule, writing out_id[row]. Chunks are disjoint ascending index ranges, so the fold is
+// exactly the single-row kernel's global selection.
+kernel void argmax_f32_greedy_batch_merge(
+    device const float* part_val [[buffer(0)]],
+    device const uint* part_idx [[buffer(1)]],
+    device uint* out_id [[buffer(2)]],
+    constant uint& chunks [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    float best = -INFINITY;
+    uint best_i = 0xffffffffu;
+    for (uint c = 0; c < chunks; ++c) {
+        const float v = part_val[row * chunks + c];
+        const uint i = part_idx[row * chunks + c];
+        if (v > best || (v == best && i < best_i)) {
+            best = v;
+            best_i = i;
+        }
+    }
+    out_id[row] = best_i;
+}
+
 // Opt-in target-candidate sibling of argmax_f32_greedy. This deliberately leaves the
 // production argmax kernel and output buffer untouched: it performs eight deterministic
 // repeated reductions into a compact [8] token-id row. Every pass uses the same strict-`>` /
@@ -13278,6 +13487,20 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let argmax_f32_greedy_pipeline = device
                 .new_compute_pipeline_state_with_function(&argmax_f32_greedy_function)
                 .ok()?;
+            let argmax_f32_greedy_batch_partial_function = elementwise_library
+                .get_function("argmax_f32_greedy_batch_partial", None)
+                .ok()?;
+            let argmax_f32_greedy_batch_partial_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &argmax_f32_greedy_batch_partial_function,
+                )
+                .ok()?;
+            let argmax_f32_greedy_batch_merge_function = elementwise_library
+                .get_function("argmax_f32_greedy_batch_merge", None)
+                .ok()?;
+            let argmax_f32_greedy_batch_merge_pipeline = device
+                .new_compute_pipeline_state_with_function(&argmax_f32_greedy_batch_merge_function)
+                .ok()?;
             let topk8_f32_greedy_function = elementwise_library
                 .get_function("topk8_f32_greedy", None)
                 .ok()?;
@@ -13707,6 +13930,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 argmax_f32_greedy_pipeline,
+                argmax_f32_greedy_batch_partial_pipeline,
+                argmax_f32_greedy_batch_merge_pipeline,
                 topk8_f32_greedy_pipeline,
                 sample_gumbel_f32_pipeline,
                 attention_decode_splitk_pipeline,
@@ -19840,6 +20065,86 @@ fn verify_ablate(stage: &str) -> bool {
         .is_some_and(|v| v.split(',').any(|s| s.trim() == stage))
 }
 
+/// Opt-in verifier tail: `CAMELID_METAL_VERIFY_BATCH_ARGMAX=1` (or `true`) replaces the
+/// `k` serial single-threadgroup `argmax_f32_greedy` dispatches with one chunked
+/// row-batched partial pass plus one merge pass over the same logits. Every other
+/// spelling keeps the serial dispatch sequence. The selected ids are identical by
+/// construction (comparison-only reduction, same tie rule; see
+/// `argmax_f32_greedy_batch_partial`).
+fn verify_batch_argmax_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_batch_argmax_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_METAL_VERIFY_BATCH_ARGMAX").ok();
+        verify_batch_argmax_from_env(value.as_deref())
+    })
+}
+
+/// Chunks per logits row for the batched argmax: about 16 K values (sixteen 1024-thread
+/// strides) per threadgroup, at least one and at most 32 chunks. Pure work partitioning;
+/// the id selected does not depend on it.
+fn verify_batch_argmax_chunks(count: usize) -> usize {
+    count.div_ceil(16_384).clamp(1, 32)
+}
+
+/// Encode the two-stage batched greedy argmax over a packed `[rows, count]` f32 logits
+/// buffer into `out_id[row]`. `count_scalar` holds `count` (u32) and `chunks_scalar`
+/// holds `chunks` (u32); `part_val`/`part_idx` are `rows * chunks` f32/u32 scratch that
+/// must stay alive until the command buffer completes.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_verify_batch_argmax(
+    k: &MetalLinearKernel,
+    e: &metal::ComputeCommandEncoderRef,
+    logits: &Buffer,
+    out_id: &Buffer,
+    count_scalar: &Buffer,
+    chunks_scalar: &Buffer,
+    part_val: &Buffer,
+    part_idx: &Buffer,
+    rows: usize,
+    chunks: usize,
+) {
+    e.set_compute_pipeline_state(&k.argmax_f32_greedy_batch_partial_pipeline);
+    e.set_buffer(0, Some(logits), 0);
+    e.set_buffer(1, Some(part_val), 0);
+    e.set_buffer(2, Some(part_idx), 0);
+    e.set_buffer(3, Some(count_scalar), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: chunks as u64,
+            height: rows as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.set_compute_pipeline_state(&k.argmax_f32_greedy_batch_merge_pipeline);
+    e.set_buffer(0, Some(part_val), 0);
+    e.set_buffer(1, Some(part_idx), 0);
+    e.set_buffer(2, Some(out_id), 0);
+    e.set_buffer(3, Some(chunks_scalar), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Output rows each threadgroup of the batched-column verify GEMV owns. MUST stay in
 /// step with `NR0` in `q8_0_block_linear_ksplit_f32y_wire_nsg8_verify`: it sizes both
 /// the dispatch grid and the `[row * 32 + ..]` threadgroup scratch. It is a pure
@@ -19889,7 +20194,15 @@ struct KquantV3Kernels {
     q4k_mc: ComputePipelineState,
     q6k_single: ComputePipelineState,
     q6k_mc: ComputePipelineState,
+    /// Segmented twin of `q4k_single` for 2..=3 row-aligned tensors of one input
+    /// (`q4k_linear_f32_v3_seg3`). `None` leaves every caller on the per-tensor
+    /// dispatches; the lane itself never depends on it.
+    q4k_seg3: Option<ComputePipelineState>,
 }
+
+/// Rows one `q4k_linear_f32_v3` threadgroup owns (two SIMD groups of two rows). A
+/// segment of the segmented twin must be a positive multiple of this.
+const EAGLE3_V3_SEG_TILE_ROWS: usize = 4;
 
 #[cfg(target_os = "macos")]
 fn kquant_v3_kernels() -> Option<&'static KquantV3Kernels> {
@@ -19918,6 +20231,7 @@ fn kquant_v3_kernels() -> Option<&'static KquantV3Kernels> {
                 q4k_mc: pipeline("q4k_linear_f32_mc_v3")?,
                 q6k_single: pipeline("q6k_linear_f32_v3")?,
                 q6k_mc: pipeline("q6k_linear_f32_mc_v3")?,
+                q4k_seg3: pipeline("q4k_linear_f32_v3_seg3"),
             })
         })
         .as_ref()
@@ -31972,6 +32286,46 @@ fn eagle3_evaluated_vocab_logsumexp(logits: &[f32]) -> std::result::Result<f32, 
     eagle3_evaluated_vocab_logsumexp_with_exp_mode(logits, eagle3_parallel_lse_enabled())
 }
 
+/// Opt-in draft-cell twin: `CAMELID_EAGLE3_FUSED_QKV=1` (or `true`) encodes the cell's
+/// q|k|v projections of `combined`, and its gate|up projections of `post_norm`, as one
+/// segmented `q4k_linear_f32_v3_seg3` dispatch each instead of one dispatch per tensor.
+/// Same kernel body in the same strict-math library; only the threadgroup->tensor routing
+/// differs, so every output row is bit-identical. Any other spelling keeps the per-tensor
+/// dispatches. Applies to every EAGLE cell (draft forwards and the authoritative update's
+/// final cell) whose body matrices are Q4_K.
+fn eagle3_fused_qkv_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_fused_qkv_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_EAGLE3_FUSED_QKV").ok();
+        eagle3_fused_qkv_from_env(value.as_deref())
+    })
+}
+
+/// Opt-in authoritative-update twin: `CAMELID_EAGLE3_AUTHORITATIVE_KV_BATCH_PROJ=1` (or
+/// `true`) normalizes every row of one fused authoritative update into a packed buffer and
+/// projects all of their K and V with one `rows`-column V3 dispatch each (weights streamed
+/// once) instead of one single-column dispatch per row; RoPE and the F16 scatter stay per
+/// row on the unchanged kernels at row offsets. Effective only on the one-command-buffer
+/// update (`CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION=1`) with 2..=8 rows and a Q4_K
+/// draft body; other rounds keep the row-serial sequence. Any other spelling is off.
+fn eagle3_authoritative_kv_batch_proj_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_authoritative_kv_batch_proj_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_EAGLE3_AUTHORITATIVE_KV_BATCH_PROJ").ok();
+        eagle3_authoritative_kv_batch_proj_from_env(value.as_deref())
+    })
+}
+
 fn eagle3_validate_batch_shape(
     token_embedding_values: usize,
     g_state_values: usize,
@@ -32217,30 +32571,7 @@ fn encode_eagle3_matmul_f32(
 ) {
     if weight.format == ResidentWeightFormat::Q4K && n_tokens == 1 {
         if let Some(v3) = kquant_v3_kernels() {
-            unsafe {
-                let p = scalar.contents() as *mut u32;
-                *p = (input_width / EAGLE3_Q4K_SUPERBLOCK_VALUES) as u32;
-                *p.add(1) = rows as u32;
-                *p.add(2) = 1;
-            }
-            e.set_compute_pipeline_state(&v3.q4k_single);
-            e.set_buffer(0, Some(y), 0);
-            e.set_buffer(2, Some(&weight.buffer), 0);
-            e.set_buffer(3, Some(out), 0);
-            e.set_buffer(4, Some(scalar), 0);
-            e.set_buffer(5, Some(scalar), 4);
-            e.dispatch_thread_groups(
-                metal::MTLSize {
-                    width: rows.div_ceil(4) as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                metal::MTLSize {
-                    width: 64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            encode_eagle3_q4k_single_off(e, v3, y, 0, weight, out, scalar, input_width, rows);
             return;
         }
     }
@@ -32256,6 +32587,194 @@ fn encode_eagle3_matmul_f32(
         rows,
         n_tokens,
     );
+}
+
+/// The draft head's single-column direct-f32 Q4_K GEMV (`q4k_linear_f32_v3`), with an
+/// input byte offset so a caller holding a packed `[rows, width]` activation buffer can
+/// project one of its rows. `scalar` must hold 12 bytes (n_sb @0, rows @4, n_tokens=1 @8).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_eagle3_q4k_single_off(
+    e: &metal::ComputeCommandEncoderRef,
+    v3: &KquantV3Kernels,
+    y: &Buffer,
+    y_offset: u64,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    input_width: usize,
+    rows: usize,
+) {
+    debug_assert_eq!(weight.format, ResidentWeightFormat::Q4K);
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = (input_width / EAGLE3_Q4K_SUPERBLOCK_VALUES) as u32;
+        *p.add(1) = rows as u32;
+        *p.add(2) = 1;
+    }
+    e.set_compute_pipeline_state(&v3.q4k_single);
+    e.set_buffer(0, Some(y), y_offset);
+    e.set_buffer(2, Some(&weight.buffer), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(EAGLE3_V3_SEG_TILE_ROWS) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Multi-column direct-f32 Q4_K GEMV (`q4k_linear_f32_mc_v3`) over `n_tokens` (2..=8)
+/// packed `[n_tokens, width]` input rows into `out[t * rows + row]`. The resident lane
+/// admits this window as bit-identical to `n_tokens` single-column dispatches (same
+/// per-column fold, strict math); the authoritative update uses it for the K and V of
+/// every row of one update. `scalar` holds n_sb @0, rows @4, n_tokens @8.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_eagle3_q4k_multi_column(
+    e: &metal::ComputeCommandEncoderRef,
+    v3: &KquantV3Kernels,
+    y: &Buffer,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    input_width: usize,
+    rows: usize,
+    n_tokens: usize,
+) {
+    debug_assert_eq!(weight.format, ResidentWeightFormat::Q4K);
+    debug_assert!((2..=KQUANT_V3_MAX_COLUMNS).contains(&n_tokens));
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = (input_width / EAGLE3_Q4K_SUPERBLOCK_VALUES) as u32;
+        *p.add(1) = rows as u32;
+        *p.add(2) = n_tokens as u32;
+    }
+    e.set_compute_pipeline_state(&v3.q4k_mc);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(2, Some(&weight.buffer), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(EAGLE3_V3_SEG_TILE_ROWS) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Whether one segmented single-column dispatch may cover `segments`: 2..=3 Q4_K
+/// tensors, each a positive multiple of the V3 threadgroup height, over a super-block
+/// multiple input width. Pure routing eligibility; arithmetic is never in question.
+fn eagle3_seg_projection_eligible(
+    segment_rows: &[usize],
+    all_q4k: bool,
+    input_width: usize,
+) -> bool {
+    (2..=KQUANT_V4_FUSED_MAX_SEGMENTS).contains(&segment_rows.len())
+        && all_q4k
+        && input_width.is_multiple_of(EAGLE3_Q4K_SUPERBLOCK_VALUES)
+        && input_width > 0
+        && segment_rows
+            .iter()
+            .all(|rows| *rows > 0 && rows.is_multiple_of(EAGLE3_V3_SEG_TILE_ROWS))
+}
+
+/// Encode one segmented single-column dispatch (`q4k_linear_f32_v3_seg3`) over 2..=3
+/// Q4_K projections of the same input vector (bound at `input_offset`). Returns false
+/// before encoding anything unless the V3 lane and its segmented twin are built and
+/// [`eagle3_seg_projection_eligible`] holds; the caller then falls back to one dispatch
+/// per projection (same arithmetic). The 16-byte scalar (n_sb @0, rows0..2 @4..16) is
+/// pushed onto `keep`.
+#[cfg(target_os = "macos")]
+fn encode_eagle3_seg_projection(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    input_offset: u64,
+    segments: &[(&ResidentLinearWeight, &Buffer, usize)],
+    input_width: usize,
+) -> bool {
+    let Some(v3) = kquant_v3_kernels() else {
+        return false;
+    };
+    let Some(pipeline) = v3.q4k_seg3.as_ref() else {
+        return false;
+    };
+    let segment_rows: Vec<usize> = segments.iter().map(|s| s.2).collect();
+    let all_q4k = segments
+        .iter()
+        .all(|(weight, _, _)| weight.format == ResidentWeightFormat::Q4K);
+    if !eagle3_seg_projection_eligible(&segment_rows, all_q4k, input_width) {
+        return false;
+    }
+    let scalar = pool_get(k, (4 * (1 + KQUANT_V4_FUSED_MAX_SEGMENTS)) as u64);
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = (input_width / EAGLE3_Q4K_SUPERBLOCK_VALUES) as u32;
+        for slot in 0..KQUANT_V4_FUSED_MAX_SEGMENTS {
+            *p.add(1 + slot) = segment_rows.get(slot).copied().unwrap_or(0) as u32;
+        }
+    }
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(input), input_offset);
+    e.set_buffer(4, Some(&scalar), 0);
+    e.set_buffer(5, Some(&scalar), 4);
+    // An unused trailing segment carries zero rows, so no threadgroup ever resolves to
+    // it; alias its buffers to segment 0 to keep every slot bound.
+    const SLOTS: [(u64, u64); KQUANT_V4_FUSED_MAX_SEGMENTS] = [(2, 3), (9, 10), (11, 12)];
+    for (slot, &(weight_slot, out_slot)) in SLOTS.iter().enumerate() {
+        let (weight, out, _) = segments.get(slot).copied().unwrap_or(segments[0]);
+        e.set_buffer(weight_slot, Some(&weight.buffer), 0);
+        e.set_buffer(out_slot, Some(out), 0);
+    }
+    let total_rows: usize = segment_rows.iter().sum();
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (total_rows / EAGLE3_V3_SEG_TILE_ROWS) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    keep.push(scalar);
+    true
+}
+
+/// GPU-resident inputs a caller has already produced for one EAGLE cell: the row's
+/// normalized `combined` vector and its projected (pre-RoPE) K and V, bound at byte
+/// offsets into packed buffers the caller keeps alive until completion. The cell then
+/// skips its two RMSNorms and its K/V projections and computes only Q from `combined`.
+#[cfg(target_os = "macos")]
+struct Eagle3PrecomputedCellInputs<'a> {
+    v3: &'a KquantV3Kernels,
+    combined: &'a Buffer,
+    combined_offset: u64,
+    key: &'a Buffer,
+    key_offset: u64,
+    value: &'a Buffer,
+    value_offset: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -32666,6 +33185,180 @@ impl Eagle3MetalState {
         keep.extend([embedding, g_buf]);
     }
 
+    /// Whether one fused authoritative update of `rows` rows may take the batched K/V
+    /// projection route: a multi-column window the V3 kernel admits, and Q4_K q/k/v so the
+    /// final cell's Q and the batched K/V share the draft head's single-column lane.
+    fn batched_kv_projection_eligible(&self, rows: usize) -> bool {
+        (2..=KQUANT_V3_MAX_COLUMNS).contains(&rows)
+            && [&self.q_proj, &self.k_proj, &self.v_proj]
+                .iter()
+                .all(|weight| weight.format == ResidentWeightFormat::Q4K)
+    }
+
+    /// Batched-projection twin of the row-serial prefix scatters plus final cell.
+    ///
+    /// Every row's `combined = [rms(embedding) || rms(g)]` depends only on that row, so all
+    /// `rows` RMSNorms (the unchanged single-row kernel, bound at row offsets) fill one
+    /// packed `[rows, ATTN_INPUT]` buffer, and K and V are each projected once as a
+    /// `rows`-column `q4k_linear_f32_mc_v3` dispatch whose per-column fold is
+    /// `q4k_linear_f32_v3`'s (weights streamed once instead of once per row). RoPE and the
+    /// F16 scatter run per prefix row on the unchanged kernels at row offsets, and the final
+    /// cell consumes its own row of the packed buffers. The K/V cache bytes and the final
+    /// cell are therefore those of the row-serial path; only weight streaming and dispatch
+    /// count change.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_authoritative_rows_batched_kv(
+        &self,
+        e: &metal::ComputeCommandEncoderRef,
+        k: &MetalLinearKernel,
+        v3: &KquantV3Kernels,
+        keep: &mut Vec<Buffer>,
+        token_embeddings: &Buffer,
+        g_states: &Buffer,
+        row_offsets: &[u64],
+        start_position: usize,
+        rows: usize,
+        fused_qkv: bool,
+    ) -> Eagle3EncodedCell {
+        debug_assert!(self.batched_kv_projection_eligible(rows));
+        debug_assert_eq!(row_offsets.len(), rows);
+        let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
+        let f32b = |n: usize| nb(n * std::mem::size_of::<f32>());
+        let kv_width = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        let combined_all = f32b(rows * EAGLE3_ATTN_INPUT);
+        let key_all = f32b(rows * kv_width);
+        let value_all = f32b(rows * kv_width);
+        let rms_scalar = nb(8);
+        let kv_scalar = nb(12);
+        unsafe {
+            let rms = rms_scalar.contents() as *mut u8;
+            *(rms as *mut u32) = EAGLE3_HIDDEN as u32;
+            *(rms.add(4) as *mut f32) = EAGLE3_RMS_EPS;
+        }
+        let combined_row_bytes = (EAGLE3_ATTN_INPUT * std::mem::size_of::<f32>()) as u64;
+        let kv_row_bytes = (kv_width * std::mem::size_of::<f32>()) as u64;
+
+        // EAGLE order is [normalized token embedding || normalized g], one packed row each.
+        for row in 0..rows {
+            let combined_offset = row as u64 * combined_row_bytes;
+            encode_eagle3_rms_norm_off(
+                e,
+                k,
+                token_embeddings,
+                row_offsets[row],
+                &self.input_layernorm,
+                &combined_all,
+                combined_offset,
+                &rms_scalar,
+            );
+            encode_eagle3_rms_norm_off(
+                e,
+                k,
+                g_states,
+                row_offsets[row],
+                &self.hidden_norm,
+                &combined_all,
+                combined_offset + (EAGLE3_HIDDEN * std::mem::size_of::<f32>()) as u64,
+                &rms_scalar,
+            );
+        }
+        encode_eagle3_q4k_multi_column(
+            e,
+            v3,
+            &combined_all,
+            &self.k_proj,
+            &key_all,
+            &kv_scalar,
+            EAGLE3_ATTN_INPUT,
+            kv_width,
+            rows,
+        );
+        encode_eagle3_q4k_multi_column(
+            e,
+            v3,
+            &combined_all,
+            &self.v_proj,
+            &value_all,
+            &kv_scalar,
+            EAGLE3_ATTN_INPUT,
+            kv_width,
+            rows,
+        );
+
+        // Prefix rows: RoPE the key and scatter K/V exactly as the row-serial path does,
+        // reading this row's slice of the packed projections.
+        for row in 0..rows - 1 {
+            let position = start_position + row;
+            let k_rope_scalar = nb(16);
+            let scatter_scalar = nb(16);
+            let (cos, sin) = eagle3_rope_tables(position, self.rope_theta);
+            let cos_buf = f32b(cos.len());
+            let sin_buf = f32b(sin.len());
+            write_buffer_f32(&cos_buf, &cos);
+            write_buffer_f32(&sin_buf, &sin);
+            unsafe {
+                let rope = k_rope_scalar.contents() as *mut u32;
+                *rope = EAGLE3_KV_HEADS as u32;
+                *rope.add(1) = EAGLE3_HEAD_DIM as u32;
+                *rope.add(2) = (EAGLE3_HEAD_DIM / 2) as u32;
+                *rope.add(3) = 1; // raw HF/JAX weights use split-half rotate_half
+                let scatter = scatter_scalar.contents() as *mut u32;
+                *scatter = EAGLE3_HEAD_DIM as u32;
+                *scatter.add(1) = self.max_positions as u32;
+                *scatter.add(2) = position as u32;
+                *scatter.add(3) = kv_width as u32;
+            }
+            let kv_offset = row as u64 * kv_row_bytes;
+            encode_rope(
+                e,
+                k,
+                &key_all,
+                &cos_buf,
+                &sin_buf,
+                &k_rope_scalar,
+                EAGLE3_KV_HEADS,
+                EAGLE3_HEAD_DIM / 2,
+                kv_offset,
+                0,
+            );
+            e.set_compute_pipeline_state(&k.kv_scatter_kv16_pipeline);
+            e.set_buffer(0, Some(&key_all), kv_offset);
+            e.set_buffer(1, Some(&value_all), kv_offset);
+            e.set_buffer(2, Some(&self.cache_k), 0);
+            e.set_buffer(3, Some(&self.cache_v), 0);
+            e.set_buffer(4, Some(&scatter_scalar), 0);
+            e.set_buffer(5, Some(&scatter_scalar), 4);
+            e.set_buffer(6, Some(&scatter_scalar), 8);
+            e.set_buffer(7, Some(&scatter_scalar), 12);
+            dispatch_1d(e, &k.kv_scatter_kv16_pipeline, kv_width);
+            keep.extend([k_rope_scalar, scatter_scalar, cos_buf, sin_buf]);
+        }
+
+        let final_row = rows - 1;
+        let encoded = self.encode_forward_token_from_buffers_with(
+            e,
+            k,
+            keep,
+            token_embeddings,
+            row_offsets[final_row],
+            g_states,
+            row_offsets[final_row],
+            start_position + final_row,
+            Some(Eagle3PrecomputedCellInputs {
+                v3,
+                combined: &combined_all,
+                combined_offset: final_row as u64 * combined_row_bytes,
+                key: &key_all,
+                key_offset: final_row as u64 * kv_row_bytes,
+                value: &value_all,
+                value_offset: final_row as u64 * kv_row_bytes,
+            }),
+            fused_qkv,
+        );
+        keep.extend([combined_all, key_all, value_all, rms_scalar, kv_scalar]);
+        encoded
+    }
+
     /// Append one or more exact authoritative K/V rows in one Metal command buffer.
     ///
     /// Rows remain encoded in strict sequence order. They are independent until the later
@@ -32775,8 +33468,15 @@ impl Eagle3MetalState {
     /// the benchmark-only authoritative path put feature fusion, prefix K/V scatters, and the
     /// final cell in one command buffer while the established `forward_token` wrapper below
     /// retains its original one-cell behavior.
+    ///
+    /// Two opt-in twins are explicit parameters so a test process can compare them against
+    /// the established cell: `precomputed` supplies this row's normalized `combined` and
+    /// projected K/V from caller-owned packed buffers (the batched authoritative update),
+    /// and `fused_qkv` routes q|k|v and gate|up through the segmented single-column
+    /// kernel. With `None` and `false` the dispatch sequence is the established cell,
+    /// unchanged.
     #[allow(clippy::too_many_arguments)]
-    fn encode_forward_token_from_buffers(
+    fn encode_forward_token_from_buffers_with(
         &self,
         e: &metal::ComputeCommandEncoderRef,
         k: &MetalLinearKernel,
@@ -32786,13 +33486,43 @@ impl Eagle3MetalState {
         g_states: &Buffer,
         g_state_offset: u64,
         position: usize,
+        precomputed: Option<Eagle3PrecomputedCellInputs<'_>>,
+        fused_qkv: bool,
     ) -> Eagle3EncodedCell {
         let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
         let f32b = |n: usize| nb(n * std::mem::size_of::<f32>());
-        let combined = f32b(EAGLE3_ATTN_INPUT);
+        let mut owned_inputs: Vec<Buffer> = Vec::new();
+        let (combined, combined_offset, key, key_offset, value, value_offset): (
+            &Buffer,
+            u64,
+            &Buffer,
+            u64,
+            &Buffer,
+            u64,
+        ) = match precomputed.as_ref() {
+            Some(inputs) => (
+                inputs.combined,
+                inputs.combined_offset,
+                inputs.key,
+                inputs.key_offset,
+                inputs.value,
+                inputs.value_offset,
+            ),
+            None => {
+                owned_inputs.push(f32b(EAGLE3_ATTN_INPUT));
+                owned_inputs.push(f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM));
+                owned_inputs.push(f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM));
+                (
+                    &owned_inputs[0],
+                    0,
+                    &owned_inputs[1],
+                    0,
+                    &owned_inputs[2],
+                    0,
+                )
+            }
+        };
         let query = f32b(EAGLE3_HIDDEN);
-        let key = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
-        let value = f32b(EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM);
         let context = f32b(EAGLE3_HIDDEN);
         let attention_out = f32b(EAGLE3_HIDDEN);
         let attention_residual = f32b(EAGLE3_HIDDEN);
@@ -32883,62 +33613,99 @@ impl Eagle3MetalState {
         }
 
         // EAGLE order is [normalized token embedding || normalized g].
-        encode_eagle3_rms_norm_off(
-            e,
-            k,
-            token_embeddings,
-            token_embedding_offset,
-            &self.input_layernorm,
-            &combined,
-            0,
-            &rms_scalar,
-        );
-        encode_eagle3_rms_norm_off(
-            e,
-            k,
-            g_states,
-            g_state_offset,
-            &self.hidden_norm,
-            &combined,
-            (EAGLE3_HIDDEN * 4) as u64,
-            &rms_scalar,
-        );
-        encode_eagle3_matmul_f32(
-            e,
-            k,
-            keep,
-            &combined,
-            &self.q_proj,
-            &query,
-            &q_scalar,
-            EAGLE3_ATTN_INPUT,
-            EAGLE3_HIDDEN,
-            1,
-        );
-        encode_eagle3_matmul_f32(
-            e,
-            k,
-            keep,
-            &combined,
-            &self.k_proj,
-            &key,
-            &kv_scalar,
-            EAGLE3_ATTN_INPUT,
-            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
-            1,
-        );
-        encode_eagle3_matmul_f32(
-            e,
-            k,
-            keep,
-            &combined,
-            &self.v_proj,
-            &value,
-            &kv_scalar,
-            EAGLE3_ATTN_INPUT,
-            EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
-            1,
-        );
+        match precomputed.as_ref() {
+            None => {
+                encode_eagle3_rms_norm_off(
+                    e,
+                    k,
+                    token_embeddings,
+                    token_embedding_offset,
+                    &self.input_layernorm,
+                    combined,
+                    0,
+                    &rms_scalar,
+                );
+                encode_eagle3_rms_norm_off(
+                    e,
+                    k,
+                    g_states,
+                    g_state_offset,
+                    &self.hidden_norm,
+                    combined,
+                    (EAGLE3_HIDDEN * 4) as u64,
+                    &rms_scalar,
+                );
+                // Opt-in: one segmented dispatch for q|k|v of `combined` (same kernel body,
+                // routed per threadgroup); otherwise the established three dispatches.
+                let fused = fused_qkv
+                    && encode_eagle3_seg_projection(
+                        e,
+                        k,
+                        keep,
+                        combined,
+                        0,
+                        &[
+                            (&self.q_proj, &query, EAGLE3_HIDDEN),
+                            (&self.k_proj, key, EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM),
+                            (&self.v_proj, value, EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM),
+                        ],
+                        EAGLE3_ATTN_INPUT,
+                    );
+                if !fused {
+                    encode_eagle3_matmul_f32(
+                        e,
+                        k,
+                        keep,
+                        combined,
+                        &self.q_proj,
+                        &query,
+                        &q_scalar,
+                        EAGLE3_ATTN_INPUT,
+                        EAGLE3_HIDDEN,
+                        1,
+                    );
+                    encode_eagle3_matmul_f32(
+                        e,
+                        k,
+                        keep,
+                        combined,
+                        &self.k_proj,
+                        key,
+                        &kv_scalar,
+                        EAGLE3_ATTN_INPUT,
+                        EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+                        1,
+                    );
+                    encode_eagle3_matmul_f32(
+                        e,
+                        k,
+                        keep,
+                        combined,
+                        &self.v_proj,
+                        value,
+                        &kv_scalar,
+                        EAGLE3_ATTN_INPUT,
+                        EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM,
+                        1,
+                    );
+                }
+            }
+            Some(inputs) => {
+                // The caller normalized this row into `combined` and projected its K/V with
+                // the batched twin; only Q remains, from the same single-column kernel.
+                encode_eagle3_q4k_single_off(
+                    e,
+                    inputs.v3,
+                    combined,
+                    combined_offset,
+                    &self.q_proj,
+                    &query,
+                    &q_scalar,
+                    EAGLE3_ATTN_INPUT,
+                    EAGLE3_HIDDEN,
+                );
+            }
+        }
         encode_rope(
             e,
             k,
@@ -32954,18 +33721,18 @@ impl Eagle3MetalState {
         encode_rope(
             e,
             k,
-            &key,
+            key,
             &cos_buf,
             &sin_buf,
             &k_rope_scalar,
             EAGLE3_KV_HEADS,
             EAGLE3_HEAD_DIM / 2,
-            0,
+            key_offset,
             0,
         );
         e.set_compute_pipeline_state(&k.kv_scatter_kv16_pipeline);
-        e.set_buffer(0, Some(&key), 0);
-        e.set_buffer(1, Some(&value), 0);
+        e.set_buffer(0, Some(key), key_offset);
+        e.set_buffer(1, Some(value), value_offset);
         e.set_buffer(2, Some(&self.cache_k), 0);
         e.set_buffer(3, Some(&self.cache_v), 0);
         e.set_buffer(4, Some(&scatter_scalar), 0);
@@ -33029,30 +33796,47 @@ impl Eagle3MetalState {
             &post_norm,
             &rms_scalar,
         );
-        encode_eagle3_matmul_f32(
-            e,
-            k,
-            keep,
-            &post_norm,
-            &self.gate_proj,
-            &gate,
-            &gate_up_scalar,
-            EAGLE3_HIDDEN,
-            EAGLE3_FFN,
-            1,
-        );
-        encode_eagle3_matmul_f32(
-            e,
-            k,
-            keep,
-            &post_norm,
-            &self.up_proj,
-            &up,
-            &gate_up_scalar,
-            EAGLE3_HIDDEN,
-            EAGLE3_FFN,
-            1,
-        );
+        // Opt-in: gate|up of `post_norm` as one segmented dispatch (same kernel body);
+        // otherwise the established two dispatches.
+        let fused_gate_up = fused_qkv
+            && encode_eagle3_seg_projection(
+                e,
+                k,
+                keep,
+                &post_norm,
+                0,
+                &[
+                    (&self.gate_proj, &gate, EAGLE3_FFN),
+                    (&self.up_proj, &up, EAGLE3_FFN),
+                ],
+                EAGLE3_HIDDEN,
+            );
+        if !fused_gate_up {
+            encode_eagle3_matmul_f32(
+                e,
+                k,
+                keep,
+                &post_norm,
+                &self.gate_proj,
+                &gate,
+                &gate_up_scalar,
+                EAGLE3_HIDDEN,
+                EAGLE3_FFN,
+                1,
+            );
+            encode_eagle3_matmul_f32(
+                e,
+                k,
+                keep,
+                &post_norm,
+                &self.up_proj,
+                &up,
+                &gate_up_scalar,
+                EAGLE3_HIDDEN,
+                EAGLE3_FFN,
+                1,
+            );
+        }
         encode_binary(
             e,
             &k.silu_mul_pipeline,
@@ -33119,11 +33903,9 @@ impl Eagle3MetalState {
                 depth: 1,
             },
         );
+        keep.extend(owned_inputs);
         keep.extend([
-            combined,
             query,
-            key,
-            value,
             context,
             attention_out,
             attention_residual,
@@ -33199,6 +33981,17 @@ impl Eagle3MetalState {
         g: &[f32],
         position: usize,
     ) -> std::result::Result<Eagle3MetalOutput, String> {
+        self.forward_token_with(token_embedding, g, position, eagle3_fused_qkv_enabled())
+    }
+
+    /// [`Self::forward_token`] with the segmented q|k|v / gate|up routing explicit.
+    fn forward_token_with(
+        &mut self,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+        fused_qkv: bool,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
         if token_embedding.len() != EAGLE3_HIDDEN || g.len() != EAGLE3_HIDDEN {
             return Err(format!(
                 "EAGLE-3 forward expected embedding/g widths {EAGLE3_HIDDEN}, got {}/{}",
@@ -33227,8 +34020,9 @@ impl Eagle3MetalState {
         let cb = k.queue.new_command_buffer();
         let e = cb.new_compute_command_encoder();
         let mut keep = Vec::new();
-        let encoded = self
-            .encode_forward_token_from_buffers(e, k, &mut keep, &embedding, 0, &g_buf, 0, position);
+        let encoded = self.encode_forward_token_from_buffers_with(
+            e, k, &mut keep, &embedding, 0, &g_buf, 0, position, None, fused_qkv,
+        );
         keep.extend([embedding, g_buf]);
         e.end_encoding();
         cb.commit();
@@ -33250,6 +34044,28 @@ impl Eagle3MetalState {
         token_embeddings: &[f32],
         features: &[f32],
         start_position: usize,
+    ) -> std::result::Result<Eagle3MetalOutput, String> {
+        self.forward_authoritative_features_last_output_fused_impl(
+            token_embeddings,
+            features,
+            start_position,
+            eagle3_authoritative_kv_batch_proj_enabled(),
+            eagle3_fused_qkv_enabled(),
+        )
+    }
+
+    /// [`Self::forward_authoritative_features_last_output_fused`] with its opt-in twins
+    /// explicit: `batch_kv_proj` projects every row's K/V with one multi-column dispatch
+    /// each (see `encode_authoritative_rows_batched_kv`); `fused_qkv` routes the final
+    /// cell's q|k|v and gate|up through the segmented kernel. Both `false` is the
+    /// established one-command-buffer update, dispatch for dispatch.
+    fn forward_authoritative_features_last_output_fused_impl(
+        &mut self,
+        token_embeddings: &[f32],
+        features: &[f32],
+        start_position: usize,
+        batch_kv_proj: bool,
+        fused_qkv: bool,
     ) -> std::result::Result<Eagle3MetalOutput, String> {
         let rows = eagle3_validate_authoritative_fusion_shape(
             features.len(),
@@ -33302,33 +34118,53 @@ impl Eagle3MetalState {
             rows,
         );
 
-        // Prefix scatters stay row-serial and keep their per-row n_tokens=1 projection
-        // geometry. Distinct row scalars/tables are retained in `keep` until completion.
-        for row in 0..rows - 1 {
-            let row_offset = row_offsets[row];
-            self.encode_authoritative_kv_row_from_buffers(
+        let batched_kv = batch_kv_proj && self.batched_kv_projection_eligible(rows);
+        let encoded = match (batched_kv, kquant_v3_kernels()) {
+            (true, Some(v3)) => self.encode_authoritative_rows_batched_kv(
                 e,
                 k,
+                v3,
                 &mut keep,
                 &embedding_input,
-                row_offset,
                 &fused,
-                row_offset,
-                start_position + row,
-            );
-        }
-        let final_row = rows - 1;
-        let final_offset = row_offsets[final_row];
-        let encoded = self.encode_forward_token_from_buffers(
-            e,
-            k,
-            &mut keep,
-            &embedding_input,
-            final_offset,
-            &fused,
-            final_offset,
-            start_position + final_row,
-        );
+                &row_offsets,
+                start_position,
+                rows,
+                fused_qkv,
+            ),
+            _ => {
+                // Prefix scatters stay row-serial and keep their per-row n_tokens=1
+                // projection geometry. Distinct row scalars/tables are retained in `keep`
+                // until completion.
+                for row in 0..rows - 1 {
+                    let row_offset = row_offsets[row];
+                    self.encode_authoritative_kv_row_from_buffers(
+                        e,
+                        k,
+                        &mut keep,
+                        &embedding_input,
+                        row_offset,
+                        &fused,
+                        row_offset,
+                        start_position + row,
+                    );
+                }
+                let final_row = rows - 1;
+                let final_offset = row_offsets[final_row];
+                self.encode_forward_token_from_buffers_with(
+                    e,
+                    k,
+                    &mut keep,
+                    &embedding_input,
+                    final_offset,
+                    &fused,
+                    final_offset,
+                    start_position + final_row,
+                    None,
+                    fused_qkv,
+                )
+            }
+        };
         keep.extend([feature_input, embedding_input, fused, fc_scalar]);
         e.end_encoding();
         cb.commit();
@@ -34042,6 +34878,752 @@ mod eagle3_metal_contract_tests {
         weights.sliding_window = Some(0);
         let error = eagle3_validate_weights(&weights, 2_048).unwrap_err();
         assert!(error.contains("sliding_window"), "{error}");
+    }
+
+    #[test]
+    fn eagle3_tidy_gates_are_default_off_and_fail_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("on"),
+            Some("2"),
+            Some(" 1"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !eagle3_fused_qkv_from_env(value),
+                "{value:?} must keep the per-tensor q/k/v and gate/up dispatches"
+            );
+            assert!(
+                !eagle3_authoritative_kv_batch_proj_from_env(value),
+                "{value:?} must keep the row-serial K/V projections"
+            );
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(eagle3_fused_qkv_from_env(Some(value)));
+            assert!(eagle3_authoritative_kv_batch_proj_from_env(Some(value)));
+        }
+    }
+
+    #[test]
+    fn eagle3_seg_projection_eligibility_is_routing_only() {
+        let kv = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        assert!(eagle3_seg_projection_eligible(
+            &[EAGLE3_HIDDEN, kv, kv],
+            true,
+            EAGLE3_ATTN_INPUT
+        ));
+        assert!(eagle3_seg_projection_eligible(
+            &[EAGLE3_FFN, EAGLE3_FFN],
+            true,
+            EAGLE3_HIDDEN
+        ));
+        assert!(eagle3_seg_projection_eligible(&[4, 8], true, 256));
+        assert!(
+            !eagle3_seg_projection_eligible(&[EAGLE3_HIDDEN], true, EAGLE3_ATTN_INPUT),
+            "one tensor is not a fusion"
+        );
+        assert!(
+            !eagle3_seg_projection_eligible(&[4, 4, 4, 4], true, 256),
+            "the twin binds three segments"
+        );
+        assert!(
+            !eagle3_seg_projection_eligible(&[EAGLE3_HIDDEN, kv], false, EAGLE3_ATTN_INPUT),
+            "only Q4_K tensors share the kernel"
+        );
+        assert!(
+            !eagle3_seg_projection_eligible(&[6, 4], true, 256),
+            "a threadgroup must never straddle two tensors"
+        );
+        assert!(!eagle3_seg_projection_eligible(&[4, 0], true, 256));
+        assert!(!eagle3_seg_projection_eligible(&[4, 4], true, 300));
+        assert!(!eagle3_seg_projection_eligible(&[4, 4], true, 0));
+    }
+
+    /// Deterministic xorshift for the synthetic-head identity tests below.
+    struct TidyRng(u64);
+
+    impl TidyRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Uniform in [-1, 1).
+        fn unit(&mut self) -> f32 {
+            ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+
+        fn f32s(&mut self, n: usize, base: f32, spread: f32) -> Vec<f32> {
+            (0..n).map(|_| base + self.unit() * spread).collect()
+        }
+
+        /// Row-major BF16 bytes of `rows * cols` values uniform in [-scale, scale).
+        #[cfg(target_os = "macos")]
+        fn bf16(&mut self, rows: usize, cols: usize, scale: f32) -> Vec<u8> {
+            let mut out = vec![0u8; rows * cols * 2];
+            for pair in out.chunks_exact_mut(2) {
+                let bits = (self.unit() * scale).to_bits();
+                pair.copy_from_slice(&((bits >> 16) as u16).to_le_bytes());
+            }
+            out
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const TIDY_SENTINEL: f32 = -3.0e30;
+
+    #[cfg(target_os = "macos")]
+    fn tidy_f32_buffer(k: &MetalLinearKernel, values: &[f32]) -> Buffer {
+        let buffer = k.device.new_buffer(
+            (values.len() * 4).max(4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        write_buffer_f32(&buffer, values);
+        buffer
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tidy_sentinel_buffer(k: &MetalLinearKernel, len: usize) -> Buffer {
+        tidy_f32_buffer(k, &vec![TIDY_SENTINEL; len])
+    }
+
+    /// Read `len` f32 as bits, failing if any output slot was never written.
+    #[cfg(target_os = "macos")]
+    fn tidy_read_bits(buffer: &Buffer, len: usize, what: &str) -> Vec<u32> {
+        let mut out = vec![0.0f32; len];
+        read_buffer_f32(buffer, &mut out);
+        assert!(
+            out.iter().all(|v| v.to_bits() != TIDY_SENTINEL.to_bits()),
+            "{what}: an output slot was never written"
+        );
+        out.iter().map(|v| v.to_bits()).collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tidy_read_u16(buffer: &Buffer, len: usize) -> Vec<u16> {
+        unsafe { std::slice::from_raw_parts(buffer.contents() as *const u16, len).to_vec() }
+    }
+
+    /// Random Q4_K wire with finite, well-scaled super-block scales and mins.
+    #[cfg(target_os = "macos")]
+    fn synthetic_q4k_weight(
+        k: &MetalLinearKernel,
+        rows: usize,
+        n_sb: usize,
+        rng: &mut TidyRng,
+    ) -> ResidentLinearWeight {
+        let mut wire = vec![0u8; rows * n_sb * EAGLE3_Q4K_SUPERBLOCK_BYTES];
+        for (block_index, block) in wire
+            .chunks_exact_mut(EAGLE3_Q4K_SUPERBLOCK_BYTES)
+            .enumerate()
+        {
+            for byte in block.iter_mut() {
+                *byte = (rng.next() >> 24) as u8;
+            }
+            let d = 0.002 + (block_index % 97) as f32 * 0.0001;
+            block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+            block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.37).to_le_bytes());
+        }
+        let buffer = k
+            .device
+            .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+        write_buffer_u8(&buffer, &wire);
+        ResidentLinearWeight {
+            format: ResidentWeightFormat::Q4K,
+            buffer,
+            soa8_buffer: None,
+            q8_wire: false,
+        }
+    }
+
+    /// `CAMELID_EAGLE3_FUSED_QKV`: one segmented dispatch over 2..=3 Q4_K tensors of one
+    /// input must write, for every tensor and row, the bits of that tensor's own
+    /// `q4k_linear_f32_v3` dispatch. Covers the draft cell's q|k|v of `combined` and gate|up
+    /// of `post_norm` at their real geometry, plus small routing edge cases.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_eagle3_segmented_v3_projection_is_bit_identical_to_per_tensor_dispatches() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let v3 = kquant_v3_kernels().expect("KQUANT_V3_SHADER");
+        assert!(v3.q4k_seg3.is_some(), "the segmented V3 twin must build");
+        let kv = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        let mut rng = TidyRng(0x5eed_0f00_ba5e_ba11);
+        let cases: [(usize, Vec<usize>); 5] = [
+            (EAGLE3_ATTN_INPUT / 256, vec![EAGLE3_HIDDEN, kv, kv]),
+            (EAGLE3_HIDDEN / 256, vec![EAGLE3_FFN, EAGLE3_FFN]),
+            (2, vec![8, 4, 12]),
+            (1, vec![4, 4]),
+            (3, vec![20, 8]),
+        ];
+        for (n_sb, segment_rows) in cases {
+            let input_width = n_sb * 256;
+            let input = tidy_f32_buffer(k, &rng.f32s(input_width, 0.0, 1.0));
+            let weights: Vec<ResidentLinearWeight> = segment_rows
+                .iter()
+                .map(|&rows| synthetic_q4k_weight(k, rows, n_sb, &mut rng))
+                .collect();
+            let reference: Vec<Buffer> = segment_rows
+                .iter()
+                .map(|&rows| tidy_sentinel_buffer(k, rows))
+                .collect();
+            let fused: Vec<Buffer> = segment_rows
+                .iter()
+                .map(|&rows| tidy_sentinel_buffer(k, rows))
+                .collect();
+            let scalars: Vec<Buffer> = segment_rows
+                .iter()
+                .map(|_| {
+                    k.device
+                        .new_buffer(12, MTLResourceOptions::StorageModeShared)
+                })
+                .collect();
+            let mut keep = Vec::new();
+            let cb = k.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            for (i, weight) in weights.iter().enumerate() {
+                encode_eagle3_q4k_single_off(
+                    e,
+                    v3,
+                    &input,
+                    0,
+                    weight,
+                    &reference[i],
+                    &scalars[i],
+                    input_width,
+                    segment_rows[i],
+                );
+            }
+            let segments: Vec<(&ResidentLinearWeight, &Buffer, usize)> = weights
+                .iter()
+                .zip(&fused)
+                .zip(&segment_rows)
+                .map(|((weight, out), &rows)| (weight, out, rows))
+                .collect();
+            assert!(
+                encode_eagle3_seg_projection(e, k, &mut keep, &input, 0, &segments, input_width),
+                "n_sb={n_sb} rows={segment_rows:?} must take the segmented dispatch"
+            );
+            // Ineligible lists are refused before anything is bound.
+            let ragged = [(segments[0].0, segments[0].1, 6usize), segments[1]];
+            assert!(!encode_eagle3_seg_projection(
+                e,
+                k,
+                &mut keep,
+                &input,
+                0,
+                &ragged,
+                input_width
+            ));
+            assert!(!encode_eagle3_seg_projection(
+                e,
+                k,
+                &mut keep,
+                &input,
+                0,
+                &segments[..1],
+                input_width
+            ));
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            for (i, &rows) in segment_rows.iter().enumerate() {
+                let what = format!("n_sb={n_sb} segment {i} rows={rows}");
+                assert_eq!(
+                    tidy_read_bits(&fused[i], rows, &what),
+                    tidy_read_bits(&reference[i], rows, &what),
+                    "{what}"
+                );
+            }
+            pool_recycle(k, keep);
+        }
+    }
+
+    /// `CAMELID_EAGLE3_AUTHORITATIVE_KV_BATCH_PROJ` rests on the V3 lane's contract that a
+    /// `n`-column `q4k_linear_f32_mc_v3` window equals `n` single-column dispatches: check it
+    /// directly at the draft head's K/V geometry for every admitted width, and at the Q
+    /// geometry once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_eagle3_multi_column_v3_projection_is_bit_identical_per_column() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let v3 = kquant_v3_kernels().expect("KQUANT_V3_SHADER");
+        let kv = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        let input_width = EAGLE3_ATTN_INPUT;
+        let mut rng = TidyRng(0x0c0f_fee0_b00b_1e5u64);
+        let k_weight = synthetic_q4k_weight(k, kv, input_width / 256, &mut rng);
+        let q_weight = synthetic_q4k_weight(k, EAGLE3_HIDDEN, input_width / 256, &mut rng);
+        let cases: Vec<(&ResidentLinearWeight, usize, usize)> = (2..=KQUANT_V3_MAX_COLUMNS)
+            .map(|n| (&k_weight, kv, n))
+            .chain([(&q_weight, EAGLE3_HIDDEN, 3usize)])
+            .collect();
+        for (weight, rows, n_tokens) in cases {
+            let input = tidy_f32_buffer(k, &rng.f32s(n_tokens * input_width, 0.0, 1.0));
+            let batched = tidy_sentinel_buffer(k, n_tokens * rows);
+            let singles: Vec<Buffer> = (0..n_tokens)
+                .map(|_| tidy_sentinel_buffer(k, rows))
+                .collect();
+            let scalars: Vec<Buffer> = (0..=n_tokens)
+                .map(|_| {
+                    k.device
+                        .new_buffer(12, MTLResourceOptions::StorageModeShared)
+                })
+                .collect();
+            let cb = k.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            encode_eagle3_q4k_multi_column(
+                e,
+                v3,
+                &input,
+                weight,
+                &batched,
+                &scalars[n_tokens],
+                input_width,
+                rows,
+                n_tokens,
+            );
+            for t in 0..n_tokens {
+                encode_eagle3_q4k_single_off(
+                    e,
+                    v3,
+                    &input,
+                    (t * input_width * 4) as u64,
+                    weight,
+                    &singles[t],
+                    &scalars[t],
+                    input_width,
+                    rows,
+                );
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let what = format!("rows={rows} n_tokens={n_tokens}");
+            let batched_bits = tidy_read_bits(&batched, n_tokens * rows, &what);
+            for t in 0..n_tokens {
+                assert_eq!(
+                    batched_bits[t * rows..(t + 1) * rows].to_vec(),
+                    tidy_read_bits(&singles[t], rows, &what),
+                    "{what} column {t}"
+                );
+            }
+        }
+    }
+
+    /// Deterministic full-geometry Q4_K draft head with a 256-row LM head (the vocabulary
+    /// depth is irrelevant to the cache/cell identities under test) and a small private
+    /// cache. Built field-by-field so the wire plan does not depend on process env.
+    #[cfg(target_os = "macos")]
+    fn synthetic_q4k_head(
+        k: &MetalLinearKernel,
+        max_positions: usize,
+        rng: &mut TidyRng,
+    ) -> Eagle3MetalState {
+        let kv = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        let lm_head_rows = 256usize;
+        let mut upload = |name: &str, rows: usize, cols: usize| {
+            let bf16 = rng.bf16(rows, cols, 0.02);
+            eagle3_upload_matrix(k, name, &bf16, rows, cols, Eagle3DraftWire::Q4K).expect(name)
+        };
+        let fc = upload("fc", EAGLE3_HIDDEN, EAGLE3_AUX_WIDTH);
+        let q_proj = upload("q_proj", EAGLE3_HIDDEN, EAGLE3_ATTN_INPUT);
+        let k_proj = upload("k_proj", kv, EAGLE3_ATTN_INPUT);
+        let v_proj = upload("v_proj", kv, EAGLE3_ATTN_INPUT);
+        let o_proj = upload("o_proj", EAGLE3_HIDDEN, EAGLE3_HIDDEN);
+        let gate_proj = upload("gate_proj", EAGLE3_FFN, EAGLE3_HIDDEN);
+        let up_proj = upload("up_proj", EAGLE3_FFN, EAGLE3_HIDDEN);
+        let down_proj = upload("down_proj", EAGLE3_HIDDEN, EAGLE3_FFN);
+        let lm_head = upload("lm_head", lm_head_rows, EAGLE3_HIDDEN);
+        let cache_bytes = kv * max_positions * std::mem::size_of::<u16>();
+        Eagle3MetalState {
+            fc,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            gate_proj,
+            up_proj,
+            down_proj,
+            lm_head,
+            lm_head_rows,
+            input_layernorm: eagle3_upload_f32(k, &rng.f32s(EAGLE3_HIDDEN, 1.0, 0.1)),
+            hidden_norm: eagle3_upload_f32(k, &rng.f32s(EAGLE3_HIDDEN, 1.0, 0.1)),
+            post_attention_layernorm: eagle3_upload_f32(k, &rng.f32s(EAGLE3_HIDDEN, 1.0, 0.1)),
+            output_norm: eagle3_upload_f32(k, &rng.f32s(EAGLE3_HIDDEN, 1.0, 0.1)),
+            d2t_offsets: (0..EAGLE3_DRAFT_VOCAB).map(|i| (i % 7) as i32).collect(),
+            cache_k: eagle3_zero_buffer(k, cache_bytes),
+            cache_v: eagle3_zero_buffer(k, cache_bytes),
+            max_positions,
+            filled: 0,
+            rope_theta: EAGLE3_ROPE_THETA,
+            sliding_window: None,
+        }
+    }
+
+    /// Overwrite the F16 K/V cache rows at `positions` with a sentinel so a route that
+    /// failed to write a row cannot pass by leaving the control's bytes in place.
+    #[cfg(target_os = "macos")]
+    fn poison_cache_rows(head: &Eagle3MetalState, positions: std::ops::Range<usize>) {
+        for cache in [&head.cache_k, &head.cache_v] {
+            let p = cache.contents() as *mut u16;
+            for h in 0..EAGLE3_KV_HEADS {
+                for pos in positions.clone() {
+                    for d in 0..EAGLE3_HEAD_DIM {
+                        unsafe {
+                            *p.add((h * head.max_positions + pos) * EAGLE3_HEAD_DIM + d) = 0xdead;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_same_cell_output(a: &Eagle3MetalOutput, b: &Eagle3MetalOutput, what: &str) {
+        assert_eq!(a.draft_token, b.draft_token, "{what}: draft_token");
+        assert_eq!(a.target_token, b.target_token, "{what}: target_token");
+        assert_eq!(a.evaluated_vocab_rows, b.evaluated_vocab_rows, "{what}: rows");
+        assert_eq!(
+            a.evaluated_vocab_logsumexp.to_bits(),
+            b.evaluated_vocab_logsumexp.to_bits(),
+            "{what}: logsumexp"
+        );
+        let candidates = |o: &Eagle3MetalOutput| -> Vec<(u32, u32, u32)> {
+            o.top_candidates
+                .iter()
+                .map(|c| (c.draft_token, c.target_token, c.logit.to_bits()))
+                .collect()
+        };
+        assert_eq!(candidates(a), candidates(b), "{what}: top candidates");
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits(&a.raw_hidden), bits(&b.raw_hidden), "{what}: raw_hidden");
+    }
+
+    /// End to end on a synthetic full-geometry Q4_K head: the batched K/V projection update
+    /// (`CAMELID_EAGLE3_AUTHORITATIVE_KV_BATCH_PROJ`), with and without the segmented cell
+    /// (`CAMELID_EAGLE3_FUSED_QKV`), must leave byte-identical K/V cache contents and a
+    /// bit-identical final-cell output compared with the row-serial one-command-buffer
+    /// update, for every admitted row count; and a draft `forward_token` with the segmented
+    /// routing must equal the per-tensor cell. Cache rows are poisoned between arms.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_eagle3_batched_kv_update_and_fused_qkv_cells_are_bit_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        assert!(kquant_v3_kernels().is_some(), "KQUANT_V3_SHADER");
+        let max_positions = 48usize;
+        let mut rng = TidyRng(0x1234_5678_9abc_def1);
+        let mut head = synthetic_q4k_head(k, max_positions, &mut rng);
+        let cache_len = EAGLE3_KV_HEADS * max_positions * EAGLE3_HEAD_DIM;
+
+        // Authoritative prefix through the established path so later updates attend history.
+        let seed_rows = 3usize;
+        let embeddings = rng.f32s(seed_rows * EAGLE3_HIDDEN, 0.0, 0.5);
+        let features = rng.f32s(seed_rows * EAGLE3_AUX_WIDTH, 0.0, 0.5);
+        head.forward_authoritative_features_last_output_fused_impl(
+            &embeddings,
+            &features,
+            0,
+            false,
+            false,
+        )
+        .expect("seed update");
+        assert_eq!(head.filled(), seed_rows);
+
+        for rows in [2usize, 4, 5, KQUANT_V3_MAX_COLUMNS] {
+            let start = head.filled();
+            assert!(head.batched_kv_projection_eligible(rows));
+            let embeddings = rng.f32s(rows * EAGLE3_HIDDEN, 0.0, 0.5);
+            let features = rng.f32s(rows * EAGLE3_AUX_WIDTH, 0.0, 0.5);
+            let control = head
+                .forward_authoritative_features_last_output_fused_impl(
+                    &embeddings,
+                    &features,
+                    start,
+                    false,
+                    false,
+                )
+                .expect("row-serial update");
+            assert_eq!(head.filled(), start + rows);
+            let control_k = tidy_read_u16(&head.cache_k, cache_len);
+            let control_v = tidy_read_u16(&head.cache_v, cache_len);
+            for fused_qkv in [false, true] {
+                let what = format!("update rows={rows} fused_qkv={fused_qkv}");
+                head.rollback_to_position(start).unwrap();
+                poison_cache_rows(&head, start..start + rows);
+                assert_ne!(
+                    tidy_read_u16(&head.cache_k, cache_len),
+                    control_k,
+                    "{what}: poison must be observable"
+                );
+                let batched = head
+                    .forward_authoritative_features_last_output_fused_impl(
+                        &embeddings,
+                        &features,
+                        start,
+                        true,
+                        fused_qkv,
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                assert_eq!(head.filled(), start + rows, "{what}: watermark");
+                assert_eq!(
+                    tidy_read_u16(&head.cache_k, cache_len),
+                    control_k,
+                    "{what}: cache_k bytes"
+                );
+                assert_eq!(
+                    tidy_read_u16(&head.cache_v, cache_len),
+                    control_v,
+                    "{what}: cache_v bytes"
+                );
+                assert_same_cell_output(&control, &batched, &what);
+            }
+        }
+
+        // Draft cell: segmented q|k|v and gate|up against the per-tensor dispatches.
+        let start = head.filled();
+        let embedding = rng.f32s(EAGLE3_HIDDEN, 0.0, 0.5);
+        let g = rng.f32s(EAGLE3_HIDDEN, 0.0, 0.5);
+        let control = head
+            .forward_token_with(&embedding, &g, start, false)
+            .expect("per-tensor draft cell");
+        let control_k = tidy_read_u16(&head.cache_k, cache_len);
+        let control_v = tidy_read_u16(&head.cache_v, cache_len);
+        head.rollback_to_position(start).unwrap();
+        poison_cache_rows(&head, start..start + 1);
+        let fused = head
+            .forward_token_with(&embedding, &g, start, true)
+            .expect("segmented draft cell");
+        assert_eq!(head.filled(), start + 1);
+        assert_eq!(
+            tidy_read_u16(&head.cache_k, cache_len),
+            control_k,
+            "draft cache_k"
+        );
+        assert_eq!(
+            tidy_read_u16(&head.cache_v, cache_len),
+            control_v,
+            "draft cache_v"
+        );
+        assert_same_cell_output(&control, &fused, "draft cell fused_qkv");
+    }
+
+    /// GPU-time probe (ignored; run explicitly with `--ignored`): median GPU busy time of
+    /// the draft cell's q|k|v and gate|up as per-tensor dispatches versus one segmented
+    /// dispatch, and of one 4-row update's K/V as row-serial single-column dispatches
+    /// versus one multi-column dispatch per tensor, on synthetic Q4_K weights at the real
+    /// geometry. Printed to stderr.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_eagle3_projection_routes_gpu_time_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let v3 = kquant_v3_kernels().expect("KQUANT_V3_SHADER");
+        let kv = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        let attn_sb = EAGLE3_ATTN_INPUT / 256;
+        let mut rng = TidyRng(0x7a11_c0de_5eed_0001);
+        let q = synthetic_q4k_weight(k, EAGLE3_HIDDEN, attn_sb, &mut rng);
+        let kw = synthetic_q4k_weight(k, kv, attn_sb, &mut rng);
+        let vw = synthetic_q4k_weight(k, kv, attn_sb, &mut rng);
+        let gate = synthetic_q4k_weight(k, EAGLE3_FFN, EAGLE3_HIDDEN / 256, &mut rng);
+        let up = synthetic_q4k_weight(k, EAGLE3_FFN, EAGLE3_HIDDEN / 256, &mut rng);
+        let rows = 4usize;
+        let combined_all = tidy_f32_buffer(k, &rng.f32s(rows * EAGLE3_ATTN_INPUT, 0.0, 1.0));
+        let post_norm = tidy_f32_buffer(k, &rng.f32s(EAGLE3_HIDDEN, 0.0, 1.0));
+        let q_out = tidy_sentinel_buffer(k, EAGLE3_HIDDEN);
+        let k_out = tidy_sentinel_buffer(k, rows * kv);
+        let v_out = tidy_sentinel_buffer(k, rows * kv);
+        let k_rows: Vec<Buffer> = (0..rows).map(|_| tidy_sentinel_buffer(k, kv)).collect();
+        let v_rows: Vec<Buffer> = (0..rows).map(|_| tidy_sentinel_buffer(k, kv)).collect();
+        let gate_out = tidy_sentinel_buffer(k, EAGLE3_FFN);
+        let up_out = tidy_sentinel_buffer(k, EAGLE3_FFN);
+        let scalars: Vec<Buffer> = (0..24)
+            .map(|_| {
+                k.device
+                    .new_buffer(16, MTLResourceOptions::StorageModeShared)
+            })
+            .collect();
+        // Median GPU-busy time of `reps` back-to-back repetitions in one command buffer.
+        let time =
+            |reps: usize, encode: &dyn Fn(&metal::ComputeCommandEncoderRef, &mut Vec<Buffer>)| {
+                let mut samples = Vec::new();
+                for _ in 0..15 {
+                    let mut keep = Vec::new();
+                    let cb = k.queue.new_command_buffer().to_owned();
+                    let e = cb.new_compute_command_encoder();
+                    for _ in 0..reps {
+                        encode(e, &mut keep);
+                    }
+                    e.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    samples.push(command_buffer_gpu_times_us(&cb).0);
+                    pool_recycle(k, keep);
+                }
+                samples.sort_unstable();
+                samples[samples.len() / 2]
+            };
+        // Marginal cost of one repetition inside a warm command buffer: (11 reps - 1 rep)
+        // / 10, so the per-command-buffer floor (idle-clock ramp, scheduling) cancels.
+        let marginal =
+            |encode: &dyn Fn(&metal::ComputeCommandEncoderRef, &mut Vec<Buffer>)| -> u128 {
+                let one = time(1, encode);
+                let eleven = time(11, encode);
+                eleven.saturating_sub(one) / 10
+            };
+        let qkv_serial = marginal(&|e, _| {
+            encode_eagle3_q4k_single_off(
+                e,
+                v3,
+                &combined_all,
+                0,
+                &q,
+                &q_out,
+                &scalars[0],
+                EAGLE3_ATTN_INPUT,
+                EAGLE3_HIDDEN,
+            );
+            encode_eagle3_q4k_single_off(
+                e,
+                v3,
+                &combined_all,
+                0,
+                &kw,
+                &k_out,
+                &scalars[1],
+                EAGLE3_ATTN_INPUT,
+                kv,
+            );
+            encode_eagle3_q4k_single_off(
+                e,
+                v3,
+                &combined_all,
+                0,
+                &vw,
+                &v_out,
+                &scalars[2],
+                EAGLE3_ATTN_INPUT,
+                kv,
+            );
+        });
+        let qkv_fused = marginal(&|e, keep| {
+            assert!(encode_eagle3_seg_projection(
+                e,
+                k,
+                keep,
+                &combined_all,
+                0,
+                &[(&q, &q_out, EAGLE3_HIDDEN), (&kw, &k_out, kv), (&vw, &v_out, kv)],
+                EAGLE3_ATTN_INPUT,
+            ));
+        });
+        let gate_up_serial = marginal(&|e, _| {
+            encode_eagle3_q4k_single_off(
+                e,
+                v3,
+                &post_norm,
+                0,
+                &gate,
+                &gate_out,
+                &scalars[3],
+                EAGLE3_HIDDEN,
+                EAGLE3_FFN,
+            );
+            encode_eagle3_q4k_single_off(
+                e,
+                v3,
+                &post_norm,
+                0,
+                &up,
+                &up_out,
+                &scalars[4],
+                EAGLE3_HIDDEN,
+                EAGLE3_FFN,
+            );
+        });
+        let gate_up_fused = marginal(&|e, keep| {
+            assert!(encode_eagle3_seg_projection(
+                e,
+                k,
+                keep,
+                &post_norm,
+                0,
+                &[(&gate, &gate_out, EAGLE3_FFN), (&up, &up_out, EAGLE3_FFN)],
+                EAGLE3_HIDDEN,
+            ));
+        });
+        let kv_serial = marginal(&|e, _| {
+            for row in 0..rows {
+                let offset = (row * EAGLE3_ATTN_INPUT * 4) as u64;
+                encode_eagle3_q4k_single_off(
+                    e,
+                    v3,
+                    &combined_all,
+                    offset,
+                    &kw,
+                    &k_rows[row],
+                    &scalars[5 + 2 * row],
+                    EAGLE3_ATTN_INPUT,
+                    kv,
+                );
+                encode_eagle3_q4k_single_off(
+                    e,
+                    v3,
+                    &combined_all,
+                    offset,
+                    &vw,
+                    &v_rows[row],
+                    &scalars[6 + 2 * row],
+                    EAGLE3_ATTN_INPUT,
+                    kv,
+                );
+            }
+        });
+        let kv_batched = marginal(&|e, _| {
+            encode_eagle3_q4k_multi_column(
+                e,
+                v3,
+                &combined_all,
+                &kw,
+                &k_out,
+                &scalars[20],
+                EAGLE3_ATTN_INPUT,
+                kv,
+                rows,
+            );
+            encode_eagle3_q4k_multi_column(
+                e,
+                v3,
+                &combined_all,
+                &vw,
+                &v_out,
+                &scalars[21],
+                EAGLE3_ATTN_INPUT,
+                kv,
+                rows,
+            );
+        });
+        eprintln!(
+            "[tidy-probe] eagle cell q|k|v: 3 singles {qkv_serial} us vs segmented {qkv_fused} us; gate|up: 2 singles {gate_up_serial} us vs segmented {gate_up_fused} us; update K/V x{rows} rows: {} singles {kv_serial} us vs 2 multi-column {kv_batched} us (marginal per rep, (11-1)/10 of median-of-15 GPU-busy)",
+            2 * rows
+        );
     }
 
     #[test]
@@ -38954,23 +40536,49 @@ impl ResidentDecodeState {
             vocab,
             k,
         );
-        for i in (0..k).take_while(|_| !verify_ablate("argmax")) {
-            e.set_compute_pipeline_state(&kern.argmax_f32_greedy_pipeline);
-            e.set_buffer(0, Some(&logits_buf), (i * vocab * 4) as u64);
-            e.set_buffer(1, Some(&pred_buf), (i * 4) as u64);
-            e.set_buffer(2, Some(&argmax_count), 0);
-            e.dispatch_thread_groups(
-                metal::MTLSize {
-                    width: 1,
-                    height: 1,
-                    depth: 1,
-                },
-                metal::MTLSize {
-                    width: 1024,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+        if !verify_ablate("argmax") {
+            if verify_batch_argmax_enabled() {
+                // One chunked partial pass over every row plus one merge pass, in place of
+                // `k` serial single-threadgroup scans of the same logits. Same ids by
+                // construction (see argmax_f32_greedy_batch_partial).
+                let chunks = verify_batch_argmax_chunks(vocab);
+                let part_val = nb(k * chunks * 4);
+                let part_idx = nb(k * chunks * 4);
+                let chunks_scalar = nb(4);
+                unsafe { *(chunks_scalar.contents() as *mut u32) = chunks as u32 };
+                encode_verify_batch_argmax(
+                    kern,
+                    e,
+                    &logits_buf,
+                    &pred_buf,
+                    &argmax_count,
+                    &chunks_scalar,
+                    &part_val,
+                    &part_idx,
+                    k,
+                    chunks,
+                );
+                keep.extend([part_val, part_idx, chunks_scalar]);
+            } else {
+                for i in 0..k {
+                    e.set_compute_pipeline_state(&kern.argmax_f32_greedy_pipeline);
+                    e.set_buffer(0, Some(&logits_buf), (i * vocab * 4) as u64);
+                    e.set_buffer(1, Some(&pred_buf), (i * 4) as u64);
+                    e.set_buffer(2, Some(&argmax_count), 0);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: 1,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 1024,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+            }
         }
         if let Some(target_topk_buf) = target_topk_buf.as_ref() {
             for i in (0..k).take_while(|_| !verify_ablate("argmax")) {
@@ -44387,6 +45995,37 @@ mod tests {
             !kquant_v4_fused_segments_route_requested(true, true, true),
             "the process-wide SOA8 gate suppresses the segmented twin"
         );
+    }
+
+    #[test]
+    fn verify_batch_argmax_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("on"),
+            Some("2"),
+            Some(" 1"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !verify_batch_argmax_from_env(value),
+                "{value:?} must keep the serial per-row argmax dispatches"
+            );
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(verify_batch_argmax_from_env(Some(value)));
+        }
+        // Work partitioning only: ~16 K values per threadgroup, clamped to 1..=32 chunks.
+        assert_eq!(verify_batch_argmax_chunks(128_256), 8);
+        assert_eq!(verify_batch_argmax_chunks(32_000), 2);
+        assert_eq!(verify_batch_argmax_chunks(16_384), 1);
+        assert_eq!(verify_batch_argmax_chunks(16_385), 2);
+        assert_eq!(verify_batch_argmax_chunks(1), 1);
+        assert_eq!(verify_batch_argmax_chunks(10_000_000), 32);
     }
 
     /// SOA8 must be a pure address-layout change. Compare it against the
@@ -59818,6 +61457,264 @@ mod tests {
                 assert_eq!(got_topk[0], got, "top-1 must equal production greedy");
             }
         }
+    }
+
+    /// The batched verifier argmax (`CAMELID_METAL_VERIFY_BATCH_ARGMAX`) must select exactly
+    /// the ids the serial per-row `argmax_f32_greedy` dispatches select: strict `>`, lowest
+    /// id on ties (including ties that straddle chunk boundaries), NaN and -INFINITY never
+    /// selected, UINT_MAX for a row with no selectable value. Both routes run in one command
+    /// buffer on the same logits and are compared row by row against each other and against
+    /// the host sampler contract.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_verify_batch_argmax_matches_serial_greedy_argmax() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (rows, count): the production verifier shapes (k=8 tree, k=16 wide, k=1) at the
+        // Llama vocab, the draft vocab, a one-chunk row, a ragged multi-chunk count and an
+        // exact chunk multiple.
+        for (rows, count) in [
+            (8usize, 128_256usize),
+            (16, 128_256),
+            (1, 128_256),
+            (8, 32_000),
+            (3, 5),
+            (5, 16_384 * 8 + 1),
+            (4, 16_384),
+        ] {
+            let chunks = verify_batch_argmax_chunks(count);
+            let chunk_len = count.div_ceil(chunks);
+            let mut logits: Vec<f32> = (0..rows * count)
+                .map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32) * 40.0 - 20.0)
+                .collect();
+            for row in 0..rows {
+                let base = row * count;
+                match row % 5 {
+                    0 => {}
+                    1 => {
+                        // Global max duplicated at the end of the first chunk, mid-row and
+                        // at the last index: the lowest id must win across chunks.
+                        logits[base + chunk_len.min(count) - 1] = 50.0;
+                        logits[base + count / 2] = 50.0;
+                        logits[base + count - 1] = 50.0;
+                    }
+                    2 => {
+                        // NaNs sprinkled through the row are never selected.
+                        for i in (0..count).step_by(97) {
+                            logits[base + i] = f32::NAN;
+                        }
+                        logits[base + count - 1] = 60.0;
+                    }
+                    3 => {
+                        // No selectable value at all -> UINT_MAX.
+                        for v in &mut logits[base..base + count] {
+                            *v = f32::NEG_INFINITY;
+                        }
+                        if count > 3 {
+                            logits[base + 3] = f32::NAN;
+                        }
+                    }
+                    _ => {
+                        // Max at the very last index, duplicated on a chunk boundary.
+                        logits[base + count - 1] = 70.0;
+                        if chunk_len < count {
+                            logits[base + chunk_len] = 70.0;
+                        }
+                    }
+                }
+            }
+            let expected: Vec<u32> = (0..rows)
+                .map(|row| {
+                    let mut best = f32::NEG_INFINITY;
+                    let mut best_i = u32::MAX;
+                    for (i, &v) in logits[row * count..(row + 1) * count].iter().enumerate() {
+                        if v > best {
+                            best = v;
+                            best_i = i as u32;
+                        }
+                    }
+                    best_i
+                })
+                .collect();
+
+            let lb = k.device.new_buffer_with_data(
+                logits.as_ptr() as *const _,
+                (logits.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let new_u32s = |n: usize, fill: u32| {
+                let buf = k
+                    .device
+                    .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let values = vec![fill; n];
+                write_buffer_bytes(&buf, &values);
+                buf
+            };
+            let serial = new_u32s(rows, 0xdead_beef);
+            let batched = new_u32s(rows, 0xdead_beef);
+            let count_scalar = new_u32s(1, count as u32);
+            let chunks_scalar = new_u32s(1, chunks as u32);
+            let part_val = new_u32s(rows * chunks, 0x7fc0_0000);
+            let part_idx = new_u32s(rows * chunks, 0xdead_beef);
+
+            let cb = k.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            for i in 0..rows {
+                e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+                e.set_buffer(0, Some(&lb), (i * count * 4) as u64);
+                e.set_buffer(1, Some(&serial), (i * 4) as u64);
+                e.set_buffer(2, Some(&count_scalar), 0);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 1024,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
+            encode_verify_batch_argmax(
+                k,
+                e,
+                &lb,
+                &batched,
+                &count_scalar,
+                &chunks_scalar,
+                &part_val,
+                &part_idx,
+                rows,
+                chunks,
+            );
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let read = |buf: &Buffer| -> Vec<u32> {
+                (0..rows)
+                    .map(|i| unsafe { *(buf.contents() as *const u32).add(i) })
+                    .collect()
+            };
+            let got_serial = read(&serial);
+            let got_batched = read(&batched);
+            assert_eq!(
+                got_serial, expected,
+                "serial production argmax vs host contract, rows={rows} count={count}"
+            );
+            assert_eq!(
+                got_batched, got_serial,
+                "batched argmax vs serial, rows={rows} count={count} chunks={chunks}"
+            );
+        }
+    }
+
+    /// GPU-time probe for the verifier tail (ignored; run explicitly with `--ignored`):
+    /// median GPU busy time of the k=8 serial single-threadgroup argmax dispatches versus
+    /// the batched partial+merge pair over the same 8 x 128,256 logits, printed to stderr.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_verify_batch_argmax_gpu_time_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let rows = 8usize;
+        let count = 128_256usize;
+        let chunks = verify_batch_argmax_chunks(count);
+        let logits: Vec<f32> = (0..rows * count)
+            .map(|i| ((i as u64 * 2_654_435_761) % 9973) as f32 * 0.001)
+            .collect();
+        let lb = k.device.new_buffer_with_data(
+            logits.as_ptr() as *const _,
+            (logits.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let new_u32s = |n: usize, fill: u32| {
+            let buf = k
+                .device
+                .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let values = vec![fill; n];
+            write_buffer_bytes(&buf, &values);
+            buf
+        };
+        let out = new_u32s(rows, 0);
+        let count_scalar = new_u32s(1, count as u32);
+        let chunks_scalar = new_u32s(1, chunks as u32);
+        let part_val = new_u32s(rows * chunks, 0);
+        let part_idx = new_u32s(rows * chunks, 0);
+        // Median GPU-busy time of `reps` back-to-back repetitions in one command buffer.
+        let time = |reps: usize, batched: bool| -> u128 {
+            let mut samples = Vec::new();
+            for _ in 0..15 {
+                let cb = k.queue.new_command_buffer().to_owned();
+                let e = cb.new_compute_command_encoder();
+                for _ in 0..reps {
+                    if batched {
+                        encode_verify_batch_argmax(
+                            k,
+                            e,
+                            &lb,
+                            &out,
+                            &count_scalar,
+                            &chunks_scalar,
+                            &part_val,
+                            &part_idx,
+                            rows,
+                            chunks,
+                        );
+                    } else {
+                        for i in 0..rows {
+                            e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+                            e.set_buffer(0, Some(&lb), (i * count * 4) as u64);
+                            e.set_buffer(1, Some(&out), (i * 4) as u64);
+                            e.set_buffer(2, Some(&count_scalar), 0);
+                            e.dispatch_thread_groups(
+                                metal::MTLSize {
+                                    width: 1,
+                                    height: 1,
+                                    depth: 1,
+                                },
+                                metal::MTLSize {
+                                    width: 1024,
+                                    height: 1,
+                                    depth: 1,
+                                },
+                            );
+                        }
+                    }
+                }
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                samples.push(command_buffer_gpu_times_us(&cb).0);
+            }
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        };
+        // Marginal cost of one round's tail inside a warm command buffer: (11 reps - 1 rep)
+        // / 10, so the per-command-buffer floor (idle-clock ramp, scheduling) cancels.
+        let serial_1 = time(1, false);
+        let serial_11 = time(11, false);
+        let batched_1 = time(1, true);
+        let batched_11 = time(11, true);
+        eprintln!(
+            "[tidy-probe] verify argmax k={rows} vocab={count}: serial {} us/round (1 rep {serial_1} us, 11 reps {serial_11} us); batched chunks={chunks} {} us/round (1 rep {batched_1} us, 11 reps {batched_11} us); marginal = (11-1)/10 of median-of-15 GPU-busy",
+            serial_11.saturating_sub(serial_1) / 10,
+            batched_11.saturating_sub(batched_1) / 10
+        );
     }
 
     #[cfg(target_os = "macos")]
