@@ -163,6 +163,10 @@ const LIVE_LOOKUP_PATTERNS = [
   /\bwho won\b/i,
   /\bscore of\b/i,
   /\bfinal score\b/i,
+  /\b(?:play|playing)\s+next\b/i,
+  /\bwhen (?:do|does|is|are)\b.{1,60}\b(?:play|playing)\b/i,
+  /\b(?:next|upcoming)\s+(?:game|match|schedule|fixture|fight|race|event)\b/i,
+  /\b(?:game|match|season)\s+schedule\b/i,
   /\b(?:stock|share)\s+prices?\b/i,
   /\bprice of\s+(?!(?:this|that|the|a|an|using|doing|being)\b)\S+/i,
   /\btrading at\b/i,
@@ -172,6 +176,14 @@ const LIVE_LOOKUP_PATTERNS = [
 ]
 
 const LOOKUP_QUESTION_PREFIXES = [
+  'when do the',
+  'when does the',
+  'when do',
+  'when does',
+  'when is the',
+  'when is',
+  'when are the',
+  'when are',
   'please tell me about',
   'please tell me the',
   'please tell me',

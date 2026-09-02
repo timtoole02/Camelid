@@ -232,5 +232,17 @@
     "needed": false,
     "has_query": false,
     "url_count": 0
+  },
+  {
+    "prompt": "When do the Seattle Seahawks play next?",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Upcoming game schedule for Arsenal",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
   }
 ]

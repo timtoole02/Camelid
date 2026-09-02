@@ -69,7 +69,10 @@ const USER_AGENT: &str = "Camelid-WebResearch/0.6 (+https://github.com/timtoole0
 
 #[derive(Debug, Deserialize)]
 pub(super) struct WebResearchRequest {
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -859,29 +862,47 @@ pub(super) async fn handler(
             )
         }
     };
-    let prompt = request.prompt.trim();
-    if prompt.is_empty() {
+    let direct_query = request.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let prompt = request.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if direct_query.is_none() && prompt.is_none() {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_web_research_prompt",
-            "prompt must not be empty".to_string(),
+            "prompt or query must not be empty".to_string(),
             Some("prompt"),
         );
     }
-    if prompt.len() > MAX_PROMPT_BYTES {
-        return api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "web_research_prompt_too_large",
-            format!("prompt exceeds the {MAX_PROMPT_BYTES}-byte web-research limit"),
-            Some("prompt"),
-        );
+    if let Some(p) = prompt {
+        if p.len() > MAX_PROMPT_BYTES {
+            return api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "web_research_prompt_too_large",
+                format!("prompt exceeds the {MAX_PROMPT_BYTES}-byte web-research limit"),
+                Some("prompt"),
+            );
+        }
+    }
+    if let Some(q) = direct_query {
+        if q.len() > MAX_PROMPT_BYTES {
+            return api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "web_research_prompt_too_large",
+                format!("query exceeds the {MAX_PROMPT_BYTES}-byte web-research limit"),
+                Some("query"),
+            );
+        }
     }
 
-    let decision = classify_prompt(prompt);
-    if matches!(decision, ResearchDecision::Skip) {
-        return Json(skipped_response()).into_response();
-    }
-    let reason = decision.reason();
+    let (reason, is_direct_query) = if direct_query.is_some() {
+        ("tool_search", true)
+    } else {
+        let p = prompt.unwrap();
+        let decision = classify_prompt(p);
+        if matches!(decision, ResearchDecision::Skip) {
+            return Json(skipped_response()).into_response();
+        }
+        (decision.reason(), false)
+    };
     let permit = match tokio::time::timeout(
         RESEARCH_ADMISSION_TIMEOUT,
         research_semaphore().acquire_owned(),
@@ -905,7 +926,8 @@ pub(super) async fn handler(
         }
     };
 
-    let prompt = prompt.to_string();
+    let direct_query_owned = direct_query.map(str::to_string);
+    let prompt_owned = prompt.map(str::to_string);
     let transport = state.web_research_transport.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_worker = cancel.clone();
@@ -920,7 +942,11 @@ pub(super) async fn handler(
             deadline: Instant::now() + RESEARCH_TOTAL_DEADLINE,
             cancel: cancel_worker,
         };
-        research_prompt(&prompt, &bounded)
+        if is_direct_query {
+            search_and_fetch(&bounded, "tool_search", direct_query_owned.unwrap())
+        } else {
+            research_prompt(&prompt_owned.unwrap(), &bounded)
+        }
     })
     .await
     .unwrap_or_else(|error| WebResearchResponse {
@@ -1644,6 +1670,14 @@ fn strip_lookup_question_fluff(query: &str) -> String {
         .trim()
         .to_string();
     const PREFIXES: &[&str] = &[
+        "when do the",
+        "when does the",
+        "when do",
+        "when does",
+        "when is the",
+        "when is",
+        "when are the",
+        "when are",
         "please tell me about",
         "please tell me the",
         "please tell me",
@@ -1709,7 +1743,20 @@ fn has_live_lookup(lower: &str) -> bool {
         return true;
     }
 
-    const SPORTS: &[&str] = &["who won", "score of", "final score"];
+    const SPORTS: &[&str] = &[
+        "who won",
+        "score of",
+        "final score",
+        "play next",
+        "playing next",
+        "next game",
+        "next match",
+        "upcoming game",
+        "upcoming match",
+        "next schedule",
+        "game schedule",
+        "match schedule",
+    ];
     const MARKETS: &[&str] = &[
         "stock price",
         "stock prices",
@@ -1730,6 +1777,19 @@ fn has_live_lookup(lower: &str) -> bool {
         .any(|phrase| contains_word_bounded(lower, phrase))
         || has_price_of_lookup(lower)
         || has_latest_lts_lookup(lower)
+        || has_play_schedule_lookup(lower)
+}
+
+fn has_play_schedule_lookup(lower: &str) -> bool {
+    const INTROS: &[&str] = &["when do ", "when does ", "when is ", "when are "];
+    INTROS.iter().any(|intro| {
+        if let Some(pos) = lower.find(intro) {
+            let tail = &lower[pos + intro.len()..];
+            tail.contains("play") || tail.contains("playing")
+        } else {
+            false
+        }
+    })
 }
 
 fn has_direct_condition_question(lower: &str) -> bool {
@@ -4185,14 +4245,15 @@ fn curl_single_hop(
     if url
         .host()
         .is_some_and(|host| matches!(host, Host::Domain(_)))
+        && !addresses.is_empty()
     {
-        for address in addresses {
-            let pinned = match address {
-                IpAddr::V4(address) => format!("{host}:{port}:{address}"),
-                IpAddr::V6(address) => format!("{host}:{port}:[{address}]"),
-            };
-            command.args(["--resolve", &pinned]);
-        }
+        let addrs_str = addresses
+            .iter()
+            .map(|address| address.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let pinned = format!("{host}:{port}:{addrs_str}");
+        command.args(["--resolve", &pinned]);
     }
     command
         .arg("--")
