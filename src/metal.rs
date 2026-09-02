@@ -391,6 +391,8 @@ struct MetalLinearKernel {
     attention_decode_splitk_kv16_direct_batch_pf_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_kv16_direct_batch_pf2_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_kv16_direct_batch_pfv_pipeline: Option<ComputePipelineState>,
+    attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline: Option<ComputePipelineState>,
+    attention_decode_splitk_merge_batch_w32_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_merge_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
     kv_dequant_q8_to_h_pipeline: ComputePipelineState,
@@ -12494,6 +12496,118 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf(
     }
 }
 
+// Step-8 sibling of attention_decode_splitk_kv16_direct_batch_pf: the same grid, threadgroup
+// shape, work assignment, loads-first schedule and partial layout, but each iteration of the
+// online-softmax recurrence consumes EIGHT positions (sixteen half4 loads in flight, one
+// running-max update, one rescale of the accumulator per eight scores instead of per four).
+// The grouping of the max and of the l-sum differs from the step-4 kernel, so its partials
+// are a different (equally valid) arithmetic: it is only ever selected for BOTH the plain
+// row and the verify rows (CAMELID_METAL_ATTN_PREFETCH_SPLIT=<chunk>:8), never for one side.
+kernel void attention_decode_splitk_kv16_direct_batch_pf_s8(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* partials [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& max_splits [[buffer(13)]],
+    device const uint2* row_meta [[buffer(14)]],
+    device const uint* tail_offsets [[buffer(15)]],
+    device const uint* tail_slots [[buffer(16)]],
+    constant uint& tree_base [[buffer(17)]],
+    constant uint& tree_mode [[buffer(18)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint row = tg.z;
+    const uint position_count = row_meta[row].x;
+    const uint n_splits = row_meta[row].y;
+    if (split >= n_splits) return;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float4 q4 = float4(0.0f);
+    if (active) {
+        const ulong q_base = ((ulong)row * n_heads + qh) * 128;
+        q4 = *reinterpret_cast<device const float4*>(query + q_base + lane * 4) * scale;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float4 acc = float4(0.0f);
+    if (active) {
+        const uint tail_off = (tree_mode != 0) ? tail_offsets[row] : 0u;
+        for (uint j0 = p0; j0 < p1; j0 += 8) {
+            half4 kbuf[8];
+            half4 vbuf[8];
+            for (uint jj = 0; jj < 8; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const uint slot = (tree_mode != 0 && j >= tree_base)
+                        ? tail_slots[tail_off + j - tree_base]
+                        : j;
+                    const uint off = kv_base + slot * position_stride + lane * 4;
+                    kbuf[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                    vbuf[jj] = *reinterpret_cast<device const half4*>(values + off);
+                } else {
+                    kbuf[jj] = half4(0.0h);
+                    vbuf[jj] = half4(0.0h);
+                }
+            }
+            float s8[8];
+            for (uint jj = 0; jj < 8; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const half4 k4 = kbuf[jj];
+                    s8[jj] = simd_sum(dot(float4(k4), q4));
+                } else {
+                    s8[jj] = -INFINITY;
+                }
+            }
+            const float m8 = max(
+                max(max(s8[0], s8[1]), max(s8[2], s8[3])),
+                max(max(s8[4], s8[5]), max(s8[6], s8[7])));
+            const float m_new = max(m, m8);
+            const float corr = exp(m - m_new);
+            float w8[8];
+            for (uint jj = 0; jj < 8; ++jj) {
+                w8[jj] = (s8[jj] == -INFINITY) ? 0.0f : exp(s8[jj] - m_new);
+            }
+            acc *= corr;
+            for (uint jj = 0; jj < 8; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const half4 v4 = vbuf[jj];
+                    acc += w8[jj] * float4(v4);
+                }
+            }
+            l = l * corr + ((w8[0] + w8[1] + w8[2] + w8[3]) + (w8[4] + w8[5] + w8[6] + w8[7]));
+            m = m_new;
+        }
+        device float* dst = partials
+            + ((((ulong)row * n_heads + qh) * max_splits + split) * (128 + 2));
+        dst[lane * 4] = acc.x;
+        dst[lane * 4 + 1] = acc.y;
+        dst[lane * 4 + 2] = acc.z;
+        dst[lane * 4 + 3] = acc.w;
+        if (lane == 0) {
+            dst[128] = m;
+            dst[129] = l;
+        }
+    }
+}
+
 // Minimal perturbation: the K load and the dot stay exactly where the batch kernel has
 // them; only the four V loads of a step move up beside the K loads, so the value bytes
 // are already in flight while the step's max/exp work runs.
@@ -12864,6 +12978,58 @@ kernel void attention_decode_splitk_merge_batch_f32(
         }
         dst[d] = o * inv;
     }
+}
+
+// Lane-per-float4 twin of attention_decode_splitk_merge_batch_f32 for head_dim 128: one
+// simdgroup per (row, head), four heads per 128-thread threadgroup, each lane owning dims
+// [4*lane, 4*lane+4) through one float4 load per split instead of 128 threads each loading
+// one float.  m_tot, l_tot and every output element are computed by the merge kernel's
+// statements in the merge kernel's split order (the per-element product-and-add and the
+// final `* inv`), so every output word is bit-identical to the 128-thread merge; the probe
+// and the identity test assert that rather than assume it.
+kernel void attention_decode_splitk_merge_batch_f32_w32(
+    device const float* partials [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& n_heads [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& max_splits [[buffer(4)]],
+    device const uint2* row_meta [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint head = tg.x * 4 + sg;
+    const uint row = tg.y;
+    if (head >= n_heads || head_dim != 128) return;
+    const uint n_splits = row_meta[row].y;
+    device const float* base = partials
+        + (((ulong)row * n_heads + head) * max_splits * (head_dim + 2));
+    float m_tot = -INFINITY;
+    for (uint s2 = 0; s2 < n_splits; ++s2) {
+        m_tot = max(m_tot, base[s2 * (head_dim + 2) + head_dim]);
+    }
+    float l_tot = 0.0f;
+    for (uint s2 = 0; s2 < n_splits; ++s2) {
+        const float mi = base[s2 * (head_dim + 2) + head_dim];
+        if (mi != -INFINITY) {
+            l_tot += base[s2 * (head_dim + 2) + head_dim + 1] * exp(mi - m_tot);
+        }
+    }
+    const float inv = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
+    float4 o = float4(0.0f);
+    for (uint s2 = 0; s2 < n_splits; ++s2) {
+        const float mi = base[s2 * (head_dim + 2) + head_dim];
+        if (mi != -INFINITY) {
+            const float4 p4 = *reinterpret_cast<device const float4*>(
+                base + s2 * (head_dim + 2) + lane * 4);
+            o += p4 * exp(mi - m_tot);
+        }
+    }
+    device float* dst = output + ((ulong)row * n_heads + head) * head_dim;
+    dst[lane * 4] = o.x * inv;
+    dst[lane * 4 + 1] = o.y * inv;
+    dst[lane * 4 + 2] = o.z * inv;
+    dst[lane * 4 + 3] = o.w * inv;
 }
 
 // Qwen3.5 gated-delta-net kernels. These operate on the same f32 activation
@@ -13861,6 +14027,22 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline = elementwise_library
+                .get_function("attention_decode_splitk_kv16_direct_batch_pf_s8", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let attention_decode_splitk_merge_batch_w32_pipeline = elementwise_library
+                .get_function("attention_decode_splitk_merge_batch_f32_w32", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let attention_decode_splitk_merge_batch_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_batch_f32", None)
                 .ok()?;
@@ -14405,6 +14587,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_kv16_direct_batch_pf_pipeline,
                 attention_decode_splitk_kv16_direct_batch_pf2_pipeline,
                 attention_decode_splitk_kv16_direct_batch_pfv_pipeline,
+                attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline,
+                attention_decode_splitk_merge_batch_w32_pipeline,
                 attention_decode_splitk_merge_batch_pipeline,
                 attention_decode_splitk_kvq8_pipeline,
                 kv_dequant_q8_to_h_pipeline,
@@ -24313,6 +24497,188 @@ fn attention_prefetch_enabled() -> bool {
     })
 }
 
+/// The dispatch geometry of the prefetch universe's decode attention.
+///
+/// `CAMELID_METAL_ATTN_PREFETCH_SPLIT=<chunk>[:<step>]` (default `64:4`, the geometry the
+/// universe was certified on) and `CAMELID_METAL_ATTN_PREFETCH_MERGE=w32` (default: the
+/// 128-thread merge).
+///
+/// The partition IS the arithmetic: every split runs its own online-softmax recurrence over
+/// its positions and the merge folds the per-split (m, l, acc) triples, so a different chunk
+/// or step changes the output bits.  It is nevertheless a lossless change inside the
+/// universe: the plain decode row and the k-row verifier both take their split count and
+/// their partial kernel from THIS ONE geometry at the same position, so they move together
+/// and the plain==verify contract (`metal_attention_prefetch_plain_row_matches_verify_rows`)
+/// keeps holding bit for bit.  Like the universe switch itself, a new chunk or step redefines
+/// the certified token array and must be re-certified.  The `w32` merge is bit-identical to
+/// the 128-thread merge (same statements, same split order) and changes no array.
+///
+/// Grammar is exact: `chunk` in 8..=1024, `step` in {4, 8}; the merge spelling is exactly
+/// `w32`.  Anything else keeps the default and says so once on stderr.  A step or merge whose
+/// pipeline failed to build falls back to the certified kernel FOR BOTH SIDES (one process-
+/// wide resolution), never for one side.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionPrefetchGeometry {
+    /// Target positions per split: `n_splits = div_ceil(position_count, chunk).clamp(2, 64)`.
+    chunk: usize,
+    /// Positions per recurrence step: 4 (`_pf`) or 8 (`_pf_s8`).
+    step: usize,
+    /// Fold the partials with the lane-per-float4 merge twin.
+    merge_w32: bool,
+    /// Threads per threadgroup of the partial dispatch (bit-invariant; probe-only variation).
+    threadgroup: u64,
+}
+
+#[cfg(target_os = "macos")]
+const ATTN_PREFETCH_CERTIFIED: AttentionPrefetchGeometry = AttentionPrefetchGeometry {
+    chunk: 64,
+    step: 4,
+    merge_w32: false,
+    threadgroup: 128,
+};
+/// Partials are sized per (row, head, split); the cap bounds them and matches the row-wise
+/// kernels' `clamp(2, 64)`.
+#[cfg(target_os = "macos")]
+const ATTN_PREFETCH_MAX_SPLITS: usize = 64;
+
+/// `<chunk>[:<step>]` -> (chunk, step); `None` for anything outside the exact grammar.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_split_from_env(value: Option<&str>) -> Option<(usize, usize)> {
+    let value = value?;
+    let (chunk, step) = match value.split_once(':') {
+        Some((chunk, step)) => (chunk, step),
+        None => (value, "4"),
+    };
+    let chunk: usize = chunk.parse().ok()?;
+    let step: usize = step.parse().ok()?;
+    ((8..=1024).contains(&chunk) && matches!(step, 4 | 8)).then_some((chunk, step))
+}
+
+/// `w32` -> true; anything else (including unset) -> the 128-thread merge.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_merge_from_env(value: Option<&str>) -> bool {
+    value == Some("w32")
+}
+
+/// The process-wide geometry (read once), resolved against the pipelines that actually built
+/// so plain and verify can never disagree about the kernel.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_geometry() -> AttentionPrefetchGeometry {
+    #[cfg(test)]
+    if let Some(geometry) = ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.get()) {
+        return geometry;
+    }
+    static GEOMETRY: OnceLock<AttentionPrefetchGeometry> = OnceLock::new();
+    *GEOMETRY.get_or_init(|| {
+        let mut geometry = ATTN_PREFETCH_CERTIFIED;
+        let raw = std::env::var("CAMELID_METAL_ATTN_PREFETCH_SPLIT").ok();
+        match (raw.as_deref(), attention_prefetch_split_from_env(raw.as_deref())) {
+            (None, _) => {}
+            (Some(_), Some((chunk, step))) => {
+                geometry.chunk = chunk;
+                geometry.step = step;
+            }
+            (Some(raw), None) => eprintln!(
+                "[metal-attn] CAMELID_METAL_ATTN_PREFETCH_SPLIT={raw:?} is not <chunk>[:<step>] with \
+                 chunk in 8..=1024 and step 4 or 8; keeping {}:{}",
+                ATTN_PREFETCH_CERTIFIED.chunk, ATTN_PREFETCH_CERTIFIED.step
+            ),
+        }
+        let merge_raw = std::env::var("CAMELID_METAL_ATTN_PREFETCH_MERGE").ok();
+        geometry.merge_w32 = attention_prefetch_merge_from_env(merge_raw.as_deref());
+        if let Some(raw) = merge_raw.as_deref().filter(|_| !geometry.merge_w32) {
+            eprintln!(
+                "[metal-attn] CAMELID_METAL_ATTN_PREFETCH_MERGE={raw:?} is not `w32`; keeping the \
+                 128-thread merge"
+            );
+        }
+        if let Some(k) = metal_linear_kernel() {
+            if geometry.step == 8
+                && admitted_32_lane_pipeline(
+                    k.attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline.as_ref(),
+                )
+                .is_none()
+            {
+                eprintln!(
+                    "[metal-attn] prefetch step 8 requested but its kernel did not build; keeping step 4"
+                );
+                geometry.step = 4;
+            }
+            if geometry.merge_w32 && k.attention_decode_splitk_merge_batch_w32_pipeline.is_none() {
+                eprintln!(
+                    "[metal-attn] prefetch merge w32 requested but its kernel did not build; keeping \
+                     the 128-thread merge"
+                );
+                geometry.merge_w32 = false;
+            }
+        }
+        if geometry != ATTN_PREFETCH_CERTIFIED {
+            eprintln!(
+                "[metal-attn] prefetch universe geometry chunk={} step={} merge={} applied to plain \
+                 rows and verify rows",
+                geometry.chunk,
+                geometry.step,
+                if geometry.merge_w32 { "w32" } else { "t128" }
+            );
+        }
+        geometry
+    })
+}
+
+/// THE split-count function of the prefetch universe.  `encode_attention_prefetch_row`
+/// (plain decode, verifier fallback) and the k-row batch route must both call this and
+/// nothing else, or a verify row stops equalling the plain row at the same position.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_split_count(position_count: usize) -> usize {
+    position_count
+        .div_ceil(attention_prefetch_geometry().chunk)
+        .clamp(2, ATTN_PREFETCH_MAX_SPLITS)
+}
+
+/// The partial kernel of the geometry (`_pf` for step 4, `_pf_s8` for step 8), admitted for
+/// a 32-lane simdgroup; `None` when the universe cannot run and the callers must fall back
+/// together.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_partial_pipeline(k: &MetalLinearKernel) -> Option<&ComputePipelineState> {
+    let pipeline = match attention_prefetch_geometry().step {
+        8 => k.attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline.as_ref(),
+        _ => k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref(),
+    };
+    admitted_32_lane_pipeline(pipeline)
+}
+
+/// The merge of the geometry: `(pipeline, threadgroups along heads, threads)`; the w32 twin
+/// folds four heads per 128-thread threadgroup, the established merge one head per 128.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_merge_dispatch(
+    k: &MetalLinearKernel,
+    n_heads: usize,
+) -> (&ComputePipelineState, u64, u64) {
+    if attention_prefetch_geometry().merge_w32 {
+        if let Some(pipeline) = k.attention_decode_splitk_merge_batch_w32_pipeline.as_ref() {
+            return (pipeline, n_heads.div_ceil(4) as u64, 128);
+        }
+    }
+    (&k.attention_decode_splitk_merge_batch_pipeline, n_heads as u64, 128)
+}
+
+/// Threads per threadgroup of the prefetch partial dispatch.  The kernels activate
+/// simdgroup `sg` only while `sg < group`; no threadgroup memory or barrier exists, so the
+/// width is bit-invariant (the fourth simdgroup of a 128-wide group-3 launch just returns).
+#[cfg(target_os = "macos")]
+fn attention_prefetch_threadgroup_width(_group: usize) -> u64 {
+    attention_prefetch_geometry().threadgroup
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    /// Probe-only override of the whole geometry for the calling thread (the probe and the
+    /// identity tests sweep it without re-spawning the process); `None` = process-wide.
+    static ATTN_PREFETCH_PROBE_GEOMETRY: std::cell::Cell<Option<AttentionPrefetchGeometry>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Half-mirror reads for the f32 lane's split-K attention (opt out with
 /// `CAMELID_METAL_ATTN_SPLITK_KV16=0`).  Cached: this sits inside the per-row attention
 /// encode, so a speculative round would otherwise re-read it k*layers times per round.
@@ -24741,6 +25107,9 @@ enum SplitkRowsEncode {
     /// call per row with that row's query/output offset and tail slots — what plain
     /// decode and the verifier fallback run.
     PrefetchRow,
+    /// Probe-only: the geometry's partial dispatch without its merge (attribution of the
+    /// merge's share of the layer time; the output is left unwritten).
+    PrefetchNoMerge,
 }
 
 /// Low-level row-wise-vs-row-dimensional F16 split-K driver.  `tree` is the
@@ -24771,13 +25140,9 @@ fn try_attention_splitk_kv16_rows_for_test(
     };
     let rowshare_kvh_fastest = matches!(encode, SplitkRowsEncode::RowShare(_, true));
     let prefetch_pipeline = match encode {
-        SplitkRowsEncode::Prefetch => Some(
-            admitted_32_lane_pipeline(
-                metal_linear_kernel()?
-                    .attention_decode_splitk_kv16_direct_batch_pf_pipeline
-                    .as_ref(),
-            )?,
-        ),
+        SplitkRowsEncode::Prefetch | SplitkRowsEncode::PrefetchNoMerge => {
+            Some(attention_prefetch_partial_pipeline(metal_linear_kernel()?)?)
+        }
         SplitkRowsEncode::Prefetch2 => Some(
             admitted_32_lane_pipeline(
                 metal_linear_kernel()?
@@ -24877,9 +25242,18 @@ fn try_attention_splitk_kv16_rows_for_test(
         }
     }
 
+    // The prefetch encodes partition like production (the one shared function, honouring
+    // the probe overrides); every other geometry keeps the established 64-position chunk.
+    let prefetch_partition = prefetch_pipeline.is_some() || encode == SplitkRowsEncode::PrefetchRow;
     let split_counts: Vec<usize> = position_counts
         .iter()
-        .map(|&pc| pc.div_ceil(64).clamp(2, 64))
+        .map(|&pc| {
+            if prefetch_partition {
+                attention_prefetch_split_count(pc)
+            } else {
+                pc.div_ceil(64).clamp(2, 64)
+            }
+        })
         .collect();
     let max_splits = split_counts.iter().copied().max()?;
     let common = device.new_buffer(32, opts);
@@ -25061,13 +25435,29 @@ fn try_attention_splitk_kv16_rows_for_test(
                         depth: rows as u64,
                     },
                     metal::MTLSize {
-                        width: 128,
+                        width: if prefetch_pipeline.is_some() {
+                            attention_prefetch_threadgroup_width(group)
+                        } else {
+                            128
+                        },
                         height: 1,
                         depth: 1,
                     },
                 );
             }
-            e.set_compute_pipeline_state(&kernel.attention_decode_splitk_merge_batch_pipeline);
+            if encode == SplitkRowsEncode::PrefetchNoMerge {
+                continue;
+            }
+            let (merge_pipeline, merge_groups, merge_threads) = if prefetch_pipeline.is_some() {
+                attention_prefetch_merge_dispatch(kernel, n_heads)
+            } else {
+                (
+                    &kernel.attention_decode_splitk_merge_batch_pipeline,
+                    n_heads as u64,
+                    128,
+                )
+            };
+            e.set_compute_pipeline_state(merge_pipeline);
             e.set_buffer(0, Some(&partials), 0);
             e.set_buffer(1, Some(&out), 0);
             e.set_buffer(2, Some(&common), 0);
@@ -25076,12 +25466,12 @@ fn try_attention_splitk_kv16_rows_for_test(
             e.set_buffer(5, Some(&row_meta), 0);
             e.dispatch_thread_groups(
                 metal::MTLSize {
-                    width: n_heads as u64,
+                    width: merge_groups,
                     height: rows as u64,
                     depth: 1,
                 },
                 metal::MTLSize {
-                    width: 128,
+                    width: merge_threads,
                     height: 1,
                     depth: 1,
                 },
@@ -25189,9 +25579,10 @@ fn try_attention_splitk_kv16_rows_for_test(
         "split-K attention wrote beyond its logical output"
     );
     assert!(
-        physical_output[..output_words]
-            .iter()
-            .all(|value| value.to_bits() != OUTPUT_SENTINEL.to_bits()),
+        encode == SplitkRowsEncode::PrefetchNoMerge
+            || physical_output[..output_words]
+                .iter()
+                .all(|value| value.to_bits() != OUTPUT_SENTINEL.to_bits()),
         "split-K attention left part of its logical output unwritten"
     );
     let result = physical_output[..output_words].to_vec();
@@ -25980,20 +26371,18 @@ fn encode_attention_prefetch_row(
     if head_dim != 128 || n_kv_heads == 0 || position_count == 0 {
         return false;
     }
-    let Some(pipeline) =
-        admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref())
-    else {
+    let Some(pipeline) = attention_prefetch_partial_pipeline(k) else {
         return false;
     };
     static ANNOUNCE: std::sync::Once = std::sync::Once::new();
     ANNOUNCE.call_once(|| {
         eprintln!(
             "[metal-attn] prefetch universe: single-row attention routed to \
-             attention_decode_splitk_kv16_direct_batch_pf (plain decode / verifier fallback)"
+             attention_decode_splitk_kv16_direct_batch_pf[_s8] (plain decode / verifier fallback)"
         );
     });
     ATTN_PREFETCH_ROW_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let n_splits = position_count.div_ceil(64).clamp(2, 64);
+    let n_splits = attention_prefetch_split_count(position_count);
     let partials = pool_get(k, (n_heads * n_splits * (head_dim + 2) * 4) as u64);
     let row_meta = pool_get(k, 8);
     let scalars = pool_get(k, 32);
@@ -26044,12 +26433,14 @@ fn encode_attention_prefetch_row(
             depth: 1,
         },
         metal::MTLSize {
-            width: 128,
+            width: attention_prefetch_threadgroup_width(n_heads / n_kv_heads),
             height: 1,
             depth: 1,
         },
     );
-    e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_batch_pipeline);
+    let (merge_pipeline, merge_groups, merge_threads) =
+        attention_prefetch_merge_dispatch(k, n_heads);
+    e.set_compute_pipeline_state(merge_pipeline);
     e.set_buffer(0, Some(&partials), 0);
     e.set_buffer(1, Some(out), out_off);
     e.set_buffer(2, Some(scalar), 0); // n_heads
@@ -26058,12 +26449,12 @@ fn encode_attention_prefetch_row(
     e.set_buffer(5, Some(&row_meta), 0);
     e.dispatch_thread_groups(
         metal::MTLSize {
-            width: n_heads as u64,
+            width: merge_groups,
             height: 1,
             depth: 1,
         },
         metal::MTLSize {
-            width: 128,
+            width: merge_threads,
             height: 1,
             depth: 1,
         },
@@ -26125,20 +26516,26 @@ fn encode_attention_splitk_kv16_batch(
     #[cfg(test)]
     VERIFY_BATCH_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let split_counts: Vec<usize> = position_counts
-        .iter()
-        .map(|&pc| pc.div_ceil(64).clamp(2, 64))
-        .collect();
-    let max_splits = split_counts.iter().copied().max().unwrap_or(0);
     // The prefetch universe owns the route when armed (`attention_prefetch_enabled`);
     // otherwise the exact geometries apply: rowshare, then shared-prefix, then batch.
     let prefetch_pipeline = (attention_prefetch_enabled() && head_dim == 128)
-        .then(|| {
-            admitted_32_lane_pipeline(
-                k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref(),
-            )
-        })
+        .then(|| attention_prefetch_partial_pipeline(k))
         .flatten();
+    // The prefetch universe partitions positions with the one function the single-row
+    // encode uses (`attention_prefetch_split_count`) — that shared call is what keeps a
+    // verify row bit-identical to the plain row at the same position.  The exact
+    // geometries keep their established 64-position chunk.
+    let split_counts: Vec<usize> = position_counts
+        .iter()
+        .map(|&pc| {
+            if prefetch_pipeline.is_some() {
+                attention_prefetch_split_count(pc)
+            } else {
+                pc.div_ceil(64).clamp(2, 64)
+            }
+        })
+        .collect();
+    let max_splits = split_counts.iter().copied().max().unwrap_or(0);
     if prefetch_pipeline.is_some() {
         static ANNOUNCE: std::sync::Once = std::sync::Once::new();
         ANNOUNCE.call_once(|| {
@@ -26288,14 +26685,25 @@ fn encode_attention_splitk_kv16_batch(
                 depth: rows as u64,
             },
             metal::MTLSize {
-                width: 128,
+                width: if prefetch_pipeline.is_some() {
+                    attention_prefetch_threadgroup_width(group)
+                } else {
+                    128
+                },
                 height: 1,
                 depth: 1,
             },
         );
     }
 
-    e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_batch_pipeline);
+    // The prefetch universe folds with its geometry's merge; the exact geometries keep the
+    // established 128-thread merge.
+    let (merge_pipeline, merge_groups, merge_threads) = if prefetch_pipeline.is_some() {
+        attention_prefetch_merge_dispatch(k, n_heads)
+    } else {
+        (&k.attention_decode_splitk_merge_batch_pipeline, n_heads as u64, 128)
+    };
+    e.set_compute_pipeline_state(merge_pipeline);
     e.set_buffer(0, Some(&partials), 0);
     e.set_buffer(1, Some(out), 0);
     e.set_buffer(2, Some(scalar), 0); // n_heads
@@ -26304,12 +26712,12 @@ fn encode_attention_splitk_kv16_batch(
     e.set_buffer(5, Some(&row_meta), 0);
     e.dispatch_thread_groups(
         metal::MTLSize {
-            width: n_heads as u64,
+            width: merge_groups,
             height: rows as u64,
             depth: 1,
         },
         metal::MTLSize {
-            width: 128,
+            width: merge_threads,
             height: 1,
             depth: 1,
         },
@@ -49795,6 +50203,73 @@ mod tests {
         }
     }
 
+    /// `CAMELID_METAL_ATTN_PREFETCH_SPLIT` accepts exactly `<chunk>` / `<chunk>:4` with the
+    /// chunk in 8..=1024; every other spelling keeps the certified 64-position partition.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefetch_split_gate_is_fail_closed() {
+        for (value, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("0"), None),
+            (Some("4"), None),
+            (Some("64"), Some((64, 4))),
+            (Some("64:4"), Some((64, 4))),
+            (Some("64:8"), Some((64, 8))),
+            (Some("32"), Some((32, 4))),
+            (Some("32:4"), Some((32, 4))),
+            (Some("128:8"), Some((128, 8))),
+            (Some("8:4"), Some((8, 4))),
+            (Some("1024"), Some((1024, 4))),
+            (Some("2048"), None),
+            (Some("32:16"), None),
+            (Some("32:2"), None),
+            (Some("32:"), None),
+            (Some(":4"), None),
+            (Some(" 32"), None),
+            (Some("32 "), None),
+            (Some("-32"), None),
+            (Some("0x20"), None),
+            (Some("chunk=32"), None),
+        ] {
+            assert_eq!(
+                attention_prefetch_split_from_env(value),
+                expected,
+                "CAMELID_METAL_ATTN_PREFETCH_SPLIT={value:?}"
+            );
+        }
+        for (value, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("1"), false),
+            (Some("true"), false),
+            (Some("W32"), false),
+            (Some(" w32"), false),
+            (Some("w32"), true),
+        ] {
+            assert_eq!(
+                attention_prefetch_merge_from_env(value),
+                expected,
+                "CAMELID_METAL_ATTN_PREFETCH_MERGE={value:?}"
+            );
+        }
+        // The default geometry is the certified one and the cap matches the row-wise kernels.
+        assert_eq!(ATTN_PREFETCH_CERTIFIED.chunk, 64);
+        assert_eq!(ATTN_PREFETCH_CERTIFIED.step, 4);
+        assert!(!ATTN_PREFETCH_CERTIFIED.merge_w32);
+        assert_eq!(ATTN_PREFETCH_MAX_SPLITS, 64);
+        let probe = |chunk| AttentionPrefetchGeometry { chunk, ..ATTN_PREFETCH_CERTIFIED };
+        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(probe(64))));
+        for (pc, splits) in [(128usize, 2usize), (543, 9), (551, 9), (800, 13), (4137, 64), (8, 2)] {
+            assert_eq!(attention_prefetch_split_count(pc), splits, "pc={pc} chunk=64");
+        }
+        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(probe(32))));
+        for (pc, splits) in [(128usize, 4usize), (543, 17), (551, 18), (800, 25), (4137, 64)] {
+            assert_eq!(attention_prefetch_split_count(pc), splits, "pc={pc} chunk=32");
+        }
+        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(None));
+    }
+
     /// The re-certification switch fails closed on everything but the exact string "1".
     #[cfg(target_os = "macos")]
     #[test]
@@ -49871,6 +50346,44 @@ mod tests {
         }
         let max_positions = 560usize;
         let (n_heads, n_kv_heads, head_dim, scale, keys, values) = prefetch_fixture(max_positions);
+        // The contract must hold at every geometry the gates admit: chunks across the grammar,
+        // both steps, both merges, and the group-exact 96-wide threadgroup (bit-invariant by
+        // construction; asserted rather than assumed).  The first entry is the certified one.
+        let geometries: Vec<AttentionPrefetchGeometry> = [
+            (64usize, 4usize, false, 128u64),
+            (64, 4, true, 128),
+            (64, 8, false, 128),
+            (64, 8, true, 96),
+            (16, 4, false, 128),
+            (32, 8, true, 128),
+            (48, 4, false, 96),
+            (128, 4, true, 128),
+            (128, 8, false, 128),
+            (256, 8, true, 96),
+        ]
+        .into_iter()
+        .map(|(chunk, step, merge_w32, threadgroup)| AttentionPrefetchGeometry {
+            chunk,
+            step,
+            merge_w32,
+            threadgroup,
+        })
+        .collect();
+        for geometry in geometries {
+        let (chunk, threadgroup) = (geometry.chunk, geometry.threadgroup);
+        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(geometry)));
+        let k = metal_linear_kernel().expect("metal kernel");
+        assert!(
+            attention_prefetch_partial_pipeline(k).is_some(),
+            "prefetch partial kernel for step {} did not build",
+            geometry.step
+        );
+        if geometry.merge_w32 {
+            assert!(
+                k.attention_decode_splitk_merge_batch_w32_pipeline.is_some(),
+                "prefetch merge w32 did not build"
+            );
+        }
         for base in [128usize, 543] {
             for rows in 2..=8usize {
                 let query: Vec<f32> = (0..rows * n_heads * head_dim)
@@ -49905,12 +50418,43 @@ mod tests {
                         );
                     }
                     eprintln!(
-                        "metal_attention_prefetch_plain_row_matches_verify_rows: {label} base={base} k={rows} PLAIN==VERIFY BIT-IDENTICAL ({} words)",
+                        "metal_attention_prefetch_plain_row_matches_verify_rows: chunk={chunk} step={} merge={} tg={threadgroup} {label} base={base} k={rows} PLAIN==VERIFY BIT-IDENTICAL ({} words)",
+                        geometry.step,
+                        if geometry.merge_w32 { "w32" } else { "t128" },
                         plain.len()
                     );
+                    // The w32 merge must reproduce the 128-thread merge bit for bit at the
+                    // same partition and step: it is admitted as exact, not as a new universe.
+                    if geometry.merge_w32 {
+                        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| {
+                            cell.set(Some(AttentionPrefetchGeometry {
+                                merge_w32: false,
+                                ..geometry
+                            }))
+                        });
+                        let (t128, _, _) = run(SplitkRowsEncode::Prefetch);
+                        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(geometry)));
+                        let bad = t128
+                            .iter()
+                            .zip(&verify)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        assert_eq!(
+                            bad, 0,
+                            "prefetch merge w32 {label} base={base} k={rows} chunk={chunk} step={}: differs from the 128-thread merge in {bad} of {} words",
+                            geometry.step,
+                            t128.len()
+                        );
+                        eprintln!(
+                            "metal_attention_prefetch_plain_row_matches_verify_rows: chunk={chunk} step={} {label} base={base} k={rows} MERGE w32==t128 BIT-IDENTICAL",
+                            geometry.step
+                        );
+                    }
                 }
             }
         }
+        }
+        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(None));
     }
 
     /// Run-to-run stability of the prefetch universe: the same dispatch shape must produce
@@ -50315,6 +50859,217 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Probe: split-partition sweep of the prefetch universe at production shape (24q/8kv,
+    /// head_dim 128, 28 layers' dispatches in one command buffer, distinct per-layer K/V so
+    /// the cache cannot flatter a shallow depth), k=8 verifier rows at the Pitch depths and
+    /// deep.  Every (chunk, threadgroup) candidate is first held to the universe contract
+    /// (verify row r == production single-row encode at the same partition, bit for bit) and
+    /// its divergence from the certified 64:4 partition is reported (expected: a different
+    /// partition is different arithmetic).  Timing is seven interleaved rounds, median and
+    /// best, GPU-busy from the command buffer's own timestamps.
+    /// Run: cargo test --release --lib attention_prefetch_split_probe -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn attention_prefetch_split_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let n_heads = 24usize;
+        let n_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let rows = 8usize;
+        let layers = 28usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let query: Vec<f32> = (0..rows * n_heads * head_dim)
+            .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
+            .collect();
+        let set = |geometry: AttentionPrefetchGeometry| {
+            ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(geometry)));
+        };
+        // (chunk, step, merge_w32, threadgroup, merge_included)
+        let default_variants: Vec<(usize, usize, bool, u64, bool)> = vec![
+            (64, 4, false, 128, true),
+            (64, 4, false, 128, false),
+            (64, 4, true, 128, true),
+            (64, 8, false, 128, true),
+            (64, 8, true, 128, true),
+            (96, 4, false, 128, true),
+            (96, 8, true, 128, true),
+            (128, 4, false, 128, true),
+            (128, 4, true, 128, true),
+            (128, 8, false, 128, true),
+            (128, 8, true, 128, true),
+            (256, 8, true, 128, true),
+        ];
+        // CAMELID_PROBE_GEOMETRIES=c:s:m:tg[:nomerge],... overrides the sweep (m = 0|1).
+        let variants: Vec<(String, AttentionPrefetchGeometry, bool)> = std::env::var(
+            "CAMELID_PROBE_GEOMETRIES",
+        )
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|spec| {
+                    let f: Vec<&str> = spec.trim().split(':').collect();
+                    Some((
+                        f.first()?.parse().ok()?,
+                        f.get(1)?.parse().ok()?,
+                        f.get(2)? == &"1",
+                        f.get(3)?.parse().ok()?,
+                        f.get(4) != Some(&"nomerge"),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or(default_variants)
+        .into_iter()
+        .map(|(chunk, step, merge_w32, threadgroup, merged)| {
+            (
+                format!(
+                    "c{chunk}/s{step}/{}{}{}",
+                    if merge_w32 { "w32" } else { "t128" },
+                    if threadgroup != 128 { format!("/tg{threadgroup}") } else { String::new() },
+                    if merged { "" } else { "/NOMERGE" }
+                ),
+                AttentionPrefetchGeometry {
+                    chunk,
+                    step,
+                    merge_w32,
+                    threadgroup,
+                },
+                merged,
+            )
+        })
+        .collect();
+        let depths: Vec<usize> = std::env::var("CAMELID_PROBE_DEPTHS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect())
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![543, 800, 4_137]);
+        for base in depths {
+            let max_positions = base + rows;
+            let position_counts: Vec<usize> = (1..=rows).map(|row| base + row).collect();
+            let keys: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
+                .map(|i| ((i * 13 % 31) as f32 - 15.0) * 0.03125)
+                .collect();
+            let values: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
+                .map(|i| ((i * 19 % 37) as f32 - 18.0) * 0.03125)
+                .collect();
+            const KV_COPIES: usize = 28;
+            let run = |encode, repeats, kv_copies| {
+                try_attention_splitk_kv16_rows_for_test(
+                    &query,
+                    &keys,
+                    &values,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_positions,
+                    &position_counts,
+                    scale,
+                    None,
+                    encode,
+                    true,
+                    repeats,
+                    kv_copies,
+                )
+                .expect("production-shape prefetch probe")
+            };
+            set(ATTN_PREFETCH_CERTIFIED);
+            let (certified, _, _) = run(SplitkRowsEncode::Prefetch, 1, 1);
+            let words = n_heads * head_dim;
+            for (label, geometry, merged) in &variants {
+                if !merged {
+                    continue;
+                }
+                set(*geometry);
+                let (verify, _, _) = run(SplitkRowsEncode::Prefetch, 1, 1);
+                let (plain, _, _) = run(SplitkRowsEncode::PrefetchRow, 1, 1);
+                if geometry.merge_w32 {
+                    set(AttentionPrefetchGeometry {
+                        merge_w32: false,
+                        ..*geometry
+                    });
+                    let (t128, _, _) = run(SplitkRowsEncode::Prefetch, 1, 1);
+                    set(*geometry);
+                    let bad = t128
+                        .iter()
+                        .zip(&verify)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    assert_eq!(bad, 0, "prefetch {label} base={base}: merge w32 differs from the 128-thread merge in {bad} words");
+                }
+                for row in 0..rows {
+                    let bad = verify[row * words..(row + 1) * words]
+                        .iter()
+                        .zip(&plain[row * words..(row + 1) * words])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    assert_eq!(
+                        bad, 0,
+                        "prefetch {label} base={base}: verify row {row} differs from the plain single-row encode in {bad} of {words} words"
+                    );
+                }
+                let moved = verify
+                    .iter()
+                    .zip(&certified)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let splits = position_counts
+                    .iter()
+                    .map(|&pc| attention_prefetch_split_count(pc).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "prefetch split probe base={base} {label}: PLAIN==VERIFY BIT-IDENTICAL (k={rows}); splits/row [{splits}]; words moved vs certified 64:4 = {moved} of {}",
+                    verify.len()
+                );
+            }
+            const ROUNDS: usize = 7;
+            let mut samples = vec![Vec::with_capacity(ROUNDS); variants.len()];
+            for round in 0..ROUNDS {
+                let mut line = format!("prefetch split probe base={base} round={round}:");
+                for (idx, (label, geometry, merged)) in variants.iter().enumerate() {
+                    set(*geometry);
+                    let encode = if *merged {
+                        SplitkRowsEncode::Prefetch
+                    } else {
+                        SplitkRowsEncode::PrefetchNoMerge
+                    };
+                    let (_, gpu_us, _) = run(encode, layers, KV_COPIES);
+                    samples[idx].push(gpu_us);
+                    line.push_str(&format!(" {label}={:.3}", gpu_us as f64 / 1000.0));
+                }
+                eprintln!("{line}");
+            }
+            let bytes_once = (n_kv_heads * (base + rows) * head_dim * 2 * 2 * layers) as f64;
+            let stat = |idx: usize| {
+                let mut s = samples[idx].clone();
+                s.sort_unstable();
+                (s[0], s[s.len() / 2])
+            };
+            let (cert_best, cert_median) = stat(0);
+            eprintln!(
+                "prefetch split probe base={base} k={rows} layers={layers} kv_copies={KV_COPIES} rounds={ROUNDS} (K/V read once = {:.1} MB):",
+                bytes_once / 1.0e6
+            );
+            for (idx, (label, _, _)) in variants.iter().enumerate() {
+                let (best, median) = stat(idx);
+                eprintln!(
+                    "  {label:<22} best {:>8.3} ms ({:.3}x)  median {:>8.3} ms ({:.3}x)  per-layer(med) {:>7.1} us  once-rate(med) {:>6.1} GB/s",
+                    best as f64 / 1000.0,
+                    cert_best as f64 / best as f64,
+                    median as f64 / 1000.0,
+                    cert_median as f64 / median as f64,
+                    median as f64 / layers as f64,
+                    bytes_once / (median as f64 * 1.0e-6) / 1.0e9,
+                );
+            }
+        }
+        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(None));
     }
 
     /// Probe: decode-attention kernel rate at depth, production-shaped (Llama-3.2-3B:
