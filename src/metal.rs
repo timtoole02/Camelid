@@ -388,6 +388,7 @@ struct MetalLinearKernel {
     attention_decode_splitk_kv16_direct_rowshare_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_kv16_direct_batch_pf_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_kv16_direct_batch_pf2_pipeline: Option<ComputePipelineState>,
+    attention_decode_splitk_kv16_direct_batch_pfv_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_merge_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
     kv_dequant_q8_to_h_pipeline: ComputePipelineState,
@@ -11766,8 +11767,8 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf(
     if (active) {
         const uint tail_off = (tree_mode != 0) ? tail_offsets[row] : 0u;
         for (uint j0 = p0; j0 < p1; j0 += 4) {
-            half4 k4[4];
-            half4 v4[4];
+            half4 kbuf[4];
+            half4 vbuf[4];
             for (uint jj = 0; jj < 4; ++jj) {
                 const uint j = j0 + jj;
                 if (j < p1) {
@@ -11775,17 +11776,19 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf(
                         ? tail_slots[tail_off + j - tree_base]
                         : j;
                     const uint off = kv_base + slot * position_stride + lane * 4;
-                    k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
-                    v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+                    kbuf[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                    vbuf[jj] = *reinterpret_cast<device const half4*>(values + off);
                 } else {
-                    k4[jj] = half4(0.0h);
-                    v4[jj] = half4(0.0h);
+                    kbuf[jj] = half4(0.0h);
+                    vbuf[jj] = half4(0.0h);
                 }
             }
             float s4[4];
             for (uint jj = 0; jj < 4; ++jj) {
-                if (j0 + jj < p1) {
-                    s4[jj] = simd_sum(dot(float4(k4[jj]), q4));
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const half4 k4 = kbuf[jj];
+                    s4[jj] = simd_sum(dot(float4(k4), q4));
                 } else {
                     s4[jj] = -INFINITY;
                 }
@@ -11799,8 +11802,106 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf(
             }
             acc *= corr;
             for (uint jj = 0; jj < 4; ++jj) {
-                if (j0 + jj < p1) {
-                    acc += w4[jj] * float4(v4[jj]);
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const half4 v4 = vbuf[jj];
+                    acc += w4[jj] * float4(v4);
+                }
+            }
+            l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
+            m = m_new;
+        }
+        device float* dst = partials
+            + ((((ulong)row * n_heads + qh) * max_splits + split) * (128 + 2));
+        dst[lane * 4] = acc.x;
+        dst[lane * 4 + 1] = acc.y;
+        dst[lane * 4 + 2] = acc.z;
+        dst[lane * 4 + 3] = acc.w;
+        if (lane == 0) {
+            dst[128] = m;
+            dst[129] = l;
+        }
+    }
+}
+
+// Minimal perturbation: the K load and the dot stay exactly where the batch kernel has
+// them; only the four V loads of a step move up beside the K loads, so the value bytes
+// are already in flight while the step's max/exp work runs.
+kernel void attention_decode_splitk_kv16_direct_batch_pfv(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* partials [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& max_splits [[buffer(13)]],
+    device const uint2* row_meta [[buffer(14)]],
+    device const uint* tail_offsets [[buffer(15)]],
+    device const uint* tail_slots [[buffer(16)]],
+    constant uint& tree_base [[buffer(17)]],
+    constant uint& tree_mode [[buffer(18)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint row = tg.z;
+    const uint position_count = row_meta[row].x;
+    const uint n_splits = row_meta[row].y;
+    if (split >= n_splits) return;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float4 q4 = float4(0.0f);
+    if (active) {
+        const ulong q_base = ((ulong)row * n_heads + qh) * 128;
+        q4 = *reinterpret_cast<device const float4*>(query + q_base + lane * 4) * scale;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float4 acc = float4(0.0f);
+    if (active) {
+        for (uint j0 = p0; j0 < p1; j0 += 4) {
+            half4 vbuf[4];
+            float s4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const uint slot = (tree_mode != 0 && j >= tree_base)
+                        ? tail_slots[tail_offsets[row] + j - tree_base]
+                        : j;
+                    vbuf[jj] = *reinterpret_cast<device const half4*>(
+                        values + kv_base + slot * position_stride + lane * 4);
+                    const half4 k4 = *reinterpret_cast<device const half4*>(
+                        keys + kv_base + slot * position_stride + lane * 4);
+                    s4[jj] = simd_sum(dot(float4(k4), q4));
+                } else {
+                    s4[jj] = -INFINITY;
+                }
+            }
+            const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+            const float m_new = max(m, m4);
+            const float corr = exp(m - m_new);
+            float w4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+            }
+            acc *= corr;
+            for (uint jj = 0; jj < 4; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const half4 v4 = vbuf[jj];
+                    acc += w4[jj] * float4(v4);
                 }
             }
             l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
@@ -11901,8 +12002,10 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf2(
             }
             float s4[4];
             for (uint jj = 0; jj < 4; ++jj) {
-                if (j0 + jj < p1) {
-                    s4[jj] = simd_sum(dot(float4(kcur[jj]), q4));
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const half4 k4 = kcur[jj];
+                    s4[jj] = simd_sum(dot(float4(k4), q4));
                 } else {
                     s4[jj] = -INFINITY;
                 }
@@ -11916,8 +12019,10 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf2(
             }
             acc *= corr;
             for (uint jj = 0; jj < 4; ++jj) {
-                if (j0 + jj < p1) {
-                    acc += w4[jj] * float4(vcur[jj]);
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const half4 v4 = vcur[jj];
+                    acc += w4[jj] * float4(v4);
                 }
             }
             l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
@@ -13078,6 +13183,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let attention_decode_splitk_kv16_direct_batch_pfv_pipeline = elementwise_library
+                .get_function("attention_decode_splitk_kv16_direct_batch_pfv", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let attention_decode_splitk_merge_batch_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_batch_f32", None)
                 .ok()?;
@@ -13605,6 +13718,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_kv16_direct_rowshare_pipeline,
                 attention_decode_splitk_kv16_direct_batch_pf_pipeline,
                 attention_decode_splitk_kv16_direct_batch_pf2_pipeline,
+                attention_decode_splitk_kv16_direct_batch_pfv_pipeline,
                 attention_decode_splitk_merge_batch_pipeline,
                 attention_decode_splitk_kvq8_pipeline,
                 kv_dequant_q8_to_h_pipeline,
@@ -23184,6 +23298,8 @@ fn verify_attention_rowshare_rows_per_tg() -> usize {
 enum AttentionRowshareMode {
     /// Batch grid, K and V of a step loaded together.
     Prefetch,
+    /// Batch grid, only the V loads of a step hoisted beside the K loads.
+    PrefetchV,
     /// Batch grid, next step's K/V in flight during this step's arithmetic.
     Prefetch2,
     /// Row-colocated chains (geometry study; `..._CHAINS`/`..._ORDER` knobs).
@@ -23193,6 +23309,7 @@ enum AttentionRowshareMode {
 #[cfg(target_os = "macos")]
 fn attention_rowshare_mode_from_env(value: Option<&str>) -> AttentionRowshareMode {
     match value.map(str::trim) {
+        Some("pfv") => AttentionRowshareMode::PrefetchV,
         Some("pf2") => AttentionRowshareMode::Prefetch2,
         Some("chains") => AttentionRowshareMode::Chains,
         _ => AttentionRowshareMode::Prefetch,
@@ -23616,6 +23733,9 @@ enum SplitkRowsEncode {
     /// Batch grid, next step's K/V in flight during this step:
     /// `attention_decode_splitk_kv16_direct_batch_pf2`.
     Prefetch2,
+    /// Batch grid, only the V loads hoisted:
+    /// `attention_decode_splitk_kv16_direct_batch_pfv`.
+    PrefetchV,
 }
 
 /// Low-level row-wise-vs-row-dimensional F16 split-K driver.  `tree` is the
@@ -23657,6 +23777,13 @@ fn try_attention_splitk_kv16_rows_for_test(
             admitted_32_lane_pipeline(
                 metal_linear_kernel()?
                     .attention_decode_splitk_kv16_direct_batch_pf2_pipeline
+                    .as_ref(),
+            )?,
+        ),
+        SplitkRowsEncode::PrefetchV => Some(
+            admitted_32_lane_pipeline(
+                metal_linear_kernel()?
+                    .attention_decode_splitk_kv16_direct_batch_pfv_pipeline
                     .as_ref(),
             )?,
         ),
@@ -24781,6 +24908,9 @@ fn encode_attention_splitk_kv16_batch(
         }
         Some(AttentionRowshareMode::Prefetch2) if head_dim == 128 => {
             admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf2_pipeline.as_ref())
+        }
+        Some(AttentionRowshareMode::PrefetchV) if head_dim == 128 => {
+            admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pfv_pipeline.as_ref())
         }
         _ => None,
     };
@@ -46744,6 +46874,7 @@ mod tests {
             (Some("pf"), AttentionRowshareMode::Prefetch),
             (Some("nonsense"), AttentionRowshareMode::Prefetch),
             (Some("pf2"), AttentionRowshareMode::Prefetch2),
+            (Some("pfv"), AttentionRowshareMode::PrefetchV),
             (Some(" chains "), AttentionRowshareMode::Chains),
         ] {
             assert_eq!(attention_rowshare_mode_from_env(value), expected, "mode {value:?}");
@@ -46830,6 +46961,7 @@ mod tests {
                     {
                         encodes.extend([
                             SplitkRowsEncode::Prefetch,
+                            SplitkRowsEncode::PrefetchV,
                             SplitkRowsEncode::Prefetch2,
                             SplitkRowsEncode::RowShare(8, true),
                             SplitkRowsEncode::RowShare(4, true),
@@ -46964,6 +47096,10 @@ mod tests {
             "direct_batch_pf2",
             kernel.attention_decode_splitk_kv16_direct_batch_pf2_pipeline.as_ref(),
         );
+        report(
+            "direct_batch_pfv",
+            kernel.attention_decode_splitk_kv16_direct_batch_pfv_pipeline.as_ref(),
+        );
         for base in [543usize, 800, 4_137] {
             let max_positions = base + rows;
             let position_counts: Vec<usize> = (1..=rows).map(|row| base + row).collect();
@@ -47001,6 +47137,7 @@ mod tests {
                 ("row", SplitkRowsEncode::RowWise),
                 ("batch", SplitkRowsEncode::Batch),
                 ("prefetch", SplitkRowsEncode::Prefetch),
+                ("prefetchV", SplitkRowsEncode::PrefetchV),
                 ("prefetch2", SplitkRowsEncode::Prefetch2),
                 ("shared", SplitkRowsEncode::SharedPrefix),
                 ("chains8kvh", SplitkRowsEncode::RowShare(8, true)),
