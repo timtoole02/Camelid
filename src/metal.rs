@@ -11777,11 +11777,18 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf(
                     const uint off = kv_base + slot * position_stride + lane * 4;
                     k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
                     v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+                } else {
+                    k4[jj] = half4(0.0h);
+                    v4[jj] = half4(0.0h);
                 }
             }
             float s4[4];
             for (uint jj = 0; jj < 4; ++jj) {
-                s4[jj] = (j0 + jj < p1) ? simd_sum(dot(float4(k4[jj]), q4)) : -INFINITY;
+                if (j0 + jj < p1) {
+                    s4[jj] = simd_sum(dot(float4(k4[jj]), q4));
+                } else {
+                    s4[jj] = -INFINITY;
+                }
             }
             const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
             const float m_new = max(m, m4);
@@ -11857,8 +11864,10 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf2(
     float4 acc = float4(0.0f);
     if (active) {
         const uint tail_off = (tree_mode != 0) ? tail_offsets[row] : 0u;
-        half4 k4[4];
-        half4 v4[4];
+        half4 kcur[4];
+        half4 vcur[4];
+        half4 knext[4];
+        half4 vnext[4];
         // Prologue: the first step's loads.
         for (uint jj = 0; jj < 4; ++jj) {
             const uint j = p0 + jj;
@@ -11867,29 +11876,36 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf2(
                     ? tail_slots[tail_off + j - tree_base]
                     : j;
                 const uint off = kv_base + slot * position_stride + lane * 4;
-                k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
-                v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+                kcur[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                vcur[jj] = *reinterpret_cast<device const half4*>(values + off);
+            } else {
+                kcur[jj] = half4(0.0h);
+                vcur[jj] = half4(0.0h);
             }
         }
         for (uint j0 = p0; j0 < p1; j0 += 4) {
-            const half4 k_cur[4] = {k4[0], k4[1], k4[2], k4[3]};
-            const half4 v_cur[4] = {v4[0], v4[1], v4[2], v4[3]};
-            // Issue the next step's loads before consuming this one.
-            const uint j0n = j0 + 4;
+            // Issue the next step's loads before consuming this step's registers.
             for (uint jj = 0; jj < 4; ++jj) {
-                const uint j = j0n + jj;
+                const uint j = j0 + 4 + jj;
                 if (j < p1) {
                     const uint slot = (tree_mode != 0 && j >= tree_base)
                         ? tail_slots[tail_off + j - tree_base]
                         : j;
                     const uint off = kv_base + slot * position_stride + lane * 4;
-                    k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
-                    v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+                    knext[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                    vnext[jj] = *reinterpret_cast<device const half4*>(values + off);
+                } else {
+                    knext[jj] = half4(0.0h);
+                    vnext[jj] = half4(0.0h);
                 }
             }
             float s4[4];
             for (uint jj = 0; jj < 4; ++jj) {
-                s4[jj] = (j0 + jj < p1) ? simd_sum(dot(float4(k_cur[jj]), q4)) : -INFINITY;
+                if (j0 + jj < p1) {
+                    s4[jj] = simd_sum(dot(float4(kcur[jj]), q4));
+                } else {
+                    s4[jj] = -INFINITY;
+                }
             }
             const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
             const float m_new = max(m, m4);
@@ -11901,11 +11917,15 @@ kernel void attention_decode_splitk_kv16_direct_batch_pf2(
             acc *= corr;
             for (uint jj = 0; jj < 4; ++jj) {
                 if (j0 + jj < p1) {
-                    acc += w4[jj] * float4(v_cur[jj]);
+                    acc += w4[jj] * float4(vcur[jj]);
                 }
             }
             l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
             m = m_new;
+            for (uint jj = 0; jj < 4; ++jj) {
+                kcur[jj] = knext[jj];
+                vcur[jj] = vnext[jj];
+            }
         }
         device float* dst = partials
             + ((((ulong)row * n_heads + qh) * max_splits + split) * (128 + 2));
