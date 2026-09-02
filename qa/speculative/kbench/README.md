@@ -16,7 +16,17 @@ qa/speculative/kbench/target/release/kbench q6kmma --rows 4096 --nsb 56
 `--iters N` controls timing repetitions. `KBENCH_SKIP_CHECK=1` disables the
 identity check for measurement-only experiments. `CAMELID_METAL_SOURCE` can
 point at another `metal.rs`; otherwise the tool resolves this repository's
-source relative to its manifest.
+source relative to its manifest. `KBENCH_REPS` sets dispatches per command
+buffer (default 8).
+
+Candidate kernels can be timed before they enter `metal.rs`:
+`KBENCH_EXTRA_METAL=<file>` appends benchmark-only kernels to the strict v2
+library; the generic cases `q4kcustomv4` / `q6kcustomv4` take the kernel from
+`KBENCH_CASE_MC`, the reference from `KBENCH_CASE_ORACLE`, rows per threadgroup
+and threads from `KBENCH_CASE_ROWS_PER_TG` / `KBENCH_CASE_THREADS`, and
+alternate activation staging kernels for the candidate only from
+`KBENCH_CASE_STAGE_Y` / `KBENCH_CASE_STAGE_YSUMS` (the oracle keeps production
+staging). `kbench <case> --check` compiles the library and exits.
 
 Useful Llama-3-8B Q4_K_M shapes:
 

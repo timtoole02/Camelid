@@ -3,8 +3,17 @@
 // production shapes. Also cross-checks the mc kernel against k single-token
 // dispatches bit-for-bit, so a kernel edit that breaks exactness fails HERE first.
 //
-// Usage: kbench [q4k|q5k|q6k|q4kv2|q6kv2|q4kmma|q6kmma|q4kv4|q6kv4|q4kv4w|q6kv4w]
-//               [--rows N] [--nsb N] [--iters N]
+// Usage: kbench [q4k|q5k|q6k|q4kv2|q6kv2|q4kmma|q6kmma|q4kv4|q6kv4|q4kv4w|q6kv4w
+//                |q4kreg2v4|q6kafragv4|q4kreg2sk4v4|q6kafragsk4v4|...]
+//               [--rows N] [--nsb N] [--iters N] [--seed N] [--sane]
+//
+// Cases with an `oracle` compare the candidate's k=1..=8 output words (as u32
+// bits) against that reference kernel over the same zero-padded staging the
+// production route uses; KBENCH_REPS (default 8) sets the dispatches per
+// command buffer so per-dispatch launch cost can be amortized like production.
+// The production register-exact pair is q4kreg2v4 / q6kafragv4 and their
+// split-K twins (CAMELID_KQUANT_V4_REGISTER_EXACT_SPLITK) are q4kreg2sk4v4 /
+// q6kafragsk4v4.
 use metal::*;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -40,7 +49,19 @@ fn extract_v2_shader() -> String {
     let start_tag = "const KQUANT_V2_SHADER: &str = r#\"";
     let s = src.find(start_tag).expect("v2 shader start") + start_tag.len();
     let e = src[s..].find("\"#;").expect("v2 shader end") + s;
-    src[s..e].to_string()
+    let mut text = src[s..e].to_string();
+    // KBENCH_EXTRA_METAL=<file>: benchmark-only kernels appended to the strict
+    // v2 library (same compile options), so candidates can be timed before
+    // they enter metal.rs.
+    if let Some(extra) = std::env::var_os("KBENCH_EXTRA_METAL").filter(|v| !v.is_empty()) {
+        text.push('\n');
+        text.push_str(&std::fs::read_to_string(&extra).expect("read KBENCH_EXTRA_METAL"));
+    }
+    text
+}
+
+fn env_str(name: &str) -> Option<&'static str> {
+    std::env::var(name).ok().map(|v| &*Box::leak(v.into_boxed_str()))
 }
 
 fn extract_v3_shader() -> String {
@@ -77,6 +98,37 @@ struct Case {
     single: &'static str,
     mc: &'static str,
     tiled: &'static str,
+    /// Output rows covered by one `mc` threadgroup (grid = ceil(rows / this)).
+    mc_rows_per_tg: usize,
+    /// Reference kernel (same ABI family as `mc`) whose k=1..=8 output words the
+    /// candidate must reproduce bit-for-bit. For v3 cases the oracle is the
+    /// single-column kernel dispatched k times.
+    oracle: Option<&'static str>,
+    /// Threads per `mc` threadgroup (32 = one SIMD group; split-K kernels use more).
+    mc_threads: u64,
+}
+
+/// splitmix64 finaliser: seed-dependent deterministic test data.
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
+}
+
+/// f32 -> IEEE half bits, round-to-nearest-even (normal range only).
+fn f16_bits(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 31) & 1) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = b & 0x7f_ffff;
+    assert!((1..31).contains(&exp), "f16_bits: value {v} outside the normal half range");
+    let mut h = (sign << 15) | ((exp as u16) << 10) | ((mant >> 13) as u16);
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+        h += 1;
+    }
+    h
 }
 
 fn main() {
@@ -95,6 +147,22 @@ fn main() {
     let iters = getn("--iters", 30);
 
     let device = Device::system_default().expect("metal device");
+    if args.iter().any(|a| a == "--check") {
+        // Compile the strict v2 library (plus KBENCH_EXTRA_METAL) and exit:
+        // a fast syntax gate before a long timing batch.
+        let strict = CompileOptions::new();
+        strict.set_fast_math_enabled(false);
+        match device.new_library_with_source(&extract_v2_shader(), &strict) {
+            Ok(_) => {
+                println!("kbench --check: v2 shader (+extra) compiles");
+                return;
+            }
+            Err(err) => {
+                eprintln!("kbench --check: COMPILE ERROR\n{err}");
+                std::process::exit(3);
+            }
+        }
+    }
     let queue = device.new_command_queue();
     let options = CompileOptions::new();
     let lib = device
@@ -107,8 +175,12 @@ fn main() {
     let is_v4_wide = which == "q4kv4w" || which == "q6kv4w";
     let is_v4 = which.ends_with("v4") || is_v4_wide;
     let is_mma = which == "q4kmma" || which == "q6kmma" || is_v4;
-    let is_mma_q6 = which == "q6kmma" || which == "q6kv4" || which == "q6kv4w";
+    let is_mma_q6 = is_mma && which.starts_with("q6k");
     let is_v3 = which.ends_with("v3");
+    let seed = getn("--seed", 0) as u64;
+    // --sane: rewrite every block's f16 `d` into a finite, small positive value
+    // so no row is masked by NaN/Inf and every word is a live comparison.
+    let sane_d = args.iter().any(|a| a == "--sane");
     let is_v2 = which.ends_with("v2") || is_mma;
     let case = match which {
         "q4k" => Case {
@@ -118,6 +190,9 @@ fn main() {
             single: "q4k_linear_simd",
             mc: "q4k_linear_simd_mc",
             tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 1,
+            oracle: None,
+            mc_threads: 32,
         },
         "q5k" => Case {
             name: "q5k",
@@ -126,6 +201,9 @@ fn main() {
             single: "q5k_linear_simd",
             mc: "q5k_linear_simd_mc",
             tiled: "q5k_linear_tiled",
+            mc_rows_per_tg: 1,
+            oracle: None,
+            mc_threads: 32,
         },
         "q6k" => Case {
             name: "q6k",
@@ -134,6 +212,9 @@ fn main() {
             single: "q6k_linear_simd",
             mc: "q6k_linear_simd_mc",
             tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 1,
+            oracle: None,
+            mc_threads: 32,
         },
         "q4kv2" => Case {
             name: "q4kv2",
@@ -142,6 +223,9 @@ fn main() {
             single: "q4k_linear_simd_v2",
             mc: "q4k_linear_simd_mc_v2",
             tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 1,
+            oracle: None,
+            mc_threads: 32,
         },
         "q4kmma" => Case {
             name: "q4kmma",
@@ -150,6 +234,9 @@ fn main() {
             single: "q4k_linear_simd_v2",
             mc: "q4k_linear_mma_mc_v2",
             tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
         },
         "q6kmma" => Case {
             name: "q6kmma",
@@ -158,6 +245,9 @@ fn main() {
             single: "q6k_linear_simd_v2",
             mc: "q6k_linear_mma_mc_v2",
             tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
         },
         "q4kv4" => Case {
             name: "q4kv4",
@@ -166,6 +256,9 @@ fn main() {
             single: "q4k_linear_mma_combined_v4",
             mc: "q4k_linear_mma_combined_v4",
             tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
         },
         "q6kv4" => Case {
             name: "q6kv4",
@@ -174,6 +267,9 @@ fn main() {
             single: "q6k_linear_mma_combined_v4",
             mc: "q6k_linear_mma_combined_v4",
             tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
         },
         "q4kv4w" => Case {
             name: "q4kv4w",
@@ -182,6 +278,9 @@ fn main() {
             single: "q4k_linear_mma_combined_v4",
             mc: "q4k_linear_mma_combined_w16_v4",
             tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 64,
         },
         "q6kv4w" => Case {
             name: "q6kv4w",
@@ -190,6 +289,9 @@ fn main() {
             single: "q6k_linear_mma_combined_v4",
             mc: "q6k_linear_mma_combined_w16_v4",
             tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 64,
         },
         "q5kv2" => Case {
             name: "q5kv2",
@@ -198,6 +300,9 @@ fn main() {
             single: "q5k_linear_simd_v2",
             mc: "q5k_linear_simd_mc_v2",
             tiled: "q5k_linear_tiled",
+            mc_rows_per_tg: 1,
+            oracle: None,
+            mc_threads: 32,
         },
         "q6kv2" => Case {
             name: "q6kv2",
@@ -206,6 +311,9 @@ fn main() {
             single: "q6k_linear_simd_v2",
             mc: "q6k_linear_simd_mc_v2",
             tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 1,
+            oracle: None,
+            mc_threads: 32,
         },
         "q4kv3" => Case {
             name: "q4kv3",
@@ -214,6 +322,9 @@ fn main() {
             single: "q4k_linear_f32_v3",
             mc: "q4k_linear_f32_mc_v3",
             tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 4,
+            oracle: None,
+            mc_threads: 32,
         },
         "q6kv3" => Case {
             name: "q6kv3",
@@ -222,7 +333,418 @@ fn main() {
             single: "q6k_linear_f32_v3",
             mc: "q6k_linear_f32_mc_v3",
             tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 4,
+            oracle: None,
+            mc_threads: 32,
         },
+        "q6kafragv4" => Case {
+            name: "q6kafragv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_afrag_v4",
+            mc: "q6k_linear_mma_combined_afrag_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_mma_combined_direct_v4"),
+            mc_threads: 32,
+        },
+        "q6kafrag2v4" => Case {
+            name: "q6kafrag2v4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_afrag2_v4",
+            mc: "q6k_linear_mma_combined_afrag2_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: Some("q6k_linear_mma_combined_direct_v4"),
+            mc_threads: 32,
+        },
+        "q6kdirectv4" => Case {
+            name: "q6kdirectv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_direct_v4",
+            mc: "q6k_linear_mma_combined_direct_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_mma_combined_v4"),
+            mc_threads: 32,
+        },
+        "q6kr2v3" => Case {
+            name: "q6kr2v3",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_f32_v3",
+            mc: "q6k_linear_f32_mc_reg2_v3",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 4,
+            oracle: Some("q6k_linear_f32_v3"),
+            mc_threads: 32,
+        },
+        "q6kr4v3" => Case {
+            name: "q6kr4v3",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_f32_v3",
+            mc: "q6k_linear_f32_mc_reg4_v3",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_f32_v3"),
+            mc_threads: 32,
+        },
+        "q6kdiagmmav4" => Case {
+            name: "q6kdiagmmav4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_afrag_diag_mma_v4",
+            mc: "q6k_afrag_diag_mma_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q6kdiagdecv4" => Case {
+            name: "q6kdiagdecv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_afrag_diag_decode_v4",
+            mc: "q6k_afrag_diag_decode_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q6kdiagloadv4" => Case {
+            name: "q6kdiagloadv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_afrag_diag_load_v4",
+            mc: "q6k_afrag_diag_load_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q6kafragbv4" => Case {
+            name: "q6kafragbv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_afragb_v4",
+            mc: "q6k_linear_mma_combined_afragb_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_mma_combined_direct_v4"),
+            mc_threads: 32,
+        },
+        "q6kdiagmmaonlyv4" => Case {
+            name: "q6kdiagmmaonlyv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_afrag_diag_mmaonly_v4",
+            mc: "q6k_afrag_diag_mmaonly_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q6kdiagbloadv4" => Case {
+            name: "q6kdiagbloadv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_afrag_diag_bload_v4",
+            mc: "q6k_afrag_diag_bload_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q6kstgv4" => Case {
+            name: "q6kstgv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_stg_v4",
+            mc: "q6k_linear_mma_combined_stg_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_mma_combined_direct_v4"),
+            mc_threads: 32,
+        },
+        "q6kstg2v4" => Case {
+            name: "q6kstg2v4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_stg2_v4",
+            mc: "q6k_linear_mma_combined_stg2_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: Some("q6k_linear_mma_combined_direct_v4"),
+            mc_threads: 32,
+        },
+        "q6kafragpv4" => Case {
+            name: "q6kafragpv4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_afragp_v4",
+            mc: "q6k_linear_mma_combined_afragp_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_mma_combined_direct_v4"),
+            mc_threads: 32,
+        },
+        "q6kafragp2v4" => Case {
+            name: "q6kafragp2v4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_afragp2_v4",
+            mc: "q6k_linear_mma_combined_afragp2_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: Some("q6k_linear_mma_combined_direct_v4"),
+            mc_threads: 32,
+        },
+        "q6kdiagload8v4" => Case {
+            name: "q6kdiagload8v4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_afrag_diag_load8_v4",
+            mc: "q6k_afrag_diag_load8_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q6kdiagload32v4" => Case {
+            name: "q6kdiagload32v4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_afrag_diag_load32_v4",
+            mc: "q6k_afrag_diag_load32_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q4kreg2v4" => Case {
+            name: "q4kreg2v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg2_v4",
+            mc: "q4k_linear_mma_combined_reg2_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: Some("q4k_linear_mma_combined_v4"),
+            mc_threads: 32,
+        },
+        "q4kdirectv4" => Case {
+            name: "q4kdirectv4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_direct_v4",
+            mc: "q4k_linear_mma_combined_direct_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q4k_linear_mma_combined_v4"),
+            mc_threads: 32,
+        },
+        "q4kreg2sk2v4" => Case {
+            name: "q4kreg2sk2v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg2_sk2_v4",
+            mc: "q4k_linear_mma_combined_reg2_sk2_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 64,
+        },
+        "q4kreg2sk4v4" => Case {
+            name: "q4kreg2sk4v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg2_sk4_v4",
+            mc: "q4k_linear_mma_combined_reg2_sk4_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 128,
+        },
+        "q4kreg1sk4v4" => Case {
+            name: "q4kreg1sk4v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg1_sk4_v4",
+            mc: "q4k_linear_mma_combined_reg1_sk4_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 128,
+        },
+        "q4kreg1sk2v4" => Case {
+            name: "q4kreg1sk2v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg1_sk2_v4",
+            mc: "q4k_linear_mma_combined_reg1_sk2_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 64,
+        },
+        "q6kafragsk2v4" => Case {
+            name: "q6kafragsk2v4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_afrag_sk2_v4",
+            mc: "q6k_linear_mma_combined_afrag_sk2_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_mma_combined_afrag_v4"),
+            mc_threads: 64,
+        },
+        "q6kafragsk4v4" => Case {
+            name: "q6kafragsk4v4",
+            block_bytes: 210,
+            scratch_ints_per_sb: 0,
+            single: "q6k_linear_mma_combined_afrag_sk4_v4",
+            mc: "q6k_linear_mma_combined_afrag_sk4_v4",
+            tiled: "q6k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q6k_linear_mma_combined_afrag_v4"),
+            mc_threads: 128,
+        },
+        "q4kdiagloadv4" => Case {
+            name: "q4kdiagloadv4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_reg2_diag_load_v4",
+            mc: "q4k_reg2_diag_load_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q4kdiagload16v4" => Case {
+            name: "q4kdiagload16v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_reg2_diag_load16_v4",
+            mc: "q4k_reg2_diag_load16_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q4kdiagmmav4" => Case {
+            name: "q4kdiagmmav4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_reg2_diag_mma_v4",
+            mc: "q4k_reg2_diag_mma_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q4kdiagbmmav4" => Case {
+            name: "q4kdiagbmmav4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_reg2_diag_bmma_v4",
+            mc: "q4k_reg2_diag_bmma_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q4kreg2pv4" => Case {
+            name: "q4kreg2pv4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg2p_v4",
+            mc: "q4k_linear_mma_combined_reg2p_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 32,
+        },
+        "q4kreg4pv4" => Case {
+            name: "q4kreg4pv4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg4p_v4",
+            mc: "q4k_linear_mma_combined_reg4p_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 32,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 32,
+        },
+        "q4kreg4v4" => Case {
+            name: "q4kreg4v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg4_v4",
+            mc: "q4k_linear_mma_combined_reg4_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 32,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 32,
+        },
+        "q4kreg1v4" => Case {
+            name: "q4kreg1v4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_linear_mma_combined_reg1_v4",
+            mc: "q4k_linear_mma_combined_reg1_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 8,
+            oracle: Some("q4k_linear_mma_combined_reg2_v4"),
+            mc_threads: 32,
+        },
+        "q4kdiagmmaonlyv4" => Case {
+            name: "q4kdiagmmaonlyv4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_reg2_diag_mmaonly_v4",
+            mc: "q4k_reg2_diag_mmaonly_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: None,
+            mc_threads: 32,
+        },
+        "q4kdiagnullv4" => Case {
+            name: "q4kdiagnullv4",
+            block_bytes: 144,
+            scratch_ints_per_sb: 0,
+            single: "q4k_reg2_diag_null_v4",
+            mc: "q4k_reg2_diag_null_v4",
+            tiled: "q4k_linear_tiled",
+            mc_rows_per_tg: 16,
+            oracle: None,
+            mc_threads: 32,
+        },
+        // Generic register-exact-ABI candidate: KBENCH_CASE_MC (kernel name),
+        // KBENCH_CASE_ORACLE (reference kernel, optional), KBENCH_CASE_ROWS_PER_TG
+        // (default 16 for Q4, 8 for Q6), KBENCH_CASE_THREADS (default 32).
+        "q4kcustomv4" | "q6kcustomv4" => {
+            let q6 = which == "q6kcustomv4";
+            Case {
+                name: if q6 { "q6kcustomv4" } else { "q4kcustomv4" },
+                block_bytes: if q6 { 210 } else { 144 },
+                scratch_ints_per_sb: 0,
+                single: env_str("KBENCH_CASE_MC").expect("KBENCH_CASE_MC"),
+                mc: env_str("KBENCH_CASE_MC").expect("KBENCH_CASE_MC"),
+                tiled: if q6 { "q6k_linear_tiled" } else { "q4k_linear_tiled" },
+                mc_rows_per_tg: std::env::var("KBENCH_CASE_ROWS_PER_TG")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(if q6 { 8 } else { 16 }),
+                oracle: env_str("KBENCH_CASE_ORACLE"),
+                mc_threads: std::env::var("KBENCH_CASE_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(32),
+            }
+        }
         other => panic!("unknown case {other}"),
     };
     let v2_lib = if is_v2 {
@@ -297,6 +819,21 @@ fn main() {
             .expect("ref single pipe")
     };
     let _ = case.tiled;
+    let oracle_pipe = case.oracle.map(|name| {
+        if is_v3 {
+            let f = v3_lib.as_ref().unwrap().get_function(name, None).expect(name);
+            device.new_compute_pipeline_state_with_function(&f).expect(name)
+        } else {
+            v2_pipe(name)
+        }
+    });
+    println!(
+        "{} pipelines: mc maxTotalThreadsPerThreadgroup={} (registers pressure proxy) | seed={} sane_d={}",
+        case.name,
+        mc.max_total_threads_per_threadgroup(),
+        seed,
+        sane_d
+    );
     let quantize = pipe("quantize_q8k_rows");
 
     let max_k = 16usize;
@@ -307,7 +844,12 @@ fn main() {
     for (i, y) in y_flat.iter_mut().enumerate() {
         let t = i / cols;
         let c = i % cols;
-        *y = ((((t * 131 + c * 17) % 251) as f32) - 125.0) * 0.017 + t as f32 * 0.0011;
+        *y = if seed == 0 {
+            ((((t * 131 + c * 17) % 251) as f32) - 125.0) * 0.017 + t as f32 * 0.0011
+        } else {
+            let h = mix64((i as u64) ^ (seed << 40) ^ 0xA5A5);
+            (((h & 0xffff) as f32) / 65535.0 - 0.5) * 4.2 + t as f32 * 0.0011
+        };
     }
     let buf_f32 = |data: &[f32]| {
         device.new_buffer_with_data(
@@ -361,7 +903,20 @@ fn main() {
     // Deterministic wire blocks.
     let mut wire = vec![0u8; rows * n_sb * case.block_bytes];
     for (i, b) in wire.iter_mut().enumerate() {
-        *b = ((i * 13 + i / 97 + 5) % 256) as u8;
+        *b = if seed == 0 {
+            ((i * 13 + i / 97 + 5) % 256) as u8
+        } else {
+            mix64((i as u64) ^ (seed << 40) ^ 0x5A5A) as u8
+        };
+    }
+    if sane_d && case.block_bytes == 210 {
+        for blk in 0..rows * n_sb {
+            let h = mix64((blk as u64) ^ (seed << 40) ^ 0xD00D);
+            let v = 0.002f32 + 0.03f32 * ((h & 0xffff) as f32 / 65535.0);
+            let bits = f16_bits(v);
+            wire[blk * 210 + 208] = (bits & 0xff) as u8;
+            wire[blk * 210 + 209] = (bits >> 8) as u8;
+        }
     }
     let w_buf = device.new_buffer_with_data(
         wire.as_ptr() as *const _,
@@ -394,7 +949,12 @@ fn main() {
 
     // Repetitions per command buffer: amortizes the ~0.2 ms commit/wait latency
     // the same way production does (hundreds of dispatches per buffer).
-    const REPS: usize = 8;
+    let reps_env: usize = std::env::var("KBENCH_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    #[allow(non_snake_case)]
+    let REPS: usize = reps_env;
 
     // --- Reference: k single-token dispatches into out_single ------------------
     // Returns amortized ms for ONE set of k dispatches.
@@ -469,8 +1029,16 @@ fn main() {
     } else {
         None
     };
+    // KBENCH_CASE_STAGE_Y / KBENCH_CASE_STAGE_YSUMS: alternate activation
+    // staging kernels (same buffer sizes, permuted layout) used for the
+    // candidate dispatches only; the oracle keeps the production staging.
+    let mma_aux_cand = mma_aux.as_ref().map(|(sy, sys, yh, ys)| {
+        let sy2 = env_str("KBENCH_CASE_STAGE_Y").map(|n| v2_pipe(n)).unwrap_or_else(|| sy.clone());
+        let sys2 = env_str("KBENCH_CASE_STAGE_YSUMS").map(|n| v2_pipe(n)).unwrap_or_else(|| sys.clone());
+        (sy2, sys2, yh.clone(), ys.clone())
+    });
     let run_mma = |k: usize, timed_iters: usize| -> f64 {
-        let (stage_y, stage_ysums, y_half, ysums) = mma_aux.as_ref().unwrap();
+        let (stage_y, stage_ysums, y_half, ysums) = mma_aux_cand.as_ref().unwrap();
         let k_pad = if is_v4_wide { 16 } else { (k + 7) & !7 };
         let scalar = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
         unsafe {
@@ -541,12 +1109,12 @@ fn main() {
                 }
                 e.dispatch_thread_groups(
                     MTLSize {
-                        width: (rows as u64).div_ceil(8),
+                        width: (rows as u64).div_ceil(case.mc_rows_per_tg as u64),
                         height: 1,
                         depth: 1,
                     },
                     MTLSize {
-                        width: if is_v4_wide { 64 } else { 32 },
+                        width: case.mc_threads,
                         height: 1,
                         depth: 1,
                     },
@@ -576,7 +1144,7 @@ fn main() {
     // of every older scalar arithmetic universe.
     let run_v4_singles = |k: usize, timed_iters: usize| -> f64 {
         assert!(is_v4 && k <= if is_v4_wide { 16 } else { 8 });
-        let (stage_y, stage_ysums, y_staged, ysums) = mma_aux.as_ref().unwrap();
+        let (stage_y, stage_ysums, y_staged, ysums) = mma_aux_cand.as_ref().unwrap();
         let scalar = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
         unsafe {
             let p = scalar.contents() as *mut u32;
@@ -647,12 +1215,12 @@ fn main() {
                     }
                     e.dispatch_thread_groups(
                         MTLSize {
-                            width: (rows as u64).div_ceil(8),
+                            width: (rows as u64).div_ceil(case.mc_rows_per_tg as u64),
                             height: 1,
                             depth: 1,
                         },
                         MTLSize {
-                            width: 32,
+                            width: case.mc_threads,
                             height: 1,
                             depth: 1,
                         },
@@ -706,7 +1274,7 @@ fn main() {
                 e.dispatch_thread_groups(
                     MTLSize {
                         width: if is_v3 {
-                            (rows as u64).div_ceil(4)
+                            (rows as u64).div_ceil(case.mc_rows_per_tg as u64)
                         } else {
                             rows as u64
                         },
@@ -775,7 +1343,116 @@ fn main() {
         }
     };
 
+    // ORACLE (MMA ABI): the reference V4-family kernel over the very same staged
+    // activation tile (k_pad=8, n_tokens=k), grid ceil(rows/8), 32 threads.
+    let run_oracle_mma = |k: usize| {
+        let (stage_y, stage_ysums, y_half, ysums) = mma_aux.as_ref().unwrap();
+        let oracle = oracle_pipe.as_ref().unwrap();
+        let k_pad = 8usize;
+        let scalar = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let p = scalar.contents() as *mut u32;
+            *p = n_sb as u32;
+            *p.add(1) = rows as u32;
+            *p.add(2) = k as u32;
+            *p.add(3) = cols as u32;
+            *p.add(4) = k_pad as u32;
+        }
+        let cb = queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        e.set_compute_pipeline_state(stage_y);
+        e.set_buffer(0, Some(&quants_buf), 0);
+        e.set_buffer(1, Some(y_half), 0);
+        e.set_buffer(2, Some(&scalar), 12);
+        e.set_buffer(3, Some(&scalar), 8);
+        e.set_buffer(4, Some(&scalar), 16);
+        let total = (cols * k_pad) as u64;
+        let w = stage_y.thread_execution_width();
+        e.dispatch_thread_groups(
+            MTLSize { width: total.div_ceil(w), height: 1, depth: 1 },
+            MTLSize { width: w, height: 1, depth: 1 },
+        );
+        if !is_mma_q6 {
+            // Q4 oracles consume the staged 16-element activation sums too.
+            e.set_compute_pipeline_state(stage_ysums);
+            e.set_buffer(0, Some(&quants_buf), 0);
+            e.set_buffer(1, Some(ysums), 0);
+            e.set_buffer(2, Some(&scalar), 0);
+            e.set_buffer(3, Some(&scalar), 8);
+            e.set_buffer(4, Some(&scalar), 16);
+            let total = (n_sb * 16 * k_pad) as u64;
+            let w = stage_ysums.thread_execution_width();
+            e.dispatch_thread_groups(
+                MTLSize { width: total.div_ceil(w), height: 1, depth: 1 },
+                MTLSize { width: w, height: 1, depth: 1 },
+            );
+        }
+        e.set_compute_pipeline_state(oracle);
+        e.set_buffer(0, Some(&scales_buf), 0);
+        e.set_buffer(2, Some(&w_buf), 0);
+        e.set_buffer(3, Some(&out_ref), 0);
+        e.set_buffer(4, Some(&scalar), 0);
+        e.set_buffer(5, Some(&scalar), 4);
+        e.set_buffer(6, Some(&scalar), 8);
+        e.set_buffer(7, Some(y_half), 0);
+        if !is_mma_q6 {
+            e.set_buffer(8, Some(ysums), 0);
+        }
+        e.dispatch_thread_groups(
+            MTLSize { width: (rows as u64).div_ceil(8), height: 1, depth: 1 },
+            MTLSize { width: 32, height: 1, depth: 1 },
+        );
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    };
+
     let skip_check = std::env::var("KBENCH_SKIP_CHECK").is_ok();
+    if !skip_check && oracle_pipe.is_some() {
+        // Candidate mc(k) vs ORACLE(k), every output word as u32 bits, k = 1..=8.
+        let mut all_ok = true;
+        for k in 1..=8usize {
+            // Poison both outputs so a word the kernel never writes is caught.
+            unsafe {
+                std::ptr::write_bytes(out_mc.contents() as *mut u8, 0xEE, max_k * rows * 4);
+                std::ptr::write_bytes(out_ref.contents() as *mut u8, 0xDD, max_k * rows * 4);
+                std::ptr::write_bytes(out_single.contents() as *mut u8, 0xDD, max_k * rows * 4);
+            }
+            run_mc(k, 1);
+            let o: &[u32] = if is_v3 {
+                run_single_k(k, 1);
+                unsafe { std::slice::from_raw_parts(out_single.contents() as *const u32, k * rows) }
+            } else {
+                run_oracle_mma(k);
+                unsafe { std::slice::from_raw_parts(out_ref.contents() as *const u32, k * rows) }
+            };
+            let c = unsafe { std::slice::from_raw_parts(out_mc.contents() as *const u32, k * rows) };
+            let nonfinite = o.iter().filter(|w| !f32::from_bits(**w).is_finite()).count();
+            let bad: Vec<usize> = (0..k * rows).filter(|&i| o[i] != c[i]).collect();
+            if bad.is_empty() {
+                println!(
+                    "{} ORACLE {} k={} PASS ({} words, {} non-finite oracle words)",
+                    case.name, case.oracle.unwrap(), k, k * rows, nonfinite
+                );
+            } else {
+                all_ok = false;
+                let i = bad[0];
+                println!(
+                    "{} ORACLE {} k={} MISMATCH {} of {} words; first row={} col={} oracle={:#010x} ({}) candidate={:#010x} ({})",
+                    case.name, case.oracle.unwrap(), k, bad.len(), k * rows,
+                    i % rows, i / rows, o[i], f32::from_bits(o[i]), c[i], f32::from_bits(c[i])
+                );
+            }
+        }
+        if !all_ok {
+            println!("{} ORACLE SUMMARY: MISMATCH", case.name);
+            if std::env::var("KBENCH_CONTINUE_ON_MISMATCH").is_err() {
+                std::process::exit(2);
+            }
+        } else {
+            println!("{} ORACLE SUMMARY: PASS (k=1..=8, seed {})", case.name, seed);
+        }
+    }
     // Bit-identity: edited single(k dispatches) vs the HEAD oracle, k = 16 covers all columns.
     // v2 is its own bit-universe AND its own dispatch geometry, so the HEAD-oracle
     // dispatch does not apply there; single_v2 vs mc_v2 below is the real contract.
@@ -979,6 +1656,13 @@ kernel void probe128(device const uint4* w [[buffer(0)]], device float* out [[bu
         t1,
         weight_bytes / (t1 / 1000.0) / 1e9
     );
+    if oracle_pipe.is_some() && is_v3 {
+        let tc1 = run_mc(1, iters);
+        println!(
+            "{} candidate k=1 (mc kernel, n_tokens=1): {:.3} ms  ({:.1} GB/s) vs single {:.3} ms",
+            case.name, tc1, weight_bytes / (tc1 / 1000.0) / 1e9, t1
+        );
+    }
     let perf_ks: &[usize] = if is_v4_wide {
         &[8, 16]
     } else if is_v3 || is_v4 {

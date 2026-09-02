@@ -7065,6 +7065,467 @@ kernel void q6k_linear_mma_combined_afrag_seg3_v4(
     );
 }
 
+// ---- Register-exact V2: fragment-major activation panel -------------------
+// The register-exact kernels above read each B fragment with a simdgroup_load
+// from the [position][k_pad] panel: 32 (+2) tile loads per superblock, each a
+// dependent L2 access interleaved with the MMA chain. Attribution on the
+// 8192x12 gate/up shape shows that interleaving, not the MMA issue rate or the
+// weight stream, carries the remaining gap to the byte floor. The V2 twins
+// consume the same half values from a fragment-major panel: the pair lane L
+// needs for B fragment (superblock sb, K-chunk kk) sits at word
+// kquant_v4_yreg_word(sb, kk, L), so two uint4 loads cover K-chunks 8g..8g+7.
+// Every B fragment the MMA sees is bit-identical to the [position][k_pad]
+// panel's, the A operands, MMA order, zero-initialised C per superblock and
+// the increasing-superblock f32 tail are the register-exact bodies' statements
+// verbatim, so each output word is the same bit pattern the register-exact
+// kernels produce. Rows past the tensor decode a valid neighbour and are never
+// written (C rows are independent).
+inline uint kquant_v4_yreg_word(uint sb, uint kk, uint lane) {
+    return ((sb * 8 + (kk >> 2)) * 32 + lane) * 4 + (kk & 3u);
+}
+
+// y_reg[word][2] halves, word = kquant_v4_yreg_word(sb, kk, lane): element e
+// is column fcol0(lane)+e of position sb*256 + kk*8 + frow(lane). Same values
+// as q4k_mma_stage_y with k_pad = 8; zero for pad columns.
+kernel void q4k_mma_stage_y_reg(
+    device const char* input_quants [[buffer(0)]],
+    device half* y_reg [[buffer(1)]],
+    constant uint& width [[buffer(2)]],     // n_sb * 256
+    constant uint& n_tokens [[buffer(3)]],
+    constant uint& k_pad [[buffer(4)]],     // must be 8
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint total = width * 8;
+    if (gid >= total) return;
+    const uint w = gid >> 1;
+    const uint e = gid & 1u;
+    const uint c = w & 3u;
+    const uint lane = (w >> 2) & 31u;
+    const uint q = (w >> 7) & 7u;
+    const uint sb = w >> 10;
+    const uint kk = q * 4 + c;
+    const uint2 fc = kquant_v4_fragment_coord(lane);
+    const uint pos = sb * 256 + kk * 8 + fc.y;
+    const uint col = fc.x + e;
+    y_reg[gid] = (col < n_tokens && k_pad == 8)
+        ? half(int(input_quants[col * width + pos]))
+        : half(0.0f);
+}
+
+// ysums_reg: uint2 index sb*32 + lane, word m in {0,1}, element e: the
+// 16-sum for j16 = m*8 + frow(lane), column fcol0(lane)+e. Same values as
+// q4k_mma_stage_ysums (|sum| <= 2048: exact in half).
+kernel void q4k_mma_stage_ysums_reg(
+    device const char* input_quants [[buffer(0)]],
+    device half* ysums_reg [[buffer(1)]],
+    constant uint& n_sb [[buffer(2)]],
+    constant uint& n_tokens [[buffer(3)]],
+    constant uint& k_pad [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint total = n_sb * 16 * 8;
+    if (gid >= total) return;
+    const uint w = gid >> 1;
+    const uint e = gid & 1u;
+    const uint m = w & 1u;
+    const uint lane = (w >> 1) & 31u;
+    const uint sb = w >> 6;
+    const uint2 fc = kquant_v4_fragment_coord(lane);
+    const uint j16 = m * 8 + fc.y;
+    const uint col = fc.x + e;
+    if (col >= n_tokens || k_pad != 8) {
+        ysums_reg[gid] = half(0.0f);
+        return;
+    }
+    const uint width = n_sb * 256;
+    device const char* y = input_quants + col * width + sb * 256 + j16 * 16;
+    short s = 0;
+    for (uint i = 0; i < 16; ++i) {
+        s += short(y[i]);
+    }
+    ysums_reg[gid] = half(int(s));
+}
+
+// Q4_K register-exact V2 body: q4k_linear_mma_combined_reg_v4_body with the B
+// fragments of each 32-K group taken from two fragment-major uint4 loads.
+template <uint PANELS>
+inline void q4k_linear_mma_combined_reg_yg_v4_body(
+    device const float* input_scales,
+    device const uchar* weight_blocks,
+    device float* output,
+    uint n_sb,
+    uint rows,
+    uint n_tokens,
+    device const half* y_reg,
+    device const half* ysums_reg,
+    uint tile,
+    uint lane
+) {
+    const uint group_r0 = tile * 8 * PANELS;
+    if (group_r0 >= rows) return;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fcol0 = fragment_coord.x;
+    const uint frow = fragment_coord.y;
+    device const uint4* y4 = reinterpret_cast<device const uint4*>(y_reg);
+    device const uint2* ys2 = reinterpret_cast<device const uint2*>(ysums_reg);
+
+    uint out_row[PANELS];
+    uint safe_row[PANELS];
+    float accum[PANELS][2];
+    for (uint p = 0; p < PANELS; ++p) {
+        out_row[p] = group_r0 + p * 8 + frow;
+        safe_row[p] = min(out_row[p], rows - 1u);
+        accum[p][0] = 0.0f;
+        accum[p][1] = 0.0f;
+    }
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        half slo[PANELS][4];
+        half shi[PANELS][4];
+        half mnl[PANELS][2];
+        ushort wq[PANELS][16];
+        float dw[PANELS];
+        float dm[PANELS];
+        for (uint p = 0; p < PANELS; ++p) {
+            device const uchar* block = weight_blocks + (safe_row[p] * n_sb + sb) * 144;
+            uchar sc[8], mn[8];
+            q4k_scale_min_v2(block, sc, mn);
+            for (uint g = 0; g < 4; ++g) {
+                slo[p][g] = half(int(sc[2 * g]));
+                shi[p][g] = half(int(sc[2 * g + 1]));
+            }
+            mnl[p][0] = half(int(mn[fcol0 >> 1]));
+            mnl[p][1] = half(int(mn[4 + (fcol0 >> 1)]));
+            device const ushort* w16 =
+                reinterpret_cast<device const ushort*>(block + 16 + fcol0);
+            for (uint g = 0; g < 4; ++g) {
+                for (uint m = 0; m < 4; ++m) {
+                    wq[p][g * 4 + m] = w16[g * 16 + m * 4];
+                }
+            }
+            dw[p] = float(*reinterpret_cast<device const half*>(block));
+            dm[p] = float(*reinterpret_cast<device const half*>(block + 2));
+        }
+        const uint2 ysq = ys2[sb * 32 + lane];
+
+        simdgroup_float8x8 c_main[PANELS];
+        for (uint p = 0; p < PANELS; ++p) {
+            c_main[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (uint g = 0; g < 4; ++g) {
+            const uint4 ylo = y4[(sb * 8 + 2 * g) * 32 + lane];
+            const uint4 yhi = y4[(sb * 8 + 2 * g + 1) * 32 + lane];
+            for (uint m = 0; m < 4; ++m) {
+                simdgroup_half8x8 b;
+                const half2 bh = as_type<half2>(ylo[m]);
+                b.thread_elements()[0] = bh.x;
+                b.thread_elements()[1] = bh.y;
+                for (uint p = 0; p < PANELS; ++p) {
+                    const uint w = uint(wq[p][g * 4 + m]);
+                    simdgroup_half8x8 a;
+                    a.thread_elements()[0] = slo[p][g] * half(int(w & 0x0fu));
+                    a.thread_elements()[1] = slo[p][g] * half(int((w >> 8) & 0x0fu));
+                    simdgroup_multiply_accumulate(c_main[p], a, b, c_main[p]);
+                }
+            }
+            for (uint m = 0; m < 4; ++m) {
+                simdgroup_half8x8 b;
+                const half2 bh = as_type<half2>(yhi[m]);
+                b.thread_elements()[0] = bh.x;
+                b.thread_elements()[1] = bh.y;
+                for (uint p = 0; p < PANELS; ++p) {
+                    const uint w = uint(wq[p][g * 4 + m]);
+                    simdgroup_half8x8 a;
+                    a.thread_elements()[0] = shi[p][g] * half(int((w >> 4) & 0x0fu));
+                    a.thread_elements()[1] = shi[p][g] * half(int((w >> 12) & 0x0fu));
+                    simdgroup_multiply_accumulate(c_main[p], a, b, c_main[p]);
+                }
+            }
+        }
+        simdgroup_float8x8 c_min[PANELS];
+        for (uint p = 0; p < PANELS; ++p) {
+            c_min[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (uint m = 0; m < 2; ++m) {
+            simdgroup_half8x8 b;
+            const half2 bh = as_type<half2>(m == 0 ? ysq.x : ysq.y);
+            b.thread_elements()[0] = bh.x;
+            b.thread_elements()[1] = bh.y;
+            for (uint p = 0; p < PANELS; ++p) {
+                simdgroup_half8x8 a;
+                a.thread_elements()[0] = mnl[p][m];
+                a.thread_elements()[1] = mnl[p][m];
+                simdgroup_multiply_accumulate(c_min[p], a, b, c_min[p]);
+            }
+        }
+
+        for (uint p = 0; p < PANELS; ++p) {
+            if (out_row[p] < rows) {
+                for (uint cell = 0; cell < 2; ++cell) {
+                    const uint token = fcol0 + cell;
+                    if (token < n_tokens) {
+                        const float da = input_scales[token * n_sb + sb];
+                        accum[p][cell] += (dw[p] * da) * c_main[p].thread_elements()[cell]
+                                        - (dm[p] * da) * c_min[p].thread_elements()[cell];
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint p = 0; p < PANELS; ++p) {
+        if (out_row[p] < rows) {
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint token = fcol0 + cell;
+                if (token < n_tokens) {
+                    output[token * rows + out_row[p]] = accum[p][cell];
+                }
+            }
+        }
+    }
+}
+
+kernel void q4k_linear_mma_combined_reg_yg_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_reg [[buffer(7)]],
+    device const half* ysums_reg [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    q4k_linear_mma_combined_reg_yg_v4_body<1>(
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_reg, ysums_reg,
+        tile, lane
+    );
+}
+
+// Q6_K register-exact V2 body: q6k_linear_mma_combined_afrag_v4_body with the
+// B fragments of each 32-K group taken from two fragment-major uint4 loads,
+// fetched one group ahead of the MMAs that consume them (the final prefetch
+// re-reads an in-range group).
+template <uint PANELS>
+inline void q6k_linear_mma_combined_afrag_yg_v4_body(
+    device const float* input_scales,
+    device const uchar* weight_blocks,
+    device float* output,
+    uint n_sb,
+    uint rows,
+    uint n_tokens,
+    device const half* y_reg,
+    uint tile,
+    uint lane
+) {
+    const uint group_r0 = tile * (8u * PANELS);
+    if (group_r0 >= rows) return;
+    const uint2 fragment_coord = kquant_v4_fragment_coord(lane);
+    const uint fragment_column0 = fragment_coord.x;
+    const uint fragment_row = fragment_coord.y;
+    device const uint4* y4 = reinterpret_cast<device const uint4*>(y_reg);
+
+    uint out_row[PANELS];
+    uint safe_row[PANELS];
+    float accum[PANELS][2];
+    for (uint p = 0; p < PANELS; ++p) {
+        out_row[p] = group_r0 + p * 8u + fragment_row;
+        safe_row[p] = min(out_row[p], rows - 1u);
+        accum[p][0] = 0.0f;
+        accum[p][1] = 0.0f;
+    }
+
+    uint4 yn0 = y4[0u * 32 + lane];
+    uint4 yn1 = y4[1u * 32 + lane];
+
+    for (uint sb = 0; sb < n_sb; ++sb) {
+        simdgroup_float8x8 c_main[PANELS];
+        ushort wl[PANELS][8];
+        ushort wh[PANELS][8];
+        ushort wq[PANELS][8];
+        ushort ws[PANELS][8];
+        for (uint p = 0; p < PANELS; ++p) {
+            c_main[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            device const uchar* block =
+                weight_blocks + (safe_row[p] * n_sb + sb) * 210;
+            for (uint h = 0; h < 2; ++h) {
+                for (uint j = 0; j < 4; ++j) {
+                    const uint o = h * 64 + 8 * j + fragment_column0;
+                    wl[p][h * 4 + j] =
+                        *reinterpret_cast<device const ushort*>(block + o);
+                    wh[p][h * 4 + j] =
+                        *reinterpret_cast<device const ushort*>(block + o + 32);
+                    wq[p][h * 4 + j] = *reinterpret_cast<device const ushort*>(
+                        block + 128 + h * 32 + 8 * j + fragment_column0
+                    );
+                }
+            }
+            for (uint i = 0; i < 8; ++i) {
+                ws[p][i] =
+                    *reinterpret_cast<device const ushort*>(block + 192 + 2 * i);
+            }
+        }
+
+        for (uint g = 0; g < 4; ++g) {
+            const uint4 ylo = yn0;
+            const uint4 yhi = yn1;
+            const uint nsb = (g == 3) ? ((sb + 1u < n_sb) ? sb + 1u : sb) : sb;
+            const uint ng = (g == 3) ? 0u : g + 1u;
+            yn0 = y4[(nsb * 8 + 2 * ng) * 32 + lane];
+            yn1 = y4[(nsb * 8 + 2 * ng + 1) * 32 + lane];
+            for (uint i = 0; i < 8; ++i) {
+                const uint kk = g * 8 + i;
+                simdgroup_half8x8 b;
+                const half2 bh = as_type<half2>(i < 4 ? ylo[i] : yhi[i - 4]);
+                b.thread_elements()[0] = bh.x;
+                b.thread_elements()[1] = bh.y;
+                const uint h = kk >> 4;
+                const uint quarter = (kk >> 2) & 3u;
+                const uint j = kk & 3u;
+                const uint idx = h * 4 + j;
+                for (uint p = 0; p < PANELS; ++p) {
+                    const uint src = (quarter & 1u) ? uint(wh[p][idx]) : uint(wl[p][idx]);
+                    const uint nib = (quarter & 2u) ? ((src >> 4) & 0x0f0fu) : (src & 0x0f0fu);
+                    const uint hb = ((uint(wq[p][idx]) >> (2 * quarter)) & 0x0303u) << 4;
+                    const uint v = nib | hb;
+                    const uint sword = uint(ws[p][kk >> 2]);
+                    const int sc = int(char((sword >> (8 * ((kk >> 1) & 1u))) & 0xffu));
+                    const int a0 = int(v & 0xffu) - 32;
+                    const int a1 = int(v >> 8) - 32;
+                    simdgroup_half8x8 a;
+                    a.thread_elements()[0] = half(sc * a0);
+                    a.thread_elements()[1] = half(sc * a1);
+                    simdgroup_multiply_accumulate(c_main[p], a, b, c_main[p]);
+                }
+            }
+        }
+
+        for (uint p = 0; p < PANELS; ++p) {
+            if (out_row[p] < rows) {
+                device const uchar* block =
+                    weight_blocks + (out_row[p] * n_sb + sb) * 210;
+                const float dw = float(*reinterpret_cast<device const half*>(block + 208));
+                for (uint cell = 0; cell < 2; ++cell) {
+                    const uint token = fragment_column0 + cell;
+                    if (token < n_tokens) {
+                        const float da = input_scales[token * n_sb + sb];
+                        accum[p][cell] += (dw * da) * c_main[p].thread_elements()[cell];
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint p = 0; p < PANELS; ++p) {
+        if (out_row[p] < rows) {
+            for (uint cell = 0; cell < 2; ++cell) {
+                const uint token = fragment_column0 + cell;
+                if (token < n_tokens) {
+                    output[token * rows + out_row[p]] = accum[p][cell];
+                }
+            }
+        }
+    }
+}
+
+kernel void q6k_linear_mma_combined_afrag_yg_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_reg [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    q6k_linear_mma_combined_afrag_yg_v4_body<1>(
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_reg, tile, lane
+    );
+}
+
+// Segmented twins of the V2 pair (same segment resolution as the register-
+// exact seg3 kernels; both V2 bodies cover eight rows per tile).
+kernel void q4k_linear_mma_combined_reg_yg_seg3_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks0 [[buffer(2)]],
+    device float* output0 [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint* segment_rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_reg [[buffer(7)]],
+    device const half* ysums_reg [[buffer(8)]],
+    device const uchar* weight_blocks1 [[buffer(9)]],
+    device float* output1 [[buffer(10)]],
+    device const uchar* weight_blocks2 [[buffer(11)]],
+    device float* output2 [[buffer(12)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint tile_rows = 8u;
+    uint r0 = tile * tile_rows;
+    uint rows = segment_rows[0];
+    device const uchar* weight_blocks = weight_blocks0;
+    device float* output = output0;
+    if (r0 >= rows) {
+        r0 -= rows;
+        rows = segment_rows[1];
+        weight_blocks = weight_blocks1;
+        output = output1;
+        if (r0 >= rows) {
+            r0 -= rows;
+            rows = segment_rows[2];
+            weight_blocks = weight_blocks2;
+            output = output2;
+            if (r0 >= rows) return;
+        }
+    }
+    q4k_linear_mma_combined_reg_yg_v4_body<1>(
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_reg, ysums_reg,
+        r0 / tile_rows, lane
+    );
+}
+
+kernel void q6k_linear_mma_combined_afrag_yg_seg3_v4(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight_blocks0 [[buffer(2)]],
+    device float* output0 [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint* segment_rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    device const half* y_reg [[buffer(7)]],
+    device const uchar* weight_blocks1 [[buffer(9)]],
+    device float* output1 [[buffer(10)]],
+    device const uchar* weight_blocks2 [[buffer(11)]],
+    device float* output2 [[buffer(12)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint tile_rows = 8u;
+    uint r0 = tile * tile_rows;
+    uint rows = segment_rows[0];
+    device const uchar* weight_blocks = weight_blocks0;
+    device float* output = output0;
+    if (r0 >= rows) {
+        r0 -= rows;
+        rows = segment_rows[1];
+        weight_blocks = weight_blocks1;
+        output = output1;
+        if (r0 >= rows) {
+            r0 -= rows;
+            rows = segment_rows[2];
+            weight_blocks = weight_blocks2;
+            output = output2;
+            if (r0 >= rows) return;
+        }
+    }
+    q6k_linear_mma_combined_afrag_yg_v4_body<1>(
+        input_scales, weight_blocks, output, n_sb, rows, n_tokens, y_reg,
+        r0 / tile_rows, lane
+    );
+}
+
 
 "#;
 
@@ -18412,6 +18873,10 @@ struct KquantV4ActivationStage {
     input_width: usize,
     n_tokens: usize,
     k_pad: usize,
+    /// `y_stage`/`ysums` hold the fragment-major permutation written by the
+    /// `*_reg` staging kernels (same half values, same byte sizes); only the
+    /// register-exact V2 kernels may read such a stage.
+    fragment_major: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -18449,6 +18914,7 @@ fn allocate_kquant_v4_activation_stage(
     input_width: usize,
     n_tokens: usize,
     with_ysums: bool,
+    fragment_major: bool,
 ) -> KquantV4ActivationStage {
     debug_assert!(input_width > 0 && input_width.is_multiple_of(256));
     debug_assert!((1..=KQUANT_V4_MAX_COLUMNS).contains(&n_tokens));
@@ -18473,6 +18939,7 @@ fn allocate_kquant_v4_activation_stage(
         input_width,
         n_tokens,
         k_pad,
+        fragment_major: fragment_major && k_pad == 8,
     }
 }
 
@@ -18483,22 +18950,36 @@ fn encode_kquant_v4_activation_stage(
     quants: &Buffer,
     stage: &KquantV4ActivationStage,
 ) {
-    e.set_compute_pipeline_state(&v4.q4k_mma_stage_y);
+    // A fragment-major stage is only allocated while the V2 lane is active,
+    // which requires both `*_reg` staging pipelines to be admitted.
+    let (stage_y, stage_ysums) = if stage.fragment_major {
+        (
+            v4.q4k_mma_stage_y_reg
+                .as_ref()
+                .expect("fragment-major stage requires the admitted V2 staging pipelines"),
+            v4.q4k_mma_stage_ysums_reg
+                .as_ref()
+                .expect("fragment-major stage requires the admitted V2 staging pipelines"),
+        )
+    } else {
+        (&v4.q4k_mma_stage_y, &v4.q4k_mma_stage_ysums)
+    };
+    e.set_compute_pipeline_state(stage_y);
     e.set_buffer(0, Some(quants), 0);
     e.set_buffer(1, Some(&stage.y_stage), 0);
     e.set_buffer(2, Some(&stage.scalar), 12);
     e.set_buffer(3, Some(&stage.scalar), 8);
     e.set_buffer(4, Some(&stage.scalar), 16);
-    dispatch_1d(e, &v4.q4k_mma_stage_y, stage.input_width * stage.k_pad);
+    dispatch_1d(e, stage_y, stage.input_width * stage.k_pad);
 
     if let Some(ysums) = stage.ysums.as_ref() {
-        e.set_compute_pipeline_state(&v4.q4k_mma_stage_ysums);
+        e.set_compute_pipeline_state(stage_ysums);
         e.set_buffer(0, Some(quants), 0);
         e.set_buffer(1, Some(ysums), 0);
         e.set_buffer(2, Some(&stage.scalar), 0);
         e.set_buffer(3, Some(&stage.scalar), 8);
         e.set_buffer(4, Some(&stage.scalar), 16);
-        dispatch_1d(e, &v4.q4k_mma_stage_ysums, stage.n_sb * 16 * stage.k_pad);
+        dispatch_1d(e, stage_ysums, stage.n_sb * 16 * stage.k_pad);
     }
 }
 
@@ -18514,10 +18995,13 @@ fn encode_kquant_v4_strict_fused_stage(
     scales: &Buffer,
     stage: &KquantV4ActivationStage,
 ) -> bool {
+    // The strict fused kernel writes the [position][k_pad] panel; a
+    // fragment-major stage keeps the exact three-dispatch preparation.
     if !(1..=8).contains(&stage.n_tokens)
         || stage.k_pad != 8
         || stage.input_width == 0
         || !stage.input_width.is_multiple_of(256)
+        || stage.fragment_major
     {
         return false;
     }
@@ -18614,6 +19098,10 @@ fn encode_kquant_v4_prepared_projection_route(
     {
         return false;
     }
+    // A fragment-major panel is readable only by the register-exact V2 pair.
+    if stage.fragment_major && route != KquantV4ProjectionRoute::RegisterExact {
+        return false;
+    }
     let wide = stage.n_tokens > 8;
     let pipeline = match (is_q6k, wide, route) {
         (false, false, KquantV4ProjectionRoute::DirectFragment) => v4.q4k_v4_direct.as_ref(),
@@ -18624,8 +19112,20 @@ fn encode_kquant_v4_prepared_projection_route(
         (true, false, KquantV4ProjectionRoute::DirectSimdBarrier) => {
             v4.q6k_v4_direct_simdbarrier.as_ref()
         }
-        (false, false, KquantV4ProjectionRoute::RegisterExact) => v4.q4k_v4_register_exact.as_ref(),
-        (true, false, KquantV4ProjectionRoute::RegisterExact) => v4.q6k_v4_register_exact.as_ref(),
+        (false, false, KquantV4ProjectionRoute::RegisterExact) => {
+            if stage.fragment_major {
+                v4.q4k_v4_register_exact_v2.as_ref()
+            } else {
+                v4.q4k_v4_register_exact.as_ref()
+            }
+        }
+        (true, false, KquantV4ProjectionRoute::RegisterExact) => {
+            if stage.fragment_major {
+                v4.q6k_v4_register_exact_v2.as_ref()
+            } else {
+                v4.q6k_v4_register_exact.as_ref()
+            }
+        }
         (
             _,
             true,
@@ -18689,7 +19189,10 @@ fn encode_kquant_v4_prepared_projection_route(
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: rows.div_ceil(
-                if route == KquantV4ProjectionRoute::RegisterExact && !is_q6k {
+                if route == KquantV4ProjectionRoute::RegisterExact
+                    && !is_q6k
+                    && !stage.fragment_major
+                {
                     16
                 } else {
                     8
@@ -18771,6 +19274,13 @@ fn encode_kquant_v4_prepared_projection(
             rows,
             KquantV4ProjectionRoute::RegisterExact,
         );
+    // A fragment-major stage exists only while the V2 lane is active, which
+    // implies the register-exact request and admitted V2 pipelines; no other
+    // kernel may consume it, so a miss here must never fall through.
+    assert!(
+        !stage.fragment_major || used_register_exact,
+        "fragment-major V4 activation stage reached a non-register-exact route"
+    );
     if register_exact_requested && !used_register_exact {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -18831,15 +19341,28 @@ fn encode_kquant_v4_prepared_projection(
     } else {
         KquantV4ProjectionRoute::Synchronized
     };
-    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows, route);
+    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows, route, stage.fragment_major);
 }
 
-/// Rows one segmented register-exact tile owns: the Q4_K body covers two
-/// eight-row panels per threadgroup, the Q6_K body one.
-#[cfg(target_os = "macos")]
+/// Rows one segmented register-exact tile owns on a [position][k_pad] stage:
+/// the Q4_K body covers two eight-row panels per threadgroup, the Q6_K body
+/// one. Production resolves the layout through `_for`; this standard-layout
+/// form serves the model-free tests.
+#[cfg(all(test, target_os = "macos"))]
 fn kquant_v4_fused_segment_tile_rows(format: ResidentWeightFormat) -> Option<usize> {
+    kquant_v4_fused_segment_tile_rows_for(format, false)
+}
+
+/// Tile height of the segmented kernel that serves `format` on a stage of the
+/// given layout: the two-panel Q4_K register-exact body covers 16 rows, the
+/// one-panel V2 bodies and the Q6_K body cover 8.
+#[cfg(target_os = "macos")]
+fn kquant_v4_fused_segment_tile_rows_for(
+    format: ResidentWeightFormat,
+    fragment_major: bool,
+) -> Option<usize> {
     match format {
-        ResidentWeightFormat::Q4K => Some(16),
+        ResidentWeightFormat::Q4K => Some(if fragment_major { 8 } else { 16 }),
         ResidentWeightFormat::Q6K => Some(8),
         _ => None,
     }
@@ -18849,11 +19372,21 @@ fn kquant_v4_fused_segment_tile_rows(format: ResidentWeightFormat) -> Option<usi
 /// exact dispatch may cover. Returns the shared format when the whole list is
 /// eligible: 2..=3 segments, one K-quant format, a narrow window, and every row
 /// count a positive multiple of that format's tile height so no tile straddles
-/// two tensors.
-#[cfg(target_os = "macos")]
+/// two tensors. Production resolves the stage layout through `_for`; this
+/// standard-layout form serves the model-free tests.
+#[cfg(all(test, target_os = "macos"))]
 fn kquant_v4_fused_segments_format(
     segments: &[(&ResidentLinearWeight, &Buffer, usize)],
     n_tokens: usize,
+) -> Option<ResidentWeightFormat> {
+    kquant_v4_fused_segments_format_for(segments, n_tokens, false)
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_fused_segments_format_for(
+    segments: &[(&ResidentLinearWeight, &Buffer, usize)],
+    n_tokens: usize,
+    fragment_major: bool,
 ) -> Option<ResidentWeightFormat> {
     if !(2..=KQUANT_V4_FUSED_MAX_SEGMENTS).contains(&segments.len())
         || !(1..=8).contains(&n_tokens)
@@ -18861,7 +19394,7 @@ fn kquant_v4_fused_segments_format(
         return None;
     }
     let format = segments[0].0.format;
-    let tile_rows = kquant_v4_fused_segment_tile_rows(format)?;
+    let tile_rows = kquant_v4_fused_segment_tile_rows_for(format, fragment_major)?;
     segments
         .iter()
         .all(|(weight, _, rows)| {
@@ -18885,17 +19418,20 @@ fn encode_kquant_v4_prepared_fused_projection(
     segments: &[(&ResidentLinearWeight, &Buffer, usize)],
     scalar: &Buffer,
 ) -> bool {
-    let Some(format) = kquant_v4_fused_segments_format(segments, stage.n_tokens) else {
+    let Some(format) =
+        kquant_v4_fused_segments_format_for(segments, stage.n_tokens, stage.fragment_major)
+    else {
         return false;
     };
     if stage.k_pad != 8 || !kquant_v4_register_exact_pair_admitted(v4) {
         return false;
     }
     let is_q6k = format == ResidentWeightFormat::Q6K;
-    let pipeline = admitted_32_lane_pipeline(if is_q6k {
-        v4.q6k_v4_register_exact_seg3.as_ref()
-    } else {
-        v4.q4k_v4_register_exact_seg3.as_ref()
+    let pipeline = admitted_32_lane_pipeline(match (is_q6k, stage.fragment_major) {
+        (true, true) => v4.q6k_v4_register_exact_v2_seg3.as_ref(),
+        (false, true) => v4.q4k_v4_register_exact_v2_seg3.as_ref(),
+        (true, false) => v4.q6k_v4_register_exact_seg3.as_ref(),
+        (false, false) => v4.q4k_v4_register_exact_seg3.as_ref(),
     });
     let Some(pipeline) = pipeline else {
         return false;
@@ -18908,7 +19444,8 @@ fn encode_kquant_v4_prepared_fused_projection(
             None => return false,
         }
     };
-    let tile_rows = kquant_v4_fused_segment_tile_rows(format).expect("eligible format");
+    let tile_rows = kquant_v4_fused_segment_tile_rows_for(format, stage.fragment_major)
+        .expect("eligible format");
     unsafe {
         let p = scalar.contents() as *mut u32;
         *p = stage.n_sb as u32;
@@ -18951,7 +19488,7 @@ fn encode_kquant_v4_prepared_fused_projection(
             depth: 1,
         },
     );
-    trace_kquant_v4_fused_dispatch(format, stage.n_tokens, segments);
+    trace_kquant_v4_fused_dispatch(format, stage.n_tokens, segments, stage.fragment_major);
     true
 }
 
@@ -18974,7 +19511,9 @@ fn encode_kquant_v4_prepared_projection_group(
     while i < projections.len() {
         if fuse {
             let format = projections[i].0.format;
-            if let Some(tile_rows) = kquant_v4_fused_segment_tile_rows(format) {
+            if let Some(tile_rows) =
+                kquant_v4_fused_segment_tile_rows_for(format, prepared.stage.fragment_major)
+            {
                 let mut j = i;
                 while j < projections.len()
                     && j - i < KQUANT_V4_FUSED_MAX_SEGMENTS
@@ -19032,6 +19571,30 @@ fn encode_shared_kquant_v4_activation(
     input_width: usize,
     n_tokens: usize,
 ) -> SharedKquantV4Activation {
+    encode_shared_kquant_v4_activation_with_layout(
+        e,
+        k,
+        v4,
+        y,
+        input_width,
+        n_tokens,
+        kquant_v4_stage_fragment_major(v4, n_tokens),
+    )
+}
+
+/// `encode_shared_kquant_v4_activation` with the stage layout chosen by the
+/// caller (the process decision is `kquant_v4_stage_fragment_major`); the
+/// model-free identity tests stage both layouts of one input side by side.
+#[cfg(target_os = "macos")]
+fn encode_shared_kquant_v4_activation_with_layout(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    v4: &KquantV2Kernels,
+    y: &Buffer,
+    input_width: usize,
+    n_tokens: usize,
+    fragment_major: bool,
+) -> SharedKquantV4Activation {
     let n_sb = input_width / 256;
     let scales = pool_get(k, (n_tokens * n_sb * 4) as u64);
     let fusion_requested = kquant_v4_strict_prep_fusion_enabled();
@@ -19039,7 +19602,8 @@ fn encode_shared_kquant_v4_activation(
         // Keep the flag-off allocation and dispatch sequence exactly as it was:
         // scales, transient quants, stage buffers, then quantize/y/ysums.
         let quants = pool_get(k, (n_tokens * input_width) as u64);
-        let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true);
+        let stage =
+            allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true, fragment_major);
         e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
         e.set_buffer(0, Some(y), 0);
         e.set_buffer(1, Some(&scales), 0);
@@ -19057,7 +19621,8 @@ fn encode_shared_kquant_v4_activation(
 
     // A shared verifier preparation always includes ysums: a mixed Q4/Q6
     // projection group can then reuse one panel, while Q6 simply ignores it.
-    let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true);
+    let stage =
+        allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true, fragment_major);
     let fused = encode_kquant_v4_strict_fused_stage(e, k, y, &scales, &stage);
     let quants = if fused {
         None
@@ -19732,7 +20297,13 @@ fn encode_resident_kquant_matmul_f32(
         // Both v4 formats stage quantized activations as half: every Q8_K
         // code is exactly representable. Q6's intentional rounding happens
         // only when its row-dependent dequantized weights enter half A.
-        let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, !is_q6k);
+        let stage = allocate_kquant_v4_activation_stage(
+            k,
+            input_width,
+            n_tokens,
+            !is_q6k,
+            kquant_v4_stage_fragment_major(v4, n_tokens),
+        );
         encode_kquant_v4_activation_stage(e, v4, quants, &stage);
         encode_kquant_v4_prepared_projection(e, v4, scales, &stage, weight, out, scalar, rows);
         stage.recycle_into(keep);
@@ -20257,6 +20828,8 @@ struct KquantV2Kernels {
     q4k_mma: ComputePipelineState,
     q4k_mma_stage_y: ComputePipelineState,
     q4k_mma_stage_ysums: ComputePipelineState,
+    q4k_mma_stage_y_reg: Option<ComputePipelineState>,
+    q4k_mma_stage_ysums_reg: Option<ComputePipelineState>,
     q6k_single: ComputePipelineState,
     q6k_mc: ComputePipelineState,
     q6k_mma: ComputePipelineState,
@@ -20266,6 +20839,8 @@ struct KquantV2Kernels {
     q4k_v4_direct_simdbarrier: Option<ComputePipelineState>,
     q4k_v4_register_exact: Option<ComputePipelineState>,
     q4k_v4_register_exact_seg3: Option<ComputePipelineState>,
+    q4k_v4_register_exact_v2: Option<ComputePipelineState>,
+    q4k_v4_register_exact_v2_seg3: Option<ComputePipelineState>,
     q4k_v4_soa8: Option<ComputePipelineState>,
     q4k_v4_w16: ComputePipelineState,
     q6k_v4: ComputePipelineState,
@@ -20273,6 +20848,8 @@ struct KquantV2Kernels {
     q6k_v4_direct_simdbarrier: Option<ComputePipelineState>,
     q6k_v4_register_exact: Option<ComputePipelineState>,
     q6k_v4_register_exact_seg3: Option<ComputePipelineState>,
+    q6k_v4_register_exact_v2: Option<ComputePipelineState>,
+    q6k_v4_register_exact_v2_seg3: Option<ComputePipelineState>,
     q6k_v4_soa8: Option<ComputePipelineState>,
     q6k_v4_w16: ComputePipelineState,
 }
@@ -20281,6 +20858,58 @@ struct KquantV2Kernels {
 fn kquant_v4_register_exact_pair_admitted(v4: &KquantV2Kernels) -> bool {
     admitted_32_lane_pipeline(v4.q4k_v4_register_exact.as_ref()).is_some()
         && admitted_32_lane_pipeline(v4.q6k_v4_register_exact.as_ref()).is_some()
+}
+
+/// Every pipeline the fragment-major register-exact V2 lane needs: both
+/// projection kernels, both segmented twins, and both staging kernels. The
+/// lane is all-or-nothing because a fragment-major activation panel is
+/// readable only by these kernels.
+#[cfg(target_os = "macos")]
+fn kquant_v4_register_exact_v2_pipelines_admitted(v4: &KquantV2Kernels) -> bool {
+    admitted_32_lane_pipeline(v4.q4k_v4_register_exact_v2.as_ref()).is_some()
+        && admitted_32_lane_pipeline(v4.q6k_v4_register_exact_v2.as_ref()).is_some()
+        && admitted_32_lane_pipeline(v4.q4k_v4_register_exact_v2_seg3.as_ref()).is_some()
+        && admitted_32_lane_pipeline(v4.q6k_v4_register_exact_v2_seg3.as_ref()).is_some()
+        && v4.q4k_mma_stage_y_reg.is_some()
+        && v4.q4k_mma_stage_ysums_reg.is_some()
+}
+
+/// Process-wide decision for the register-exact V2 lane: requested by the gate
+/// pair (register-exact on, V2 on, SOA8 off) and every V2 pipeline admitted.
+/// Latched once; a missing pipeline keeps the established register-exact pair
+/// for the whole process (one warning) instead of mixing layouts mid-run.
+#[cfg(target_os = "macos")]
+fn kquant_v4_register_exact_v2_route_active(v4: &KquantV2Kernels) -> bool {
+    static ACTIVE: OnceLock<bool> = OnceLock::new();
+    *ACTIVE.get_or_init(|| {
+        if !kquant_v4_register_exact_v2_requested(
+            kquant_v4_register_exact_enabled(),
+            kquant_v4_register_exact_v2_enabled(),
+            kquant_v4_soa8_enabled(),
+        ) {
+            return false;
+        }
+        if kquant_v4_register_exact_v2_pipelines_admitted(v4)
+            && kquant_v4_register_exact_pair_admitted(v4)
+        {
+            true
+        } else {
+            eprintln!(
+                "[metal] CAMELID_KQUANT_V4_REGISTER_EXACT_V2 requested, but its fragment-major \
+                 pipelines are unavailable; retaining the established register-exact pair"
+            );
+            false
+        }
+    })
+}
+
+/// Whether a narrow V4 activation stage for `n_tokens` columns is staged in
+/// the fragment-major layout: only while the V2 lane is active and the window
+/// fits one eight-column tile (wider windows keep the [position][k_pad] panel
+/// and the established kernels).
+#[cfg(target_os = "macos")]
+fn kquant_v4_stage_fragment_major(v4: &KquantV2Kernels, n_tokens: usize) -> bool {
+    n_tokens <= 8 && kquant_v4_register_exact_v2_route_active(v4)
 }
 
 /// Lazily compile the v2 library on first use. A compile failure disables only
@@ -20313,6 +20942,8 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q4k_mma: pipeline("q4k_linear_mma_mc_v2")?,
                 q4k_mma_stage_y: pipeline("q4k_mma_stage_y")?,
                 q4k_mma_stage_ysums: pipeline("q4k_mma_stage_ysums")?,
+                q4k_mma_stage_y_reg: pipeline("q4k_mma_stage_y_reg"),
+                q4k_mma_stage_ysums_reg: pipeline("q4k_mma_stage_ysums_reg"),
                 q6k_single: pipeline("q6k_linear_simd_v2")?,
                 q6k_mc: pipeline("q6k_linear_simd_mc_v2")?,
                 q6k_mma: pipeline("q6k_linear_mma_mc_v2")?,
@@ -20324,6 +20955,10 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 ),
                 q4k_v4_register_exact: pipeline("q4k_linear_mma_combined_reg2_v4"),
                 q4k_v4_register_exact_seg3: pipeline("q4k_linear_mma_combined_reg2_seg3_v4"),
+                q4k_v4_register_exact_v2: pipeline("q4k_linear_mma_combined_reg_yg_v4"),
+                q4k_v4_register_exact_v2_seg3: pipeline(
+                    "q4k_linear_mma_combined_reg_yg_seg3_v4",
+                ),
                 q4k_v4_soa8: pipeline("q4k_linear_mma_combined_soa8_v4"),
                 q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
@@ -20333,6 +20968,10 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 ),
                 q6k_v4_register_exact: pipeline("q6k_linear_mma_combined_afrag_v4"),
                 q6k_v4_register_exact_seg3: pipeline("q6k_linear_mma_combined_afrag_seg3_v4"),
+                q6k_v4_register_exact_v2: pipeline("q6k_linear_mma_combined_afrag_yg_v4"),
+                q6k_v4_register_exact_v2_seg3: pipeline(
+                    "q6k_linear_mma_combined_afrag_yg_seg3_v4",
+                ),
                 q6k_v4_soa8: pipeline("q6k_linear_mma_combined_soa8_v4"),
                 q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
@@ -20402,6 +21041,37 @@ fn kquant_v4_register_exact_enabled() -> bool {
         let value = std::env::var("CAMELID_KQUANT_V4_REGISTER_EXACT").ok();
         kquant_v4_register_exact_from_env(value.as_deref())
     })
+}
+
+/// Opt in to the fragment-major register-exact V2 pair
+/// (CAMELID_KQUANT_V4_REGISTER_EXACT_V2=1). It takes precedence over the
+/// reg2/afrag pair only when set, only inside the register-exact route, and
+/// only when every V2 pipeline is admitted; the activation panel is then
+/// staged fragment-major (two uint4 loads per 32-K group instead of eight
+/// simdgroup tile loads) and consumed by kernels whose A operands, MMA order,
+/// and f32 tail are the register-exact bodies' statements verbatim. Default
+/// off; any value other than `1`/`true` keeps the established pair.
+fn kquant_v4_register_exact_v2_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn kquant_v4_register_exact_v2_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_KQUANT_V4_REGISTER_EXACT_V2").ok();
+        kquant_v4_register_exact_v2_from_env(value.as_deref())
+    })
+}
+
+/// The V2 lane is a twin of the register-exact route only: dormant unless that
+/// route is the process route, and suppressed by the process-wide SOA8 gate
+/// exactly as register-exact itself is.
+fn kquant_v4_register_exact_v2_requested(
+    register_exact_enabled: bool,
+    v2_enabled: bool,
+    soa8_enabled: bool,
+) -> bool {
+    register_exact_enabled && v2_enabled && !soa8_enabled
 }
 
 /// Opt in to covering the verifier's Q/K/V and gate/up projection groups with
@@ -20516,6 +21186,7 @@ fn trace_kquant_v4_dispatch(
     n_tokens: usize,
     rows: usize,
     route: KquantV4ProjectionRoute,
+    fragment_major: bool,
 ) {
     static TRACE: OnceLock<bool> = OnceLock::new();
     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -20538,6 +21209,7 @@ fn trace_kquant_v4_dispatch(
         KquantV4ProjectionRoute::DirectSimdBarrier => 3,
         KquantV4ProjectionRoute::RegisterExact => 4,
     };
+    let route_index = if fragment_major { 5 } else { route_index };
     let bit = 1u32 << (shape + route_index * 6);
     let previous = SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
     if previous & bit == 0 {
@@ -20556,6 +21228,11 @@ fn trace_kquant_v4_dispatch(
             (KquantV4ProjectionRoute::Soa8, _) => "combined-mma-v4-soa8",
             (KquantV4ProjectionRoute::RegisterExact, _) => unreachable!(),
         };
+        let pipeline = match (fragment_major, format) {
+            (true, ResidentWeightFormat::Q4K) => "combined-mma-v4-register-exact-v2-q4-reg-yg",
+            (true, ResidentWeightFormat::Q6K) => "combined-mma-v4-register-exact-v2-q6-afrag-yg",
+            _ => pipeline,
+        };
         eprintln!(
             "[metal-kquant-v4] dispatch={label} n_tokens={n_tokens} rows={rows} pipeline={pipeline}"
         );
@@ -20571,6 +21248,7 @@ fn trace_kquant_v4_fused_dispatch(
     format: ResidentWeightFormat,
     n_tokens: usize,
     segments: &[(&ResidentLinearWeight, &Buffer, usize)],
+    fragment_major: bool,
 ) {
     static TRACE: OnceLock<bool> = OnceLock::new();
     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -20589,6 +21267,11 @@ fn trace_kquant_v4_fused_dispatch(
             "combined-mma-v4-register-exact-q6-afrag-seg3",
         ),
         _ => return,
+    };
+    let pipeline = match (fragment_major, format) {
+        (true, ResidentWeightFormat::Q4K) => "combined-mma-v4-register-exact-v2-q4-reg-yg-seg3",
+        (true, ResidentWeightFormat::Q6K) => "combined-mma-v4-register-exact-v2-q6-afrag-yg-seg3",
+        _ => pipeline,
     };
     let bit =
         1u32 << (shape * KQUANT_V4_FUSED_MAX_SEGMENTS as u32 + segments.len() as u32 - 2);
@@ -47456,6 +48139,350 @@ mod tests {
                 }
             }
             drop(prepared);
+        }
+    }
+
+    #[test]
+    fn kquant_v4_register_exact_v2_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("garbage"),
+        ] {
+            assert!(!kquant_v4_register_exact_v2_from_env(value));
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(kquant_v4_register_exact_v2_from_env(Some(value)));
+        }
+        // Twin of the register-exact route only: dormant without it, and
+        // suppressed by the process-wide SOA8 gate exactly as register-exact is.
+        assert!(kquant_v4_register_exact_v2_requested(true, true, false));
+        assert!(!kquant_v4_register_exact_v2_requested(false, true, false));
+        assert!(!kquant_v4_register_exact_v2_requested(true, false, false));
+        assert!(!kquant_v4_register_exact_v2_requested(true, true, true));
+        assert!(!kquant_v4_register_exact_v2_requested(false, false, false));
+    }
+
+    /// Model-free exactness gate for the fragment-major register-exact V2
+    /// pair. One input is staged twice: the [position][k_pad] panel feeds the
+    /// register-exact route (control) and the fragment-major panel feeds the
+    /// same route resolved to the V2 kernels (candidate). Sentinel-filled
+    /// outputs are compared as exact u32 bits at N in {1, 3, 7, 8} over ragged
+    /// rows (19 rows exercise the eight-row tile tail without padded writes).
+    /// The fragment-major stage must refuse every other route, and the V2
+    /// segmented twins must reproduce separate V2 dispatches bit for bit,
+    /// including an eight-row Q4 segment the two-panel kernel could not fuse.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_register_exact_v2_is_bit_identical_and_guarded() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        assert!(
+            kquant_v4_register_exact_pair_admitted(v4),
+            "register-exact pair must be admitted before its V2 twins"
+        );
+        assert!(
+            kquant_v4_register_exact_v2_pipelines_admitted(v4),
+            "every register-exact V2 pipeline must be admitted"
+        );
+        for (label, pipeline) in [
+            ("Q4", v4.q4k_v4_register_exact_v2.as_ref()),
+            ("Q6", v4.q6k_v4_register_exact_v2.as_ref()),
+            ("Q4 seg3", v4.q4k_v4_register_exact_v2_seg3.as_ref()),
+            ("Q6 seg3", v4.q6k_v4_register_exact_v2_seg3.as_ref()),
+        ] {
+            let pipeline = pipeline.unwrap_or_else(|| panic!("{label} V2 pipeline"));
+            assert_eq!(
+                pipeline.thread_execution_width(),
+                32,
+                "{label} V2 route requires one Apple-width SIMD group"
+            );
+            assert!(pipeline.max_total_threads_per_threadgroup() >= 32);
+        }
+        assert_eq!(
+            kquant_v4_fused_segment_tile_rows_for(ResidentWeightFormat::Q4K, true),
+            Some(8)
+        );
+        assert_eq!(
+            kquant_v4_fused_segment_tile_rows_for(ResidentWeightFormat::Q4K, false),
+            Some(16)
+        );
+        assert_eq!(
+            kquant_v4_fused_segment_tile_rows_for(ResidentWeightFormat::Q6K, true),
+            Some(8)
+        );
+        assert_eq!(
+            kquant_v4_fused_segment_tile_rows_for(ResidentWeightFormat::Q8_0, true),
+            None
+        );
+
+        let device = &kernel.device;
+        let rows = 19usize;
+        let n_sb = 3usize;
+        let input_width = n_sb * 256;
+        let physical_columns = 8usize;
+        let make_weight = |format: ResidentWeightFormat, rows: usize, salt: usize| {
+            let block_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                .map(|i| ((i * 59 + i / 17 + salt * 37) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                let d = 0.005 + block_index as f32 * 0.00011;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.37).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let buffer =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_u8(&buffer, &wire);
+            ResidentLinearWeight {
+                format,
+                buffer,
+                soa8_buffer: None,
+                q8_wire: false,
+            }
+        };
+        let q4_weight = make_weight(ResidentWeightFormat::Q4K, rows, 3);
+        let q6_weight = make_weight(ResidentWeightFormat::Q6K, rows, 11);
+        // Segment groups: Q4 with an eight-row member (fusable only on the
+        // eight-row V2 tiles) and a Q6 pair.
+        let q4_a = make_weight(ResidentWeightFormat::Q4K, 48, 17);
+        let q4_b = make_weight(ResidentWeightFormat::Q4K, 16, 19);
+        let q4_c = make_weight(ResidentWeightFormat::Q4K, 8, 23);
+        let q6_a = make_weight(ResidentWeightFormat::Q6K, 24, 29);
+        let q6_b = make_weight(ResidentWeightFormat::Q6K, 8, 31);
+
+        let make_output = |rows: usize| {
+            let output = device.new_buffer(
+                (physical_columns * rows * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            fill_buffer_sentinel(&output, physical_columns * rows);
+            output
+        };
+        let compare = |label: &str, n_tokens: usize, rows: usize, control: &Buffer, candidate: &Buffer| {
+            let mut control_values = vec![0.0f32; physical_columns * rows];
+            let mut candidate_values = vec![0.0f32; physical_columns * rows];
+            read_buffer_f32(control, &mut control_values);
+            read_buffer_f32(candidate, &mut candidate_values);
+            let active = n_tokens * rows;
+            assert_no_sentinel(&candidate_values[..active], label, n_tokens);
+            for i in 0..active {
+                assert_eq!(
+                    candidate_values[i].to_bits(),
+                    control_values[i].to_bits(),
+                    "{label} n={n_tokens} element={i}: {} ({:#010x}) != control {} ({:#010x})",
+                    candidate_values[i],
+                    candidate_values[i].to_bits(),
+                    control_values[i],
+                    control_values[i].to_bits(),
+                );
+            }
+            for i in active..physical_columns * rows {
+                assert_eq!(
+                    candidate_values[i].to_bits(),
+                    KQUANT_TEST_SENTINEL.to_bits(),
+                    "{label} wrote padded output n={n_tokens} element={i}"
+                );
+            }
+        };
+
+        for n_tokens in [1usize, 3, 7, 8] {
+            let input: Vec<f32> = (0..n_tokens * input_width)
+                .map(|i| {
+                    let token = i / input_width;
+                    let col = i % input_width;
+                    ((((token * 151 + col * 43) % 269) as f32) - 134.0) * 0.012
+                        + token as f32 * 0.0009
+                })
+                .collect();
+            let input_buf = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buf, &input);
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let q4_control = make_output(rows);
+            let q4_candidate = make_output(rows);
+            let q6_control = make_output(rows);
+            let q6_candidate = make_output(rows);
+            let refused = make_output(rows);
+
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            let standard = encode_shared_kquant_v4_activation_with_layout(
+                e,
+                kernel,
+                v4,
+                &input_buf,
+                input_width,
+                n_tokens,
+                false,
+            );
+            let fragment = encode_shared_kquant_v4_activation_with_layout(
+                e,
+                kernel,
+                v4,
+                &input_buf,
+                input_width,
+                n_tokens,
+                true,
+            );
+            assert!(!standard.stage.fragment_major);
+            assert!(fragment.stage.fragment_major);
+            // A fragment-major stage refuses every non-register-exact route
+            // before encoding anything.
+            for route in [
+                KquantV4ProjectionRoute::Synchronized,
+                KquantV4ProjectionRoute::DirectFragment,
+                KquantV4ProjectionRoute::DirectSimdBarrier,
+                KquantV4ProjectionRoute::Soa8,
+            ] {
+                assert!(
+                    !encode_kquant_v4_prepared_projection_route(
+                        e,
+                        v4,
+                        &fragment.scales,
+                        &fragment.stage,
+                        &q4_weight,
+                        &refused,
+                        &scalar,
+                        rows,
+                        route,
+                    ),
+                    "fragment-major stage must refuse {route:?}"
+                );
+            }
+            for (weight, output, prepared) in [
+                (&q4_weight, &q4_control, &standard),
+                (&q4_weight, &q4_candidate, &fragment),
+                (&q6_weight, &q6_control, &standard),
+                (&q6_weight, &q6_candidate, &fragment),
+            ] {
+                assert!(encode_kquant_v4_prepared_projection_route(
+                    e,
+                    v4,
+                    &prepared.scales,
+                    &prepared.stage,
+                    weight,
+                    output,
+                    &scalar,
+                    rows,
+                    KquantV4ProjectionRoute::RegisterExact,
+                ));
+            }
+
+            // Segmented V2 twins versus separate V2 dispatches on the same
+            // fragment-major stage.
+            let groups: [(&str, Vec<(&ResidentLinearWeight, usize)>); 2] = [
+                ("q4-48-16-8", vec![(&q4_a, 48), (&q4_b, 16), (&q4_c, 8)]),
+                ("q6-24-8", vec![(&q6_a, 24), (&q6_b, 8)]),
+            ];
+            let mut fused_checks: Vec<(String, usize, Buffer, Buffer)> = Vec::new();
+            for (label, members) in &groups {
+                let separate: Vec<Buffer> = members.iter().map(|m| make_output(m.1)).collect();
+                let fused: Vec<Buffer> = members.iter().map(|m| make_output(m.1)).collect();
+                for (index, &(weight, member_rows)) in members.iter().enumerate() {
+                    let member_scalar =
+                        device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+                    unsafe {
+                        let p = member_scalar.contents() as *mut u32;
+                        *p = n_sb as u32;
+                        *p.add(1) = member_rows as u32;
+                        *p.add(2) = n_tokens as u32;
+                    }
+                    assert!(encode_kquant_v4_prepared_projection_route(
+                        e,
+                        v4,
+                        &fragment.scales,
+                        &fragment.stage,
+                        weight,
+                        &separate[index],
+                        &member_scalar,
+                        member_rows,
+                        KquantV4ProjectionRoute::RegisterExact,
+                    ));
+                }
+                let segments: Vec<(&ResidentLinearWeight, &Buffer, usize)> = members
+                    .iter()
+                    .zip(fused.iter())
+                    .map(|(&(weight, member_rows), out)| (weight, out, member_rows))
+                    .collect();
+                assert_eq!(
+                    kquant_v4_fused_segments_format_for(&segments, n_tokens, false),
+                    if label.starts_with("q4") {
+                        None
+                    } else {
+                        Some(ResidentWeightFormat::Q6K)
+                    },
+                    "{label}: the eight-row Q4 member must not fuse on 16-row tiles"
+                );
+                let fused_scalar = device.new_buffer(
+                    (4 * (2 + KQUANT_V4_FUSED_MAX_SEGMENTS)) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                assert!(
+                    encode_kquant_v4_prepared_fused_projection(
+                        e,
+                        v4,
+                        &fragment.scales,
+                        &fragment.stage,
+                        &segments,
+                        &fused_scalar,
+                    ),
+                    "{label}: V2 segmented dispatch must be eligible"
+                );
+                for (index, &(_, member_rows)) in members.iter().enumerate() {
+                    fused_checks.push((
+                        format!("{label} segment {index} V2 seg3"),
+                        member_rows,
+                        separate[index].clone(),
+                        fused[index].clone(),
+                    ));
+                }
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            compare("Q4 register exact V2", n_tokens, rows, &q4_control, &q4_candidate);
+            compare("Q6 register exact V2", n_tokens, rows, &q6_control, &q6_candidate);
+            for (label, member_rows, separate, fused) in &fused_checks {
+                compare(label, n_tokens, *member_rows, separate, fused);
+            }
+            let mut refused_values = vec![0.0f32; physical_columns * rows];
+            read_buffer_f32(&refused, &mut refused_values);
+            for (i, value) in refused_values.iter().enumerate() {
+                assert_eq!(
+                    value.to_bits(),
+                    KQUANT_TEST_SENTINEL.to_bits(),
+                    "a refused route wrote output element {i}"
+                );
+            }
+            drop(standard);
+            drop(fragment);
         }
     }
 
