@@ -11107,6 +11107,11 @@ struct Eagle3BenchRun {
     dynamic_tree_emitted_tokens: u64,
     materialized_head_forwards: u64,
     replay_scatter_commits: u64,
+    /// Dynamic rounds the confidence-gated draft early exit ended before the expansion budget.
+    draft_early_exit_rounds: u64,
+    /// Dynamic rounds by recorded head expansions, root included: index `k - 1` counts the
+    /// rounds that recorded exactly `k` expansions.
+    draft_expansions_histogram: Vec<u64>,
     dynamic_tree_max_depth_sum: u64,
     verifier_widths: Eagle3VerifierWidthTelemetry,
     x3_x4_expansions: Eagle3X3X4Telemetry,
@@ -11120,6 +11125,55 @@ struct Eagle3BenchRun {
     dual_eagle_shadow_update_us: u128,
     dual_eagle_selected_head: Option<DualEagleHead>,
     argmax_shadow_rounds: Vec<Eagle3ArgmaxShadowRoundReceipt>,
+}
+
+impl Eagle3BenchRun {
+    /// Account one materialized dynamic frontier: its expansion count and whether the
+    /// confidence-gated early exit ended it. `materialized_head_forwards` stays the lane's own
+    /// per-round sum so its mean remains exact whether or not the exit fired.
+    fn note_dynamic_frontier(
+        &mut self,
+        frontier: &camelid::eagle3_runtime::Eagle3DynamicFrontier,
+        early_exit_theta: Option<f64>,
+        early_exit_trace: bool,
+    ) {
+        let expansions = frontier.head_expansions();
+        if self.draft_expansions_histogram.len() < expansions {
+            self.draft_expansions_histogram.resize(expansions, 0);
+        }
+        if let Some(slot) = expansions
+            .checked_sub(1)
+            .and_then(|index| self.draft_expansions_histogram.get_mut(index))
+        {
+            *slot += 1;
+        }
+        if let Some(exit) = frontier.draft_early_exit() {
+            self.draft_early_exit_rounds += 1;
+            if early_exit_trace {
+                eprintln!(
+                    "[eagle3-draft-early-exit] round={} k={} materialized_head_forwards={} skipped_parent={} depth={} probability={:.9} log-probability={:.9} theta={:.9}",
+                    self.rounds + 1,
+                    exit.completed_head_expansions,
+                    frontier.materialized_head_forwards(),
+                    exit.next_parent,
+                    exit.next_parent_depth,
+                    exit.next_parent_cumulative_probability,
+                    exit.next_parent_cumulative_log_probability,
+                    early_exit_theta.unwrap_or(0.0),
+                );
+            }
+        }
+    }
+}
+
+/// Histogram of dynamic rounds by recorded head expansions, padded to `min_expansions`
+/// entries so every budgeted expansion count has a slot even when no round reached it.
+fn eagle3_draft_expansions_histogram(counts: &[u64], min_expansions: usize) -> Vec<u64> {
+    let mut histogram = counts.to_vec();
+    if histogram.len() < min_expansions {
+        histogram.resize(min_expansions, 0);
+    }
+    histogram
 }
 
 fn run_plain_resident_greedy(
@@ -11303,6 +11357,9 @@ fn run_eagle3_resident_greedy(
         && std::env::var_os("CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR_TRACE").is_some();
     let x3_x4_trace = x3_x4_selector.is_some()
         && std::env::var_os("CAMELID_BENCH_EAGLE3_X3_X4_SELECTOR_TRACE").is_some();
+    let draft_early_exit_theta = camelid::eagle3_runtime::eagle3_draft_early_exit_theta();
+    let draft_early_exit_trace =
+        draft_early_exit_theta.is_some() && std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some();
 
     let decode_started = Instant::now();
     while run.generated.len() < max_tokens
@@ -11448,6 +11505,11 @@ fn run_eagle3_resident_greedy(
                     )?,
                 };
                 let materialized_head_forwards = frontier.materialized_head_forwards();
+                run.note_dynamic_frontier(
+                    &frontier,
+                    draft_early_exit_theta,
+                    draft_early_exit_trace,
+                );
                 let replay_scatter_commits = frontier.replay_scatter_commits();
                 let forest = frontier.finish()?;
                 let actual_nodes = forest.scored.tree.nodes();
@@ -11750,6 +11812,11 @@ fn run_eagle3_resident_greedy(
                         },
                     )?;
                     let materialized_head_forwards = frontier.materialized_head_forwards();
+                    run.note_dynamic_frontier(
+                        &frontier,
+                        draft_early_exit_theta,
+                        draft_early_exit_trace,
+                    );
                     let replay_scatter_commits = frontier.replay_scatter_commits();
                     let forest = frontier.finish()?;
                     let actual_nodes = forest.scored.tree.nodes();
@@ -11870,6 +11937,11 @@ fn run_eagle3_resident_greedy(
                     },
                 )?;
                 let materialized_head_forwards = frontier.materialized_head_forwards();
+                run.note_dynamic_frontier(
+                    &frontier,
+                    draft_early_exit_theta,
+                    draft_early_exit_trace,
+                );
                 let replay_scatter_commits = frontier.replay_scatter_commits();
                 let eagle_forest = frontier.finish_borrowed()?;
                 // Retain the target-blind proposal union before releasing the recurrent lattice.
@@ -12194,6 +12266,11 @@ fn run_eagle3_resident_greedy(
                     }
                 }
                 let materialized_head_forwards = frontier.materialized_head_forwards();
+                run.note_dynamic_frontier(
+                    &frontier,
+                    draft_early_exit_theta,
+                    draft_early_exit_trace,
+                );
                 let replay_scatter_commits = frontier.replay_scatter_commits();
                 // Benchmark-only admission changes only which connected subset reaches the
                 // verifier. The ordinary target-authoritative acceptance below remains the sole
@@ -13021,6 +13098,18 @@ struct BenchEagle3Record {
     materialized_head_forwards: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mean_materialized_head_forwards_per_dynamic_round: Option<f64>,
+    /// CAMELID_EAGLE3_DRAFT_EARLY_EXIT threshold armed for this run; absent when the gate is
+    /// off, so an off receipt keeps its established shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_early_exit_theta: Option<f64>,
+    /// Dynamic rounds the confidence-gated draft early exit ended before the expansion budget.
+    /// Zero with the gate off, so a receipt proves whether the exit fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_early_exit_rounds: Option<u64>,
+    /// Dynamic rounds by recorded head expansions, root included: index `k - 1` counts the
+    /// rounds that recorded exactly `k` expansions, for `k` in `1..=tree_expansions`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_expansions_histogram: Option<Vec<u64>>,
     /// CAMELID_BENCH_EAGLE3_REPLAY_SCATTER armed for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     replay_scatter: Option<bool>,
@@ -13952,6 +14041,110 @@ fn validate_eagle3_x3_x4_selector_config(
 }
 
 #[cfg(test)]
+mod eagle3_draft_early_exit_receipt_tests {
+    use super::*;
+    use camelid::eagle3::HIDDEN_SIZE;
+    use camelid::eagle3_runtime::{Eagle3DynamicFrontier, Eagle3DynamicFrontierConfig};
+    use camelid::metal::{Eagle3DraftCandidate, Eagle3MetalOutput, EAGLE3_DRAFT_VOCAB};
+
+    fn observation(candidates: &[(u32, f32)]) -> Eagle3MetalOutput {
+        let top_candidates: Vec<Eagle3DraftCandidate> = candidates
+            .iter()
+            .enumerate()
+            .map(|(draft_token, &(target_token, probability))| Eagle3DraftCandidate {
+                draft_token: draft_token as u32,
+                target_token,
+                logit: probability.ln(),
+            })
+            .collect();
+        Eagle3MetalOutput {
+            draft_token: 0,
+            target_token: top_candidates[0].target_token,
+            top_candidates,
+            evaluated_vocab_rows: EAGLE3_DRAFT_VOCAB,
+            evaluated_vocab_logsumexp: 0.0,
+            raw_hidden: vec![1.0; HIDDEN_SIZE],
+        }
+    }
+
+    fn x5_frontier(theta: Option<f64>) -> Eagle3DynamicFrontier {
+        let config = Eagle3DynamicFrontierConfig {
+            max_verify_nodes: 8,
+            max_lattice_nodes: 21,
+            max_depth: 15,
+            candidates_per_parent: 4,
+            max_head_expansions: 5,
+            adaptive_branching: false,
+            certified_argmax_shadow: false,
+        };
+        let observations = [
+            observation(&[(11, 0.50), (12, 0.30), (13, 0.15), (14, 0.05)]),
+            observation(&[(21, 0.56), (22, 0.30)]),
+            observation(&[(31, 0.80), (32, 0.20)]),
+            observation(&[(41, 0.90), (42, 0.10)]),
+            observation(&[(51, 0.90), (52, 0.10)]),
+        ];
+        let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
+        while let Some(parent) = frontier.next_parent() {
+            if let Some(theta) = theta {
+                if let Some(evidence) = frontier.early_exit_before_next_expansion(theta) {
+                    frontier.record_early_exit(evidence).unwrap();
+                    break;
+                }
+            }
+            frontier
+                .record_expansion(parent, &observations[frontier.head_expansions()])
+                .unwrap();
+        }
+        frontier
+    }
+
+    #[test]
+    fn histogram_is_padded_to_the_expansion_budget() {
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&[], 5),
+            vec![0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&[0, 3], 5),
+            vec![0, 3, 0, 0, 0]
+        );
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&[1, 2, 3, 4, 5, 6, 7], 5),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn full_budget_rounds_count_in_the_last_bin_and_never_as_early_exits() {
+        let mut run = Eagle3BenchRun::default();
+        let full = x5_frontier(None);
+        assert_eq!(full.head_expansions(), 5);
+        run.note_dynamic_frontier(&full, None, false);
+        run.note_dynamic_frontier(&x5_frontier(Some(0.0)), Some(0.0), false);
+        assert_eq!(run.draft_early_exit_rounds, 0);
+        assert_eq!(run.draft_expansions_histogram, vec![0, 0, 0, 0, 2]);
+        assert_eq!(
+            eagle3_draft_expansions_histogram(&run.draft_expansions_histogram, 5),
+            vec![0, 0, 0, 0, 2]
+        );
+    }
+
+    #[test]
+    fn early_exit_rounds_land_in_their_expansion_bin() {
+        let mut run = Eagle3BenchRun::default();
+        // theta .31 declines the third expansion (12 at joint .30): two recorded expansions.
+        let exited = x5_frontier(Some(0.31));
+        assert_eq!(exited.head_expansions(), 2);
+        assert_eq!(exited.draft_early_exit().unwrap().next_parent, 2);
+        run.note_dynamic_frontier(&exited, Some(0.31), false);
+        run.note_dynamic_frontier(&x5_frontier(None), Some(0.31), false);
+        assert_eq!(run.draft_early_exit_rounds, 1);
+        assert_eq!(run.draft_expansions_histogram, vec![0, 1, 0, 0, 1]);
+    }
+}
+
+#[cfg(test)]
 mod eagle3_x3_x4_selector_tests {
     use super::*;
     use camelid::eagle3_runtime::Eagle3NextExpansionEvidence;
@@ -14512,6 +14705,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS",
+        camelid::eagle3_runtime::EAGLE3_DRAFT_EARLY_EXIT_ENV,
     ] {
         if std::env::var_os(key).is_some() {
             values.insert(key.to_string(), std::env::var(key).ok());
@@ -14871,6 +15065,7 @@ fn run_bench_eagle3(
     let authoritative_cb_fusion = eagle3_authoritative_cb_fusion_enabled()?;
     let terminal_head_skip = eagle3_terminal_head_skip_enabled()?;
     let replay_scatter = camelid::eagle3_runtime::eagle3_replay_scatter_enabled();
+    let draft_early_exit_theta = camelid::eagle3_runtime::eagle3_draft_early_exit_theta();
     let adaptive_branching = eagle3_adaptive_branching_enabled();
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
@@ -15779,6 +15974,11 @@ fn run_bench_eagle3(
         materialized_head_forwards: tree_nodes.map(|_| eagle.materialized_head_forwards),
         mean_materialized_head_forwards_per_dynamic_round: tree_nodes
             .map(|_| mean_materialized_head_forwards),
+        draft_early_exit_theta: tree_nodes.and(draft_early_exit_theta),
+        draft_early_exit_rounds: tree_nodes.map(|_| eagle.draft_early_exit_rounds),
+        draft_expansions_histogram: tree_nodes.map(|_| {
+            eagle3_draft_expansions_histogram(&eagle.draft_expansions_histogram, tree_expansions)
+        }),
         replay_scatter: tree_nodes.map(|_| replay_scatter),
         replay_scatter_commits: tree_nodes.map(|_| eagle.replay_scatter_commits),
         mean_dynamic_tree_max_depth: tree_nodes.map(|_| mean_dynamic_tree_max_depth),

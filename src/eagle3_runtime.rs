@@ -377,6 +377,50 @@ pub fn eagle3_replay_scatter_enabled() -> bool {
     eagle3_replay_scatter_enabled_from(std::env::var(EAGLE3_REPLAY_SCATTER_ENV).ok().as_deref())
 }
 
+pub const EAGLE3_DRAFT_EARLY_EXIT_ENV: &str = "CAMELID_EAGLE3_DRAFT_EARLY_EXIT";
+
+/// Parse the confidence-gated draft early-exit threshold.
+///
+/// `Ok(None)` is the byte-preserving default: unset, empty, or an explicit zero leave the
+/// dynamic frontier scheduler exactly as it is. `Ok(Some(theta))` for a finite `theta` in
+/// `(0, 1]` arms the exit. Anything else is malformed and reported so the caller can fail
+/// closed to the default rather than guess.
+fn eagle3_draft_early_exit_theta_from(
+    value: Option<&str>,
+) -> std::result::Result<Option<f64>, String> {
+    let Some(raw) = value.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let theta = raw.parse::<f64>().map_err(|error| {
+        format!("{EAGLE3_DRAFT_EARLY_EXIT_ENV} must be a number in (0, 1], got {raw:?}: {error}")
+    })?;
+    if !theta.is_finite() || !(0.0..=1.0).contains(&theta) {
+        return Err(format!(
+            "{EAGLE3_DRAFT_EARLY_EXIT_ENV} must be a finite number in (0, 1], got {raw:?}"
+        ));
+    }
+    Ok((theta > 0.0).then_some(theta))
+}
+
+/// Process-wide confidence-gated draft early-exit threshold, read once.
+///
+/// A malformed value prints a single stderr line and behaves as unset, so a typo can never
+/// silently change the shipped X5 lattice sizing or the expansion order.
+pub fn eagle3_draft_early_exit_theta() -> Option<f64> {
+    static THETA: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *THETA.get_or_init(|| {
+        match eagle3_draft_early_exit_theta_from(
+            std::env::var(EAGLE3_DRAFT_EARLY_EXIT_ENV).ok().as_deref(),
+        ) {
+            Ok(theta) => theta,
+            Err(message) => {
+                eprintln!("[eagle3-draft-early-exit] {message}; the gate stays off");
+                None
+            }
+        }
+    })
+}
+
 fn eagle3_path_transition(
     current_path: &[usize],
     next_path: &[usize],
@@ -436,6 +480,9 @@ pub struct Eagle3DynamicFrontier {
     replay_scatter_commits: usize,
     /// Completely target-blind observation sidecar. `None` is the byte-preserving default.
     certified_argmax_shadow: Option<Eagle3ArgmaxCandidateShadow>,
+    /// The scheduled expansion that the confidence-gated early exit declined to materialize.
+    /// `None` when the exit is off or never fired for this lattice.
+    early_exit: Option<Eagle3NextExpansionEvidence>,
 }
 
 /// Target-blind evidence available immediately before one dynamic-frontier head expansion.
@@ -496,6 +543,7 @@ impl Eagle3DynamicFrontier {
             certified_argmax_shadow: config
                 .certified_argmax_shadow
                 .then(Eagle3ArgmaxCandidateShadow::default),
+            early_exit: None,
         })
     }
 
@@ -581,6 +629,56 @@ impl Eagle3DynamicFrontier {
             next_parent_cumulative_log_probability: node.cumulative_log_probability,
             next_parent_cumulative_probability: node.cumulative_log_probability.exp(),
         })
+    }
+
+    /// The expansion the confidence-gated early exit declined, if it fired for this lattice.
+    pub fn draft_early_exit(&self) -> Option<Eagle3NextExpansionEvidence> {
+        self.early_exit
+    }
+
+    /// Confidence-gated early exit, evaluated immediately before the next non-root expansion.
+    ///
+    /// The rule reads the scheduler's own ranking key: the cumulative log probability of the
+    /// globally strongest unexpanded node, i.e. the parent [`Self::next_parent`] would
+    /// materialize next. When that joint probability is strictly below `theta` the caller
+    /// should stop drafting and verify the lattice built so far. Equality keeps expanding, a
+    /// `theta` of zero or less never stops, and the root distribution is never subject to the
+    /// rule because it costs no head forward. No budget, depth, or admission parameter is
+    /// consulted or altered here; only the number of materialized expansions can change.
+    pub fn early_exit_before_next_expansion(
+        &self,
+        theta: f64,
+    ) -> Option<Eagle3NextExpansionEvidence> {
+        let next_parent = self.next_parent()?;
+        self.early_exit_for_parent(next_parent, theta)
+    }
+
+    fn early_exit_for_parent(
+        &self,
+        next_parent: usize,
+        theta: f64,
+    ) -> Option<Eagle3NextExpansionEvidence> {
+        if self.head_expansions == 0 {
+            return None;
+        }
+        let evidence = self.expansion_evidence_for_parent(next_parent)?;
+        (f64::from(evidence.next_parent_cumulative_probability) < theta).then_some(evidence)
+    }
+
+    /// Record that drafting stopped at `evidence` instead of materializing it. The evidence
+    /// must name the expansion this frontier would schedule next; anything else fails closed
+    /// so a receipt can never attribute an exit to the wrong expansion.
+    pub fn record_early_exit(&mut self, evidence: Eagle3NextExpansionEvidence) -> Result<()> {
+        let expected = self.next_expansion_evidence().ok_or_else(|| {
+            invalid("EAGLE-3 dynamic frontier early exit has no remaining scheduled expansion")
+        })?;
+        if evidence != expected || self.early_exit.is_some() {
+            return Err(invalid(format!(
+                "EAGLE-3 dynamic frontier early exit {evidence:?} does not match the scheduled expansion {expected:?}"
+            )));
+        }
+        self.early_exit = Some(evidence);
+        Ok(())
     }
 
     /// Globally strongest parent still worth expanding.
@@ -1243,6 +1341,10 @@ impl Eagle3Drafter {
         // Scheduling, admission, scoring, reranking, the verifier and acceptance are untouched;
         // the terminal cell of every path is still a full forward.
         let replay_scatter = eagle3_replay_scatter_enabled();
+        // Confidence-gated early exit. Every X-derived sizing parameter (lattice budget, depth,
+        // verifier width, head capacity) is fixed by `config` above and stays untouched; the
+        // rule below can only end this loop before the expansion budget is spent.
+        let early_exit_theta = eagle3_draft_early_exit_theta();
 
         // Lattice root zero is represented by `stable_seed`, not a private cache row. Each
         // successful non-root materialization below extends this cursor by exactly one row per
@@ -1251,6 +1353,12 @@ impl Eagle3Drafter {
         let mut cursor_path = vec![0usize];
         let materialization = (|| -> Result<Eagle3DynamicFrontier> {
             while let Some(parent) = frontier.next_parent() {
+                if let Some(theta) = early_exit_theta {
+                    if let Some(evidence) = frontier.early_exit_for_parent(parent, theta) {
+                        frontier.record_early_exit(evidence)?;
+                        break;
+                    }
+                }
                 if let Some(admit_next_expansion) = expansion_gate.as_mut() {
                     let evidence =
                         frontier
@@ -1949,6 +2057,176 @@ mod tests {
         assert_eq!(before_fourth.next_parent_depth, 2);
         assert!((before_fourth.next_parent_cumulative_probability - 0.27).abs() < 1.0e-6);
         assert!((before_fourth.next_parent_cumulative_log_probability.exp() - 0.27).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn draft_early_exit_gate_is_default_off_and_fails_closed() {
+        use super::eagle3_draft_early_exit_theta_from as parse;
+        assert_eq!(parse(None), Ok(None));
+        assert_eq!(parse(Some("")), Ok(None));
+        assert_eq!(parse(Some("   ")), Ok(None));
+        assert_eq!(parse(Some("0")), Ok(None));
+        assert_eq!(parse(Some("0.0")), Ok(None));
+        assert_eq!(parse(Some("0.30")), Ok(Some(0.30)));
+        assert_eq!(parse(Some(" 0.25 ")), Ok(Some(0.25)));
+        assert_eq!(parse(Some("1")), Ok(Some(1.0)));
+        for malformed in [
+            "abc", "NaN", "inf", "-inf", "-0.1", "1.5", "true", "on", "0,3",
+        ] {
+            assert!(
+                parse(Some(malformed)).is_err(),
+                "{malformed:?} must be rejected so the gate fails closed"
+            );
+        }
+    }
+
+    /// Drive a frontier the way `draft_dynamic_frontier_impl` does, minus the Metal head:
+    /// each scheduled parent is answered from `observations` in schedule order, and the
+    /// confidence-gated early exit is consulted before every non-root expansion.
+    fn drive_frontier(
+        config: Eagle3DynamicFrontierConfig,
+        observations: &[Eagle3MetalOutput],
+        theta: Option<f64>,
+    ) -> Eagle3DynamicFrontier {
+        let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
+        while let Some(parent) = frontier.next_parent() {
+            if let Some(theta) = theta {
+                if let Some(evidence) = frontier.early_exit_for_parent(parent, theta) {
+                    frontier.record_early_exit(evidence).unwrap();
+                    break;
+                }
+            }
+            let observation = &observations[frontier.head_expansions()];
+            frontier.record_expansion(parent, observation).unwrap();
+        }
+        frontier
+    }
+
+    /// Root .50/.30/.15/.05; under 11: .28/.15; under 12: .24/.06; under 21: .252/.028;
+    /// under 41: .2268/.0252. The globally strongest unexpanded node before each non-root
+    /// expansion is therefore 11 (.50), 12 (.30), 21 (.28), 41 (.252) in schedule order, with
+    /// no probability ties anywhere so the expected schedule does not depend on rounding.
+    fn study_observations() -> Vec<Eagle3MetalOutput> {
+        vec![
+            output(&[(11, 0.50), (12, 0.30), (13, 0.15), (14, 0.05)], 1.0),
+            output(&[(21, 0.56), (22, 0.30)], 2.0),
+            output(&[(31, 0.80), (32, 0.20)], 3.0),
+            output(&[(41, 0.90), (42, 0.10)], 4.0),
+            output(&[(51, 0.90), (52, 0.10)], 5.0),
+        ]
+    }
+
+    #[test]
+    fn early_exit_stops_exactly_when_best_unexpanded_joint_probability_is_below_theta() {
+        let config = frontier_config(8, 21, 5);
+        let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
+        // The root distribution is free: no threshold, not even one, declines it.
+        assert_eq!(frontier.next_parent(), Some(0));
+        assert_eq!(frontier.early_exit_before_next_expansion(1.0), None);
+
+        let observations = study_observations();
+        frontier.record_expansion(0, &observations[0]).unwrap();
+        // Before the first materialized expansion the scheduler wants 11 at joint .50.
+        assert_eq!(frontier.next_parent(), Some(1));
+        let scheduled = frontier.next_expansion_evidence().unwrap();
+        let joint = f64::from(scheduled.next_parent_cumulative_probability);
+        assert!((joint - 0.50).abs() < 1.0e-6);
+        assert_eq!(frontier.early_exit_before_next_expansion(0.0), None);
+        // Strictly below: equality keeps expanding, the next representable step stops.
+        assert_eq!(frontier.early_exit_before_next_expansion(joint), None);
+        let exit = frontier
+            .early_exit_before_next_expansion(joint + 1.0e-9)
+            .unwrap();
+        assert_eq!(exit, scheduled);
+        assert_eq!(exit.completed_head_expansions, 1);
+        assert_eq!(exit.next_parent, 1);
+        assert_eq!(exit.next_parent_depth, 1);
+        // The rule is read-only: nothing about the frontier changed.
+        assert_eq!(frontier.draft_early_exit(), None);
+        assert_eq!(frontier.head_expansions(), 1);
+        assert_eq!(frontier.next_parent(), Some(1));
+        // Recording an exit fails closed unless it names exactly the scheduled expansion.
+        let mut stale = scheduled;
+        stale.completed_head_expansions += 1;
+        assert!(frontier.record_early_exit(stale).is_err());
+        let mut wrong_parent = scheduled;
+        wrong_parent.next_parent = 2;
+        assert!(frontier.record_early_exit(wrong_parent).is_err());
+        assert_eq!(frontier.draft_early_exit(), None);
+
+        // After expanding 11 (children .28/.15) the best unexpanded node is 12 at .30.
+        frontier.record_expansion(1, &observations[1]).unwrap();
+        assert_eq!(frontier.next_parent(), Some(2));
+        assert_eq!(frontier.early_exit_before_next_expansion(0.29), None);
+        let exit = frontier.early_exit_before_next_expansion(0.31).unwrap();
+        assert_eq!(exit.completed_head_expansions, 2);
+        assert_eq!(exit.next_parent, 2);
+        assert!((exit.next_parent_cumulative_probability - 0.30).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn early_exit_with_theta_zero_is_the_ungated_scheduler() {
+        let config = frontier_config(8, 21, 5);
+        let observations = study_observations();
+        let ungated = drive_frontier(config, &observations, None);
+        let armed_never_fires = drive_frontier(config, &observations, Some(0.0));
+        assert_eq!(ungated.head_expansions(), 5);
+        assert_eq!(ungated.draft_early_exit(), None);
+        assert_eq!(armed_never_fires, ungated);
+        assert_eq!(
+            armed_never_fires.finish().unwrap().scored,
+            ungated.finish().unwrap().scored
+        );
+        // Sanity: the same schedule with the existing (pre-gate) tests' lattices.
+        let sparse = frontier_config(5, 7, 3);
+        let sparse_observations = vec![
+            output(&[(11, 0.50), (12, 0.30)], 1.0),
+            output(&[(13, 0.50), (14, 0.40)], 2.0),
+            output(&[(15, 0.50), (16, 0.25)], 3.0),
+        ];
+        assert_eq!(
+            drive_frontier(sparse, &sparse_observations, Some(0.0)),
+            drive_frontier(sparse, &sparse_observations, None)
+        );
+    }
+
+    #[test]
+    fn early_exit_truncates_the_x5_lattice_without_touching_its_sizing() {
+        let x5 = frontier_config(8, 21, 5);
+        let observations = study_observations();
+        // theta .31 admits expansion two (11 at .50), declines expansion three (12 at .30).
+        let exited = drive_frontier(x5, &observations, Some(0.31));
+        assert_eq!(exited.head_expansions(), 2);
+        assert_eq!(exited.config(), x5);
+        let exit = exited.draft_early_exit().unwrap();
+        assert_eq!(exit.completed_head_expansions, 2);
+        assert_eq!(exit.next_parent, 2);
+        assert!((exit.next_parent_cumulative_probability - 0.30).abs() < 1.0e-6);
+        // The verifier sees exactly the lattice the offline study replays: the X5 run cut
+        // after two expansions, re-admitted with the unchanged N and depth.
+        let truncated = drive_frontier(frontier_config(8, 21, 2), &observations, None);
+        assert_eq!(truncated.draft_early_exit(), None);
+        assert_eq!(exited.lattice(), truncated.lattice());
+        assert_eq!(
+            exited.finish_borrowed().unwrap().scored,
+            truncated.finish_borrowed().unwrap().scored
+        );
+        // Lower thresholds walk further (21 at .28, then 41 at .252); a threshold above every
+        // joint stops before the first head forward.
+        for (theta, expansions) in [(0.29, 3), (0.26, 4), (0.25, 5), (0.20, 5)] {
+            assert_eq!(
+                drive_frontier(x5, &observations, Some(theta)).head_expansions(),
+                expansions,
+                "theta {theta}"
+            );
+        }
+        let immediate = drive_frontier(x5, &observations, Some(1.0));
+        assert_eq!(immediate.head_expansions(), 1);
+        assert_eq!(immediate.draft_early_exit().unwrap().next_parent, 1);
+        assert_eq!(
+            immediate.finish().unwrap().scored.tree.tokens,
+            vec![10, 11, 12, 13, 14]
+        );
     }
 
     #[test]
