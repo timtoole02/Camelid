@@ -33587,6 +33587,50 @@ fn eagle3_fused_qkv_enabled() -> bool {
     })
 }
 
+/// `CAMELID_METAL_SPIN_WAIT=1` (or `true`): wait for the EAGLE round's committed command
+/// buffers (draft forwards, the authoritative update, the verify) by polling their status
+/// from the calling thread instead of blocking in `wait_until_completed`.  Pure
+/// synchronization — no dispatch, value or order changes — so it is exact by construction.
+/// The turnaround probe (`command_buffer_turnaround_probe`) measured the host-visible gap
+/// between GPU-busy and commit-to-return at 270-390 us for `wait_until_completed` versus
+/// 200-220 us for a status spin on this device; the round issues six or more command
+/// buffers.  Any other spelling keeps `wait_until_completed`; the spin itself falls back to
+/// it after 200 ms so a stalled buffer can never pin a core.
+fn metal_spin_wait_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn metal_spin_wait_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_METAL_SPIN_WAIT").ok();
+        metal_spin_wait_from_env(value.as_deref())
+    })
+}
+
+/// Block until `cb` (already committed) has completed or errored; see
+/// `metal_spin_wait_enabled` for the two routes.
+#[cfg(target_os = "macos")]
+fn wait_command_buffer_completed(cb: &metal::CommandBufferRef) {
+    if metal_spin_wait_enabled() {
+        let started = std::time::Instant::now();
+        loop {
+            match cb.status() {
+                metal::MTLCommandBufferStatus::Completed | metal::MTLCommandBufferStatus::Error => {
+                    return;
+                }
+                _ => {}
+            }
+            if started.elapsed() > std::time::Duration::from_millis(200) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    cb.wait_until_completed();
+}
+
 /// Opt-in draft-cell tail: `CAMELID_EAGLE3_GPU_TAIL=1` (or `true`) ranks the cell's top-8
 /// draft candidates and reduces the full-vocabulary log-sum-exp statistics on the GPU
 /// (`eagle3_draft_tail_f32`, inside the cell's command buffer) instead of the host's
@@ -35473,7 +35517,7 @@ impl Eagle3MetalState {
         keep.extend([embedding, g_buf]);
         e.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        wait_command_buffer_completed(cb);
         let output = self.finish_encoded_cell(k, encoded, keep)?;
         self.filled = position + 1;
         Ok(output)
@@ -35615,7 +35659,7 @@ impl Eagle3MetalState {
         keep.extend([feature_input, embedding_input, fused, fc_scalar]);
         e.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        wait_command_buffer_completed(cb);
         if cb.status() != metal::MTLCommandBufferStatus::Completed {
             return Err(
                 "EAGLE-3 fused authoritative update command buffer did not complete"
@@ -36353,6 +36397,16 @@ mod eagle3_metal_contract_tests {
         for value in ["1", "true", "TRUE"] {
             assert!(eagle3_fused_qkv_from_env(Some(value)));
             assert!(eagle3_authoritative_kv_batch_proj_from_env(Some(value)));
+        }
+    }
+
+    #[test]
+    fn metal_spin_wait_gate_is_default_off_and_fails_closed() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("yes"), Some("on"), Some(" 1"), Some("spin")] {
+            assert!(!metal_spin_wait_from_env(value), "{value:?} must keep wait_until_completed");
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(metal_spin_wait_from_env(Some(value)));
         }
     }
 
@@ -42258,11 +42312,11 @@ impl ResidentDecodeState {
         let tail_commit_started = std::time::Instant::now();
         let commit_started = first_commit_started.unwrap_or_else(|| tail_commit_started.clone());
         cb.commit();
-        cb.wait_until_completed();
+        wait_command_buffer_completed(&cb);
         // Tail completion on this serial queue implies layer 0 completed. Keep the explicit
         // wait as a lifetime/status fence before any host readback or pool recycle.
         if let Some(head) = layer0_cb.as_ref() {
-            head.wait_until_completed();
+            wait_command_buffer_completed(head);
         }
         if verify_trace {
             let wall_us = commit_started.elapsed().as_micros();
@@ -51628,6 +51682,75 @@ mod tests {
             }
         }
         ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(None));
+    }
+
+    /// Probe: command-buffer turnaround on this device — the host-visible gap between GPU-busy
+    /// time and commit-to-completion wall time, for `wait_until_completed` and for a status
+    /// spin, at three command-buffer sizes.  The EAGLE round issues six or more command
+    /// buffers (every draft forward, the update, the verify), so this gap times six is the
+    /// ceiling of what any synchronization change can recover.
+    /// Run: cargo test --release --lib command_buffer_turnaround_probe -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn command_buffer_turnaround_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let count = 128_256usize;
+        let opts = MTLResourceOptions::StorageModeShared;
+        let logits = k.device.new_buffer((count * 4) as u64, opts);
+        write_buffer_f32(&logits, &(0..count).map(|i| (i % 977) as f32).collect::<Vec<_>>());
+        let out = k.device.new_buffer(4, opts);
+        let count_buf = k.device.new_buffer(4, opts);
+        unsafe { *(count_buf.contents() as *mut u32) = count as u32 };
+        for dispatches in [1usize, 8, 32] {
+            for spin in [false, true] {
+                let mut wall = Vec::new();
+                let mut busy = Vec::new();
+                for _ in 0..21 {
+                    let cb = k.queue.new_command_buffer().to_owned();
+                    let e = cb.new_compute_command_encoder();
+                    for _ in 0..dispatches {
+                        e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+                        e.set_buffer(0, Some(&logits), 0);
+                        e.set_buffer(1, Some(&out), 0);
+                        e.set_buffer(2, Some(&count_buf), 0);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize { width: 1, height: 1, depth: 1 },
+                            metal::MTLSize { width: 1024, height: 1, depth: 1 },
+                        );
+                    }
+                    e.end_encoding();
+                    let started = std::time::Instant::now();
+                    cb.commit();
+                    if spin {
+                        let deadline = started + std::time::Duration::from_secs(2);
+                        while cb.status() != metal::MTLCommandBufferStatus::Completed {
+                            if std::time::Instant::now() > deadline {
+                                cb.wait_until_completed();
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    } else {
+                        cb.wait_until_completed();
+                    }
+                    wall.push(started.elapsed().as_micros());
+                    busy.push(command_buffer_gpu_times_us(&cb).0);
+                }
+                wall.sort_unstable();
+                busy.sort_unstable();
+                let (w, b) = (wall[wall.len() / 2], busy[busy.len() / 2]);
+                eprintln!(
+                    "cb turnaround probe: dispatches={dispatches:>2} {}: wall(med) {w:>6} us  gpu_busy(med) {b:>6} us  gap {:>5} us  (min wall {} us)",
+                    if spin { "spin " } else { "wait " },
+                    w.saturating_sub(b),
+                    wall[0]
+                );
+            }
+        }
     }
 
     /// Probe: decode-attention kernel rate at depth, production-shaped (Llama-3.2-3B:
