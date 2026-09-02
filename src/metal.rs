@@ -23290,9 +23290,17 @@ fn verify_attention_rowshare_rows_per_tg() -> usize {
     })
 }
 
-/// Which kernel `CAMELID_METAL_ATTN_ROWSHARE=1` routes to.  All are bit-identical to the
-/// row-wise kernels; they differ only in load scheduling and threadgroup mapping.
-/// `CAMELID_METAL_ATTN_ROWSHARE_MODE=pf|pf2|chains` selects, default `pf`.
+/// Which kernel `CAMELID_METAL_ATTN_ROWSHARE=1` routes to
+/// (`CAMELID_METAL_ATTN_ROWSHARE_MODE=chains|pf|pfv|pf2`, default `chains`).
+///
+/// `Chains` only moves work between threadgroups, so it stays bit-identical to the
+/// row-wise kernels.  The hoisted-load kernels do NOT: MEASURED on two M4s, moving a
+/// step's loads above its arithmetic lets Metal's default fast math re-associate the
+/// work, which is where their speed comes from — 1.89x at depth 543 and 1.74x at 800,
+/// with about 94% of the output words differing from the row-wise reference.  They are
+/// therefore unroutable without `CAMELID_METAL_ATTN_ROWSHARE_ALLOW_INEXACT=1`, which is
+/// a re-certification decision (the emitted token array would have to be re-approved),
+/// never a performance switch.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AttentionRowshareMode {
@@ -23309,11 +23317,30 @@ enum AttentionRowshareMode {
 #[cfg(target_os = "macos")]
 fn attention_rowshare_mode_from_env(value: Option<&str>) -> AttentionRowshareMode {
     match value.map(str::trim) {
+        Some("pf") => AttentionRowshareMode::Prefetch,
         Some("pfv") => AttentionRowshareMode::PrefetchV,
         Some("pf2") => AttentionRowshareMode::Prefetch2,
-        Some("chains") => AttentionRowshareMode::Chains,
-        _ => AttentionRowshareMode::Prefetch,
+        // Anything unrecognised lands on the bit-identical geometry.
+        _ => AttentionRowshareMode::Chains,
     }
+}
+
+/// The hoisted-load kernels change the arithmetic, so arming the lane is not enough:
+/// `CAMELID_METAL_ATTN_ROWSHARE_ALLOW_INEXACT=1` must also acknowledge that the emitted
+/// token array is no longer the certified one.  Without it those modes refuse and the
+/// encode falls back to the row-dimensional batch kernel.
+#[cfg(target_os = "macos")]
+fn attention_rowshare_inexact_allowed_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_attention_rowshare_inexact_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let value = std::env::var("CAMELID_METAL_ATTN_ROWSHARE_ALLOW_INEXACT").ok();
+        attention_rowshare_inexact_allowed_from_env(value.as_deref())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -24902,7 +24929,9 @@ fn encode_attention_splitk_kv16_batch(
     let max_splits = split_counts.iter().copied().max().unwrap_or(0);
     // Rowshare takes precedence over shared-prefix when both are armed.
     let rowshare_mode = verify_attention_rowshare_enabled().then(attention_rowshare_mode);
+    let inexact_ok = verify_attention_rowshare_inexact_allowed();
     let rowshare_prefetch = match rowshare_mode {
+        _ if !inexact_ok => None,
         Some(AttentionRowshareMode::Prefetch) if head_dim == 128 => {
             admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref())
         }
@@ -46868,16 +46897,27 @@ mod tests {
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(5, 3, 8), 480);
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(8, 3, 1), 96);
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(16, 4, 8), 1024);
+        // The default and every unrecognised value must land on the bit-identical
+        // geometry; the inexact kernels are reachable only by naming them.
         for (value, expected) in [
-            (None, AttentionRowshareMode::Prefetch),
-            (Some(""), AttentionRowshareMode::Prefetch),
-            (Some("pf"), AttentionRowshareMode::Prefetch),
-            (Some("nonsense"), AttentionRowshareMode::Prefetch),
-            (Some("pf2"), AttentionRowshareMode::Prefetch2),
-            (Some("pfv"), AttentionRowshareMode::PrefetchV),
+            (None, AttentionRowshareMode::Chains),
+            (Some(""), AttentionRowshareMode::Chains),
+            (Some("nonsense"), AttentionRowshareMode::Chains),
             (Some(" chains "), AttentionRowshareMode::Chains),
+            (Some("pf"), AttentionRowshareMode::Prefetch),
+            (Some("pfv"), AttentionRowshareMode::PrefetchV),
+            (Some("pf2"), AttentionRowshareMode::Prefetch2),
         ] {
             assert_eq!(attention_rowshare_mode_from_env(value), expected, "mode {value:?}");
+        }
+        for value in [None, Some(""), Some("0"), Some("false"), Some("yes"), Some(" true ")] {
+            assert!(
+                !attention_rowshare_inexact_allowed_from_env(value),
+                "inexact gate must fail closed for {value:?}"
+            );
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(attention_rowshare_inexact_allowed_from_env(Some(value)));
         }
         for (value, expected) in [
             (None, true),
@@ -46959,10 +46999,10 @@ mod tests {
                             n_heads / n_kv_heads,
                         )
                     {
+                        // The hoisted-load kernels are deliberately absent: they are
+                        // MEASURED non-bit-identical (see the depth probe's EXACT/DIVERGES
+                        // column) and cannot route without the inexact acknowledgement.
                         encodes.extend([
-                            SplitkRowsEncode::Prefetch,
-                            SplitkRowsEncode::PrefetchV,
-                            SplitkRowsEncode::Prefetch2,
                             SplitkRowsEncode::RowShare(8, true),
                             SplitkRowsEncode::RowShare(4, true),
                             SplitkRowsEncode::RowShare(1, true),
