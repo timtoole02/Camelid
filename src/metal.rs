@@ -386,6 +386,8 @@ struct MetalLinearKernel {
     attention_decode_splitk_kv16_direct_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_shared_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_kv16_direct_rowshare_pipeline: Option<ComputePipelineState>,
+    attention_decode_splitk_kv16_direct_batch_pf_pipeline: Option<ComputePipelineState>,
+    attention_decode_splitk_kv16_direct_batch_pf2_pipeline: Option<ComputePipelineState>,
     attention_decode_splitk_merge_batch_pipeline: ComputePipelineState,
     attention_decode_splitk_kvq8_pipeline: ComputePipelineState,
     kv_dequant_q8_to_h_pipeline: ComputePipelineState,
@@ -11709,6 +11711,215 @@ kernel void attention_decode_splitk_kv16_direct_shared(
     }
 }
 
+// Load-scheduling siblings of attention_decode_splitk_kv16_direct_batch: identical grid,
+// threadgroup shape, work assignment and arithmetic; only WHEN the K/V bytes of a step are
+// fetched changes.  The batch kernel issues its four V loads only after the step's
+// max/exp work, so the memory pipe drains twice per step.  `_pf` hoists both the K and the
+// V loads of a step to the top of the iteration (eight loads in flight, one drain), and
+// `_pf2` additionally double-buffers the next step's K/V so the loads of step n+1 are in
+// flight during the arithmetic of step n.  Values, order of the flash recurrence, and the
+// partial layout are unchanged, so each (row, head, split) partial stays bit-identical to
+// the row-wise kernels.
+kernel void attention_decode_splitk_kv16_direct_batch_pf(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* partials [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& max_splits [[buffer(13)]],
+    device const uint2* row_meta [[buffer(14)]],
+    device const uint* tail_offsets [[buffer(15)]],
+    device const uint* tail_slots [[buffer(16)]],
+    constant uint& tree_base [[buffer(17)]],
+    constant uint& tree_mode [[buffer(18)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint row = tg.z;
+    const uint position_count = row_meta[row].x;
+    const uint n_splits = row_meta[row].y;
+    if (split >= n_splits) return;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float4 q4 = float4(0.0f);
+    if (active) {
+        const ulong q_base = ((ulong)row * n_heads + qh) * 128;
+        q4 = *reinterpret_cast<device const float4*>(query + q_base + lane * 4) * scale;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float4 acc = float4(0.0f);
+    if (active) {
+        const uint tail_off = (tree_mode != 0) ? tail_offsets[row] : 0u;
+        for (uint j0 = p0; j0 < p1; j0 += 4) {
+            half4 k4[4];
+            half4 v4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const uint slot = (tree_mode != 0 && j >= tree_base)
+                        ? tail_slots[tail_off + j - tree_base]
+                        : j;
+                    const uint off = kv_base + slot * position_stride + lane * 4;
+                    k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                    v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+                }
+            }
+            float s4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                s4[jj] = (j0 + jj < p1) ? simd_sum(dot(float4(k4[jj]), q4)) : -INFINITY;
+            }
+            const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+            const float m_new = max(m, m4);
+            const float corr = exp(m - m_new);
+            float w4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+            }
+            acc *= corr;
+            for (uint jj = 0; jj < 4; ++jj) {
+                if (j0 + jj < p1) {
+                    acc += w4[jj] * float4(v4[jj]);
+                }
+            }
+            l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
+            m = m_new;
+        }
+        device float* dst = partials
+            + ((((ulong)row * n_heads + qh) * max_splits + split) * (128 + 2));
+        dst[lane * 4] = acc.x;
+        dst[lane * 4 + 1] = acc.y;
+        dst[lane * 4 + 2] = acc.z;
+        dst[lane * 4 + 3] = acc.w;
+        if (lane == 0) {
+            dst[128] = m;
+            dst[129] = l;
+        }
+    }
+}
+
+kernel void attention_decode_splitk_kv16_direct_batch_pf2(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* partials [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& max_splits [[buffer(13)]],
+    device const uint2* row_meta [[buffer(14)]],
+    device const uint* tail_offsets [[buffer(15)]],
+    device const uint* tail_slots [[buffer(16)]],
+    constant uint& tree_base [[buffer(17)]],
+    constant uint& tree_mode [[buffer(18)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint row = tg.z;
+    const uint position_count = row_meta[row].x;
+    const uint n_splits = row_meta[row].y;
+    if (split >= n_splits) return;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float4 q4 = float4(0.0f);
+    if (active) {
+        const ulong q_base = ((ulong)row * n_heads + qh) * 128;
+        q4 = *reinterpret_cast<device const float4*>(query + q_base + lane * 4) * scale;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float4 acc = float4(0.0f);
+    if (active) {
+        const uint tail_off = (tree_mode != 0) ? tail_offsets[row] : 0u;
+        half4 k4[4];
+        half4 v4[4];
+        // Prologue: the first step's loads.
+        for (uint jj = 0; jj < 4; ++jj) {
+            const uint j = p0 + jj;
+            if (j < p1) {
+                const uint slot = (tree_mode != 0 && j >= tree_base)
+                    ? tail_slots[tail_off + j - tree_base]
+                    : j;
+                const uint off = kv_base + slot * position_stride + lane * 4;
+                k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+            }
+        }
+        for (uint j0 = p0; j0 < p1; j0 += 4) {
+            const half4 k_cur[4] = {k4[0], k4[1], k4[2], k4[3]};
+            const half4 v_cur[4] = {v4[0], v4[1], v4[2], v4[3]};
+            // Issue the next step's loads before consuming this one.
+            const uint j0n = j0 + 4;
+            for (uint jj = 0; jj < 4; ++jj) {
+                const uint j = j0n + jj;
+                if (j < p1) {
+                    const uint slot = (tree_mode != 0 && j >= tree_base)
+                        ? tail_slots[tail_off + j - tree_base]
+                        : j;
+                    const uint off = kv_base + slot * position_stride + lane * 4;
+                    k4[jj] = *reinterpret_cast<device const half4*>(keys + off);
+                    v4[jj] = *reinterpret_cast<device const half4*>(values + off);
+                }
+            }
+            float s4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                s4[jj] = (j0 + jj < p1) ? simd_sum(dot(float4(k_cur[jj]), q4)) : -INFINITY;
+            }
+            const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+            const float m_new = max(m, m4);
+            const float corr = exp(m - m_new);
+            float w4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+            }
+            acc *= corr;
+            for (uint jj = 0; jj < 4; ++jj) {
+                if (j0 + jj < p1) {
+                    acc += w4[jj] * float4(v_cur[jj]);
+                }
+            }
+            l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
+            m = m_new;
+        }
+        device float* dst = partials
+            + ((((ulong)row * n_heads + qh) * max_splits + split) * (128 + 2));
+        dst[lane * 4] = acc.x;
+        dst[lane * 4 + 1] = acc.y;
+        dst[lane * 4 + 2] = acc.z;
+        dst[lane * 4 + 3] = acc.w;
+        if (lane == 0) {
+            dst[128] = m;
+            dst[129] = l;
+        }
+    }
+}
+
 // Row-colocated sibling of attention_decode_splitk_kv16_direct_batch (head_dim == 128).
 // Grid (row_blocks, n_kv_heads, max_splits), row block on the fastest axis.  A threadgroup
 // carries rows_per_tg * group simdgroups; simdgroup sg owns the chain of
@@ -11739,13 +11950,18 @@ kernel void attention_decode_splitk_kv16_direct_rowshare(
     constant uint& tree_mode [[buffer(18)]],
     constant uint& rows [[buffer(19)]],
     constant uint& rows_per_tg [[buffer(20)]],
+    constant uint& kvh_fastest [[buffer(21)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    const uint kvh = tg.y;
+    // `kvh_fastest` selects which axis threadgroups are enumerated on first: the
+    // row-dimensional batch kernel sweeps kv heads first (concurrent threadgroups touch
+    // eight different kv-head regions), the row-fastest order makes them re-read one
+    // region.  Only scheduling order changes; each chain's arithmetic is unchanged.
+    const uint kvh = (kvh_fastest != 0) ? tg.x : tg.y;
     const uint split = tg.z;
-    const uint row = tg.x * rows_per_tg + sg / group;
+    const uint row = ((kvh_fastest != 0) ? tg.y : tg.x) * rows_per_tg + sg / group;
     if (row >= rows) return;
     const uint position_count = row_meta[row].x;
     const uint n_splits = row_meta[row].y;
@@ -12826,6 +13042,22 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let attention_decode_splitk_kv16_direct_batch_pf_pipeline = elementwise_library
+                .get_function("attention_decode_splitk_kv16_direct_batch_pf", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let attention_decode_splitk_kv16_direct_batch_pf2_pipeline = elementwise_library
+                .get_function("attention_decode_splitk_kv16_direct_batch_pf2", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let attention_decode_splitk_merge_batch_function = elementwise_library
                 .get_function("attention_decode_splitk_merge_batch_f32", None)
                 .ok()?;
@@ -13351,6 +13583,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_kv16_direct_batch_pipeline,
                 attention_decode_splitk_kv16_direct_shared_pipeline,
                 attention_decode_splitk_kv16_direct_rowshare_pipeline,
+                attention_decode_splitk_kv16_direct_batch_pf_pipeline,
+                attention_decode_splitk_kv16_direct_batch_pf2_pipeline,
                 attention_decode_splitk_merge_batch_pipeline,
                 attention_decode_splitk_kvq8_pipeline,
                 kv_dequant_q8_to_h_pipeline,
@@ -22922,6 +23156,38 @@ fn verify_attention_rowshare_rows_per_tg() -> usize {
     })
 }
 
+/// Which kernel `CAMELID_METAL_ATTN_ROWSHARE=1` routes to.  All are bit-identical to the
+/// row-wise kernels; they differ only in load scheduling and threadgroup mapping.
+/// `CAMELID_METAL_ATTN_ROWSHARE_MODE=pf|pf2|chains` selects, default `pf`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttentionRowshareMode {
+    /// Batch grid, K and V of a step loaded together.
+    Prefetch,
+    /// Batch grid, next step's K/V in flight during this step's arithmetic.
+    Prefetch2,
+    /// Row-colocated chains (geometry study; `..._CHAINS`/`..._ORDER` knobs).
+    Chains,
+}
+
+#[cfg(target_os = "macos")]
+fn attention_rowshare_mode_from_env(value: Option<&str>) -> AttentionRowshareMode {
+    match value.map(str::trim) {
+        Some("pf2") => AttentionRowshareMode::Prefetch2,
+        Some("chains") => AttentionRowshareMode::Chains,
+        _ => AttentionRowshareMode::Prefetch,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn attention_rowshare_mode() -> AttentionRowshareMode {
+    static MODE: OnceLock<AttentionRowshareMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var("CAMELID_METAL_ATTN_ROWSHARE_MODE").ok();
+        attention_rowshare_mode_from_env(value.as_deref())
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn attention_splitk_kv16_rowshare_shape_allowed(
     rows: usize,
@@ -22935,6 +23201,23 @@ fn attention_splitk_kv16_rowshare_shape_allowed(
 #[cfg(target_os = "macos")]
 fn attention_splitk_kv16_rowshare_threadgroup(rows: usize, group: usize, rows_per_tg: usize) -> usize {
     rows.min(rows_per_tg) * group * 32
+}
+
+/// Threadgroup enumeration order for the chains geometry
+/// (`CAMELID_METAL_ATTN_ROWSHARE_ORDER=row` to sweep rows first; default sweeps kv heads
+/// first, matching the row-dimensional batch kernel).
+#[cfg(target_os = "macos")]
+fn attention_rowshare_kvh_fastest_from_env(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("row"))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_attention_rowshare_kvh_fastest() -> bool {
+    static ORDER: OnceLock<bool> = OnceLock::new();
+    *ORDER.get_or_init(|| {
+        let value = std::env::var("CAMELID_METAL_ATTN_ROWSHARE_ORDER").ok();
+        attention_rowshare_kvh_fastest_from_env(value.as_deref())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -23304,9 +23587,15 @@ enum SplitkRowsEncode {
     /// `attention_decode_splitk_kv16_direct_shared` (head_dim 128, rows <= 8).
     SharedPrefix,
     /// One (row, head) chain per simdgroup, `rows_per_tg * group` simdgroups per
-    /// threadgroup, row block on the fastest grid axis:
-    /// `attention_decode_splitk_kv16_direct_rowshare` (head_dim 128, rows 2..=16).
-    RowShare(usize),
+    /// threadgroup: `attention_decode_splitk_kv16_direct_rowshare` (head_dim 128,
+    /// rows 2..=16).  `bool` selects kv-head-fastest (true) or row-fastest enumeration.
+    RowShare(usize, bool),
+    /// Batch grid, K and V of a step loaded together:
+    /// `attention_decode_splitk_kv16_direct_batch_pf`.
+    Prefetch,
+    /// Batch grid, next step's K/V in flight during this step:
+    /// `attention_decode_splitk_kv16_direct_batch_pf2`.
+    Prefetch2,
 }
 
 /// Low-level row-wise-vs-row-dimensional F16 split-K driver.  `tree` is the
@@ -23332,9 +23621,30 @@ fn try_attention_splitk_kv16_rows_for_test(
     let rows = position_counts.len();
     let group = n_heads.checked_div(n_kv_heads)?;
     let rowshare_rows_per_tg = match encode {
-        SplitkRowsEncode::RowShare(rows_per_tg) => Some(rows.min(rows_per_tg)),
+        SplitkRowsEncode::RowShare(rows_per_tg, _) => Some(rows.min(rows_per_tg)),
         _ => None,
     };
+    let rowshare_kvh_fastest = matches!(encode, SplitkRowsEncode::RowShare(_, true));
+    let prefetch_pipeline = match encode {
+        SplitkRowsEncode::Prefetch => Some(
+            admitted_32_lane_pipeline(
+                metal_linear_kernel()?
+                    .attention_decode_splitk_kv16_direct_batch_pf_pipeline
+                    .as_ref(),
+            )?,
+        ),
+        SplitkRowsEncode::Prefetch2 => Some(
+            admitted_32_lane_pipeline(
+                metal_linear_kernel()?
+                    .attention_decode_splitk_kv16_direct_batch_pf2_pipeline
+                    .as_ref(),
+            )?,
+        ),
+        _ => None,
+    };
+    if prefetch_pipeline.is_some() && (head_dim != 128 || !direct) {
+        return None;
+    }
     if rows == 0
         || repeats == 0
         || kv_copies == 0
@@ -23453,6 +23763,7 @@ fn try_attention_splitk_kv16_rows_for_test(
         *s.add(2) = u32::from(tree.is_some());
         *s.add(3) = rows as u32;
         *s.add(4) = rowshare_rows_per_tg.unwrap_or(0) as u32;
+        *s.add(5) = u32::from(rowshare_kvh_fastest);
         let offsets = tail_offsets.contents() as *mut u32;
         for (i, &offset) in flat_offsets.iter().enumerate() {
             *offsets.add(i) = offset;
@@ -23518,6 +23829,8 @@ fn try_attention_splitk_kv16_rows_for_test(
         for rep in 0..repeats {
             e.set_compute_pipeline_state(if let Some(pipeline) = rowshare_pipeline {
                 pipeline
+            } else if let Some(pipeline) = prefetch_pipeline {
+                pipeline
             } else if shared {
                 shared_pipeline.expect("shared-prefix pipeline admitted above")
             } else if direct {
@@ -23545,10 +23858,17 @@ fn try_attention_splitk_kv16_rows_for_test(
             if let Some(rows_per_tg) = rowshare_rows_per_tg {
                 e.set_buffer(19, Some(&batch_scalars), 12);
                 e.set_buffer(20, Some(&batch_scalars), 16);
+                e.set_buffer(21, Some(&batch_scalars), 20);
+                let row_blocks = rows.div_ceil(rows_per_tg) as u64;
+                let (grid_x, grid_y) = if rowshare_kvh_fastest {
+                    (n_kv_heads as u64, row_blocks)
+                } else {
+                    (row_blocks, n_kv_heads as u64)
+                };
                 e.dispatch_thread_groups(
                     metal::MTLSize {
-                        width: rows.div_ceil(rows_per_tg) as u64,
-                        height: n_kv_heads as u64,
+                        width: grid_x,
+                        height: grid_y,
                         depth: max_splits as u64,
                     },
                     metal::MTLSize {
@@ -24434,14 +24754,26 @@ fn encode_attention_splitk_kv16_batch(
         .collect();
     let max_splits = split_counts.iter().copied().max().unwrap_or(0);
     // Rowshare takes precedence over shared-prefix when both are armed.
-    let rowshare = verify_attention_rowshare_enabled()
+    let rowshare_mode = verify_attention_rowshare_enabled().then(attention_rowshare_mode);
+    let rowshare_prefetch = match rowshare_mode {
+        Some(AttentionRowshareMode::Prefetch) if head_dim == 128 => {
+            admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref())
+        }
+        Some(AttentionRowshareMode::Prefetch2) if head_dim == 128 => {
+            admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf2_pipeline.as_ref())
+        }
+        _ => None,
+    };
+    let rowshare = (rowshare_mode == Some(AttentionRowshareMode::Chains))
         .then(|| {
             let rows_per_tg = rows.min(verify_attention_rowshare_rows_per_tg());
             attention_splitk_kv16_rowshare_pipeline(k, rows, head_dim, group, rows_per_tg)
                 .map(|pipeline| (pipeline, rows_per_tg))
         })
         .flatten();
-    let shared_pipeline = (rowshare.is_none() && verify_attention_shared_prefix_enabled())
+    let shared_pipeline = (rowshare.is_none()
+        && rowshare_prefetch.is_none()
+        && verify_attention_shared_prefix_enabled())
         .then(|| attention_splitk_kv16_shared_prefix_pipeline(k, rows, head_dim, group))
         .flatten();
     let shared_prefix = shared_pipeline.is_some();
@@ -24449,8 +24781,9 @@ fn encode_attention_splitk_kv16_batch(
     if shared_prefix {
         VERIFY_SHARED_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    let rowshare_routed = rowshare.is_some() || rowshare_prefetch.is_some();
     #[cfg(test)]
-    if rowshare.is_some() {
+    if rowshare_routed {
         VERIFY_ROWSHARE_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let partials = pool_get(
@@ -24482,6 +24815,7 @@ fn encode_attention_splitk_kv16_batch(
         *scalars.add(2) = u32::from(tree.is_some());
         *scalars.add(3) = rows as u32;
         *scalars.add(4) = rowshare.map_or(0, |(_, rows_per_tg)| rows_per_tg) as u32;
+        *scalars.add(5) = u32::from(verify_attention_rowshare_kvh_fastest());
         let offsets = tail_offsets_buf.contents() as *mut u32;
         for (i, &offset) in tail_offsets.iter().enumerate() {
             *offsets.add(i) = offset;
@@ -24493,6 +24827,8 @@ fn encode_attention_splitk_kv16_batch(
     }
 
     e.set_compute_pipeline_state(if let Some((pipeline, _)) = rowshare {
+        pipeline
+    } else if let Some(pipeline) = rowshare_prefetch {
         pipeline
     } else if let Some(pipeline) = shared_pipeline {
         pipeline
@@ -24523,10 +24859,17 @@ fn encode_attention_splitk_kv16_batch(
         // rows_per_tg * group simdgroups, one (row, head) chain each.
         e.set_buffer(19, Some(&batch_scalars), 12); // rows
         e.set_buffer(20, Some(&batch_scalars), 16); // rows_per_tg
+        e.set_buffer(21, Some(&batch_scalars), 20); // kvh_fastest
+        let row_blocks = rows.div_ceil(rows_per_tg) as u64;
+        let (grid_x, grid_y) = if verify_attention_rowshare_kvh_fastest() {
+            (n_kv_heads as u64, row_blocks)
+        } else {
+            (row_blocks, n_kv_heads as u64)
+        };
         e.dispatch_thread_groups(
             metal::MTLSize {
-                width: rows.div_ceil(rows_per_tg) as u64,
-                height: n_kv_heads as u64,
+                width: grid_x,
+                height: grid_y,
                 depth: max_splits as u64,
             },
             metal::MTLSize {
@@ -24595,7 +24938,7 @@ fn encode_attention_splitk_kv16_batch(
     AttentionSplitkKv16BatchRoute {
         encoded: true,
         shared_prefix,
-        rowshare: rowshare.is_some(),
+        rowshare: rowshare_routed,
     }
 }
 
@@ -46375,6 +46718,29 @@ mod tests {
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(5, 3, 8), 480);
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(8, 3, 1), 96);
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(16, 4, 8), 1024);
+        for (value, expected) in [
+            (None, AttentionRowshareMode::Prefetch),
+            (Some(""), AttentionRowshareMode::Prefetch),
+            (Some("pf"), AttentionRowshareMode::Prefetch),
+            (Some("nonsense"), AttentionRowshareMode::Prefetch),
+            (Some("pf2"), AttentionRowshareMode::Prefetch2),
+            (Some(" chains "), AttentionRowshareMode::Chains),
+        ] {
+            assert_eq!(attention_rowshare_mode_from_env(value), expected, "mode {value:?}");
+        }
+        for (value, expected) in [
+            (None, true),
+            (Some("kvh"), true),
+            (Some("nonsense"), true),
+            (Some("row"), false),
+            (Some(" row "), false),
+        ] {
+            assert_eq!(
+                attention_rowshare_kvh_fastest_from_env(value),
+                expected,
+                "order {value:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -46443,9 +46809,12 @@ mod tests {
                         )
                     {
                         encodes.extend([
-                            SplitkRowsEncode::RowShare(8),
-                            SplitkRowsEncode::RowShare(4),
-                            SplitkRowsEncode::RowShare(1),
+                            SplitkRowsEncode::Prefetch,
+                            SplitkRowsEncode::Prefetch2,
+                            SplitkRowsEncode::RowShare(8, true),
+                            SplitkRowsEncode::RowShare(4, true),
+                            SplitkRowsEncode::RowShare(1, true),
+                            SplitkRowsEncode::RowShare(1, false),
                         ]);
                     }
                     for encode in encodes {
@@ -46543,6 +46912,38 @@ mod tests {
         let query: Vec<f32> = (0..rows * n_heads * head_dim)
             .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
             .collect();
+        // Occupancy ceilings: a kernel whose register footprint caps the threadgroup below
+        // 1024 threads cannot fill a core, which is the first place to look when a
+        // fewer-threadgroups geometry loses to the row-dimensional batch kernel.
+        let kernel = metal_linear_kernel().expect("metal kernel");
+        let report = |label: &str, pipeline: Option<&ComputePipelineState>| match pipeline {
+            Some(pipeline) => eprintln!(
+                "pipeline {label}: max_total_threads_per_threadgroup={} thread_execution_width={}",
+                pipeline.max_total_threads_per_threadgroup(),
+                pipeline.thread_execution_width()
+            ),
+            None => eprintln!("pipeline {label}: unavailable"),
+        };
+        report(
+            "direct_batch",
+            Some(&kernel.attention_decode_splitk_kv16_direct_batch_pipeline),
+        );
+        report(
+            "direct_shared",
+            kernel.attention_decode_splitk_kv16_direct_shared_pipeline.as_ref(),
+        );
+        report(
+            "direct_rowshare",
+            kernel.attention_decode_splitk_kv16_direct_rowshare_pipeline.as_ref(),
+        );
+        report(
+            "direct_batch_pf",
+            kernel.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref(),
+        );
+        report(
+            "direct_batch_pf2",
+            kernel.attention_decode_splitk_kv16_direct_batch_pf2_pipeline.as_ref(),
+        );
         for base in [543usize, 800, 4_137] {
             let max_positions = base + rows;
             let position_counts: Vec<usize> = (1..=rows).map(|row| base + row).collect();
@@ -46556,7 +46957,7 @@ mod tests {
             // Distinct K/V buffers rotate across the 28 layer repeats so the shallow depths
             // are not flattered by one layer's K/V staying cache-resident (production has a
             // distinct K/V per layer).
-            const KV_COPIES: usize = 8;
+            const KV_COPIES: usize = 28;
             let run = |encode, kv_copies| {
                 try_attention_splitk_kv16_rows_for_test(
                     &query,
@@ -46579,11 +46980,12 @@ mod tests {
             let variants = [
                 ("row", SplitkRowsEncode::RowWise),
                 ("batch", SplitkRowsEncode::Batch),
+                ("prefetch", SplitkRowsEncode::Prefetch),
+                ("prefetch2", SplitkRowsEncode::Prefetch2),
                 ("shared", SplitkRowsEncode::SharedPrefix),
-                ("rowshare8", SplitkRowsEncode::RowShare(8)),
-                ("rowshare4", SplitkRowsEncode::RowShare(4)),
-                ("rowshare2", SplitkRowsEncode::RowShare(2)),
-                ("rowshare1", SplitkRowsEncode::RowShare(1)),
+                ("chains8kvh", SplitkRowsEncode::RowShare(8, true)),
+                ("chains1kvh", SplitkRowsEncode::RowShare(1, true)),
+                ("chains1row", SplitkRowsEncode::RowShare(1, false)),
             ];
             let (row_warm, _, _) = run(SplitkRowsEncode::RowWise, 1);
             for (label, encode) in variants {
@@ -46596,35 +46998,51 @@ mod tests {
                     );
                 }
             }
-            let mut best = vec![u128::MAX; variants.len()];
+            // Seven interleaved rounds, best AND median reported: single-round spreads at
+            // the shallow depths reach 30%, so a best-of-three ranking is noise.
+            const ROUNDS: usize = 7;
+            let mut samples = vec![Vec::with_capacity(ROUNDS); variants.len()];
             let mut encode_best = vec![u128::MAX; variants.len()];
-            for round in 0..3 {
+            for round in 0..ROUNDS {
                 let mut line = format!("F16 split-K k8 base={base} round={round}:");
                 for (idx, (label, encode)) in variants.iter().enumerate() {
                     let (_, gpu_us, encode_us) = run(*encode, KV_COPIES);
-                    best[idx] = best[idx].min(gpu_us);
+                    samples[idx].push(gpu_us);
                     encode_best[idx] = encode_best[idx].min(encode_us);
-                    line.push_str(&format!(
-                        " {label}=GPU {:.3}ms/enc {:.3}ms",
-                        gpu_us as f64 / 1000.0,
-                        encode_us as f64 / 1000.0
-                    ));
+                    line.push_str(&format!(" {label}={:.3}", gpu_us as f64 / 1000.0));
                 }
                 eprintln!("{line}");
             }
+            let best: Vec<u128> = samples
+                .iter()
+                .map(|s| s.iter().copied().min().unwrap_or(u128::MAX))
+                .collect();
+            let median: Vec<u128> = samples
+                .iter()
+                .map(|s| {
+                    let mut s = s.clone();
+                    s.sort_unstable();
+                    s[s.len() / 2]
+                })
+                .collect();
             let bytes_once = (n_kv_heads * (base + rows) * head_dim * 2 * 2 * layers) as f64;
             let batch_best = best[1] as f64;
+            let batch_median = median[1] as f64;
             eprintln!(
-                "F16 split-K k8 base={base} layers={layers} kv_copies={KV_COPIES} best GPU (K/V read once = {:.1} MB):",
+                "F16 split-K k8 base={base} layers={layers} kv_copies={KV_COPIES} rounds={ROUNDS} (K/V read once = {:.1} MB):",
                 bytes_once / 1.0e6
             );
             for (idx, (label, _)) in variants.iter().enumerate() {
                 eprintln!(
-                    "  {label:<10} GPU {:>8.3} ms  batch/this {:.3}x  per-layer {:>7.1} us  once-rate {:>6.1} GB/s",
+                    "  {label:<11} best {:>8.3} ms ({:.3}x)  median {:>8.3} ms ({:.3}x)  per-layer(med) {:>7.1} us  \
+                     once-rate(med) {:>6.1} GB/s  x8-rate {:>6.1} GB/s",
                     best[idx] as f64 / 1000.0,
                     batch_best / best[idx] as f64,
-                    best[idx] as f64 / layers as f64,
-                    bytes_once / (best[idx] as f64 * 1.0e-6) / 1.0e9,
+                    median[idx] as f64 / 1000.0,
+                    batch_median / median[idx] as f64,
+                    median[idx] as f64 / layers as f64,
+                    bytes_once / (median[idx] as f64 * 1.0e-6) / 1.0e9,
+                    8.0 * bytes_once / (median[idx] as f64 * 1.0e-6) / 1.0e9,
                 );
             }
         }
