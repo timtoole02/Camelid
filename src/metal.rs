@@ -33138,6 +33138,20 @@ struct Eagle3EncodedCell {
     raw_hidden: Buffer,
     logits: Buffer,
     selected: Buffer,
+    /// The cell's own post-RoPE key and value projections (`[kv_heads * head_dim]` f32 each),
+    /// present only when the encoder allocated them itself. A caller that later wants this
+    /// row's cache bytes again can scatter these through the same F16 kernel instead of
+    /// streaming the head weights a second time.
+    scored_kv: Option<(Buffer, Buffer)>,
+}
+
+/// One scored draft cell plus the key/value it wrote, so a later branch switch can restore
+/// the row through [`Eagle3MetalState::commit_scored_row`] without a weight stream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Eagle3MetalScoredRow {
+    pub output: Eagle3MetalOutput,
+    pub key: Vec<f32>,
+    pub value: Vec<f32>,
 }
 
 #[cfg(target_os = "macos")]
@@ -34586,7 +34600,11 @@ impl Eagle3MetalState {
                 depth: 1,
             },
         );
-        keep.extend(owned_inputs);
+        // Owned inputs are [combined, key, value]; the key/value ride along in the cell so the
+        // caller can read them back after completion. Precomputed inputs belong to the caller.
+        let mut owned_inputs = owned_inputs.into_iter();
+        keep.extend(owned_inputs.next());
+        let scored_kv = owned_inputs.next().zip(owned_inputs.next());
         keep.extend([
             query,
             context,
@@ -34620,6 +34638,7 @@ impl Eagle3MetalState {
             raw_hidden,
             logits,
             selected,
+            scored_kv,
         }
     }
 
@@ -34627,8 +34646,37 @@ impl Eagle3MetalState {
         &self,
         k: &MetalLinearKernel,
         encoded: Eagle3EncodedCell,
-        mut keep: Vec<Buffer>,
+        keep: Vec<Buffer>,
     ) -> std::result::Result<Eagle3MetalOutput, String> {
+        self.finish_encoded_cell_scored(k, encoded, keep, false)
+            .map(|row| row.output)
+    }
+
+    /// [`Self::finish_encoded_cell`] that also returns the cell's post-RoPE key/value when
+    /// `want_kv` is set (an 8 KB readback); the buffers are recycled either way.
+    fn finish_encoded_cell_scored(
+        &self,
+        k: &MetalLinearKernel,
+        encoded: Eagle3EncodedCell,
+        mut keep: Vec<Buffer>,
+        want_kv: bool,
+    ) -> std::result::Result<Eagle3MetalScoredRow, String> {
+        let kv_dim = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        let mut missing_kv = false;
+        match encoded.scored_kv {
+            Some((key_buf, value_buf)) => {
+                if want_kv {
+                    key = vec![0.0f32; kv_dim];
+                    value = vec![0.0f32; kv_dim];
+                    read_buffer_f32(&key_buf, &mut key);
+                    read_buffer_f32(&value_buf, &mut value);
+                }
+                keep.extend([key_buf, value_buf]);
+            }
+            None => missing_kv = want_kv,
+        }
         let draft_token = unsafe { *(encoded.selected.contents() as *const u32) };
         let target_token = eagle3_map_draft_token(draft_token, &self.d2t_offsets);
         let draft_logits = unsafe {
@@ -34643,13 +34691,23 @@ impl Eagle3MetalState {
         let target_token = target_token?;
         let top_candidates = top_candidates?;
         let evaluated_vocab_logsumexp = evaluated_vocab_logsumexp?;
-        Ok(Eagle3MetalOutput {
-            draft_token,
-            target_token,
-            top_candidates,
-            evaluated_vocab_rows: self.lm_head_rows,
-            evaluated_vocab_logsumexp,
-            raw_hidden: raw_hidden_out,
+        if missing_kv {
+            return Err(
+                "EAGLE-3 scored forward requested key/value from a cell that did not own them"
+                    .to_string(),
+            );
+        }
+        Ok(Eagle3MetalScoredRow {
+            output: Eagle3MetalOutput {
+                draft_token,
+                target_token,
+                top_candidates,
+                evaluated_vocab_rows: self.lm_head_rows,
+                evaluated_vocab_logsumexp,
+                raw_hidden: raw_hidden_out,
+            },
+            key,
+            value,
         })
     }
 
@@ -34667,6 +34725,28 @@ impl Eagle3MetalState {
         self.forward_token_with(token_embedding, g, position, eagle3_fused_qkv_enabled())
     }
 
+    /// [`Self::forward_token`] that also returns the cell's post-RoPE key and value.
+    ///
+    /// Same dispatches, same cache write, same output bits; the only addition is an 8 KB
+    /// readback of the two projections. Keeping them lets a caller that later has to
+    /// re-materialize this row -- a lattice branch switch replaying an already-scored node --
+    /// restore its cache bytes through [`Self::commit_scored_row`] for a scatter instead of a
+    /// full head forward.
+    pub fn forward_token_scored(
+        &mut self,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+    ) -> std::result::Result<Eagle3MetalScoredRow, String> {
+        self.forward_token_scored_with(
+            token_embedding,
+            g,
+            position,
+            eagle3_fused_qkv_enabled(),
+            true,
+        )
+    }
+
     /// [`Self::forward_token`] with the segmented q|k|v / gate|up routing explicit.
     fn forward_token_with(
         &mut self,
@@ -34675,6 +34755,18 @@ impl Eagle3MetalState {
         position: usize,
         fused_qkv: bool,
     ) -> std::result::Result<Eagle3MetalOutput, String> {
+        self.forward_token_scored_with(token_embedding, g, position, fused_qkv, false)
+            .map(|row| row.output)
+    }
+
+    fn forward_token_scored_with(
+        &mut self,
+        token_embedding: &[f32],
+        g: &[f32],
+        position: usize,
+        fused_qkv: bool,
+        want_kv: bool,
+    ) -> std::result::Result<Eagle3MetalScoredRow, String> {
         if token_embedding.len() != EAGLE3_HIDDEN || g.len() != EAGLE3_HIDDEN {
             return Err(format!(
                 "EAGLE-3 forward expected embedding/g widths {EAGLE3_HIDDEN}, got {}/{}",
@@ -34710,9 +34802,79 @@ impl Eagle3MetalState {
         e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
-        let output = self.finish_encoded_cell(k, encoded, keep)?;
+        let row = self.finish_encoded_cell_scored(k, encoded, keep, want_kv)?;
         self.filled = position + 1;
-        Ok(output)
+        Ok(row)
+    }
+
+    /// Restore one previously scored row's key/value at exactly the current watermark.
+    ///
+    /// `key` is the row's post-RoPE key projection and `value` its value projection, as
+    /// returned by [`Self::forward_token_scored`]. They go through the same F16 scatter kernel
+    /// `forward_token` used, so the cache bytes are identical to the ones that forward wrote;
+    /// no weight matrix is streamed and no output is produced. This is the whole cost of
+    /// re-materializing an already-scored lattice node on a branch switch.
+    pub fn commit_scored_row(
+        &mut self,
+        key: &[f32],
+        value: &[f32],
+        position: usize,
+    ) -> std::result::Result<(), String> {
+        let kv_dim = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        if key.len() != kv_dim || value.len() != kv_dim {
+            return Err(format!(
+                "EAGLE-3 scored-row commit expected key/value widths {kv_dim}, got {}/{}",
+                key.len(),
+                value.len()
+            ));
+        }
+        if position != self.filled {
+            return Err(format!(
+                "EAGLE-3 scored-row commit position {position} does not match KV watermark {}; rollback first",
+                self.filled
+            ));
+        }
+        if position >= self.max_positions {
+            return Err(format!(
+                "EAGLE-3 scored-row commit position {position} exceeds cache capacity {}",
+                self.max_positions
+            ));
+        }
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let key_buf = pool_get(k, (kv_dim * std::mem::size_of::<f32>()) as u64);
+        let value_buf = pool_get(k, (kv_dim * std::mem::size_of::<f32>()) as u64);
+        let scatter_scalar = pool_get(k, 16);
+        write_buffer_f32(&key_buf, key);
+        write_buffer_f32(&value_buf, value);
+        unsafe {
+            let scatter = scatter_scalar.contents() as *mut u32;
+            *scatter = EAGLE3_HEAD_DIM as u32;
+            *scatter.add(1) = self.max_positions as u32;
+            *scatter.add(2) = position as u32;
+            *scatter.add(3) = kv_dim as u32;
+        }
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        e.set_compute_pipeline_state(&k.kv_scatter_kv16_pipeline);
+        e.set_buffer(0, Some(&key_buf), 0);
+        e.set_buffer(1, Some(&value_buf), 0);
+        e.set_buffer(2, Some(&self.cache_k), 0);
+        e.set_buffer(3, Some(&self.cache_v), 0);
+        e.set_buffer(4, Some(&scatter_scalar), 0);
+        e.set_buffer(5, Some(&scatter_scalar), 4);
+        e.set_buffer(6, Some(&scatter_scalar), 8);
+        e.set_buffer(7, Some(&scatter_scalar), 12);
+        dispatch_1d(e, &k.kv_scatter_kv16_pipeline, kv_dim);
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let completed = cb.status() == metal::MTLCommandBufferStatus::Completed;
+        pool_recycle(k, [key_buf, value_buf, scatter_scalar]);
+        if !completed {
+            return Err("EAGLE-3 scored-row commit command buffer did not complete".to_string());
+        }
+        self.filled = position + 1;
+        Ok(())
     }
 
     /// Benchmark-only one-command-buffer authoritative update.
@@ -34984,6 +35146,24 @@ impl Eagle3MetalState {
         _g: &[f32],
         _position: usize,
     ) -> std::result::Result<Eagle3MetalOutput, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn forward_token_scored(
+        &mut self,
+        _token_embedding: &[f32],
+        _g: &[f32],
+        _position: usize,
+    ) -> std::result::Result<Eagle3MetalScoredRow, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
+    pub fn commit_scored_row(
+        &mut self,
+        _key: &[f32],
+        _value: &[f32],
+        _position: usize,
+    ) -> std::result::Result<(), String> {
         Err("EAGLE-3 Metal is only available on macOS".to_string())
     }
 
@@ -35992,6 +36172,107 @@ mod eagle3_metal_contract_tests {
         assert_eq!(candidates(a), candidates(b), "{what}: top candidates");
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
         assert_eq!(bits(&a.raw_hidden), bits(&b.raw_hidden), "{what}: raw_hidden");
+    }
+
+    /// Replay-by-scatter bit-identity on a real Metal device: a child cell scored after
+    /// `commit_scored_row` restored its parent's row must equal the child scored after the
+    /// parent was materialized by a full `forward_token` -- the sequential replay path. Also
+    /// checks that `forward_token_scored` itself bit-equals `forward_token`, that the commit
+    /// moves the watermark by exactly one row, and that malformed commits fail closed.
+    ///
+    /// `cargo test --release --lib \
+    /// eagle3_metal_contract_tests::eagle3_replay_scatter_child_matches_sequential_replay \
+    /// -- --ignored --nocapture --test-threads=1`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn eagle3_replay_scatter_child_matches_sequential_replay() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        assert!(kquant_v3_kernels().is_some(), "KQUANT_V3_SHADER");
+        let max_positions = 48usize;
+        let mut rng = TidyRng(0x5eed_0f0f_c0ff_ee01);
+        let mut head = synthetic_q4k_head(k, max_positions, &mut rng);
+        let kv_dim = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+
+        // Authoritative prefix so every cell under test attends real history.
+        let seed_rows = 5usize;
+        let seed_embeddings = rng.f32s(seed_rows * EAGLE3_HIDDEN, 0.0, 0.5);
+        let seed_features = rng.f32s(seed_rows * EAGLE3_AUX_WIDTH, 0.0, 0.5);
+        head.forward_authoritative_features_last_output_fused_impl(
+            &seed_embeddings,
+            &seed_features,
+            0,
+            false,
+            false,
+        )
+        .expect("seed update");
+        let stable = head.filled();
+        assert_eq!(stable, seed_rows);
+
+        let parent_embedding = rng.f32s(EAGLE3_HIDDEN, 0.0, 0.5);
+        let parent_g = rng.f32s(EAGLE3_HIDDEN, 0.0, 0.5);
+        let child_embedding = rng.f32s(EAGLE3_HIDDEN, 0.0, 0.5);
+
+        // Sequential replay path: parent by forward, child by forward.
+        let parent_plain = head
+            .forward_token(&parent_embedding, &parent_g, stable)
+            .expect("parent forward");
+        let child_reference = head
+            .forward_token(&child_embedding, &parent_plain.raw_hidden, stable + 1)
+            .expect("child forward");
+        head.rollback_to_position(stable).unwrap();
+
+        // The scored forward is the same cell plus an 8 KB readback.
+        let parent_scored = head
+            .forward_token_scored(&parent_embedding, &parent_g, stable)
+            .expect("parent scored forward");
+        assert_eq!(
+            parent_scored.output, parent_plain,
+            "forward_token_scored must bit-equal forward_token"
+        );
+        assert_eq!(parent_scored.key.len(), kv_dim);
+        assert_eq!(parent_scored.value.len(), kv_dim);
+        assert!(parent_scored.key.iter().all(|v| v.is_finite()));
+        assert!(parent_scored.value.iter().all(|v| v.is_finite()));
+        assert_eq!(head.filled(), stable + 1);
+        head.rollback_to_position(stable).unwrap();
+
+        // Poison the slot the commit will rewrite, so a stale-byte match cannot pass.
+        {
+            let poison_embedding = rng.f32s(EAGLE3_HIDDEN, 3.0, 0.5);
+            let poison_g = rng.f32s(EAGLE3_HIDDEN, -3.0, 0.5);
+            head.forward_token(&poison_embedding, &poison_g, stable)
+                .expect("poison forward");
+            head.rollback_to_position(stable).unwrap();
+        }
+
+        // Replay-by-scatter path: parent restored by scatter, child by forward.
+        head.commit_scored_row(&parent_scored.key, &parent_scored.value, stable)
+            .expect("scatter-only commit");
+        assert_eq!(head.filled(), stable + 1, "a commit is exactly one row");
+        let child_after_commit = head
+            .forward_token(&child_embedding, &parent_scored.output.raw_hidden, stable + 1)
+            .expect("child after commit");
+        assert_eq!(
+            child_after_commit, child_reference,
+            "a child scored over a scatter-restored parent must bit-equal the sequential replay"
+        );
+        head.rollback_to_position(stable).unwrap();
+
+        // Fail closed: wrong widths and a position off the watermark commit nothing.
+        assert!(head
+            .commit_scored_row(&parent_scored.key[..kv_dim - 1], &parent_scored.value, stable)
+            .is_err());
+        assert!(head
+            .commit_scored_row(&parent_scored.key, &parent_scored.value, stable + 1)
+            .is_err());
+        assert_eq!(head.filled(), stable, "rejected commits leave the watermark alone");
+        eprintln!(
+            "[replay-scatter] child after scatter-only commit bit-equals the sequential replay; scored forward bit-equals forward_token"
+        );
     }
 
     /// End to end on a synthetic full-geometry Q4_K head: the batched K/V projection update

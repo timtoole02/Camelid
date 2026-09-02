@@ -11106,6 +11106,7 @@ struct Eagle3BenchRun {
     dynamic_tree_offered: u64,
     dynamic_tree_emitted_tokens: u64,
     materialized_head_forwards: u64,
+    replay_scatter_commits: u64,
     dynamic_tree_max_depth_sum: u64,
     verifier_widths: Eagle3VerifierWidthTelemetry,
     x3_x4_expansions: Eagle3X3X4Telemetry,
@@ -11447,6 +11448,7 @@ fn run_eagle3_resident_greedy(
                     )?,
                 };
                 let materialized_head_forwards = frontier.materialized_head_forwards();
+                let replay_scatter_commits = frontier.replay_scatter_commits();
                 let forest = frontier.finish()?;
                 let actual_nodes = forest.scored.tree.nodes();
                 let actual_max_depth = forest.scored.tree.max_depth();
@@ -11572,6 +11574,7 @@ fn run_eagle3_resident_greedy(
                 run.dynamic_tree_offered += offered as u64;
                 run.dynamic_tree_emitted_tokens += emitted_count as u64;
                 run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.replay_scatter_commits += replay_scatter_commits as u64;
                 run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
                 (acceptance.emitted_tokens, offered, actual_nodes)
             } else if !suffix_drafts.is_empty() {
@@ -11747,6 +11750,7 @@ fn run_eagle3_resident_greedy(
                         },
                     )?;
                     let materialized_head_forwards = frontier.materialized_head_forwards();
+                    let replay_scatter_commits = frontier.replay_scatter_commits();
                     let forest = frontier.finish()?;
                     let actual_nodes = forest.scored.tree.nodes();
                     let actual_max_depth = forest.scored.tree.max_depth();
@@ -11818,6 +11822,7 @@ fn run_eagle3_resident_greedy(
                     run.dynamic_tree_offered += offered as u64;
                     run.dynamic_tree_emitted_tokens += emitted_count as u64;
                     run.materialized_head_forwards += materialized_head_forwards as u64;
+                    run.replay_scatter_commits += replay_scatter_commits as u64;
                     run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
                     run.token_recycling
                         .note_candidates(actual_nodes, candidate_ids);
@@ -11865,6 +11870,7 @@ fn run_eagle3_resident_greedy(
                     },
                 )?;
                 let materialized_head_forwards = frontier.materialized_head_forwards();
+                let replay_scatter_commits = frontier.replay_scatter_commits();
                 let eagle_forest = frontier.finish_borrowed()?;
                 // Retain the target-blind proposal union before releasing the recurrent lattice.
                 // It is diagnostic input only; the fused verifier tree and full head stay fixed.
@@ -12103,6 +12109,7 @@ fn run_eagle3_resident_greedy(
                 run.dynamic_tree_offered += offered as u64;
                 run.dynamic_tree_emitted_tokens += emitted_count as u64;
                 run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.replay_scatter_commits += replay_scatter_commits as u64;
                 run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
                 (acceptance.emitted_tokens, offered, actual_nodes)
             } else {
@@ -12187,6 +12194,7 @@ fn run_eagle3_resident_greedy(
                     }
                 }
                 let materialized_head_forwards = frontier.materialized_head_forwards();
+                let replay_scatter_commits = frontier.replay_scatter_commits();
                 // Benchmark-only admission changes only which connected subset reaches the
                 // verifier. The ordinary target-authoritative acceptance below remains the sole
                 // source of emitted tokens, so choosing N5 cannot change greedy exactness.
@@ -12281,6 +12289,7 @@ fn run_eagle3_resident_greedy(
                 run.dynamic_tree_offered += offered as u64;
                 run.dynamic_tree_emitted_tokens += emitted_count as u64;
                 run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.replay_scatter_commits += replay_scatter_commits as u64;
                 run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
                 (acceptance.emitted_tokens, offered, actual_nodes)
             }
@@ -13012,6 +13021,13 @@ struct BenchEagle3Record {
     materialized_head_forwards: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mean_materialized_head_forwards_per_dynamic_round: Option<f64>,
+    /// CAMELID_BENCH_EAGLE3_REPLAY_SCATTER armed for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_scatter: Option<bool>,
+    /// Path-replay rows restored by a scatter-only commit instead of a head forward. Zero with
+    /// the gate off, so a receipt proves the lane fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_scatter_commits: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mean_dynamic_tree_max_depth: Option<f64>,
     resident_verify_rounds: u64,
@@ -14854,6 +14870,7 @@ fn run_bench_eagle3(
     let x3_x4_selector = eagle3_x3_x4_selector_config()?;
     let authoritative_cb_fusion = eagle3_authoritative_cb_fusion_enabled()?;
     let terminal_head_skip = eagle3_terminal_head_skip_enabled()?;
+    let replay_scatter = camelid::eagle3_runtime::eagle3_replay_scatter_enabled();
     let adaptive_branching = eagle3_adaptive_branching_enabled();
     anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
     anyhow::ensure!(
@@ -15762,6 +15779,8 @@ fn run_bench_eagle3(
         materialized_head_forwards: tree_nodes.map(|_| eagle.materialized_head_forwards),
         mean_materialized_head_forwards_per_dynamic_round: tree_nodes
             .map(|_| mean_materialized_head_forwards),
+        replay_scatter: tree_nodes.map(|_| replay_scatter),
+        replay_scatter_commits: tree_nodes.map(|_| eagle.replay_scatter_commits),
         mean_dynamic_tree_max_depth: tree_nodes.map(|_| mean_dynamic_tree_max_depth),
         resident_verify_rounds: eagle.resident_verify_rounds,
         cpu_verify_rounds: eagle.cpu_verify_rounds,

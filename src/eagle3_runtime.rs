@@ -14,7 +14,7 @@ use crate::inference::spec_tree::{
 };
 use crate::inference::LlamaLoadedWeights;
 use crate::metal::{
-    Eagle3MetalOutput, Eagle3MetalState, Eagle3MetalWeights, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
+    Eagle3MetalOutput, Eagle3MetalScoredRow, Eagle3MetalState, Eagle3MetalWeights, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
 };
 use crate::tensor::CpuTensor;
 
@@ -365,6 +365,18 @@ impl Eagle3ArgmaxCandidateShadow {
     }
 }
 
+pub const EAGLE3_REPLAY_SCATTER_ENV: &str = "CAMELID_BENCH_EAGLE3_REPLAY_SCATTER";
+
+/// Benchmark-only replay-by-scatter gate. Only the exact spelling `1` arms it; every other
+/// value, including `true`, fails closed to the established replay-by-forward path.
+fn eagle3_replay_scatter_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+pub fn eagle3_replay_scatter_enabled() -> bool {
+    eagle3_replay_scatter_enabled_from(std::env::var(EAGLE3_REPLAY_SCATTER_ENV).ok().as_deref())
+}
+
 fn eagle3_path_transition(
     current_path: &[usize],
     next_path: &[usize],
@@ -416,6 +428,12 @@ pub struct Eagle3DynamicFrontier {
     /// Successful non-root `forward_token` calls used to materialize this lattice. The root
     /// distribution comes from `stable_seed` and therefore costs no call here.
     materialized_head_forwards: usize,
+    /// Post-RoPE key/value of every scored non-root node, retained only under the
+    /// replay-by-scatter gate. A branch switch that has to re-materialize an already-scored
+    /// node restores these through the F16 scatter instead of streaming the head weights.
+    scored_kv: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+    /// Path-replay rows restored by scatter instead of by a head forward.
+    replay_scatter_commits: usize,
     /// Completely target-blind observation sidecar. `None` is the byte-preserving default.
     certified_argmax_shadow: Option<Eagle3ArgmaxCandidateShadow>,
 }
@@ -473,6 +491,8 @@ impl Eagle3DynamicFrontier {
             recurrent_g: vec![None],
             head_expansions: 0,
             materialized_head_forwards: 0,
+            scored_kv: vec![None],
+            replay_scatter_commits: 0,
             certified_argmax_shadow: config
                 .certified_argmax_shadow
                 .then(Eagle3ArgmaxCandidateShadow::default),
@@ -493,6 +513,49 @@ impl Eagle3DynamicFrontier {
 
     pub fn materialized_head_forwards(&self) -> usize {
         self.materialized_head_forwards
+    }
+
+    /// Path-replay rows restored by a scatter-only commit rather than a head forward. Zero
+    /// with the gate off, so a receipt can prove the lane fired.
+    pub fn replay_scatter_commits(&self) -> usize {
+        self.replay_scatter_commits
+    }
+
+    /// [`Self::record_expansion`] that also retains the scored row's key/value for later
+    /// scatter-only replays.
+    pub fn record_scored_expansion(
+        &mut self,
+        parent: usize,
+        row: &Eagle3MetalScoredRow,
+    ) -> Result<Vec<usize>> {
+        let kv_dim = crate::metal::EAGLE3_KV_HEADS * crate::metal::EAGLE3_HEAD_DIM;
+        if row.key.len() != kv_dim || row.value.len() != kv_dim {
+            return Err(invalid(format!(
+                "EAGLE-3 scored expansion for node {parent} carries key/value widths {}/{}, expected {kv_dim}",
+                row.key.len(),
+                row.value.len()
+            )));
+        }
+        let children = self.record_expansion(parent, &row.output)?;
+        let node_count = self.lattice.nodes().len();
+        if self.scored_kv.len() < node_count {
+            self.scored_kv.resize(node_count, None);
+        }
+        self.scored_kv[parent] = Some((row.key.clone(), row.value.clone()));
+        Ok(children)
+    }
+
+    /// Key/value retained for an already-scored node.
+    fn scored_kv(&self, node: usize) -> Result<(&[f32], &[f32])> {
+        self.scored_kv
+            .get(node)
+            .and_then(|entry| entry.as_ref())
+            .map(|(key, value)| (key.as_slice(), value.as_slice()))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "EAGLE-3 replay-by-scatter has no retained key/value for node {node}"
+                ))
+            })
     }
 
     pub fn certified_argmax_shadow(&self) -> Option<&Eagle3ArgmaxCandidateShadow> {
@@ -1176,6 +1239,10 @@ impl Eagle3Drafter {
         let stable = self.head.filled();
         let mut frontier = Eagle3DynamicFrontier::new(anchor, config)?;
         frontier.record_expansion(0, &stable_seed)?;
+        // Benchmark-only: restore already-scored path rows by scatter instead of by forward.
+        // Scheduling, admission, scoring, reranking, the verifier and acceptance are untouched;
+        // the terminal cell of every path is still a full forward.
+        let replay_scatter = eagle3_replay_scatter_enabled();
 
         // Lattice root zero is represented by `stable_seed`, not a private cache row. Each
         // successful non-root materialization below extends this cursor by exactly one row per
@@ -1229,11 +1296,34 @@ impl Eagle3Drafter {
 
                 let mut selected_output = None;
                 for &source in &path[transition.replay_from..] {
+                    // Every path node before `parent` was expanded earlier this round -- that
+                    // is how the next node on the path came to exist -- so its distribution is
+                    // already in the lattice and only its cache row is needed here. With the
+                    // gate armed, restore that row from the key/value retained when it was
+                    // scored: one F16 scatter instead of a full head forward. The bytes are
+                    // the ones that forward wrote, so the terminal cell below reads the same
+                    // history either way.
+                    if replay_scatter && source != parent {
+                        let (key, value) = frontier.scored_kv(source)?;
+                        metal(self.head.commit_scored_row(key, value, self.head.filled()))?;
+                        frontier.replay_scatter_commits += 1;
+                        continue;
+                    }
                     let token = frontier.lattice.nodes()[source].token;
                     let recurrent = frontier.recurrent_g(source)?.to_vec();
                     let embedding = target_weights
                         .token_embedding
                         .embedding_lookup(&[token], "eagle3_dynamic_frontier_token_embedding")?;
+                    if replay_scatter {
+                        let row = metal(self.head.forward_token_scored(
+                            &embedding.data,
+                            &recurrent,
+                            self.head.filled(),
+                        ))?;
+                        frontier.materialized_head_forwards += 1;
+                        selected_output = Some(row);
+                        continue;
+                    }
                     let output = metal(self.head.forward_token(
                         &embedding.data,
                         &recurrent,
@@ -1241,10 +1331,14 @@ impl Eagle3Drafter {
                     ))?;
                     frontier.materialized_head_forwards += 1;
                     if source == parent {
-                        selected_output = Some(output);
+                        selected_output = Some(Eagle3MetalScoredRow {
+                            output,
+                            key: Vec::new(),
+                            value: Vec::new(),
+                        });
                     }
                 }
-                let output = selected_output.ok_or_else(|| {
+                let scored = selected_output.ok_or_else(|| {
                     invalid(format!(
                         "EAGLE-3 dynamic frontier path did not materialize parent {parent}"
                     ))
@@ -1259,7 +1353,11 @@ impl Eagle3Drafter {
                     )));
                 }
                 cursor_path = path;
-                frontier.record_expansion(parent, &output)?;
+                if replay_scatter {
+                    frontier.record_scored_expansion(parent, &scored)?;
+                } else {
+                    frontier.record_expansion(parent, &scored.output)?;
+                }
             }
             Ok(frontier)
         })();
@@ -1413,6 +1511,18 @@ impl Eagle3Drafter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replay_scatter_gate_is_default_off_and_fails_closed() {
+        assert!(!super::eagle3_replay_scatter_enabled_from(None));
+        assert!(!super::eagle3_replay_scatter_enabled_from(Some("")));
+        assert!(!super::eagle3_replay_scatter_enabled_from(Some("0")));
+        assert!(!super::eagle3_replay_scatter_enabled_from(Some("true")));
+        assert!(!super::eagle3_replay_scatter_enabled_from(Some("yes")));
+        assert!(!super::eagle3_replay_scatter_enabled_from(Some("11")));
+        assert!(super::eagle3_replay_scatter_enabled_from(Some("1")));
+        assert!(super::eagle3_replay_scatter_enabled_from(Some(" 1 ")));
+    }
+
     use super::*;
     use crate::metal::Eagle3DraftCandidate;
 
