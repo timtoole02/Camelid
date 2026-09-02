@@ -46969,6 +46969,9 @@ mod tests {
                             SplitkRowsEncode::RowShare(1, false),
                         ]);
                     }
+                    // Every candidate is reported before the test fails: aborting on the
+                    // first divergence hides whether the later candidates are exact.
+                    let mut diverged: Vec<String> = Vec::new();
                     for encode in encodes {
                         let (batched, _, _) = try_attention_splitk_kv16_rows_for_test(
                             &query,
@@ -46988,21 +46991,40 @@ mod tests {
                         )
                         .expect("row-dimensional split-K attention");
                         assert_eq!(rowwise.len(), batched.len());
-                        for (i, (&expected, &actual)) in rowwise.iter().zip(&batched).enumerate()
-                        {
-                            assert_eq!(
-                                actual.to_bits(),
-                                expected.to_bits(),
-                                "{label} direct={direct} {encode:?} element {i}: {actual} ({:#010x}) != row={expected} ({:#010x})",
+                        let mismatches: Vec<(usize, f32, f32)> = rowwise
+                            .iter()
+                            .zip(&batched)
+                            .enumerate()
+                            .filter(|(_, (expected, actual))| {
+                                actual.to_bits() != expected.to_bits()
+                            })
+                            .map(|(i, (&expected, &actual))| (i, expected, actual))
+                            .collect();
+                        if mismatches.is_empty() {
+                            eprintln!(
+                                "metal_attention_splitk_kv16_batch_matches_rowwise: {label} direct={direct} {encode:?} BIT-IDENTICAL ({} words)",
+                                batched.len()
+                            );
+                        } else {
+                            let (i, expected, actual) = mismatches[0];
+                            let detail = format!(
+                                "{label} direct={direct} {encode:?} DIVERGES ({} of {} words, first element {i}: {actual} ({:#010x}) != row={expected} ({:#010x}))",
+                                mismatches.len(),
+                                batched.len(),
                                 actual.to_bits(),
                                 expected.to_bits(),
                             );
+                            eprintln!(
+                                "metal_attention_splitk_kv16_batch_matches_rowwise: {detail}"
+                            );
+                            diverged.push(detail);
                         }
-                        eprintln!(
-                            "metal_attention_splitk_kv16_batch_matches_rowwise: {label} direct={direct} {encode:?} BIT-IDENTICAL ({} words)",
-                            batched.len()
-                        );
                     }
+                    assert!(
+                        diverged.is_empty(),
+                        "verifier attention variants are not bit-identical: {}",
+                        diverged.join("; ")
+                    );
                 }
             };
 
@@ -47144,15 +47166,31 @@ mod tests {
                 ("chains1kvh", SplitkRowsEncode::RowShare(1, true)),
                 ("chains1row", SplitkRowsEncode::RowShare(1, false)),
             ];
+            // Exactness is reported per variant rather than asserted for all of them: a
+            // candidate that diverges is disqualified, but its timing still bounds what
+            // the restructuring could ever buy. The routed kernels must be exact.
             let (row_warm, _, _) = run(SplitkRowsEncode::RowWise, 1);
-            for (label, encode) in variants {
-                let (warm, _, _) = run(encode, KV_COPIES);
-                for (i, (&expected, &actual)) in row_warm.iter().zip(&warm).enumerate() {
-                    assert_eq!(
-                        actual.to_bits(),
-                        expected.to_bits(),
-                        "k8 base={base} {label} element {i} is not bit-identical"
-                    );
+            let exact: Vec<bool> = variants
+                .iter()
+                .map(|(label, encode)| {
+                    let (warm, _, _) = run(*encode, KV_COPIES);
+                    let bad = row_warm
+                        .iter()
+                        .zip(&warm)
+                        .filter(|(e, a)| a.to_bits() != e.to_bits())
+                        .count();
+                    if bad != 0 {
+                        eprintln!(
+                            "F16 split-K k8 base={base} {label}: DIVERGES from row-wise in {bad} of {} words",
+                            warm.len()
+                        );
+                    }
+                    bad == 0
+                })
+                .collect();
+            for (idx, (label, _)) in variants.iter().enumerate() {
+                if matches!(*label, "row" | "batch") {
+                    assert!(exact[idx], "k8 base={base} {label} is not bit-identical");
                 }
             }
             // Seven interleaved rounds, best AND median reported: single-round spreads at
@@ -47191,8 +47229,9 @@ mod tests {
             );
             for (idx, (label, _)) in variants.iter().enumerate() {
                 eprintln!(
-                    "  {label:<11} best {:>8.3} ms ({:.3}x)  median {:>8.3} ms ({:.3}x)  per-layer(med) {:>7.1} us  \
+                    "  {label:<11} {:<9} best {:>8.3} ms ({:.3}x)  median {:>8.3} ms ({:.3}x)  per-layer(med) {:>7.1} us  \
                      once-rate(med) {:>6.1} GB/s  x8-rate {:>6.1} GB/s",
+                    if exact[idx] { "EXACT" } else { "DIVERGES" },
                     best[idx] as f64 / 1000.0,
                     batch_best / best[idx] as f64,
                     median[idx] as f64 / 1000.0,
