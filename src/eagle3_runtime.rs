@@ -1245,6 +1245,23 @@ impl Eagle3Drafter {
         self.head.filled()
     }
 
+    /// Capacity of the private one-layer head cache, in positions.
+    pub fn max_positions(&self) -> usize {
+        self.head.max_positions()
+    }
+
+    /// Forget every request-specific row so the uploaded head can serve another
+    /// generation. The cache watermark, the stable root seed and the per-run fusion
+    /// telemetry are exactly the state [`Self::seed_prompt`] demands of a fresh drafter;
+    /// the Metal-resident weights and the cache allocation are untouched, so a reuse
+    /// costs no upload. Stale cache bytes are unobservable: every read is bounded by the
+    /// watermark and each admitted row overwrites its own slot first.
+    pub fn reset_for_reuse(&mut self) {
+        self.head.reset();
+        self.stable_seed = None;
+        self.authoritative_fusion = Eagle3AuthoritativeFusionTelemetry::default();
+    }
+
     /// Decode-time telemetry for the benchmark-only authoritative command-buffer fusion.
     /// Prompt seeding is deliberately excluded and remains on the established control path.
     pub fn authoritative_fusion_telemetry(&self) -> Eagle3AuthoritativeFusionTelemetry {

@@ -51,7 +51,7 @@ use crate::{
         clamp_max_tokens_to_logical_budget as clamp_eagle3_max_tokens,
         configured_logical_token_limit as configured_eagle3_logical_token_limit,
         validate_logical_budget as validate_eagle3_logical_budget, Eagle3ServingConfig,
-        Eagle3ServingState, MAX_DRAFT_TOKENS as EAGLE3_MAX_DRAFT_TOKENS,
+        Eagle3ServeHeadKey, Eagle3ServingState, MAX_DRAFT_TOKENS as EAGLE3_MAX_DRAFT_TOKENS,
     },
     embedding::{
         cosine_similarity, validate_bitnet_embedding_metadata, EmbeddingRuntime, EncoderConfig,
@@ -144,8 +144,10 @@ struct CachedEagle3Checkpoint {
     model: Arc<Eagle3DraftModel>,
 }
 
-/// Host-side EAGLE checkpoint cache. The per-request Metal head owns uploaded
-/// copies, while this avoids re-reading and reallocating ~486 MB on every chat.
+/// Host-side EAGLE checkpoint cache: avoids re-reading and reallocating the
+/// ~486 MB checkpoint on every chat. The Metal-resident upload built from it is
+/// pooled separately (`eagle3_serving::Eagle3ServeHeadKey`), so a pool miss
+/// re-uploads from these bytes without touching disk.
 static EAGLE3_CHECKPOINT_CACHE: OnceLock<Mutex<Option<CachedEagle3Checkpoint>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -2109,8 +2111,9 @@ enum SpecDecodeMode {
     /// Suffix-decoding drafting, flattened to a chain so it rides the batched
     /// column verify rather than the (much more expensive) tree verify.
     Suffix,
-    /// Llama-3.2-3B EAGLE-3: full-width suffix-first verification with a
-    /// measured N8/K4/X4 learned-tree fallback.
+    /// Llama-3.2-3B EAGLE-3: full-width suffix-first verification with the
+    /// certified N8/K4/X5 learned-tree fallback (operator-overridable through
+    /// `CAMELID_EAGLE3_SERVE_TREE_{NODES,TOP_K,EXPANSIONS}`).
     Eagle3,
 }
 
@@ -2211,9 +2214,11 @@ fn eagle3_target_contract_error(config: &LlamaModelConfig, target_sha256: &str) 
     }
 }
 
+/// Returns the host checkpoint and its weights SHA-256 (the serve head pool's
+/// identity component).
 fn load_eagle3_checkpoint_cached(
     path: &std::path::Path,
-) -> crate::error::Result<Arc<Eagle3DraftModel>> {
+) -> crate::error::Result<(Arc<Eagle3DraftModel>, String)> {
     let weights_path = path.join("model.safetensors");
     let sha256 = receipt::sha256_file_hex_cached(&weights_path).map_err(|error| {
         BackendError::InvalidModelMetadata(format!(
@@ -2264,7 +2269,7 @@ fn load_eagle3_checkpoint_cached(
             .map(|hit| Arc::clone(&hit.model))
     };
     if let Some(model) = cached_model {
-        return Ok(model);
+        return Ok((model, sha256));
     }
 
     let model = Arc::new(Eagle3DraftModel::load(path)?);
@@ -2303,10 +2308,10 @@ fn load_eagle3_checkpoint_cached(
         .lock()
         .expect("EAGLE-3 checkpoint cache mutex poisoned") = Some(CachedEagle3Checkpoint {
         path: path.to_path_buf(),
-        sha256,
+        sha256: sha256.clone(),
         model: Arc::clone(&model),
     });
-    Ok(model)
+    Ok((model, sha256))
 }
 
 fn spec_ngram_min_from_env() -> usize {
@@ -18499,7 +18504,8 @@ async fn prepare_generation(
                         None,
                     )
                 })?;
-            let checkpoint = tokio::task::spawn_blocking(move || {
+            let checkpoint_path = sidecar_path.clone();
+            let (checkpoint, checkpoint_sha256) = tokio::task::spawn_blocking(move || {
                 load_eagle3_checkpoint_cached(&sidecar_path)
             })
             .await
@@ -18519,9 +18525,26 @@ async fn prepare_generation(
                     None,
                 )
             })?;
+            // The uploaded draft wire is request-independent: the serving state
+            // checks it out of the serve-wide single-slot pool at bootstrap
+            // (keyed by head, target, wire gates and envelope) instead of
+            // re-uploading ~486 MB (~1.2 s) on every request.
+            let head_key = Eagle3ServeHeadKey::current(
+                &checkpoint_path,
+                &checkpoint_sha256,
+                &model.lane.gguf_sha256,
+            )
+            .map_err(|error| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "eagle3_model_load_failed",
+                    error.to_string(),
+                    None,
+                )
+            })?;
             Some(PreparedSpeculative {
                 drafter: PreparedSpeculativeDrafter::Eagle3(Box::new(
-                    Eagle3ServingState::new(checkpoint, config),
+                    Eagle3ServingState::new(checkpoint, config).with_pooled_head(head_key),
                 )),
                 draft_tokens,
                 // EAGLE's hybrid scheduler is itself the measured admission
@@ -19867,6 +19890,14 @@ fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
     } else {
         spec.accepted_drafts as f64 * 100.0 / spec.drafted as f64
     };
+    let (eagle3_head_reused, eagle3_early_exit_rounds, eagle3_tree) = match &spec.drafter {
+        PreparedSpeculativeDrafter::Eagle3(state) => (
+            state.head_reused(),
+            state.early_exit_rounds(),
+            Some(format!("{:?}", state.dynamic_tree())),
+        ),
+        PreparedSpeculativeDrafter::Standard(_) => (false, 0, None),
+    };
     tracing::info!(
         rounds = spec.rounds,
         drafted = spec.drafted,
@@ -19893,6 +19924,9 @@ fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
         suffix_min_confident_depth =
             crate::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH,
         eagle3 = spec.is_eagle3(),
+        eagle3_head_reused,
+        eagle3_early_exit_rounds,
+        eagle3_tree,
         generated,
         "speculative decode summary"
     );

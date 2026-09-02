@@ -2,11 +2,24 @@
 //!
 //! The target model remains authoritative for every emitted token. A cheap
 //! suffix chain gets first refusal (and can use all 16 verifier rows); misses
-//! fall through to the measured N8/K4/X4 learned tree. Target activation rows
+//! fall through to the certified N8/K4/X5 learned tree. Target activation rows
 //! from successful suffix rounds are buffered and applied to the learned head
 //! only when that fallback is actually needed.
+//!
+//! The Metal-resident draft head (the uploaded draft wire plus its private
+//! one-layer cache) is request-independent and expensive (~486 MB, ~1.2 s per
+//! upload on an M4), so serving keeps one in a single-slot checkout pool keyed
+//! by [`Eagle3ServeHeadKey`]. Everything a generation mutates -- the head's
+//! cache watermark and root seed, the suffix statistics, the pending catch-up
+//! rows -- is either reset when the head is returned or lives in the
+//! per-request [`Eagle3ServingState`]. A head is never shared: a checkout
+//! empties the slot, so a concurrent second generation uploads its own.
 
-use std::sync::Arc;
+use std::{
+    ops::RangeInclusive,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+};
 
 use crate::{
     eagle3::{Eagle3DraftModel, TARGET_LAYER_INPUT_IDS},
@@ -36,11 +49,258 @@ const DEEP_CONTEXT_VERIFY_NODES: usize = 8;
 
 const DEFAULT_DYNAMIC_VERIFY_NODES: usize = 8;
 const DEFAULT_DYNAMIC_TOP_K: usize = 4;
-const DEFAULT_DYNAMIC_EXPANSIONS: usize = 4;
+/// X5, not the earlier X4: the certified `bench-eagle3` stack runs N8/K4/X5
+/// (91.4 tok/s on mini2, 83 tok/s on mini1, Llama-3.2-3B Q4_K_M + the SW512
+/// head on the Pitch prompt) and measured +3.3 tok/s over X4, which also lost
+/// 7.5% of acceptance on the same prompt. Verify nodes and top-k stay at the
+/// receipted N8/K4 point.
+const DEFAULT_DYNAMIC_EXPANSIONS: usize = 5;
+
+/// Operator overrides for the learned-tree shape. Each is optional; a set value
+/// must parse and sit inside its range, and any bad value rejects the whole
+/// override (see [`dynamic_tree_from_values`]).
+pub const SERVE_TREE_NODES_ENV: &str = "CAMELID_EAGLE3_SERVE_TREE_NODES";
+pub const SERVE_TREE_TOP_K_ENV: &str = "CAMELID_EAGLE3_SERVE_TREE_TOP_K";
+pub const SERVE_TREE_EXPANSIONS_ENV: &str = "CAMELID_EAGLE3_SERVE_TREE_EXPANSIONS";
+/// A tree verify needs the root plus at least one drafted row.
+const MIN_DYNAMIC_VERIFY_NODES: usize = 2;
+/// The head retains this many ranked candidates per expansion; a larger top-k
+/// would be silently truncated to it.
+const MAX_DYNAMIC_TOP_K: usize = crate::metal::EAGLE3_TOP_K_CANDIDATES;
+/// Sanity ceiling on head forwards per round; every certified point is <= 8.
+const MAX_DYNAMIC_EXPANSIONS: usize = 32;
 
 fn invalid(message: impl Into<String>) -> BackendError {
     BackendError::InvalidModelMetadata(message.into())
 }
+
+/// The learned-tree shape the serving lane drafts when the suffix lane declines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eagle3DynamicTree {
+    pub verify_nodes: usize,
+    pub top_k: usize,
+    pub expansions: usize,
+}
+
+impl Eagle3DynamicTree {
+    pub const DEFAULT: Self = Self {
+        verify_nodes: DEFAULT_DYNAMIC_VERIFY_NODES,
+        top_k: DEFAULT_DYNAMIC_TOP_K,
+        expansions: DEFAULT_DYNAMIC_EXPANSIONS,
+    };
+
+    fn label(self) -> String {
+        format!("N{}/K{}/X{}", self.verify_nodes, self.top_k, self.expansions)
+    }
+}
+
+fn parse_tree_value(
+    name: &str,
+    value: Option<&str>,
+    default: usize,
+    range: RangeInclusive<usize>,
+) -> std::result::Result<usize, String> {
+    let Some(raw) = value.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(default);
+    };
+    let parsed = raw.parse::<usize>().map_err(|error| {
+        format!(
+            "{name} must be an integer in {}..={}, got {raw:?}: {error}",
+            range.start(),
+            range.end()
+        )
+    })?;
+    if !range.contains(&parsed) {
+        return Err(format!(
+            "{name} must be in {}..={}, got {parsed}",
+            range.start(),
+            range.end()
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Parse the operator's serve-tree override. Unset or empty fields keep their
+/// defaults; a malformed or out-of-range field rejects the WHOLE override, so a
+/// half-applied shape can never run.
+pub fn dynamic_tree_from_values(
+    nodes: Option<&str>,
+    top_k: Option<&str>,
+    expansions: Option<&str>,
+) -> std::result::Result<Eagle3DynamicTree, String> {
+    Ok(Eagle3DynamicTree {
+        verify_nodes: parse_tree_value(
+            SERVE_TREE_NODES_ENV,
+            nodes,
+            DEFAULT_DYNAMIC_VERIFY_NODES,
+            MIN_DYNAMIC_VERIFY_NODES..=TREE_MAX_NODES,
+        )?,
+        top_k: parse_tree_value(
+            SERVE_TREE_TOP_K_ENV,
+            top_k,
+            DEFAULT_DYNAMIC_TOP_K,
+            1..=MAX_DYNAMIC_TOP_K,
+        )?,
+        expansions: parse_tree_value(
+            SERVE_TREE_EXPANSIONS_ENV,
+            expansions,
+            DEFAULT_DYNAMIC_EXPANSIONS,
+            1..=MAX_DYNAMIC_EXPANSIONS,
+        )?,
+    })
+}
+
+/// Process-wide serve tree shape, read once. A rejected override prints one
+/// stderr line and serving keeps the default tree; an accepted non-default
+/// override prints one line naming the shape it will run.
+pub fn configured_dynamic_tree() -> Eagle3DynamicTree {
+    static TREE: OnceLock<Eagle3DynamicTree> = OnceLock::new();
+    *TREE.get_or_init(|| {
+        let nodes = std::env::var(SERVE_TREE_NODES_ENV).ok();
+        let top_k = std::env::var(SERVE_TREE_TOP_K_ENV).ok();
+        let expansions = std::env::var(SERVE_TREE_EXPANSIONS_ENV).ok();
+        match dynamic_tree_from_values(nodes.as_deref(), top_k.as_deref(), expansions.as_deref()) {
+            Ok(tree) => {
+                if tree != Eagle3DynamicTree::DEFAULT {
+                    eprintln!(
+                        "[eagle3-serve-tree] learned tree {} (operator override of the certified {})",
+                        tree.label(),
+                        Eagle3DynamicTree::DEFAULT.label()
+                    );
+                }
+                tree
+            }
+            Err(message) => {
+                eprintln!(
+                    "[eagle3-serve-tree] {message}; serving keeps the certified {} tree",
+                    Eagle3DynamicTree::DEFAULT.label()
+                );
+                Eagle3DynamicTree::DEFAULT
+            }
+        }
+    })
+}
+
+/// Identity of the request-independent part of the serving drafter: the
+/// Metal-resident draft wire plus its private cache allocation. Two requests
+/// may share one uploaded head only when every field agrees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3ServeHeadKey {
+    pub checkpoint_path: PathBuf,
+    pub checkpoint_sha256: String,
+    pub target_sha256: String,
+    /// `crate::metal::eagle3_draft_wire_identity()`: the body/lm_head wire
+    /// formats and lm_head rows the upload was planned with.
+    pub draft_wire: String,
+    pub max_positions: usize,
+}
+
+impl Eagle3ServeHeadKey {
+    /// Head cache capacity that admits every request the serving envelope can
+    /// accept: `prompt + max_tokens` never exceeds the logical limit, and one
+    /// round holds at most `MAX_DRAFT_TOKENS` drafted rows plus the anchor.
+    pub fn pooled_max_positions(logical_token_limit: usize) -> Result<usize> {
+        logical_token_limit
+            .checked_add(MAX_DRAFT_TOKENS + 1)
+            .ok_or_else(|| invalid("EAGLE-3 pooled head capacity overflow"))
+    }
+
+    /// The identity a request would need right now, under the current wire
+    /// gates and logical envelope.
+    pub fn current(
+        checkpoint_path: &Path,
+        checkpoint_sha256: &str,
+        target_sha256: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            checkpoint_path: checkpoint_path.to_path_buf(),
+            checkpoint_sha256: checkpoint_sha256.to_string(),
+            target_sha256: target_sha256.to_string(),
+            draft_wire: crate::metal::eagle3_draft_wire_identity().map_err(invalid)?,
+            max_positions: Self::pooled_max_positions(configured_logical_token_limit()?)?,
+        })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "head={} sha={} target={} wire=[{}] positions={}",
+            self.checkpoint_path.display(),
+            &self.checkpoint_sha256[..self.checkpoint_sha256.len().min(12)],
+            &self.target_sha256[..self.target_sha256.len().min(12)],
+            self.draft_wire,
+            self.max_positions
+        )
+    }
+}
+
+/// Result of asking the pool for a head.
+pub enum Eagle3HeadCheckout<T> {
+    /// The pooled head matched and is now owned by the caller.
+    Hit(T),
+    /// Nothing pooled (never populated, or checked out by another generation).
+    Empty,
+    /// The pooled head belonged to a different identity and has been dropped.
+    Invalidated(Eagle3ServeHeadKey),
+}
+
+/// Single-slot checkout pool for one expensive, request-independent value.
+/// A checkout removes the value, so it can never be observed by two owners;
+/// a restore into an occupied slot drops the newcomer, so the pool holds at
+/// most one value (the memory cost stays one head, even under overlap).
+pub struct Eagle3HeadPool<T> {
+    slot: Mutex<Option<(Eagle3ServeHeadKey, T)>>,
+}
+
+impl<T> Eagle3HeadPool<T> {
+    pub const fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// Take the pooled value when its identity matches `key`. A pooled value with
+    /// a different identity (model, head, wire gates or envelope changed under
+    /// the server) is discarded here so a stale head is never handed out.
+    pub fn checkout(&self, key: &Eagle3ServeHeadKey) -> Eagle3HeadCheckout<T> {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        match slot.take() {
+            Some((pooled_key, value)) if pooled_key == *key => Eagle3HeadCheckout::Hit(value),
+            Some((pooled_key, value)) => {
+                drop(value);
+                Eagle3HeadCheckout::Invalidated(pooled_key)
+            }
+            None => Eagle3HeadCheckout::Empty,
+        }
+    }
+
+    /// Return a value to the pool. `false` means the slot was already occupied
+    /// and the value was dropped instead.
+    pub fn restore(&self, key: Eagle3ServeHeadKey, value: T) -> bool {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some((key, value));
+        true
+    }
+
+    /// Whether the slot currently holds a value (diagnostics/tests only).
+    pub fn is_populated(&self) -> bool {
+        self.slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+}
+
+impl<T> Default for Eagle3HeadPool<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The serve-wide pool of the one uploaded draft head.
+static SERVE_HEAD_POOL: Eagle3HeadPool<Eagle3Drafter> = Eagle3HeadPool::new();
 
 pub fn logical_token_limit_from_value(value: Option<&str>) -> Result<usize> {
     let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -141,7 +401,13 @@ pub struct Eagle3ServingConfig {
 }
 
 impl Eagle3ServingConfig {
+    /// The serving width plus the process-wide learned tree
+    /// ([`configured_dynamic_tree`]: certified N8/K4/X5 unless overridden).
     pub fn new(draft_tokens: usize) -> Result<Self> {
+        Self::with_dynamic_tree(draft_tokens, configured_dynamic_tree())
+    }
+
+    pub fn with_dynamic_tree(draft_tokens: usize, tree: Eagle3DynamicTree) -> Result<Self> {
         if !(1..=MAX_DRAFT_TOKENS).contains(&draft_tokens) {
             return Err(invalid(format!(
                 "EAGLE-3 serving draft width must be in 1..={MAX_DRAFT_TOKENS}, got {draft_tokens}"
@@ -149,11 +415,11 @@ impl Eagle3ServingConfig {
         }
         Ok(Self {
             draft_tokens,
-            // N8/K4/X4 is the receipted general-chat learned-tree point. The
-            // suffix lane can still consume the full physical width 16.
-            dynamic_verify_nodes: DEFAULT_DYNAMIC_VERIFY_NODES,
-            dynamic_top_k: DEFAULT_DYNAMIC_TOP_K,
-            dynamic_expansions: DEFAULT_DYNAMIC_EXPANSIONS,
+            // The learned tree is the fallback shape; the suffix lane can still
+            // consume the full physical width 16.
+            dynamic_verify_nodes: tree.verify_nodes,
+            dynamic_top_k: tree.top_k,
+            dynamic_expansions: tree.expansions,
         })
     }
 }
@@ -172,11 +438,18 @@ pub struct Eagle3ServingRound {
     pub timings: LlamaForwardTimings,
 }
 
-/// Per-request mutable draft state. The checkpoint itself is shared across
-/// requests; only the small one-layer KV state is private to a generation.
+/// Per-request mutable draft state. The host checkpoint is shared across
+/// requests and the uploaded head is pooled (see [`Eagle3ServeHeadKey`]);
+/// the suffix statistics and pending catch-up rows are private to a generation.
 pub struct Eagle3ServingState {
     checkpoint: Option<Arc<Eagle3DraftModel>>,
     drafter: Option<Eagle3Drafter>,
+    /// When set, `bootstrap` checks the head out of the serve-wide pool under
+    /// this identity and `Drop` returns it. `None` keeps the original
+    /// per-request upload.
+    pooled_head: Option<Eagle3ServeHeadKey>,
+    head_reused: bool,
+    early_exit_rounds: u64,
     suffix: SuffixDecodingDrafter,
     pending_suffix_head: Eagle3AuthoritativeCatchup,
     config: Eagle3ServingConfig,
@@ -187,14 +460,89 @@ impl Eagle3ServingState {
         Self {
             checkpoint: Some(checkpoint),
             drafter: None,
+            pooled_head: None,
+            head_reused: false,
+            early_exit_rounds: 0,
             suffix: SuffixDecodingDrafter::default(),
             pending_suffix_head: Eagle3AuthoritativeCatchup::default(),
             config,
         }
     }
 
+    /// Serve the uploaded head from the process-wide single-slot pool under
+    /// `key` instead of uploading it for this request alone.
+    pub fn with_pooled_head(mut self, key: Eagle3ServeHeadKey) -> Self {
+        self.pooled_head = Some(key);
+        self
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.drafter.is_some()
+    }
+
+    /// Whether `bootstrap` reused an already-uploaded head.
+    pub fn head_reused(&self) -> bool {
+        self.head_reused
+    }
+
+    /// Learned-tree rounds in which the confidence-gated early exit
+    /// (`CAMELID_EAGLE3_DRAFT_EARLY_EXIT`) ended drafting before the
+    /// expansion budget was spent.
+    pub fn early_exit_rounds(&self) -> u64 {
+        self.early_exit_rounds
+    }
+
+    pub fn dynamic_tree(&self) -> Eagle3DynamicTree {
+        Eagle3DynamicTree {
+            verify_nodes: self.config.dynamic_verify_nodes,
+            top_k: self.config.dynamic_top_k,
+            expansions: self.config.dynamic_expansions,
+        }
+    }
+
+    /// Obtain the uploaded head for this generation: a pooled one when its
+    /// identity matches and its allocation covers this request, otherwise a
+    /// fresh upload (which `Drop` will pool when it carries an identity).
+    fn acquire_head(
+        &mut self,
+        checkpoint: &Eagle3DraftModel,
+        required_capacity: usize,
+    ) -> Result<Eagle3Drafter> {
+        let Some(key) = self
+            .pooled_head
+            .clone()
+            .filter(|key| key.max_positions >= required_capacity)
+        else {
+            // Uncached by construction, or a request the pooled allocation
+            // cannot hold: a private head with the exact capacity, as before.
+            self.pooled_head = None;
+            return Eagle3Drafter::new(checkpoint, required_capacity);
+        };
+        match SERVE_HEAD_POOL.checkout(&key) {
+            Eagle3HeadCheckout::Hit(mut drafter) => {
+                if drafter.max_positions() != key.max_positions {
+                    return Err(invalid(format!(
+                        "EAGLE-3 pooled head holds {} positions but its key says {}",
+                        drafter.max_positions(),
+                        key.max_positions
+                    )));
+                }
+                // `restore` already reset it; repeating is free and keeps the
+                // fresh-drafter contract of `seed_prompt` local to this seam.
+                drafter.reset_for_reuse();
+                self.head_reused = true;
+                Ok(drafter)
+            }
+            Eagle3HeadCheckout::Invalidated(stale) => {
+                eprintln!(
+                    "[eagle3-serve] cached draft head no longer matches ({}); uploading a fresh head for {}",
+                    stale.summary(),
+                    key.summary()
+                );
+                Eagle3Drafter::new(checkpoint, key.max_positions)
+            }
+            Eagle3HeadCheckout::Empty => Eagle3Drafter::new(checkpoint, key.max_positions),
+        }
     }
 
     /// Capture the real target prompt activations, obtain the first target
@@ -244,7 +592,7 @@ impl Eagle3ServingState {
             .checkpoint
             .take()
             .ok_or_else(|| invalid("EAGLE-3 checkpoint was consumed before bootstrap"))?;
-        let mut drafter = Eagle3Drafter::new(checkpoint.as_ref(), head_capacity)?;
+        let mut drafter = self.acquire_head(checkpoint.as_ref(), head_capacity)?;
         drafter.seed_prompt(
             target_weights,
             prompt_tokens,
@@ -369,11 +717,13 @@ impl Eagle3ServingState {
                 )));
             }
 
-            let node_budget = self
-                .config
-                .dynamic_verify_nodes
-                .min(context_room)
-                .min(budget + 1);
+            // N8 is valid at every supported position; an operator-widened
+            // tree narrows to the checked deep-context lane like the suffix
+            // lane does (a no-op at the certified N8).
+            let node_budget =
+                cap_verify_nodes_for_position(target_before, self.config.dynamic_verify_nodes)
+                    .min(context_room)
+                    .min(budget + 1);
             if node_budget < 2 {
                 return Err(invalid(format!(
                     "EAGLE-3 dynamic verifier has only {node_budget} rows"
@@ -399,6 +749,9 @@ impl Eagle3ServingState {
                     certified_argmax_shadow: false,
                 },
             )?;
+            // The confidence-gated early exit lives inside the shared
+            // `draft_dynamic_frontier` scheduler; count the rounds it fired.
+            let early_exit = frontier.draft_early_exit().is_some();
             let forest = frontier.finish()?;
             let actual_nodes = forest.scored.tree.nodes();
             if !(2..=node_budget).contains(&actual_nodes) {
@@ -435,6 +788,9 @@ impl Eagle3ServingState {
                 &verified.layer_inputs,
                 &acceptance,
             )?;
+            if early_exit {
+                self.early_exit_rounds += 1;
+            }
             Eagle3ServingRound {
                 emitted: acceptance.emitted_tokens,
                 offered: actual_nodes - 1,
@@ -467,19 +823,193 @@ impl Eagle3ServingState {
     }
 }
 
+impl Drop for Eagle3ServingState {
+    fn drop(&mut self) {
+        // A panicking generation may have left a Metal command mid-flight;
+        // never pool that head.
+        if std::thread::panicking() {
+            return;
+        }
+        let (Some(key), Some(mut drafter)) = (self.pooled_head.take(), self.drafter.take())
+        else {
+            return;
+        };
+        drafter.reset_for_reuse();
+        SERVE_HEAD_POOL.restore(key, drafter);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn serving_width_is_strict_and_keeps_dynamic_tree_at_receipted_point() {
+    fn serving_width_is_strict_and_keeps_dynamic_tree_at_certified_point() {
         assert!(Eagle3ServingConfig::new(0).is_err());
         assert!(Eagle3ServingConfig::new(MAX_DRAFT_TOKENS + 1).is_err());
-        let config = Eagle3ServingConfig::new(MAX_DRAFT_TOKENS).unwrap();
+        let config =
+            Eagle3ServingConfig::with_dynamic_tree(MAX_DRAFT_TOKENS, Eagle3DynamicTree::DEFAULT)
+                .unwrap();
         assert_eq!(config.draft_tokens + 1, TREE_MAX_NODES);
         assert_eq!(config.dynamic_verify_nodes, 8);
         assert_eq!(config.dynamic_top_k, 4);
-        assert_eq!(config.dynamic_expansions, 4);
+        assert_eq!(config.dynamic_expansions, 5);
+        assert_eq!(Eagle3DynamicTree::DEFAULT.label(), "N8/K4/X5");
+    }
+
+    #[test]
+    fn serve_tree_env_keeps_defaults_and_accepts_in_range_overrides() {
+        let default = dynamic_tree_from_values(None, None, None).unwrap();
+        assert_eq!(default, Eagle3DynamicTree::DEFAULT);
+        assert_eq!(
+            dynamic_tree_from_values(Some(""), Some("  "), Some("")).unwrap(),
+            Eagle3DynamicTree::DEFAULT
+        );
+        assert_eq!(
+            dynamic_tree_from_values(Some("8"), Some("4"), Some(" 5 ")).unwrap(),
+            Eagle3DynamicTree::DEFAULT
+        );
+        assert_eq!(
+            dynamic_tree_from_values(None, None, Some("4")).unwrap(),
+            Eagle3DynamicTree {
+                expansions: 4,
+                ..Eagle3DynamicTree::DEFAULT
+            }
+        );
+        assert_eq!(
+            dynamic_tree_from_values(Some("16"), Some("8"), Some("32")).unwrap(),
+            Eagle3DynamicTree {
+                verify_nodes: 16,
+                top_k: 8,
+                expansions: 32,
+            }
+        );
+        assert_eq!(
+            dynamic_tree_from_values(Some("2"), Some("1"), Some("1")).unwrap(),
+            Eagle3DynamicTree {
+                verify_nodes: 2,
+                top_k: 1,
+                expansions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn serve_tree_env_rejects_the_whole_override_on_any_bad_field() {
+        for (nodes, top_k, expansions) in [
+            (Some("1"), None, None),
+            (Some("17"), None, None),
+            (Some("0"), None, None),
+            (None, Some("0"), None),
+            (None, Some("9"), None),
+            (None, None, Some("0")),
+            (None, None, Some("33")),
+            (Some("eight"), None, None),
+            (None, Some("4.0"), None),
+            (None, None, Some("-5")),
+            // One bad field poisons an otherwise valid override.
+            (Some("12"), Some("4"), Some("zero")),
+        ] {
+            let error = dynamic_tree_from_values(nodes, top_k, expansions).unwrap_err();
+            assert!(
+                error.contains("CAMELID_EAGLE3_SERVE_TREE_"),
+                "{nodes:?}/{top_k:?}/{expansions:?}: {error}"
+            );
+        }
+        let error = dynamic_tree_from_values(Some("12"), Some("4"), Some("zero")).unwrap_err();
+        assert!(error.contains(SERVE_TREE_EXPANSIONS_ENV), "{error}");
+    }
+
+    fn head_key(tag: &str) -> Eagle3ServeHeadKey {
+        Eagle3ServeHeadKey {
+            checkpoint_path: PathBuf::from(format!("/heads/{tag}")),
+            checkpoint_sha256: format!("{tag}-head-sha"),
+            target_sha256: format!("{tag}-target-sha"),
+            draft_wire: "body=q4_k lm_head=q4_k rows=32000".to_string(),
+            max_positions: 2_064,
+        }
+    }
+
+    #[test]
+    fn serve_head_pool_hands_out_one_head_and_never_shares_it() {
+        let pool = Eagle3HeadPool::<Arc<()>>::new();
+        let key = head_key("a");
+        assert!(matches!(pool.checkout(&key), Eagle3HeadCheckout::Empty));
+        assert!(!pool.is_populated());
+
+        let head = Arc::new(());
+        assert!(pool.restore(key.clone(), Arc::clone(&head)));
+        assert!(pool.is_populated());
+        // A second restore into the occupied slot is dropped, not queued.
+        let extra = Arc::new(());
+        assert!(!pool.restore(key.clone(), Arc::clone(&extra)));
+        assert_eq!(Arc::strong_count(&extra), 1);
+
+        let Eagle3HeadCheckout::Hit(checked_out) = pool.checkout(&key) else {
+            panic!("matching key must hit")
+        };
+        assert!(Arc::ptr_eq(&checked_out, &head));
+        // While one generation owns it, another cannot get the same head.
+        assert!(matches!(pool.checkout(&key), Eagle3HeadCheckout::Empty));
+        assert!(pool.restore(key.clone(), checked_out));
+        assert!(matches!(pool.checkout(&key), Eagle3HeadCheckout::Hit(_)));
+    }
+
+    #[test]
+    fn serve_head_pool_invalidates_on_any_identity_change() {
+        let base = head_key("a");
+        let variants = [
+            Eagle3ServeHeadKey {
+                checkpoint_path: PathBuf::from("/heads/other"),
+                ..base.clone()
+            },
+            Eagle3ServeHeadKey {
+                checkpoint_sha256: "other-head-sha".to_string(),
+                ..base.clone()
+            },
+            Eagle3ServeHeadKey {
+                target_sha256: "other-target-sha".to_string(),
+                ..base.clone()
+            },
+            Eagle3ServeHeadKey {
+                draft_wire: "body=q8_0 lm_head=q4_k rows=32000".to_string(),
+                ..base.clone()
+            },
+            Eagle3ServeHeadKey {
+                max_positions: 4_112,
+                ..base.clone()
+            },
+        ];
+        for changed in variants {
+            let pool = Eagle3HeadPool::<Arc<()>>::new();
+            let head = Arc::new(());
+            assert!(pool.restore(base.clone(), Arc::clone(&head)));
+            let Eagle3HeadCheckout::Invalidated(stale) = pool.checkout(&changed) else {
+                panic!("{changed:?} must invalidate the pooled head")
+            };
+            assert_eq!(stale, base);
+            // The stale head was dropped inside the pool, not leaked or kept.
+            assert_eq!(Arc::strong_count(&head), 1);
+            assert!(!pool.is_populated());
+            assert!(matches!(pool.checkout(&base), Eagle3HeadCheckout::Empty));
+        }
+    }
+
+    #[test]
+    fn pooled_head_capacity_covers_the_whole_serving_envelope() {
+        for limit in SUPPORTED_LOGICAL_TOKEN_LIMITS {
+            let pooled = Eagle3ServeHeadKey::pooled_max_positions(limit).unwrap();
+            assert_eq!(pooled, limit + TREE_MAX_NODES);
+            // Every admissible (prompt, max_tokens) pair at the widest draft
+            // fits the pooled allocation, so a hit never needs a re-upload.
+            for prompt_tokens in [3, limit / 2, limit - 1] {
+                let max_tokens =
+                    clamp_max_tokens_to_logical_budget_at_limit(prompt_tokens, limit, limit)
+                        .unwrap();
+                assert!(prompt_tokens + max_tokens + MAX_DRAFT_TOKENS + 1 <= pooled);
+            }
+        }
+        assert!(Eagle3ServeHeadKey::pooled_max_positions(usize::MAX).is_err());
     }
 
     #[test]

@@ -32894,6 +32894,19 @@ fn eagle3_lm_head_plan() -> std::result::Result<Eagle3LmHeadPlan, String> {
     )
 }
 
+/// Stable identity of the load-time draft wire plan (`body=... lm_head=... rows=...`),
+/// so a serving cache can tell whether an already-uploaded head still matches the
+/// operator's wire-format gates. Same fail-closed parsing as the upload itself.
+pub fn eagle3_draft_wire_identity() -> std::result::Result<String, String> {
+    let plan = eagle3_lm_head_plan()?;
+    Ok(format!(
+        "body={} lm_head={} rows={}",
+        plan.body.label(),
+        plan.lm_head.label(),
+        plan.rows
+    ))
+}
+
 /// Bytes of one GGUF Q4_K super-block: `d` f16, `dmin` f16, twelve bytes of packed
 /// 6-bit sub-block scales/mins, and 128 bytes of 4-bit codes for 256 weights.
 const EAGLE3_Q4K_SUPERBLOCK_BYTES: usize = 144;
