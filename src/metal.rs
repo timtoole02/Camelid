@@ -23290,65 +23290,42 @@ fn verify_attention_rowshare_rows_per_tg() -> usize {
     })
 }
 
-/// Which kernel `CAMELID_METAL_ATTN_ROWSHARE=1` routes to
-/// (`CAMELID_METAL_ATTN_ROWSHARE_MODE=chains|pf|pfv|pf2`, default `chains`).
+
+/// `CAMELID_METAL_ATTN_PREFETCH=1` — the re-certification switch for decode attention.
 ///
-/// `Chains` only moves work between threadgroups, so it stays bit-identical to the
-/// row-wise kernels.  The hoisted-load kernels do NOT: MEASURED on two M4s, moving a
-/// step's loads above its arithmetic lets Metal's default fast math re-associate the
-/// work, which is where their speed comes from — 1.89x at depth 543 and 1.74x at 800,
-/// with about 94% of the output words differing from the row-wise reference.  They are
-/// therefore unroutable without `CAMELID_METAL_ATTN_ROWSHARE_ALLOW_INEXACT=1`, which is
-/// a re-certification decision (the emitted token array would have to be re-approved),
-/// never a performance switch.
+/// Enabling it DEFINES A NEW NUMERICS UNIVERSE: every attention output the model computes
+/// after prefill (the k-row verifier rows AND the single-token plain decode step) is
+/// produced by `attention_decode_splitk_kv16_direct_batch_pf` plus
+/// `attention_decode_splitk_merge_batch_f32`, whose fast-math schedule differs from the
+/// row-wise kernels in about 94% of output words.  The certified 256-token array of the
+/// protected run therefore CHANGES under this gate and must be re-certified; what does
+/// not change is losslessness — plain greedy decode and the EAGLE verifier run the same
+/// two kernels for a row at the same position, so their streams still agree bit for bit
+/// on the same binary.  Fails closed on anything but the exact string "1".
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AttentionRowshareMode {
-    /// Batch grid, K and V of a step loaded together.
-    Prefetch,
-    /// Batch grid, only the V loads of a step hoisted beside the K loads.
-    PrefetchV,
-    /// Batch grid, next step's K/V in flight during this step's arithmetic.
-    Prefetch2,
-    /// Row-colocated chains (geometry study; `..._CHAINS`/`..._ORDER` knobs).
-    Chains,
+fn attention_prefetch_from_env(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 #[cfg(target_os = "macos")]
-fn attention_rowshare_mode_from_env(value: Option<&str>) -> AttentionRowshareMode {
-    match value.map(str::trim) {
-        Some("pf") => AttentionRowshareMode::Prefetch,
-        Some("pfv") => AttentionRowshareMode::PrefetchV,
-        Some("pf2") => AttentionRowshareMode::Prefetch2,
-        // Anything unrecognised lands on the bit-identical geometry.
-        _ => AttentionRowshareMode::Chains,
-    }
-}
-
-/// The hoisted-load kernels change the arithmetic, so arming the lane is not enough:
-/// `CAMELID_METAL_ATTN_ROWSHARE_ALLOW_INEXACT=1` must also acknowledge that the emitted
-/// token array is no longer the certified one.  Without it those modes refuse and the
-/// encode falls back to the row-dimensional batch kernel.
-#[cfg(target_os = "macos")]
-fn attention_rowshare_inexact_allowed_from_env(value: Option<&str>) -> bool {
-    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-}
-
-#[cfg(target_os = "macos")]
-fn verify_attention_rowshare_inexact_allowed() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    *ALLOWED.get_or_init(|| {
-        let value = std::env::var("CAMELID_METAL_ATTN_ROWSHARE_ALLOW_INEXACT").ok();
-        attention_rowshare_inexact_allowed_from_env(value.as_deref())
+fn attention_prefetch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_METAL_ATTN_PREFETCH").ok();
+        attention_prefetch_from_env(value.as_deref())
     })
 }
 
+/// Half-mirror reads for the f32 lane's split-K attention (opt out with
+/// `CAMELID_METAL_ATTN_SPLITK_KV16=0`).  Cached: this sits inside the per-row attention
+/// encode, so a speculative round would otherwise re-read it k*layers times per round.
+/// Shared by the plain, tree and prefetch encodes so all three answer alike.
 #[cfg(target_os = "macos")]
-fn attention_rowshare_mode() -> AttentionRowshareMode {
-    static MODE: OnceLock<AttentionRowshareMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        let value = std::env::var("CAMELID_METAL_ATTN_ROWSHARE_MODE").ok();
-        attention_rowshare_mode_from_env(value.as_deref())
+fn splitk_kv16_mirrors_enabled() -> bool {
+    static SPLITK_KV16: OnceLock<bool> = OnceLock::new();
+    *SPLITK_KV16.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
     })
 }
 
@@ -23763,6 +23740,10 @@ enum SplitkRowsEncode {
     /// Batch grid, only the V loads hoisted:
     /// `attention_decode_splitk_kv16_direct_batch_pfv`.
     PrefetchV,
+    /// The PRODUCTION single-row prefetch encode (`encode_attention_prefetch_row`), one
+    /// call per row with that row's query/output offset and tail slots — what plain
+    /// decode and the verifier fallback run.
+    PrefetchRow,
 }
 
 /// Low-level row-wise-vs-row-dimensional F16 split-K driver.  `tree` is the
@@ -23816,7 +23797,9 @@ fn try_attention_splitk_kv16_rows_for_test(
         ),
         _ => None,
     };
-    if prefetch_pipeline.is_some() && (head_dim != 128 || !direct) {
+    if (prefetch_pipeline.is_some() || encode == SplitkRowsEncode::PrefetchRow)
+        && (head_dim != 128 || !direct)
+    {
         return None;
     }
     if rows == 0
@@ -23835,7 +23818,10 @@ fn try_attention_splitk_kv16_rows_for_test(
     {
         return None;
     }
-    let batched = encode != SplitkRowsEncode::RowWise;
+    let batched = !matches!(
+        encode,
+        SplitkRowsEncode::RowWise | SplitkRowsEncode::PrefetchRow
+    );
     let kernel = metal_linear_kernel()?;
     let shared_pipeline = (encode == SplitkRowsEncode::SharedPrefix)
         .then(|| attention_splitk_kv16_shared_prefix_pipeline(kernel, rows, head_dim, group))
@@ -23991,6 +23977,7 @@ fn try_attention_splitk_kv16_rows_for_test(
         })
         .collect();
 
+    let mut prefetch_keep: Vec<Buffer> = Vec::new();
     let encode_started = std::time::Instant::now();
     let cb = kernel.queue.new_command_buffer();
     let e = cb.new_compute_command_encoder();
@@ -24103,6 +24090,33 @@ fn try_attention_splitk_kv16_rows_for_test(
                 },
             );
         }
+    } else if encode == SplitkRowsEncode::PrefetchRow {
+        for rep in 0..repeats {
+            for row in 0..rows {
+                let row_off = (row * n_heads * head_dim * 4) as u64;
+                let tree_bufs = tree.map(|_| (&tree_base_scalar, &row_tail_buffers[row]));
+                assert!(
+                    encode_attention_prefetch_row(
+                        e,
+                        kernel,
+                        &mut prefetch_keep,
+                        &q,
+                        row_off,
+                        &ks[rep % kv_copies],
+                        &vs[rep % kv_copies],
+                        &out,
+                        row_off,
+                        &row_scalars[row],
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        position_counts[row],
+                        tree_bufs,
+                    ),
+                    "prefetch pipeline unavailable"
+                );
+            }
+        }
     } else {
         let row_partials: Vec<Buffer> = split_counts
             .iter()
@@ -24167,6 +24181,7 @@ fn try_attention_splitk_kv16_rows_for_test(
     let encode_us = encode_started.elapsed().as_micros();
     cb.commit();
     cb.wait_until_completed();
+    drop(prefetch_keep);
     let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
     let mut physical_output = vec![0.0f32; output_words + OUTPUT_GUARD_WORDS];
     read_buffer_f32(&out, &mut physical_output);
@@ -24522,24 +24537,49 @@ fn encode_attention(
         && (1..=4).contains(&group)
         && position_count >= 128;
     if splitk {
+        // Half-mirror reads halve the dominant KV traffic at depth; opt out with
+        // CAMELID_METAL_ATTN_SPLITK_KV16=0 to keep the f32 split-K reads.
+        let use_mirrors = kv16_mirrors.is_some() && splitk_kv16_mirrors_enabled();
+        // Prefetch universe: the plain decode row must come off the same kernels the
+        // k-row verify uses (see `attention_prefetch_enabled`).  The predicate here
+        // (split-K, head_dim 128, an f16 cache to read) is the one the verifier's batch
+        // route and its per-row fallback evaluate, so both sides fall back together.
+        if attention_prefetch_enabled() && head_dim == 128 && !kvq8 {
+            let f16 = if kv16 {
+                Some((keys, values))
+            } else if use_mirrors {
+                kv16_mirrors
+            } else {
+                None
+            };
+            if let Some((k16, v16)) = f16 {
+                if encode_attention_prefetch_row(
+                    e,
+                    k,
+                    keep,
+                    query,
+                    query_off,
+                    k16,
+                    v16,
+                    out,
+                    out_off,
+                    scalar,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    position_count,
+                    None,
+                ) {
+                    return;
+                }
+            }
+        }
         let n_splits = position_count.div_ceil(64).clamp(2, 64);
         let partials = pool_get(k, (n_heads * n_splits * (head_dim + 2) * 4) as u64);
         let splits_scalar = pool_get(k, 4);
         unsafe {
             *(splits_scalar.contents() as *mut u32) = n_splits as u32;
         }
-        // Half-mirror reads halve the dominant KV traffic at depth; opt out with
-        // CAMELID_METAL_ATTN_SPLITK_KV16=0 to keep the f32 split-K reads.
-        // Cached like its five siblings (`splitk_attention_enabled`, `attn2_enabled`,
-        // ...): this sits inside the per-row attention encode, so a speculative
-        // round re-read it once per row per layer -- k*32 lookups, each taking the
-        // env lock and allocating a String, for a value that cannot change.
-        static SPLITK_KV16: OnceLock<bool> = OnceLock::new();
-        let splitk_kv16 = *SPLITK_KV16.get_or_init(|| {
-            !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
-                .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-        });
-        let use_mirrors = kv16_mirrors.is_some() && splitk_kv16;
         if kvq8 {
             // Q8 primary: read the 34-byte-block cache directly. No mirrors exist on this
             // lane (cache_k16/cache_v16 are empty under a compressed primary), and none are
@@ -24765,6 +24805,33 @@ fn encode_attention_tree(
         if kv16 {
             TREE_KV16_SPLITK_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // Prefetch universe: same kernels as the k-row verify and the plain row (see
+        // `encode_attention`); the node's tail slots and prefix length bind as-is.
+        if attention_prefetch_enabled()
+            && head_dim == 128
+            && (kv16 || splitk_kv16_mirrors_enabled())
+            && encode_attention_prefetch_row(
+                e,
+                k,
+                keep,
+                query,
+                query_off,
+                mk,
+                mv,
+                out,
+                out_off,
+                scalar,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                position_count,
+                Some((base_buf, tail_slots_buf)),
+            )
+        {
+            keep.push(partials);
+            keep.push(splits_scalar);
+            return;
+        }
         if head_dim == 128 {
             e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_tree_pipeline);
         } else {
@@ -24878,7 +24945,146 @@ struct AttentionSplitkKv16BatchRoute {
     encoded: bool,
     shared_prefix: bool,
     rowshare: bool,
+    prefetch: bool,
 }
+
+/// One row of prefetch-universe attention — the single plain-decode token, or one verifier
+/// row when the k-row batch route is ineligible — through THE SAME two kernels the k-row
+/// prefetch verify dispatches: `attention_decode_splitk_kv16_direct_batch_pf` as a 1-row
+/// instance (row 0 of a `rows=1` grid, identical per-thread code path) and
+/// `attention_decode_splitk_merge_batch_f32`.  The split partition is the shared
+/// `position_count.div_ceil(64).clamp(2, 64)`, so for a row at a given position this
+/// produces the bits the k-row verify produces for that row; that equality is the
+/// plain==verify contract the re-certified lossless claim rests on, and it is asserted
+/// by `metal_attention_prefetch_plain_row_matches_verify_rows`.
+///
+/// `tree` binds a node's absolute ancestor tail slots and the committed-prefix length
+/// (as u32 buffers) exactly as `encode_attention_tree` does.  Returns false without
+/// encoding when the pipeline is unavailable so the caller can take its normal route.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_attention_prefetch_row(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    query: &Buffer,
+    query_off: u64,
+    keys16: &Buffer,
+    values16: &Buffer,
+    out: &Buffer,
+    out_off: u64,
+    scalar: &Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    tree: Option<(&Buffer, &Buffer)>,
+) -> bool {
+    if head_dim != 128 || n_kv_heads == 0 || position_count == 0 {
+        return false;
+    }
+    let Some(pipeline) =
+        admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref())
+    else {
+        return false;
+    };
+    static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+    ANNOUNCE.call_once(|| {
+        eprintln!(
+            "[metal-attn] prefetch universe: single-row attention routed to \
+             attention_decode_splitk_kv16_direct_batch_pf (plain decode / verifier fallback)"
+        );
+    });
+    ATTN_PREFETCH_ROW_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n_splits = position_count.div_ceil(64).clamp(2, 64);
+    let partials = pool_get(k, (n_heads * n_splits * (head_dim + 2) * 4) as u64);
+    let row_meta = pool_get(k, 8);
+    let scalars = pool_get(k, 32);
+    let tail_offsets = pool_get(k, 4);
+    unsafe {
+        let meta = row_meta.contents() as *mut u32;
+        *meta = position_count as u32;
+        *meta.add(1) = n_splits as u32;
+        let s = scalars.contents() as *mut u32;
+        *s = n_splits as u32; // max_splits == n_splits for one row
+        *s.add(1) = 0; // tree_base placeholder for the linear case
+        *s.add(2) = u32::from(tree.is_some()); // tree_mode
+        *s.add(3) = 1; // rows
+        *s.add(4) = 0;
+        *s.add(5) = 0;
+        *(tail_offsets.contents() as *mut u32) = 0;
+    }
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(query), query_off);
+    e.set_buffer(1, Some(keys16), 0);
+    e.set_buffer(2, Some(values16), 0);
+    e.set_buffer(3, Some(&partials), 0);
+    e.set_buffer(5, Some(scalar), 0); // n_heads
+    e.set_buffer(6, Some(scalar), 4); // head_dim
+    e.set_buffer(8, Some(scalar), 12); // group
+    e.set_buffer(9, Some(scalar), 16); // scale
+    e.set_buffer(10, Some(scalar), 20); // position_stride
+    e.set_buffer(11, Some(scalar), 24); // kv_head_stride
+    e.set_buffer(12, Some(scalar), 28); // kv_base_offset
+    e.set_buffer(13, Some(&scalars), 0); // max_splits
+    e.set_buffer(14, Some(&row_meta), 0);
+    e.set_buffer(15, Some(&tail_offsets), 0);
+    match tree {
+        Some((base_buf, tail_slots_buf)) => {
+            e.set_buffer(16, Some(tail_slots_buf), 0);
+            e.set_buffer(17, Some(base_buf), 0); // tree_base
+        }
+        None => {
+            e.set_buffer(16, Some(&tail_offsets), 0); // never indexed in linear mode
+            e.set_buffer(17, Some(&scalars), 4); // tree_base (unused)
+        }
+    }
+    e.set_buffer(18, Some(&scalars), 8); // tree_mode
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_kv_heads as u64,
+            height: n_splits as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_batch_pipeline);
+    e.set_buffer(0, Some(&partials), 0);
+    e.set_buffer(1, Some(out), out_off);
+    e.set_buffer(2, Some(scalar), 0); // n_heads
+    e.set_buffer(3, Some(scalar), 4); // head_dim
+    e.set_buffer(4, Some(&scalars), 0); // max_splits
+    e.set_buffer(5, Some(&row_meta), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    keep.extend([partials, row_meta, scalars, tail_offsets]);
+    true
+}
+
+/// Cumulative count of single-row prefetch-universe attention encodes in this process
+/// (plain decode steps and verifier fallbacks); routing evidence alongside the verify
+/// receipt's `attn_prefetch_layers`.
+#[cfg(target_os = "macos")]
+static ATTN_PREFETCH_ROW_ENCODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, target_os = "macos"))]
+static VERIFY_PREFETCH_KV16_ENCODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
@@ -24927,23 +25133,27 @@ fn encode_attention_splitk_kv16_batch(
         .map(|&pc| pc.div_ceil(64).clamp(2, 64))
         .collect();
     let max_splits = split_counts.iter().copied().max().unwrap_or(0);
-    // Rowshare takes precedence over shared-prefix when both are armed.
-    let rowshare_mode = verify_attention_rowshare_enabled().then(attention_rowshare_mode);
-    let inexact_ok = verify_attention_rowshare_inexact_allowed();
-    let rowshare_prefetch = match rowshare_mode {
-        _ if !inexact_ok => None,
-        Some(AttentionRowshareMode::Prefetch) if head_dim == 128 => {
-            admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref())
-        }
-        Some(AttentionRowshareMode::Prefetch2) if head_dim == 128 => {
-            admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pf2_pipeline.as_ref())
-        }
-        Some(AttentionRowshareMode::PrefetchV) if head_dim == 128 => {
-            admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_batch_pfv_pipeline.as_ref())
-        }
-        _ => None,
-    };
-    let rowshare = (rowshare_mode == Some(AttentionRowshareMode::Chains))
+    // The prefetch universe owns the route when armed (`attention_prefetch_enabled`);
+    // otherwise the exact geometries apply: rowshare, then shared-prefix, then batch.
+    let prefetch_pipeline = (attention_prefetch_enabled() && head_dim == 128)
+        .then(|| {
+            admitted_32_lane_pipeline(
+                k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref(),
+            )
+        })
+        .flatten();
+    if prefetch_pipeline.is_some() {
+        static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+        ANNOUNCE.call_once(|| {
+            eprintln!(
+                "[metal-attn] prefetch universe: k-row verifier attention routed to \
+                 attention_decode_splitk_kv16_direct_batch_pf"
+            );
+        });
+        #[cfg(test)]
+        VERIFY_PREFETCH_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let rowshare = (prefetch_pipeline.is_none() && verify_attention_rowshare_enabled())
         .then(|| {
             let rows_per_tg = rows.min(verify_attention_rowshare_rows_per_tg());
             attention_splitk_kv16_rowshare_pipeline(k, rows, head_dim, group, rows_per_tg)
@@ -24951,7 +25161,7 @@ fn encode_attention_splitk_kv16_batch(
         })
         .flatten();
     let shared_pipeline = (rowshare.is_none()
-        && rowshare_prefetch.is_none()
+        && prefetch_pipeline.is_none()
         && verify_attention_shared_prefix_enabled())
         .then(|| attention_splitk_kv16_shared_prefix_pipeline(k, rows, head_dim, group))
         .flatten();
@@ -24960,7 +25170,7 @@ fn encode_attention_splitk_kv16_batch(
     if shared_prefix {
         VERIFY_SHARED_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let rowshare_routed = rowshare.is_some() || rowshare_prefetch.is_some();
+    let rowshare_routed = rowshare.is_some();
     #[cfg(test)]
     if rowshare_routed {
         VERIFY_ROWSHARE_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -25005,9 +25215,9 @@ fn encode_attention_splitk_kv16_batch(
         }
     }
 
-    e.set_compute_pipeline_state(if let Some((pipeline, _)) = rowshare {
+    e.set_compute_pipeline_state(if let Some(pipeline) = prefetch_pipeline {
         pipeline
-    } else if let Some(pipeline) = rowshare_prefetch {
+    } else if let Some((pipeline, _)) = rowshare {
         pipeline
     } else if let Some(pipeline) = shared_pipeline {
         pipeline
@@ -25118,6 +25328,7 @@ fn encode_attention_splitk_kv16_batch(
         encoded: true,
         shared_prefix,
         rowshare: rowshare_routed,
+        prefetch: prefetch_pipeline.is_some(),
     }
 }
 
@@ -38292,6 +38503,7 @@ impl ResidentDecodeState {
         let mut batched_attention_layers = 0usize;
         let mut shared_attention_layers = 0usize;
         let mut rowshare_attention_layers = 0usize;
+        let mut prefetch_attention_layers = 0usize;
         let mut batched_rope_scatter_layers = 0usize;
         for l in 0..layers.len() {
             let e = &encoder;
@@ -38516,7 +38728,8 @@ impl ResidentDecodeState {
             let want_batched_attention = !omit_attention
                 && (verify_attention_batch_enabled()
                     || verify_attention_shared_prefix_enabled()
-                    || verify_attention_rowshare_enabled());
+                    || verify_attention_rowshare_enabled()
+                    || attention_prefetch_enabled());
             let f16_kv = if !want_batched_attention {
                 None
             } else if self.kv16 {
@@ -38557,6 +38770,7 @@ impl ResidentDecodeState {
             batched_attention_layers += usize::from(batched_attention);
             shared_attention_layers += usize::from(attention_route.shared_prefix);
             rowshare_attention_layers += usize::from(attention_route.rowshare);
+            prefetch_attention_layers += usize::from(attention_route.prefetch);
             if !omit_attention && !batched_attention {
                 for (i, attn_scalar) in attn_scalars.iter().enumerate() {
                     match tree {
@@ -38811,7 +39025,10 @@ impl ResidentDecodeState {
                  kernel_window={kernel_window_us}us attn_batch_layers={batched_attention_layers} \
                  attn_shared_layers={shared_attention_layers} \
                  attn_rowshare_layers={rowshare_attention_layers} \
-                 rope_scatter_batch_layers={batched_rope_scatter_layers}"
+                 attn_prefetch_layers={prefetch_attention_layers} \
+                 attn_prefetch_row_encodes={} \
+                 rope_scatter_batch_layers={batched_rope_scatter_layers}",
+                ATTN_PREFETCH_ROW_ENCODES.load(std::sync::atomic::Ordering::Relaxed)
             );
         }
         // Strictly post-authoritative diagnostic. The full head, production argmax, and their
@@ -46897,28 +47114,6 @@ mod tests {
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(5, 3, 8), 480);
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(8, 3, 1), 96);
         assert_eq!(attention_splitk_kv16_rowshare_threadgroup(16, 4, 8), 1024);
-        // The default and every unrecognised value must land on the bit-identical
-        // geometry; the inexact kernels are reachable only by naming them.
-        for (value, expected) in [
-            (None, AttentionRowshareMode::Chains),
-            (Some(""), AttentionRowshareMode::Chains),
-            (Some("nonsense"), AttentionRowshareMode::Chains),
-            (Some(" chains "), AttentionRowshareMode::Chains),
-            (Some("pf"), AttentionRowshareMode::Prefetch),
-            (Some("pfv"), AttentionRowshareMode::PrefetchV),
-            (Some("pf2"), AttentionRowshareMode::Prefetch2),
-        ] {
-            assert_eq!(attention_rowshare_mode_from_env(value), expected, "mode {value:?}");
-        }
-        for value in [None, Some(""), Some("0"), Some("false"), Some("yes"), Some(" true ")] {
-            assert!(
-                !attention_rowshare_inexact_allowed_from_env(value),
-                "inexact gate must fail closed for {value:?}"
-            );
-        }
-        for value in ["1", "true", "TRUE"] {
-            assert!(attention_rowshare_inexact_allowed_from_env(Some(value)));
-        }
         for (value, expected) in [
             (None, true),
             (Some("kvh"), true),
@@ -46931,6 +47126,178 @@ mod tests {
                 expected,
                 "order {value:?}"
             );
+        }
+    }
+
+    /// The re-certification switch fails closed on everything but the exact string "1".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefetch_gate_is_fail_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("true"),
+            Some("TRUE"),
+            Some("yes"),
+            Some(" 1 "),
+            Some("1 "),
+            Some("01"),
+        ] {
+            assert!(
+                !attention_prefetch_from_env(value),
+                "CAMELID_METAL_ATTN_PREFETCH must fail closed for {value:?}"
+            );
+        }
+        assert!(attention_prefetch_from_env(Some("1")));
+    }
+
+    /// Shared fixture: Llama-style GQA (3 query heads per kv head), head_dim 128, a
+    /// deterministic cache deep enough for the Pitch prefix.
+    #[cfg(target_os = "macos")]
+    fn prefetch_fixture(max_positions: usize) -> (usize, usize, usize, f32, Vec<f32>, Vec<f32>) {
+        let n_heads = 6usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 128usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let keys: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) * 0.03125)
+            .collect();
+        let values: Vec<f32> = (0..n_kv_heads * max_positions * head_dim)
+            .map(|i| ((i * 19 % 37) as f32 - 18.0) * 0.03125)
+            .collect();
+        (n_heads, n_kv_heads, head_dim, scale, keys, values)
+    }
+
+    /// Branching forest through the rows, exactly as `TreeAttn` presents it (each tail
+    /// includes the node itself), rooted at `base`.
+    #[cfg(target_os = "macos")]
+    fn prefetch_tree_rows(base: usize, rows: usize) -> (Vec<usize>, Vec<Vec<u32>>) {
+        let parents = [0usize, 0, 0, 1, 2, 2, 5, 5, 3, 3, 4, 4, 6, 6, 7, 7];
+        let tail_slots: Vec<Vec<u32>> = (0..rows)
+            .map(|node| {
+                let mut path = vec![(base + node) as u32];
+                let mut cursor = node;
+                while cursor != 0 {
+                    cursor = parents[cursor];
+                    path.push((base + cursor) as u32);
+                }
+                path.reverse();
+                path
+            })
+            .collect();
+        let pcs = tail_slots.iter().map(|s| base + s.len()).collect();
+        (pcs, tail_slots)
+    }
+
+    /// The plain==verify contract of the prefetch universe: the k-row prefetch verify
+    /// output for row r equals the PRODUCTION single-row prefetch encode
+    /// (`encode_attention_prefetch_row`, what plain decode runs) at the same position and
+    /// tail, bit for bit, for k in 2..=8, linear and branching tree, at a shallow and a
+    /// Pitch-depth prefix.  This replaces the old prefetch-vs-row-wise check, which is
+    /// expected to differ in this universe.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_prefetch_plain_row_matches_verify_rows() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let max_positions = 560usize;
+        let (n_heads, n_kv_heads, head_dim, scale, keys, values) = prefetch_fixture(max_positions);
+        for base in [128usize, 543] {
+            for rows in 2..=8usize {
+                let query: Vec<f32> = (0..rows * n_heads * head_dim)
+                    .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
+                    .collect();
+                let (tree_pcs, tree_slots) = prefetch_tree_rows(base, rows);
+                let linear_pcs: Vec<usize> = (1..=rows).map(|r| base + r).collect();
+                let cases: [(&str, Vec<usize>, Option<(usize, &[Vec<u32>])>); 2] = [
+                    ("linear", linear_pcs, None),
+                    ("branching-tree", tree_pcs, Some((base, tree_slots.as_slice()))),
+                ];
+                for (label, pcs, tree) in cases {
+                    let run = |encode| {
+                        try_attention_splitk_kv16_rows_for_test(
+                            &query, &keys, &values, n_heads, n_kv_heads, head_dim,
+                            max_positions, &pcs, scale, tree, encode, true, 1, 1,
+                        )
+                        .expect("prefetch encode")
+                    };
+                    let (verify, _, _) = run(SplitkRowsEncode::Prefetch);
+                    let (plain, _, _) = run(SplitkRowsEncode::PrefetchRow);
+                    assert_eq!(verify.len(), plain.len());
+                    let words = n_heads * head_dim;
+                    for row in 0..rows {
+                        let v = &verify[row * words..(row + 1) * words];
+                        let p = &plain[row * words..(row + 1) * words];
+                        let bad = v.iter().zip(p).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                        assert_eq!(
+                            bad, 0,
+                            "prefetch {label} base={base} k={rows}: verify row {row} (pc={}) differs from the plain single-row encode in {bad} of {words} words",
+                            pcs[row]
+                        );
+                    }
+                    eprintln!(
+                        "metal_attention_prefetch_plain_row_matches_verify_rows: {label} base={base} k={rows} PLAIN==VERIFY BIT-IDENTICAL ({} words)",
+                        plain.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run-to-run stability of the prefetch universe: the same dispatch shape must produce
+    /// the same bits every time (fast-math re-association is a compile-time schedule, not a
+    /// runtime one — this asserts it).  Twenty repeats of the k-row verify encode and of the
+    /// production single-row encode, linear and tree, at the Pitch prefix depth.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_prefetch_is_deterministic() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let max_positions = 560usize;
+        let (n_heads, n_kv_heads, head_dim, scale, keys, values) = prefetch_fixture(max_positions);
+        let rows = 8usize;
+        let base = 543usize;
+        let query: Vec<f32> = (0..rows * n_heads * head_dim)
+            .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
+            .collect();
+        let (tree_pcs, tree_slots) = prefetch_tree_rows(base, rows);
+        let linear_pcs: Vec<usize> = (1..=rows).map(|r| base + r).collect();
+        let cases: [(&str, Vec<usize>, Option<(usize, &[Vec<u32>])>); 2] = [
+            ("linear", linear_pcs, None),
+            ("branching-tree", tree_pcs, Some((base, tree_slots.as_slice()))),
+        ];
+        for (label, pcs, tree) in cases {
+            for (encode_label, encode) in [
+                ("verify-k8", SplitkRowsEncode::Prefetch),
+                ("plain-row", SplitkRowsEncode::PrefetchRow),
+            ] {
+                let run = || {
+                    try_attention_splitk_kv16_rows_for_test(
+                        &query, &keys, &values, n_heads, n_kv_heads, head_dim,
+                        max_positions, &pcs, scale, tree, encode, true, 1, 1,
+                    )
+                    .expect("prefetch encode")
+                    .0
+                };
+                let first = run();
+                for repeat in 1..20 {
+                    let again = run();
+                    let bad = first.iter().zip(&again).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    assert_eq!(
+                        bad, 0,
+                        "prefetch {label} {encode_label} repeat {repeat}: {bad} of {} words changed between runs",
+                        first.len()
+                    );
+                }
+                eprintln!(
+                    "metal_attention_prefetch_is_deterministic: {label} {encode_label} 20 runs BIT-IDENTICAL ({} words)",
+                    first.len()
+                );
+            }
         }
     }
 
