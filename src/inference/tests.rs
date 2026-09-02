@@ -15124,23 +15124,58 @@ fn metal_resident_rollback_moves_filled_with_the_kv_position() {
 // it is the only thing that fails when a merge quietly deletes one.
 #[test]
 fn resident_session_construction_sets_the_kquant_lane_at_both_sites() {
+    // The invariant is a PAIRING, not a count: every resident session
+    // construction must be immediately preceded by the lane record. Asserting a
+    // fixed number went stale the moment a legitimate third construction site
+    // landed, which is exactly the kind of false red that trains people to
+    // renumber the constant instead of reading the diff. Pair them positionally
+    // instead: this still fails when a merge deletes a lane record (the orphaned
+    // `new(` has no preceding call inside the window) and it additionally fails
+    // when a new construction site arrives unguarded, which the count never
+    // caught.
     let src = include_str!("metal_resident.rs");
-    let calls: Vec<usize> = src
+    let lane_sets: Vec<usize> = src
         .match_indices("metal::set_resident_kquant_lane(weights_use_kquant(")
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(
-        calls.len(),
-        2,
-        "expected the K-quant lane to be recorded at both resident construction \
-         sites (prefill + decode rebuild), found {}",
-        calls.len()
+    let constructions: Vec<usize> = src
+        .match_indices("metal::ResidentDecodeState::new(")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        !constructions.is_empty(),
+        "no resident session construction found; this guard has lost its subject"
     );
-    for at in calls {
+    assert_eq!(
+        lane_sets.len(),
+        constructions.len(),
+        "every resident construction needs exactly one preceding lane record: \
+         {} lane records for {} construction sites",
+        lane_sets.len(),
+        constructions.len()
+    );
+    // A lane record configures the construction that follows it, so the two
+    // sequences must interleave: lane[i] < new[i] < lane[i + 1].
+    for (i, &at) in constructions.iter().enumerate() {
+        let lane = lane_sets[i];
         assert!(
-            src[at..].contains("metal::ResidentDecodeState::new("),
-            "a set_resident_kquant_lane call must precede the session construction \
-             it configures"
+            lane < at,
+            "construction site {i} at byte {at} is not preceded by its lane record"
+        );
+        if let Some(&next_lane) = lane_sets.get(i + 1) {
+            assert!(
+                at < next_lane,
+                "construction site {i} at byte {at} is separated from its lane \
+                 record at {lane} by another lane record at {next_lane}"
+            );
+        }
+        // Dropping an F16 primary where the lane is engaged is silent at
+        // runtime, so keep the record adjacent to what it configures.
+        let gap = src[lane..at].lines().count();
+        assert!(
+            gap <= 24,
+            "lane record at {lane} is {gap} lines from the construction at {at}; \
+             keep them adjacent so a rebase cannot separate them"
         );
     }
 }
