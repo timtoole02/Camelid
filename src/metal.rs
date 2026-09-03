@@ -290,6 +290,10 @@ struct MetalLinearKernel {
     q5k_linear_simd_pipeline: ComputePipelineState,
     q6k_linear_simd_pipeline: ComputePipelineState,
     q4k_linear_tiled_pipeline: ComputePipelineState,
+    /// K-quant -> half weight staging that admits a K-quant model to the
+    /// simdgroup-matrix prefill. See `q4k_dequant_to_half`.
+    q4k_dequant_to_half_pipeline: ComputePipelineState,
+    q6k_dequant_to_half_pipeline: ComputePipelineState,
     q5k_linear_tiled_pipeline: ComputePipelineState,
     q6k_linear_tiled_pipeline: ComputePipelineState,
     q4k_linear_simd_mc_pipeline: ComputePipelineState,
@@ -2298,6 +2302,75 @@ kernel void q6k_linear_tiled(
         float acc = 0.0f;
         for (uint l = 0; l < 8; ++l) acc += sums[t][l];
         output[(t0 + t) * rows + row] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K-quant -> half weight staging for the simdgroup-matrix prefill.
+//
+// The MM prefill path (`q8_0_block_wire_mm_f16o`) reads the Q8_0 wire format
+// directly, so a K-quant model has nothing to bind to and falls back to
+// `*_linear_tiled` above: a 4-token tiled GEMV that re-unpacks every super-block
+// once per token. `CAMELID_PREFILL_TRACE=1` on an M4 at 871 tokens puts the four
+// projection GEMMs at 98.9% of that model's prefill and the whole prefill at
+// 22.6x the same model in Q8_0.
+//
+// Raising the token tile does NOT fix it -- TILE_T 4 -> 8 measured +1.6%, so the
+// kernel is not weight-bandwidth-bound; it is ALU-bound on the per-token unpack.
+// Unpacking ONCE into a half panel removes exactly that redundancy, after which
+// the existing general `half_mm_batched_f16o` runs the projection with no new
+// matmul kernel. The dequant is O(weight) per layer against a GEMM that is
+// O(weight x tokens), so it amortizes away at any useful prompt length.
+//
+// Output layout is [row][col] half, row-major with row stride n_sb * 256 -- the
+// `a` operand `half_mm_batched_f16o` wants, with a_row_stride = k and
+// a_elem_stride = 1.
+//
+// One thread owns one (row, super-block) pair and writes its 256 values.
+kernel void q4k_dequant_to_half(
+    device const uchar* weight_blocks [[buffer(0)]],
+    device half* out [[buffer(1)]],
+    constant uint& n_sb [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint row = gid / n_sb;
+    if (row >= rows) return;
+    const uint b = gid - row * n_sb;
+    device const uchar* block = weight_blocks + (row * n_sb + b) * 144;
+    // Reconstruction mirrors q4k_linear_tiled exactly: value =
+    // dw * sc[idx/32] * code - dm * mn[idx/32].
+    const float dw = float(*reinterpret_cast<device const half*>(block));
+    const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+    uchar sc[8], mn[8];
+    q4k_scale_min(block, sc, mn);
+    device half* dst = out + (ulong)row * n_sb * 256 + (ulong)b * 256;
+    for (uint idx = 0; idx < 256; ++idx) {
+        const uint j = idx >> 5;
+        dst[idx] = half(dw * float(sc[j]) * float(q4k_code(block, idx))
+                        - dm * float(mn[j]));
+    }
+}
+
+// Q6_K twin. Reconstruction mirrors q6k_linear_tiled: the 16 signed sub-scales
+// live at byte 192 and each covers 16 values; the super-block scale is the half
+// at byte 208; there is no min term.
+kernel void q6k_dequant_to_half(
+    device const uchar* weight_blocks [[buffer(0)]],
+    device half* out [[buffer(1)]],
+    constant uint& n_sb [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint row = gid / n_sb;
+    if (row >= rows) return;
+    const uint b = gid - row * n_sb;
+    device const uchar* block = weight_blocks + (row * n_sb + b) * 210;
+    const float dw = float(*reinterpret_cast<device const half*>(block + 208));
+    device const char* sc = reinterpret_cast<device const char*>(block + 192);
+    device half* dst = out + (ulong)row * n_sb * 256 + (ulong)b * 256;
+    for (uint idx = 0; idx < 256; ++idx) {
+        dst[idx] = half(dw * float(int(sc[idx >> 4])) * float(q6k_code(block, idx)));
     }
 }
 
@@ -14572,6 +14645,16 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q4k_linear_tiled_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4k_linear_tiled_function)
                 .ok()?;
+            let q4k_dequant_to_half_function =
+                library.get_function("q4k_dequant_to_half", None).ok()?;
+            let q4k_dequant_to_half_pipeline = device
+                .new_compute_pipeline_state_with_function(&q4k_dequant_to_half_function)
+                .ok()?;
+            let q6k_dequant_to_half_function =
+                library.get_function("q6k_dequant_to_half", None).ok()?;
+            let q6k_dequant_to_half_pipeline = device
+                .new_compute_pipeline_state_with_function(&q6k_dequant_to_half_function)
+                .ok()?;
             let q5k_linear_tiled_function = library.get_function("q5k_linear_tiled", None).ok()?;
             let q5k_linear_tiled_pipeline = device
                 .new_compute_pipeline_state_with_function(&q5k_linear_tiled_function)
@@ -14681,6 +14764,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q5k_linear_simd_pipeline,
                 q6k_linear_simd_pipeline,
                 q4k_linear_tiled_pipeline,
+                q4k_dequant_to_half_pipeline,
+                q6k_dequant_to_half_pipeline,
                 q5k_linear_tiled_pipeline,
                 q6k_linear_tiled_pipeline,
                 q4k_linear_simd_mc_pipeline,
@@ -19149,6 +19234,52 @@ fn mm_prefill_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("CAMELID_METAL_MM").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
+}
+
+/// Admit a K-QUANT model to the simdgroup-matrix prefill by staging each projection's
+/// weight into a transient half panel (`q4k_dequant_to_half` / `q6k_dequant_to_half`),
+/// then running the existing general `half_mm_batched_f16o` against it.
+///
+/// `use_mm` requires `all_q8` because `q8_0_block_wire_mm_f16o` reads the Q8_0 wire format
+/// directly, so a Q4_K/Q6_K model has nothing to bind to and keeps `*_linear_tiled` — a
+/// 4-token tiled GEMV that re-unpacks every super-block once per token. Measured on an M4,
+/// 871 tokens, Llama-3.2-1B, the same model in the two formats:
+///
+/// | stage | Q4_K_M | Q8_0 |
+/// |---|---|---|
+/// | gemm_qkv | 1268 ms | 56 ms |
+/// | gemm_o | 791 ms | 37 ms |
+/// | gemm_gateup | 6312 ms | 272 ms |
+/// | gemm_down | 3652 ms | 144 ms |
+/// | attention | 346 ms | 28 ms |
+/// | **total** | **12 387 ms** | **549 ms** |
+///
+/// The four projection GEMMs are 98.9% of it, which is why this gate is about `use_mm` and
+/// not `use_attn_mm` — attention is 2.8%. Raising the GEMV's token tile is not the fix
+/// either: TILE_T 4 -> 8 measured +1.6%, so that kernel is ALU-bound on the per-token
+/// unpack rather than weight-bandwidth-bound, and unpacking once is exactly what removes it.
+///
+/// The staged weight is rounded to f16. That is lossy against the exact K-quant GEMV, by
+/// roughly 2^-11 relative — around a fiftieth of the quantization error already present in
+/// a Q4_K weight — and the accumulate stays f32 in `simdgroup_float8x8`.
+///
+/// Off by default: `CAMELID_METAL_KQUANT_MM=1` to arm.
+#[cfg(target_os = "macos")]
+fn kquant_mm_prefill_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_KQUANT_MM")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Bytes for the K-quant half staging panel: the largest single projection in the model,
+/// reused by every projection of every layer. `None` when it would exceed the scratch cap,
+/// which declines the lane rather than allocating it.
+#[cfg(target_os = "macos")]
+fn kquant_mm_stage_bytes(max_rows: usize, max_k: usize, cap: usize) -> Option<usize> {
+    let bytes = max_rows.checked_mul(max_k)?.checked_mul(2)?;
+    (bytes > 0 && bytes <= cap).then_some(bytes)
 }
 
 /// Admit a Q8_0 primary to the attention-as-matmul prefill by staging its blocks into a
@@ -39021,6 +39152,29 @@ impl ResidentDecodeState {
             .iter()
             .flatten()
             .all(|w| w.format == ResidentWeightFormat::Q8_0);
+        // Every resident weight is Q4_K or Q6_K -- the shape a Q4_K_M download has, which
+        // mixes the two. Q5_K is excluded: it has no dequant kernel here, and one mixed-in
+        // Q5_K tensor would silently fall back per projection rather than per model.
+        let all_kquant_mm = resident.iter().flatten().all(|w| {
+            matches!(
+                w.format,
+                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+            )
+        });
+        // The panel is reused by every projection of every layer, so it only has to hold
+        // the largest one. `down` contracts over ffn_dim into hidden rows; `gate`/`up`
+        // expand hidden into ffn_dim rows -- both are hidden * ffn_dim elements, and that
+        // dominates the attention projections whenever ffn_dim >= q_dim.
+        let kq_stage_bytes = (all_kquant_mm && kquant_mm_prefill_enabled())
+            .then(|| {
+                kquant_mm_stage_bytes(
+                    self.ffn_dim.max(q_dim).max(kv_dim),
+                    self.ffn_dim.max(self.hidden),
+                    attn_mm_scratch_cap_bytes(),
+                )
+            })
+            .flatten();
+        let use_kq_mm = kq_stage_bytes.is_some();
 
         let nb = |bytes: usize| {
             k.device
@@ -39233,12 +39387,15 @@ impl ResidentDecodeState {
         // and the validated non-attn-mm attention path. The MM GEMM here outputs f32
         // (use_h16 is false), so the per-head norm runs in f32 against the existing
         // rms_norm_per_head_f32 kernel.
-        let use_mm = all_q8
+        let use_mm = (all_q8 || use_kq_mm)
             && mm_prefill_enabled()
             && q_dim.is_multiple_of(128)
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)
             && self.ffn_dim.is_multiple_of(128);
+        // Only reachable with `use_mm`, so a declined MM leaves the K-quant GEMV path
+        // exactly as it was.
+        let use_kq_mm = use_kq_mm && use_mm;
         // Half-precision GEMM inputs, padded to a 64-token multiple so the MM kernel's
         // direct device B loads never run off the end (padding rows are garbage; they
         // only feed output columns past n_tokens, which are never stored).
@@ -39359,6 +39516,10 @@ impl ResidentDecodeState {
             e.set_buffer(2, Some(count_buf), count_off);
             dispatch_1d(e, &k.f32_to_f16_pipeline, count);
         };
+        // One half panel, reused by every projection of every layer. Serial dispatch in
+        // this encoder orders each dequant before the GEMM that reads it and before the
+        // next dequant overwrites it.
+        let kq_stage = nb(kq_stage_bytes.unwrap_or(2));
         let mut projection_keep = Vec::new();
         // One activation-quant scratch pair per contraction width, shared by
         // every K-quant projection of every layer. See
@@ -39377,6 +39538,98 @@ impl ResidentDecodeState {
                         n_off: u64,
                         input_width: usize,
                         rows: usize| {
+            // K-quant weight on the MM lane: unpack this projection into the shared half
+            // panel, then run the general half GEMM against it. `half_mm_batched_f16o`
+            // computes C[token][row] = sum_k A[row][k] * B[token][k] with c_row_stride =
+            // rows -- byte-identical in layout to what `q8_0_block_wire_mm_f16o` writes,
+            // so everything downstream is unchanged.
+            if use_kq_mm
+                && matches!(
+                    w.format,
+                    ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+                )
+            {
+                let n_sb = input_width / 256;
+                let dq_scalar = pool_get(k, 8);
+                unsafe {
+                    let p = dq_scalar.contents() as *mut u32;
+                    *p = n_sb as u32;
+                    *p.add(1) = rows as u32;
+                }
+                e.set_compute_pipeline_state(if w.format == ResidentWeightFormat::Q4K {
+                    &k.q4k_dequant_to_half_pipeline
+                } else {
+                    &k.q6k_dequant_to_half_pipeline
+                });
+                e.set_buffer(0, Some(&w.buffer), 0);
+                e.set_buffer(1, Some(&kq_stage), 0);
+                e.set_buffer(2, Some(&dq_scalar), 0);
+                e.set_buffer(3, Some(&dq_scalar), 4);
+                dispatch_1d(e, &k.q4k_dequant_to_half_pipeline, rows * n_sb);
+
+                let mm_scalar = pool_get(k, 48);
+                unsafe {
+                    let p = mm_scalar.contents() as *mut u32;
+                    *p = 0; // a_batch_stride
+                    *p.add(1) = 0; // b_batch_stride
+                    *p.add(2) = 0; // c_batch_stride
+                    *p.add(3) = input_width as u32; // a_row_stride: staged [row][k]
+                    *p.add(4) = input_width as u32; // b_row_stride: activations [token][k]
+                    *p.add(5) = rows as u32; // c_row_stride: out [token][row]
+                    *p.add(6) = 1; // a_elem_stride
+                    *p.add(7) = 1; // group_a
+                    *p.add(8) = 0; // causal_mode: a plain GEMM
+                    *p.add(9) = n_tokens as u32; // cols
+                    *p.add(10) = 0; // q_offset
+                    *p.add(11) = 0; // window
+                }
+                let dims = pool_get(k, 8);
+                unsafe {
+                    let p = dims.contents() as *mut u32;
+                    *p = input_width as u32; // kdim
+                    *p.add(1) = rows as u32; // rows
+                }
+                // Output element type must match what the Q8 lane would have written for
+                // this same `use_h16`, because everything downstream reads `out` on that
+                // assumption: `_f16o` writes half, the plain kernel writes f32. A K-quant
+                // model has `use_attn_mm` false (it requires `all_q8`) and therefore
+                // `use_h16` false, so this takes the f32 arm today -- but selecting on the
+                // flag rather than hardcoding it keeps the two lanes in step if that
+                // changes.
+                e.set_compute_pipeline_state(if use_h16 {
+                    &k.half_mm_batched_f16o_pipeline
+                } else {
+                    &k.half_mm_batched_pipeline
+                });
+                e.set_buffer(0, Some(&kq_stage), 0);
+                e.set_buffer(1, Some(y), 0);
+                e.set_buffer(2, Some(out), 0);
+                e.set_buffer(3, Some(&dims), 0);
+                e.set_buffer(4, Some(&dims), 4);
+                e.set_buffer(5, Some(&mm_scalar), 36);
+                for j in 0..9u64 {
+                    e.set_buffer(6 + j, Some(&mm_scalar), j * 4);
+                }
+                e.set_buffer(15, Some(&mm_scalar), 40);
+                e.set_buffer(16, Some(&mm_scalar), 44);
+                e.set_threadgroup_memory_length(0, 8192);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: (rows as u64).div_ceil(64),
+                        height: (n_tokens as u64).div_ceil(64),
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                projection_keep.push(dq_scalar);
+                projection_keep.push(mm_scalar);
+                projection_keep.push(dims);
+                return;
+            }
             if use_mm {
                 // Simdgroup-matrix tiles: 64-row x 64-token output per threadgroup, so
                 // weights stream once per 64 tokens instead of once per 8.
