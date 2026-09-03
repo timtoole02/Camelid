@@ -13972,6 +13972,7 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: t("blk.0.attn_norm.weight", vec![2], 2),
             attention_q: t("blk.0.attn_q.weight", vec![2, 2], 4),
             attention_k: t("blk.0.attn_k.weight", vec![2, 2], 4),
