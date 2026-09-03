@@ -2646,6 +2646,42 @@ impl CpuTensor {
         Self::from_f32(name, vec![rows, cols], normed.data)
     }
 
+    /// Per-head L2 normalisation with NO learnable weight: `x * rsqrt(mean(x^2) + eps)`.
+    ///
+    /// This is RMSNorm with an all-ones gain, which is exactly MobileMoE's
+    /// `MobileMoEL2Norm`. It ships no `attn_q_norm`/`attn_k_norm` tensors at all, so
+    /// the weighted [`Self::per_head_rms_norm`] path has nothing to bind — and unlike
+    /// qwen3, MobileMoE applies this AFTER RoPE rather than before.
+    pub fn per_head_l2_norm(
+        &self,
+        head_count: usize,
+        eps: f32,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        require_rank(self, 2, "per_head_l2_norm input")?;
+        let rows = self.dim(0)?;
+        let cols = self.dim(1)?;
+        if head_count == 0 || !cols.is_multiple_of(head_count) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "per_head_l2_norm width {cols} is not divisible by head count {head_count}"
+            )));
+        }
+        let head_dim = cols / head_count;
+        let name = name.into();
+        let mut out = self.data.clone();
+        for head in out.chunks_exact_mut(head_dim) {
+            let mut sum_sq = 0.0f32;
+            for v in head.iter() {
+                sum_sq += *v * *v;
+            }
+            let scale = 1.0f32 / ((sum_sq / head_dim as f32) + eps).sqrt();
+            for v in head.iter_mut() {
+                *v *= scale;
+            }
+        }
+        Self::from_f32(name, vec![rows, cols], out)
+    }
+
     pub fn softmax_last_dim(&self, name: impl Into<String>) -> Result<Self> {
         if self.shape.dims.is_empty() {
             return Err(BackendError::RuntimeShapeMismatch(

@@ -2183,6 +2183,7 @@ impl GhostFile {
                 ffn_up: take("ffn_up")?,
                 ffn_down: take("ffn_down")?,
                 moe_router: None, // ghost v1 only supports dense models
+                moe_expert_bias: None,
                 moe_shared_gate: None,
                 moe_shared_up: None,
                 moe_shared_down: None,

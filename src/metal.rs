@@ -139,6 +139,28 @@ struct MetalLinearKernel {
     q4_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     nvfp4_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
+    /// Routed-expert MoE lane: router top-k, expert-indexed GEMV, weighted slot sum.
+    moe_merge_pipeline: ComputePipelineState,
+    moe_router_topk_v2_pipeline: ComputePipelineState,
+    moe_gate_up_silu_turbo_pipeline: ComputePipelineState,
+    moe_down_turbo_pipeline: ComputePipelineState,
+    moe_add_routed_rows_pipeline: ComputePipelineState,
+    moe_zero_u32_pipeline: ComputePipelineState,
+    moe_slot_count_pipeline: ComputePipelineState,
+    moe_slot_prefix_pipeline: ComputePipelineState,
+    moe_slot_scatter_pipeline: ComputePipelineState,
+    moe_grouped_gate_up_silu_pipeline: ComputePipelineState,
+    moe_grouped_down_pipeline: ComputePipelineState,
+    moe_wire_mm_id_pipeline: ComputePipelineState,
+    moe_tile_map_pipeline: ComputePipelineState,
+    moe_fill_u32_pipeline: ComputePipelineState,
+    moe_panel_fill_pipeline: ComputePipelineState,
+    moe_add_routed_panel_pipeline: ComputePipelineState,
+    seg3_qkv_pipeline: ComputePipelineState,
+    moe_router_topk_v2_h_pipeline: ComputePipelineState,
+    moe_wire_mm_id32_pipeline: ComputePipelineState,
+    moe_add_routed_panel_h_pipeline: ComputePipelineState,
+    moe_l2_post_rope_h_pipeline: ComputePipelineState,
     #[allow(dead_code)] // batched-column verify GEMV; exercised by the C0 unit test,
     // consumed by the speculative-verify lane in a later checkpoint
     q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline: ComputePipelineState,
@@ -1385,6 +1407,87 @@ kernel void q8_0_block_linear_row_ksplit_f32y_wire_nsg8(
         const float tot = simd_sum(shmem[row * 32 + lane]);
         if (lane == 0 && sg == 0) {
             output[r0 + row] = tot;
+        }
+    }
+}
+
+// Segmented q|k|v GEMV: one grid over q_dim+kv_dim+kv_dim rows, three weight/output pairs.
+// Per-row arithmetic is identical to the production GEMV (same block order, same reduction),
+// so each output row is bit-identical; it saves two dispatches (and their drains) per layer.
+kernel void q8_0_seg3_row_ksplit_f32y_wire_nsg8(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& seg0 [[buffer(6)]],
+    constant uint& seg1 [[buffer(7)]],
+    device const char* weight1 [[buffer(8)]],
+    device const char* weight2 [[buffer(9)]],
+    device float* output1 [[buffer(10)]],
+    device float* output2 [[buffer(11)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint q8_block_bytes = 34;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+
+    float sumf[NR0] = {0.0f, 0.0f};
+    for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+        float yl[NQ];
+        device const float* yb = y + ib * 32 + il;
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        for (uint row = 0; row < NR0; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= rows) {
+                break;
+            }
+            // segment select per row (boundaries are even, so a 2-row threadgroup never straddles)
+            device const char* wseg = weight_blocks;
+            uint lr = rr;
+            if (rr >= seg0 + seg1) { wseg = weight2; lr = rr - seg0 - seg1; }
+            else if (rr >= seg0) { wseg = weight1; lr = rr - seg0; }
+            device const char* wb = wseg + lr * row_stride + ib * q8_block_bytes;
+            const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            device const char* wq = wb + 2 + il;
+            float sumq = 0.0f;
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(wq[i]) * yl[i];
+            }
+            sumf[row] += sumq * w_scale;
+        }
+    }
+    for (uint row = 0; row < NR0; ++row) {
+        if (sg == 0) {
+            shmem[row * 32 + lane] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (lane == 0) {
+            shmem[row * 32 + sg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+        const float tot = simd_sum(shmem[row * 32 + lane]);
+        if (lane == 0 && sg == 0) {
+            const uint rr = r0 + row;
+            if (rr >= seg0 + seg1) { output2[rr - seg0 - seg1] = tot; }
+            else if (rr >= seg0) { output1[rr - seg0] = tot; }
+            else { output[rr] = tot; }
         }
     }
 }
@@ -2646,6 +2749,875 @@ kernel void embed_row_gather_q2_0_g128(
     const uint q = (uint(block[2 + (i >> 2)]) >> ((i & 3) * 2)) & 3u;
     embedding[gid] = float(int(q) - 1) * d * embed_scale;
 }
+
+
+
+
+// out[i] = in[i] + shared[i] + sum_s weights[s] * slots[s*n + i]  (slot order as the CPU path).
+// One dispatch replacing weighted-sum + two residual adds.
+kernel void moe_merge_f32(
+    device const float* inp [[buffer(0)]],
+    device const float* shared [[buffer(1)]],
+    device const float* slots [[buffer(2)]],
+    device const float* weights [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    constant uint& k [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < k; ++s) acc += weights[s] * slots[s * n + gid];
+    output[gid] = inp[gid] + (shared[gid] + acc);
+}
+
+// ---- MoE parameters shared by the router, expert and merge kernels -------------------------
+// Routing semantics match deepseek_moe_ffn: sigmoid -> (+bias) selects, the unbiased sigmoid
+// is the weight, normalise, scale.
+struct MoeParams {
+    uint blocks_per_row;      // input width / 32
+    uint rows;                // output rows per expert slab
+    uint expert_block_stride; // blocks per expert slab (0 in dense mode)
+    uint y_slot_div;          // y row = slot / y_slot_div
+    uint n_expert;
+    uint k;                   // slots per token
+    uint norm;
+    uint has_bias;
+    uint routed;              // 0 = dense (expert 0), 1 = route on logits[slot / k]
+    float scale;
+};
+
+
+
+
+
+
+// ---- MoE v3 --------------------------------------------------------------------------
+// Routing happens ONCE per layer in a single vectorized threadgroup (float4 loads, all 8
+// simdgroups, ~50 independent loads in flight per lane) and is consumed through a tiny
+// ids/weights buffer. The expert GEMVs use the ghost-campaign "rows per simdgroup" shape:
+// each of the 8 simdgroups owns 2 output rows end to end and reduces with simd_sum only —
+// no threadgroup memory, no barriers — so a threadgroup streams 16 rows (x2 for gate+up)
+// instead of 2, which is what a 768/384-wide matrix needs to keep the memory system busy.
+kernel void moe_router_topk_v2_f32(
+    device const float* x [[buffer(0)]],
+    device const float* router [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device uint* ids [[buffer(3)]],
+    device float* weights [[buffer(4)]],
+    constant MoeParams& p [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup float sig[256];
+    threadgroup float sel[256];
+    const uint hidden = p.blocks_per_row * 32;
+    const uint n4 = hidden / 4;
+    // one threadgroup per token: grid = n_tokens (decode: 1)
+    x += ulong(tgid) * ulong(hidden);
+    ids += ulong(tgid) * ulong(p.k);
+    weights += ulong(tgid) * ulong(p.k);
+    device const float4* x4 = reinterpret_cast<device const float4*>(x);
+    for (uint e = sg; e < p.n_expert; e += 8) {
+        device const float4* w4 =
+            reinterpret_cast<device const float4*>(router + ulong(e) * ulong(hidden));
+        float acc = 0.0f;
+        for (uint i = lane; i < n4; i += 32) acc += dot(x4[i], w4[i]);
+        const float tot = simd_sum(acc);
+        if (lane == 0) {
+            const float sgm = 1.0f / (1.0f + exp(-tot));
+            sig[e] = sgm;
+            sel[e] = (p.has_bias != 0) ? (sgm + bias[e]) : sgm;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+    float sum = 0.0f;
+    for (uint s = 0; s < p.k; ++s) {
+        int best = -1;
+        float best_sel = -INFINITY;
+        for (uint i = 0; i < p.n_expert; ++i) {
+            if (sel[i] > best_sel) { best_sel = sel[i]; best = int(i); }
+        }
+        sel[best] = -INFINITY;
+        ids[s] = uint(best);
+        weights[s] = sig[best];
+        sum += sig[best];
+    }
+    for (uint s = 0; s < p.k; ++s) {
+        float w = weights[s];
+        if (p.norm != 0 && sum > 0.0f) w /= sum;
+        if (p.scale != 1.0f && p.scale != 0.0f) w *= p.scale;
+        weights[s] = w;
+    }
+}
+
+// half-activation variant for the f16 prefill stream (attention-as-matmul path)
+kernel void moe_router_topk_v2_h(
+    device const half* x [[buffer(0)]],
+    device const float* router [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device uint* ids [[buffer(3)]],
+    device float* weights [[buffer(4)]],
+    constant MoeParams& p [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup float sig[256];
+    threadgroup float sel[256];
+    const uint hidden = p.blocks_per_row * 32;
+    const uint n4 = hidden / 4;
+    // one threadgroup per token: grid = n_tokens (decode: 1)
+    x += ulong(tgid) * ulong(hidden);
+    ids += ulong(tgid) * ulong(p.k);
+    weights += ulong(tgid) * ulong(p.k);
+    device const half4* x4 = reinterpret_cast<device const half4*>(x);
+    for (uint e = sg; e < p.n_expert; e += 8) {
+        device const float4* w4 =
+            reinterpret_cast<device const float4*>(router + ulong(e) * ulong(hidden));
+        float acc = 0.0f;
+        for (uint i = lane; i < n4; i += 32) acc += dot(float4(x4[i]), w4[i]);
+        const float tot = simd_sum(acc);
+        if (lane == 0) {
+            const float sgm = 1.0f / (1.0f + exp(-tot));
+            sig[e] = sgm;
+            sel[e] = (p.has_bias != 0) ? (sgm + bias[e]) : sgm;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+    float sum = 0.0f;
+    for (uint s = 0; s < p.k; ++s) {
+        int best = -1;
+        float best_sel = -INFINITY;
+        for (uint i = 0; i < p.n_expert; ++i) {
+            if (sel[i] > best_sel) { best_sel = sel[i]; best = int(i); }
+        }
+        sel[best] = -INFINITY;
+        ids[s] = uint(best);
+        weights[s] = sig[best];
+        sum += sig[best];
+    }
+    for (uint s = 0; s < p.k; ++s) {
+        float w = weights[s];
+        if (p.norm != 0 && sum > 0.0f) w /= sum;
+        if (p.scale != 1.0f && p.scale != 0.0f) w *= p.scale;
+        weights[s] = w;
+    }
+}
+
+// Fused gate+up+SiLU, rows-per-simdgroup. Grid (ceil(rows/16), slots) x 256 threads.
+kernel void q8_0_moe_gate_up_silu_turbo(
+    device const float* y [[buffer(0)]],
+    device const uint* ids [[buffer(1)]],
+    device const char* gate_blocks [[buffer(2)]],
+    device const char* up_blocks [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant MoeParams& p [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR = 2;
+    constexpr uint NQ = 8;
+    constexpr uint BB = 34;
+    const uint slot = tg.y;
+    const uint expert = (p.routed != 0) ? ids[slot] : 0u;
+    device const float* ys = y + ulong(slot / p.y_slot_div) * ulong(p.blocks_per_row) * 32;
+    const ulong ebase = ulong(expert) * ulong(p.expert_block_stride) * ulong(BB);
+    device const char* gbase = gate_blocks + ebase;
+    device const char* ubase = up_blocks + ebase;
+    device float* out = output + ulong(slot) * ulong(p.rows);
+    const uint r0 = (tg.x * NSG + sg) * NR;
+    if (r0 >= p.rows) return;
+    const uint row_stride = p.blocks_per_row * BB;
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+    float sumg[NR] = {0.0f, 0.0f};
+    float sumu[NR] = {0.0f, 0.0f};
+    for (uint ib = ix; ib < p.blocks_per_row; ib += 8) {
+        float yl[NQ];
+        device const float* yb = ys + ib * 32 + il;
+        for (uint i = 0; i < NQ; ++i) yl[i] = yb[i];
+        for (uint row = 0; row < NR; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= p.rows) break;
+            device const char* gb = gbase + rr * row_stride + ib * BB;
+            device const char* ub = ubase + rr * row_stride + ib * BB;
+            const float gs = float(*reinterpret_cast<device const half*>(gb));
+            const float us = float(*reinterpret_cast<device const half*>(ub));
+            device const char* gq = gb + 2 + il;
+            device const char* uq = ub + 2 + il;
+            float sq = 0.0f, su = 0.0f;
+            for (uint i = 0; i < NQ; ++i) { sq += float(gq[i]) * yl[i]; su += float(uq[i]) * yl[i]; }
+            sumg[row] += sq * gs;
+            sumu[row] += su * us;
+        }
+    }
+    for (uint row = 0; row < NR; ++row) {
+        const float g = simd_sum(sumg[row]);
+        const float u = simd_sum(sumu[row]);
+        if (lane == 0 && r0 + row < p.rows) out[r0 + row] = (g / (1.0f + exp(-g))) * u;
+    }
+}
+
+// Single-weight GEMV, rows-per-simdgroup. Grid (ceil(rows/16), slots) x 256 threads.
+kernel void q8_0_moe_down_turbo(
+    device const float* y [[buffer(0)]],
+    device const uint* ids [[buffer(1)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant MoeParams& p [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR = 2;
+    constexpr uint NQ = 8;
+    constexpr uint BB = 34;
+    const uint slot = tg.y;
+    const uint expert = (p.routed != 0) ? ids[slot] : 0u;
+    device const float* ys = y + ulong(slot / p.y_slot_div) * ulong(p.blocks_per_row) * 32;
+    device const char* wbase =
+        weight_blocks + ulong(expert) * ulong(p.expert_block_stride) * ulong(BB);
+    device float* out = output + ulong(slot) * ulong(p.rows);
+    const uint r0 = (tg.x * NSG + sg) * NR;
+    if (r0 >= p.rows) return;
+    const uint row_stride = p.blocks_per_row * BB;
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+    float sumf[NR] = {0.0f, 0.0f};
+    for (uint ib = ix; ib < p.blocks_per_row; ib += 8) {
+        float yl[NQ];
+        device const float* yb = ys + ib * 32 + il;
+        for (uint i = 0; i < NQ; ++i) yl[i] = yb[i];
+        for (uint row = 0; row < NR; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= p.rows) break;
+            device const char* wb = wbase + rr * row_stride + ib * BB;
+            const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            device const char* wq = wb + 2 + il;
+            float sumq = 0.0f;
+            for (uint i = 0; i < NQ; ++i) sumq += float(wq[i]) * yl[i];
+            sumf[row] += sumq * w_scale;
+        }
+    }
+    for (uint row = 0; row < NR; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (lane == 0 && r0 + row < p.rows) out[r0 + row] = tot;
+    }
+}
+
+// Batched prefill: cur[t][i] += sum_s wts[t*k+s] * ed[(t*k+s)*n + i]
+kernel void moe_add_routed_rows_f32(
+    device float* cur [[buffer(0)]],
+    device const float* ed [[buffer(1)]],
+    device const float* wts [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& k [[buffer(4)]],
+    constant uint& total [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    const uint t = gid / n;
+    const uint i = gid - t * n;
+    float acc = 0.0f;
+    for (uint s = 0; s < k; ++s) acc += wts[t * k + s] * ed[(ulong(t) * k + s) * n + i];
+    cur[gid] += acc;
+}
+
+// ---- Prefill: group the N*k slots by expert so each expert slab streams ONCE per layer -----
+kernel void moe_zero_u32(device uint* p [[buffer(0)]], constant uint& n [[buffer(1)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid < n) p[gid] = 0u;
+}
+kernel void moe_slot_count(device const uint* ids [[buffer(0)]],
+                           device atomic_uint* counts [[buffer(1)]],
+                           constant uint& n_slots [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= n_slots) return;
+    atomic_fetch_add_explicit(&counts[ids[gid]], 1u, memory_order_relaxed);
+}
+kernel void moe_slot_prefix(device const uint* counts [[buffer(0)]],
+                            device uint* starts [[buffer(1)]],
+                            device atomic_uint* cursors [[buffer(2)]],
+                            constant uint& n_expert [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid != 0) return;
+    uint acc = 0u;
+    for (uint e = 0; e < n_expert; ++e) {
+        starts[e] = acc;
+        atomic_store_explicit(&cursors[e], acc, memory_order_relaxed);
+        acc += counts[e];
+    }
+    starts[n_expert] = acc;
+}
+kernel void moe_slot_scatter(device const uint* ids [[buffer(0)]],
+                             device atomic_uint* cursors [[buffer(1)]],
+                             device uint* slot_by_expert [[buffer(2)]],
+                             constant uint& n_slots [[buffer(3)]],
+                             uint gid [[thread_position_in_grid]]) {
+    if (gid >= n_slots) return;
+    const uint pos = atomic_fetch_add_explicit(&cursors[ids[gid]], 1u, memory_order_relaxed);
+    slot_by_expert[pos] = gid;
+}
+
+// Grouped gate+up+SiLU: grid (ceil(rows/16), n_expert). Threadgroup = expert e, rows
+// r0..r0+15 (8 simdgroups x 2). It loops over ALL slots routed to e in tiles of T=4, loading
+// each weight block once per tile: weight traffic ~ (#experts x slab) instead of (#slots x slab).
+kernel void q8_0_moe_grouped_gate_up_silu(
+    device const float* y [[buffer(0)]],
+    device const uint* slot_by_expert [[buffer(1)]],
+    device const char* gate_blocks [[buffer(2)]],
+    device const char* up_blocks [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    device const uint* starts [[buffer(5)]],
+    constant MoeParams& p [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR = 2;
+    constexpr uint NQ = 8;
+    constexpr uint BB = 34;
+    constexpr uint T = 4;
+    const uint e = tg.y;
+    const uint s0 = starts[e];
+    const uint s1 = starts[e + 1];
+    if (s0 == s1) return;
+    const uint r0 = (tg.x * NSG + sg) * NR;
+    if (r0 >= p.rows) return;
+    const ulong ebase = ulong(e) * ulong(p.expert_block_stride) * ulong(BB);
+    device const char* gbase = gate_blocks + ebase;
+    device const char* ubase = up_blocks + ebase;
+    const uint row_stride = p.blocks_per_row * BB;
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+    for (uint t0 = s0; t0 < s1; t0 += T) {
+        const uint tn = min(T, s1 - t0);
+        uint slot[T];
+        for (uint t = 0; t < T; ++t) slot[t] = (t < tn) ? slot_by_expert[t0 + t] : slot_by_expert[t0];
+        float sg_[NR][T];
+        float su_[NR][T];
+        for (uint r = 0; r < NR; ++r) for (uint t = 0; t < T; ++t) { sg_[r][t] = 0.0f; su_[r][t] = 0.0f; }
+        for (uint ib = ix; ib < p.blocks_per_row; ib += 8) {
+            float yl[T][NQ];
+            for (uint t = 0; t < T; ++t) {
+                device const float* yb = y + ulong(slot[t] / p.y_slot_div) * ulong(p.blocks_per_row) * 32 + ib * 32 + il;
+                for (uint i = 0; i < NQ; ++i) yl[t][i] = yb[i];
+            }
+            for (uint row = 0; row < NR; ++row) {
+                const uint rr = r0 + row;
+                if (rr >= p.rows) break;
+                device const char* gb = gbase + rr * row_stride + ib * BB;
+                device const char* ub = ubase + rr * row_stride + ib * BB;
+                const float gs = float(*reinterpret_cast<device const half*>(gb));
+                const float us = float(*reinterpret_cast<device const half*>(ub));
+                device const char* gq = gb + 2 + il;
+                device const char* uq = ub + 2 + il;
+                for (uint t = 0; t < T; ++t) {
+                    float sq = 0.0f, su = 0.0f;
+                    for (uint i = 0; i < NQ; ++i) { sq += float(gq[i]) * yl[t][i]; su += float(uq[i]) * yl[t][i]; }
+                    sg_[row][t] += sq * gs;
+                    su_[row][t] += su * us;
+                }
+            }
+        }
+        for (uint row = 0; row < NR; ++row) {
+            for (uint t = 0; t < T; ++t) {
+                const float g = simd_sum(sg_[row][t]);
+                const float u = simd_sum(su_[row][t]);
+                if (lane == 0 && t < tn && r0 + row < p.rows) {
+                    output[ulong(slot[t]) * ulong(p.rows) + r0 + row] = (g / (1.0f + exp(-g))) * u;
+                }
+            }
+        }
+    }
+}
+
+kernel void q8_0_moe_grouped_down(
+    device const float* y [[buffer(0)]],
+    device const uint* slot_by_expert [[buffer(1)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device const uint* starts [[buffer(5)]],
+    constant MoeParams& p [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR = 2;
+    constexpr uint NQ = 8;
+    constexpr uint BB = 34;
+    constexpr uint T = 4;
+    const uint e = tg.y;
+    const uint s0 = starts[e];
+    const uint s1 = starts[e + 1];
+    if (s0 == s1) return;
+    const uint r0 = (tg.x * NSG + sg) * NR;
+    if (r0 >= p.rows) return;
+    device const char* wbase = weight_blocks + ulong(e) * ulong(p.expert_block_stride) * ulong(BB);
+    const uint row_stride = p.blocks_per_row * BB;
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+    for (uint t0 = s0; t0 < s1; t0 += T) {
+        const uint tn = min(T, s1 - t0);
+        uint slot[T];
+        for (uint t = 0; t < T; ++t) slot[t] = (t < tn) ? slot_by_expert[t0 + t] : slot_by_expert[t0];
+        float sf[NR][T];
+        for (uint r = 0; r < NR; ++r) for (uint t = 0; t < T; ++t) sf[r][t] = 0.0f;
+        for (uint ib = ix; ib < p.blocks_per_row; ib += 8) {
+            float yl[T][NQ];
+            for (uint t = 0; t < T; ++t) {
+                device const float* yb = y + ulong(slot[t] / p.y_slot_div) * ulong(p.blocks_per_row) * 32 + ib * 32 + il;
+                for (uint i = 0; i < NQ; ++i) yl[t][i] = yb[i];
+            }
+            for (uint row = 0; row < NR; ++row) {
+                const uint rr = r0 + row;
+                if (rr >= p.rows) break;
+                device const char* wb = wbase + rr * row_stride + ib * BB;
+                const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+                device const char* wq = wb + 2 + il;
+                for (uint t = 0; t < T; ++t) {
+                    float sumq = 0.0f;
+                    for (uint i = 0; i < NQ; ++i) sumq += float(wq[i]) * yl[t][i];
+                    sf[row][t] += sumq * w_scale;
+                }
+            }
+        }
+        for (uint row = 0; row < NR; ++row) {
+            for (uint t = 0; t < T; ++t) {
+                const float tot = simd_sum(sf[row][t]);
+                if (lane == 0 && t < tn && r0 + row < p.rows) output[ulong(slot[t]) * ulong(p.rows) + r0 + row] = tot;
+            }
+        }
+    }
+}
+
+// ---- Expert-indexed simdgroup-matrix GEMM for the MoE prefill (mul_mat_id shape) ----------
+// Identical to q8_0_block_wire_mm except each token tile carries its own expert (weight slab)
+// and its own valid-row count, so slots grouped by expert stream each expert once through
+// the MMA path; 32-token quadrants past the valid count skip their MMAs.
+kernel void q8_0_moe_wire_mm_id(
+    device const half* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    device const uint* tile_map [[buffer(6)]],
+    constant uint& expert_block_stride [[buffer(7)]],
+    device const uint* row_map [[buffer(8)]],
+    constant uint& indirect [[buffer(9)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR0 = 64;  // weight rows per tile
+    constexpr uint NR1 = 128; // tokens per tile (weights stream once per 128 tokens)
+    constexpr uint NK = 32;   // k per step = one Q8_0 block
+    constexpr uint q8_block_bytes = 34;
+    // All position attributes must share one dimensionality; tg is uint2, so derive the
+    // flat thread id from the (always-scalar) simdgroup/lane indices instead.
+    const uint tid = sg * 32 + lane;
+
+    threadgroup half* sa = shmem;        // A: 8 row-octets x 4 k-octets of 8x8 blocks
+    threadgroup half* sb = shmem + 2048; // B: 16 token-octets x 4 k-octets of 8x8 blocks
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(shmem);
+    const uint r0 = tg.x * NR0; // weight-row tile
+    // tile j -> (expert, panel row offset, valid rows); empty tiles exit uniformly
+    const uint tj = tg.y;
+    const uint e_id = tile_map[3 * tj];
+    const uint t0 = tile_map[3 * tj + 1];
+    const uint n_valid = tile_map[3 * tj + 2];
+    if (n_valid == 0) return;
+    const uint n_rows_in = t0 + n_valid;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+    const uint k_width = blocks_per_row * 32;
+
+    const uint lr0 = tid / 4;      // weight row in tile (0..63)
+    const uint il0 = (tid / 2) % 2; // which 16-value half of the Q8_0 block
+    const uint lr1 = tid / 2;      // token in tile (0..127)
+
+    device const char* x = weight_blocks + ulong(e_id) * ulong(expert_block_stride) * ulong(q8_block_bytes) + (r0 + lr0) * row_stride;
+    // indirect: panel row -> source row (padding rows map to row 0; their outputs are
+    // never stored because they sit past n_valid)
+    const uint prow = t0 + lr1;
+    const uint srow = (indirect != 0u) ? row_map[prow] : prow;
+    device const half* yp = y + ulong(srow == 0xFFFFFFFFu ? 0u : srow) * k_width;
+
+    // This simdgroup's quadrant: 32 rows (sg % 2) x 32 tokens (sg / 2). A quadrant
+    // entirely past n_rows_in only sees zero-padding — skip its loads and MMAs
+    // (staging and barriers stay uniform across the threadgroup).
+    const uint sg_row_oct = (sg % 2) * 4;
+    const uint sg_tok_oct = (sg / 2) * 4;
+    const bool sg_active = t0 + 8 * sg_tok_oct < n_rows_in;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[4];
+    simdgroup_float8x8 mc[16];
+    for (uint i = 0; i < 16; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint ib = 0; ib < blocks_per_row; ++ib) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // A: dequantize 8 values per thread (half of a 16-value half-block); store
+        // TRANSPOSED (k-major inside each 8x8 block) so the A operand loads contiguously.
+        {
+            device const char* wb = x + ib * q8_block_bytes;
+            const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            const uint q8 = tid % 2; // which 8 of the 16-value half-block
+            device const packed_char4* wq =
+                reinterpret_cast<device const packed_char4*>(wb + 2 + il0 * 16 + q8 * 8);
+            const uint sy = lr0 / 8;
+            const uint lx = lr0 % 8;
+            const uint sx = 2 * il0 + q8;
+            for (uint i = 0; i < 8; ++i) {
+                sa[64 * (8 * sx + sy) + 8 * i + lx] =
+                    half(float(wq[i / 4][i % 4]) * w_scale);
+            }
+        }
+        // B: one vectorized 8-half store per thread x 2 k-octets, token-major blocks.
+        {
+            const uint sy = lr1 / 8;
+            const uint ly = lr1 % 8;
+            for (uint s = 0; s < 2; ++s) {
+                const uint sx = (tid % 2) * 2 + s;
+                *reinterpret_cast<threadgroup half2x4*>(sb + 64 * (16 * sx + sy) + 8 * ly) =
+                    *reinterpret_cast<device const half2x4*>(yp + ib * NK + 16 * (tid % 2) + 8 * s);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+            threadgroup const half* lsma = sa + 64 * sg_row_oct;
+            threadgroup const half* lsmb = sb + 64 * sg_tok_oct;
+            for (uint ik = 0; ik < NK / 8; ++ik) {
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 16; ++i) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+                }
+                lsma += 64 * 8;
+                lsmb += 64 * 16;
+            }
+        }
+    }
+
+    if (t0 + NR1 <= n_rows_in) {
+        // Full tile: store fragments straight to device memory.
+        device float* c = output + (r0 + 32 * (sg % 2)) + (t0 + 32 * (sg / 2)) * rows;
+        for (uint i = 0; i < 16; ++i) {
+            simdgroup_store(mc[i], c + 8 * (i % 4) + 8 * rows * (i / 4), rows, 0, false);
+        }
+    } else {
+        // Ragged token tail: stage each 8x8 fragment through per-simdgroup scratch
+        // (reusing the consumed A region) and write guarded. Slow, but only the final
+        // token tile takes this path.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 16; ++i) {
+            simdgroup_store(mc[i], scratch + sg * 64, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint t_oct = t0 + 32 * (sg / 2) + 8 * (i / 4);
+            const uint r_oct = r0 + 32 * (sg % 2) + 8 * (i % 4);
+            for (uint e2 = lane; e2 < 64; e2 += 32) {
+                const uint ft = e2 / 8;
+                const uint fr = e2 % 8;
+                if (t_oct + ft < n_rows_in) {
+                    output[(t_oct + ft) * rows + r_oct + fr] = scratch[sg * 64 + ft * 8 + fr];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// 32-token expert tile, 128 weight rows x 32 tokens per threadgroup. An expert tile holds
+// roughly n_tokens*k/n_expert valid rows (about 22 for MobileMoE-S at 340 tokens), so the
+// 128-token kernel above re-read its activation panel once per 64-row block for 17% useful
+// rows. Here all 8 simdgroups share the same 32 tokens and each owns 16 weight rows.
+// A 384-row variant (one block per 384-wide FFN) was measured 3x slower: 26 KB of threadgroup
+// memory per group and 48 scattered staging stores per thread per k-block left the GPU
+// latency-bound, and the L2 already absorbs most of the activation re-reads this was meant to
+// save. Same operand layout and accumulation order per output element as the 128-token kernel.
+kernel void q8_0_moe_wire_mm_id32(
+    device const half* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    device const uint* tile_map [[buffer(6)]],
+    constant uint& expert_block_stride [[buffer(7)]],
+    device const uint* row_map [[buffer(8)]],
+    constant uint& indirect [[buffer(9)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR0 = 128;      // weight rows per tile
+    constexpr uint NR1 = 32;           // tokens per tile
+    constexpr uint NK = 32;            // k per step = one Q8_0 block
+    constexpr uint ROCT = NR0 / 8;     // row-octets per tile
+    constexpr uint SGOCT = ROCT / 8;   // row-octets per simdgroup
+    constexpr uint q8_block_bytes = 34;
+    const uint tid = sg * 32 + lane;
+
+    threadgroup half* sa = shmem;             // A: ROCT row-octets x 4 k-octets of 8x8 blocks
+    threadgroup half* sb = shmem + NR0 * 32;  // B: 4 token-octets x 4 k-octets (1024 halves)
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(shmem);
+    const uint r0 = tg.x * NR0;
+    const uint tj = tg.y;
+    const uint e_id = tile_map[3 * tj];
+    const uint t0 = tile_map[3 * tj + 1];
+    const uint n_valid = tile_map[3 * tj + 2];
+    if (n_valid == 0) return;
+    const uint n_rows_in = t0 + n_valid;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+    const uint k_width = blocks_per_row * 32;
+
+    device const char* xe = weight_blocks + ulong(e_id) * ulong(expert_block_stride) * ulong(q8_block_bytes) + r0 * row_stride;
+    // B staging: eight threads per token, four k-values each.
+    const uint lt = tid / 8;   // token in tile (0..31)
+    const uint part = tid % 8; // k = 4*part .. 4*part+3 within the block
+    const uint prow = t0 + lt;
+    const uint srow = (indirect != 0u) ? row_map[prow] : prow;
+    device const half* yp = y + ulong(srow == 0xFFFFFFFFu ? 0u : srow) * k_width;
+
+    simdgroup_half8x8 ma[SGOCT];
+    simdgroup_half8x8 mb[4];
+    simdgroup_float8x8 mc[4 * SGOCT];
+    for (uint i = 0; i < 4 * SGOCT; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint ib = 0; ib < blocks_per_row; ++ib) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // A staging: one thread per weight row (strided when NR0 > 256), all 32 values,
+        // stored TRANSPOSED (k-major inside each 8x8 block).
+        for (uint lr0 = tid; lr0 < NR0; lr0 += 256) {
+            device const char* wb = xe + lr0 * row_stride + ib * q8_block_bytes;
+            const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            device const packed_char4* wq = reinterpret_cast<device const packed_char4*>(wb + 2);
+            const uint sy = lr0 / 8;
+            const uint lx = lr0 % 8;
+            for (uint sx = 0; sx < 4; ++sx) {
+                for (uint i = 0; i < 8; ++i) {
+                    sa[64 * (ROCT * sx + sy) + 8 * i + lx] =
+                        half(float(wq[sx * 2 + i / 4][i % 4]) * w_scale);
+                }
+            }
+        }
+        {
+            const uint sy = lt / 8;   // token-octet (0..3)
+            const uint ly = lt % 8;
+            const uint sx = part / 2; // k-octet (0..3)
+            const uint kq = (part % 2) * 4;
+            *reinterpret_cast<threadgroup half4*>(sb + 64 * (4 * sx + sy) + 8 * ly + kq) =
+                *reinterpret_cast<device const half4*>(yp + ib * NK + 4 * part);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 64 * (SGOCT * sg); // this simdgroup's row-octets
+        threadgroup const half* lsmb = sb;
+        for (uint ik = 0; ik < NK / 8; ++ik) {
+            for (uint i = 0; i < SGOCT; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            for (uint j = 0; j < 4; ++j) {
+                simdgroup_load(mb[j], lsmb + 64 * j, 8, 0, false);
+            }
+            for (uint i = 0; i < SGOCT; ++i) {
+                for (uint j = 0; j < 4; ++j) {
+                    simdgroup_multiply_accumulate(mc[4 * i + j], mb[j], ma[i], mc[4 * i + j]);
+                }
+            }
+            lsma += 64 * ROCT;
+            lsmb += 64 * 4;
+        }
+    }
+
+    if (t0 + NR1 <= n_rows_in) {
+        device float* c = output + (r0 + 8 * SGOCT * sg) + t0 * rows;
+        for (uint i = 0; i < SGOCT; ++i) {
+            for (uint j = 0; j < 4; ++j) {
+                simdgroup_store(mc[4 * i + j], c + 8 * i + 8 * rows * j, rows, 0, false);
+            }
+        }
+    } else {
+        // Ragged token tail: stage each 8x8 fragment through per-simdgroup scratch (the
+        // consumed A region) and write guarded.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint m = 0; m < 4 * SGOCT; ++m) {
+            simdgroup_store(mc[m], scratch + sg * 64, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint t_oct = t0 + 8 * (m % 4);
+            const uint r_oct = r0 + 8 * SGOCT * sg + 8 * (m / 4);
+            for (uint e2 = lane; e2 < 64; e2 += 32) {
+                const uint ft = e2 / 8;
+                const uint fr = e2 % 8;
+                if (t_oct + ft < n_rows_in) {
+                    output[(t_oct + ft) * rows + r_oct + fr] = scratch[sg * 64 + ft * 8 + fr];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+
+// One thread: from per-expert counts build the tile map [(expert, panel_t0, n_valid)] and the
+// per-expert panel offsets (each expert padded to a 128-row tile boundary).
+kernel void moe_tile_map(
+    device const uint* counts [[buffer(0)]],
+    device uint* tile_map [[buffer(1)]],
+    device uint* panel_off [[buffer(2)]],
+    constant uint& n_expert [[buffer(3)]],
+    constant uint& j_max [[buffer(4)]],
+    constant uint& tile_tok [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uint j = 0u, p = 0u;
+    for (uint e = 0; e < n_expert; ++e) {
+        panel_off[e] = p;
+        const uint c = counts[e];
+        const uint tiles = (c + tile_tok - 1u) / tile_tok;
+        for (uint t = 0; t < tiles; ++t) {
+            if (j < j_max) {
+                tile_map[3 * j] = e;
+                tile_map[3 * j + 1] = p + t * tile_tok;
+                tile_map[3 * j + 2] = min(tile_tok, c - t * tile_tok);
+            }
+            ++j;
+        }
+        p += ((c + 31u) / 32u) * 32u; // 32-row padding per expert; B staging over-reads into slack
+    }
+    for (; j < j_max; ++j) { tile_map[3 * j] = 0u; tile_map[3 * j + 1] = 0u; tile_map[3 * j + 2] = 0u; }
+}
+kernel void moe_fill_u32(device uint* p [[buffer(0)]], constant uint& n [[buffer(1)]],
+                         constant uint& value [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if (gid < n) p[gid] = value;
+}
+// panel_slot[panel_off[e] + i] = the i-th slot routed to expert e (parallel over sorted slots)
+kernel void moe_panel_fill(
+    device const uint* ids [[buffer(0)]],
+    device const uint* slot_by_expert [[buffer(1)]],
+    device const uint* starts [[buffer(2)]],
+    device const uint* panel_off [[buffer(3)]],
+    device uint* panel_slot [[buffer(4)]],
+    constant uint& n_slots [[buffer(5)]],
+    device uint* row_map_tok [[buffer(6)]],
+    device uint* slot_panel [[buffer(7)]],
+    constant uint& k [[buffer(8)]],
+    uint q [[thread_position_in_grid]]
+) {
+    if (q >= n_slots) return;
+    const uint slot = slot_by_expert[q];
+    const uint e = ids[slot];
+    const uint prow = panel_off[e] + (q - starts[e]);
+    panel_slot[prow] = slot;
+    row_map_tok[prow] = slot / k;
+    slot_panel[slot] = prow;
+}
+// cur[t][i] += sum_s wts[t*k+s] * pd[slot_panel[t*k+s]][i]   (reads the down panel in place)
+kernel void moe_add_routed_panel_f32(
+    device float* cur [[buffer(0)]],
+    device const float* pd [[buffer(1)]],
+    device const float* wts [[buffer(2)]],
+    device const uint* slot_panel [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& k [[buffer(5)]],
+    constant uint& total [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    const uint t = gid / n;
+    const uint i = gid - t * n;
+    float acc = 0.0f;
+    for (uint s = 0; s < k; ++s) {
+        const uint slot = t * k + s;
+        acc += wts[slot] * pd[ulong(slot_panel[slot]) * n + i];
+    }
+    cur[gid] += acc;
+}
+
+// half-stream variant
+kernel void moe_add_routed_panel_h(
+    device half* cur [[buffer(0)]],
+    device const float* pd [[buffer(1)]],
+    device const float* wts [[buffer(2)]],
+    device const uint* slot_panel [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& k [[buffer(5)]],
+    constant uint& total [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    const uint t = gid / n;
+    const uint i = gid - t * n;
+    float acc = 0.0f;
+    for (uint s = 0; s < k; ++s) {
+        const uint slot = t * k + s;
+        acc += wts[slot] * pd[ulong(slot_panel[slot]) * n + i];
+    }
+    cur[gid] = half(float(cur[gid]) + acc);
+}
+
+// MobileMoE on the fused-RoPE prefill path: parameterless per-head L2 (RMS, no weight) AFTER
+// RoPE, applied in place to the half Q panel and to this layer's cached K rows for positions
+// 0..n_tokens (f32 primary, mirrored to the f16 cache the attention matmul reads). One
+// simdgroup per (token, head) row.
+kernel void moe_l2_post_rope_h(
+    device half* q_h [[buffer(0)]],
+    device float* cache_k [[buffer(1)]],
+    device half* cache_k16 [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& n_kv_heads [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant uint& max_positions [[buffer(6)]],
+    constant uint& n_tokens [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint per_tok = n_heads + n_kv_heads;
+    const uint t = tgid / per_tok;
+    const uint j = tgid - t * per_tok;
+    if (t >= n_tokens) return;
+    if (j < n_heads) {
+        device half* row = q_h + (ulong(t) * ulong(n_heads) + j) * head_dim;
+        float ss = 0.0f;
+        for (uint d = lane; d < head_dim; d += 32) { const float v = float(row[d]); ss += v * v; }
+        ss = simd_sum(ss);
+        const float inv = rsqrt(ss / float(head_dim) + eps);
+        for (uint d = lane; d < head_dim; d += 32) row[d] = half(float(row[d]) * inv);
+    } else {
+        const uint h = j - n_heads;
+        const ulong base = (ulong(h) * ulong(max_positions) + t) * head_dim;
+        device float* row = cache_k + base;
+        device half* row16 = cache_k16 + base;
+        float ss = 0.0f;
+        for (uint d = lane; d < head_dim; d += 32) { const float v = row[d]; ss += v * v; }
+        ss = simd_sum(ss);
+        const float inv = rsqrt(ss / float(head_dim) + eps);
+        for (uint d = lane; d < head_dim; d += 32) { const float v = row[d] * inv; row[d] = v; row16[d] = half(v); }
+    }
+}
+
 "#;
 
 // Q8_K activation quantization is compiled separately with fast math disabled.
@@ -8310,6 +9282,50 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                     &q8_0_block_ksplit_f32y_wire_nsg8_verify_function,
                 )
                 .ok()?;
+            let moe_merge_function = library.get_function("moe_merge_f32", None).ok()?;
+            let moe_merge_pipeline = device
+                .new_compute_pipeline_state_with_function(&moe_merge_function)
+                .ok()?;
+            let moe_router_topk_v2_function =
+                library.get_function("moe_router_topk_v2_f32", None).ok()?;
+            let moe_router_topk_v2_pipeline = device
+                .new_compute_pipeline_state_with_function(&moe_router_topk_v2_function)
+                .ok()?;
+            let moe_gate_up_silu_turbo_function = library
+                .get_function("q8_0_moe_gate_up_silu_turbo", None)
+                .ok()?;
+            let moe_gate_up_silu_turbo_pipeline = device
+                .new_compute_pipeline_state_with_function(&moe_gate_up_silu_turbo_function)
+                .ok()?;
+            let moe_down_turbo_function = library.get_function("q8_0_moe_down_turbo", None).ok()?;
+            let moe_down_turbo_pipeline = device
+                .new_compute_pipeline_state_with_function(&moe_down_turbo_function)
+                .ok()?;
+            let moe_add_routed_rows_function =
+                library.get_function("moe_add_routed_rows_f32", None).ok()?;
+            let moe_add_routed_rows_pipeline = device
+                .new_compute_pipeline_state_with_function(&moe_add_routed_rows_function)
+                .ok()?;
+            let mk = |name: &str| -> Option<ComputePipelineState> {
+                let f = library.get_function(name, None).ok()?;
+                device.new_compute_pipeline_state_with_function(&f).ok()
+            };
+            let moe_zero_u32_pipeline = mk("moe_zero_u32")?;
+            let moe_slot_count_pipeline = mk("moe_slot_count")?;
+            let moe_slot_prefix_pipeline = mk("moe_slot_prefix")?;
+            let moe_slot_scatter_pipeline = mk("moe_slot_scatter")?;
+            let moe_grouped_gate_up_silu_pipeline = mk("q8_0_moe_grouped_gate_up_silu")?;
+            let moe_grouped_down_pipeline = mk("q8_0_moe_grouped_down")?;
+            let moe_wire_mm_id_pipeline = mk("q8_0_moe_wire_mm_id")?;
+            let moe_tile_map_pipeline = mk("moe_tile_map")?;
+            let moe_fill_u32_pipeline = mk("moe_fill_u32")?;
+            let moe_panel_fill_pipeline = mk("moe_panel_fill")?;
+            let moe_add_routed_panel_pipeline = mk("moe_add_routed_panel_f32")?;
+            let seg3_qkv_pipeline = mk("q8_0_seg3_row_ksplit_f32y_wire_nsg8")?;
+            let moe_router_topk_v2_h_pipeline = mk("moe_router_topk_v2_h")?;
+            let moe_wire_mm_id32_pipeline = mk("q8_0_moe_wire_mm_id32")?;
+            let moe_add_routed_panel_h_pipeline = mk("moe_add_routed_panel_h")?;
+            let moe_l2_post_rope_h_pipeline = mk("moe_l2_post_rope_h")?;
             let q8_0_block_wire_mm_function =
                 library.get_function("q8_0_block_wire_mm", None).ok()?;
             let q8_0_block_wire_mm_pipeline = device
@@ -8507,6 +9523,27 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 nvfp4_block_ksplit_f32y_wire_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline,
+                moe_merge_pipeline,
+                moe_router_topk_v2_pipeline,
+                moe_gate_up_silu_turbo_pipeline,
+                moe_down_turbo_pipeline,
+                moe_add_routed_rows_pipeline,
+                moe_zero_u32_pipeline,
+                moe_slot_count_pipeline,
+                moe_slot_prefix_pipeline,
+                moe_slot_scatter_pipeline,
+                moe_grouped_gate_up_silu_pipeline,
+                moe_grouped_down_pipeline,
+                moe_wire_mm_id_pipeline,
+                moe_tile_map_pipeline,
+                moe_fill_u32_pipeline,
+                moe_panel_fill_pipeline,
+                moe_add_routed_panel_pipeline,
+                seg3_qkv_pipeline,
+                moe_router_topk_v2_h_pipeline,
+                moe_wire_mm_id32_pipeline,
+                moe_add_routed_panel_h_pipeline,
+                moe_l2_post_rope_h_pipeline,
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
                 quantize_q8k_rows_pipeline,
@@ -12987,6 +14024,50 @@ fn q8_attn_mm_enabled() -> bool {
     })
 }
 
+#[cfg(target_os = "macos")]
+fn prefill_decline(fn_name: &str, site: u32) {
+    if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+        eprintln!("[resident-prefill] {fn_name} declined at site {site}");
+    }
+}
+
+/// 32-token expert tiles for the id-GEMM (default on); `CAMELID_METAL_MOE_TILE32=0` selects the
+/// 128-token tile for A/B.
+#[cfg(target_os = "macos")]
+fn moe_prefill_tile32_enabled() -> bool {
+    !std::env::var("CAMELID_METAL_MOE_TILE32").is_ok_and(|v| v == "0")
+}
+
+#[cfg(target_os = "macos")]
+fn moe_prefill_mm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_MOE_PREFILL_MM")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn moe_prefill_grouped_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_MOE_PREFILL_GROUPED")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn moe_prefill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_MOE_PREFILL")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// K-split GEMV over an f32 activation vector (see q8_0_block_linear_row_ksplit_f32y).
 /// The weight buffer must match the active format: decoded 36-byte blocks normally, wire
 /// 34-byte blocks when CAMELID_METAL_WIRE is on (prepare_token resolves accordingly).
@@ -17415,6 +18496,203 @@ fn encode_ffn_block(
     ]);
 }
 
+/// Measurement-only ablations for the MoE block (output is WRONG when set):
+/// CAMELID_MOE_ABLATE_ROUTED=1 skips router/top-k/experts; CAMELID_MOE_ABLATE_SHARED=1 skips
+/// the shared expert. Read once per process.
+#[cfg(target_os = "macos")]
+fn moe_ablate(which: &'static str) -> bool {
+    use std::sync::OnceLock;
+    static ROUTED: OnceLock<bool> = OnceLock::new();
+    static SHARED: OnceLock<bool> = OnceLock::new();
+    let (cell, var) = match which {
+        "routed" => (&ROUTED, "CAMELID_MOE_ABLATE_ROUTED"),
+        "shared" => (&SHARED, "CAMELID_MOE_ABLATE_SHARED"),
+        other => unreachable!("unknown MoE ablation {other}"),
+    };
+    *cell.get_or_init(|| std::env::var_os(var).is_some())
+}
+
+/// MoE FFN block for the resident decode (MobileMoE shape): reads `in_buf`, writes
+/// `out_buf = in + shared_expert(normf) + sum_k w_k * expert_k(normf)`. The routing
+/// decision never leaves the GPU: router GEMV -> on-device sigmoid/bias/top-k ->
+/// expert-indexed GEMVs (one dispatch per projection for all k experts) -> weighted merge.
+/// Everything stays inside the token's single command encoder.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_moe_ffn_block(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    in_buf: &Buffer,
+    out_buf: &Buffer,
+    ffn_norm: &[f32],
+    eps: f32,
+    shared_gate_w: &ResidentLinearWeight,
+    shared_up_w: &ResidentLinearWeight,
+    shared_down_w: &ResidentLinearWeight,
+    shexp_dim: usize,
+    moe: &ResidentMoeResolved,
+) {
+    // v3 — 7 dispatches per layer: rms_norm, router+top-k (one vectorized threadgroup),
+    // shared gate+up+silu, shared down, expert gate+up+silu (k slots), expert down, merge.
+    let hidden = ffn_norm.len();
+    let bpr_hidden = hidden / 32;
+    let ff = moe.expert_ff;
+    let bpr_ff = ff / 32;
+    let kk = moe.n_expert_used;
+    let ne = moe.n_expert;
+    let nb = |bytes: u64| pool_get(k, bytes);
+    let ablate_routed = moe_ablate("routed");
+    let ablate_shared = moe_ablate("shared");
+    debug_assert!(ne <= 256 && kk <= 16 && hidden.is_multiple_of(4));
+
+    let params = |routed: bool, bpr: usize, rows: usize, stride: usize, ydiv: usize| {
+        let b = nb(40);
+        unsafe {
+            let p = b.contents() as *mut u32;
+            *p = bpr as u32;
+            *p.add(1) = rows as u32;
+            *p.add(2) = stride as u32;
+            *p.add(3) = ydiv.max(1) as u32;
+            *p.add(4) = ne as u32;
+            *p.add(5) = kk as u32;
+            *p.add(6) = u32::from(moe.weights_norm);
+            *p.add(7) = u32::from(moe.expert_bias.is_some());
+            *p.add(8) = u32::from(routed);
+            *(p.add(9) as *mut f32) = moe.weights_scale;
+        }
+        b
+    };
+    let grid = |rows: usize, slots: usize| metal::MTLSize {
+        width: (rows as u64).div_ceil(16),
+        height: slots as u64,
+        depth: 1,
+    };
+    let tg256 = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+
+    let norm_w_buf = nb((hidden * 4) as u64);
+    let rms_scalar = nb(8);
+    let normf = nb((hidden * 4) as u64);
+    write_buffer_f32(&norm_w_buf, ffn_norm);
+    unsafe {
+        let p = rms_scalar.contents() as *mut u8;
+        *(p as *mut u32) = hidden as u32;
+        *(p.add(4) as *mut f32) = eps;
+    }
+    encode_rms_norm_f32(e, k, in_buf, &norm_w_buf, &normf, &rms_scalar);
+
+    // routing: one 256-thread threadgroup -> ids[k], wts[k]
+    let ids = nb((kk * 4) as u64);
+    let wts = nb((kk * 4) as u64);
+    let rt_p = params(true, bpr_hidden, ne, 0, 1);
+    let bias_buf: &Buffer = moe.expert_bias.as_ref().unwrap_or(&wts);
+    if !ablate_routed {
+        e.set_compute_pipeline_state(&k.moe_router_topk_v2_pipeline);
+        e.set_buffer(0, Some(&normf), 0);
+        e.set_buffer(1, Some(&moe.router.buffer), 0);
+        e.set_buffer(2, Some(bias_buf), 0);
+        e.set_buffer(3, Some(&ids), 0);
+        e.set_buffer(4, Some(&wts), 0);
+        e.set_buffer(6, Some(&rt_p), 0);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            tg256,
+        );
+    }
+
+    // shared expert (dense mode)
+    let sh_act = nb((shexp_dim * 4) as u64);
+    let sh_out = nb((hidden * 4) as u64);
+    let sh_p1 = params(false, bpr_hidden, shexp_dim, 0, 1);
+    let sh_p2 = params(false, shexp_dim / 32, hidden, 0, 1);
+    if !ablate_shared {
+        e.set_compute_pipeline_state(&k.moe_gate_up_silu_turbo_pipeline);
+        e.set_buffer(0, Some(&normf), 0);
+        e.set_buffer(1, Some(&ids), 0);
+        e.set_buffer(2, Some(&shared_gate_w.buffer), 0);
+        e.set_buffer(3, Some(&shared_up_w.buffer), 0);
+        e.set_buffer(4, Some(&sh_act), 0);
+        e.set_buffer(6, Some(&sh_p1), 0);
+        e.dispatch_thread_groups(grid(shexp_dim, 1), tg256);
+        e.set_compute_pipeline_state(&k.moe_down_turbo_pipeline);
+        e.set_buffer(0, Some(&sh_act), 0);
+        e.set_buffer(1, Some(&ids), 0);
+        e.set_buffer(2, Some(&shared_down_w.buffer), 0);
+        e.set_buffer(3, Some(&sh_out), 0);
+        e.set_buffer(6, Some(&sh_p2), 0);
+        e.dispatch_thread_groups(grid(hidden, 1), tg256);
+    }
+
+    // routed experts: gate+up+silu over k slots (all read y row 0), then down (per slot)
+    let ea = nb((kk * ff * 4) as u64);
+    let ed = nb((kk * hidden * 4) as u64);
+    let ex_p1 = params(true, bpr_hidden, ff, ff * bpr_hidden, kk);
+    let ex_p2 = params(true, bpr_ff, hidden, hidden * bpr_ff, 1);
+    if !ablate_routed {
+        e.set_compute_pipeline_state(&k.moe_gate_up_silu_turbo_pipeline);
+        e.set_buffer(0, Some(&normf), 0);
+        e.set_buffer(1, Some(&ids), 0);
+        e.set_buffer(2, Some(&moe.gate_exps.buffer), 0);
+        e.set_buffer(3, Some(&moe.up_exps.buffer), 0);
+        e.set_buffer(4, Some(&ea), 0);
+        e.set_buffer(6, Some(&ex_p1), 0);
+        e.dispatch_thread_groups(grid(ff, kk), tg256);
+        e.set_compute_pipeline_state(&k.moe_down_turbo_pipeline);
+        e.set_buffer(0, Some(&ea), 0);
+        e.set_buffer(1, Some(&ids), 0);
+        e.set_buffer(2, Some(&moe.down_exps.buffer), 0);
+        e.set_buffer(3, Some(&ed), 0);
+        e.set_buffer(6, Some(&ex_p2), 0);
+        e.dispatch_thread_groups(grid(hidden, kk), tg256);
+    }
+
+    // merge: out = in + shared + sum_s w_s * ed_s
+    let ws_scalar = nb(8);
+    unsafe {
+        let p = ws_scalar.contents() as *mut u32;
+        *p = hidden as u32;
+        *p.add(1) = kk as u32;
+    }
+    if ablate_routed {
+        let resid_n = nb(4);
+        unsafe {
+            *(resid_n.contents() as *mut u32) = hidden as u32;
+        }
+        encode_binary(
+            e,
+            &k.residual_add_pipeline,
+            in_buf,
+            &sh_out,
+            out_buf,
+            &resid_n,
+            hidden,
+        );
+        keep.push(resid_n);
+    } else {
+        e.set_compute_pipeline_state(&k.moe_merge_pipeline);
+        e.set_buffer(0, Some(in_buf), 0);
+        e.set_buffer(1, Some(&sh_out), 0);
+        e.set_buffer(2, Some(&ed), 0);
+        e.set_buffer(3, Some(&wts), 0);
+        e.set_buffer(4, Some(out_buf), 0);
+        e.set_buffer(5, Some(&ws_scalar), 0);
+        e.set_buffer(6, Some(&ws_scalar), 4);
+        dispatch_1d(e, &k.moe_merge_pipeline, hidden);
+    }
+    keep.extend([
+        norm_w_buf, rms_scalar, normf, ids, wts, rt_p, sh_act, sh_out, sh_p1, sh_p2, ea, ed, ex_p1,
+        ex_p2, ws_scalar,
+    ]);
+}
+
 /// Encode the attention block op-chain into `cb` with no commit/readback: reads `in_buf`,
 /// writes the residual sum into `out_buf` (rms_norm -> quantize -> q/k/v matmul -> RoPE(q,k)
 /// -> blit current k/v into `cache_k_buf`/`cache_v_buf` at slot `write_position` -> decode
@@ -17470,6 +18748,7 @@ fn encode_attention_block(
     window_start: usize,
     scale: f32,
     split_half_pairing: bool,
+    qk_l2_norm_after_rope: bool,
 ) {
     let hidden = attn_norm.len();
     let q_dim = n_heads * head_dim;
@@ -17552,42 +18831,89 @@ fn encode_attention_block(
     let normf_attn = if f32y_gemv_enabled() {
         let normf = nb((hidden * 4) as u64);
         encode_rms_norm_f32(e, k, in_buf, &norm_w_buf, &normf, &rms_scalar);
-        encode_resident_matmul_f32(
-            e,
-            k,
-            keep,
-            &normf,
-            q_w_buf,
-            &query_buf,
-            &q_mm_scalar,
-            hidden,
-            q_dim,
-            1,
-        );
-        encode_resident_matmul_f32(
-            e,
-            k,
-            keep,
-            &normf,
-            k_w_buf,
-            &key_buf,
-            &kv_mm_scalar,
-            hidden,
-            kv_dim,
-            1,
-        );
-        encode_resident_matmul_f32(
-            e,
-            k,
-            keep,
-            &normf,
-            v_w_buf,
-            &val_buf,
-            &kv_mm_scalar,
-            hidden,
-            kv_dim,
-            1,
-        );
+        // mobilemoe (the lane carrying the post-RoPE L2 flag): one segmented GEMV over the
+        // q|k|v rows instead of three dispatches. Same per-row arithmetic as the production
+        // nsg8 wire kernel, so outputs are bit-identical. Needs all three in wire Q8_0.
+        let seg3 = qk_l2_norm_after_rope
+            && wire_nsg8_enabled()
+            && [q_w_buf, k_w_buf, v_w_buf]
+                .iter()
+                .all(|w| w.format == ResidentWeightFormat::Q8_0 && w.q8_wire)
+            && q_dim.is_multiple_of(2)
+            && kv_dim.is_multiple_of(2);
+        if seg3 {
+            let seg_scalar = nb(16);
+            unsafe {
+                let p = seg_scalar.contents() as *mut u32;
+                *p = (hidden / 32) as u32; // blocks per row
+                *p.add(1) = (q_dim + 2 * kv_dim) as u32; // total rows
+                *p.add(2) = q_dim as u32; // seg0 rows
+                *p.add(3) = kv_dim as u32; // seg1 rows
+            }
+            e.set_compute_pipeline_state(&k.seg3_qkv_pipeline);
+            e.set_buffer(0, Some(&normf), 0);
+            e.set_buffer(2, Some(&q_w_buf.buffer), 0);
+            e.set_buffer(3, Some(&query_buf), 0);
+            e.set_buffer(4, Some(&seg_scalar), 0);
+            e.set_buffer(5, Some(&seg_scalar), 4);
+            e.set_buffer(6, Some(&seg_scalar), 8);
+            e.set_buffer(7, Some(&seg_scalar), 12);
+            e.set_buffer(8, Some(&k_w_buf.buffer), 0);
+            e.set_buffer(9, Some(&v_w_buf.buffer), 0);
+            e.set_buffer(10, Some(&key_buf), 0);
+            e.set_buffer(11, Some(&val_buf), 0);
+            e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: ((q_dim + 2 * kv_dim) as u64).div_ceil(2),
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            keep.push(seg_scalar);
+        } else {
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                q_w_buf,
+                &query_buf,
+                &q_mm_scalar,
+                hidden,
+                q_dim,
+                1,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                k_w_buf,
+                &key_buf,
+                &kv_mm_scalar,
+                hidden,
+                kv_dim,
+                1,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                v_w_buf,
+                &val_buf,
+                &kv_mm_scalar,
+                hidden,
+                kv_dim,
+                1,
+            );
+        }
         Some(normf)
     } else {
         encode_rms_norm_quantize(
@@ -17692,6 +19018,25 @@ fn encode_attention_block(
         0,
         0,
     );
+    // MobileMoE: parameterless per-head L2 norm on Q and K AFTER RoPE — the reverse of the
+    // qwen3 order above, and with no weight tensor. The per-head RMSNorm kernel already
+    // has a weightless mode (`use_weight == 0`; it ignores buffer 1), which is exactly
+    // `x * rsqrt(mean(x^2) + eps)`. Same `eps` as the CPU `per_head_l2_norm`.
+    if qk_l2_norm_after_rope {
+        let l2_scalar = nb(12);
+        unsafe {
+            let p = l2_scalar.contents() as *mut u8;
+            *(p as *mut u32) = head_dim as u32;
+            *(p.add(4) as *mut f32) = eps;
+            *(p.add(8) as *mut u32) = 0; // use_weight = 0
+        }
+        encode_rms_norm_per_head(
+            e, k, &query_buf, &cos_buf, &query_buf, &l2_scalar, n_heads, 0,
+        );
+        encode_rms_norm_per_head(
+            e, k, &key_buf, &cos_buf, &key_buf, &l2_scalar, n_kv_heads, 0,
+        );
+    }
     // Write the current token's (roped) K and (raw) V into the cache at `write_position` via
     // a compute scatter, so the whole token stays inside ONE compute command encoder (encoder
     // boundaries force full GPU serialization; within one serial encoder Metal's hazard
@@ -21099,6 +22444,7 @@ pub fn try_attention_block_resident(
         0,
         scale,
         split_half_pairing,
+        false,
     );
     e.end_encoding();
     cb.commit();
@@ -21236,6 +22582,7 @@ pub fn try_decode_layer_resident(
         0,
         scale,
         split_half_pairing,
+        false,
     );
     encode_ffn_block(
         e, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, None, false, &gate_w, &up_w, &down_w,
@@ -21415,6 +22762,7 @@ pub fn try_decode_forward_resident(
             0,
             scale,
             split_half_pairing,
+            false,
         );
         encode_ffn_block(
             e,
@@ -21478,6 +22826,52 @@ pub struct ResidentLayerWeights<'a> {
     pub gate_weight_blocks: ResidentWeightBytes<'a>,
     pub up_weight_blocks: ResidentWeightBytes<'a>,
     pub down_weight_blocks: ResidentWeightBytes<'a>,
+    /// Routed experts + router for a MoE layer. When set, `gate/up/down_weight_blocks`
+    /// carry the ALWAYS-ON SHARED expert (a dense FFN of `ffn_dim`) and the routed
+    /// top-k contribution is added on top. `None` for dense layers.
+    pub moe: Option<ResidentMoeLayerWeights<'a>>,
+    /// Parameterless per-head L2 QK-norm applied AFTER RoPE (MobileMoE). Independent of
+    /// `q_norm`/`k_norm`, which are the weighted pre-RoPE norms (Qwen3/gemma3).
+    pub qk_l2_norm_after_rope: bool,
+}
+
+/// CPU-side view of one MoE layer's routed experts for the resident lane.
+#[cfg(target_os = "macos")]
+pub struct ResidentMoeLayerWeights<'a> {
+    /// Router `[n_expert][hidden]`, F32 (llama.cpp keeps `ffn_gate_inp` unquantized).
+    pub router: &'a [f32],
+    /// Frozen per-expert SELECTION bias `[n_expert]` (`exp_probs_b`), if the row ships one.
+    pub expert_bias: Option<&'a [f32]>,
+    /// Stacked expert matrices in ggml order `[in, out, expert]`: each expert is a
+    /// contiguous `[out rows][in/32 blocks]` Q8_0 slab.
+    pub gate_exps: ResidentWeightBytes<'a>,
+    pub up_exps: ResidentWeightBytes<'a>,
+    pub down_exps: ResidentWeightBytes<'a>,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub expert_ff: usize,
+    pub weights_scale: f32,
+    pub weights_norm: bool,
+}
+
+/// Non-macOS stand-in so `ResidentLayerWeights::moe` keeps one shape on every target; the
+/// resident lane itself is compiled out there.
+#[cfg(not(target_os = "macos"))]
+pub struct ResidentMoeLayerWeights<'a>(core::marker::PhantomData<&'a ()>);
+
+/// Resident (uploaded) form of [`ResidentMoeLayerWeights`].
+#[cfg(target_os = "macos")]
+struct ResidentMoeResolved {
+    router: ResidentLinearWeight,
+    expert_bias: Option<Buffer>,
+    gate_exps: ResidentLinearWeight,
+    up_exps: ResidentLinearWeight,
+    down_exps: ResidentLinearWeight,
+    n_expert: usize,
+    n_expert_used: usize,
+    expert_ff: usize,
+    weights_scale: f32,
+    weights_norm: bool,
 }
 
 /// Where a resident weight's bytes live on the CPU side.
@@ -22565,6 +23959,22 @@ impl ResidentDecodeState {
             {
                 return None;
             }
+            if let Some(m) = &l.moe {
+                let ne = m.n_expert;
+                if m.n_expert_used == 0
+                    || m.n_expert_used > ne
+                    || ne > 256
+                    || m.expert_ff == 0
+                    || !m.expert_ff.is_multiple_of(32)
+                    || m.router.len() != ne * self.hidden
+                    || m.expert_bias.is_some_and(|b| b.len() != ne)
+                    || !m.gate_exps.matches_shape(self.hidden, m.expert_ff * ne)
+                    || !m.up_exps.matches_shape(self.hidden, m.expert_ff * ne)
+                    || !m.down_exps.matches_shape(m.expert_ff, self.hidden * ne)
+                {
+                    return None;
+                }
+            }
         }
         if let Some(s) = &logits_stage {
             if s.vocab_size == 0
@@ -22751,9 +24161,16 @@ impl ResidentDecodeState {
         logits_stage: Option<&LogitsStage>,
         sample_stage: Option<&SampleStage>,
     ) -> Option<PreparedToken> {
+        // The MoE lane encodes only the f32-activation wire-format chain.
+        if layers.iter().any(|l| l.moe.is_some())
+            && !(f32y_gemv_enabled() && wire_weights_enabled())
+        {
+            return None;
+        }
         // Resolve all resident weight buffers (layer weights + optional output stage) under one
         // cache lock. They are keyed by (pointer, len), so they upload once and persist.
         let resident: Vec<[ResidentLinearWeight; 7]>;
+        let resident_moe: Vec<Option<ResidentMoeResolved>>;
         let stage_bufs: Option<(ResidentLinearWeight, Buffer)>;
         let emb_buf: Option<ResidentLinearWeight>;
         {
@@ -22790,6 +24207,43 @@ impl ResidentDecodeState {
                 }
                 _ => None,
             };
+            resident_moe = layers
+                .iter()
+                .map(|l| {
+                    // dense layer -> Some(None); MoE layer -> Some(Some(resolved)),
+                    // or None (abort the whole graph) if any expert buffer fails to resolve.
+                    l.moe.as_ref().map_or(Some(None), |m| {
+                        Some(Some(ResidentMoeResolved {
+                            router: ResidentLinearWeight {
+                                format: ResidentWeightFormat::DenseF32,
+                                buffer: cache.weight_buffer(&k.device, m.router),
+                                q8_wire: false,
+                            },
+                            expert_bias: m.expert_bias.map(|b| cache.weight_buffer(&k.device, b)),
+                            gate_exps: resolve_resident_weight(
+                                &mut cache,
+                                &k.device,
+                                &m.gate_exps,
+                                wire,
+                            )?,
+                            up_exps: resolve_resident_weight(
+                                &mut cache, &k.device, &m.up_exps, wire,
+                            )?,
+                            down_exps: resolve_resident_weight(
+                                &mut cache,
+                                &k.device,
+                                &m.down_exps,
+                                wire,
+                            )?,
+                            n_expert: m.n_expert,
+                            n_expert_used: m.n_expert_used,
+                            expert_ff: m.expert_ff,
+                            weights_scale: m.weights_scale,
+                            weights_norm: m.weights_norm,
+                        }))
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
         }
         let filled = position + 1;
         let mut keep = Vec::new();
@@ -22855,22 +24309,39 @@ impl ResidentDecodeState {
                 window_start,
                 scale,
                 self.split_half_pairing,
+                layer.qk_l2_norm_after_rope,
             );
-            encode_ffn_block(
-                e,
-                k,
-                &mut keep,
-                &self.mid,
-                out_buf,
-                layer.ffn_norm,
-                self.eps,
-                layer.post_ffw_norm,
-                layer.ffn_geglu,
-                &w[4],
-                &w[5],
-                &w[6],
-                self.ffn_dim,
-            );
+            match resident_moe[i].as_ref() {
+                Some(moe) => encode_moe_ffn_block(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.mid,
+                    out_buf,
+                    layer.ffn_norm,
+                    self.eps,
+                    &w[4],
+                    &w[5],
+                    &w[6],
+                    self.ffn_dim,
+                    moe,
+                ),
+                None => encode_ffn_block(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.mid,
+                    out_buf,
+                    layer.ffn_norm,
+                    self.eps,
+                    layer.post_ffw_norm,
+                    layer.ffn_geglu,
+                    &w[4],
+                    &w[5],
+                    &w[6],
+                    self.ffn_dim,
+                ),
+            }
             from_a = !from_a;
         }
         let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
@@ -23091,6 +24562,21 @@ impl ResidentDecodeState {
         sin_all: &[f32],
         scale: f32,
     ) -> Option<()> {
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-prefill] prefill_tokens ENTER n_tokens={n_tokens} moe={}",
+                layers.iter().any(|l| l.moe.is_some())
+            );
+        }
+        // MoE layers ride the f32 activation path with the routed experts added after the
+        // (shared-expert) dense FFN. Opt out with CAMELID_METAL_MOE_PREFILL=0 -> CPU prefill.
+        let has_moe = layers.iter().any(|l| l.moe.is_some());
+        if has_moe && !moe_prefill_enabled() {
+            {
+                prefill_decline("prefill_tokens", 1);
+                return None;
+            }
+        }
         if n_tokens == 0
             || !wire_weights_enabled()
             || !self.head_dim.is_multiple_of(32)
@@ -23099,7 +24585,10 @@ impl ResidentDecodeState {
             || self.filled != 0
             || !self.ensure_capacity(n_tokens)
         {
-            return None;
+            {
+                prefill_decline("prefill_tokens", 2);
+                return None;
+            }
         }
         // gemma3 sandwich norms are wired into the decode encodes only
         // (encode_attention_block / encode_ffn_block); this batched prefill does
@@ -23112,11 +24601,17 @@ impl ResidentDecodeState {
                 .iter()
                 .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some() || l.ffn_geglu)
         {
-            return None;
+            {
+                prefill_decline("prefill_tokens", 3);
+                return None;
+            }
         }
         let half_rope = cos_all.len() / n_tokens;
         if sin_all.len() != cos_all.len() || half_rope * 2 > self.head_dim {
-            return None;
+            {
+                prefill_decline("prefill_tokens", 4);
+                return None;
+            }
         }
         let k = metal_linear_kernel()?;
         // Qwen3 per-head QK-norm: when the layers carry q_norm/k_norm we apply an
@@ -23156,6 +24651,49 @@ impl ResidentDecodeState {
             .iter()
             .flatten()
             .all(|w| w.format == ResidentWeightFormat::Q8_0);
+        let resident_moe: Vec<Option<ResidentMoeResolved>> = if has_moe {
+            let mut cache = metal_linear_cache().lock().ok()?;
+            layers
+                .iter()
+                .map(|l| {
+                    l.moe.as_ref().map_or(Some(None), |m| {
+                        Some(Some(ResidentMoeResolved {
+                            router: ResidentLinearWeight {
+                                format: ResidentWeightFormat::DenseF32,
+                                buffer: cache.weight_buffer(&k.device, m.router),
+                                q8_wire: false,
+                            },
+                            expert_bias: m.expert_bias.map(|b| cache.weight_buffer(&k.device, b)),
+                            gate_exps: resolve_resident_weight(
+                                &mut cache,
+                                &k.device,
+                                &m.gate_exps,
+                                true,
+                            )?,
+                            up_exps: resolve_resident_weight(
+                                &mut cache, &k.device, &m.up_exps, true,
+                            )?,
+                            down_exps: resolve_resident_weight(
+                                &mut cache,
+                                &k.device,
+                                &m.down_exps,
+                                true,
+                            )?,
+                            n_expert: m.n_expert,
+                            n_expert_used: m.n_expert_used,
+                            expert_ff: m.expert_ff,
+                            weights_scale: m.weights_scale,
+                            weights_norm: m.weights_norm,
+                        }))
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?
+        } else {
+            vec![None; layers.len()]
+                .into_iter()
+                .map(|_: Option<()>| None)
+                .collect()
+        };
 
         let nb = |bytes: usize| {
             k.device
@@ -23179,7 +24717,10 @@ impl ResidentDecodeState {
                 k.device.max_buffer_length() as usize,
             )
         });
-        let use_attn_mm = !self.kv16
+        // MoE layers ride the f16 stream only when the routed path is the id-GEMM + panel
+        // add (those have half variants); the grouped-GEMV fallback reads/writes f32.
+        let use_attn_mm = (!has_moe || (moe_prefill_mm_enabled() && moe_prefill_grouped_enabled()))
+            && !self.kv16
             && (!self.kvq8 || stage_q8_kv)
             && (!stage_q8_kv || q8_stage_bytes.is_some())
             && all_q8
@@ -23361,6 +24902,10 @@ impl ResidentDecodeState {
         // and the validated non-attn-mm attention path. The MM GEMM here outputs f32
         // (use_h16 is false), so the per-head norm runs in f32 against the existing
         // rms_norm_per_head_f32 kernel.
+        // MoE layers keep the GEMM path for attention + shared expert (their dense work is
+        // ~85% of the prefill and the batched-column GEMV is issue-bound); only the
+        // attention-as-matmul/f16-stream path is declined so the residual stream stays f32
+        // for the routed-expert kernels.
         let use_mm = all_q8
             && mm_prefill_enabled()
             && q_dim.is_multiple_of(128)
@@ -23632,6 +25177,41 @@ impl ResidentDecodeState {
         if let Some(seq_f32) = &seq_f32 {
             convert(&e, seq_f32, &seq, &n_elems, 0, n_tokens * self.hidden);
         }
+        let mut moe_keep: Vec<Buffer> = Vec::new();
+        // Expert-indexed MMA prefill scratch, allocated ONCE (per-layer fresh allocation of
+        // ~60 MB of panels inflated the driver scheduling window from 2 to 29 ms).
+        let moe_mm = if has_moe && moe_prefill_mm_enabled() {
+            resident_moe.iter().flatten().next().map(|m| {
+                let kk = m.n_expert_used;
+                let ff = m.expert_ff;
+                let ne = m.n_expert;
+                let slots = n_tokens * kk;
+                let tile_tok = if moe_prefill_tile32_enabled() {
+                    32
+                } else {
+                    128
+                };
+                let j_max = ne + slots.div_ceil(tile_tok);
+                // rows: every expert padded to 32 + a 128-row slack the last tile may over-read
+                let total_pad = slots + 32 * ne + 128;
+                (
+                    j_max,
+                    total_pad,
+                    nb(j_max * 3 * 4),               // tile_map
+                    nb(ne * 4),                      // panel_off
+                    nb(total_pad * 4),               // panel_slot
+                    nb(total_pad * 4),               // row_map_tok (was panel_x)
+                    nb(total_pad * ff * 4),          // pg
+                    nb(total_pad * ff * 4),          // pu
+                    nb(total_pad * ff * 2),          // pact_h (f16, silu fused)
+                    nb(total_pad * self.hidden * 4), // pd
+                    nb(80),                          // scalars (+ zero word at 76)
+                    nb(slots * 4),                   // slot_panel (inverse map)
+                )
+            })
+        } else {
+            None
+        };
         let (cur, nxt) = (&seq, &seq_out);
         for (i, layer) in layers.iter().enumerate() {
             // The resident prefill exists to fill the KV cache: the caller discards the
@@ -23786,6 +25366,39 @@ impl ResidentDecodeState {
                     (self.n_heads + self.n_kv_heads) * half_rope + kv_dim,
                     n_tokens,
                 );
+                // MobileMoE: parameterless per-head L2 AFTER RoPE. The fused kernel already
+                // wrote Q to the half panel and K into the caches, so norm them in place.
+                if layer.qk_l2_norm_after_rope {
+                    debug_assert!(use_h16, "fused-rope L2 expects the half query panel");
+                    let l2s = nb(8);
+                    unsafe {
+                        let q = l2s.contents() as *mut u8;
+                        *(q as *mut u32) = n_tokens as u32;
+                        *(q.add(4) as *mut f32) = self.eps;
+                    }
+                    e.set_compute_pipeline_state(&k.moe_l2_post_rope_h_pipeline);
+                    e.set_buffer(0, Some(&q_h), 0);
+                    e.set_buffer(1, Some(&self.cache_k[i]), 0);
+                    e.set_buffer(2, Some(&self.cache_k16[i]), 0);
+                    e.set_buffer(3, Some(&fused_rope_scalar), 0); // n_heads
+                    e.set_buffer(4, Some(&fused_rope_scalar), 4); // n_kv_heads
+                    e.set_buffer(5, Some(&fused_rope_scalar), 8); // head_dim
+                    e.set_buffer(6, Some(&fused_rope_scalar), 20); // max_positions
+                    e.set_buffer(7, Some(&l2s), 0);
+                    e.set_buffer(8, Some(&l2s), 4);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: (n_tokens * (self.n_heads + self.n_kv_heads)) as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
             } else if use_h16 && stage_q8_kv {
                 // es=2 Q8 lane: q_buf/k_buf/v_buf are half here, so the f32 RoPE would
                 // reinterpret them. Q rotates straight into the half query panel rather
@@ -23855,6 +25468,39 @@ impl ResidentDecodeState {
                     self.n_kv_heads * half_rope,
                     n_tokens,
                 );
+                // MobileMoE: parameterless per-head L2 norm on Q and K AFTER RoPE — must match
+                // the decode path or the prefilled K in the cache is un-normed.
+                if layer.qk_l2_norm_after_rope {
+                    let l2_scalar = nb(12);
+                    unsafe {
+                        let p = l2_scalar.contents() as *mut u8;
+                        *(p as *mut u32) = self.head_dim as u32;
+                        *(p.add(4) as *mut f32) = self.eps;
+                        *(p.add(8) as *mut u32) = 0;
+                    }
+                    if !last_layer {
+                        encode_rms_norm_per_head(
+                            &e,
+                            k,
+                            &q_buf,
+                            &cos_buf,
+                            &q_buf,
+                            &l2_scalar,
+                            n_tokens * self.n_heads,
+                            0,
+                        );
+                    }
+                    encode_rms_norm_per_head(
+                        &e,
+                        k,
+                        &k_buf,
+                        &cos_buf,
+                        &k_buf,
+                        &l2_scalar,
+                        n_tokens * self.n_kv_heads,
+                        0,
+                    );
+                }
                 let scatter_pipeline = if self.kvq8 {
                     &k.kv_scatter_batch_kvq8_pipeline
                 } else if self.kv16 {
@@ -24327,6 +25973,370 @@ impl ResidentDecodeState {
                 n_tokens * self.hidden,
             );
             stage!("9:resid+silu");
+            if let Some(moe) = resident_moe[i].as_ref().filter(|_| !moe_ablate("routed")) {
+                if use_mm && !use_h16 {
+                    // the GEMM path normed into f16 `normf_h`; the f32 router reads f32 rows
+                    norm_rows(
+                        &e,
+                        &k.rms_norm_batch_pipeline,
+                        nxt,
+                        &ffn_norm_buf,
+                        &normf,
+                        &rms_scalar,
+                        n_tokens,
+                    );
+                }
+                // cur = nxt + shared. Add the routed experts for all n_tokens: route each
+                // token (one threadgroup each), gate/up/silu over n_tokens*k slots reading
+                // y row = slot/k, down per slot, then cur[t] += sum_s w[t,s] * ed[t*k+s].
+                let kk = moe.n_expert_used;
+                let ff = moe.expert_ff;
+                let ne = moe.n_expert;
+                let slots = n_tokens * kk;
+                let ids = nb(slots * 4);
+                let wts = nb(slots * 4);
+                let ea = nb(slots * ff * 4);
+                let ed = nb(slots * self.hidden * 4);
+                let mk = |routed: bool, bpr: usize, rows: usize, stride: usize, ydiv: usize| {
+                    let b = nb(40);
+                    unsafe {
+                        let q = b.contents() as *mut u32;
+                        *q = bpr as u32;
+                        *q.add(1) = rows as u32;
+                        *q.add(2) = stride as u32;
+                        *q.add(3) = ydiv.max(1) as u32;
+                        *q.add(4) = ne as u32;
+                        *q.add(5) = kk as u32;
+                        *q.add(6) = u32::from(moe.weights_norm);
+                        *q.add(7) = u32::from(moe.expert_bias.is_some());
+                        *q.add(8) = u32::from(routed);
+                        *(q.add(9) as *mut f32) = moe.weights_scale;
+                    }
+                    b
+                };
+                let rt_p = mk(true, bpr_hidden, ne, 0, 1);
+                let p1 = mk(true, bpr_hidden, ff, ff * bpr_hidden, kk);
+                let p2 = mk(true, ff / 32, self.hidden, self.hidden * (ff / 32), 1);
+                let bias_buf: &Buffer = moe.expert_bias.as_ref().unwrap_or(&wts);
+                let tg256 = metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                };
+                if use_h16 {
+                    e.set_compute_pipeline_state(&k.moe_router_topk_v2_h_pipeline);
+                    e.set_buffer(0, Some(&normf_h), 0);
+                } else {
+                    e.set_compute_pipeline_state(&k.moe_router_topk_v2_pipeline);
+                    e.set_buffer(0, Some(&normf), 0);
+                }
+                e.set_buffer(1, Some(&moe.router.buffer), 0);
+                e.set_buffer(2, Some(bias_buf), 0);
+                e.set_buffer(3, Some(&ids), 0);
+                e.set_buffer(4, Some(&wts), 0);
+                e.set_buffer(6, Some(&rt_p), 0);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: n_tokens as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    tg256,
+                );
+                if moe_prefill_grouped_enabled() {
+                    // group slots by expert: zero counts -> count -> prefix/cursors -> scatter
+                    let counts = nb(ne * 4);
+                    let starts = nb((ne + 1) * 4);
+                    let cursors = nb(ne * 4);
+                    let by_expert = nb(slots * 4);
+                    let gs = nb(8);
+                    unsafe {
+                        let q = gs.contents() as *mut u32;
+                        *q = ne as u32;
+                        *q.add(1) = slots as u32;
+                    }
+                    e.set_compute_pipeline_state(&k.moe_zero_u32_pipeline);
+                    e.set_buffer(0, Some(&counts), 0);
+                    e.set_buffer(1, Some(&gs), 0);
+                    dispatch_1d(&e, &k.moe_zero_u32_pipeline, ne);
+                    e.set_compute_pipeline_state(&k.moe_slot_count_pipeline);
+                    e.set_buffer(0, Some(&ids), 0);
+                    e.set_buffer(1, Some(&counts), 0);
+                    e.set_buffer(2, Some(&gs), 4);
+                    dispatch_1d(&e, &k.moe_slot_count_pipeline, slots);
+                    e.set_compute_pipeline_state(&k.moe_slot_prefix_pipeline);
+                    e.set_buffer(0, Some(&counts), 0);
+                    e.set_buffer(1, Some(&starts), 0);
+                    e.set_buffer(2, Some(&cursors), 0);
+                    e.set_buffer(3, Some(&gs), 0);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: 1,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 1,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    e.set_compute_pipeline_state(&k.moe_slot_scatter_pipeline);
+                    e.set_buffer(0, Some(&ids), 0);
+                    e.set_buffer(1, Some(&cursors), 0);
+                    e.set_buffer(2, Some(&by_expert), 0);
+                    e.set_buffer(3, Some(&gs), 4);
+                    dispatch_1d(&e, &k.moe_slot_scatter_pipeline, slots);
+                    if let Some((
+                        j_max,
+                        total_pad,
+                        tile_map,
+                        panel_off,
+                        panel_slot,
+                        row_map_tok,
+                        pg,
+                        pu,
+                        pact_h,
+                        pd,
+                        sc,
+                        slot_panel,
+                    )) = moe_mm.as_ref()
+                    {
+                        // Expert-indexed MMA: tile map -> gather f16 panel -> gate/up GEMMs ->
+                        // silu (f16 store) -> down GEMM -> scatter rows back to slot order.
+                        let (j_max, total_pad) = (*j_max, *total_pad);
+                        unsafe {
+                            let q = sc.contents() as *mut u32;
+                            *q = ne as u32;
+                            *q.add(1) = j_max as u32;
+                            *q.add(2) = total_pad as u32;
+                            *q.add(3) = 0xFFFF_FFFF;
+                            *q.add(4) = slots as u32;
+                            *q.add(5) = self.hidden as u32;
+                            *q.add(6) = kk as u32;
+                            *q.add(7) = (total_pad * self.hidden) as u32;
+                            *q.add(8) = (total_pad * ff) as u32;
+                            *q.add(9) = 1u32; // indirect flag = 1 (offset 36); offset 0..3 reused below
+                            *q.add(10) = (ff * bpr_hidden) as u32;
+                            *q.add(11) = (self.hidden * (ff / 32)) as u32;
+                            *q.add(12) = bpr_hidden as u32;
+                            *q.add(13) = ff as u32;
+                            *q.add(14) = (ff / 32) as u32;
+                            *q.add(15) = self.hidden as u32;
+                            *q.add(16) = if moe_prefill_tile32_enabled() {
+                                32u32
+                            } else {
+                                128u32
+                            }; // token tile (offset 64)
+                            *q.add(19) = 0u32; // zero word at offset 76 (indirect = 0)
+                        }
+                        e.set_compute_pipeline_state(&k.moe_tile_map_pipeline);
+                        e.set_buffer(0, Some(&counts), 0);
+                        e.set_buffer(1, Some(tile_map), 0);
+                        e.set_buffer(2, Some(panel_off), 0);
+                        e.set_buffer(3, Some(sc), 0);
+                        e.set_buffer(4, Some(sc), 4);
+                        e.set_buffer(5, Some(sc), 64);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: 1,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 1,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        // padding rows -> NONE in both panel_slot and row_map_tok
+                        e.set_compute_pipeline_state(&k.moe_fill_u32_pipeline);
+                        e.set_buffer(0, Some(panel_slot), 0);
+                        e.set_buffer(1, Some(sc), 8);
+                        e.set_buffer(2, Some(sc), 12);
+                        dispatch_1d(&e, &k.moe_fill_u32_pipeline, total_pad);
+                        e.set_buffer(0, Some(row_map_tok), 0);
+                        dispatch_1d(&e, &k.moe_fill_u32_pipeline, total_pad);
+                        e.set_compute_pipeline_state(&k.moe_panel_fill_pipeline);
+                        e.set_buffer(0, Some(&ids), 0);
+                        e.set_buffer(1, Some(&by_expert), 0);
+                        e.set_buffer(2, Some(&starts), 0);
+                        e.set_buffer(3, Some(panel_off), 0);
+                        e.set_buffer(4, Some(panel_slot), 0);
+                        e.set_buffer(5, Some(sc), 16);
+                        e.set_buffer(6, Some(row_map_tok), 0);
+                        e.set_buffer(7, Some(slot_panel), 0);
+                        e.set_buffer(8, Some(sc), 24);
+                        dispatch_1d(&e, &k.moe_panel_fill_pipeline, slots);
+                        let mm_id = |e: &metal::ComputeCommandEncoderRef,
+                                     y: &Buffer,
+                                     w: &ResidentLinearWeight,
+                                     out: &Buffer,
+                                     bpr_off: u64,
+                                     rows_off: u64,
+                                     stride_off: u64,
+                                     rows: usize,
+                                     indirect: bool| {
+                            // 32-token tiles need rows % 128 == 0; otherwise the 128-token kernel
+                            // consumes the same (32-token) tile map as a ragged tail.
+                            let t32 = moe_prefill_tile32_enabled() && rows.is_multiple_of(128);
+                            e.set_compute_pipeline_state(if t32 {
+                                &k.moe_wire_mm_id32_pipeline
+                            } else {
+                                &k.moe_wire_mm_id_pipeline
+                            });
+                            e.set_buffer(0, Some(y), 0);
+                            e.set_buffer(2, Some(&w.buffer), 0);
+                            e.set_buffer(3, Some(out), 0);
+                            e.set_buffer(4, Some(sc), bpr_off);
+                            e.set_buffer(5, Some(sc), rows_off);
+                            e.set_buffer(6, Some(tile_map), 0);
+                            e.set_buffer(7, Some(sc), stride_off);
+                            e.set_buffer(8, Some(row_map_tok), 0);
+                            e.set_buffer(9, Some(sc), if indirect { 36 } else { 3 * 4 + 64 }); // 36 -> 1; 76 -> zero word (see zero_word below)
+                            e.set_threadgroup_memory_length(0, if t32 { 10240 } else { 12288 });
+                            e.dispatch_thread_groups(
+                                metal::MTLSize {
+                                    width: (rows / if t32 { 128 } else { 64 }) as u64,
+                                    height: j_max as u64,
+                                    depth: 1,
+                                },
+                                metal::MTLSize {
+                                    width: 256,
+                                    height: 1,
+                                    depth: 1,
+                                },
+                            );
+                        };
+                        // gate/up read the f16 FFN-norm rows IN PLACE through row_map_tok (no gather)
+                        mm_id(&e, &normf_h, &moe.gate_exps, pg, 48, 52, 40, ff, true);
+                        mm_id(&e, &normf_h, &moe.up_exps, pu, 48, 52, 40, ff, true);
+                        // silu(gate)*up with the f16 store fused (the down GEMM consumes f16, panel order)
+                        encode_binary_off(
+                            &e,
+                            &k.silu_mul_f16o_pipeline,
+                            pg,
+                            pu,
+                            pact_h,
+                            sc,
+                            32,
+                            total_pad * ff,
+                        );
+                        // the "indirect" flag must be 0 here: scalar slot 60 holds `hidden` (nonzero) so
+                        // use a dedicated zero at offset 56? no — 56 holds down bpr. Use slot 3's neighbour:
+                        // we pass indirect=false via offset 60 being nonzero is WRONG; bind a zero word.
+                        mm_id(
+                            &e,
+                            pact_h,
+                            &moe.down_exps,
+                            pd,
+                            56,
+                            60,
+                            44,
+                            self.hidden,
+                            false,
+                        );
+                    } else {
+                        // grouped expert GEMVs: grid (rows/16, n_expert)
+                        e.set_compute_pipeline_state(&k.moe_grouped_gate_up_silu_pipeline);
+                        e.set_buffer(0, Some(&normf), 0);
+                        e.set_buffer(1, Some(&by_expert), 0);
+                        e.set_buffer(2, Some(&moe.gate_exps.buffer), 0);
+                        e.set_buffer(3, Some(&moe.up_exps.buffer), 0);
+                        e.set_buffer(4, Some(&ea), 0);
+                        e.set_buffer(5, Some(&starts), 0);
+                        e.set_buffer(6, Some(&p1), 0);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: (ff as u64).div_ceil(16),
+                                height: ne as u64,
+                                depth: 1,
+                            },
+                            tg256,
+                        );
+                        e.set_compute_pipeline_state(&k.moe_grouped_down_pipeline);
+                        e.set_buffer(0, Some(&ea), 0);
+                        e.set_buffer(1, Some(&by_expert), 0);
+                        e.set_buffer(2, Some(&moe.down_exps.buffer), 0);
+                        e.set_buffer(3, Some(&ed), 0);
+                        e.set_buffer(5, Some(&starts), 0);
+                        e.set_buffer(6, Some(&p2), 0);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: (self.hidden as u64).div_ceil(16),
+                                height: ne as u64,
+                                depth: 1,
+                            },
+                            tg256,
+                        );
+                    }
+                    moe_keep.extend([counts, starts, cursors, by_expert, gs]);
+                } else {
+                    e.set_compute_pipeline_state(&k.moe_gate_up_silu_turbo_pipeline);
+                    e.set_buffer(0, Some(&normf), 0);
+                    e.set_buffer(1, Some(&ids), 0);
+                    e.set_buffer(2, Some(&moe.gate_exps.buffer), 0);
+                    e.set_buffer(3, Some(&moe.up_exps.buffer), 0);
+                    e.set_buffer(4, Some(&ea), 0);
+                    e.set_buffer(6, Some(&p1), 0);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: (ff as u64).div_ceil(16),
+                            height: slots as u64,
+                            depth: 1,
+                        },
+                        tg256,
+                    );
+                    e.set_compute_pipeline_state(&k.moe_down_turbo_pipeline);
+                    e.set_buffer(0, Some(&ea), 0);
+                    e.set_buffer(1, Some(&ids), 0);
+                    e.set_buffer(2, Some(&moe.down_exps.buffer), 0);
+                    e.set_buffer(3, Some(&ed), 0);
+                    e.set_buffer(6, Some(&p2), 0);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: (self.hidden as u64).div_ceil(16),
+                            height: slots as u64,
+                            depth: 1,
+                        },
+                        tg256,
+                    );
+                }
+                let ar = nb(12);
+                unsafe {
+                    let q = ar.contents() as *mut u32;
+                    *q = self.hidden as u32;
+                    *q.add(1) = kk as u32;
+                    *q.add(2) = (n_tokens * self.hidden) as u32;
+                }
+                if let Some((_, _, _, _, _, _, _, _, _, pd, _, slot_panel)) =
+                    moe_mm.as_ref().filter(|_| moe_prefill_grouped_enabled())
+                {
+                    e.set_compute_pipeline_state(if use_h16 {
+                        &k.moe_add_routed_panel_h_pipeline
+                    } else {
+                        &k.moe_add_routed_panel_pipeline
+                    });
+                    e.set_buffer(0, Some(cur), 0);
+                    e.set_buffer(1, Some(pd), 0);
+                    e.set_buffer(2, Some(&wts), 0);
+                    e.set_buffer(3, Some(slot_panel), 0);
+                    e.set_buffer(4, Some(&ar), 0);
+                    e.set_buffer(5, Some(&ar), 4);
+                    e.set_buffer(6, Some(&ar), 8);
+                    dispatch_1d(&e, &k.moe_add_routed_panel_pipeline, n_tokens * self.hidden);
+                } else {
+                    e.set_compute_pipeline_state(&k.moe_add_routed_rows_pipeline);
+                    e.set_buffer(0, Some(cur), 0);
+                    e.set_buffer(1, Some(&ed), 0);
+                    e.set_buffer(2, Some(&wts), 0);
+                    e.set_buffer(3, Some(&ar), 0);
+                    e.set_buffer(4, Some(&ar), 4);
+                    e.set_buffer(5, Some(&ar), 8);
+                    dispatch_1d(&e, &k.moe_add_routed_rows_pipeline, n_tokens * self.hidden);
+                }
+                moe_keep.extend([ids, wts, ea, ed, rt_p, p1, p2, ar]);
+            }
             // Attention residual wrote cur -> nxt; FFN residual wrote nxt -> cur, so this
             // layer's output is back in `cur` for the next layer.
 
@@ -24447,6 +26457,10 @@ impl ResidentDecodeState {
         scale: f32,
         chunk_rows: usize,
     ) -> Option<()> {
+        // The batched paths encode the dense FFN only; a MoE layer must fail closed.
+        if layers.iter().any(|l| l.moe.is_some()) {
+            return None;
+        }
         self.prefill_tokens_windowed_inner(
             embeddings,
             n_tokens,
@@ -25575,6 +27589,10 @@ impl ResidentDecodeState {
         k: usize,
         scale: f32,
     ) -> Option<Vec<u32>> {
+        // The batched paths encode the dense FFN only; a MoE layer must fail closed.
+        if layers.iter().any(|l| l.moe.is_some()) {
+            return None;
+        }
         self.verify_batch_inner(
             embeddings,
             cos_all,
@@ -35550,6 +37568,8 @@ mod tests {
         let weights: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
                 q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
@@ -35887,6 +37907,8 @@ mod tests {
         let mk_views = |with_qk_norm: bool| -> Vec<ResidentLayerWeights<'_>> {
             data.iter()
                 .map(|d| ResidentLayerWeights {
+                    moe: None,
+                    qk_l2_norm_after_rope: false,
                     attn_norm: &d.attn_norm,
                     ffn_norm: &d.ffn_norm,
                     q_norm: with_qk_norm.then_some(d.q_norm.as_slice()),
@@ -36120,6 +38142,8 @@ mod tests {
         let mk_views = |with_post_norms: bool| -> Vec<ResidentLayerWeights<'_>> {
             data.iter()
                 .map(|d| ResidentLayerWeights {
+                    moe: None,
+                    qk_l2_norm_after_rope: false,
                     attn_norm: &d.attn_norm,
                     ffn_norm: &d.ffn_norm,
                     q_norm: Some(&d.q_norm),
@@ -36286,6 +38310,8 @@ mod tests {
         let up = mk_w36(ffn, bpr_hidden, 6);
         let down = mk_w36(hidden, ffn / 32, 7);
         let layer = ResidentLayerWeights {
+            moe: None,
+            qk_l2_norm_after_rope: false,
             attn_norm: &attn_norm,
             ffn_norm: &ffn_norm,
             q_norm: None,
@@ -36430,6 +38456,8 @@ mod tests {
         let mk_views = |geglu: bool| -> Vec<ResidentLayerWeights<'_>> {
             data.iter()
                 .map(|d| ResidentLayerWeights {
+                    moe: None,
+                    qk_l2_norm_after_rope: false,
                     attn_norm: &d.attn_norm,
                     ffn_norm: &d.ffn_norm,
                     q_norm: Some(&d.q_norm),
@@ -36676,6 +38704,8 @@ mod tests {
         let weights: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
                 q_norm: Some(&d.q_norm),
@@ -37061,6 +39091,8 @@ mod tests {
         fn mk_views(set: &[LW]) -> Vec<ResidentLayerWeights<'_>> {
             set.iter()
                 .map(|d| ResidentLayerWeights {
+                    moe: None,
+                    qk_l2_norm_after_rope: false,
                     attn_norm: &d.attn_norm,
                     ffn_norm: &d.ffn_norm,
                     q_norm: Some(&d.q_norm),
@@ -37491,6 +39523,8 @@ mod tests {
         let weights: Vec<ResidentLayerWeights<'_>> = data
             .iter()
             .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
                 q_norm: Some(&d.q_norm),
@@ -37950,6 +39984,8 @@ mod tests {
         let weights: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
                 q_norm: Some(&d.q_norm),
@@ -38252,6 +40288,8 @@ mod tests {
         let mk_views = |gemma3: bool| -> Vec<ResidentLayerWeights<'_>> {
             data.iter()
                 .map(|d| ResidentLayerWeights {
+                    moe: None,
+                    qk_l2_norm_after_rope: false,
                     attn_norm: &d.attn_norm,
                     ffn_norm: &d.ffn_norm,
                     q_norm: gemma3.then_some(d.q_norm.as_slice()),
@@ -38609,6 +40647,8 @@ mod tests {
             self.layers
                 .iter()
                 .map(|d| ResidentLayerWeights {
+                    moe: None,
+                    qk_l2_norm_after_rope: false,
                     attn_norm: &d.attn_norm,
                     ffn_norm: &d.ffn_norm,
                     q_norm: Some(&d.q_norm),
@@ -40531,6 +42571,8 @@ mod tests {
             down: mk_w36(hidden, bpr_ffn, 7),
         };
         let weights = vec![ResidentLayerWeights {
+            moe: None,
+            qk_l2_norm_after_rope: false,
             attn_norm: &data.attn_norm,
             ffn_norm: &data.ffn_norm,
             q_norm: Some(&data.q_norm),
@@ -40748,6 +42790,8 @@ mod tests {
         let weights: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
                 q_norm: Some(&d.q_norm),
@@ -41061,6 +43105,8 @@ mod tests {
         let weights: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
                 q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
@@ -41337,6 +43383,8 @@ mod tests {
         let weights: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
                 q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
@@ -42561,6 +44609,837 @@ mod tests {
         let mut output = [0.0_f32, 0.0];
         assert!(!try_linear_row_f32(&input, &weights, 2, 2, &mut output));
         assert_eq!(output, [0.0, 0.0]);
+    }
+
+    // ---- MobileMoE Metal kernel tests -------------------------------------------------
+    // Bindings, threadgroup sizes and grid shapes mirror the host dispatch sites:
+    //   seg3          -> encode_attention_block, the `seg3` branch
+    //   mm_id32       -> ResidentDecodeState::prefill_tokens, the `mm_id` closure (t32)
+    //   l2_post_rope  -> ResidentDecodeState::prefill_tokens, `qk_l2_norm_after_rope`
+    // They dispatch the pipelines directly so they do not depend on the process-wide
+    // env gates that a shared test binary cannot arm.
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_rng_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform in [0, 1) with 24 random mantissa bits.
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_rng_unit(state: &mut u64) -> f32 {
+        (mobilemoe_rng_next(state) >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Uniform in [-1, 1).
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_rng_signed(state: &mut u64) -> f32 {
+        2.0 * mobilemoe_rng_unit(state) - 1.0
+    }
+
+    /// Q8_0 WIRE block = 34 bytes: little-endian f16 scale, then 32 i8 quants. This is the
+    /// byte layout every `*_wire_*` kernel in LINEAR_ROW_SHADER reads (`q8_block_bytes = 34`,
+    /// `w_scale = float(*(device const half*)wb)`, `wq = wb + 2`).
+    #[cfg(target_os = "macos")]
+    const MOBILEMOE_Q8_0_WIRE_BYTES: usize = 34;
+
+    /// `rows` x `blocks_per_row` random Q8_0 wire blocks. Scales are signed, exactly
+    /// representable in f16 (they are MADE from f16 bits), and small enough that a 768-wide
+    /// dot against activations in [-1, 1] stays O(10): comfortably inside f16/f32 range.
+    /// Row 0 / block 0 gets the two extreme quants so the +-127 corners are always present.
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_q8_0_wire_rows(rows: usize, blocks_per_row: usize, rng: &mut u64) -> Vec<u8> {
+        const WIRE: usize = MOBILEMOE_Q8_0_WIRE_BYTES;
+        let mut wire = vec![0u8; rows * blocks_per_row * WIRE];
+        for row in 0..rows {
+            for block in 0..blocks_per_row {
+                let off = (row * blocks_per_row + block) * WIRE;
+                let magnitude = 0.004 + mobilemoe_rng_unit(rng) * 0.016;
+                let scale = if mobilemoe_rng_next(rng) & 1 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                };
+                wire[off..off + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                for lane in 0..32 {
+                    // Full i8 range except -128 (GGUF Q8_0 never emits it; llama.cpp clamps to +-127).
+                    let q = (mobilemoe_rng_next(rng) % 255) as i32 - 127;
+                    wire[off + 2 + lane] = (q as i8) as u8;
+                }
+            }
+        }
+        if rows > 0 && blocks_per_row > 0 {
+            wire[2] = 127i8 as u8;
+            wire[3] = (-127i8) as u8;
+        }
+        wire
+    }
+
+    /// f16 scale of one wire block, as the GPU sees it (`float(half)` is exact).
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_wire_block_scale(block: &[u8]) -> f32 {
+        f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]))
+    }
+
+    /// CPU f32 reference for the GEMV kernels: exact dequant (`scale * q`) dotted against the
+    /// f32 activation, serial left-to-right accumulation. NOT bit-identical to the split-K GPU
+    /// reduction (different order), so callers use it only as a loose sanity oracle.
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_wire_row_dot_f32(row_wire: &[u8], y: &[f32]) -> f32 {
+        const WIRE: usize = MOBILEMOE_Q8_0_WIRE_BYTES;
+        let blocks = row_wire.len() / WIRE;
+        debug_assert_eq!(y.len(), blocks * 32);
+        let mut acc = 0.0f32;
+        for b in 0..blocks {
+            let block = &row_wire[b * WIRE..(b + 1) * WIRE];
+            let scale = mobilemoe_wire_block_scale(block);
+            let mut sumq = 0.0f32;
+            for lane in 0..32 {
+                sumq += (block[2 + lane] as i8) as f32 * y[b * 32 + lane];
+            }
+            acc += sumq * scale;
+        }
+        acc
+    }
+
+    /// Dequantize one wire row EXACTLY the way `q8_0_moe_wire_mm_id32` stages its A operand:
+    /// `half(float(q) * w_scale)`, i.e. f32 multiply then round-to-nearest-even to f16. The
+    /// returned f32 values are those f16 values widened, so a CPU dot over them sees the same
+    /// operand rounding as the simdgroup matrix multiply.
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_wire_row_dequant_as_f16(row_wire: &[u8], out: &mut [f32]) {
+        const WIRE: usize = MOBILEMOE_Q8_0_WIRE_BYTES;
+        let blocks = row_wire.len() / WIRE;
+        debug_assert_eq!(out.len(), blocks * 32);
+        for b in 0..blocks {
+            let block = &row_wire[b * WIRE..(b + 1) * WIRE];
+            let scale = mobilemoe_wire_block_scale(block);
+            for lane in 0..32 {
+                let w = (block[2 + lane] as i8) as f32 * scale;
+                out[b * 32 + lane] = f16_bits_to_f32(f32_to_f16_bits(w));
+            }
+        }
+    }
+
+    /// Raw u16 (f16 bits) readback; mirrors `read_buffer_f32`.
+    #[cfg(target_os = "macos")]
+    fn mobilemoe_read_buffer_u16(buffer: &Buffer, out: &mut [u16]) {
+        let len = std::mem::size_of_val(out);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buffer.contents().cast::<u8>(),
+                out.as_mut_ptr().cast::<u8>(),
+                len,
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // (1) Segmented q|k|v GEMV is BIT-IDENTICAL, per row, to the production GEMV.
+    // ---------------------------------------------------------------------------------------
+
+    /// MobileMoE's attention block replaces three `q8_0_block_linear_row_ksplit_f32y_wire_nsg8`
+    /// dispatches (q, k, v) with ONE `q8_0_seg3_row_ksplit_f32y_wire_nsg8` dispatch over
+    /// q_dim + 2*kv_dim rows. The seg3 kernel's claim is that only the ADDRESSING changed —
+    /// per-row block order, per-lane partial products, simd_sum and the 8-simdgroup shmem fold
+    /// are the production kernel's — so every output row must be identical to the u32 bit,
+    /// not to an epsilon. This test is that claim's gate: it drives both kernels directly (the
+    /// exact bindings/threadgroup geometry the host uses) on shared random Q8_0 wire bytes and
+    /// compares `to_bits()`.
+    ///
+    /// Shape: q 768 rows, k 256, v 256 over k_width 768 (blocks_per_row 24) — MobileMoE-S's
+    /// hidden 768 / GQA head geometry, and the shape at which the K-split leaves 5 of 8
+    /// simdgroups' block slots idle (24 blocks < NSG*NQ = 64), so the zero-initialised shmem
+    /// lanes matter. Segment boundaries are even, as the host's `q_dim % 2 == 0 && kv_dim % 2
+    /// == 0` admission requires (a 2-row threadgroup must never straddle a segment).
+    ///
+    /// Non-vacuity guards: distinct pre-fill sentinels on the seg3 and production outputs (an
+    /// unwritten row cannot masquerade as a match), a no-NaN / not-all-zero check, and a loose
+    /// CPU f32 dot (1e-3) proving both kernels computed the right dot product and not two
+    /// copies of the same wrong one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_mobilemoe_seg3_qkv_gemv_is_bit_identical_to_production_nsg8() {
+        let Some(kernel) = required_q8_kernel("MobileMoE seg3 q|k|v GEMV bit identity") else {
+            return;
+        };
+        let device = &kernel.device;
+        let nb =
+            |bytes: usize| device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+
+        let k_width = 768usize;
+        let blocks_per_row = k_width / 32; // 24
+        let q_rows = 768usize;
+        let kv_rows = 256usize;
+        let total_rows = q_rows + 2 * kv_rows; // 1280
+
+        // Host admission: `q_dim.is_multiple_of(2) && kv_dim.is_multiple_of(2)`.
+        assert!(q_rows.is_multiple_of(2));
+        assert!(kv_rows.is_multiple_of(2));
+
+        let mut rng = 0x5E63_0000_0000_0001u64 ^ 0x9E37_79B9_7F4A_7C15;
+        let w_q = mobilemoe_q8_0_wire_rows(q_rows, blocks_per_row, &mut rng);
+        let w_k = mobilemoe_q8_0_wire_rows(kv_rows, blocks_per_row, &mut rng);
+        let w_v = mobilemoe_q8_0_wire_rows(kv_rows, blocks_per_row, &mut rng);
+        let y: Vec<f32> = (0..k_width)
+            .map(|_| mobilemoe_rng_signed(&mut rng))
+            .collect();
+
+        let y_buf = nb(k_width * 4);
+        write_buffer_f32(&y_buf, &y);
+        let wq_buf = nb(w_q.len());
+        let wk_buf = nb(w_k.len());
+        let wv_buf = nb(w_v.len());
+        write_buffer_u8(&wq_buf, &w_q);
+        write_buffer_u8(&wk_buf, &w_k);
+        write_buffer_u8(&wv_buf, &w_v);
+
+        // Distinct sentinels: a row the seg3 kernel never writes stays +1e30, a row the
+        // production kernel never writes stays -1e30 — either way the bit compare fails.
+        const SEG3_SENTINEL: f32 = 1.0e30;
+        const PROD_SENTINEL: f32 = -1.0e30;
+        let seg_out_q = nb(q_rows * 4);
+        let seg_out_k = nb(kv_rows * 4);
+        let seg_out_v = nb(kv_rows * 4);
+        write_buffer_f32(&seg_out_q, &vec![SEG3_SENTINEL; q_rows]);
+        write_buffer_f32(&seg_out_k, &vec![SEG3_SENTINEL; kv_rows]);
+        write_buffer_f32(&seg_out_v, &vec![SEG3_SENTINEL; kv_rows]);
+
+        // --- seg3: ONE dispatch. Host layout (encode_attention_block, `if seg3`):
+        //   scalar[0] = blocks_per_row, [1] = total rows, [2] = seg0 (q rows), [3] = seg1 (k rows)
+        //   buffers 0 y | 2 w_q | 3 out_q | 4 bpr | 5 rows | 6 seg0 | 7 seg1 | 8 w_k | 9 w_v
+        //           10 out_k | 11 out_v ; threadgroup mem 2*32*4 @0 ; grid rows/2 x 256 threads
+        let seg_scalar = nb(16);
+        unsafe {
+            let p = seg_scalar.contents() as *mut u32;
+            *p = blocks_per_row as u32;
+            *p.add(1) = total_rows as u32;
+            *p.add(2) = q_rows as u32;
+            *p.add(3) = kv_rows as u32;
+        }
+        {
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&kernel.seg3_qkv_pipeline);
+            e.set_buffer(0, Some(&y_buf), 0);
+            e.set_buffer(2, Some(&wq_buf), 0);
+            e.set_buffer(3, Some(&seg_out_q), 0);
+            e.set_buffer(4, Some(&seg_scalar), 0);
+            e.set_buffer(5, Some(&seg_scalar), 4);
+            e.set_buffer(6, Some(&seg_scalar), 8);
+            e.set_buffer(7, Some(&seg_scalar), 12);
+            e.set_buffer(8, Some(&wk_buf), 0);
+            e.set_buffer(9, Some(&wv_buf), 0);
+            e.set_buffer(10, Some(&seg_out_k), 0);
+            e.set_buffer(11, Some(&seg_out_v), 0);
+            e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (total_rows as u64).div_ceil(2),
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        // --- production: THREE dispatches of q8_0_block_linear_row_ksplit_f32y_wire_nsg8.
+        // Same geometry encode_q8_matmul_f32y uses for the wire+nsg8 pipeline: scalar
+        // [bpr, rows] at offsets 0/4, threadgroup mem 2*32*4, grid rows.div_ceil(2) x 256.
+        let run_production = |w_buf: &Buffer, rows: usize| -> Vec<f32> {
+            let out = nb(rows * 4);
+            write_buffer_f32(&out, &vec![PROD_SENTINEL; rows]);
+            let scalar = nb(8);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = blocks_per_row as u32;
+                *p.add(1) = rows as u32;
+            }
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&kernel.q8_0_block_ksplit_f32y_wire_nsg8_pipeline);
+            e.set_buffer(0, Some(&y_buf), 0);
+            e.set_buffer(2, Some(w_buf), 0);
+            e.set_buffer(3, Some(&out), 0);
+            e.set_buffer(4, Some(&scalar), 0);
+            e.set_buffer(5, Some(&scalar), 4);
+            e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (rows as u64).div_ceil(2),
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let mut got = vec![0.0f32; rows];
+            read_buffer_f32(&out, &mut got);
+            got
+        };
+        let prod_q = run_production(&wq_buf, q_rows);
+        let prod_k = run_production(&wk_buf, kv_rows);
+        let prod_v = run_production(&wv_buf, kv_rows);
+
+        let mut seg_q = vec![0.0f32; q_rows];
+        let mut seg_k = vec![0.0f32; kv_rows];
+        let mut seg_v = vec![0.0f32; kv_rows];
+        read_buffer_f32(&seg_out_q, &mut seg_q);
+        read_buffer_f32(&seg_out_k, &mut seg_k);
+        read_buffer_f32(&seg_out_v, &mut seg_v);
+
+        let mut nonzero = 0usize;
+        for (segment, seg, prod, wire, rows) in [
+            ("q", &seg_q, &prod_q, &w_q, q_rows),
+            ("k", &seg_k, &prod_k, &w_k, kv_rows),
+            ("v", &seg_v, &prod_v, &w_v, kv_rows),
+        ] {
+            assert_eq!(seg.len(), rows);
+            for row in 0..rows {
+                let a = seg[row];
+                let b = prod[row];
+                assert!(
+                    a.to_bits() != SEG3_SENTINEL.to_bits(),
+                    "segment {segment} row {row}: seg3 kernel never wrote this row"
+                );
+                assert!(
+                    b.to_bits() != PROD_SENTINEL.to_bits(),
+                    "segment {segment} row {row}: production kernel never wrote this row"
+                );
+                assert!(
+                    !a.is_nan() && !b.is_nan(),
+                    "segment {segment} row {row}: NaN output"
+                );
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "segment {segment} row {row}: seg3 {a} ({:#010x}) != production {b} ({:#010x})",
+                    a.to_bits(),
+                    b.to_bits(),
+                );
+                nonzero += usize::from(a != 0.0);
+
+                // Loose CPU oracle (serial f32 order differs from the split-K fold, so this is
+                // a sanity bound, not identity): both kernels really computed Q8_0 wire dots.
+                let stride = blocks_per_row * MOBILEMOE_Q8_0_WIRE_BYTES;
+                let want = mobilemoe_wire_row_dot_f32(&wire[row * stride..(row + 1) * stride], &y);
+                let tolerance = 1.0e-3 * want.abs().max(1.0);
+                assert!(
+                    (a - want).abs() <= tolerance,
+                    "segment {segment} row {row}: gpu {a} vs cpu {want} (|delta| {} > {tolerance})",
+                    (a - want).abs()
+                );
+            }
+        }
+        assert!(
+            nonzero > total_rows / 2,
+            "only {nonzero} of {total_rows} outputs are non-zero; the fixture is degenerate"
+        );
+        eprintln!(
+            "metal_mobilemoe_seg3_qkv_gemv_is_bit_identical_to_production_nsg8: BIT-IDENTICAL \
+         over {total_rows} rows (q {q_rows} | k {kv_rows} | v {kv_rows}) x {blocks_per_row} blocks"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // (2) Expert-indexed 32-token simdgroup-matrix GEMM vs a CPU f32 reference.
+    // ---------------------------------------------------------------------------------------
+
+    /// `q8_0_moe_wire_mm_id32` is the routed-expert prefill GEMM: one threadgroup per
+    /// (128-row weight tile, 32-token tile), the tile map saying which expert's weights and
+    /// which panel rows each token tile covers, and (with `indirect = 1`) a row map redirecting
+    /// each panel row to its source activation row so the gate/up GEMMs read the f16
+    /// FFN-norm rows IN PLACE without a gather. This test builds the tile map / row map by
+    /// hand — the same shapes `moe_tile_map` + `moe_fill_u32` + `moe_panel_fill` produce
+    /// (per-expert panels padded to 32 rows, padding rows = 0xFFFFFFFF, trailing (0,0,0) tile
+    /// entries up to j_max) — and checks every valid output element against a CPU f32 dot over
+    /// the SAME f16-rounded operands the kernel stages (`half(float(q) * scale)` weights, f16
+    /// activations).
+    ///
+    /// Coverage, per `rows` in {128, 256} (both multiples of 128, so the host's `mm_id`
+    /// closure would route them to this pipeline on its `t32` path):
+    ///   * a FULL tile (n_valid == 32) -> the unguarded `simdgroup_store` path;
+    ///   * RAGGED tails (n_valid 20, 8, 5) -> the scratch-staged, guarded store path;
+    ///   * an expert spanning two tiles (32 + 8), so t0 != panel offset for the second;
+    ///   * an EMPTY tile in the middle AND at the tail (n_valid 0) -> early return, no writes;
+    ///   * repeated source rows across experts (top-k routing sends one token to k experts);
+    ///   * padding panel rows never written (sentinel survives) — the B staging reads them
+    ///     (row 0 of y, by the `srow == 0xFFFFFFFF ? 0 : srow` clamp) but must not store them.
+    ///
+    /// Tolerance: the products of two f16 values are exact in f32, so the only GPU/CPU
+    /// divergence is f32 accumulation ORDER inside the MMA (~1e-4 absolute at these
+    /// magnitudes). The check is relative 2e-2 with an absolute floor of 2e-2 * 0.05 = 1e-3
+    /// for near-zero outputs (a pure relative bound is meaningless where the true value is
+    /// ~0 by cancellation). Typical |out| here is O(10).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_mobilemoe_wire_mm_id32_matches_cpu_reference_with_ragged_and_empty_tiles() {
+        let Some(kernel) =
+            required_q8_kernel("MobileMoE expert-indexed 32-token GEMM vs CPU reference")
+        else {
+            return;
+        };
+        let device = &kernel.device;
+        let nb =
+            |bytes: usize| device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+
+        const NONE: u32 = 0xFFFF_FFFF;
+        const NR0: usize = 128; // weight rows per threadgroup (kernel constexpr)
+        const NR1: usize = 32; // tokens per tile (kernel constexpr)
+        const WIRE: usize = MOBILEMOE_Q8_0_WIRE_BYTES;
+        let k_width = 768usize;
+        let blocks_per_row = k_width / 32; // 24
+        let n_expert = 4usize;
+        let n_src = 45usize; // source activation rows (tokens)
+
+        // Per-expert routed counts and the host's panel layout: each expert's rows padded to
+        // a 32-row boundary (`p += ((c + 31) / 32) * 32` in moe_tile_map).
+        let counts = [32usize, 20, 40, 5];
+        let mut panel_off = vec![0usize; n_expert];
+        let mut total_pad = 0usize;
+        for e in 0..n_expert {
+            panel_off[e] = total_pad;
+            total_pad += counts[e].div_ceil(NR1) * NR1;
+        }
+        assert_eq!(panel_off, vec![0, 32, 64, 128]);
+        assert_eq!(total_pad, 160);
+
+        // row_map: panel row -> source activation row; padding rows -> NONE. Repeats across
+        // experts are deliberate (a token routed to several experts).
+        let mut row_map = vec![NONE; total_pad];
+        for e in 0..n_expert {
+            for i in 0..counts[e] {
+                row_map[panel_off[e] + i] = ((e * 17 + i * 7 + 3) % n_src) as u32;
+            }
+        }
+
+        // tile_map: (expert, panel t0, n_valid) triples, in the host's expert order, with an
+        // EMPTY tile injected mid-list and the host's (0,0,0) j_max padding at the tail.
+        let mut tile_map: Vec<u32> = Vec::new();
+        let mut push_tile = |e: usize, t0: usize, n_valid: usize| {
+            tile_map.extend_from_slice(&[e as u32, t0 as u32, n_valid as u32]);
+        };
+        push_tile(0, panel_off[0], 32); // full tile
+        push_tile(1, panel_off[1], 20); // ragged
+        push_tile(0, 0, 0); // EMPTY, mid-list
+        push_tile(2, panel_off[2], 32); // full tile, expert spanning two tiles
+        push_tile(2, panel_off[2] + 32, 8); // ragged tail of that expert
+        push_tile(3, panel_off[3], 5); // ragged, single small tile
+        push_tile(0, 0, 0); // EMPTY, j_max tail padding
+        let n_tiles = tile_map.len() / 3;
+        assert_eq!(n_tiles, 7);
+
+        // f16 activation matrix [n_src][k_width]: generated AS f16 bits, so the CPU reference
+        // and the kernel read identical operand values.
+        let mut rng = 0x000A_1D32_u64 ^ 0xD1B5_4A32_D192_ED03;
+        let y_bits: Vec<u16> = (0..n_src * k_width)
+            .map(|_| f32_to_f16_bits(mobilemoe_rng_signed(&mut rng)))
+            .collect();
+        let y32: Vec<f32> = y_bits.iter().map(|&b| f16_bits_to_f32(b)).collect();
+        let y_buf = nb(y_bits.len() * 2);
+        write_buffer_bytes(&y_buf, &y_bits);
+
+        let tile_buf = nb(tile_map.len() * 4);
+        write_buffer_bytes(&tile_buf, &tile_map);
+        let row_map_buf = nb(row_map.len() * 4);
+        write_buffer_bytes(&row_map_buf, &row_map);
+
+        for rows in [128usize, 256] {
+            // Host admission: `t32 = moe_prefill_tile32_enabled() && rows.is_multiple_of(128)`.
+            assert!(rows.is_multiple_of(NR0), "mm_id32 requires rows % 128 == 0");
+            let expert_block_stride = rows * blocks_per_row; // in Q8_0 BLOCKS, expert-major
+
+            // Expert-major Q8_0 wire weights: expert e's row r block b lives at
+            // ((e * expert_block_stride) + r * blocks_per_row + b) * 34.
+            let experts: Vec<Vec<u8>> = (0..n_expert)
+                .map(|_| mobilemoe_q8_0_wire_rows(rows, blocks_per_row, &mut rng))
+                .collect();
+            let mut w_all: Vec<u8> = Vec::with_capacity(n_expert * rows * blocks_per_row * WIRE);
+            for w in &experts {
+                assert_eq!(w.len(), expert_block_stride * WIRE);
+                w_all.extend_from_slice(w);
+            }
+            let w_buf = nb(w_all.len());
+            write_buffer_u8(&w_buf, &w_all);
+
+            // Output is token-major [panel_row][rows] f32, pre-filled with a sentinel so
+            // untouched (padding / empty-tile) rows are provable.
+            const SENTINEL: f32 = -7777.0;
+            let out_buf = nb(total_pad * rows * 4);
+            write_buffer_f32(&out_buf, &vec![SENTINEL; total_pad * rows]);
+
+            // Scalars: [bpr @0, rows @4, expert_block_stride @8, indirect=1 @12]. Host binds
+            // these from its 80-byte `sc` block at other offsets; the kernel only sees `uint&`.
+            let sc = nb(16);
+            unsafe {
+                let p = sc.contents() as *mut u32;
+                *p = blocks_per_row as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = expert_block_stride as u32;
+                *p.add(3) = 1u32;
+            }
+
+            // Host `mm_id` closure (t32 path): buffers 0 y | 2 w | 3 out | 4 bpr | 5 rows
+            // | 6 tile_map | 7 expert_block_stride | 8 row_map | 9 indirect ; threadgroup mem
+            // 10240 bytes @0 (A: 128*32 halves + B: 1024 halves) ; grid (rows/128, j_max) x 256.
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&kernel.moe_wire_mm_id32_pipeline);
+            e.set_buffer(0, Some(&y_buf), 0);
+            e.set_buffer(2, Some(&w_buf), 0);
+            e.set_buffer(3, Some(&out_buf), 0);
+            e.set_buffer(4, Some(&sc), 0);
+            e.set_buffer(5, Some(&sc), 4);
+            e.set_buffer(6, Some(&tile_buf), 0);
+            e.set_buffer(7, Some(&sc), 8);
+            e.set_buffer(8, Some(&row_map_buf), 0);
+            e.set_buffer(9, Some(&sc), 12);
+            e.set_threadgroup_memory_length(0, ((NR0 * 32 + 1024) * 2) as u64);
+            assert_eq!((NR0 * 32 + 1024) * 2, 10240);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (rows / NR0) as u64,
+                    height: n_tiles as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let mut got = vec![0.0f32; total_pad * rows];
+            read_buffer_f32(&out_buf, &mut got);
+
+            // CPU reference over the kernel's own operand rounding (f16 weights, f16 acts).
+            let row_stride = blocks_per_row * WIRE;
+            let mut deq_row = vec![0.0f32; k_width];
+            let mut valid_rows = vec![false; total_pad];
+            let mut checked = 0usize;
+            let mut max_rel = 0.0f32;
+            for tile in 0..n_tiles {
+                let (e_id, t0, n_valid) = (
+                    tile_map[3 * tile] as usize,
+                    tile_map[3 * tile + 1] as usize,
+                    tile_map[3 * tile + 2] as usize,
+                );
+                if n_valid == 0 {
+                    continue;
+                }
+                let w = &experts[e_id];
+                for prow in t0..t0 + n_valid {
+                    valid_rows[prow] = true;
+                    let src = row_map[prow];
+                    assert_ne!(
+                        src, NONE,
+                        "tile {tile}: panel row {prow} is padding but counted valid"
+                    );
+                    let act = &y32[src as usize * k_width..(src as usize + 1) * k_width];
+                    for r in 0..rows {
+                        mobilemoe_wire_row_dequant_as_f16(
+                            &w[r * row_stride..(r + 1) * row_stride],
+                            &mut deq_row,
+                        );
+                        let mut want = 0.0f32;
+                        for kk in 0..k_width {
+                            want += deq_row[kk] * act[kk];
+                        }
+                        let got_v = got[prow * rows + r];
+                        assert!(
+                            !got_v.is_nan(),
+                            "rows={rows} tile {tile} prow {prow} r {r}: NaN"
+                        );
+                        assert!(
+                            got_v.to_bits() != SENTINEL.to_bits(),
+                            "rows={rows} tile {tile} prow {prow} r {r}: never written"
+                        );
+                        let tolerance = 2.0e-2 * want.abs().max(0.05);
+                        let delta = (got_v - want).abs();
+                        assert!(
+                        delta <= tolerance,
+                        "rows={rows} tile {tile} (expert {e_id}, t0 {t0}, n_valid {n_valid}) \
+                         prow {prow} src {src} r {r}: gpu {got_v} cpu {want} |delta| {delta} > {tolerance}"
+                    );
+                        if want.abs() >= 0.05 {
+                            max_rel = max_rel.max(delta / want.abs());
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+            assert_eq!(checked, counts.iter().sum::<usize>() * rows);
+
+            // Padding rows (and everything an empty tile would have covered) stay untouched.
+            for prow in 0..total_pad {
+                if valid_rows[prow] {
+                    continue;
+                }
+                assert_eq!(
+                    row_map[prow], NONE,
+                    "panel row {prow} is unrouted but not marked NONE"
+                );
+                for r in 0..rows {
+                    let v = got[prow * rows + r];
+                    assert_eq!(
+                        v.to_bits(),
+                        SENTINEL.to_bits(),
+                        "rows={rows}: padding panel row {prow} col {r} was written ({v})"
+                    );
+                }
+            }
+            eprintln!(
+            "metal_mobilemoe_wire_mm_id32_matches_cpu_reference_with_ragged_and_empty_tiles: \
+             rows={rows} checked {checked} elements over {n_tiles} tiles (max rel err {max_rel:.3e})"
+        );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // (3) Parameterless per-head L2 after RoPE, in place on the half Q panel and the K cache.
+    // ---------------------------------------------------------------------------------------
+
+    /// MobileMoE applies a weightless per-head RMS (L2) norm AFTER RoPE. On the fused-RoPE
+    /// prefill path the rotated Q already sits in the half query panel and the rotated K in
+    /// this layer's caches, so `moe_l2_post_rope_h` norms both in place: one 32-lane
+    /// simdgroup per (token, head) row; the K rows are normed in the f32 primary and mirrored
+    /// as `half(v)` into the f16 cache the attention matmul reads.
+    ///
+    /// Fixture: n_tokens 5, n_heads 3, n_kv_heads 2, head_dim 64 (two elements per lane, so the
+    /// strided loops actually stride), max_positions 16, eps 1e-5. Cache layout is the resident
+    /// lane's `[(h * max_positions + t) * head_dim + d]`. Grid = n_tokens * (n_heads +
+    /// n_kv_heads) threadgroups of 32 threads, exactly the host dispatch.
+    ///
+    /// Checks:
+    ///   * every Q row (f16) equals `x * rsqrt(mean(x^2) + eps)` within 1 f16 ulp-ish (2e-3 rel);
+    ///   * every K row for t < n_tokens (f32) equals the same within 1e-5 rel (rsqrt + simd_sum
+    ///     order are the only divergences from the serial CPU formula);
+    ///   * `cache_k16 == half(cache_k)` BIT-EXACT for touched rows: the kernel writes both from
+    ///     the same f32 `v`, and `f32_to_f16_bits` is RTNE like Metal's `half(float)`;
+    ///   * untouched positions t >= n_tokens keep their original f32 bits and the f16 sentinel;
+    ///   * a guard Q row beyond n_tokens keeps its sentinel (no overrun);
+    ///   * normalized rows have mean(v^2) ~= 1 (non-vacuity: the norm really ran).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_mobilemoe_l2_post_rope_h_matches_cpu_and_mirrors_k16() {
+        let Some(kernel) = required_q8_kernel("MobileMoE post-RoPE per-head L2 (half Q, K cache)")
+        else {
+            return;
+        };
+        let device = &kernel.device;
+        let nb =
+            |bytes: usize| device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+
+        let n_tokens = 5usize;
+        let n_heads = 3usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 64usize;
+        let max_positions = 16usize;
+        let eps = 1.0e-5f32;
+
+        // Half Q panel [n_tokens (+1 guard row)][n_heads * head_dim]. Values are kept away
+        // from zero (|x| >= 0.1) so a relative f16 bound is meaningful everywhere.
+        let q_row_len = n_heads * head_dim;
+        const Q_GUARD_BITS: u16 = 0xE414; // f16(-1044.0): a sentinel no normalized value hits
+        let mut q_bits = vec![Q_GUARD_BITS; (n_tokens + 1) * q_row_len];
+        for t in 0..n_tokens {
+            for j in 0..n_heads {
+                for d in 0..head_dim {
+                    let mut v = (((t * 37 + j * 11 + d * 5) % 23) as f32 - 11.0) * 0.17;
+                    if v.abs() < 0.1 {
+                        v += 0.3;
+                    }
+                    q_bits[(t * n_heads + j) * head_dim + d] = f32_to_f16_bits(v);
+                }
+            }
+        }
+        let q_in: Vec<f32> = q_bits.iter().map(|&b| f16_bits_to_f32(b)).collect();
+        let q_buf = nb(q_bits.len() * 2);
+        write_buffer_bytes(&q_buf, &q_bits);
+
+        // f32 K cache [(h * max_positions + t) * head_dim + d], ALL positions populated so the
+        // untouched-positions check is meaningful; f16 mirror pre-filled with a sentinel.
+        let cache_len = n_kv_heads * max_positions * head_dim;
+        let mut k_in = vec![0.0f32; cache_len];
+        for h in 0..n_kv_heads {
+            for t in 0..max_positions {
+                for d in 0..head_dim {
+                    let mut v = (((h * 53 + t * 19 + d * 7) % 29) as f32 - 14.0) * 0.23;
+                    if v.abs() < 0.1 {
+                        v -= 0.4;
+                    }
+                    k_in[(h * max_positions + t) * head_dim + d] = v;
+                }
+            }
+        }
+        let k_buf = nb(cache_len * 4);
+        write_buffer_f32(&k_buf, &k_in);
+        const K16_SENTINEL_BITS: u16 = 0x6414; // f16(+1044.0)
+        let k16_buf = nb(cache_len * 2);
+        write_buffer_bytes(&k16_buf, &vec![K16_SENTINEL_BITS; cache_len]);
+
+        // Scalars: [n_heads @0, n_kv_heads @4, head_dim @8, max_positions @12, n_tokens @16,
+        // eps (f32) @20]. The host binds n_heads/n_kv_heads/head_dim/max_positions from its
+        // fused_rope_scalar and n_tokens/eps from a 2-word `l2s` buffer; same kernel view.
+        let sc = nb(24);
+        unsafe {
+            let p = sc.contents() as *mut u32;
+            *p = n_heads as u32;
+            *p.add(1) = n_kv_heads as u32;
+            *p.add(2) = head_dim as u32;
+            *p.add(3) = max_positions as u32;
+            *p.add(4) = n_tokens as u32;
+            *(p.add(5) as *mut f32) = eps;
+        }
+
+        let cb = kernel.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        e.set_compute_pipeline_state(&kernel.moe_l2_post_rope_h_pipeline);
+        e.set_buffer(0, Some(&q_buf), 0);
+        e.set_buffer(1, Some(&k_buf), 0);
+        e.set_buffer(2, Some(&k16_buf), 0);
+        e.set_buffer(3, Some(&sc), 0); // n_heads
+        e.set_buffer(4, Some(&sc), 4); // n_kv_heads
+        e.set_buffer(5, Some(&sc), 8); // head_dim
+        e.set_buffer(6, Some(&sc), 12); // max_positions
+        e.set_buffer(7, Some(&sc), 16); // n_tokens
+        e.set_buffer(8, Some(&sc), 20); // eps
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (n_tokens * (n_heads + n_kv_heads)) as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let mut q_out_bits = vec![0u16; q_bits.len()];
+        mobilemoe_read_buffer_u16(&q_buf, &mut q_out_bits);
+        let mut k_out = vec![0.0f32; cache_len];
+        read_buffer_f32(&k_buf, &mut k_out);
+        let mut k16_out = vec![0u16; cache_len];
+        mobilemoe_read_buffer_u16(&k16_buf, &mut k16_out);
+
+        let rms_inv = |row: &[f32]| -> f32 {
+            let ss: f32 = row.iter().map(|v| v * v).sum();
+            1.0 / (ss / row.len() as f32 + eps).sqrt()
+        };
+
+        // --- Q panel (half, in place).
+        for t in 0..n_tokens {
+            for j in 0..n_heads {
+                let base = (t * n_heads + j) * head_dim;
+                let x = &q_in[base..base + head_dim];
+                let inv = rms_inv(x);
+                let mut ss_out = 0.0f32;
+                for d in 0..head_dim {
+                    let want = x[d] * inv;
+                    let got = f16_bits_to_f32(q_out_bits[base + d]);
+                    let tolerance = 2.0e-3 * want.abs().max(1.0e-2);
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "q token {t} head {j} d {d}: gpu {got} cpu {want} |delta| {} > {tolerance}",
+                        (got - want).abs()
+                    );
+                    ss_out += got * got;
+                }
+                let mean_sq = ss_out / head_dim as f32;
+                assert!(
+                    (mean_sq - 1.0).abs() < 5.0e-3,
+                    "q token {t} head {j}: mean(v^2) = {mean_sq}, row was not L2-normalized"
+                );
+            }
+        }
+        // Guard row beyond n_tokens: untouched.
+        for d in 0..q_row_len {
+            assert_eq!(
+                q_out_bits[n_tokens * q_row_len + d],
+                Q_GUARD_BITS,
+                "q guard row (token {n_tokens}) element {d} was written"
+            );
+        }
+
+        // --- K cache (f32 primary + f16 mirror, in place).
+        for h in 0..n_kv_heads {
+            for t in 0..max_positions {
+                let base = (h * max_positions + t) * head_dim;
+                if t >= n_tokens {
+                    for d in 0..head_dim {
+                        assert_eq!(
+                        k_out[base + d].to_bits(),
+                        k_in[base + d].to_bits(),
+                        "cache_k kv-head {h} position {t} d {d}: position >= n_tokens was modified"
+                    );
+                        assert_eq!(
+                        k16_out[base + d],
+                        K16_SENTINEL_BITS,
+                        "cache_k16 kv-head {h} position {t} d {d}: position >= n_tokens was written"
+                    );
+                    }
+                    continue;
+                }
+                let x = &k_in[base..base + head_dim];
+                let inv = rms_inv(x);
+                let mut ss_out = 0.0f32;
+                for d in 0..head_dim {
+                    let want = x[d] * inv;
+                    let got = k_out[base + d];
+                    let tolerance = 1.0e-5 * want.abs().max(1.0e-3);
+                    assert!(
+                    (got - want).abs() <= tolerance,
+                    "cache_k kv-head {h} position {t} d {d}: gpu {got} cpu {want} |delta| {} > {tolerance}",
+                    (got - want).abs()
+                );
+                    // Mirror: bit-exact RTNE of the f32 the kernel itself stored.
+                    assert_eq!(
+                    k16_out[base + d],
+                    f32_to_f16_bits(got),
+                    "cache_k16 kv-head {h} position {t} d {d}: {:#06x} != half({got}) = {:#06x}",
+                    k16_out[base + d],
+                    f32_to_f16_bits(got),
+                );
+                    ss_out += got * got;
+                }
+                let mean_sq = ss_out / head_dim as f32;
+                assert!(
+                (mean_sq - 1.0).abs() < 1.0e-3,
+                "cache_k kv-head {h} position {t}: mean(v^2) = {mean_sq}, row was not L2-normalized"
+            );
+            }
+        }
+        eprintln!(
+            "metal_mobilemoe_l2_post_rope_h_matches_cpu_and_mirrors_k16: {} q rows + {} k rows \
+         normalized in place, {} k positions untouched, k16 mirror bit-exact",
+            n_tokens * n_heads,
+            n_tokens * n_kv_heads,
+            (max_positions - n_tokens) * n_kv_heads
+        );
     }
 }
 

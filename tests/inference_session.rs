@@ -1050,6 +1050,7 @@ fn tiny_weights() -> LlamaLoadedWeights {
         )),
         rope_freqs: None,
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: ones("blk.0.attn_norm.weight", hidden),
             attention_q: select_rows("blk.0.attn_q.weight", hidden, hidden, &[0, 1, 2, 3]),
             attention_k: select_rows("blk.0.attn_k.weight", 2, hidden, &[0, 1]),

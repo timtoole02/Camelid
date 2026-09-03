@@ -173,10 +173,57 @@ pub(super) fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeight
         },
         None => metal::ResidentWeightBytes::Blocks36(q8_0_blocks_as_bytes(
             tensor
-                .q8_0_blocks
-                .as_ref()
+                .q8_0_block_slice()
                 .expect("resident Q8 eligibility requires blocks or wire pages"),
         )),
+    }
+}
+
+/// Resident-lane view of a MoE layer. The always-on shared expert becomes the layer's
+/// "dense" FFN (`gate/up/down_weight_blocks`, width `feed_forward_length`), and the routed
+/// experts + router ride in `moe`. Only `mobilemoe` is admitted: its routing (sigmoid,
+/// selection bias, normalised, scaled, postgate) is what the GPU kernels implement.
+#[cfg(target_os = "macos")]
+pub(super) fn resident_moe_view<'a>(
+    config: &crate::model::LlamaModelConfig,
+    l: &'a super::LlamaLayerWeights,
+) -> Option<metal::ResidentMoeLayerWeights<'a>> {
+    if config.architecture != "mobilemoe" {
+        return None;
+    }
+    let moe = config.moe.as_ref()?;
+    let router = l.moe_router.as_ref()?;
+    l.moe_shared_gate.as_ref()?;
+    Some(metal::ResidentMoeLayerWeights {
+        router: router.data.as_slice(),
+        expert_bias: l.moe_expert_bias.as_ref().map(|t| t.data.as_slice()),
+        gate_exps: resident_weight_bytes(&l.ffn_gate),
+        up_exps: resident_weight_bytes(&l.ffn_up),
+        down_exps: resident_weight_bytes(&l.ffn_down),
+        n_expert: moe.expert_count as usize,
+        n_expert_used: moe.expert_used_count as usize,
+        expert_ff: moe.expert_feed_forward_length? as usize,
+        weights_scale: moe.expert_weights_scale,
+        weights_norm: moe.expert_weights_norm,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn resident_moe_view<'a>(
+    _config: &crate::model::LlamaModelConfig,
+    _l: &'a super::LlamaLayerWeights,
+) -> Option<metal::ResidentMoeLayerWeights<'a>> {
+    None
+}
+
+/// The dense-FFN triple the resident lane should bind for a layer: the shared expert on a
+/// MoE row, the ordinary FFN otherwise.
+pub(super) fn resident_dense_ffn(
+    l: &super::LlamaLayerWeights,
+) -> (&CpuTensor, &CpuTensor, &CpuTensor) {
+    match (&l.moe_shared_gate, &l.moe_shared_up, &l.moe_shared_down) {
+        (Some(g), Some(u), Some(d)) => (g, u, d),
+        _ => (&l.ffn_gate, &l.ffn_up, &l.ffn_down),
     }
 }
 
@@ -215,6 +262,13 @@ impl super::LlamaInferenceSession {
     }
 
     pub(super) fn try_metal_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        if trace {
+            eprintln!(
+                "[resident-prefill] try_metal_resident_prefill ENTER n={}",
+                token_ids.len()
+            );
+        }
         // Two independent arming gates for two different batched prefills:
         //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
         //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
@@ -235,7 +289,12 @@ impl super::LlamaInferenceSession {
             || self.weights.layer_range.is_some()
             || !self.resident_decode_eligible(false)?
         {
-            return Ok(false);
+            {
+                if trace {
+                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 1");
+                }
+                return Ok(false);
+            }
         }
         let weights = Arc::clone(&self.weights);
         let dims = DenseLlamaDims::from_config(&self.config)?;
@@ -246,7 +305,12 @@ impl super::LlamaInferenceSession {
         let kv_cap = self.config.context_length as usize;
         let n = token_ids.len();
         if n >= kv_cap {
-            return Ok(false);
+            {
+                if trace {
+                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 2");
+                }
+                return Ok(false);
+            }
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
@@ -262,7 +326,14 @@ impl super::LlamaInferenceSession {
             weights.rope_freqs.as_ref(),
         )? {
             Some(t) => t,
-            None => return Ok(false),
+            None => {
+                if trace {
+                    eprintln!(
+                        "[resident-prefill] try_metal_resident_prefill declined (match) site c1"
+                    );
+                }
+                return Ok(false);
+            }
         };
         let (cos_all, sin_all, split_half_pairing) =
             (tables.cos, tables.sin, tables.split_half_pairing);
@@ -329,7 +400,14 @@ impl super::LlamaInferenceSession {
             schedule,
         ) {
             Some(s) => s,
-            None => return Ok(false),
+            None => {
+                if trace {
+                    eprintln!(
+                        "[resident-prefill] try_metal_resident_prefill declined (match) site c2"
+                    );
+                }
+                return Ok(false);
+            }
         };
 
         let session_us = session_started.elapsed().as_micros();
@@ -362,9 +440,11 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
-                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
-                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
+                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
+                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
+                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
+                moe: resident_moe_view(&self.config, l),
+                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
             })
             .collect();
 
@@ -394,14 +474,24 @@ impl super::LlamaInferenceSession {
                 .is_some()
         };
         if !prefilled {
-            return Ok(false);
+            {
+                if trace {
+                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 3");
+                }
+                return Ok(false);
+            }
         }
         // G11, asserted rather than assumed: the resident decode's rebuild predicate is
         // `filled() != position`, and a short `filled` re-seeds from a CPU KV cache this
         // lane leaves hollow — which then declines at `history_materialized` and silently
         // drops the whole prompt onto a CPU path that fails closed for windowed archs.
         if session.filled() != n {
-            return Ok(false);
+            {
+                if trace {
+                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 4");
+                }
+                return Ok(false);
+            }
         }
         if time_edges {
             eprintln!(
@@ -416,7 +506,12 @@ impl super::LlamaInferenceSession {
         // GPU cache now holds positions 0..n; the resident decode continues this sequence.
         self.kv_cache.position = n;
         self.resident_decode = Some(session);
-        Ok(true)
+        {
+            if trace {
+                eprintln!("[resident-prefill] try_metal_resident_prefill OK");
+            }
+            Ok(true)
+        }
     }
 
     /// Make the CPU KV cache hold this sequence's real history before a CPU forward reads it.
@@ -848,9 +943,11 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
-                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
-                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
+                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
+                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
+                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
+                moe: resident_moe_view(&self.config, l),
+                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
             })
             .collect();
 
@@ -1095,9 +1192,11 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
-                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
-                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
+                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
+                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
+                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
+                moe: resident_moe_view(&self.config, l),
+                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
             })
             .collect();
         let logits_stage = metal::LogitsStage {
@@ -1245,9 +1344,11 @@ impl super::LlamaInferenceSession {
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
                 o_weight_blocks: resident_weight_bytes(&l.attention_output),
-                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
-                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
-                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
+                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
+                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
+                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
+                moe: resident_moe_view(&self.config, l),
+                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
             })
             .collect();
         let logits_stage = metal::LogitsStage {

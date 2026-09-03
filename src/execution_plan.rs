@@ -1832,6 +1832,11 @@ fn cuda_resident_q8_runnable_plan() -> (
 /// CUDA-resident windowed plan on a CUDA host).
 fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
     let arch = gguf.architecture().unwrap_or("");
+    // mobilemoe is the one MoE arch the resident lane routes on the GPU (expert-indexed
+    // GEMV + on-device top-k), so it is admitted despite its non-zero expert_count.
+    if arch == "mobilemoe" {
+        return true;
+    }
     if !matches!(arch, "llama" | "qwen2" | "qwen3" | "mistral") {
         return false;
     }

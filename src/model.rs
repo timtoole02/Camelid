@@ -151,6 +151,7 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
             | "command-r"
             | "lfm2"
             | "bitnet-b1.58"
+            | "mobilemoe"
     )
 }
 
@@ -344,7 +345,7 @@ impl LlamaModelConfig {
             Some(
                 architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35"
                 | "smollm3" | "gemma2" | "gemma3" | "gemma4" | "phi3" | "command-r"
-                | "lfm2" | "bitnet-b1.58"),
+                | "lfm2" | "bitnet-b1.58" | "mobilemoe"),
             ) => architecture,
             // Gemma 4 MTP/assistant drafter heads ship as a distinct architecture.
             // The tensor map parses (q-only attention layers, per-layer
@@ -582,6 +583,11 @@ pub struct MixtralMoeMetadata {
     /// (fine-grained MoE like qwen3moe: `{arch}.expert_feed_forward_length`).
     /// `None` keeps the Mixtral convention of expert width == dense FFN width.
     pub expert_feed_forward_length: Option<u32>,
+    /// Always-on shared-expert FFN width (`{arch}.expert_shared_feed_forward_length`).
+    /// MobileMoE sizes this independently of the routed experts (1536 vs 384), so it
+    /// cannot be inferred from `expert_feed_forward_length`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expert_shared_feed_forward_length: Option<u32>,
 }
 
 impl MixtralMoeMetadata {
@@ -613,6 +619,10 @@ impl MixtralMoeMetadata {
             architecture,
             "expert_feed_forward_length",
         ));
+        let expert_shared_feed_forward_length = gguf.metadata_u32(&architecture_key(
+            architecture,
+            "expert_shared_feed_forward_length",
+        ));
 
         Some(Self {
             family_label,
@@ -622,6 +632,7 @@ impl MixtralMoeMetadata {
             expert_weights_norm,
             expert_gating_func,
             expert_feed_forward_length,
+            expert_shared_feed_forward_length,
         })
     }
 }
@@ -1602,6 +1613,10 @@ pub enum LlamaFfnTensors {
         down_experts: LlamaMoeExpertTensors,
     },
     DeepSeekMoE {
+        /// Frozen per-expert SELECTION bias (`blk.N.exp_probs_b.bias`). Added to the
+        /// sigmoid scores before top-k; the committed weights are gathered from the
+        /// UNBIASED scores. Optional: DeepSeek-V2 rows do not ship it.
+        expert_bias: Option<GgufTensorDescriptor>,
         shared_gate: GgufTensorDescriptor,
         shared_up: GgufTensorDescriptor,
         shared_down: GgufTensorDescriptor,
@@ -1858,29 +1873,83 @@ impl LlamaTensorBinding {
                 ffn_norm,
                 post_ffw_norm,
                 ffn: if let Some(moe) = config.moe.as_ref() {
-                    LlamaFfnTensors::MoE {
-                        router: required_tensor(
-                            gguf,
-                            &format!("blk.{layer_idx}.ffn_gate_inp.weight"),
-                        )?,
-                        gate_experts: bind_moe_expert_tensors(
-                            gguf,
-                            layer_idx,
-                            "gate",
-                            moe.expert_count,
-                        )?,
-                        up_experts: bind_moe_expert_tensors(
-                            gguf,
-                            layer_idx,
-                            "up",
-                            moe.expert_count,
-                        )?,
-                        down_experts: bind_moe_expert_tensors(
-                            gguf,
-                            layer_idx,
-                            "down",
-                            moe.expert_count,
-                        )?,
+                    // An always-on shared expert (DeepSeek-V3 / MobileMoE shape) ships as
+                    // `ffn_{gate,up,down}_shexp`. When all three are present, bind the
+                    // DeepSeekMoE variant so the sigmoid/normalised/scaled routing path in
+                    // `deepseek_moe_ffn` is reachable at all; without this the binder only
+                    // ever emitted `MoE`, `moe_shared_*` stayed None, and every model fell
+                    // through to `mixtral_moe_ffn`'s hardcoded softmax.
+                    // Only `mobilemoe` is admitted to the shared-expert (DeepSeek-style)
+                    // binding: its routing is what `deepseek_moe_ffn` and the Metal kernels
+                    // implement. Any other row keeps the plain `MoE` binding even if a future
+                    // GGUF ships `shexp` tensors.
+                    let shexp = if config.architecture == "mobilemoe" {
+                        (
+                            find_tensor(gguf, &format!("blk.{layer_idx}.ffn_gate_shexp.weight")),
+                            find_tensor(gguf, &format!("blk.{layer_idx}.ffn_up_shexp.weight")),
+                            find_tensor(gguf, &format!("blk.{layer_idx}.ffn_down_shexp.weight")),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
+                    if let (Some(shared_gate), Some(shared_up), Some(shared_down)) = shexp {
+                        LlamaFfnTensors::DeepSeekMoE {
+                            expert_bias: find_tensor(
+                                gguf,
+                                &format!("blk.{layer_idx}.exp_probs_b.bias"),
+                            )
+                            .cloned(),
+                            shared_gate: shared_gate.clone(),
+                            shared_up: shared_up.clone(),
+                            shared_down: shared_down.clone(),
+                            router: required_tensor(
+                                gguf,
+                                &format!("blk.{layer_idx}.ffn_gate_inp.weight"),
+                            )?,
+                            gate_experts: bind_moe_expert_tensors(
+                                gguf,
+                                layer_idx,
+                                "gate",
+                                moe.expert_count,
+                            )?,
+                            up_experts: bind_moe_expert_tensors(
+                                gguf,
+                                layer_idx,
+                                "up",
+                                moe.expert_count,
+                            )?,
+                            down_experts: bind_moe_expert_tensors(
+                                gguf,
+                                layer_idx,
+                                "down",
+                                moe.expert_count,
+                            )?,
+                        }
+                    } else {
+                        LlamaFfnTensors::MoE {
+                            router: required_tensor(
+                                gguf,
+                                &format!("blk.{layer_idx}.ffn_gate_inp.weight"),
+                            )?,
+                            gate_experts: bind_moe_expert_tensors(
+                                gguf,
+                                layer_idx,
+                                "gate",
+                                moe.expert_count,
+                            )?,
+                            up_experts: bind_moe_expert_tensors(
+                                gguf,
+                                layer_idx,
+                                "up",
+                                moe.expert_count,
+                            )?,
+                            down_experts: bind_moe_expert_tensors(
+                                gguf,
+                                layer_idx,
+                                "down",
+                                moe.expert_count,
+                            )?,
+                        }
                     }
                 } else {
                     LlamaFfnTensors::Dense {

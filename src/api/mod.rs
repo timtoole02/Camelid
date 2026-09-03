@@ -17380,6 +17380,7 @@ fn estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
                 gate_experts,
                 up_experts,
                 down_experts,
+                ..
             } => {
                 for desc in [shared_gate, shared_up, shared_down] {
                     total = total
@@ -27108,6 +27109,7 @@ mod tests {
     #[test]
     fn mixtral_multi_token_generation_stays_fail_closed_until_explicitly_enabled() {
         let mixtral = crate::model::MixtralMoeMetadata {
+            expert_shared_feed_forward_length: None,
             family_label: "Mixtral",
             expert_count: 8,
             expert_used_count: 2,
@@ -31913,6 +31915,7 @@ mod tests {
             )),
             rope_freqs: None,
             layers: vec![LlamaLayerWeights {
+                moe_expert_bias: None,
                 attention_norm: ones("blk.0.attn_norm.weight", hidden),
                 attention_q: select_rows("blk.0.attn_q.weight", hidden, hidden, &[0, 1, 2, 3]),
                 attention_k: select_rows("blk.0.attn_k.weight", 2, hidden, &[0, 1]),

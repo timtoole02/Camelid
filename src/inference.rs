@@ -332,6 +332,9 @@ pub struct LlamaLayerWeights {
     pub mla_kv_b_proj: Option<CpuTensor>,
 
     // DeepSeekMoE Shared Experts
+    /// Frozen per-expert selection bias (`exp_probs_b`). Added to the sigmoid
+    /// scores for top-k SELECTION only; committed weights use the unbiased scores.
+    pub moe_expert_bias: Option<CpuTensor>,
     pub moe_shared_gate: Option<CpuTensor>,
     pub moe_shared_up: Option<CpuTensor>,
     pub moe_shared_down: Option<CpuTensor>,
@@ -938,6 +941,7 @@ impl LlamaLoadedWeights {
                         gate_experts,
                         up_experts,
                         down_experts,
+                        ..
                     } => (
                         load_moe_experts(gate_experts)?,
                         load_moe_experts(up_experts)?,
@@ -1177,6 +1181,13 @@ impl LlamaLoadedWeights {
                     ffn_up,
                     ffn_down,
                     moe_router,
+                    moe_expert_bias: match &layer.ffn {
+                        LlamaFfnTensors::DeepSeekMoE {
+                            expert_bias: Some(desc),
+                            ..
+                        } => Some(store.load_cpu_f32(&desc.name)?),
+                        _ => None,
+                    },
                     moe_shared_gate,
                     moe_shared_up,
                     moe_shared_down,
@@ -1226,6 +1237,7 @@ impl LlamaLoadedWeights {
                         gate_experts,
                         up_experts,
                         down_experts,
+                        ..
                     } => (
                         match gate_experts {
                             LlamaMoeExpertTensors::Merged(desc) => &desc.name,
@@ -1323,6 +1335,7 @@ impl LlamaLoadedWeights {
                     ffn_down: CpuTensor::from_f32(ffn_down_name, vec![0], vec![])?,
                     moe_router: moe_router_name
                         .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
+                    moe_expert_bias: None,
                     moe_shared_gate: moe_shared_gate_name
                         .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
                     moe_shared_up: moe_shared_up_name
@@ -2917,7 +2930,7 @@ impl LlamaInferenceSession {
         if !resident_decode_metal_enabled() && !resident_decode_cuda_enabled() {
             bail!("neither CAMELID_METAL_RESIDENT_DECODE nor CAMELID_CUDA_RESIDENT_DECODE enabled");
         }
-        if self.config.moe.is_some() {
+        if self.config.moe.is_some() && self.config.architecture != "mobilemoe" {
             bail!("moe config");
         }
         if want_logits && self.config.logit_scale.is_some() {
@@ -3052,16 +3065,36 @@ impl LlamaInferenceSession {
                  drops the gemma3 embed scale; serve falls back to the runnable bridge"
             );
         }
+        // mobilemoe rides the resident lane with its routed experts: the layer's "dense"
+        // FFN slots carry the always-on shared expert, and the stacked expert tensors
+        // (retained as RAM-resident Q8 blocks behind the shared-Arc accessor, which the
+        // `q8_0_blocks` field does not see) must be Q8_0 with materialized blocks.
+        let moe_arch = self.config.architecture == "mobilemoe";
+        let is_q8_expert_stack = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q8_0) && t.q8_0_block_slice().is_some()
+        };
         for (idx, layer) in self.weights.layers[range].iter().enumerate() {
+            let moe_layer = moe_arch && layer.moe_router.is_some();
+            let ffn_ok = if moe_layer {
+                matches!(
+                    (&layer.moe_shared_gate, &layer.moe_shared_up, &layer.moe_shared_down),
+                    (Some(g), Some(u), Some(d))
+                        if is_resident_quant(g) && is_resident_quant(u) && is_resident_quant(d)
+                ) && is_q8_expert_stack(&layer.ffn_gate)
+                    && is_q8_expert_stack(&layer.ffn_up)
+                    && is_q8_expert_stack(&layer.ffn_down)
+            } else {
+                is_resident_quant(&layer.ffn_gate)
+                    && is_resident_quant(&layer.ffn_up)
+                    && is_resident_quant(&layer.ffn_down)
+            };
             if layer.attention_biases.is_some()
-                || layer.moe_router.is_some()
+                || (layer.moe_router.is_some() && !moe_layer)
                 || !is_resident_quant(&layer.attention_q)
                 || !is_resident_quant(&layer.attention_k)
                 || !is_resident_quant(&layer.attention_v)
                 || !is_resident_quant(&layer.attention_output)
-                || !is_resident_quant(&layer.ffn_gate)
-                || !is_resident_quant(&layer.ffn_up)
-                || !is_resident_quant(&layer.ffn_down)
+                || !ffn_ok
             {
                 bail!(format!(
                     "layer {idx} not resident-eligible (attention_biases={}, q8 blocks/pages present: q={}/{} k={}/{} v={}/{} o={}/{} gate={}/{} up={}/{} down={}/{})",
@@ -5431,7 +5464,9 @@ impl LlamaInferenceSession {
             });
         }
         let resident_prefill_started = Instant::now();
-        if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
+        let resident_prefill_ok =
+            prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])?;
+        if resident_prefill_ok {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
             // token below decodes through the resident session. The wall-clock covers
             // session setup + the command buffer; per-stage GPU splits aren't available.
@@ -7757,6 +7792,26 @@ fn forward_layer_timed(
             &cached_layer_label!(layer_idx, "attention_k_rope"),
         )?
     };
+    // MobileMoE applies a PARAMETERLESS L2 QK-norm AFTER RoPE — the reverse of
+    // qwen3, which applies a weighted per-head RMSNorm BEFORE it. The checkpoint
+    // ships no attn_q_norm/attn_k_norm tensors at all, so the weighted path above
+    // is a no-op here and this is where the normalisation actually happens.
+    let (q, k) = if config.architecture == "mobilemoe" {
+        (
+            q.per_head_l2_norm(
+                config.attention_head_count as usize,
+                rms_norm_epsilon,
+                cached_layer_label!(layer_idx, "attention_q_l2_norm"),
+            )?,
+            k.per_head_l2_norm(
+                config.attention_head_count_kv as usize,
+                rms_norm_epsilon,
+                cached_layer_label!(layer_idx, "attention_k_l2_norm"),
+            )?,
+        )
+    } else {
+        (q, k)
+    };
     let attention_q_rope_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&q))
         .transpose()?;
@@ -7946,6 +8001,7 @@ fn forward_layer_timed(
                 &ffn_norm,
                 DeepSeekMoeWeights {
                     router,
+                    expert_bias: layer.moe_expert_bias.as_ref(),
                     shared_gate,
                     shared_up,
                     shared_down,
@@ -8380,6 +8436,24 @@ fn forward_prefill_layer_chunk_timed(
     } else {
         k
     };
+    // MobileMoE: parameterless L2 QK-norm AFTER RoPE (see the decode path). Both
+    // paths must agree or the KV written during prefill would not match decode.
+    let (q, k) = if config.architecture == "mobilemoe" {
+        (
+            q.per_head_l2_norm(
+                config.attention_head_count as usize,
+                params.rms_norm_epsilon,
+                cached_layer_label!(layer_idx, "prefill_attention_q_l2_norm"),
+            )?,
+            k.per_head_l2_norm(
+                config.attention_head_count_kv as usize,
+                params.rms_norm_epsilon,
+                cached_layer_label!(layer_idx, "prefill_attention_k_l2_norm"),
+            )?,
+        )
+    } else {
+        (q, k)
+    };
     timings.attention_rope = started.elapsed().as_micros();
     if let Some(memory) = &mut memory {
         memory.record_after_attention_rope(capture_memory_sample(kv_cache));
@@ -8463,6 +8537,7 @@ fn forward_prefill_layer_chunk_timed(
                 &ffn_norm,
                 DeepSeekMoeWeights {
                     router,
+                    expert_bias: layer.moe_expert_bias.as_ref(),
                     shared_gate,
                     shared_up,
                     shared_down,
@@ -12268,6 +12343,7 @@ fn mixtral_moe_ffn(
 
 struct DeepSeekMoeWeights<'a> {
     router: &'a CpuTensor,
+    expert_bias: Option<&'a CpuTensor>,
     shared_gate: &'a CpuTensor,
     shared_up: &'a CpuTensor,
     shared_down: &'a CpuTensor,
@@ -12291,6 +12367,7 @@ fn deepseek_moe_ffn(
 )> {
     let DeepSeekMoeWeights {
         router,
+        expert_bias: _expert_bias,
         shared_gate,
         shared_up,
         shared_down,
@@ -12318,13 +12395,12 @@ fn deepseek_moe_ffn(
     let mut down_elapsed = 0;
 
     // 1. Shared Expert Pass
-    let shared_activated = gated_ffn_activation(
-        input,
-        shared_gate,
-        shared_up,
-        "shared_expert_activated",
-        false,
-    )?;
+    // NOTE: must be the BATCH helper. `gated_ffn_activation` hard-refuses rows != 1
+    // (see its rank/rows guard), yet the loop below indexes `shared_expert_out` over
+    // `rows` rows — so prefill died on layer 0 the moment a shared-expert model
+    // became reachable. This path had never executed before MobileMoE.
+    let shared_activated =
+        gated_ffn_activation_batch(input, shared_gate, shared_up, "shared_expert_activated")?;
     gate_elapsed += shared_activated.gate;
     up_elapsed += shared_activated.up;
     activation_elapsed += shared_activated.activation;
@@ -12357,16 +12433,25 @@ fn deepseek_moe_ffn(
 
         let mut weights_and_indices = match moe.expert_gating_func {
             2 => {
-                // SIGMOID
+                // SIGMOID. When the row ships a frozen `exp_probs_b` bias
+                // (DeepSeek-V3 loss-free balancing, and MobileMoE), that bias is
+                // added ONLY to steer top-k selection — the committed weights are
+                // gathered from the UNBIASED sigmoid scores. Ranking on the biased
+                // score while returning the biased value would change the mixture,
+                // not just which experts are consulted.
                 let mut scored = Vec::with_capacity(expert_count);
                 for col in 0..expert_count {
                     let logit = logits.data[row * expert_count + col];
                     let sigmoid = 1.0 / (1.0 + (-logit).exp());
-                    scored.push((col, sigmoid));
+                    let selection_score = match weights.expert_bias {
+                        Some(bias) => sigmoid + bias.data[col],
+                        None => sigmoid,
+                    };
+                    scored.push((col, sigmoid, selection_score));
                 }
-                scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+                scored.sort_by(|a, b| b.2.total_cmp(&a.2));
                 scored.truncate(moe.expert_used_count as usize);
-                scored
+                scored.into_iter().map(|(c, w, _)| (c, w)).collect()
             }
             _ => {
                 // SOFTMAX (DeepSeek V2 uses softmax, but not renormalized like Mixtral)
