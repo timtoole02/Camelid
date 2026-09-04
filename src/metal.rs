@@ -46844,7 +46844,7 @@ mod attn_mm_parity {
                 for d in (0..hd).step_by(3) {
                     let mut o = 0f32;
                     for p2 in 0..=q {
-                        let pw = ((scores[p2] - m).exp() / l) as f32;
+                        let pw = (scores[p2] - m).exp() / l;
                         // kernel rounds P to half
                         let pw = fh(h(pw));
                         o += pw * fh(v[(z / group) * max_pos * hd + p2 * hd + d]);
