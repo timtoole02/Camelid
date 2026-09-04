@@ -1,8 +1,8 @@
 # EAGLE-3 target-authoritative N1 commit pipeline
 
-Status: source-only architecture, frozen-tree host contract, and standalone Metal selector
-falsifier. It is default-inert. Every build, test, Metal execution, and model measurement belongs
-on mini2.
+Status: source-only architecture, frozen-tree host contract, standalone Metal falsifier, and a
+default-off real-model selector shadow. The shadow changes no authoritative state. Every build,
+test, Metal execution, and model measurement belongs on mini2.
 
 ## Architectural correction
 
@@ -159,8 +159,26 @@ The raw terminal ID is retained for parity. E2 binds `safe_terminal_token` to it
 and the transaction is never made visible unless `terminal_valid == 1`; this prevents an
 impossible all-invalid argmax sentinel from becoming an out-of-bounds embedding read.
 
-The source-only Metal falsifier in `src/metal.rs` compiles this selector as a standalone test
-library. It is not a production pipeline and changes no runtime path.
+The Metal falsifier in `src/metal.rs` compiles the same selector source as a standalone test
+library. The first production staging slice is armed only by
+`CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW=1`. On a committing EAGLE tree verify with the exact
+`[2, 14, 25]` capture contract, it lazily creates the selector pipeline, appends one thread to the
+existing target command buffer after production argmax, and compares every returned field with
+the host oracle. It does not split the target command buffer yet and does not feed emission,
+target compaction, or EAGLE state.
+
+Gate-off verification continues through the pre-existing wrappers with `None` for the acceptance
+plan, so there is no selector pipeline lookup, allocation, binding, dispatch, or receipt readback.
+Gate-on telemetry is emitted once per real tree round:
+
+```text
+[eagle3-device-accept-shadow] outcome=match ... requested_total=R encoded_total=R \
+matched_total=R mismatched_total=0 fallback_total=0
+```
+
+The two accounting identities are `requested = encoded + fallback` and
+`encoded = matched + mismatched`. Any mismatch is diagnostic only; the already-existing host path
+still controls emitted tokens and `compact_tree_kv_path`.
 
 ### 5. Pre-encode one fixed-shape E2 cell
 
@@ -235,7 +253,11 @@ a partial commit.
     E2, and compaction.
 11. **Cancellation safety:** reset, rollback, cancellation, or fallback invalidates the epoch.
 12. **Default off:** without `CAMELID_BENCH_EAGLE3_TARGET_COMMIT_PIPELINE=1`, there is no target
-    split, extra queue/allocation, selector, or changed update path.
+    split, E1/E2, extra queue, or changed update path. Without the separate
+    `CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW=1` falsifier gate there is also no selector pipeline
+    lookup, allocation, dispatch, or receipt readback.
+13. **Shadow isolation:** the device-acceptance shadow may add only the selector and parity receipt.
+    It cannot arm E1/E2, select emitted tokens, or change either cache length.
 
 ## Implementation seams
 
@@ -247,11 +269,16 @@ a partial commit.
   - counters: rounds, selector parity, E1 edge rows, E2 full rows (must equal rounds), route-boundary
     fallbacks, target/EAGLE compact time, epoch failures.
 - `src/inference/metal_resident.rs`
-  - split/gated target verify handle retaining `pred_buf`, captures, tree K/V scratch, and event;
+  - current slice: strict shadow gate, real verifier receipt comparison, cumulative route counters,
+    and reuse of the one host compaction path as the parity oracle;
+  - next slice: split/gated target verify handle retaining `pred_buf`, captures, tree K/V scratch,
+    and event;
   - encode selector and target two-stage path compactor after argmax;
   - leave ordinary tree verify untouched as gate-off oracle.
 - `src/metal.rs`
-  - promote the proven standalone selector into `ELEMENTWISE_SHADER` only after falsification;
+  - current slice: lazily compile the proven selector source only for the shadow wrapper and bind
+    the unchanged production `pred_buf`;
+  - promote it into the permanent shader library only after real-model falsification;
   - fixed F32/rope/path-slot selected-row gathers;
   - E1 K/V-only edge encoder;
   - one-row authoritative E2 twin using buffer-backed leaf/token/count/path metadata;
@@ -288,19 +315,45 @@ Run:
 cargo test --lib eagle3_device_acceptance -- --nocapture
 ```
 
-On macOS this must run and pass exactly these two tests:
+On macOS this must run and pass these five tests:
 
 ```text
 eagle3_runtime::tests::eagle3_device_acceptance_matches_target_oracle
+inference::metal_resident::eagle3_device_acceptance_shadow_tests::eagle3_device_acceptance_shadow_gate_is_strict_and_default_off
+inference::metal_resident::eagle3_device_acceptance_shadow_tests::eagle3_device_acceptance_shadow_compares_every_commit_field
+metal::tests::eagle3_device_acceptance_plan_fails_closed_on_every_tree_invariant
 metal::tests::metal_eagle3_device_acceptance_matches_host_oracle
 ```
 
 The assertions cover root misses, every branch/depth, terminal bonuses, 256 deterministic N8
 prediction vectors, an invalid UINT_MAX terminal made gather-safe, and a synthetic duplicate
 sibling whose lower row must win. Any leaf, count, path, emitted ID, terminal ID, safe ID, validity,
-or depth mismatch falsifies device acceptance.
+or depth mismatch falsifies device acceptance. The production admission test separately proves
+that malformed lengths, root metadata, parent/depth links, vocabulary IDs, and duplicate siblings
+fail closed before allocation or dispatch.
 
-### Checkpoint B: default-off integrated shadow (next)
+### Checkpoint B: default-off real-model selector shadow (implemented, mini2 only)
+
+Build one candidate, then run the protected N8/K4/X5 Pitch command once with the promoted
+environment unchanged and once with this single addition:
+
+```text
+CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW=1
+```
+
+The gate-on stderr must contain one `outcome=match` line per committing EAGLE tree verify, no
+`outcome=mismatch`, and no `outcome=fallback`. On the final line, if `R` is `requested_total`, the
+counters must satisfy:
+
+```text
+requested_total=R encoded_total=R matched_total=R mismatched_total=0 fallback_total=0
+```
+
+Every ordinary N8 line must say `rows=8`; a shortened final output-budget round may be narrower.
+The control and shadow receipts must have identical target/EAGLE token arrays, `lossless=true`, and
+the same first-divergence result. Any mismatch or cache/token difference blocks the target split.
+
+### Checkpoint C: split target plus E1/E2 (next)
 
 Interleave control and candidate rounds under the mini2 lock:
 

@@ -51,6 +51,180 @@ impl MetalSampleRequest {
 #[allow(dead_code)]
 pub(super) const MAX_VERIFY_K: usize = 16;
 
+/// Stage-0 target-authoritative commit prototype. This gate only appends the exact integer
+/// acceptance walk to a real EAGLE tree verify and compares its device receipt with the existing
+/// host oracle. It does not authorize emission, compaction, or EAGLE state changes.
+#[cfg(any(target_os = "macos", test))]
+const EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENV: &str =
+    "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW";
+
+#[cfg(any(target_os = "macos", test))]
+fn eagle3_device_acceptance_shadow_setting_enables(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_device_acceptance_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        eagle3_device_acceptance_shadow_setting_enables(
+            std::env::var(EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Eagle3DeviceAcceptanceShadowCounters {
+    requested: u64,
+    encoded: u64,
+    matched: u64,
+    mismatched: u64,
+    fallback: u64,
+}
+
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_REQUESTED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MATCHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MISMATCHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static EAGLE3_DEVICE_ACCEPTANCE_SHADOW_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+fn eagle3_device_acceptance_shadow_counters() -> Eagle3DeviceAcceptanceShadowCounters {
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    Eagle3DeviceAcceptanceShadowCounters {
+        requested: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_REQUESTED.load(ordering),
+        encoded: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED.load(ordering),
+        matched: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MATCHED.load(ordering),
+        mismatched: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MISMATCHED.load(ordering),
+        fallback: EAGLE3_DEVICE_ACCEPTANCE_SHADOW_FALLBACK.load(ordering),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eagle3DeviceAcceptanceShadowVerdict {
+    Matched,
+    Mismatched(&'static str),
+    Fallback(metal::ResidentTreeAcceptanceShadowFallbackReason),
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn compare_eagle3_device_acceptance_shadow(
+    tree: &spec_tree::TokenTree,
+    target_vocab_size: usize,
+    host_emitted: &[u32],
+    host_leaf: usize,
+    host_path: &[usize],
+    shadow: &metal::ResidentTreeAcceptanceShadow,
+) -> Eagle3DeviceAcceptanceShadowVerdict {
+    let (
+        selected_leaf,
+        emitted_count,
+        terminal_token,
+        safe_terminal_token,
+        terminal_depth,
+        terminal_valid,
+        path_rows,
+        emitted_tokens,
+    ) = match shadow {
+        metal::ResidentTreeAcceptanceShadow::Encoded {
+            selected_leaf,
+            emitted_count,
+            terminal_token,
+            safe_terminal_token,
+            terminal_depth,
+            terminal_valid,
+            path_rows,
+            emitted_tokens,
+        } => (
+            selected_leaf,
+            emitted_count,
+            terminal_token,
+            safe_terminal_token,
+            terminal_depth,
+            terminal_valid,
+            path_rows,
+            emitted_tokens,
+        ),
+        metal::ResidentTreeAcceptanceShadow::Fallback(reason) => {
+            return Eagle3DeviceAcceptanceShadowVerdict::Fallback(*reason);
+        }
+    };
+    let Some(&expected_terminal) = host_emitted.last() else {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("host_empty");
+    };
+    let Some(&expected_depth) = tree.depth.get(host_leaf) else {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("host_leaf_out_of_range");
+    };
+    let expected_terminal_valid = (expected_terminal as usize) < target_vocab_size;
+    if *selected_leaf as usize != host_leaf {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("selected_leaf");
+    }
+    if *emitted_count as usize != host_emitted.len() {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("emitted_count");
+    }
+    if *terminal_token != expected_terminal {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("terminal_token");
+    }
+    if *safe_terminal_token
+        != if expected_terminal_valid {
+            expected_terminal
+        } else {
+            0
+        }
+    {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("safe_terminal_token");
+    }
+    if *terminal_depth != u32::from(expected_depth) {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("terminal_depth");
+    }
+    if *terminal_valid != expected_terminal_valid {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("terminal_valid");
+    }
+    if path_rows.len() != host_path.len()
+        || path_rows
+            .iter()
+            .zip(host_path)
+            .any(|(&device, &host)| device as usize != host)
+    {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("path_rows");
+    }
+    if emitted_tokens != host_emitted {
+        return Eagle3DeviceAcceptanceShadowVerdict::Mismatched("emitted_tokens");
+    }
+    Eagle3DeviceAcceptanceShadowVerdict::Matched
+}
+
+#[cfg(target_os = "macos")]
+fn record_eagle3_device_acceptance_shadow(
+    verdict: Eagle3DeviceAcceptanceShadowVerdict,
+) -> Eagle3DeviceAcceptanceShadowCounters {
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    EAGLE3_DEVICE_ACCEPTANCE_SHADOW_REQUESTED.fetch_add(1, ordering);
+    match verdict {
+        Eagle3DeviceAcceptanceShadowVerdict::Matched => {
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED.fetch_add(1, ordering);
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MATCHED.fetch_add(1, ordering);
+        }
+        Eagle3DeviceAcceptanceShadowVerdict::Mismatched(_) => {
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENCODED.fetch_add(1, ordering);
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_MISMATCHED.fetch_add(1, ordering);
+        }
+        Eagle3DeviceAcceptanceShadowVerdict::Fallback(_) => {
+            EAGLE3_DEVICE_ACCEPTANCE_SHADOW_FALLBACK.fetch_add(1, ordering);
+        }
+    }
+    eagle3_device_acceptance_shadow_counters()
+}
+
 /// Whether `prepare_for_prompt_prefix_cache` may vouch for ANY session — the
 /// prompt-prefix-cache host-safety gate. Default ON except on hosts with 8 GiB
 /// of physical RAM or less: mirroring and then cloning a long resident prompt
@@ -1933,12 +2107,62 @@ impl super::LlamaInferenceSession {
             .resident_decode
             .as_mut()
             .expect("resident session present (readiness checked above)");
+        // Strictly shadow-only: ordinary tree verification never passes a device-acceptance
+        // plan, so its existing wrapper/dispatch/allocation path is unchanged. The first staged
+        // production falsifier is limited to committing EAGLE verifies with the exact three
+        // target capture taps; generic trees, probes, and suffix verification stay on their
+        // established entry points even when the process gate is armed.
+        let acceptance_shadow_requested = commit
+            && capture_layer_ids == crate::eagle3::TARGET_LAYER_INPUT_IDS.as_slice()
+            && eagle3_device_acceptance_shadow_enabled();
         // Established entry points remain on their original Metal APIs. Only the explicit
         // benchmark request reaches the post-authoritative indexed-head replay.
-        let (predicted, raw_layer_inputs, target_top_k, indexed_head_shadow) = if let Some(
-            candidate_ids,
-        ) = indexed_head_shadow_candidates
-        {
+        let (
+            predicted,
+            raw_layer_inputs,
+            target_top_k,
+            indexed_head_shadow,
+            device_acceptance_shadow,
+        ) = if acceptance_shadow_requested {
+            let acceptance_plan = metal::ResidentTreeAcceptancePlan {
+                tree_tokens: &tree.tokens,
+                tree_parent: &tree.parent,
+                tree_depth: &tree.depth,
+            };
+            let Some((
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                device_acceptance_shadow,
+            )) = session.verify_batch_tree_with_acceptance_shadow(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+                capture_layer_ids,
+                read_target_top_k,
+                indexed_head_shadow_candidates,
+                &acceptance_plan,
+            )
+            else {
+                return Ok(None);
+            };
+            (
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                Some(device_acceptance_shadow),
+            )
+        } else if let Some(candidate_ids) = indexed_head_shadow_candidates {
             let Some((predicted, raw_layer_inputs, target_top_k, indexed_head_shadow)) = session
                 .verify_batch_tree_with_indexed_head_shadow(
                     &embeddings.data,
@@ -1964,6 +2188,7 @@ impl super::LlamaInferenceSession {
                 raw_layer_inputs,
                 target_top_k,
                 Some(indexed_head_shadow),
+                None,
             )
         } else if read_target_top_k {
             if capture_layer_ids.is_empty() {
@@ -1982,7 +2207,7 @@ impl super::LlamaInferenceSession {
                 ) else {
                     return Ok(None);
                 };
-                (predicted, Vec::new(), target_top_k, None)
+                (predicted, Vec::new(), target_top_k, None, None)
             } else {
                 let Some((predicted, raw_layer_inputs, target_top_k)) = session
                     .verify_batch_tree_with_layer_inputs_and_target_top_k(
@@ -2002,7 +2227,7 @@ impl super::LlamaInferenceSession {
                 else {
                     return Ok(None);
                 };
-                (predicted, raw_layer_inputs, target_top_k, None)
+                (predicted, raw_layer_inputs, target_top_k, None, None)
             }
         } else if capture_layer_ids.is_empty() {
             let Some(predicted) = session.verify_batch_tree(
@@ -2020,7 +2245,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (predicted, Vec::new(), Vec::new(), None)
+            (predicted, Vec::new(), Vec::new(), None, None)
         } else {
             let Some(captured) = session.verify_batch_tree_with_layer_inputs(
                 &embeddings.data,
@@ -2038,7 +2263,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (captured.0, captured.1, Vec::new(), None)
+            (captured.0, captured.1, Vec::new(), None, None)
         };
 
         // Host accept: longest greedy-exact path through the tree. A committing call compacts the
@@ -2046,9 +2271,86 @@ impl super::LlamaInferenceSession {
         // The benchmark cold-start probe deliberately leaves the provisional slots uncommitted;
         // the immediately following full-tree verify starts at the same base and overwrites them.
         let (emitted, leaf) = tree.accept_longest_path(&predicted);
+        // Gate-off committing calls already build exactly one host path for compaction. Gate-on
+        // reuses that same allocation as the parity oracle, rather than reconstructing the
+        // selected path a second time. A non-committing call only builds a path if a future
+        // diagnostic explicitly supplies a receipt.
+        let accepted_path = (commit || device_acceptance_shadow.is_some())
+            .then(|| tree.path_to(leaf));
+        if let Some(shadow) = device_acceptance_shadow.as_ref() {
+            let host_path = accepted_path
+                .as_deref()
+                .expect("device acceptance receipt requires a host oracle path");
+            let verdict = compare_eagle3_device_acceptance_shadow(
+                tree,
+                vocab,
+                &emitted,
+                leaf,
+                host_path,
+                shadow,
+            );
+            let counters = record_eagle3_device_acceptance_shadow(verdict);
+            match (verdict, shadow) {
+                (
+                    Eagle3DeviceAcceptanceShadowVerdict::Matched,
+                    metal::ResidentTreeAcceptanceShadow::Encoded {
+                        selected_leaf,
+                        emitted_count,
+                        terminal_token,
+                        terminal_depth,
+                        terminal_valid,
+                        ..
+                    },
+                ) => eprintln!(
+                    "[eagle3-device-accept-shadow] outcome=match route=device-selector-host-commit \
+                     base={position} rows={n} host_leaf={leaf} host_count={} \
+                     device_leaf={selected_leaf} device_count={emitted_count} \
+                     terminal_token={terminal_token} terminal_depth={terminal_depth} \
+                     terminal_valid={terminal_valid} requested_total={} encoded_total={} \
+                     matched_total={} mismatched_total={} fallback_total={}",
+                    emitted.len(),
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+                (Eagle3DeviceAcceptanceShadowVerdict::Mismatched(field), _) => eprintln!(
+                    "[eagle3-device-accept-shadow] outcome=mismatch route=device-selector-host-commit \
+                     field={field} base={position} rows={n} host_leaf={leaf} host_count={} \
+                     host_path={host_path:?} host_emitted={emitted:?} device={shadow:?} \
+                     requested_total={} encoded_total={} matched_total={} mismatched_total={} \
+                     fallback_total={}",
+                    emitted.len(),
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+                (Eagle3DeviceAcceptanceShadowVerdict::Fallback(reason), _) => eprintln!(
+                    "[eagle3-device-accept-shadow] outcome=fallback route=host-only \
+                     reason={} base={position} rows={n} host_leaf={leaf} host_count={} \
+                     requested_total={} encoded_total={} matched_total={} mismatched_total={} \
+                     fallback_total={}",
+                    reason.label(),
+                    emitted.len(),
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+                // A verdict is constructed from this same receipt immediately above; crossed
+                // variants would indicate a local bookkeeping bug, not a model outcome.
+                _ => unreachable!("device acceptance verdict/receipt variant diverged"),
+            }
+        }
         if commit {
-            let path = tree.path_to(leaf); // includes the anchor (node 0); root first
-            session.compact_tree_kv_path(&path, position).map_err(|e| {
+            let path = accepted_path
+                .as_deref()
+                .expect("committing tree verify requires an accepted path");
+            session.compact_tree_kv_path(path, position).map_err(|e| {
                 BackendError::RuntimeShapeMismatch(format!("tree KV compaction failed: {e}"))
             })?;
             let new_position = position + emitted.len();
@@ -2218,5 +2520,88 @@ impl super::LlamaInferenceSession {
         _tree: &spec_tree::TokenTree,
     ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod eagle3_device_acceptance_shadow_tests {
+    use super::*;
+
+    #[test]
+    fn eagle3_device_acceptance_shadow_gate_is_strict_and_default_off() {
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(None));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("")));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("0")));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("true")));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("01")));
+        assert!(eagle3_device_acceptance_shadow_setting_enables(Some("1")));
+        assert!(eagle3_device_acceptance_shadow_setting_enables(Some(" 1\n")));
+    }
+
+    #[test]
+    fn eagle3_device_acceptance_shadow_compares_every_commit_field() {
+        let tree = spec_tree::TokenTree {
+            tokens: vec![10, 11, 12, 13, 14, 15, 16, 17],
+            parent: vec![-1, 0, 0, 1, 1, 2, 4, 4],
+            depth: vec![0, 1, 1, 2, 2, 2, 3, 3],
+        };
+        let predictions = vec![11, 14, 0, 0, 16, 0, 99, 0];
+        let (emitted, leaf) = tree.accept_longest_path(&predictions);
+        let path = tree.path_to(leaf);
+        let exact = metal::ResidentTreeAcceptanceShadow::Encoded {
+            selected_leaf: leaf as u32,
+            emitted_count: emitted.len() as u32,
+            terminal_token: 99,
+            safe_terminal_token: 99,
+            terminal_depth: 3,
+            terminal_valid: true,
+            path_rows: path.iter().map(|&row| row as u32).collect(),
+            emitted_tokens: emitted.clone(),
+        };
+        assert_eq!(
+            compare_eagle3_device_acceptance_shadow(
+                &tree,
+                crate::eagle3::TARGET_VOCAB_SIZE,
+                &emitted,
+                leaf,
+                &path,
+                &exact,
+            ),
+            Eagle3DeviceAcceptanceShadowVerdict::Matched
+        );
+
+        let mut wrong_path = exact.clone();
+        let metal::ResidentTreeAcceptanceShadow::Encoded { path_rows, .. } = &mut wrong_path else {
+            unreachable!()
+        };
+        path_rows[2] = 5;
+        assert_eq!(
+            compare_eagle3_device_acceptance_shadow(
+                &tree,
+                crate::eagle3::TARGET_VOCAB_SIZE,
+                &emitted,
+                leaf,
+                &path,
+                &wrong_path,
+            ),
+            Eagle3DeviceAcceptanceShadowVerdict::Mismatched("path_rows")
+        );
+
+        let fallback = metal::ResidentTreeAcceptanceShadow::Fallback(
+            metal::ResidentTreeAcceptanceShadowFallbackReason::PipelineUnavailable,
+        );
+        assert_eq!(
+            compare_eagle3_device_acceptance_shadow(
+                &tree,
+                crate::eagle3::TARGET_VOCAB_SIZE,
+                &emitted,
+                leaf,
+                &path,
+                &fallback,
+            ),
+            Eagle3DeviceAcceptanceShadowVerdict::Fallback(
+                metal::ResidentTreeAcceptanceShadowFallbackReason::PipelineUnavailable
+            )
+        );
     }
 }

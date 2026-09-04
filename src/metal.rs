@@ -108,6 +108,107 @@ pub struct ResidentIndexedHeadShadow {
     pub rows: Vec<ResidentIndexedHeadShadowRow>,
 }
 
+/// Immutable verifier-tree arrays consumed by the default-off device-acceptance shadow.
+///
+/// The production target prediction buffer is supplied separately inside `verify_batch_inner`,
+/// after the ordinary full head and argmax have been encoded.  Keeping predictions out of this
+/// host plan is what makes the shadow a real device-side dependency rather than a CPU replay.
+#[derive(Debug, Clone, Copy)]
+pub struct ResidentTreeAcceptancePlan<'a> {
+    pub tree_tokens: &'a [u32],
+    pub tree_parent: &'a [i32],
+    pub tree_depth: &'a [u16],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentTreeAcceptanceShadowFallbackReason {
+    LengthMismatch,
+    InvalidRoot,
+    InvalidParentDepth,
+    TokenOutOfVocabulary,
+    DuplicateSiblingToken,
+    ArgmaxAblated,
+    PipelineUnavailable,
+    InvalidDeviceOutput,
+}
+
+impl ResidentTreeAcceptanceShadowFallbackReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LengthMismatch => "length_mismatch",
+            Self::InvalidRoot => "invalid_root",
+            Self::InvalidParentDepth => "invalid_parent_depth",
+            Self::TokenOutOfVocabulary => "token_out_of_vocabulary",
+            Self::DuplicateSiblingToken => "duplicate_sibling_token",
+            Self::ArgmaxAblated => "argmax_ablated",
+            Self::PipelineUnavailable => "pipeline_unavailable",
+            Self::InvalidDeviceOutput => "invalid_device_output",
+        }
+    }
+}
+
+/// Device-selected target-authoritative endpoint metadata from one real verifier command buffer.
+///
+/// This receipt never authorizes token emission or cache mutation.  The host continues to run
+/// `TokenTree::accept_longest_path`; the default-off shadow compares this receipt with that oracle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResidentTreeAcceptanceShadow {
+    Encoded {
+        selected_leaf: u32,
+        emitted_count: u32,
+        terminal_token: u32,
+        safe_terminal_token: u32,
+        terminal_depth: u32,
+        terminal_valid: bool,
+        path_rows: Vec<u32>,
+        emitted_tokens: Vec<u32>,
+    },
+    Fallback(ResidentTreeAcceptanceShadowFallbackReason),
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resident_tree_acceptance_plan_fallback(
+    plan: &ResidentTreeAcceptancePlan<'_>,
+    rows: usize,
+    vocab_size: usize,
+) -> Option<ResidentTreeAcceptanceShadowFallbackReason> {
+    if rows == 0
+        || rows > crate::inference::spec_tree::TREE_MAX_NODES
+        || plan.tree_tokens.len() != rows
+        || plan.tree_parent.len() != rows
+        || plan.tree_depth.len() != rows
+    {
+        return Some(ResidentTreeAcceptanceShadowFallbackReason::LengthMismatch);
+    }
+    if plan.tree_parent[0] != -1 || plan.tree_depth[0] != 0 {
+        return Some(ResidentTreeAcceptanceShadowFallbackReason::InvalidRoot);
+    }
+    for row in 0..rows {
+        if plan.tree_tokens[row] as usize >= vocab_size {
+            return Some(ResidentTreeAcceptanceShadowFallbackReason::TokenOutOfVocabulary);
+        }
+        if row == 0 {
+            continue;
+        }
+        let Ok(parent) = usize::try_from(plan.tree_parent[row]) else {
+            return Some(ResidentTreeAcceptanceShadowFallbackReason::InvalidParentDepth);
+        };
+        if parent >= row
+            || plan.tree_depth[row] == 0
+            || plan.tree_depth[parent].checked_add(1) != Some(plan.tree_depth[row])
+        {
+            return Some(ResidentTreeAcceptanceShadowFallbackReason::InvalidParentDepth);
+        }
+        if (1..row).any(|earlier| {
+            plan.tree_parent[earlier] == plan.tree_parent[row]
+                && plan.tree_tokens[earlier] == plan.tree_tokens[row]
+        }) {
+            return Some(ResidentTreeAcceptanceShadowFallbackReason::DuplicateSiblingToken);
+        }
+    }
+    None
+}
+
 impl ResidentIndexedHeadShadow {
     /// Means only that the diagnostic scorer ran; it does not mean all-vocabulary certification.
     pub fn scored(&self) -> bool {
@@ -38171,6 +38272,302 @@ struct TreeAttn {
     tail_slots: Vec<Vec<u32>>,
 }
 
+/// Integer-only target-authoritative tree walk.  The same source is compiled lazily by the
+/// production shadow and directly by its exhaustive Metal test.  `cases` is one in production;
+/// the test batches hundreds of prediction vectors through the identical kernel.
+#[cfg(target_os = "macos")]
+const EAGLE3_ACCEPT_TREE_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint EAGLE3_MAX_NODES = 16;
+
+kernel void eagle3_accept_tree_u32(
+    device const uint* tree_tokens [[buffer(0)]],
+    device const int* tree_parent [[buffer(1)]],
+    device const ushort* tree_depth [[buffer(2)]],
+    device const uint* predictions [[buffer(3)]],
+    constant uint& nodes [[buffer(4)]],
+    constant uint& cases [[buffer(5)]],
+    constant uint& vocab_size [[buffer(6)]],
+    device uint* selected_leaf [[buffer(7)]],
+    device uint* emitted_count [[buffer(8)]],
+    device uint* terminal_token [[buffer(9)]],
+    device uint* safe_terminal_token [[buffer(10)]],
+    device uint* terminal_depth [[buffer(11)]],
+    device uint* terminal_valid [[buffer(12)]],
+    device uint* path_rows [[buffer(13)]],
+    device uint* emitted_tokens [[buffer(14)]],
+    uint case_id [[thread_position_in_grid]]
+) {
+    if (case_id >= cases) return;
+    if (nodes == 0 || nodes > EAGLE3_MAX_NODES) {
+        terminal_valid[case_id] = 0;
+        return;
+    }
+
+    const uint prediction_base = case_id * nodes;
+    const uint output_base = case_id * EAGLE3_MAX_NODES;
+    uint current = 0;
+    for (uint emitted_index = 0; emitted_index < nodes; ++emitted_index) {
+        path_rows[output_base + emitted_index] = current;
+        const uint next = predictions[prediction_base + current];
+        emitted_tokens[output_base + emitted_index] = next;
+
+        uint matched = 0xffffffffu;
+        // Mirrors TokenTree::accept_longest_path's increasing-row, first-match scan. Production
+        // plans have unique child tokens; first-match also defines synthetic duplicate fixtures.
+        for (uint child = current + 1; child < nodes; ++child) {
+            if (tree_parent[child] == int(current) && tree_tokens[child] == next) {
+                matched = child;
+                break;
+            }
+        }
+        if (matched != 0xffffffffu) {
+            current = matched;
+            continue;
+        }
+
+        selected_leaf[case_id] = current;
+        emitted_count[case_id] = emitted_index + 1;
+        terminal_token[case_id] = next;
+        const bool valid = next < vocab_size;
+        safe_terminal_token[case_id] = valid ? next : 0;
+        terminal_depth[case_id] = uint(tree_depth[current]);
+        terminal_valid[case_id] = valid ? 1 : 0;
+        return;
+    }
+    terminal_valid[case_id] = 0;
+}
+"#;
+
+#[cfg(target_os = "macos")]
+static EAGLE3_ACCEPT_TREE_PIPELINE: OnceLock<Option<ComputePipelineState>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn eagle3_accept_tree_pipeline(device: &Device) -> Option<&'static ComputePipelineState> {
+    EAGLE3_ACCEPT_TREE_PIPELINE
+        .get_or_init(|| {
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(EAGLE3_ACCEPT_TREE_SHADER, &options)
+                .map_err(|error| {
+                    eprintln!(
+                        "[eagle3-device-accept-shadow] outcome=fallback reason=shader_compile error={error}"
+                    )
+                })
+                .ok()?;
+            let function = library.get_function("eagle3_accept_tree_u32", None).ok()?;
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .ok()
+        })
+        .as_ref()
+}
+
+#[cfg(target_os = "macos")]
+struct ResidentTreeAcceptancePending {
+    tree_tokens: Buffer,
+    tree_parent: Buffer,
+    tree_depth: Buffer,
+    scalars: Buffer,
+    selected_leaf: Buffer,
+    emitted_count: Buffer,
+    terminal_token: Buffer,
+    safe_terminal_token: Buffer,
+    terminal_depth: Buffer,
+    terminal_valid: Buffer,
+    path_rows: Buffer,
+    emitted_tokens: Buffer,
+    rows: usize,
+    vocab_size: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl ResidentTreeAcceptancePending {
+    fn read(
+        &self,
+    ) -> Result<ResidentTreeAcceptanceShadow, ResidentTreeAcceptanceShadowFallbackReason> {
+        let read_scalar = |buffer: &Buffer| unsafe { *(buffer.contents() as *const u32) };
+        let emitted_count = read_scalar(&self.emitted_count);
+        let selected_leaf = read_scalar(&self.selected_leaf);
+        let terminal_token = read_scalar(&self.terminal_token);
+        let safe_terminal_token = read_scalar(&self.safe_terminal_token);
+        let terminal_depth = read_scalar(&self.terminal_depth);
+        let terminal_valid = read_scalar(&self.terminal_valid);
+        let terminal_in_vocab = (terminal_token as usize) < self.vocab_size;
+        if !(1..=self.rows as u32).contains(&emitted_count)
+            || selected_leaf >= self.rows as u32
+            || terminal_depth.checked_add(1) != Some(emitted_count)
+            || terminal_valid > 1
+            || (terminal_valid == 1) != terminal_in_vocab
+            || safe_terminal_token
+                != if terminal_in_vocab {
+                    terminal_token
+                } else {
+                    0
+                }
+        {
+            return Err(ResidentTreeAcceptanceShadowFallbackReason::InvalidDeviceOutput);
+        }
+        let count = emitted_count as usize;
+        let read_prefix = |buffer: &Buffer| unsafe {
+            std::slice::from_raw_parts(buffer.contents() as *const u32, count).to_vec()
+        };
+        let path_rows = read_prefix(&self.path_rows);
+        let emitted_tokens = read_prefix(&self.emitted_tokens);
+        if path_rows.first().copied() != Some(0)
+            || path_rows.iter().any(|&row| row >= self.rows as u32)
+            || path_rows.last().copied() != Some(selected_leaf)
+            || emitted_tokens.last().copied() != Some(terminal_token)
+        {
+            return Err(ResidentTreeAcceptanceShadowFallbackReason::InvalidDeviceOutput);
+        }
+        let tree_tokens = unsafe {
+            std::slice::from_raw_parts(self.tree_tokens.contents() as *const u32, self.rows)
+        };
+        let tree_parent = unsafe {
+            std::slice::from_raw_parts(self.tree_parent.contents() as *const i32, self.rows)
+        };
+        let tree_depth = unsafe {
+            std::slice::from_raw_parts(self.tree_depth.contents() as *const u16, self.rows)
+        };
+        if tree_depth[selected_leaf as usize] as u32 != terminal_depth
+            || path_rows.windows(2).any(|edge| {
+                tree_parent[edge[1] as usize] != edge[0] as i32
+            })
+            || emitted_tokens
+                .iter()
+                .take(count - 1)
+                .zip(path_rows.iter().skip(1))
+                .any(|(&token, &row)| token != tree_tokens[row as usize])
+        {
+            return Err(ResidentTreeAcceptanceShadowFallbackReason::InvalidDeviceOutput);
+        }
+        Ok(ResidentTreeAcceptanceShadow::Encoded {
+            selected_leaf,
+            emitted_count,
+            terminal_token,
+            safe_terminal_token,
+            terminal_depth,
+            terminal_valid: terminal_valid == 1,
+            path_rows,
+            emitted_tokens,
+        })
+    }
+
+    fn recycle_into(self, keep: &mut Vec<Buffer>) {
+        keep.extend([
+            self.tree_tokens,
+            self.tree_parent,
+            self.tree_depth,
+            self.scalars,
+            self.selected_leaf,
+            self.emitted_count,
+            self.terminal_token,
+            self.safe_terminal_token,
+            self.terminal_depth,
+            self.terminal_valid,
+            self.path_rows,
+            self.emitted_tokens,
+        ]);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn encode_resident_tree_acceptance_shadow(
+    kern: &MetalLinearKernel,
+    encoder: &metal::ComputeCommandEncoderRef,
+    predictions: &Buffer,
+    plan: &ResidentTreeAcceptancePlan<'_>,
+    rows: usize,
+    vocab_size: usize,
+) -> Result<ResidentTreeAcceptancePending, ResidentTreeAcceptanceShadowFallbackReason> {
+    if let Some(reason) = resident_tree_acceptance_plan_fallback(plan, rows, vocab_size) {
+        return Err(reason);
+    }
+    let pipeline = eagle3_accept_tree_pipeline(&kern.device)
+        .ok_or(ResidentTreeAcceptanceShadowFallbackReason::PipelineUnavailable)?;
+    let nb = |bytes: usize| pool_get(kern, bytes.max(4) as u64);
+    let tree_tokens = nb(rows * 4);
+    let tree_parent = nb(rows * 4);
+    let tree_depth = nb(rows * 2);
+    let scalars = nb(12);
+    let selected_leaf = nb(4);
+    let emitted_count = nb(4);
+    let terminal_token = nb(4);
+    let safe_terminal_token = nb(4);
+    let terminal_depth = nb(4);
+    let terminal_valid = nb(4);
+    let path_rows = nb(crate::inference::spec_tree::TREE_MAX_NODES * 4);
+    let emitted_tokens = nb(crate::inference::spec_tree::TREE_MAX_NODES * 4);
+    write_buffer_bytes(&tree_tokens, plan.tree_tokens);
+    write_buffer_bytes(&tree_parent, plan.tree_parent);
+    write_buffer_bytes(&tree_depth, plan.tree_depth);
+    unsafe {
+        let scalar = scalars.contents() as *mut u32;
+        *scalar = rows as u32;
+        *scalar.add(1) = 1;
+        *scalar.add(2) = vocab_size as u32;
+        for output in [
+            &selected_leaf,
+            &emitted_count,
+            &terminal_token,
+            &safe_terminal_token,
+            &terminal_depth,
+            &terminal_valid,
+        ] {
+            *(output.contents() as *mut u32) = u32::MAX;
+        }
+    }
+
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(&tree_tokens), 0);
+    encoder.set_buffer(1, Some(&tree_parent), 0);
+    encoder.set_buffer(2, Some(&tree_depth), 0);
+    encoder.set_buffer(3, Some(predictions), 0);
+    encoder.set_buffer(4, Some(&scalars), 0);
+    encoder.set_buffer(5, Some(&scalars), 4);
+    encoder.set_buffer(6, Some(&scalars), 8);
+    encoder.set_buffer(7, Some(&selected_leaf), 0);
+    encoder.set_buffer(8, Some(&emitted_count), 0);
+    encoder.set_buffer(9, Some(&terminal_token), 0);
+    encoder.set_buffer(10, Some(&safe_terminal_token), 0);
+    encoder.set_buffer(11, Some(&terminal_depth), 0);
+    encoder.set_buffer(12, Some(&terminal_valid), 0);
+    encoder.set_buffer(13, Some(&path_rows), 0);
+    encoder.set_buffer(14, Some(&emitted_tokens), 0);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    Ok(ResidentTreeAcceptancePending {
+        tree_tokens,
+        tree_parent,
+        tree_depth,
+        scalars,
+        selected_leaf,
+        emitted_count,
+        terminal_token,
+        safe_terminal_token,
+        terminal_depth,
+        terminal_valid,
+        path_rows,
+        emitted_tokens,
+        rows,
+        vocab_size,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn resident_indexed_head_shadow_fallback(
     format: ResidentWeightFormat,
@@ -42045,8 +42442,9 @@ impl ResidentDecodeState {
             None,
             &[],
             None,
+            None,
         )
-        .map(|(preds, _, _, _, _, _)| preds)
+        .map(|(preds, _, _, _, _, _, _)| preds)
     }
 
     /// Resident speculative verify with snapshots of selected target decoder layer inputs.
@@ -42085,8 +42483,9 @@ impl ResidentDecodeState {
             None,
             capture_layer_ids,
             None,
+            None,
         )
-        .map(|(preds, _, layer_inputs, _, _, _)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _, _, _, _)| (preds, layer_inputs))
     }
 
     /// Teacher-forcing twin of [`Self::verify_batch_with_layer_inputs`] used by the
@@ -42123,8 +42522,9 @@ impl ResidentDecodeState {
             None,
             capture_layer_ids,
             None,
+            None,
         )
-        .map(|(preds, logits, layer_inputs, _, output_norm, _)| {
+        .map(|(preds, logits, layer_inputs, _, output_norm, _, _)| {
             (preds, layer_inputs, output_norm, logits)
         })
     }
@@ -42160,8 +42560,9 @@ impl ResidentDecodeState {
             None,
             &[],
             None,
+            None,
         )
-        .map(|(preds, _, _, target_top_k, _, _)| (preds, target_top_k))
+        .map(|(preds, _, _, target_top_k, _, _, _)| (preds, target_top_k))
     }
 
     /// `verify_batch` that also reads back the `k * vocab` pre-argmax logits (the byte-exact
@@ -42195,8 +42596,9 @@ impl ResidentDecodeState {
             None,
             &[],
             None,
+            None,
         )
-        .map(|(preds, logits, _, _, _, _)| (preds, logits))
+        .map(|(preds, logits, _, _, _, _, _)| (preds, logits))
     }
 
     /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
@@ -42223,6 +42625,7 @@ impl ResidentDecodeState {
         tree: Option<&TreeAttn>,
         capture_layer_ids: &[usize],
         indexed_head_shadow_candidates: Option<&[u32]>,
+        tree_acceptance_shadow_plan: Option<&ResidentTreeAcceptancePlan<'_>>,
     ) -> Option<(
         Vec<u32>,
         Vec<f32>,
@@ -42230,6 +42633,7 @@ impl ResidentDecodeState {
         Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>,
         Vec<f32>,
         Option<ResidentIndexedHeadShadow>,
+        Option<ResidentTreeAcceptanceShadow>,
     )> {
         // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
         // The tree path widens the node cap to TREE_MAX_NODES (a tree of N nodes has at most
@@ -43137,6 +43541,28 @@ impl ResidentDecodeState {
                 );
             }
         }
+        // Default-off, non-authoritative shadow. The tiny selector is encoded after the
+        // unchanged production argmax and reads `pred_buf` directly on device. With no plan,
+        // this block performs no pipeline lookup, allocation, binding, or dispatch.
+        let (tree_acceptance_pending, tree_acceptance_fallback) =
+            match tree_acceptance_shadow_plan {
+                None => (None, None),
+                Some(_) if verify_ablate("argmax") => (
+                    None,
+                    Some(ResidentTreeAcceptanceShadowFallbackReason::ArgmaxAblated),
+                ),
+                Some(plan) => match encode_resident_tree_acceptance_shadow(
+                    kern,
+                    e,
+                    &pred_buf,
+                    plan,
+                    k,
+                    vocab,
+                ) {
+                    Ok(pending) => (Some(pending), None),
+                    Err(reason) => (None, Some(reason)),
+                },
+            };
         e.end_encoding();
         let encode_us = encode_started.elapsed().as_micros();
         let tail_commit_started = std::time::Instant::now();
@@ -43327,6 +43753,14 @@ impl ResidentDecodeState {
         } else {
             Vec::new()
         };
+        let tree_acceptance_shadow = match tree_acceptance_pending.as_ref() {
+            Some(pending) => Some(
+                pending
+                    .read()
+                    .unwrap_or_else(ResidentTreeAcceptanceShadow::Fallback),
+            ),
+            None => tree_acceptance_fallback.map(ResidentTreeAcceptanceShadow::Fallback),
+        };
         // The command buffer completed and every host readback above is
         // done: return the round's scratch (activations, scalars, staging
         // from the batched projections) to the pool.
@@ -43378,6 +43812,9 @@ impl ResidentDecodeState {
         if let Some(buf) = target_topk_buf {
             keep.push(buf);
         }
+        if let Some(pending) = tree_acceptance_pending {
+            pending.recycle_into(&mut keep);
+        }
         pool_recycle(kern, keep);
         Some((
             preds,
@@ -43386,6 +43823,7 @@ impl ResidentDecodeState {
             target_top_k,
             output_norm,
             indexed_head_shadow,
+            tree_acceptance_shadow,
         ))
     }
 
@@ -43434,8 +43872,9 @@ impl ResidentDecodeState {
             Some(&tree),
             &[],
             None,
+            None,
         )
-        .map(|(preds, _, _, _, _, _)| preds)
+        .map(|(preds, _, _, _, _, _, _)| preds)
     }
 
     /// Capture-capable twin of [`Self::verify_batch_tree`].  The forward, tree-attention
@@ -43475,8 +43914,9 @@ impl ResidentDecodeState {
             Some(&tree),
             capture_layer_ids,
             None,
+            None,
         )
-        .map(|(preds, _, layer_inputs, _, _, _)| (preds, layer_inputs))
+        .map(|(preds, _, layer_inputs, _, _, _, _)| (preds, layer_inputs))
     }
 
     /// Tree-attention twin of [`Self::verify_batch_with_target_top_k`]. Candidate rows retain
@@ -43513,8 +43953,9 @@ impl ResidentDecodeState {
             Some(&tree),
             &[],
             None,
+            None,
         )
-        .map(|(preds, _, _, target_top_k, _, _)| (preds, target_top_k))
+        .map(|(preds, _, _, target_top_k, _, _, _)| (preds, target_top_k))
     }
 
     /// Benchmark-only EAGLE/Token-Recycling twin that retains both selected decoder-layer
@@ -43557,8 +43998,78 @@ impl ResidentDecodeState {
             Some(&tree),
             capture_layer_ids,
             None,
+            None,
         )
-        .map(|(preds, _, layer_inputs, target_top_k, _, _)| (preds, layer_inputs, target_top_k))
+        .map(|(preds, _, layer_inputs, target_top_k, _, _, _)| {
+            (preds, layer_inputs, target_top_k)
+        })
+    }
+
+    /// Default-off real-model falsifier for device-side target acceptance.
+    ///
+    /// This is the only production wrapper that passes an acceptance plan into
+    /// [`Self::verify_batch_inner`]. The ordinary full target head and argmax remain unchanged;
+    /// the integer selector is appended to that same command buffer and reads the production
+    /// prediction buffer directly. Its receipt is diagnostic only: callers must continue to use
+    /// `TokenTree::accept_longest_path` for token emission and cache compaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_tree_with_acceptance_shadow(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+        capture_layer_ids: &[usize],
+        read_target_top_k: bool,
+        indexed_head_shadow_candidates: Option<&[u32]>,
+        acceptance_plan: &ResidentTreeAcceptancePlan<'_>,
+    ) -> Option<(
+        Vec<u32>,
+        Vec<Vec<f32>>,
+        Vec<[u32; RESIDENT_VERIFY_TARGET_TOP_K]>,
+        Option<ResidentIndexedHeadShadow>,
+        ResidentTreeAcceptanceShadow,
+    )> {
+        let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
+        let (
+            preds,
+            _,
+            layer_inputs,
+            target_top_k,
+            _,
+            indexed_head_shadow,
+            acceptance_shadow,
+        ) = self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            n,
+            scale,
+            false,
+            read_target_top_k,
+            false,
+            Some(&tree),
+            capture_layer_ids,
+            indexed_head_shadow_candidates,
+            Some(acceptance_plan),
+        )?;
+        Some((
+            preds,
+            layer_inputs,
+            target_top_k,
+            indexed_head_shadow,
+            acceptance_shadow?,
+        ))
     }
 
     /// Benchmark-only tree verifier with an exact tied-Q6 indexed-output-head replay.
@@ -43592,7 +44103,7 @@ impl ResidentDecodeState {
         ResidentIndexedHeadShadow,
     )> {
         let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
-        let (preds, _, layer_inputs, target_top_k, _, indexed_head_shadow) = self
+        let (preds, _, layer_inputs, target_top_k, _, indexed_head_shadow, _) = self
             .verify_batch_inner(
                 embeddings,
                 cos_all,
@@ -43608,6 +44119,7 @@ impl ResidentDecodeState {
                 Some(&tree),
                 capture_layer_ids,
                 Some(candidate_ids),
+                None,
             )?;
         Some((preds, layer_inputs, target_top_k, indexed_head_shadow?))
     }
@@ -43646,8 +44158,9 @@ impl ResidentDecodeState {
             Some(&tree),
             &[],
             None,
+            None,
         )
-        .map(|(preds, logits, _, _, _, _)| (preds, logits))
+        .map(|(preds, logits, _, _, _, _, _)| (preds, logits))
     }
 
     /// Build the per-node `TreeAttn` descriptor from the ancestor bitset. For node `i`, scan
@@ -44955,10 +45468,66 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
-    /// Source-only falsifier for the selector that will sit between target argmax and the
-    /// pre-encoded N1 authoritative EAGLE cell.  It intentionally compiles a tiny standalone
-    /// library instead of adding a production pipeline: the experiment remains runtime-inert
-    /// until mini2 proves every selected row, token, and terminal bonus against the host oracle.
+    #[test]
+    fn eagle3_device_acceptance_plan_fails_closed_on_every_tree_invariant() {
+        use super::*;
+
+        let vocab = crate::eagle3::TARGET_VOCAB_SIZE;
+        let check = |tokens: &[u32], parent: &[i32], depth: &[u16], rows: usize| {
+            resident_tree_acceptance_plan_fallback(
+                &ResidentTreeAcceptancePlan {
+                    tree_tokens: tokens,
+                    tree_parent: parent,
+                    tree_depth: depth,
+                },
+                rows,
+                vocab,
+            )
+        };
+        let tokens = [10, 11, 12, 13, 14, 15, 16, 17];
+        let parent = [-1, 0, 0, 1, 1, 2, 4, 4];
+        let depth = [0, 1, 1, 2, 2, 2, 3, 3];
+        assert_eq!(check(&tokens, &parent, &depth, 8), None);
+        assert_eq!(
+            check(&tokens[..7], &parent, &depth, 8),
+            Some(ResidentTreeAcceptanceShadowFallbackReason::LengthMismatch)
+        );
+
+        let mut invalid_root = parent;
+        invalid_root[0] = 0;
+        assert_eq!(
+            check(&tokens, &invalid_root, &depth, 8),
+            Some(ResidentTreeAcceptanceShadowFallbackReason::InvalidRoot)
+        );
+        let mut invalid_parent = parent;
+        invalid_parent[6] = 6;
+        assert_eq!(
+            check(&tokens, &invalid_parent, &depth, 8),
+            Some(ResidentTreeAcceptanceShadowFallbackReason::InvalidParentDepth)
+        );
+        let mut invalid_depth = depth;
+        invalid_depth[6] = 2;
+        assert_eq!(
+            check(&tokens, &parent, &invalid_depth, 8),
+            Some(ResidentTreeAcceptanceShadowFallbackReason::InvalidParentDepth)
+        );
+        let mut invalid_token = tokens;
+        invalid_token[7] = vocab as u32;
+        assert_eq!(
+            check(&invalid_token, &parent, &depth, 8),
+            Some(ResidentTreeAcceptanceShadowFallbackReason::TokenOutOfVocabulary)
+        );
+        let mut duplicate_sibling = tokens;
+        duplicate_sibling[2] = duplicate_sibling[1];
+        assert_eq!(
+            check(&duplicate_sibling, &parent, &depth, 8),
+            Some(ResidentTreeAcceptanceShadowFallbackReason::DuplicateSiblingToken)
+        );
+    }
+
+    /// Falsifier for the selector that sits between target argmax and the future pre-encoded N1
+    /// authoritative EAGLE cell. It compiles the production shader source as a standalone
+    /// library and proves every selected row, token, and terminal bonus against the host oracle.
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_eagle3_device_acceptance_matches_host_oracle() {
@@ -44968,70 +45537,7 @@ mod tests {
         let Some(device) = Device::system_default() else {
             return;
         };
-        let shader = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-constant uint EAGLE3_MAX_NODES = 16;
-
-kernel void eagle3_accept_tree_u32(
-    device const uint* tree_tokens [[buffer(0)]],
-    device const int* tree_parent [[buffer(1)]],
-    device const ushort* tree_depth [[buffer(2)]],
-    device const uint* predictions [[buffer(3)]],
-    constant uint& nodes [[buffer(4)]],
-    constant uint& cases [[buffer(5)]],
-    constant uint& vocab_size [[buffer(6)]],
-    device uint* selected_leaf [[buffer(7)]],
-    device uint* emitted_count [[buffer(8)]],
-    device uint* terminal_token [[buffer(9)]],
-    device uint* safe_terminal_token [[buffer(10)]],
-    device uint* terminal_depth [[buffer(11)]],
-    device uint* terminal_valid [[buffer(12)]],
-    device uint* path_rows [[buffer(13)]],
-    device uint* emitted_tokens [[buffer(14)]],
-    uint case_id [[thread_position_in_grid]]
-) {
-    if (case_id >= cases) return;
-    if (nodes == 0 || nodes > EAGLE3_MAX_NODES) {
-        terminal_valid[case_id] = 0;
-        return;
-    }
-
-    const uint prediction_base = case_id * nodes;
-    const uint output_base = case_id * EAGLE3_MAX_NODES;
-    uint current = 0;
-    for (uint emitted_index = 0; emitted_index < nodes; ++emitted_index) {
-        path_rows[output_base + emitted_index] = current;
-        const uint next = predictions[prediction_base + current];
-        emitted_tokens[output_base + emitted_index] = next;
-
-        uint matched = 0xffffffffu;
-        // This is deliberately the host oracle's increasing-row, first-match scan.  Production
-        // forests have unique child tokens; retaining first-match makes duplicate fixtures exact.
-        for (uint child = current + 1; child < nodes; ++child) {
-            if (tree_parent[child] == int(current) && tree_tokens[child] == next) {
-                matched = child;
-                break;
-            }
-        }
-        if (matched != 0xffffffffu) {
-            current = matched;
-            continue;
-        }
-
-        selected_leaf[case_id] = current;
-        emitted_count[case_id] = emitted_index + 1;
-        terminal_token[case_id] = next;
-        const bool valid = next < vocab_size;
-        safe_terminal_token[case_id] = valid ? next : 0;
-        terminal_depth[case_id] = uint(tree_depth[current]);
-        terminal_valid[case_id] = valid ? 1 : 0;
-        return;
-    }
-    terminal_valid[case_id] = 0;
-}
-"#;
+        let shader = EAGLE3_ACCEPT_TREE_SHADER;
         let options = CompileOptions::new();
         let library = device
             .new_library_with_source(shader, &options)

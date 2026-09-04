@@ -14705,6 +14705,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS",
+        "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW",
         camelid::eagle3_runtime::EAGLE3_DRAFT_EARLY_EXIT_ENV,
     ] {
         if std::env::var_os(key).is_some() {
