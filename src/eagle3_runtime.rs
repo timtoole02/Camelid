@@ -1096,6 +1096,9 @@ impl Eagle3DraftForest {
         }
 
         Ok(Eagle3AuthoritativePrecomputePlan {
+            tree_tokens: tree.tokens.clone(),
+            tree_parent: tree.parent.clone(),
+            tree_depth: tree.depth.clone(),
             verified_edges,
             terminal_candidates,
         })
@@ -1113,7 +1116,10 @@ impl Eagle3DraftForest {
         acceptance: &Eagle3ForestAcceptance,
     ) -> Result<Eagle3AuthoritativeCommitResolution> {
         let tree = &self.scored.tree;
-        if plan.verified_edges.len() != tree.nodes().saturating_sub(1)
+        if plan.tree_tokens != tree.tokens
+            || plan.tree_parent != tree.parent
+            || plan.tree_depth != tree.depth
+            || plan.verified_edges.len() != tree.nodes().saturating_sub(1)
             || plan.terminal_candidates.len() != tree.nodes()
         {
             return Err(invalid(
@@ -1198,6 +1204,11 @@ pub struct Eagle3AuthoritativePrecomputeCell {
 /// Target-blind work available to a future overlapped authoritative EAGLE lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Eagle3AuthoritativePrecomputePlan {
+    /// Exact verifier-tree identity. Equal row counts are insufficient because token/parent/depth
+    /// changes alter every edge cell's input, ancestry, or RoPE position.
+    pub tree_tokens: Vec<u32>,
+    pub tree_parent: Vec<i32>,
+    pub tree_depth: Vec<u16>,
     /// One K/V cell per non-root verifier row, ordered by verifier row minus one.
     pub verified_edges: Vec<Eagle3AuthoritativePrecomputeCell>,
     /// At most one full virtual terminal cell per possible accepted endpoint.
