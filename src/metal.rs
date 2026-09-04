@@ -15435,6 +15435,9 @@ fn encode_gemma4_attention(
         &qn_buf,
         cache_k_buf,
         cache_v_buf,
+        // gemma4's KV cache is unconditionally f32 (`kv_bytes` is sized with
+        // `size_of::<f32>()`), and it stages no f16 mirrors.
+        KvOperand::F32,
         None,
         &scores_buf,
         &ctx_buf,
@@ -18153,6 +18156,78 @@ fn encode_attention_split3(
     );
 }
 
+/// The element type of the `keys` / `values` buffers a caller owns.
+///
+/// Supplied as a **witness by the buffer's owner**, never re-derived from the
+/// process-global KV format. The attention kernels declare their K/V operands as
+/// `device const float*`, `device const half*`, or a 34-byte-block Q8 layout; binding the
+/// wrong one does not fault, it reinterprets the bytes and returns plausible garbage that
+/// greedy token-identity parity cannot distinguish from a correct decode.
+///
+/// This replaces three separate process-global reads (`kvq8_enabled()`, `kv16_enabled()`,
+/// and inferring "f16 primary" from `kv16_mirrors.is_none()`). Those were correct for
+/// `ResidentDecodeState`, which maintains the invariant that mirrors exist iff the primary
+/// is f32 — but `encode_attention` is shared with the gemma4 / qwen35 / LFM2 lanes, which
+/// own unconditionally-f32 caches and pass `None` for mirrors, so "no mirrors" did not
+/// prove "half data" for them.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KvOperand {
+    /// `device const float*` — 4 bytes/element.
+    F32,
+    /// `device const half*` — 2 bytes/element.
+    F16,
+    /// Q8_0: 34-byte blocks of 32 codes plus an f16 scale.
+    Q8,
+}
+
+#[cfg(target_os = "macos")]
+impl KvOperand {
+    /// Witness for a session that records its primary format as the `kv16`/`kvq8` pair
+    /// (`ResidentDecodeState` and `encode_attention_block`). Q8 wins over F16 because the
+    /// two are mutually exclusive at construction and Q8 is the narrower layout.
+    fn from_flags(kv16: bool, kvq8: bool) -> Self {
+        if kvq8 {
+            Self::Q8
+        } else if kv16 {
+            Self::F16
+        } else {
+            Self::F32
+        }
+    }
+}
+
+/// Which buffers the split-K decode dispatch reads, and at which element type.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SplitkKvSource {
+    /// Q8_0 primary, read in place by `attention_decode_splitk_kvq8`.
+    PrimaryQ8,
+    /// F16 primary, read in place by `attention_decode_splitk_kv16{,_direct}`.
+    PrimaryF16,
+    /// F32 primary read through its staged f16 mirrors — halves KV traffic at depth.
+    MirrorsF16,
+    /// F32 primary, read in place by `attention_decode_splitk`.
+    PrimaryF32,
+}
+
+/// Resolve the split-K K/V operand from the caller's format witness and whether f16
+/// mirrors are staged and enabled.
+///
+/// Extracted as a pure function, like `splitk_kv_format_admits`, so the routing has a
+/// GPU-free gate. The regression it pins: an F32 witness with no mirrors must read the
+/// f32 primary, NEVER `PrimaryF16`. Inferring "f16 primary" from absent mirrors held only
+/// for `ResidentDecodeState` and silently mis-typed the gemma4 / qwen35 / LFM2 caches.
+#[cfg(target_os = "macos")]
+fn splitk_kv_source(kv: KvOperand, mirrors_present: bool, mirrors_enabled: bool) -> SplitkKvSource {
+    match kv {
+        KvOperand::Q8 => SplitkKvSource::PrimaryQ8,
+        KvOperand::F16 => SplitkKvSource::PrimaryF16,
+        KvOperand::F32 if mirrors_present && mirrors_enabled => SplitkKvSource::MirrorsF16,
+        KvOperand::F32 => SplitkKvSource::PrimaryF32,
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention(
@@ -18162,6 +18237,8 @@ fn encode_attention(
     query: &Buffer,
     keys: &Buffer,
     values: &Buffer,
+    // Element type of `keys`/`values` above. See `KvOperand`.
+    kv: KvOperand,
     kv16_mirrors: Option<(&Buffer, &Buffer)>,
     scores: &Buffer,
     out: &Buffer,
@@ -18179,7 +18256,8 @@ fn encode_attention(
 ) {
     // Tiled kernel (4 simdgroups/head, online softmax, no scores buffer) when enabled and
     // the head geometry allows; otherwise the one-simdgroup-per-head fallback.
-    let v2 = (attn2_enabled() || kvq8_enabled()) && head_dim.is_multiple_of(32) && head_dim <= 128;
+    let v2 =
+        (attn2_enabled() || kv == KvOperand::Q8) && head_dim.is_multiple_of(32) && head_dim <= 128;
     // Split-K flash decode for deeper contexts: the v2 kernel's one-threadgroup-per-head
     // grid leaves the GPU mostly idle while each simdgroup walks a long position range
     // serially, and GQA re-reads every K/V row once per query head. The split-K kernel
@@ -18196,7 +18274,7 @@ fn encode_attention(
     // `!kv16_enabled()` with the new gate would take split-K away from the f32 lane,
     // where it measures 1.67x on an M4.
     let splitk = v2
-        && splitk_kv_format_admits(kv16_enabled(), splitk_kv16_primary_enabled())
+        && splitk_kv_format_admits(kv == KvOperand::F16, splitk_kv16_primary_enabled())
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -18209,10 +18287,10 @@ fn encode_attention(
         }
         // Half-mirror reads halve the dominant KV traffic at depth; opt out with
         // CAMELID_METAL_ATTN_SPLITK_KV16=0 to keep the f32 split-K reads.
-        let use_mirrors = kv16_mirrors.is_some()
-            && !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
-                .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
-        if kvq8_enabled() {
+        let mirrors_enabled = !std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
+        let source = splitk_kv_source(kv, kv16_mirrors.is_some(), mirrors_enabled);
+        if source == SplitkKvSource::PrimaryQ8 {
             // Q8 primary: read the 34-byte-block cache directly. No mirrors exist on this
             // lane (cache_k16/cache_v16 are empty under a compressed primary), and none are
             // wanted -- the whole point is that the Q8 cache is 1.88x smaller than the f16
@@ -18221,24 +18299,25 @@ fn encode_attention(
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
-        } else if kv16_mirrors.is_none() {
-            // F16 PRIMARY. Selected on the ABSENCE OF MIRRORS, deliberately, not on
-            // `kv16_enabled()`: mirrors are allocated only when the primary is f32
-            // (`!kv16 && !kvq8`, see `ResidentDecodeState::new`), so with the Q8 arm
-            // already taken above, `None` here proves `keys`/`values` hold half data.
+        } else if source == SplitkKvSource::PrimaryF16 {
+            // F16 PRIMARY: bind the half-typed kernel straight to it.
             //
-            // Keying this off the process-global instead would reintroduce the exact
-            // hazard `kv_roundtrips_through_cpu_exactly` documents: a model switch
-            // re-decides the global while a session still holds an engine built under the
-            // previous format, so the global is a time-of-check answer to a time-of-use
-            // question. Getting it wrong here does not fail loudly -- it binds half data
-            // to `attention_decode_splitk_f32`, whose signature is `device const float*`,
-            // and returns plausible garbage. The buffer we were handed is the only
-            // trustworthy witness to its own element type.
+            // Selected on the caller's WITNESS. This arm previously tested
+            // `kv16_mirrors.is_none()`, reasoning that mirrors are allocated only when the
+            // primary is f32 (`!kv16 && !kvq8`, see `ResidentDecodeState::new`), so `None`
+            // proved half data. That invariant is real but LOCAL to
+            // `ResidentDecodeState`: `encode_attention` is also called by
+            // `encode_gemma4_attention`, `encode_qwen35_full_layer` and
+            // `encode_lfm2_attn_layer`, which own unconditionally-f32 caches and pass
+            // `None` unconditionally. Those lanes therefore took this arm and bound f32
+            // bytes to `device const half*` -- silent garbage at every depth past the
+            // split-K threshold, which their parity fixtures never reach.
             //
-            // This branch also closes that hazard in the other direction: the final
-            // `else` is now reachable only with mirrors present, i.e. a proven f32
-            // primary.
+            // Neither can the process-global answer it: `kv16_enabled()` is a
+            // time-of-check answer to a time-of-use question (a model switch re-decides it
+            // while a session still holds an engine built under the previous format), the
+            // hazard `kv_roundtrips_through_cpu_exactly` documents. The buffer's owner is
+            // the only trustworthy witness to its element type.
             if head_dim == 128 {
                 e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_pipeline);
             } else {
@@ -18247,8 +18326,9 @@ fn encode_attention(
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
-        } else if use_mirrors {
-            let (mk, mv) = kv16_mirrors.expect("checked is_some above");
+        } else if source == SplitkKvSource::MirrorsF16 {
+            // F32 primary with f16 mirrors staged: half the KV traffic at depth.
+            let (mk, mv) = kv16_mirrors.expect("MirrorsF16 implies mirrors_present");
             // Direct-read variant for head_dim 128: no threadgroup staging or
             // barriers -> more resident threadgroups; GQA re-reads hit the SLC.
             // Probe @7.7k positions: 11.4ms vs 14.3ms staged (and better at
@@ -18313,7 +18393,7 @@ fn encode_attention(
     // Bit-identical three-dispatch encode of the f32 fallback kernel. Same arithmetic,
     // same order; the only difference is that the score and context phases are exposed
     // as independent threads instead of being folded onto n_heads simdgroups.
-    if !v2 && !kv16_enabled() && !kvq8_enabled() && attn_split3_enabled() {
+    if !v2 && kv == KvOperand::F32 && attn_split3_enabled() {
         let denom = pool_get(k, (n_heads * 4).max(4) as u64);
         let blocks = pool_get(k, 8);
         encode_attention_split3(
@@ -18337,13 +18417,19 @@ fn encode_attention(
         keep.push(blocks);
         return;
     }
-    let attn_pipeline = match (v2, kv16_enabled(), kvq8_enabled()) {
-        (true, _, true) => &k.attention_decode_v2_kvq8_pipeline,
-        (true, true, false) => &k.attention_decode_v2_kv16_pipeline,
-        (true, false, false) => &k.attention_decode_v2_pipeline,
-        (false, true, false) => &k.attention_decode_kv16_pipeline,
-        (false, false, false) => &k.attention_decode_pipeline,
-        (false, _, true) => unreachable!("Q8 KV requires the v2 geometry"),
+    let attn_pipeline = match (v2, kv) {
+        (true, KvOperand::Q8) => &k.attention_decode_v2_kvq8_pipeline,
+        (true, KvOperand::F16) => &k.attention_decode_v2_kv16_pipeline,
+        (true, KvOperand::F32) => &k.attention_decode_v2_pipeline,
+        (false, KvOperand::F16) => &k.attention_decode_kv16_pipeline,
+        (false, KvOperand::F32) => &k.attention_decode_pipeline,
+        // Unreachable by construction, not by env state: a Q8 witness can only come from
+        // `ResidentDecodeState::new`, which refuses `kvq8` unless
+        // `head_dim.is_multiple_of(32) && head_dim <= 128` -- exactly the `v2` predicate,
+        // whose first disjunct `kv == KvOperand::Q8` is then true. Reading the format from
+        // the process-global made this arm reachable (and a panic) on any head_dim > 128
+        // lane under `CAMELID_METAL_KV_DTYPE=q8`.
+        (false, KvOperand::Q8) => unreachable!("Q8 KV requires the v2 geometry"),
     };
     e.set_compute_pipeline_state(attn_pipeline);
     e.set_buffer(0, Some(query), query_off);
@@ -18395,6 +18481,13 @@ fn encode_attention_tree(
     query: &Buffer,
     keys: &Buffer,
     values: &Buffer,
+    // Element type of `keys`/`values`. Always `F32` in practice: `verify_batch_inner`
+    // refuses the tree lane under a compressed primary (`(self.kv16 || self.kvq8) &&
+    // tree.is_some() -> None`), because the tree kernels carry no compressed-primary
+    // non-split twins. Threaded anyway so this encoder routes off the SAME witness as
+    // `encode_attention` -- the two must agree, since their byte-identity is the
+    // correctness anchor for the whole verify lane.
+    kv: KvOperand,
     kv16_mirrors: Option<(&Buffer, &Buffer)>,
     scores: &Buffer,
     out: &Buffer,
@@ -18410,8 +18503,15 @@ fn encode_attention_tree(
 ) {
     let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
+    // Tree split-K is mirror-only -- there is no f32 or Q8 split-K *tree* kernel -- so
+    // admit it on the witness plus the mirrors actually being present, rather than on
+    // `!kv16_enabled()`. The old form read a process-global that this session does not
+    // own: a concurrent kv16 session flipping it would silently drop this f32 session to
+    // the non-split tree kernel, diverging tree verify from the linear `encode_attention`
+    // at the same `position_count`. It also made the `expect` below reachable.
     let splitk = v2
-        && !kv16_enabled()
+        && kv == KvOperand::F32
+        && kv16_mirrors.is_some()
         && splitk_attention_enabled()
         && (1..=4).contains(&group)
         && position_count >= 128;
@@ -18425,7 +18525,7 @@ fn encode_attention_tree(
         // Tree split-K is mirror-only: read the f16 mirrors whenever present (the f32
         // split-K kernel has no tree clone). Under the default config the linear path
         // also reads the mirrors, so the two stay byte-identical.
-        let (mk, mv) = kv16_mirrors.expect("tree split-K requires f16 mirrors");
+        let (mk, mv) = kv16_mirrors.expect("gated on is_some above");
         if head_dim == 128 {
             e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_tree_pipeline);
         } else {
@@ -18481,6 +18581,13 @@ fn encode_attention_tree(
         return;
     }
     // Non-split path: v2 tiled (no scores buffer) or the f32 one-simdgroup fallback.
+    // BOTH tree pipelines declare their K/V operands `device const float*`, so this path
+    // is sound only for an F32 witness. `verify_batch_inner` is what guarantees that.
+    debug_assert_eq!(
+        kv,
+        KvOperand::F32,
+        "tree attention has no compressed-primary kernel; verify_batch_inner must decline"
+    );
     let attn_pipeline = if v2 {
         &k.attention_decode_v2_tree_pipeline
     } else {
@@ -19350,6 +19457,7 @@ fn encode_attention_block(
         &query_buf,
         cache_k_buf,
         cache_v_buf,
+        KvOperand::from_flags(kv16, kvq8),
         kv16_mirrors,
         &scores_buf,
         &ctx_buf,
@@ -20813,6 +20921,9 @@ fn encode_qwen35_full_layer(
         &query,
         cache_k,
         cache_v,
+        // This lane allocates its KV at `n_kv_heads * max_positions * head_dim * 4` —
+        // f32 — and stages no f16 mirrors.
+        KvOperand::F32,
         None,
         &scores,
         &context,
@@ -21908,6 +22019,8 @@ impl Lfm2MetalDecode {
                             &query,
                             cache_k,
                             cache_v,
+                            // LFM2's KV is f32 (`... * head_dim * 4`); no mirrors.
+                            KvOperand::F32,
                             None,
                             &scores,
                             &context,
@@ -22314,6 +22427,9 @@ fn encode_lfm2_attn_layer(
         &query,
         cache_k,
         cache_v,
+        // This lane allocates its KV at `n_kv_heads * max_positions * head_dim * 4` —
+        // f32 — and stages no f16 mirrors.
+        KvOperand::F32,
         None,
         &scores,
         &context,
@@ -27819,6 +27935,7 @@ impl ResidentDecodeState {
                             &q_buf,
                             &self.cache_k[l],
                             &self.cache_v[l],
+                            KvOperand::from_flags(self.kv16, self.kvq8),
                             if self.kv16 || self.kvq8 {
                                 None
                             } else {
@@ -28508,6 +28625,7 @@ impl ResidentDecodeState {
                         &q_buf,
                         &self.cache_k[l],
                         &self.cache_v[l],
+                        KvOperand::from_flags(self.kv16, self.kvq8),
                         if self.kv16 || self.kvq8 {
                             None
                         } else {
@@ -28530,6 +28648,11 @@ impl ResidentDecodeState {
                         &q_buf,
                         &self.cache_k[l],
                         &self.cache_v[l],
+                        // `verify_batch_inner` refuses the tree lane unless the primary is
+                        // f32 with mirrors staged, so this is F32 — but derive it from the
+                        // session rather than hardcoding, so the encoder's own
+                        // `debug_assert` stays a real check.
+                        KvOperand::from_flags(self.kv16, self.kvq8),
                         Some((&self.cache_k16[l], &self.cache_v16[l])),
                         &scores_buf,
                         &ctx_buf,
@@ -30127,6 +30250,89 @@ mod tests {
         // An F16 primary is admitted only behind its own gate.
         assert!(!splitk_kv_format_admits(true, false));
         assert!(splitk_kv_format_admits(true, true));
+    }
+
+    /// `encode_attention` must take the K/V element type from the CALLER'S WITNESS, never
+    /// from process-global env state or from the absence of f16 mirrors.
+    ///
+    /// The old dispatch inferred "f16 primary" from `kv16_mirrors.is_none()`. That is a
+    /// sound inference for `ResidentDecodeState`, which allocates mirrors exactly when the
+    /// primary is f32 — but `encode_attention` is shared. `encode_gemma4_attention`,
+    /// `encode_qwen35_full_layer`, `Lfm2MetalDecode::forward_prefill_chunk` and
+    /// `encode_lfm2_attn_layer` all own unconditionally-f32 KV caches and pass `None` for
+    /// mirrors, so they took the F16 arm and bound f32 bytes to a `device const half*`
+    /// kernel — reading each f32 as two halves and returning plausible garbage.
+    ///
+    /// It was live on the shipped CLI: `apply_default_fast_stack` sets
+    /// `CAMELID_METAL_ATTN2=1`, `splitk_attention_enabled()` defaults on, and
+    /// `splitk_kv_format_admits(false, _)` admits the f32 lane, so any of those models at
+    /// `position_count >= 128` with `group in 1..=4` hit it. Their parity fixtures stop
+    /// well short of 128 positions, so token-identity could never see it — the same
+    /// measurement blind spot that shipped the CUDA `attention_batched_q8_0` defect.
+    ///
+    /// Needs no GPU: this is routing policy, not dispatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn splitk_kv_source_follows_the_caller_witness_not_the_absence_of_mirrors() {
+        use super::{splitk_kv_source, KvOperand, SplitkKvSource};
+
+        // THE REGRESSION. An f32 cache with no mirrors staged must read the f32 primary.
+        // Before the witness this returned the F16 primary and mis-typed the operand.
+        assert_eq!(
+            splitk_kv_source(KvOperand::F32, false, true),
+            SplitkKvSource::PrimaryF32,
+            "an f32 cache without mirrors must not be read as an f16 primary"
+        );
+        assert_eq!(
+            splitk_kv_source(KvOperand::F32, false, false),
+            SplitkKvSource::PrimaryF32
+        );
+
+        // An f32 primary with mirrors staged reads the mirrors, unless opted out.
+        assert_eq!(
+            splitk_kv_source(KvOperand::F32, true, true),
+            SplitkKvSource::MirrorsF16
+        );
+        assert_eq!(
+            splitk_kv_source(KvOperand::F32, true, false),
+            SplitkKvSource::PrimaryF32,
+            "CAMELID_METAL_ATTN_SPLITK_KV16=0 keeps the f32 reads"
+        );
+
+        // A genuine f16 primary is read in place, mirrors or not — it has none.
+        for mirrors in [false, true] {
+            for enabled in [false, true] {
+                assert_eq!(
+                    splitk_kv_source(KvOperand::F16, mirrors, enabled),
+                    SplitkKvSource::PrimaryF16
+                );
+            }
+        }
+
+        // Q8 always reads its own 34-byte-block cache; mirrors are never staged for it.
+        for mirrors in [false, true] {
+            for enabled in [false, true] {
+                assert_eq!(
+                    splitk_kv_source(KvOperand::Q8, mirrors, enabled),
+                    SplitkKvSource::PrimaryQ8
+                );
+            }
+        }
+    }
+
+    /// The witness derived from a session's `(kv16, kvq8)` pair. `ResidentDecodeState::new`
+    /// makes the two mutually exclusive, but the mapping is load-bearing enough to pin:
+    /// getting it backwards binds a Q8 block cache to a half-typed kernel.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kv_operand_from_flags_maps_the_session_format() {
+        use super::KvOperand;
+
+        assert_eq!(KvOperand::from_flags(false, false), KvOperand::F32);
+        assert_eq!(KvOperand::from_flags(true, false), KvOperand::F16);
+        assert_eq!(KvOperand::from_flags(false, true), KvOperand::Q8);
+        // Mutually exclusive at construction; Q8 is the narrower layout, so it wins.
+        assert_eq!(KvOperand::from_flags(true, true), KvOperand::Q8);
     }
 
     /// The F16-primary resident KV cache is qualified for the K-quant lane, so
