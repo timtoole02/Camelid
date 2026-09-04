@@ -6760,6 +6760,48 @@ fn gemma4_dense_verify_width_admitted(width: usize) -> bool {
     matches!(width, 1 | 2 | 4 | 8 | 16)
 }
 
+/// Largest admitted ordered-Q4 target width that fits the remaining
+/// teacher-forced prompt. Prompt tokens have no sampling dependency on the
+/// target's intermediate predictions, so a complete chunk can be committed as
+/// one causal verifier batch while preserving the K=1 arithmetic universe.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_ordered_q4_prefill_chunk_width(remaining: usize) -> Option<usize> {
+    [16usize, 8, 4, 2, 1]
+        .into_iter()
+        .find(|&width| width <= remaining)
+}
+
+#[cfg(test)]
+mod gemma4_ordered_q4_prefill_chunk_tests {
+    use super::gemma4_ordered_q4_prefill_chunk_width;
+
+    fn plan(mut remaining: usize) -> Vec<usize> {
+        let mut widths = Vec::new();
+        while let Some(width) = gemma4_ordered_q4_prefill_chunk_width(remaining) {
+            widths.push(width);
+            remaining -= width;
+        }
+        widths
+    }
+
+    #[test]
+    fn greedily_covers_every_prompt_tail_with_admitted_widths() {
+        assert!(plan(0).is_empty());
+        assert_eq!(plan(1), [1]);
+        assert_eq!(plan(15), [8, 4, 2, 1]);
+        assert_eq!(plan(16), [16]);
+        assert_eq!(plan(31), [16, 8, 4, 2, 1]);
+        assert_eq!(plan(48), [16, 16, 16]);
+        for prompt_len in 1..=128 {
+            let widths = plan(prompt_len);
+            assert_eq!(widths.iter().sum::<usize>(), prompt_len);
+            assert!(widths
+                .iter()
+                .all(|width| matches!(width, 1 | 2 | 4 | 8 | 16)));
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Gemma4DenseVerifierState {
     fn claim_established(&mut self, position: usize) -> bool {
@@ -7462,6 +7504,137 @@ pub struct Gemma4Mtp12MetalGeneration {
     pub assistant_source_path: std::path::PathBuf,
     pub assistant_resident_ledger: Gemma4Mtp12MetalResidentLedgerReceipt,
     pub stats: Gemma4Mtp12MetalStats,
+}
+
+/// Completion state for serve-safe lossless MTP12 generation.
+///
+/// Both variants retain the complete native generation receipt accumulated up
+/// to the round boundary. Cancellation is therefore distinct from an inference
+/// error without discarding the target-verification, timing, or resident-model
+/// evidence that was already produced for the request.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum Gemma4Mtp12MetalGenerationOutcome {
+    Complete(Gemma4Mtp12MetalGeneration),
+    Cancelled(Gemma4Mtp12MetalGeneration),
+}
+
+/// Incremental text release for target-verified token ids.
+///
+/// Gemma's SPM byte-fallback tokens may end a verifier round partway through a
+/// UTF-8 scalar. `Tokenizer::decode` intentionally returns the valid prefix and
+/// withholds that incomplete suffix. Keep the smallest token suffix responsible
+/// for the withheld bytes, so a later verified round can complete the scalar;
+/// clearing the whole batch here would silently lose those bytes. This state is
+/// deliberately independent of verifier scheduling so it can also cover a
+/// one-token budget tail.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default)]
+struct Gemma4Mtp12StableTextStream {
+    pending_token_ids: Vec<u32>,
+    emitted_text: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Gemma4Mtp12StableTextStream {
+    fn push_verified<F, D>(
+        &mut self,
+        verified_token_ids: &[u32],
+        mut decode: D,
+        on_delta: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str),
+        D: FnMut(&[u32]) -> Result<String>,
+    {
+        for &token_id in verified_token_ids {
+            self.pending_token_ids.push(token_id);
+            let valid_text = decode(&self.pending_token_ids)?;
+            if valid_text.is_empty() {
+                continue;
+            }
+
+            // Select the shortest prefix which accounts for every currently
+            // decodable character and leaves only an undecodable suffix. For
+            // `[ASCII, UTF8_LEAD]`, this emits ASCII while retaining the lead;
+            // once all continuation bytes arrive, the completed scalar itself
+            // becomes that shortest prefix and is emitted exactly once.
+            let mut consumed = None;
+            for prefix_len in 1..=self.pending_token_ids.len() {
+                if decode(&self.pending_token_ids[..prefix_len])? == valid_text
+                    && decode(&self.pending_token_ids[prefix_len..])?.is_empty()
+                {
+                    consumed = Some(prefix_len);
+                    break;
+                }
+            }
+            let consumed = consumed.ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "MTP stable text decoder could not isolate its valid token prefix".into(),
+                )
+            })?;
+            on_delta(&valid_text);
+            self.emitted_text.push_str(&valid_text);
+            self.pending_token_ids.drain(..consumed);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gemma4_mtp12_stable_text_stream_tests {
+    use super::Gemma4Mtp12StableTextStream;
+
+    fn decode_byte_fallback_prefix(token_ids: &[u32]) -> crate::Result<String> {
+        let bytes: Vec<u8> = token_ids.iter().map(|id| *id as u8).collect();
+        Ok(match std::str::from_utf8(&bytes) {
+            Ok(text) => text.to_owned(),
+            Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()])
+                .unwrap_or("")
+                .to_owned(),
+        })
+    }
+
+    #[test]
+    fn verified_byte_fallback_waits_for_complete_utf8_without_losing_valid_prefix() {
+        let mut stream = Gemma4Mtp12StableTextStream::default();
+        let mut deltas = Vec::<String>::new();
+        {
+            let mut capture = |delta: &str| deltas.push(delta.to_owned());
+            stream
+                .push_verified(
+                    &[u32::from(b'A'), 0xf0],
+                    decode_byte_fallback_prefix,
+                    &mut capture,
+                )
+                .unwrap();
+        }
+        assert_eq!(deltas, ["A"]);
+        assert_eq!(stream.pending_token_ids, [0xf0]);
+
+        {
+            let mut capture = |delta: &str| deltas.push(delta.to_owned());
+            stream
+                .push_verified(&[0x9f, 0x98], decode_byte_fallback_prefix, &mut capture)
+                .unwrap();
+        }
+        assert_eq!(deltas, ["A"]);
+        assert_eq!(stream.pending_token_ids, [0xf0, 0x9f, 0x98]);
+
+        {
+            let mut capture = |delta: &str| deltas.push(delta.to_owned());
+            stream
+                .push_verified(
+                    &[0x80, u32::from(b'!')],
+                    decode_byte_fallback_prefix,
+                    &mut capture,
+                )
+                .unwrap();
+        }
+        assert_eq!(deltas, ["A", "😀", "!"]);
+        assert!(stream.pending_token_ids.is_empty());
+        assert_eq!(stream.emitted_text, "A😀!");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -8672,10 +8845,12 @@ impl Gemma4GpuRuntime {
     }
 
     /// Start a new ordered-Q4 sequence and replay the exact tokenizer prompt
-    /// (`encode(prompt, true, true)`) from position zero through authoritative
-    /// K=1 steps. Every prompt input row is committed. The final prompt
-    /// prediction is the first output token; the matching final hidden row is
-    /// returned for the first MTP recurrence.
+    /// (`encode(prompt, true, true)`) from position zero. Teacher-forced input
+    /// rows are grouped into the largest admitted causal verifier chunks
+    /// (16/8/4/2/1); unlike generated drafts, prompt rows never depend on the
+    /// target's intermediate argmax, so every physical row is authoritative and
+    /// committed. The final prompt prediction is the first output token; the
+    /// matching final hidden row is returned for the first MTP recurrence.
     pub fn prefill_ordered_q4(&self, prompt: &str) -> Result<Gemma4OrderedQ4Prefill> {
         let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
         if prompt_tokens.is_empty() {
@@ -8687,9 +8862,26 @@ impl Gemma4GpuRuntime {
         let started = std::time::Instant::now();
         let mut first_greedy_id = 0u32;
         let mut pending_target_raw_hidden = Vec::new();
-        for (position, &token) in prompt_tokens.iter().enumerate() {
-            (first_greedy_id, pending_target_raw_hidden) =
-                self.forward_greedy_ordered_q4(token, position)?;
+        let mut position = 0usize;
+        while position < prompt_tokens.len() {
+            let remaining = prompt_tokens.len() - position;
+            let width = gemma4_ordered_q4_prefill_chunk_width(remaining)
+                .expect("non-empty prompt tail has an admitted verifier width");
+            let batch = self.verify_consecutive_greedy(
+                &prompt_tokens[position..position + width],
+                position,
+            )?;
+            let Some((&last_greedy_id, last_hidden)) =
+                batch.greedy_ids.last().zip(batch.final_hidden.last())
+            else {
+                let _ = self.rollback_verifier_batch(batch.ticket);
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "ordered-Q4 prompt batch W{width} returned no final prediction or hidden row"
+                )));
+            };
+            first_greedy_id = last_greedy_id;
+            pending_target_raw_hidden = last_hidden.clone();
+            position = self.commit_verifier_prefix(batch.ticket, width)?;
         }
         Ok(Gemma4OrderedQ4Prefill {
             prompt_token_count: prompt_tokens.len(),
@@ -8985,6 +9177,234 @@ impl Gemma4GpuRuntime {
         max_new: usize,
         verify_width: usize,
     ) -> Result<Gemma4Mtp12MetalGeneration> {
+        match self.generate_greedy_mtp12_ordered_q4_controlled(
+            assistant,
+            prompt,
+            max_new,
+            verify_width,
+            None::<fn(&str)>,
+            || false,
+        )? {
+            Gemma4Mtp12MetalGenerationOutcome::Complete(generation) => Ok(generation),
+            Gemma4Mtp12MetalGenerationOutcome::Cancelled(_) => unreachable!(),
+        }
+    }
+
+    /// Serve-safe streaming counterpart to
+    /// [`Self::generate_greedy_mtp12_ordered_q4`]. Text is released only after
+    /// the target verifier has committed the corresponding logical rows. The
+    /// cancellation predicate is sampled at round boundaries, where neither a
+    /// target verifier ticket nor a partially-consumed assistant proposal is
+    /// live. A cancelled request returns its partial native receipt rather than
+    /// turning a disconnected HTTP owner into an inference failure.
+    pub fn generate_greedy_mtp12_ordered_q4_streaming_cancellable<
+        F: FnMut(&str),
+        C: FnMut() -> bool,
+    >(
+        &self,
+        assistant: &mut crate::metal::Gemma4Mtp12AssistantMetal,
+        prompt: &str,
+        max_new: usize,
+        verify_width: usize,
+        on_delta: F,
+        should_cancel: C,
+    ) -> Result<Gemma4Mtp12MetalGenerationOutcome> {
+        self.generate_greedy_mtp12_ordered_q4_controlled(
+            assistant,
+            prompt,
+            max_new,
+            verify_width,
+            Some(on_delta),
+            should_cancel,
+        )
+    }
+
+    /// Replay a caller-supplied render draft only after this exact target has
+    /// independently proved every token greedy for `prompt`. The first token is
+    /// checked against the target's post-prefill argmax; later tokens are
+    /// teacher-forced through causal verifier batches and compared with the
+    /// target prediction at their own positions before their text is released.
+    ///
+    /// This is deliberately not a cache or a trusted presentation shortcut: a
+    /// single out-of-vocabulary id, stop id, or target mismatch fails closed.
+    /// The assistant handle is retained solely to bind the same admitted lane
+    /// identity and resident ledger into the terminal MTP12 diagnostics.
+    pub fn render_target_verified_mtp12_ordered_q4_streaming_cancellable<
+        F: FnMut(&str),
+        C: FnMut() -> bool,
+    >(
+        &self,
+        assistant: &crate::metal::Gemma4Mtp12AssistantMetal,
+        prompt: &str,
+        render_draft_token_ids: &[u32],
+        verify_width: usize,
+        mut on_delta: F,
+        mut should_cancel: C,
+    ) -> Result<Gemma4Mtp12MetalGenerationOutcome> {
+        if !matches!(verify_width, 2 | 4 | 8 | 16) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 target-verified render width is {verify_width}, expected 2, 4, 8, or 16"
+            )));
+        }
+        if render_draft_token_ids.is_empty() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "Gemma 4 target-verified render draft must contain at least one token".into(),
+            ));
+        }
+        let vocab_size = self.vocab;
+        if let Some((index, token_id)) = render_draft_token_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, token_id)| *token_id as usize >= vocab_size)
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 target-verified render draft token {index} has id {token_id}, outside vocabulary size {vocab_size}"
+            )));
+        }
+
+        let target_identity_us = self.admit_mtp12_target_identity()?;
+        let prefill = self.prefill_ordered_q4(prompt)?;
+        let stop_ids = gemma4_stop_token_ids(&self.tokenizer);
+        if let Some((index, token_id)) = render_draft_token_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, token_id)| stop_ids.contains(token_id))
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 target-verified render draft contains terminal stop id {token_id} at output index {index}"
+            )));
+        }
+        if prefill.first_greedy_id != render_draft_token_ids[0] {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 target-verified render draft mismatched at output index 0: draft {}, target {}",
+                render_draft_token_ids[0], prefill.first_greedy_id,
+            )));
+        }
+
+        let mut stats = Gemma4Mtp12MetalStats {
+            configured_verify_width: verify_width,
+            width_schedule: Gemma4Mtp12WidthScheduleProvenance {
+                selector: "camelid_target_verified_render_draft_token_ids",
+                selector_value: Some(verify_width.to_string()),
+                enabled: true,
+                active_for_configured_width: true,
+                warmup_verify_width: None,
+                padded_tail_policy: None,
+                policy: "caller_render_draft;target_greedy_verified_before_emit;largest_exact_tail_width",
+            },
+            target_identity_us,
+            prefill_us: prefill.prefill_us,
+            ..Gemma4Mtp12MetalStats::default()
+        };
+        let decode_started = std::time::Instant::now();
+        let mut text_stream = Gemma4Mtp12StableTextStream::default();
+        let mut generated = Vec::with_capacity(render_draft_token_ids.len());
+        generated.push(render_draft_token_ids[0]);
+        text_stream.push_verified(
+            &render_draft_token_ids[..1],
+            |ids| self.tokenizer.decode(ids, true),
+            &mut on_delta,
+        )?;
+
+        let mut verified_outputs = 1usize;
+        let mut cancelled = false;
+        while verified_outputs < render_draft_token_ids.len() {
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
+            let remaining_predictions = render_draft_token_ids.len() - verified_outputs;
+            let width = gemma4_ordered_q4_prefill_chunk_width(remaining_predictions)
+                .expect("non-empty render tail has an admitted verifier width")
+                .min(verify_width);
+            let input_start = verified_outputs - 1;
+            let candidates = &render_draft_token_ids[input_start..input_start + width];
+            let expected = &render_draft_token_ids[verified_outputs..verified_outputs + width];
+            let position = prefill.prompt_token_count + input_start;
+            let verify_started = std::time::Instant::now();
+            let target_batch = self.verify_consecutive_greedy(candidates, position)?;
+            let target_verify_us = verify_started.elapsed().as_micros();
+            if target_batch.greedy_ids.len() != width {
+                let _ = self.rollback_verifier_batch(target_batch.ticket);
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "Gemma 4 target-verified render W{width} returned {} target predictions",
+                    target_batch.greedy_ids.len(),
+                )));
+            }
+            if let Some(relative) = target_batch
+                .greedy_ids
+                .iter()
+                .zip(expected)
+                .position(|(target, draft)| target != draft)
+            {
+                let _ = self.rollback_verifier_batch(target_batch.ticket);
+                let output_index = verified_outputs + relative;
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "Gemma 4 target-verified render draft mismatched at output index {output_index}: draft {}, target {}",
+                    expected[relative], target_batch.greedy_ids[relative],
+                )));
+            }
+            self.commit_verifier_prefix(target_batch.ticket, width)?;
+
+            generated.extend_from_slice(expected);
+            text_stream.push_verified(
+                expected,
+                |ids| self.tokenizer.decode(ids, true),
+                &mut on_delta,
+            )?;
+            verified_outputs += width;
+            stats.rounds += 1;
+            stats.drafted += width as u64;
+            stats.accepted_drafts += width as u64;
+            stats.committed_input_rows += width as u64;
+            stats.target_verify_rows += width as u64;
+            stats.target_verify_us = stats.target_verify_us.saturating_add(target_verify_us);
+            if width < verify_width {
+                stats.budget_tail_rounds += 1;
+            }
+        }
+
+        stats.decode_us = decode_started.elapsed().as_micros();
+        stats.emitted_tokens = generated.len() as u64;
+        let text = self.tokenizer.decode(&generated, true)?;
+        if text != text_stream.emitted_text {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "MTP target-verified render stream differed from final target decode: streamed {} bytes, final {} bytes",
+                text_stream.emitted_text.len(),
+                text.len(),
+            )));
+        }
+        let generation = Gemma4Mtp12MetalGeneration {
+            text,
+            token_ids: generated,
+            prompt_token_count: prefill.prompt_token_count,
+            target_model_sha256: crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
+            assistant_model_sha256: crate::metal::GEMMA4_12B_MTP_ASSISTANT_SHA256,
+            assistant_source_path: assistant.source_path().to_path_buf(),
+            assistant_resident_ledger: assistant.resident_ledger().into(),
+            stats,
+        };
+        Ok(if cancelled {
+            Gemma4Mtp12MetalGenerationOutcome::Cancelled(generation)
+        } else {
+            Gemma4Mtp12MetalGenerationOutcome::Complete(generation)
+        })
+    }
+
+    fn generate_greedy_mtp12_ordered_q4_controlled<
+        F: FnMut(&str),
+        C: FnMut() -> bool,
+    >(
+        &self,
+        assistant: &mut crate::metal::Gemma4Mtp12AssistantMetal,
+        prompt: &str,
+        max_new: usize,
+        verify_width: usize,
+        mut on_delta: Option<F>,
+        mut should_cancel: C,
+    ) -> Result<Gemma4Mtp12MetalGenerationOutcome> {
         if !matches!(verify_width, 2 | 4 | 8 | 16) {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "Gemma 4 MTP target verify width is {verify_width}, expected 2, 4, 8, or 16"
@@ -9068,8 +9488,14 @@ impl Gemma4GpuRuntime {
         let mut pending_target_raw_hidden = prefill.pending_target_raw_hidden;
         let mut position = prefill.prompt_token_count;
         let decode_started = std::time::Instant::now();
+        let mut text_stream = Gemma4Mtp12StableTextStream::default();
+        let mut cancelled = false;
 
         while generated.len() < max_new {
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
             if stop_ids.contains(&anchor_token) {
                 stats.terminal_stop_token = Some(anchor_token);
                 break;
@@ -9079,6 +9505,13 @@ impl Gemma4GpuRuntime {
                 // `anchor_token` is already the target's exact next output.  At
                 // a one-token budget tail there is no reason to forward it.
                 generated.push(anchor_token);
+                if let Some(on_delta) = on_delta.as_mut() {
+                    text_stream.push_verified(
+                        &[anchor_token],
+                        |ids| self.tokenizer.decode(ids, true),
+                        on_delta,
+                    )?;
+                }
                 break;
             };
             let logical_width = round_plan.logical_verify_width;
@@ -9150,6 +9583,13 @@ impl Gemma4GpuRuntime {
                 ));
             }
             generated.extend_from_slice(&emitted_token_ids);
+            if let Some(on_delta) = on_delta.as_mut() {
+                text_stream.push_verified(
+                    &emitted_token_ids,
+                    |ids| self.tokenizer.decode(ids, true),
+                    on_delta,
+                )?;
+            }
 
             stats.rounds += 1;
             stats.drafted += draft_k as u64;
@@ -9227,8 +9667,20 @@ impl Gemma4GpuRuntime {
         }
         stats.decode_us = decode_started.elapsed().as_micros();
         stats.emitted_tokens = generated.len() as u64;
-        let text = self.tokenizer.decode(&generated, true)?;
-        Ok(Gemma4Mtp12MetalGeneration {
+        let text = if on_delta.is_some() {
+            let final_text = self.tokenizer.decode(&generated, true)?;
+            if final_text != text_stream.emitted_text {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "MTP stable text stream differed from final target decode: streamed {} bytes, final {} bytes",
+                    text_stream.emitted_text.len(),
+                    final_text.len(),
+                )));
+            }
+            final_text
+        } else {
+            self.tokenizer.decode(&generated, true)?
+        };
+        let generation = Gemma4Mtp12MetalGeneration {
             text,
             token_ids: generated,
             prompt_token_count: prefill.prompt_token_count,
@@ -9237,6 +9689,11 @@ impl Gemma4GpuRuntime {
             assistant_source_path: assistant.source_path().to_path_buf(),
             assistant_resident_ledger: assistant.resident_ledger().into(),
             stats,
+        };
+        Ok(if cancelled {
+            Gemma4Mtp12MetalGenerationOutcome::Cancelled(generation)
+        } else {
+            Gemma4Mtp12MetalGenerationOutcome::Complete(generation)
         })
     }
 

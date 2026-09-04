@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     env, mem,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -565,6 +565,9 @@ pub enum Gemma4ServeLane {
     Local,
     Distributed,
     Cuda,
+    /// Exact Gemma 4 12B QAT Q4_0 target plus the pinned MTP12 assistant on
+    /// Apple Metal. This lane is never selected implicitly.
+    Mtp12Metal,
 }
 
 /// Effective accelerator serving the single-node Ghost-MoE lane.
@@ -903,6 +906,16 @@ pub struct ChatCompletionRequest {
     /// channels are stripped from chat output either way. Default: false (the
     /// reference's `enable_thinking:false` rendering).
     pub camelid_enable_thinking: Option<bool>,
+    /// Private two-pass presentation seam. These ids are never trusted as
+    /// output: only the exact MTP12 target lane may accept them, and each id is
+    /// target-greedy-verified for this request's rendered prompt before its text
+    /// enters the SSE stream.
+    pub camelid_target_verified_render_draft_token_ids: Option<Vec<u32>>,
+    /// Private capture-only synthesis seam. Each prepared section is rendered
+    /// against its own messages and target-greedy-verified before any text is
+    /// emitted. The route admits only the exact hash-pinned MTP12 Metal lane,
+    /// and every section must fit the receipted 512-position envelope.
+    pub camelid_target_verified_render_segments: Option<Vec<CamelidTargetVerifiedRenderSegment>>,
     /// Private Prism image sizing extensions. Values are merged image-token
     /// counts (Qwen3-VL emits one token per aligned 32x32-pixel tile).
     pub camelid_image_min_tokens: Option<u32>,
@@ -941,6 +954,12 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CamelidTargetVerifiedRenderSegment {
+    pub messages: Vec<ChatMessage>,
+    pub token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3453,9 +3472,39 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         || runnable_serve_ready
         || dg_serve_ready
         || model.is_some_and(loaded_model_generation_ready);
-    let active_context_length = model
-        .and_then(|model| model.llama_config.as_ref())
-        .map(|config| config.context_length);
+    // The explicit MTP12 runtime allocates a bounded resident KV cache. Report
+    // that allocation, never the model metadata's much larger training window,
+    // so Web Auto budgets the actual lane that will execute the request.
+    let runtime_context_length = gemma4_runtime
+        .as_deref()
+        .and_then(Gemma4ServeRuntime::effective_context_length);
+    let runtime_context_headroom = gemma4_runtime
+        .as_deref()
+        .map(Gemma4ServeRuntime::reserved_context_headroom)
+        .unwrap_or(0);
+    let runtime_usable_context =
+        runtime_context_length.map(|context| context.saturating_sub(runtime_context_headroom));
+    let active_context_length = runtime_context_length.or_else(|| {
+        model
+            .and_then(|model| model.llama_config.as_ref())
+            .map(|config| config.context_length)
+    });
+    let max_prompt_tokens = runtime_usable_context
+        .map(|context| {
+            state
+                .server_limits
+                .max_prompt_tokens
+                .min(context.saturating_sub(1) as usize)
+        })
+        .unwrap_or(state.server_limits.max_prompt_tokens);
+    let max_generation_tokens = runtime_usable_context
+        .map(|context| {
+            state
+                .server_limits
+                .max_generation_tokens
+                .min(context.saturating_sub(1))
+        })
+        .unwrap_or(state.server_limits.max_generation_tokens);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
         .as_ref()
@@ -3509,8 +3558,8 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         loaded_now,
         generation_ready,
         active_context_length,
-        max_prompt_tokens: state.server_limits.max_prompt_tokens,
-        max_generation_tokens: state.server_limits.max_generation_tokens,
+        max_prompt_tokens,
+        max_generation_tokens,
         vision_ready,
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
@@ -3766,6 +3815,7 @@ mod gemma4_serve_lane_health_tests {
             ("ghost".to_string(), Gemma4ServeLane::GhostMoe),
             ("local".to_string(), Gemma4ServeLane::Local),
             ("distributed".to_string(), Gemma4ServeLane::Distributed),
+            ("mtp12".to_string(), Gemma4ServeLane::Mtp12Metal),
         ]);
         assert_eq!(
             active_gemma4_serve_lane(Some("ghost"), &lanes),
@@ -3782,6 +3832,7 @@ mod gemma4_serve_lane_health_tests {
             (Gemma4ServeLane::GhostMoe, "ghost_moe"),
             (Gemma4ServeLane::Local, "local"),
             (Gemma4ServeLane::Distributed, "distributed"),
+            (Gemma4ServeLane::Mtp12Metal, "mtp12_metal"),
         ] {
             assert_eq!(serde_json::to_value(lane).unwrap(), expected);
         }
@@ -6618,6 +6669,48 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "durable current-head refresh, bounded context buckets through the distributed lane, and performance/RSS gates before any wider 12B claim; single-node support is not a goal on 16GB hosts",
             },
             ModelCompatibilityTarget {
+                id: "gemma4_12b_it_qat_q4_0_mtp12",
+                tool_capable: false,
+                family: "gemma4_dense_decoder_mtp12",
+                quantization: "Q4_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_single_node_base_m4_mini_mac16_10_macos_26_5_metal_lossless_mtp12_performance_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "the supported claim is pinned to one target SHA and one assistant SHA on Apple Metal with the explicit MTP12 serve opt-in; the 51 tok/s receipts cover a 96-token qualification prompt at a 512-row KV capacity, not arbitrary long-form quality or a bounded-context ladder; portability, normalized API/WebUI evidence, broader prompts, and durable current-head performance/RSS gates remain pending",
+                metadata_parses: "validated_exact_gemma4_12b_qat_q4_0_target",
+                tokenizer_works: "validated_for_gemma4_spm",
+                tensors_load: "validated_single_node_metal_resident_q4_0_target_plus_exact_resident_mtp12_assistant",
+                generation_runs: "lossless_ordered_target_verified_mtp12_greedy_decode",
+                parity_audited: "ordered_k1_token_ids_and_text_exact_for_the_qualified_96_token_run",
+                performance_measured: "51_494_tok_s_confirmation_51_305_two_run_mean_51_399_zero_swap_on_base_m4_16gb",
+                frontend_load_path_verified: "explicit_mtp12_api_serve_lane_pending_normalized_webui_capture",
+                frontend_readiness_gate: "green only on the receipted base-M4 Mac mini profile (Mac16,10 / Apple M4 / macOS 26.5.x / Metal available) when the exact target filename and SHA match this row, CAMELID_GEMMA4_MTP12_ASSISTANT names the exact admitted assistant, and health reports the mtp12_metal serve lane",
+                tested_context: "96_output_token_performance_qualification_with_512_row_kv_capacity",
+                chat_template_renderer: "gemma4_marker",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "performance_qualification_only_not_promoted_as_context_pack",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "single_node_macos_metal_mtp12_96_token_performance_qualification",
+                latest_checked_result: "pass",
+                latest_checked_output: "51.494 tok/s; confirmation 51.305 tok/s; ordered-K1 token ids and text exact; zero swaps",
+                evidence: "The exact Gemma 4 12B QAT Q4_0 target (SHA-256 93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b) and exact official MTP12 assistant (SHA-256 67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6) ran the lossless ordered target-verification lane on a 16GB base Apple M4. The primary 96-token qualification measured 51.493947835 tok/s and the confirmation measured 51.304677961 tok/s (mean 51.399), with ordered-K1 token IDs and decoded text exact and zero swaps. The winning selector was CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1. These are native decode-forward receipts using (emitted_tokens-1)/decode_us; they do not establish response quality or transfer that rate to arbitrary prompts/context sizes.",
+                next_step: "capture the normalized long-form API/WebUI run at a larger KV allocation, verify quality and memory behavior, and add bounded-context and portable performance gates before widening this exact-row claim",
+            },
+            ModelCompatibilityTarget {
                 id: "gemma4_26b_a4b_it_q4_0",
                 tool_capable: false,
                 family: "gemma4_a4b_moe_decoder",
@@ -8815,6 +8908,133 @@ fn gemma4_serve_flag(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+const GEMMA4_MTP12_ASSISTANT_ENV: &str = "CAMELID_GEMMA4_MTP12_ASSISTANT";
+const GEMMA4_MTP12_MAX_POSITIONS_ENV: &str = "CAMELID_GEMMA4_MTP12_MAX_POSITIONS";
+const GEMMA4_MTP12_VERIFY_WIDTH_ENV: &str = "CAMELID_GEMMA4_MTP12_VERIFY_WIDTH";
+const GEMMA4_MTP12_QUALIFIED_TARGET_SHA256: &str =
+    "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b";
+const GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256: &str =
+    "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6";
+const DEFAULT_GEMMA4_MTP12_MAX_POSITIONS: usize = 4096;
+const DEFAULT_GEMMA4_MTP12_VERIFY_WIDTH: usize = 16;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Gemma4Mtp12ServeConfig {
+    assistant_path: PathBuf,
+    max_positions: usize,
+    verify_width: usize,
+}
+
+/// Parse the explicit single-node MTP12 serve lane. The assistant path is the
+/// opt-in; setting either tuning variable without it is a half-configuration
+/// and fails closed instead of silently serving through the scalar runtime.
+fn parse_gemma4_mtp12_serve_config(
+    assistant_path: Option<PathBuf>,
+    max_positions: Option<&str>,
+    verify_width: Option<&str>,
+) -> std::result::Result<Option<Gemma4Mtp12ServeConfig>, String> {
+    let Some(assistant_path) = assistant_path else {
+        if max_positions.is_some() || verify_width.is_some() {
+            return Err(format!(
+                "{GEMMA4_MTP12_MAX_POSITIONS_ENV}/{GEMMA4_MTP12_VERIFY_WIDTH_ENV} require {GEMMA4_MTP12_ASSISTANT_ENV}"
+            ));
+        }
+        return Ok(None);
+    };
+    if assistant_path.as_os_str().is_empty() {
+        return Err(format!("{GEMMA4_MTP12_ASSISTANT_ENV} must name a file"));
+    }
+    let max_positions = match max_positions {
+        Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            format!("{GEMMA4_MTP12_MAX_POSITIONS_ENV} must be an integer >= 512, got {raw:?}")
+        })?,
+        None => DEFAULT_GEMMA4_MTP12_MAX_POSITIONS,
+    };
+    if max_positions < 512 {
+        return Err(format!(
+            "{GEMMA4_MTP12_MAX_POSITIONS_ENV} must be >= 512, got {max_positions}"
+        ));
+    }
+    let verify_width = match verify_width {
+        Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            format!("{GEMMA4_MTP12_VERIFY_WIDTH_ENV} must be one of 2, 4, 8, or 16, got {raw:?}")
+        })?,
+        None => DEFAULT_GEMMA4_MTP12_VERIFY_WIDTH,
+    };
+    if !matches!(verify_width, 2 | 4 | 8 | 16) {
+        return Err(format!(
+            "{GEMMA4_MTP12_VERIFY_WIDTH_ENV} must be one of 2, 4, 8, or 16, got {verify_width}"
+        ));
+    }
+    Ok(Some(Gemma4Mtp12ServeConfig {
+        assistant_path,
+        max_positions,
+        verify_width,
+    }))
+}
+
+fn gemma4_mtp12_serve_config() -> std::result::Result<Option<Gemma4Mtp12ServeConfig>, String> {
+    parse_gemma4_mtp12_serve_config(
+        std::env::var_os(GEMMA4_MTP12_ASSISTANT_ENV).map(PathBuf::from),
+        std::env::var(GEMMA4_MTP12_MAX_POSITIONS_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(GEMMA4_MTP12_VERIFY_WIDTH_ENV).ok().as_deref(),
+    )
+}
+
+fn gemma4_mtp12_support_scope_matches(
+    operating_system: &str,
+    architecture: &str,
+    mac_model_identifier: Option<&str>,
+    cpu_model: Option<&str>,
+    operating_system_version: Option<&str>,
+    metal_available: bool,
+    explicit_lane_configured: bool,
+) -> bool {
+    let receipted_macos = operating_system_version
+        .is_some_and(|version| version == "26.5" || version.starts_with("26.5."));
+    operating_system == "macos"
+        && architecture == "aarch64"
+        && mac_model_identifier == Some("Mac16,10")
+        && cpu_model == Some("Apple M4")
+        && receipted_macos
+        && metal_available
+        && explicit_lane_configured
+}
+
+fn gemma4_mtp12_supported_on_current_host() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        static HOST_FACTS: OnceLock<(String, String, String)> = OnceLock::new();
+        static METAL_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        let (model_identifier, cpu_model, operating_system_version) =
+            HOST_FACTS.get_or_init(|| {
+                (
+                    lfm2_support_command_output("sysctl", &["-n", "hw.model"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+                        .unwrap_or_else(|| "unknown".into()),
+                    lfm2_support_command_output("sw_vers", &["-productVersion"])
+                        .unwrap_or_else(|| "unknown".into()),
+                )
+            });
+        gemma4_mtp12_support_scope_matches(
+            env::consts::OS,
+            env::consts::ARCH,
+            Some(model_identifier),
+            Some(cpu_model),
+            Some(operating_system_version),
+            *METAL_AVAILABLE.get_or_init(|| crate::metal::detect_metal_device().available),
+            gemma4_mtp12_serve_config().ok().flatten().is_some(),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 const GEMMA4_GHOST_CGHOST_ENV: &str = "CAMELID_GEMMA4_GHOST_CGHOST";
 const GEMMA4_GHOST_CACHE_MIB_ENV: &str = "CAMELID_GEMMA4_GHOST_CACHE_MIB";
 const GEMMA4_GHOST_STRICT_CACHE_ENV: &str = "CAMELID_GEMMA4_GHOST_STRICT_CACHE";
@@ -9824,6 +10044,510 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn gemma4_mtp12_serve_config_is_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_gemma4_mtp12_serve_config(None, None, None).unwrap(),
+            None
+        );
+        for (max_positions, verify_width) in [(Some("4096"), None), (None, Some("16"))] {
+            let error =
+                parse_gemma4_mtp12_serve_config(None, max_positions, verify_width).unwrap_err();
+            assert!(error.contains(GEMMA4_MTP12_ASSISTANT_ENV));
+        }
+
+        let path = PathBuf::from("/models/assistant/model.safetensors");
+        assert_eq!(
+            parse_gemma4_mtp12_serve_config(Some(path.clone()), None, None).unwrap(),
+            Some(Gemma4Mtp12ServeConfig {
+                assistant_path: path.clone(),
+                max_positions: 4096,
+                verify_width: 16,
+            })
+        );
+        assert_eq!(
+            parse_gemma4_mtp12_serve_config(Some(path), Some("2048"), Some("8")).unwrap(),
+            Some(Gemma4Mtp12ServeConfig {
+                assistant_path: PathBuf::from("/models/assistant/model.safetensors"),
+                max_positions: 2048,
+                verify_width: 8,
+            })
+        );
+
+        for (max_positions, verify_width, expected_env) in [
+            (Some("511"), None, GEMMA4_MTP12_MAX_POSITIONS_ENV),
+            (Some("many"), None, GEMMA4_MTP12_MAX_POSITIONS_ENV),
+            (None, Some("15"), GEMMA4_MTP12_VERIFY_WIDTH_ENV),
+            (None, Some("wide"), GEMMA4_MTP12_VERIFY_WIDTH_ENV),
+        ] {
+            let error = parse_gemma4_mtp12_serve_config(
+                Some(PathBuf::from("assistant.safetensors")),
+                max_positions,
+                verify_width,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected_env), "{error}");
+        }
+    }
+
+    #[test]
+    fn gemma4_mtp12_support_scope_is_the_receipted_base_m4_mini_only() {
+        let scope = |os, arch, model, cpu, version, metal, configured| {
+            gemma4_mtp12_support_scope_matches(os, arch, model, cpu, version, metal, configured)
+        };
+        assert!(scope(
+            "macos",
+            "aarch64",
+            Some("Mac16,10"),
+            Some("Apple M4"),
+            Some("26.5.2"),
+            true,
+            true,
+        ));
+        assert!(scope(
+            "macos",
+            "aarch64",
+            Some("Mac16,10"),
+            Some("Apple M4"),
+            Some("26.5"),
+            true,
+            true,
+        ));
+        for (os, arch, model, cpu, version, metal, configured) in [
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+                false,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                false,
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,11"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4 Pro"),
+                Some("26.5.2"),
+                true,
+                true,
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.6"),
+                true,
+                true,
+            ),
+            (
+                "linux",
+                "aarch64",
+                Some("Mac16,10"),
+                Some("Apple M4"),
+                Some("26.5.2"),
+                true,
+                true,
+            ),
+        ] {
+            assert!(!scope(os, arch, model, cpu, version, metal, configured));
+        }
+    }
+
+    #[test]
+    fn gemma4_mtp12_exact_target_is_hash_pinned_to_its_capability_row() {
+        assert!(filename_is_supported_exact_row(
+            GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME
+        ));
+        assert_eq!(
+            supported_artifact_expected_sha256(GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME),
+            Some("93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b")
+        );
+    }
+
+    #[test]
+    fn gemma4_mtp12_startup_id_canonicalizes_only_the_exact_receipted_artifact() {
+        let exact_path = Path::new("/models/gemma-4-12b-it-qat-q4_0.gguf");
+        let exact_sha = "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b";
+        assert_eq!(
+            canonical_mtp12_startup_model_id(false, exact_path, exact_sha),
+            Some(GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID)
+        );
+        assert_eq!(
+            canonical_mtp12_startup_model_id(false, exact_path, &exact_sha.to_uppercase()),
+            Some(GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID)
+        );
+
+        // Caller-owned ids, neighbouring filenames, and same-named wrong bytes
+        // all retain the generic load pipeline's existing behavior.
+        assert_eq!(
+            canonical_mtp12_startup_model_id(true, exact_path, exact_sha),
+            None
+        );
+        assert_eq!(
+            canonical_mtp12_startup_model_id(
+                false,
+                Path::new("/models/gemma-4-12b-it-Q8_0.gguf"),
+                exact_sha,
+            ),
+            None
+        );
+        assert_eq!(
+            canonical_mtp12_startup_model_id(false, exact_path, &"0".repeat(64)),
+            None
+        );
+    }
+
+    #[test]
+    fn gemma4_mtp12_context_budget_reserves_physical_w16_headroom() {
+        assert!(gemma4_mtp12_context_budget_check(3_000, 1_080, 4_096).is_ok());
+        let error = gemma4_mtp12_context_budget_check(3_000, 1_081, 4_096)
+            .expect_err("one token beyond prompt + output + W16 must fail");
+        assert!(error.contains("4097 resident positions"), "{error}");
+        assert!(
+            error.contains("16 physical W16 verifier headroom"),
+            "{error}"
+        );
+        assert!(gemma4_mtp12_context_budget_check(usize::MAX, 1, 4_096)
+            .unwrap_err()
+            .contains("overflowed"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_mtp12_terminal_diagnostics_use_native_decode_forward_timing() {
+        let generation = crate::gemma4_runtime::Gemma4Mtp12MetalGeneration {
+            text: "ok".to_string(),
+            token_ids: vec![1, 2, 3, 4, 5, 6],
+            prompt_token_count: 3,
+            target_model_sha256: "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+            assistant_model_sha256:
+                "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6",
+            assistant_source_path: PathBuf::from("assistant.safetensors"),
+            assistant_resident_ledger: Default::default(),
+            stats: crate::gemma4_runtime::Gemma4Mtp12MetalStats {
+                configured_verify_width: 16,
+                rounds: 2,
+                drafted: 8,
+                accepted_drafts: 4,
+                emitted_tokens: 6,
+                decode_us: 100_000,
+                ..Default::default()
+            },
+        };
+        let diagnostics = gemma4_mtp12_diagnostics(&generation, None);
+        assert_eq!(diagnostics["mtp12"]["lossless_target_verified"], true);
+        assert_eq!(diagnostics["mtp12"]["decode_output_tokens"], 5);
+        assert_eq!(diagnostics["mtp12"]["decode_tokens_per_second"], 50.0);
+        assert_eq!(diagnostics["mtp12"]["configured_verify_width"], 16);
+        assert_eq!(diagnostics["mtp12"]["accepted_drafts"], 4);
+        assert_eq!(diagnostics["mtp12"]["drafted"], 8);
+        assert_eq!(diagnostics["mtp12"]["alpha"], 2.0);
+        let qualification = &diagnostics["mtp12"]["native_receipt_qualification"];
+        assert_eq!(
+            qualification["workload"],
+            "short_context_lossless_mtp_qualification"
+        );
+        assert_eq!(
+            qualification["primary_decode_tokens_per_second"],
+            51.493947835
+        );
+        assert_eq!(
+            qualification["confirmation_decode_tokens_per_second"],
+            51.304677961
+        );
+        assert_eq!(qualification["mean_decode_tokens_per_second"], 51.399);
+        assert_eq!(qualification["prompt_tokens"], 14);
+        assert_eq!(qualification["output_tokens"], 96);
+        assert_eq!(qualification["max_positions"], 512);
+        assert_eq!(
+            qualification["selector"],
+            "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16"
+        );
+        assert!(gemma4_mtp12_native_receipt_qualification(
+            "03567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+            generation.assistant_model_sha256,
+        )
+        .is_none());
+
+        let render = gemma4_mtp12_diagnostics(&generation, Some(&[1, 2, 3, 4, 5, 6]));
+        assert_eq!(render["target_verified_render"]["token_ids_exact"], true);
+        assert_eq!(render["target_verified_render"]["verified_tokens"], 6);
+        assert_eq!(
+            render["target_verified_render"]["render_tokens_per_second"],
+            50.0
+        );
+        assert_eq!(
+            render["target_verified_render"]["mode"],
+            "caller_token_ids_target_greedy_verify"
+        );
+    }
+
+    #[test]
+    fn target_verified_render_request_shape_is_streaming_exact_and_bounded() {
+        let ids = [11, 12, 13];
+        assert_eq!(
+            validate_target_verified_render_request_shape(true, 1, Some(3), Some(&ids)),
+            Ok(Some(3))
+        );
+        assert_eq!(
+            validate_target_verified_render_request_shape(false, 1, Some(3), Some(&ids))
+                .unwrap_err(),
+            "target-verified render drafts require stream:true"
+        );
+        assert!(
+            validate_target_verified_render_request_shape(true, 2, Some(3), Some(&ids))
+                .unwrap_err()
+                .contains("exactly one choice")
+        );
+        assert!(
+            validate_target_verified_render_request_shape(true, 1, Some(2), Some(&ids))
+                .unwrap_err()
+                .contains("did not equal the draft length")
+        );
+        assert!(
+            validate_target_verified_render_request_shape(true, 1, Some(0), Some(&[]))
+                .unwrap_err()
+                .contains("at least one")
+        );
+        assert_eq!(
+            validate_target_verified_render_request_shape(true, 1, None, None),
+            Ok(None)
+        );
+    }
+
+    fn target_verified_test_segment(token_ids: &[u32]) -> CamelidTargetVerifiedRenderSegment {
+        CamelidTargetVerifiedRenderSegment {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Write one focused roadmap section.".to_string(),
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+            }],
+            token_ids: token_ids.to_vec(),
+        }
+    }
+
+    #[test]
+    fn segmented_target_verified_render_shape_is_private_exact_and_bounded() {
+        let segments = vec![
+            target_verified_test_segment(&[11, 12, 13]),
+            target_verified_test_segment(&[21, 22]),
+        ];
+        assert_eq!(
+            validate_target_verified_segmented_render_request_shape(
+                true,
+                1,
+                Some(5),
+                false,
+                Some(&segments),
+            ),
+            Ok(Some(5))
+        );
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            1,
+            Some(5),
+            true,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("mutually exclusive"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            false,
+            1,
+            Some(5),
+            false,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("stream:true"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            2,
+            Some(5),
+            false,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("exactly one choice"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            1,
+            Some(4),
+            false,
+            Some(&segments),
+        )
+        .unwrap_err()
+        .contains("total draft length 5"));
+        assert!(validate_target_verified_segmented_render_request_shape(
+            true,
+            1,
+            Some(3),
+            false,
+            Some(&segments[..1]),
+        )
+        .unwrap_err()
+        .contains("2..=8 segments"));
+
+        let wire: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemma4_12b_it_qat_q4_0_mtp12",
+            "stream": true,
+            "n": 1,
+            "max_tokens": 5,
+            "camelid_expected_gguf_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+            "camelid_target_verified_render_segments": [
+                {"messages": [{"role": "user", "content": "section one"}], "token_ids": [11, 12, 13]},
+                {"messages": [{"role": "user", "content": "section two"}], "token_ids": [21, 22]}
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_target_verified_render_request(&wire),
+            Ok(Some(5))
+        ));
+        assert_eq!(
+            wire.camelid_target_verified_render_segments
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn segmented_target_verified_render_requires_request_hash_pin_and_512_envelope() {
+        assert!(validate_segmented_render_expected_sha(
+            true,
+            Some(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256)
+        )
+        .is_ok());
+        assert!(validate_segmented_render_expected_sha(
+            true,
+            Some(&GEMMA4_MTP12_QUALIFIED_TARGET_SHA256.to_uppercase())
+        )
+        .is_ok());
+        assert!(validate_segmented_render_expected_sha(true, None)
+            .unwrap_err()
+            .contains("camelid_expected_gguf_sha256"));
+        assert!(
+            validate_segmented_render_expected_sha(true, Some(&"0".repeat(64)))
+                .unwrap_err()
+                .contains(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256)
+        );
+        assert!(gemma4_mtp12_context_budget_check(
+            400,
+            96,
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+        )
+        .is_ok());
+        assert!(gemma4_mtp12_context_budget_check(
+            401,
+            96,
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+        )
+        .unwrap_err()
+        .contains("513 resident positions"));
+    }
+
+    #[test]
+    fn segmented_target_verified_diagnostics_use_ratio_of_native_sums() {
+        fn receipt(
+            prompt_tokens: usize,
+            requested_tokens: usize,
+            decode_output_tokens: u64,
+            decode_us: u64,
+        ) -> Gemma4VerifiedRenderSegmentReceipt {
+            Gemma4VerifiedRenderSegmentReceipt {
+                prompt_tokens,
+                requested_tokens,
+                verified_tokens: requested_tokens,
+                diagnostics: serde_json::json!({
+                    "mtp12": {
+                        "lossless_target_verified": true,
+                        "decode_output_tokens": decode_output_tokens,
+                        "decode_us": decode_us,
+                        "accepted_drafts": 0,
+                        "drafted": 0,
+                        "target_model_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+                        "assistant_model_sha256": GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256,
+                        "selector": "fixed_w16_target_verified_render",
+                        "width_schedule": {"widths": [16]},
+                        "native_receipt_qualification": {
+                            "target_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+                            "assistant_sha256": GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256
+                        }
+                    },
+                    "target_verified_render": {
+                        "verified_tokens": requested_tokens,
+                        "token_ids_exact": true
+                    }
+                }),
+            }
+        }
+        let mut receipts = vec![receipt(100, 6, 5, 100_000), receipt(80, 4, 3, 50_000)];
+        let diagnostics = gemma4_segmented_target_verified_diagnostics(&receipts).unwrap();
+        let expected_tps = 8.0 * 1_000_000.0 / 150_000.0;
+        assert_eq!(diagnostics["mtp12"]["decode_output_tokens"], 8);
+        assert_eq!(diagnostics["mtp12"]["decode_us"], 150_000);
+        assert_eq!(
+            diagnostics["mtp12"]["decode_tokens_per_second"],
+            expected_tps
+        );
+        let segmented = &diagnostics["target_verified_segmented_render"];
+        assert_eq!(
+            segmented["mode"],
+            "prepared_web_research_segmented_target_verify"
+        );
+        assert_eq!(segmented["segment_count"], 2);
+        assert_eq!(segmented["segments_exact"], true);
+        assert_eq!(segmented["total_prompt_tokens"], 180);
+        assert_eq!(segmented["requested_tokens"], 10);
+        assert_eq!(segmented["verified_tokens"], 10);
+        assert_eq!(segmented["decode_output_tokens"], 8);
+        assert_eq!(segmented["decode_us"], 150_000);
+        assert_eq!(segmented["render_tokens_per_second"], expected_tps);
+        assert_eq!(segmented["qualification_envelope_max_positions"], 512);
+        assert_eq!(segmented["segments"][0]["render_tokens_per_second"], 50.0);
+        assert_eq!(segmented["segments"][1]["render_tokens_per_second"], 60.0);
+
+        let progress = gemma4_target_verified_segment_progress(0, &receipts[0], "\n\n").unwrap();
+        let delta = gemma4_target_verified_segment_delta(&progress);
+        assert_eq!(delta["camelid_segment"]["index"], 0);
+        assert_eq!(delta["camelid_segment"]["token_ids_exact"], true);
+        assert_eq!(delta["camelid_segment"]["requested_tokens"], 6);
+        assert_eq!(delta["camelid_segment"]["verified_tokens"], 6);
+        assert_eq!(delta["camelid_segment"]["decode_output_tokens"], 5);
+        assert_eq!(delta["camelid_segment"]["decode_us"], 100_000);
+        assert_eq!(delta["camelid_segment"]["render_tokens_per_second"], 50.0);
+        assert_eq!(delta["camelid_segment"]["boundary"], "\n\n");
+
+        receipts[1].diagnostics["target_verified_render"]["token_ids_exact"] =
+            serde_json::Value::Bool(false);
+        assert!(gemma4_segmented_target_verified_diagnostics(&receipts)
+            .unwrap_err()
+            .contains("did not exactly target-verify"));
+    }
+
+    #[test]
     fn dg_serve_lane_defaults_on_with_explicit_opt_out() {
         // Maintainer-directed: the DiffusionGemma serve lane defaults on like the
         // runnable and gemma4 lanes — a loaded diffusion-gemma model has no other
@@ -10107,6 +10831,8 @@ mod gemma4_template_tests {
         assert_eq!(gemma4_finish_reason(8, 8), "length");
         assert_eq!(gemma4_finish_reason(0, 8), "stop");
         assert_eq!(gemma4_finish_reason(5, 8), "stop");
+        assert_eq!(gemma4_streaming_finish_reason(8, 8, false), "length");
+        assert_eq!(gemma4_streaming_finish_reason(8, 8, true), "stop");
     }
 
     #[test]
@@ -10261,6 +10987,21 @@ fn gemma4_finish_reason(completion_tokens: usize, max_tokens: usize) -> &'static
     }
 }
 
+/// A completed target-verified render consumed a finite, already naturally
+/// terminated planner draft. Its exact draft length is carried in `max_tokens`
+/// only as an integrity bound, not as a generation truncation boundary.
+fn gemma4_streaming_finish_reason(
+    completion_tokens: usize,
+    max_tokens: usize,
+    target_verified_render: bool,
+) -> &'static str {
+    if target_verified_render {
+        "stop"
+    } else {
+        gemma4_finish_reason(completion_tokens, max_tokens)
+    }
+}
+
 fn gemma4_usage(prompt_tokens: usize, completion_tokens: usize) -> CompletionUsage {
     CompletionUsage {
         prompt_tokens,
@@ -10290,10 +11031,578 @@ async fn gemma4_prompt_token_count(
     }
 }
 
+fn validate_gemma4_mtp12_request_context(
+    runtime: &Gemma4ServeRuntime,
+    prompt_tokens: usize,
+    requested_output_tokens: usize,
+) -> std::result::Result<(), Response> {
+    runtime
+        .validate_mtp12_context_budget(prompt_tokens, requested_output_tokens)
+        .map_err(|message| {
+            api_error_with_prompt_token_count(
+                StatusCode::BAD_REQUEST,
+                "context_length_exceeded",
+                message,
+                Some("max_tokens"),
+                Some(prompt_tokens),
+            )
+        })
+}
+
+fn validate_target_verified_render_request_shape(
+    stream: bool,
+    n: u32,
+    max_tokens: Option<u32>,
+    render_draft_token_ids: Option<&[u32]>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(token_ids) = render_draft_token_ids else {
+        return Ok(None);
+    };
+    if !stream {
+        return Err("target-verified render drafts require stream:true".to_string());
+    }
+    if n != 1 {
+        return Err("target-verified render drafts require exactly one choice".to_string());
+    }
+    if token_ids.is_empty() {
+        return Err("target-verified render drafts must contain at least one token id".to_string());
+    }
+    if token_ids.len() > 4096 {
+        return Err("target-verified render drafts are limited to 4096 token ids".to_string());
+    }
+    let requested = max_tokens.ok_or_else(|| {
+        "target-verified render drafts require max_tokens equal to the draft length".to_string()
+    })? as usize;
+    if requested != token_ids.len() {
+        return Err(format!(
+            "target-verified render max_tokens {requested} did not equal the draft length {}",
+            token_ids.len(),
+        ));
+    }
+    Ok(Some(token_ids.len()))
+}
+
+const GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT: usize = 2;
+const GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT: usize = 8;
+const GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS: usize = 512;
+
+fn validate_target_verified_segmented_render_request_shape(
+    stream: bool,
+    n: u32,
+    max_tokens: Option<u32>,
+    single_render_draft_present: bool,
+    segments: Option<&[CamelidTargetVerifiedRenderSegment]>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(segments) = segments else {
+        return Ok(None);
+    };
+    if single_render_draft_present {
+        return Err(
+            "segmented and single target-verified render drafts are mutually exclusive".to_string(),
+        );
+    }
+    if !stream {
+        return Err("segmented target-verified renders require stream:true".to_string());
+    }
+    if n != 1 {
+        return Err("segmented target-verified renders require exactly one choice".to_string());
+    }
+    if !(GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT..=GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT)
+        .contains(&segments.len())
+    {
+        return Err(format!(
+            "segmented target-verified renders require {}..={} segments, got {}",
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT,
+            GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT,
+            segments.len(),
+        ));
+    }
+    let mut total_tokens = 0usize;
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.messages.is_empty() {
+            return Err(format!(
+                "target-verified render segment {index} must contain at least one message"
+            ));
+        }
+        if segment.token_ids.is_empty() {
+            return Err(format!(
+                "target-verified render segment {index} must contain at least one token id"
+            ));
+        }
+        if segment.messages.iter().any(|message| {
+            !message.image_urls.is_empty() || !message.unsupported_content_parts.is_empty()
+        }) {
+            return Err(format!(
+                "target-verified render segment {index} supports text messages only"
+            ));
+        }
+        total_tokens = total_tokens
+            .checked_add(segment.token_ids.len())
+            .ok_or_else(|| "segmented target-verified render token count overflowed".to_string())?;
+    }
+    if total_tokens > 4096 {
+        return Err(
+            "segmented target-verified renders are limited to 4096 total token ids".to_string(),
+        );
+    }
+    let requested = max_tokens.ok_or_else(|| {
+        "segmented target-verified renders require max_tokens equal to the total draft length"
+            .to_string()
+    })? as usize;
+    if requested != total_tokens {
+        return Err(format!(
+            "segmented target-verified render max_tokens {requested} did not equal the total draft length {total_tokens}"
+        ));
+    }
+    Ok(Some(total_tokens))
+}
+
+fn validate_target_verified_render_request(
+    req: &ChatCompletionRequest,
+) -> std::result::Result<Option<usize>, Response> {
+    if req.camelid_target_verified_render_draft_token_ids.is_some()
+        && req.camelid_target_verified_render_segments.is_some()
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target_verified_render_segments",
+            "segmented and single target-verified render drafts are mutually exclusive".to_string(),
+            Some("camelid_target_verified_render_segments"),
+        ));
+    }
+    let single = validate_target_verified_render_request_shape(
+        req.stream.unwrap_or(false),
+        req.n.unwrap_or(1),
+        req.max_tokens,
+        req.camelid_target_verified_render_draft_token_ids
+            .as_deref(),
+    )
+    .map_err(|message| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target_verified_render_draft",
+            message,
+            Some("camelid_target_verified_render_draft_token_ids"),
+        )
+    })?;
+    let segmented = validate_target_verified_segmented_render_request_shape(
+        req.stream.unwrap_or(false),
+        req.n.unwrap_or(1),
+        req.max_tokens,
+        single.is_some(),
+        req.camelid_target_verified_render_segments.as_deref(),
+    )
+    .map_err(|message| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target_verified_render_segments",
+            message,
+            Some("camelid_target_verified_render_segments"),
+        )
+    })?;
+    Ok(single.or(segmented))
+}
+
+fn validate_segmented_render_expected_sha(
+    segmented_render_present: bool,
+    expected_sha256: Option<&str>,
+) -> std::result::Result<(), String> {
+    if !segmented_render_present {
+        return Ok(());
+    }
+    match expected_sha256 {
+        Some(value) if value.eq_ignore_ascii_case(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256) => Ok(()),
+        Some(value) => Err(format!(
+            "segmented target-verified renders require the qualified target SHA-256 {}, got {value}",
+            GEMMA4_MTP12_QUALIFIED_TARGET_SHA256
+        )),
+        None => Err(format!(
+            "segmented target-verified renders require camelid_expected_gguf_sha256={}",
+            GEMMA4_MTP12_QUALIFIED_TARGET_SHA256
+        )),
+    }
+}
+
 enum Gemma4StreamItem {
     Delta(String),
-    Complete { completion_tokens: usize },
+    SegmentBoundary(Gemma4TargetVerifiedSegmentProgress),
+    Complete {
+        completion_tokens: usize,
+        /// Native engine evidence, present only for an execution lane that
+        /// reports target-authoritative decode timing.
+        diagnostics: Option<serde_json::Value>,
+    },
     Error(String),
+}
+
+#[derive(Clone, Debug)]
+struct Gemma4TargetVerifiedSegmentProgress {
+    index: usize,
+    requested_tokens: usize,
+    verified_tokens: usize,
+    decode_output_tokens: u64,
+    decode_us: u64,
+    render_tokens_per_second: f64,
+    boundary: &'static str,
+}
+
+fn gemma4_target_verified_segment_progress(
+    index: usize,
+    receipt: &Gemma4VerifiedRenderSegmentReceipt,
+    boundary: &'static str,
+) -> std::result::Result<Gemma4TargetVerifiedSegmentProgress, String> {
+    let exact = receipt
+        .diagnostics
+        .pointer("/target_verified_render/token_ids_exact")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let native_verified_tokens = gemma4_required_diagnostic_u64(
+        &receipt.diagnostics,
+        "/target_verified_render/verified_tokens",
+    )
+    .and_then(|value| {
+        usize::try_from(value).map_err(|_| "native verified token count exceeded usize".to_string())
+    })?;
+    if !exact
+        || receipt.requested_tokens != receipt.verified_tokens
+        || native_verified_tokens != receipt.verified_tokens
+    {
+        return Err(format!(
+            "segment {index} did not exactly target-verify every requested token"
+        ));
+    }
+    let decode_output_tokens =
+        gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_output_tokens")?;
+    let decode_us = gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_us")?;
+    let render_tokens_per_second = if decode_us == 0 {
+        0.0
+    } else {
+        decode_output_tokens as f64 * 1_000_000.0 / decode_us as f64
+    };
+    Ok(Gemma4TargetVerifiedSegmentProgress {
+        index,
+        requested_tokens: receipt.requested_tokens,
+        verified_tokens: receipt.verified_tokens,
+        decode_output_tokens,
+        decode_us,
+        render_tokens_per_second,
+        boundary,
+    })
+}
+
+fn gemma4_target_verified_segment_delta(
+    progress: &Gemma4TargetVerifiedSegmentProgress,
+) -> serde_json::Value {
+    serde_json::json!({
+        "camelid_segment": {
+            "index": progress.index,
+            "token_ids_exact": true,
+            "requested_tokens": progress.requested_tokens,
+            "verified_tokens": progress.verified_tokens,
+            "decode_output_tokens": progress.decode_output_tokens,
+            "decode_us": progress.decode_us,
+            "render_tokens_per_second": progress.render_tokens_per_second,
+            "boundary": progress.boundary,
+        }
+    })
+}
+
+struct Gemma4StreamingOutcome {
+    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome,
+    diagnostics: Option<serde_json::Value>,
+}
+
+struct Gemma4PreparedRenderSegment {
+    prompt: String,
+    prompt_tokens: usize,
+    token_ids: Vec<u32>,
+}
+
+struct Gemma4VerifiedRenderSegmentReceipt {
+    prompt_tokens: usize,
+    requested_tokens: usize,
+    verified_tokens: usize,
+    diagnostics: serde_json::Value,
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp12_native_receipt_qualification(
+    target_model_sha256: &str,
+    assistant_model_sha256: &str,
+) -> Option<serde_json::Value> {
+    if !target_model_sha256.eq_ignore_ascii_case(GEMMA4_MTP12_QUALIFIED_TARGET_SHA256)
+        || !assistant_model_sha256.eq_ignore_ascii_case(GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256)
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "workload": "short_context_lossless_mtp_qualification",
+        "primary_decode_tokens_per_second": 51.493947835_f64,
+        "confirmation_decode_tokens_per_second": 51.304677961_f64,
+        "mean_decode_tokens_per_second": 51.399_f64,
+        "prompt_tokens": 14,
+        "output_tokens": 96,
+        "max_positions": 512,
+        "selector": "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16",
+        "target_sha256": GEMMA4_MTP12_QUALIFIED_TARGET_SHA256,
+        "assistant_sha256": GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp12_diagnostics(
+    generation: &crate::gemma4_runtime::Gemma4Mtp12MetalGeneration,
+    render_draft_token_ids: Option<&[u32]>,
+) -> serde_json::Value {
+    let stats = &generation.stats;
+    let decode_output_tokens = stats.emitted_tokens.saturating_sub(1);
+    let mut diagnostics = serde_json::json!({
+        "mtp12": {
+            "lossless_target_verified": true,
+            "decode_us": stats.decode_us,
+            "decode_output_tokens": decode_output_tokens,
+            "decode_tokens_per_second": stats.decode_tokens_per_second(),
+            "configured_verify_width": stats.configured_verify_width,
+            "accepted_drafts": stats.accepted_drafts,
+            "drafted": stats.drafted,
+            "alpha": stats.alpha(),
+            "target_model_sha256": generation.target_model_sha256,
+            "assistant_model_sha256": generation.assistant_model_sha256,
+            "selector": stats.width_schedule.selector,
+            "width_schedule": &stats.width_schedule,
+        }
+    });
+    if let Some(qualification) = gemma4_mtp12_native_receipt_qualification(
+        generation.target_model_sha256,
+        generation.assistant_model_sha256,
+    ) {
+        diagnostics["mtp12"]["native_receipt_qualification"] = qualification;
+    }
+    if let Some(render_draft_token_ids) = render_draft_token_ids {
+        let requested_tokens = render_draft_token_ids.len();
+        let verified_tokens = generation.token_ids.len();
+        diagnostics["target_verified_render"] = serde_json::json!({
+            "mode": "caller_token_ids_target_greedy_verify",
+            "requested_tokens": requested_tokens,
+            "verified_tokens": verified_tokens,
+            "token_ids_exact": generation.token_ids == render_draft_token_ids,
+            "render_verify_us": stats.decode_us,
+            "render_tokens_per_second": stats.decode_tokens_per_second(),
+        });
+    }
+    diagnostics
+}
+
+fn gemma4_required_diagnostic_u64(
+    diagnostics: &serde_json::Value,
+    pointer: &str,
+) -> std::result::Result<u64, String> {
+    diagnostics
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("native MTP12 diagnostics omitted {pointer}"))
+}
+
+fn gemma4_required_diagnostic_str<'a>(
+    diagnostics: &'a serde_json::Value,
+    pointer: &str,
+) -> std::result::Result<&'a str, String> {
+    diagnostics
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("native MTP12 diagnostics omitted {pointer}"))
+}
+
+/// Combine only native verifier timing. This is deliberately a ratio of sums:
+/// averaging per-section rates would overweight short sections, while wall/UI
+/// timing would not be the target decoder's measured work.
+fn gemma4_segmented_target_verified_diagnostics(
+    receipts: &[Gemma4VerifiedRenderSegmentReceipt],
+) -> std::result::Result<serde_json::Value, String> {
+    if !(GEMMA4_TARGET_VERIFIED_SEGMENT_MIN_COUNT..=GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_COUNT)
+        .contains(&receipts.len())
+    {
+        return Err(format!(
+            "segmented verifier returned an invalid section count {}",
+            receipts.len()
+        ));
+    }
+
+    let mut total_prompt_tokens = 0usize;
+    let mut total_requested_tokens = 0usize;
+    let mut total_verified_tokens = 0usize;
+    let mut total_decode_output_tokens = 0u64;
+    let mut total_decode_us = 0u64;
+    let mut total_accepted_drafts = 0u64;
+    let mut total_drafted = 0u64;
+    let mut segment_metrics = Vec::with_capacity(receipts.len());
+    let mut target_sha256: Option<String> = None;
+    let mut assistant_sha256: Option<String> = None;
+    let mut selector: Option<serde_json::Value> = None;
+    let mut width_schedule: Option<serde_json::Value> = None;
+    let mut qualification: Option<serde_json::Value> = None;
+
+    for (index, receipt) in receipts.iter().enumerate() {
+        let mtp12 = receipt
+            .diagnostics
+            .get("mtp12")
+            .ok_or_else(|| format!("segment {index} omitted native MTP12 diagnostics"))?;
+        if mtp12
+            .get("lossless_target_verified")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "segment {index} was not marked lossless_target_verified"
+            ));
+        }
+        let render = receipt
+            .diagnostics
+            .get("target_verified_render")
+            .ok_or_else(|| format!("segment {index} omitted target-verifier diagnostics"))?;
+        let token_ids_exact = render
+            .get("token_ids_exact")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let native_verified_tokens = render
+            .get("verified_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("segment {index} omitted verified_tokens"))?;
+        if !token_ids_exact
+            || receipt.verified_tokens != receipt.requested_tokens
+            || native_verified_tokens != receipt.requested_tokens
+        {
+            return Err(format!(
+                "segment {index} did not exactly target-verify every requested token"
+            ));
+        }
+
+        let decode_output_tokens =
+            gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_output_tokens")?;
+        let decode_us = gemma4_required_diagnostic_u64(&receipt.diagnostics, "/mtp12/decode_us")?;
+        let segment_tps = if decode_us == 0 {
+            0.0
+        } else {
+            decode_output_tokens as f64 * 1_000_000.0 / decode_us as f64
+        };
+        let segment_target_sha =
+            gemma4_required_diagnostic_str(&receipt.diagnostics, "/mtp12/target_model_sha256")?;
+        let segment_assistant_sha =
+            gemma4_required_diagnostic_str(&receipt.diagnostics, "/mtp12/assistant_model_sha256")?;
+        if let Some(expected) = target_sha256.as_deref() {
+            if !expected.eq_ignore_ascii_case(segment_target_sha) {
+                return Err(format!("segment {index} changed target model identity"));
+            }
+        } else {
+            target_sha256 = Some(segment_target_sha.to_string());
+        }
+        if let Some(expected) = assistant_sha256.as_deref() {
+            if !expected.eq_ignore_ascii_case(segment_assistant_sha) {
+                return Err(format!("segment {index} changed assistant model identity"));
+            }
+        } else {
+            assistant_sha256 = Some(segment_assistant_sha.to_string());
+        }
+
+        let segment_qualification = mtp12
+            .get("native_receipt_qualification")
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "segment {index} was not produced by the exact hash-pinned qualified MTP12 lane"
+                )
+            })?;
+        if let Some(expected) = qualification.as_ref() {
+            if expected != &segment_qualification {
+                return Err(format!(
+                    "segment {index} changed MTP12 qualification identity"
+                ));
+            }
+        } else {
+            qualification = Some(segment_qualification);
+        }
+
+        total_prompt_tokens = total_prompt_tokens
+            .checked_add(receipt.prompt_tokens)
+            .ok_or_else(|| "segmented verifier prompt token count overflowed".to_string())?;
+        total_requested_tokens = total_requested_tokens
+            .checked_add(receipt.requested_tokens)
+            .ok_or_else(|| "segmented verifier requested token count overflowed".to_string())?;
+        total_verified_tokens = total_verified_tokens
+            .checked_add(receipt.verified_tokens)
+            .ok_or_else(|| "segmented verifier verified token count overflowed".to_string())?;
+        total_decode_output_tokens = total_decode_output_tokens
+            .checked_add(decode_output_tokens)
+            .ok_or_else(|| "segmented verifier decode token count overflowed".to_string())?;
+        total_decode_us = total_decode_us
+            .checked_add(decode_us)
+            .ok_or_else(|| "segmented verifier decode timing overflowed".to_string())?;
+        total_accepted_drafts = total_accepted_drafts.saturating_add(
+            mtp12
+                .get("accepted_drafts")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        total_drafted = total_drafted.saturating_add(
+            mtp12
+                .get("drafted")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        selector.get_or_insert_with(|| mtp12["selector"].clone());
+        width_schedule.get_or_insert_with(|| mtp12["width_schedule"].clone());
+        segment_metrics.push(serde_json::json!({
+            "index": index,
+            "prompt_tokens": receipt.prompt_tokens,
+            "requested_tokens": receipt.requested_tokens,
+            "verified_tokens": receipt.verified_tokens,
+            "token_ids_exact": true,
+            "decode_output_tokens": decode_output_tokens,
+            "decode_us": decode_us,
+            "render_tokens_per_second": segment_tps,
+        }));
+    }
+
+    let aggregate_tps = if total_decode_us == 0 {
+        0.0
+    } else {
+        total_decode_output_tokens as f64 * 1_000_000.0 / total_decode_us as f64
+    };
+    let target_sha256 = target_sha256.expect("nonempty receipt set has target SHA");
+    let assistant_sha256 = assistant_sha256.expect("nonempty receipt set has assistant SHA");
+    let qualification = qualification.expect("nonempty qualified receipt set");
+    Ok(serde_json::json!({
+        "mtp12": {
+            "lossless_target_verified": true,
+            "decode_us": total_decode_us,
+            "decode_output_tokens": total_decode_output_tokens,
+            "decode_tokens_per_second": aggregate_tps,
+            "configured_verify_width": 16,
+            "accepted_drafts": total_accepted_drafts,
+            "drafted": total_drafted,
+            "target_model_sha256": target_sha256.clone(),
+            "assistant_model_sha256": assistant_sha256.clone(),
+            "selector": selector.unwrap_or(serde_json::Value::Null),
+            "width_schedule": width_schedule.unwrap_or(serde_json::Value::Null),
+            "native_receipt_qualification": qualification,
+        },
+        "target_verified_segmented_render": {
+            "mode": "prepared_web_research_segmented_target_verify",
+            "segment_count": receipts.len(),
+            "segments_exact": true,
+            "total_prompt_tokens": total_prompt_tokens,
+            "requested_tokens": total_requested_tokens,
+            "verified_tokens": total_verified_tokens,
+            "decode_output_tokens": total_decode_output_tokens,
+            "decode_us": total_decode_us,
+            "render_tokens_per_second": aggregate_tps,
+            "qualification_envelope_max_positions": GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+            "target_model_sha256": target_sha256,
+            "assistant_model_sha256": assistant_sha256,
+            "segments": segment_metrics,
+        }
+    }))
 }
 
 /// Resolve the Gemma 4 runtime for a chat request, if this request targets one.
@@ -10313,6 +11622,16 @@ enum Gemma4StreamItem {
 pub enum Gemma4ServeRuntime {
     Local(crate::gemma4_runtime::Gemma4Runtime),
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
+    /// Explicit, exact-artifact single-node Metal lane. The target and
+    /// assistant each perform their own SHA admission before this variant can
+    /// be installed in AppState.
+    #[cfg(target_os = "macos")]
+    Mtp12Metal {
+        runtime: crate::gemma4_runtime::Gemma4GpuRuntime,
+        assistant: std::sync::Mutex<crate::metal::Gemma4Mtp12AssistantMetal>,
+        verify_width: usize,
+        max_positions: usize,
+    },
     /// CUDA decode engine (stateful GPU runtime -> Mutex; one request at a time).
     #[cfg(feature = "cuda")]
     Cuda {
@@ -10322,7 +11641,66 @@ pub enum Gemma4ServeRuntime {
     },
 }
 
+const GEMMA4_MTP12_PHYSICAL_W16_HEADROOM: usize = 16;
+
+fn gemma4_mtp12_context_budget_check(
+    prompt_tokens: usize,
+    requested_output_tokens: usize,
+    max_positions: usize,
+) -> std::result::Result<(), String> {
+    let required = prompt_tokens
+        .checked_add(requested_output_tokens)
+        .and_then(|tokens| tokens.checked_add(GEMMA4_MTP12_PHYSICAL_W16_HEADROOM))
+        .ok_or_else(|| "Gemma 4 MTP12 context budget overflowed usize".to_string())?;
+    if required > max_positions {
+        return Err(format!(
+            "Gemma 4 MTP12 request requires {required} resident positions ({prompt_tokens} prompt + {requested_output_tokens} requested output + {GEMMA4_MTP12_PHYSICAL_W16_HEADROOM} physical W16 verifier headroom), above the runtime capacity of {max_positions}"
+        ));
+    }
+    Ok(())
+}
+
 impl Gemma4ServeRuntime {
+    fn is_mtp12_metal(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if matches!(self, Self::Mtp12Metal { .. }) {
+            return true;
+        }
+        false
+    }
+
+    fn effective_context_length(&self) -> Option<u32> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { max_positions, .. } => u32::try_from(*max_positions).ok(),
+            _ => None,
+        }
+    }
+
+    fn reserved_context_headroom(&self) -> u32 {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { .. } => GEMMA4_MTP12_PHYSICAL_W16_HEADROOM as u32,
+            _ => 0,
+        }
+    }
+
+    fn validate_mtp12_context_budget(
+        &self,
+        prompt_tokens: usize,
+        requested_output_tokens: usize,
+    ) -> std::result::Result<(), String> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { max_positions, .. } => gemma4_mtp12_context_budget_check(
+                prompt_tokens,
+                requested_output_tokens,
+                *max_positions,
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// Metal components still owned by this live runtime. The process-wide GPU
     /// and deterministic gates are deliberately applied by the health snapshot,
     /// not latched here.
@@ -10332,6 +11710,8 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(runtime) => runtime.ghost_metal_components(),
             Self::Distributed(_) => Default::default(),
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { .. } => Default::default(),
             #[cfg(feature = "cuda")]
             Self::Cuda { .. } => Default::default(),
         }
@@ -10359,6 +11739,8 @@ impl Gemma4ServeRuntime {
         let tokens = match self {
             Self::Local(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
             Self::Distributed(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal { runtime, .. } => runtime.tokenizer().encode(prompt, true, true)?,
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime, .. } => runtime
                 .lock()
@@ -10374,16 +11756,56 @@ impl Gemma4ServeRuntime {
         prompt: &str,
         max_new: usize,
         should_cancel: C,
-    ) -> crate::Result<crate::gemma4_runtime::Gemma4GenerationOutcome> {
-        match self {
+    ) -> crate::Result<Gemma4StreamingOutcome> {
+        let outcome = match self {
             Self::Local(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             Self::Distributed(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal {
+                runtime,
+                assistant,
+                verify_width,
+                ..
+            } => {
+                let mut assistant = assistant.lock().expect("gemma4 mtp12 assistant lock");
+                match runtime.generate_greedy_mtp12_ordered_q4_streaming_cancellable(
+                    &mut assistant,
+                    prompt,
+                    max_new,
+                    *verify_width,
+                    |_| {},
+                    should_cancel,
+                )? {
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Complete(result) => {
+                        let diagnostics = gemma4_mtp12_diagnostics(&result, None);
+                        return Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete {
+                                text: result.text,
+                                token_ids: result.token_ids,
+                            },
+                            diagnostics: Some(diagnostics),
+                        });
+                    }
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Cancelled(result) => {
+                        return Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled {
+                                generated_tokens: result.token_ids.len(),
+                            },
+                            diagnostics: None,
+                        })
+                    }
+                }
+            }
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_cancellable(prompt, max_new, should_cancel),
-        }
+        }?;
+        Ok(Gemma4StreamingOutcome {
+            outcome,
+            diagnostics: None,
+        })
     }
 
     fn generate_greedy_streaming_cancellable<F: FnMut(&str), C: FnMut() -> bool>(
@@ -10392,19 +11814,105 @@ impl Gemma4ServeRuntime {
         max_new: usize,
         on_delta: F,
         should_cancel: C,
-    ) -> crate::Result<crate::gemma4_runtime::Gemma4GenerationOutcome> {
-        match self {
+    ) -> crate::Result<Gemma4StreamingOutcome> {
+        let outcome = match self {
             Self::Local(r) => {
                 r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
             }
             Self::Distributed(r) => {
                 r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
             }
+            #[cfg(target_os = "macos")]
+            Self::Mtp12Metal {
+                runtime,
+                assistant,
+                verify_width,
+                ..
+            } => {
+                let mut assistant = assistant.lock().expect("gemma4 mtp12 assistant lock");
+                return match runtime.generate_greedy_mtp12_ordered_q4_streaming_cancellable(
+                    &mut assistant,
+                    prompt,
+                    max_new,
+                    *verify_width,
+                    on_delta,
+                    should_cancel,
+                )? {
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Complete(result) => {
+                        let diagnostics = gemma4_mtp12_diagnostics(&result, None);
+                        Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete {
+                                text: result.text,
+                                token_ids: result.token_ids,
+                            },
+                            diagnostics: Some(diagnostics),
+                        })
+                    }
+                    crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Cancelled(result) => {
+                        Ok(Gemma4StreamingOutcome {
+                            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled {
+                                generated_tokens: result.token_ids.len(),
+                            },
+                            diagnostics: None,
+                        })
+                    }
+                };
+            }
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel),
+        }?;
+        Ok(Gemma4StreamingOutcome {
+            outcome,
+            diagnostics: None,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_target_verified_streaming_cancellable<F: FnMut(&str), C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        render_draft_token_ids: &[u32],
+        on_delta: F,
+        should_cancel: C,
+    ) -> crate::Result<Gemma4StreamingOutcome> {
+        let Self::Mtp12Metal {
+            runtime, assistant, ..
+        } = self
+        else {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "target-verified render drafts require the exact Gemma 4 MTP12 Metal lane".into(),
+            ));
+        };
+        let assistant = assistant.lock().expect("gemma4 mtp12 assistant lock");
+        match runtime.render_target_verified_mtp12_ordered_q4_streaming_cancellable(
+            &assistant,
+            prompt,
+            render_draft_token_ids,
+            16,
+            on_delta,
+            should_cancel,
+        )? {
+            crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Complete(result) => {
+                let diagnostics = gemma4_mtp12_diagnostics(&result, Some(render_draft_token_ids));
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete {
+                        text: result.text,
+                        token_ids: result.token_ids,
+                    },
+                    diagnostics: Some(diagnostics),
+                })
+            }
+            crate::gemma4_runtime::Gemma4Mtp12MetalGenerationOutcome::Cancelled(result) => {
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled {
+                        generated_tokens: result.token_ids.len(),
+                    },
+                    diagnostics: None,
+                })
+            }
         }
     }
 }
@@ -10437,7 +11945,7 @@ async fn gemma4_generate_on_engine(
     runtime: Arc<Gemma4ServeRuntime>,
     prompt: String,
     max_tokens: usize,
-) -> std::result::Result<crate::gemma4_runtime::Gemma4GenerationOutcome, Box<Response>> {
+) -> std::result::Result<Gemma4StreamingOutcome, Box<Response>> {
     match run_cancellable_gemma4_job(state, move |worker_cancel| {
         runtime.generate_greedy_cancellable(&prompt, max_tokens, || worker_cancel.is_cancelled())
     })
@@ -10463,6 +11971,7 @@ fn gemma4_stream_on_engine(
     runtime: Arc<Gemma4ServeRuntime>,
     prompt: String,
     max_tokens: usize,
+    render_draft_token_ids: Option<Vec<u32>>,
 ) -> std::result::Result<(tokio::sync::mpsc::Receiver<Gemma4StreamItem>, CancelOnDrop), Box<Response>>
 {
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -10471,26 +11980,49 @@ fn gemma4_stream_on_engine(
     let task = engine::EngineTask::Exclusive(Box::new(move || {
         let delta_cancel = cancel.clone();
         let send_tx = tx.clone();
-        let result = runtime.generate_greedy_streaming_cancellable(
-            &prompt,
-            max_tokens,
-            move |delta| {
-                if send_tx
-                    .blocking_send(Gemma4StreamItem::Delta(delta.to_string()))
-                    .is_err()
-                {
-                    delta_cancel.cancel();
-                }
-            },
-            || cancel.is_cancelled(),
-        );
+        let on_delta = move |delta: &str| {
+            if send_tx
+                .blocking_send(Gemma4StreamItem::Delta(delta.to_string()))
+                .is_err()
+            {
+                delta_cancel.cancel();
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let result = match render_draft_token_ids.as_deref() {
+            Some(render_draft) => runtime.render_target_verified_streaming_cancellable(
+                &prompt,
+                render_draft,
+                on_delta,
+                || cancel.is_cancelled(),
+            ),
+            None => {
+                runtime.generate_greedy_streaming_cancellable(&prompt, max_tokens, on_delta, || {
+                    cancel.is_cancelled()
+                })
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = {
+            let _ = render_draft_token_ids;
+            runtime.generate_greedy_streaming_cancellable(&prompt, max_tokens, on_delta, || {
+                cancel.is_cancelled()
+            })
+        };
         match result {
-            Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { token_ids, .. }) => {
+            Ok(Gemma4StreamingOutcome {
+                outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { token_ids, .. },
+                diagnostics,
+            }) => {
                 let _ = tx.blocking_send(Gemma4StreamItem::Complete {
                     completion_tokens: token_ids.len(),
+                    diagnostics,
                 });
             }
-            Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { .. }) => {}
+            Ok(Gemma4StreamingOutcome {
+                outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { .. },
+                ..
+            }) => {}
             Err(error) => {
                 let _ = tx.blocking_send(Gemma4StreamItem::Error(error.to_string()));
             }
@@ -10501,6 +12033,143 @@ fn gemma4_stream_on_engine(
         .post(task)
         .map_err(engine_post_error_response)?;
     Ok((rx, body_guard))
+}
+
+/// Run all prepared sections under one exclusive engine lease. No separator or
+/// other server-authored text is injected: callers include headings/newlines in
+/// the target-verified drafts, and SSE sees their decoded suffixes in order.
+#[cfg(target_os = "macos")]
+fn gemma4_segmented_render_stream_on_engine(
+    state: &AppState,
+    runtime: Arc<Gemma4ServeRuntime>,
+    segments: Vec<Gemma4PreparedRenderSegment>,
+) -> std::result::Result<(tokio::sync::mpsc::Receiver<Gemma4StreamItem>, CancelOnDrop), Box<Response>>
+{
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let body_guard = CancelOnDrop(cancel.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let task = engine::EngineTask::Exclusive(Box::new(move || {
+        let mut receipts = Vec::with_capacity(segments.len());
+        let mut total_completion_tokens = 0usize;
+        let segment_count = segments.len();
+        for (index, segment) in segments.into_iter().enumerate() {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let delta_cancel = cancel.clone();
+            let send_tx = tx.clone();
+            let on_delta = move |delta: &str| {
+                if send_tx
+                    .blocking_send(Gemma4StreamItem::Delta(delta.to_string()))
+                    .is_err()
+                {
+                    delta_cancel.cancel();
+                }
+            };
+            let result = runtime.render_target_verified_streaming_cancellable(
+                &segment.prompt,
+                &segment.token_ids,
+                on_delta,
+                || cancel.is_cancelled(),
+            );
+            match result {
+                Ok(Gemma4StreamingOutcome {
+                    outcome:
+                        crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { token_ids, .. },
+                    diagnostics: Some(diagnostics),
+                }) if token_ids == segment.token_ids => {
+                    total_completion_tokens = match total_completion_tokens
+                        .checked_add(token_ids.len())
+                    {
+                        Some(total) => total,
+                        None => {
+                            let _ = tx.blocking_send(Gemma4StreamItem::Error(
+                                "segmented verifier completion token count overflowed".to_string(),
+                            ));
+                            return;
+                        }
+                    };
+                    let receipt = Gemma4VerifiedRenderSegmentReceipt {
+                        prompt_tokens: segment.prompt_tokens,
+                        requested_tokens: segment.token_ids.len(),
+                        verified_tokens: token_ids.len(),
+                        diagnostics,
+                    };
+                    let boundary = if index + 1 < segment_count {
+                        "\n\n"
+                    } else {
+                        ""
+                    };
+                    let progress =
+                        match gemma4_target_verified_segment_progress(index, &receipt, boundary) {
+                            Ok(progress) => progress,
+                            Err(error) => {
+                                let _ = tx.blocking_send(Gemma4StreamItem::Error(error));
+                                return;
+                            }
+                        };
+                    receipts.push(receipt);
+                    if tx
+                        .blocking_send(Gemma4StreamItem::SegmentBoundary(progress))
+                        .is_err()
+                    {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { .. },
+                    ..
+                }) => {
+                    let _ = tx.blocking_send(Gemma4StreamItem::Error(
+                        "segmented target verifier returned non-exact token ids or omitted native diagnostics"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                Ok(Gemma4StreamingOutcome {
+                    outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { .. },
+                    ..
+                }) => return,
+                Err(error) => {
+                    let _ = tx.blocking_send(Gemma4StreamItem::Error(error.to_string()));
+                    return;
+                }
+            }
+        }
+        match gemma4_segmented_target_verified_diagnostics(&receipts) {
+            Ok(diagnostics) => {
+                let _ = tx.blocking_send(Gemma4StreamItem::Complete {
+                    completion_tokens: total_completion_tokens,
+                    diagnostics: Some(diagnostics),
+                });
+            }
+            Err(error) => {
+                let _ = tx.blocking_send(Gemma4StreamItem::Error(error));
+            }
+        }
+    }));
+    state
+        .engine
+        .post(task)
+        .map_err(engine_post_error_response)?;
+    Ok((rx, body_guard))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gemma4_segmented_render_stream_on_engine(
+    _state: &AppState,
+    _runtime: Arc<Gemma4ServeRuntime>,
+    _segments: Vec<Gemma4PreparedRenderSegment>,
+) -> std::result::Result<(tokio::sync::mpsc::Receiver<Gemma4StreamItem>, CancelOnDrop), Box<Response>>
+{
+    Err(Box::new(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "target_verified_render_lane_required",
+        "segmented target-verified renders require the exact Gemma 4 12B MTP12 Metal lane"
+            .to_string(),
+        Some("camelid_target_verified_render_segments"),
+    )))
 }
 
 #[cfg(test)]
@@ -10678,19 +12347,31 @@ async fn gemma4_completion_nonstreaming(
         );
     };
     let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
+    {
+        Ok(count) => count,
+        Err(response) => return response,
+    };
+    if let Err(response) =
+        validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
+    {
+        return response;
+    }
     let t_generate = std::time::Instant::now();
     let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
-    let (text, ids) = match result {
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
-            (text, token_ids)
-        }
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
-            return *generation_cancelled_response(generated_tokens)
-        }
+    let (text, ids, native_diagnostics) = match result {
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids },
+            diagnostics,
+        }) => (text, token_ids, diagnostics),
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens },
+            ..
+        }) => return *generation_cancelled_response(generated_tokens),
         Err(response) => return *response,
     };
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "id": "cmpl-gemma4",
         "object": "text_completion",
         "created": unix_secs(),
@@ -10701,7 +12382,7 @@ async fn gemma4_completion_nonstreaming(
             "logprobs": null,
             "finish_reason": gemma4_finish_reason(ids.len(), max_tokens),
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": ids.len(), "total_tokens": prompt_tokens + ids.len() },
         "camelid": {
             "generated_token_ids": ids,
             // Wall-clock totals only: the gemma4 lane does not (yet) report
@@ -10714,6 +12395,12 @@ async fn gemma4_completion_nonstreaming(
             },
         },
     });
+    if let Some(mtp12) = native_diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.get("mtp12"))
+    {
+        body["camelid"]["mtp12"] = mtp12.clone();
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -10734,12 +12421,22 @@ async fn gemma4_completion_streaming(
     };
     let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
     let created = unix_secs();
-
-    let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
     {
-        Ok(stream) => stream,
-        Err(response) => return *response,
+        Ok(count) => count,
+        Err(response) => return response,
     };
+    if let Err(response) =
+        validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
+    {
+        return response;
+    }
+
+    let (mut rx, cancel_on_drop) =
+        match gemma4_stream_on_engine(state, runtime, prompt, max_tokens, None) {
+            Ok(stream) => stream,
+            Err(response) => return *response,
+        };
 
     let events = async_stream::stream! {
         let _cancel_on_drop = cancel_on_drop;
@@ -10758,7 +12455,9 @@ async fn gemma4_completion_streaming(
                     });
                     yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                 }
-                Gemma4StreamItem::Complete { completion_tokens: actual } => {
+                // Text completions never enter the private segmented chat lane.
+                Gemma4StreamItem::SegmentBoundary(_) => {}
+                Gemma4StreamItem::Complete { completion_tokens: actual, .. } => {
                     completion_tokens = actual;
                     completed = true;
                 }
@@ -10789,9 +12488,9 @@ async fn gemma4_completion_streaming(
                 "model": id,
                 "choices": [{ "index": 0, "text": "", "logprobs": null, "finish_reason": finish_reason }],
                 "usage": {
-                    "prompt_tokens": 0,
+                    "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
-                    "total_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
                 },
             });
             yield Ok(Event::default().data(done.to_string()));
@@ -10815,6 +12514,11 @@ async fn gemma4_chat_nonstreaming(
         Ok(count) => count,
         Err(response) => return response,
     };
+    if let Err(response) =
+        validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
+    {
+        return response;
+    }
     let t_generate = std::time::Instant::now();
     let telemetry_guard = telemetry::RequestGuard::begin(gemma4_telemetry_start(
         &id,
@@ -10824,11 +12528,15 @@ async fn gemma4_chat_nonstreaming(
     ));
     let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
-    let (text, ids) = match result {
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
-            (text, token_ids)
-        }
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
+    let (text, ids, native_diagnostics) = match result {
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids },
+            diagnostics,
+        }) => (text, token_ids, diagnostics),
+        Ok(Gemma4StreamingOutcome {
+            outcome: crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens },
+            ..
+        }) => {
             telemetry_guard.finish(gemma4_telemetry_error(
                 "gemma4 generation cancelled by disconnected request".to_string(),
             ));
@@ -10851,7 +12559,7 @@ async fn gemma4_chat_nonstreaming(
         prefill_tps: None,
         error: None,
     });
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "id": "chatcmpl-gemma4",
         "object": "chat.completion",
         "created": unix_secs(),
@@ -10876,6 +12584,12 @@ async fn gemma4_chat_nonstreaming(
             },
         },
     });
+    if let Some(mtp12) = native_diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.get("mtp12"))
+    {
+        body["camelid"]["mtp12"] = mtp12.clone();
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -13534,21 +15248,102 @@ async fn gemma4_chat_streaming(
     runtime: Arc<Gemma4ServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
-    let messages = req.messages.clone().unwrap_or_default();
-    let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let render_draft_token_ids = req.camelid_target_verified_render_draft_token_ids.clone();
+    let render_segments = req.camelid_target_verified_render_segments.clone();
+    let target_verified_render = render_draft_token_ids.is_some() || render_segments.is_some();
     let created = unix_secs();
-    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
-    {
-        Ok(count) => count,
-        Err(response) => return response,
+    let (prompt_tokens, max_tokens, stream) = if let Some(segments) = render_segments {
+        let mut prepared = Vec::with_capacity(segments.len());
+        let mut total_prompt_tokens = 0usize;
+        let mut total_output_tokens = 0usize;
+        for (index, segment) in segments.into_iter().enumerate() {
+            let prompt = gemma4_chat_prompt(
+                &segment.messages,
+                req.camelid_enable_thinking.unwrap_or(false),
+            );
+            let segment_prompt_tokens =
+                match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await {
+                    Ok(count) => count,
+                    Err(response) => return response,
+                };
+            if let Err(message) = gemma4_mtp12_context_budget_check(
+                segment_prompt_tokens,
+                segment.token_ids.len(),
+                GEMMA4_TARGET_VERIFIED_SEGMENT_MAX_POSITIONS,
+            ) {
+                return api_error_with_prompt_token_count(
+                    StatusCode::BAD_REQUEST,
+                    "target_verified_render_segment_context_exceeded",
+                    format!("target-verified render segment {index}: {message}"),
+                    Some("camelid_target_verified_render_segments"),
+                    Some(segment_prompt_tokens),
+                );
+            }
+            total_prompt_tokens = match total_prompt_tokens.checked_add(segment_prompt_tokens) {
+                Some(total) => total,
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_target_verified_render_segments",
+                        "segmented target-verified render prompt token count overflowed"
+                            .to_string(),
+                        Some("camelid_target_verified_render_segments"),
+                    )
+                }
+            };
+            total_output_tokens = match total_output_tokens.checked_add(segment.token_ids.len()) {
+                Some(total) => total,
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_target_verified_render_segments",
+                        "segmented target-verified render output token count overflowed"
+                            .to_string(),
+                        Some("camelid_target_verified_render_segments"),
+                    )
+                }
+            };
+            prepared.push(Gemma4PreparedRenderSegment {
+                prompt,
+                prompt_tokens: segment_prompt_tokens,
+                token_ids: segment.token_ids,
+            });
+        }
+        let stream = match gemma4_segmented_render_stream_on_engine(state, runtime, prepared) {
+            Ok(stream) => stream,
+            Err(response) => return *response,
+        };
+        (total_prompt_tokens, total_output_tokens, stream)
+    } else {
+        let messages = req.messages.clone().unwrap_or_default();
+        let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
+        let max_tokens = render_draft_token_ids
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or_else(|| req.max_tokens.unwrap_or(256).min(4096) as usize);
+        let prompt_tokens =
+            match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await {
+                Ok(count) => count,
+                Err(response) => return response,
+            };
+        if let Err(response) =
+            validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
+        {
+            return response;
+        }
+        let stream = match gemma4_stream_on_engine(
+            state,
+            runtime,
+            prompt,
+            max_tokens,
+            render_draft_token_ids,
+        ) {
+            Ok(stream) => stream,
+            Err(response) => return *response,
+        };
+        (prompt_tokens, max_tokens, stream)
     };
-
-    let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
-    {
-        Ok(stream) => stream,
-        Err(response) => return *response,
-    };
+    let (mut rx, cancel_on_drop) = stream;
 
     let events = async_stream::stream! {
         let _cancel_on_drop = cancel_on_drop;
@@ -13561,6 +15356,7 @@ async fn gemma4_chat_streaming(
             true,
         )));
         let mut completion_tokens = 0usize;
+        let mut native_diagnostics = None;
         let mut completed = false;
         // Role chunk.
         let role = serde_json::json!({
@@ -13600,8 +15396,28 @@ async fn gemma4_chat_streaming(
                     });
                     yield Ok(Event::default().data(chunk.to_string()));
                 }
-                Gemma4StreamItem::Complete { completion_tokens: actual } => {
+                Gemma4StreamItem::SegmentBoundary(progress) => {
+                    // Each section has an independent chat prompt; hidden
+                    // channel state must not leak across that prompt boundary.
+                    if !progress.boundary.is_empty() {
+                        channel_filter = Gemma4ChannelFilter::new();
+                    }
+                    let chunk = serde_json::json!({
+                        "id": "chatcmpl-gemma4",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": gemma4_target_verified_segment_delta(&progress),
+                            "finish_reason": null
+                        }],
+                    });
+                    yield Ok(Event::default().data(chunk.to_string()));
+                }
+                Gemma4StreamItem::Complete { completion_tokens: actual, diagnostics } => {
                     completion_tokens = actual;
+                    native_diagnostics = diagnostics;
                     completed = true;
                 }
                 Gemma4StreamItem::Error(e) => {
@@ -13627,7 +15443,11 @@ async fn gemma4_chat_streaming(
         }
 
         if !errored {
-            let finish_reason = gemma4_finish_reason(completion_tokens, max_tokens);
+            let finish_reason = gemma4_streaming_finish_reason(
+                completion_tokens,
+                max_tokens,
+                target_verified_render,
+            );
             if let Some(guard) = telemetry_guard.take() {
                 guard.finish(telemetry::RequestFinish {
                     status: "ok",
@@ -13647,6 +15467,10 @@ async fn gemma4_chat_streaming(
                 "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                 "usage": gemma4_usage(prompt_tokens, completion_tokens),
             });
+            let mut done = done;
+            if let Some(camelid) = native_diagnostics {
+                done["camelid"] = camelid;
+            }
             yield Ok(Event::default().data(done.to_string()));
         }
         yield Ok(Event::default().data("[DONE]"));
@@ -13674,6 +15498,10 @@ async fn load_model_from_path_with_activation(
     // Resolution runs BEFORE the idempotent fast path so a repeated relative
     // request compares equal to the resolved path the first load stored.
     let path = resolve_request_model_path(&state.models_dir, path)?;
+    // Preserve caller authority over model ids. The one startup-only canonical
+    // remap below is allowed only when no id was supplied and exact artifact
+    // identity has subsequently been proven by the phase-2 receipt hash.
+    let explicit_id_present = id.is_some();
     enforce_distributed_model_sha256(state, &path)?;
     // Idempotent fast path: the same id already loaded from the same file
     // returns the existing record instead of re-running the full load pipeline
@@ -13763,18 +15591,33 @@ async fn load_model_from_path_with_activation(
         BackendError::InvalidModelMetadata(format!("model metadata task panicked: {join_error}"))
     })??;
     state.planner_env.apply(&outcome.env_updates);
-    let id = id
+    let mut id = id
         .or_else(|| gguf.model_name().map(ToOwned::to_owned))
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "loaded-model".to_string());
     // Phase 2: config/tensor binding, tokenizer construction, and the
     // multi-gigabyte lane hash.
     let build_id = id.clone();
-    let loaded = tokio::task::spawn_blocking(move || build_loaded_model(path, build_id, gguf))
+    let mut loaded = tokio::task::spawn_blocking(move || build_loaded_model(path, build_id, gguf))
         .await
         .map_err(|join_error| {
             BackendError::InvalidModelMetadata(format!("model load task panicked: {join_error}"))
         })??;
+    // `general.name` is presentation metadata, and the certified Gemma 4 12B
+    // artifact currently records the unhelpful value "Hf" there. Only after
+    // the full-file hash proves both the exact filename and bytes do we replace
+    // that provisional fallback with its compatibility-row id. This keeps the
+    // active id, lane identity, request selection, and model APIs aligned while
+    // leaving explicit ids and every neighbouring artifact untouched.
+    if let Some(canonical_id) = canonical_mtp12_startup_model_id(
+        explicit_id_present,
+        &loaded.path,
+        &loaded.lane.gguf_sha256,
+    ) {
+        id = canonical_id.to_string();
+        loaded.id = id.clone();
+        loaded.lane.model_id = id.clone();
+    }
     finalize_execution_plan_support_for_loaded_artifact(
         &mut outcome.plan,
         &loaded.path,
@@ -13937,9 +15780,13 @@ async fn load_gemma4_serve_runtime(
         gemma4_distributed_serve_config().map_err(BackendError::InvalidModelMetadata)?;
     let ghost_moe =
         gemma4_ghost_moe_serve_config(model_path).map_err(BackendError::InvalidModelMetadata)?;
-    if distributed.is_some() && ghost_moe.is_some() {
+    let mtp12 = gemma4_mtp12_serve_config().map_err(BackendError::InvalidModelMetadata)?;
+    let requested_lanes = usize::from(distributed.is_some())
+        + usize::from(ghost_moe.is_some())
+        + usize::from(mtp12.is_some());
+    if requested_lanes > 1 {
         return Err(BackendError::InvalidModelMetadata(
-            "Gemma 4 Ghost-MoE and distributed serve are mutually exclusive; unset either CAMELID_GEMMA4_GHOST_CGHOST or CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT"
+            "Gemma 4 MTP12 Metal, Ghost-MoE, and distributed serve are mutually exclusive; configure exactly one lane"
                 .to_string(),
         ));
     }
@@ -13951,7 +15798,38 @@ async fn load_gemma4_serve_runtime(
         crate::ghost_install::apply_catalog_cuda_defaults();
     }
     let load_path = model_path.to_path_buf();
-    let runtime = tokio::task::spawn_blocking(move || match (ghost_moe, distributed) {
+    let runtime = tokio::task::spawn_blocking(move || {
+        if let Some(mtp12) = mtp12 {
+            #[cfg(target_os = "macos")]
+            {
+                // The target hash is admitted before the assistant allocation,
+                // and the assistant loader independently validates its exact
+                // config, tensor manifest, byte length, and SHA-256.
+                let runtime = crate::gemma4_runtime::Gemma4GpuRuntime::load(
+                    &load_path,
+                    mtp12.max_positions,
+                )?;
+                runtime.admit_mtp12_target_identity()?;
+                let assistant =
+                    crate::metal::Gemma4Mtp12AssistantMetal::load(&mtp12.assistant_path)?;
+                return Ok(Gemma4ServeRuntime::Mtp12Metal {
+                    runtime,
+                    assistant: std::sync::Mutex::new(assistant),
+                    verify_width: mtp12.verify_width,
+                    max_positions: mtp12.max_positions,
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = mtp12;
+                return Err(BackendError::InvalidModelMetadata(
+                    "CAMELID_GEMMA4_MTP12_ASSISTANT selects a macOS Metal-only serve lane"
+                        .to_string(),
+                ));
+            }
+        }
+
+        match (ghost_moe, distributed) {
         (Some(ghost), None) => {
             #[cfg(feature = "cuda")]
             if gemma4_ghost_cuda_enabled(ghost.catalog_managed) {
@@ -14062,6 +15940,7 @@ async fn load_gemma4_serve_runtime(
             crate::gemma4_runtime::Gemma4Runtime::load(&load_path).map(Gemma4ServeRuntime::Local)
         }
         (Some(_), Some(_)) => unreachable!("mutual exclusion checked before runtime load"),
+        }
     })
     .await
     .map_err(|e| {
@@ -14073,6 +15952,8 @@ async fn load_gemma4_serve_runtime(
         match &runtime {
             Gemma4ServeRuntime::Local(_) => Gemma4ServeLane::Local,
             Gemma4ServeRuntime::Distributed(_) => Gemma4ServeLane::Distributed,
+            #[cfg(target_os = "macos")]
+            Gemma4ServeRuntime::Mtp12Metal { .. } => Gemma4ServeLane::Mtp12Metal,
             #[cfg(feature = "cuda")]
             Gemma4ServeRuntime::Cuda { .. } => Gemma4ServeLane::Cuda,
         }
@@ -15881,6 +17762,22 @@ async fn chat_completions(
         Ok(binding) => binding,
         Err(response) => return response,
     };
+    let target_verified_render_tokens = match validate_target_verified_render_request(&req) {
+        Ok(tokens) => tokens,
+        Err(response) => return response,
+    };
+    let segmented_render_present = req.camelid_target_verified_render_segments.is_some();
+    if let Err(message) = validate_segmented_render_expected_sha(
+        segmented_render_present,
+        req.camelid_expected_gguf_sha256.as_deref(),
+    ) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "target_verified_render_artifact_binding_required",
+            message,
+            Some("camelid_expected_gguf_sha256"),
+        );
+    }
     // Fail closed on unsupported multimodal types before routing. Prism
     // `image_url` parts are collected separately and handled by the qwen35
     // runnable lane; audio, video, and malformed parts never degrade into a
@@ -15926,6 +17823,7 @@ async fn chat_completions(
     };
     let tools_active = req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
+    let tools_declared = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let tools_unsupported_on_lane = |lane: &str| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -15941,13 +17839,26 @@ async fn chat_completions(
     // through to the existing Llama/3B path unchanged.
     match resolve_gemma4_runtime(&state, &req).await {
         Ok(Some((id, runtime))) => {
+            if target_verified_render_tokens.is_some() && !runtime.is_mtp12_metal() {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "target_verified_render_lane_required",
+                    "target-verified render drafts require the exact Gemma 4 12B MTP12 Metal lane"
+                        .to_string(),
+                    Some(if segmented_render_present {
+                        "camelid_target_verified_render_segments"
+                    } else {
+                        "camelid_target_verified_render_draft_token_ids"
+                    }),
+                );
+            }
             if has_image_input {
                 return vision_unsupported_on_lane("gemma4");
             }
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
             }
-            if tools_active {
+            if tools_active || (segmented_render_present && tools_declared) {
                 return tools_unsupported_on_lane("gemma4");
             }
             // The runtime Arc was cloned while model transitions were locked;
@@ -15961,6 +17872,19 @@ async fn chat_completions(
         }
         Ok(None) => {}
         Err(resp) => return resp,
+    }
+    if target_verified_render_tokens.is_some() {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "target_verified_render_lane_required",
+            "target-verified render drafts require the exact Gemma 4 12B MTP12 Metal lane"
+                .to_string(),
+            Some(if segmented_render_present {
+                "camelid_target_verified_render_segments"
+            } else {
+                "camelid_target_verified_render_draft_token_ids"
+            }),
+        );
     }
     // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
     // short-circuits a qwen35/Ornith or gemma3 model to the runnable lane. Streaming
@@ -17723,13 +19647,13 @@ fn run_speculative_round(
                     .session
                     .forward_greedy_verify_chunk(&batch)
                     .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "speculative_verify_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "speculative_verify_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?;
                 let accepted = accepted_draft_prefix(&drafts, &predictions);
                 (predictions[..=accepted].to_vec(), accepted, timings)
             }
@@ -17768,8 +19692,7 @@ fn run_speculative_round(
                 let target_refs: Vec<&[f32]> =
                     target_probabilities.iter().map(Vec::as_slice).collect();
                 let rng = seeded_rejection_rng(sampling.seed.unwrap_or(0), history.len() as u64);
-                let result =
-                    speculative_rejection_sample(&drafts, &draft_refs, &target_refs, rng);
+                let result = speculative_rejection_sample(&drafts, &draft_refs, &target_refs, rng);
                 (result.emitted_tokens, result.accepted_draft_count, timings)
             }
         };
@@ -27078,6 +29001,10 @@ mod tests {
                 // distributed layer-sharding serve lane (single-node 16GB is
                 // memory-bound); promotion bundle + WebUI closure committed.
                 "gemma4_12b_it_q8_0",
+                // Exact 12B QAT Q4_0 + MTP12 assistant, single-node Apple Metal;
+                // native target-verified performance receipt only, explicitly
+                // configured and hash-pinned through the non-catalog allowlist.
+                "gemma4_12b_it_qat_q4_0_mtp12",
                 // 26B A4B QAT (Q4_0 experts + Q6_K head) is supported_exact_row_smoke
                 // SCOPED TO the same two-Mac distributed lane: full basic_v1 parity
                 // pack (2/5 full + 3/5 probe-verified frontiers) + distributed serve
@@ -35783,6 +37710,15 @@ fn numerical_variance_compatibility_row_ids() -> &'static std::collections::Hash
 /// what made every pinned row read "Experimental" in v0.6.0. See
 /// `classify_model_lane_with_verified_sha256` for that boundary.
 const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
+    // Exact target of the single-node lossless Metal MTP12 performance lane.
+    // It is intentionally catalog-free: the assistant is a separately pinned
+    // artifact and the lane must be explicitly configured before this row is
+    // host-eligible.
+    (
+        "gemma-4-12b-it-qat-q4_0.gguf",
+        "gemma4_12b_it_qat_q4_0_mtp12",
+        "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+    ),
     // HF pristine upload; local recompute matches the HF LFS oid (9,527,500,992 B).
     (
         "ornith-1.0-9b-Q8_0.gguf",
@@ -36103,6 +38039,29 @@ fn filename_is_numerical_variance_exact_row(filename: &str) -> bool {
 
 const LFM2_5_2_6B_Q8_0_FILENAME: &str = "LFM2.5-2.6B-Q8_0.gguf";
 const PHI3_MINI_4K_Q8_0_FILENAME: &str = "Phi-3-mini-4k-instruct-Q8_0.gguf";
+const GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME: &str = "gemma-4-12b-it-qat-q4_0.gguf";
+const GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID: &str = "gemma4_12b_it_qat_q4_0_mtp12";
+
+/// Canonicalize the one certified side-loaded MTP12 target after phase 2 has
+/// computed its receipt hash. The generic GGUF-name fallback remains unchanged:
+/// this exact filename + digest pair is the only artifact whose compatibility
+/// row id supersedes cosmetic `general.name` metadata, and an explicit caller id
+/// always wins.
+fn canonical_mtp12_startup_model_id(
+    explicit_id_present: bool,
+    path: &Path,
+    gguf_sha256: &str,
+) -> Option<&'static str> {
+    if explicit_id_present
+        || path.file_name().and_then(|name| name.to_str())
+            != Some(GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME)
+        || !supported_artifact_identity_matches(GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME, gguf_sha256)
+    {
+        return None;
+    }
+
+    Some(GEMMA4_12B_QAT_Q4_0_MTP12_ROW_ID)
+}
 
 /// The exact platform envelope carried by the LFM2 promotion receipts.
 ///
@@ -36203,6 +38162,7 @@ fn supported_exact_row_host_eligible(filename: &str) -> bool {
     match filename {
         LFM2_5_2_6B_Q8_0_FILENAME => lfm2_supported_on_current_host(),
         PHI3_MINI_4K_Q8_0_FILENAME => phi3_supported_on_current_host(),
+        GEMMA4_12B_QAT_Q4_0_MTP12_FILENAME => gemma4_mtp12_supported_on_current_host(),
         _ => true,
     }
 }

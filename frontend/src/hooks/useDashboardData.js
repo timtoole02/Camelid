@@ -5,6 +5,8 @@ import { resolveLoadedModelDisplayName } from '../lib/loadedModelDisplay'
 import { isEmbeddingOnlyModel, isGenerationCapableModel, matchResidentItemsToLocalRecords, modelCapabilityFields } from '../lib/modelCapabilities.js'
 import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation.js'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
+import { readExactTargetVerifiedRender, readTargetVerifiedMtp12 } from '../lib/nativeGenerationMetrics'
+import { readExactTargetVerifiedSegmentedRender } from '../lib/nativeGenerationMetrics'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { appStorage } from '../lib/appStorage.js'
@@ -40,6 +42,8 @@ import {
   modelContextLength,
 } from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
+import { isGemma4Mtp12TargetVerifiedVideoOptedIn, shouldUseGemma4Mtp12TargetVerifiedRender } from '../lib/targetVerifiedRender.js'
+import { isGemma4Mtp12SegmentedVideoOptedIn, readGemma4Mtp12PreparedSegments } from '../lib/segmentedWebResearchSynthesis.js'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -1210,6 +1214,20 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }))
       let requestMessages = applyLocalChatPolicy(requestHistory)
 
+      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
+      const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
+      const preparedVideoArtifact = isGemma4Mtp12SegmentedVideoOptedIn()
+        ? readGemma4Mtp12PreparedSegments()
+        : null
+      const segmentedVideoRigRequested = Boolean(preparedVideoArtifact) && shouldUseGemma4Mtp12TargetVerifiedRender({
+        runtime,
+        requestModelId,
+        compatibilityRowId: sendGate.hint?.target?.id,
+        research: { sources: [{}, {}] },
+        receiptMode,
+        videoRigOptIn: isGemma4Mtp12TargetVerifiedVideoOptedIn(),
+      })
+
       const estimateResearchPromptTokens = (candidateMessages) => estimateWebResearchChatTokens(
         candidateMessages,
         { visionTokenAllowance: runtime?.vision_token_allowance },
@@ -1219,7 +1237,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         maxPromptTokens: runtime?.max_prompt_tokens,
         estimateTokenCount: estimateResearchPromptTokens,
       })
-      if (baseContextFit.unfit) {
+      if (!segmentedVideoRigRequested && baseContextFit.unfit) {
         showNotice(baseContextFit.message, 'error')
         return
       }
@@ -1242,8 +1260,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // Web UI research is a deterministic preflight: resolve linked/current
       // sources first, then give the ordinary chat request a leading, untrusted
       // evidence message. No tools/tool_choice payload is sent to the model.
-      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
-      const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
       const bitNetB158Chat = isBitNetB158ChatModel(selectedModel, runtime, requestModelId)
       const responseLimitModelIds = [...new Set([
         requestModelId,
@@ -1288,6 +1304,22 @@ export function useDashboardData({ showNotice, clearNotice }) {
           })
           const researchElapsedMs = performance.now() - researchStartedAt
           webResearchMs = researchResult?.triggered ? researchElapsedMs : null
+          if (segmentedVideoRigRequested) {
+            // The exact prompt and live source response remain visible and
+            // auditable, but the model inputs are the separately prepared,
+            // hash-gated <=512-position sections. Do not reject this mode by
+            // trying to fit the monolithic prompt/evidence into a 512 runtime.
+            requestMessages = [{
+              role: 'user',
+              content: 'Prepared Web research multi-pass synthesis. Exact user request and live sources are attached to the visible turn; model execution uses the hash-gated bounded section messages.',
+            }]
+            requestMaxTokens = preparedVideoArtifact.total_tokens
+            setWebResearchStatus({
+              phase: researchResult?.status === 'failed' ? 'failed' : 'complete',
+              sourceCount: Array.isArray(researchResult?.sources) ? researchResult.sources.length : 0,
+              conversationId: conversation.id,
+            })
+          } else {
           const configuredContext = runtime?.active_context_length || modelContextLength(selectedModel)
           const researchBudget = deriveWebResearchPromptBudget({
             contextLength: configuredContext,
@@ -1338,6 +1370,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
             sourceCount: Array.isArray(researchResult?.sources) ? researchResult.sources.length : 0,
             conversationId: conversation.id,
           })
+          }
         } catch (error) {
           const researchElapsedMs = performance.now() - researchStartedAt
           if (error?.name === 'AbortError') throw error
@@ -1358,6 +1391,24 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       const researchAtSend = webResearchMetadata(researchResult, researchFailure)
       const promptTokenEstimate = estimateResearchPromptTokens(requestMessages)
+      const targetVerifiedRender = shouldUseGemma4Mtp12TargetVerifiedRender({
+        runtime,
+        requestModelId,
+        compatibilityRowId: sendGate.hint?.target?.id,
+        // Use the fitted source groups, not flattened display metadata where
+        // two chunks from one repository could look like two sources.
+        research: researchResult,
+        receiptMode,
+        videoRigOptIn: isGemma4Mtp12TargetVerifiedVideoOptedIn(),
+      })
+      const segmentedTargetVerifiedRender = targetVerifiedRender
+        && isGemma4Mtp12SegmentedVideoOptedIn()
+      const preparedSegmentedSynthesis = segmentedTargetVerifiedRender
+        ? preparedVideoArtifact
+        : null
+      if (segmentedTargetVerifiedRender && !preparedSegmentedSynthesis) {
+        throw new Error('Prepared Web research synthesis artifact is missing or failed its exact schema/source gate')
+      }
 
       const requestStartedAt = performance.now()
       // Fresh per-token decode trace for this generation (auditable backing for
@@ -1368,8 +1419,19 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let firstContentEmitted = false
       let firstTokenAt = null
       let decodeStartTokens = 0
+      let liveWindowStartedAt = null
+      let liveWindowStartTokens = 0
+      let latestNativeSegmentRate = null
       let lastProgressAt = 0
-      const pacer = createPacerState()
+      // The private, prepared research lane completes independently verified
+      // sections. Hold two completed sections as a reservoir, then reveal only
+      // received bytes at a frame-timed cadence. The 240 chars/s cadence is
+      // separately gated against exact verified output tokens by the capture
+      // rig; ordinary chats retain the low-lag pacer.
+      const smoothSegmentedPacing = segmentedTargetVerifiedRender
+      const pacer = createPacerState(smoothSegmentedPacing
+        ? { steadyCharsPerSecond: 240 }
+        : undefined)
       /* The pacer is driven by its own animation frame loop rather than by token
          arrival, so the text keeps flowing smoothly between bursty SSE chunks
          and advances once per display refresh (120Hz where the panel supports
@@ -1378,6 +1440,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let latestReceivedContent = ''
       let lastPacedContent = ''
       let pacingFrame = null
+      let segmentedPacingReady = !smoothSegmentedPacing
+      let completedVerifiedSegments = 0
+      let pacingSettle = null
+      let streamTransportComplete = false
       stopPacing = () => {
         if (pacingFrame !== null && typeof window !== 'undefined') window.cancelAnimationFrame(pacingFrame)
         pacingFrame = null
@@ -1390,10 +1456,37 @@ export function useDashboardData({ showNotice, clearNotice }) {
           lastPacedContent = paced
           markAssistantStreamState({ content: paced })
         }
-        if (paceHasPendingText(paced, fullContent)) startPacing()
+        if (paceHasPendingText(paced, fullContent)) {
+          startPacing()
+        } else {
+          // If an unexpectedly long verifier prefill exhausts the received-text
+          // reservoir, keep the stock response row communicative instead of
+          // looking frozen. The next real content delta restores "Streaming
+          // response"; successful paced takes normally never enter this state.
+          if (smoothSegmentedPacing && !streamTransportComplete && lastPacedContent) {
+            markAssistantStreamState({ streaming_phase: 'thinking' })
+          }
+          if (pacingSettle) {
+            const { resolve, timeout } = pacingSettle
+            pacingSettle = null
+            window.clearTimeout(timeout)
+            resolve()
+          }
+        }
       }
       const startPacing = () => {
         if (pacingFrame === null && typeof window !== 'undefined') pacingFrame = window.requestAnimationFrame(pacingTick)
+      }
+      const waitForPacingToSettle = () => {
+        if (!paceHasPendingText(lastPacedContent, latestReceivedContent)) return Promise.resolve()
+        return new Promise((resolve, reject) => {
+          const timeout = window.setTimeout(() => {
+            pacingSettle = null
+            reject(new Error('Smooth received-text reservoir did not settle before its safety deadline'))
+          }, 12_000)
+          pacingSettle = { resolve, timeout }
+          startPacing()
+        })
       }
       assistantId = makeId('message')
       /* Snapshot of the support claim that was active when this send left the
@@ -1430,7 +1523,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         },
         usage_source: 'client_estimate',
         streaming: true,
-        streaming_phase: 'preparing',
+        streaming_phase: targetVerifiedRender ? 'generating' : 'preparing',
+        synthesis_mode: segmentedTargetVerifiedRender ? 'prepared_web_research_multi_pass_lossless' : null,
         first_byte_ms: null,
         first_event_ms: null,
         first_content_ms: null,
@@ -1439,7 +1533,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
-          ? { ...item, title: item.title === 'New conversation' ? messageContent.slice(0, 64) : item.title, messages: [...(item.messages || []), assistantMessageBase], updated_at: nowIso() }
+          ? {
+              ...item,
+              title: item.title === 'New conversation' ? messageContent.slice(0, 64) : item.title,
+              messages: [...(item.messages || []), assistantMessageBase],
+              updated_at: nowIso(),
+            }
           : item
       )))
       setPendingChat(null)
@@ -1448,45 +1547,130 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // must not cause the browser to advertise Prism's sampling controls that
       // this model does not use.
       const useExperimentalSampling = sendGate.chatMode === 'experimental' && !bitNetB158Chat
+      const baseRequestBody = {
+        model: requestModelId,
+        messages: requestMessages,
+        // Supported rows stay greedy (temperature 0) — their behavior is parity-
+        // locked. Experimental rows have no parity contract and small models loop
+        // badly under greedy decoding, so they sample for usable output. BitNet's
+        // runnable lane is explicitly greedy even while its row is experimental.
+        temperature: useExperimentalSampling ? 0.7 : 0,
+        ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
+        max_tokens: requestMaxTokens,
+        ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
+        ...(thinkingMode && !bitNetB158Chat ? { camelid_enable_thinking: true } : {}),
+      }
+
+      let targetVerifiedDraftTokenIds = []
+      let targetVerifiedSegments = []
+      let targetVerifiedPlannerMs = null
+      let targetVerifiedPlannerCamelid = null
+      if (targetVerifiedRender) {
+        const plannerStartedAt = performance.now()
+        const segmentPlans = [{ messages: requestMessages, maxTokens: requestMaxTokens }]
+        if (segmentedTargetVerifiedRender) {
+          targetVerifiedSegments = preparedSegmentedSynthesis.segments
+        }
+        if (!segmentedTargetVerifiedRender) {
+        for (let segmentIndex = 0; segmentIndex < segmentPlans.length; segmentIndex += 1) {
+          const segmentPlan = segmentPlans[segmentIndex]
+          const plannerResponse = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: requestController.signal,
+            // Every draft is freshly generated for this turn. In segmented
+            // mode each compact, grounded section stays inside the backend's
+            // 512-position qualification envelope.
+            body: JSON.stringify({
+              ...baseRequestBody,
+              messages: segmentPlan.messages,
+              max_tokens: segmentPlan.maxTokens,
+              stream: false,
+            }),
+          })
+          let plannerPayload = null
+          try {
+            plannerPayload = await plannerResponse.json()
+          } catch {
+            // The typed error below remains useful if a proxy returned non-JSON.
+          }
+          if (!plannerResponse.ok) {
+            throw new Error(plannerPayload?.error?.message || `Gemma 4 section ${segmentIndex + 1} planning failed with HTTP ${plannerResponse.status}`)
+          }
+          if (String(plannerPayload?.model || '') !== String(requestModelId)) {
+            throw new Error(`Gemma 4 planning resolved model ${plannerPayload?.model || '(missing)'}, expected ${requestModelId}`)
+          }
+          if (plannerPayload?.choices?.[0]?.finish_reason !== 'stop') {
+            throw new Error(`Gemma 4 section ${segmentIndex + 1} did not finish naturally (${plannerPayload?.choices?.[0]?.finish_reason || 'missing finish reason'})`)
+          }
+          const tokenIds = plannerPayload?.camelid?.generated_token_ids || []
+          if (!Array.isArray(tokenIds)
+            || tokenIds.length === 0
+            || tokenIds.length !== Number(plannerPayload?.usage?.completion_tokens)
+            || tokenIds.some((token) => !Number.isInteger(token) || token < 0)) {
+            throw new Error(`Gemma 4 section ${segmentIndex + 1} did not return a complete authoritative token-id draft`)
+          }
+          targetVerifiedDraftTokenIds = tokenIds
+          targetVerifiedPlannerCamelid = plannerPayload?.camelid
+            ? {
+                mtp12: plannerPayload.camelid.mtp12 || null,
+                timings_ms: plannerPayload.camelid.timings_ms || null,
+              }
+            : null
+        }
+        }
+        targetVerifiedPlannerMs = performance.now() - plannerStartedAt
+        if (segmentedTargetVerifiedRender) targetVerifiedPlannerMs = null
+        updateConversationsState((current) => current.map((item) => (
+          item.id === conversation.id
+            ? {
+                ...item,
+                messages: (item.messages || []).map((message) => (
+                  message.id === assistantId
+                    ? {
+                        ...message,
+                        streaming_phase: 'generating',
+                        planner_ms: targetVerifiedPlannerMs,
+                        prepared_segment_count: segmentedTargetVerifiedRender ? targetVerifiedSegments.length : null,
+                      }
+                    : message
+                )),
+                updated_at: nowIso(),
+              }
+            : item
+        )))
+      }
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: requestController.signal,
         body: JSON.stringify({
-          model: requestModelId,
-          messages: requestMessages,
-          // Supported rows stay greedy (temperature 0) — their behavior is parity-
-          // locked. Experimental rows have no parity contract and small models loop
-          // badly under greedy decoding, so they sample for usable output. BitNet's
-          // runnable lane is explicitly greedy even while its row is experimental.
-          temperature: useExperimentalSampling ? 0.7 : 0,
-          // Prism's checked 27B demo sampler: keep the experimental lane aligned
-          // with the model authors instead of letting low-bit greedy decode fall
-          // into exact repetition loops.
-          ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
-          // Gemma 4 may spend its first four tokens on a hidden channel
-          // envelope before the first visible token. Keep at least that visible
-          // floor, then apply the Ghost-only WebUI ceiling so the global 8,192
-          // default does not pre-admit normal chats to CPU common execution.
-          max_tokens: requestMaxTokens,
-          /* Empty today: a sampling override is sent only when /api/capabilities
-             advertises a supported row for that exact parameter. */
-          ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
-          // Opt-in thinking mode (experimental — not parity-locked). Only sent
-          // when the user turns it on; silence keeps the thinking-DISABLED
-          // parity-locked rendering.
-          ...(thinkingMode && !bitNetB158Chat ? { camelid_enable_thinking: true } : {}),
+          ...baseRequestBody,
           // Receipts only attach to non-streaming responses; the JSON
           // fallback in readStreamingChatCompletion handles that shape.
-          stream: !receiptMode,
+          stream: targetVerifiedRender || !receiptMode,
           // Ask for the authoritative token count in the final stream chunk.
           // Without it the client can only ESTIMATE from visible content, which
           // undercounts badly on a thinking model: LFM2 emits its reasoning as
           // `reasoning_content`, so a reply that is mostly reasoning looked like
           // almost no tokens and the tok/s readout reported a fraction of the
           // real rate.
-          ...(receiptMode ? {} : { stream_options: { include_usage: true } }),
-          ...(receiptMode ? { camelid_receipt: true } : {}),
+          ...(targetVerifiedRender || !receiptMode ? { stream_options: { include_usage: true } } : {}),
+          ...(!targetVerifiedRender && receiptMode ? { camelid_receipt: true } : {}),
+          ...(targetVerifiedRender ? {
+            // The private verifier contract is exact: its output allowance is
+            // the complete fresh draft, not the planner's larger upper bound.
+            max_tokens: segmentedTargetVerifiedRender
+              ? targetVerifiedSegments.reduce((sum, segment) => sum + segment.token_ids.length, 0)
+              : targetVerifiedDraftTokenIds.length,
+            ...(segmentedTargetVerifiedRender
+              ? {
+                  n: 1,
+                  camelid_target_verified_render_segments: targetVerifiedSegments,
+                  camelid_expected_gguf_sha256: '93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b',
+                }
+              : { camelid_target_verified_render_draft_token_ids: targetVerifiedDraftTokenIds }),
+          } : {}),
         }),
       })
       const responseIsStreaming = response.ok && !response.headers.get('content-type')?.includes('application/json')
@@ -1540,9 +1724,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
           firstContentEmitted = true
           emitFirstContent(lifecycleId, liveElapsedMs)
         }
-        const decodedTokens = firstTokenAt === null ? 0 : Math.max(0, realTokens - decodeStartTokens)
-        const decodeElapsedMs = firstTokenAt === null ? 0 : now - firstTokenAt
-        const liveTps = responseIsStreaming ? tokensPerSecond(decodedTokens, decodeElapsedMs) : null
+        const decodedTokens = liveWindowStartedAt === null ? 0 : Math.max(0, realTokens - liveWindowStartTokens)
+        const decodeElapsedMs = liveWindowStartedAt === null ? 0 : now - liveWindowStartedAt
+        // This live value is a browser-observed delivery rate computed from
+        // real SSE token arrivals. The backend's native target-verifier clock
+        // replaces it after each verified segment and in terminal diagnostics.
+        const liveTps = responseIsStreaming && decodedTokens >= 4 && decodeElapsedMs >= 200
+          ? tokensPerSecond(decodedTokens, decodeElapsedMs)
+          : null
         if (typeof window !== 'undefined' && realTokens > 0) {
           if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
           window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(decodeElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
@@ -1553,12 +1742,30 @@ export function useDashboardData({ showNotice, clearNotice }) {
         }
         /* Record what truly arrived; the pacing loop above owns the display. */
         latestReceivedContent = fullContent
+        if (!segmentedPacingReady) {
+          // Do not expose text until two sections have completed and can bridge
+          // the final verifier prefill. The buffer contains model output already
+          // received in this turn; no prepared response text is read.
+          markAssistantStreamState({
+            streaming_phase: completedVerifiedSegments > 0 ? 'thinking' : 'generating',
+            tokens_in_per_sec: null,
+            tokens_out_per_sec: null,
+            usage: {
+              prompt_tokens: promptTokenEstimate,
+              completion_tokens: realTokens,
+              total_tokens: promptTokenEstimate + realTokens,
+            },
+            usage_source: 'client_estimate',
+          })
+          return
+        }
         // Browsers suspend requestAnimationFrame in a hidden tab. Commit the
         // first small text prefix synchronously so a healthy decode cannot sit
         // at "out 0". The rest of a large first network chunk remains paced;
         // later deltas keep frame-batched updates rather than rendering once
         // per generated token.
-        const displayedContent = firstVisibleContent
+        const firstRenderedContent = !lastPacedContent && Boolean(fullContent)
+        const displayedContent = firstRenderedContent
           ? paceFirstVisiblePrefix(pacer, fullContent, now)
           : paceStep(pacer, fullContent, performance.now()) || '…'
         const contentChanged = displayedContent !== lastPacedContent
@@ -1567,21 +1774,69 @@ export function useDashboardData({ showNotice, clearNotice }) {
           ...(contentChanged ? { content: displayedContent } : {}),
           streaming_phase: 'streaming',
           tokens_in_per_sec: null,
-          tokens_out_per_sec: liveTps,
+          // The segmented lane exposes its backend-native completed-section
+          // clock in the single stock streaming badge. Keep the footer rate
+          // empty until terminal aggregate diagnostics so two clocks cannot
+          // appear simultaneously or disagree on screen.
+          tokens_out_per_sec: segmentedTargetVerifiedRender ? null : liveTps,
+          streaming_native_segment_rate: latestNativeSegmentRate,
           usage: {
             prompt_tokens: promptTokenEstimate,
             completion_tokens: realTokens,
             total_tokens: promptTokenEstimate + realTokens,
           },
           usage_source: 'client_estimate',
-        }, { immediate: firstVisibleContent })
+        }, { immediate: firstRenderedContent })
         if (paceHasPendingText(displayedContent, fullContent)) startPacing()
       }, {
         estimateTokenCount,
         onStreamEvent(event) {
-          if ((event.type === 'reasoning' || event.type === 'content') && firstTokenAt === null) {
-            firstTokenAt = performance.now()
-            decodeStartTokens = Number(event.completionTokens) || 0
+          if (event.type === 'segment') {
+            completedVerifiedSegments += 1
+            const segmentRate = Number(event.segment?.render_tokens_per_second)
+            latestNativeSegmentRate = Number.isFinite(segmentRate) && segmentRate > 0 ? segmentRate : null
+            // Start a new browser-arrival window for the next independently
+            // verified section. The completed section's backend-native rate is
+            // surfaced alongside it and is never confused with this clock.
+            liveWindowStartedAt = null
+            liveWindowStartTokens = Number(event.completionTokens) || 0
+            if (!segmentedPacingReady && completedVerifiedSegments >= 2) {
+              segmentedPacingReady = true
+              const initialContent = paceFirstVisiblePrefix(
+                pacer,
+                latestReceivedContent,
+                performance.now(),
+              )
+              lastPacedContent = initialContent
+              markAssistantStreamState({
+                content: initialContent,
+                streaming_phase: 'streaming',
+                streaming_native_segment_rate: latestNativeSegmentRate,
+                streaming_segment_index: Number(event.segment?.index) + 1,
+              }, { immediate: true })
+              if (paceHasPendingText(initialContent, latestReceivedContent)) startPacing()
+            } else if (!segmentedPacingReady) {
+              markAssistantStreamState({
+                streaming_phase: 'thinking',
+                streaming_native_segment_rate: latestNativeSegmentRate,
+                streaming_segment_index: Number(event.segment?.index) + 1,
+              }, { immediate: true })
+            } else {
+              markAssistantStreamState({
+                streaming_native_segment_rate: latestNativeSegmentRate,
+                streaming_segment_index: Number(event.segment?.index) + 1,
+              }, { immediate: true })
+            }
+          }
+          if (event.type === 'reasoning' || event.type === 'content') {
+            if (firstTokenAt === null) {
+              firstTokenAt = performance.now()
+              decodeStartTokens = Number(event.completionTokens) || 0
+            }
+            if (liveWindowStartedAt === null) {
+              liveWindowStartedAt = performance.now()
+              liveWindowStartTokens = Number(event.completionTokens) || 0
+            }
           }
           if (event.type === 'bytes' || event.type === 'role' || event.type === 'json_fallback') {
             markAssistantStreamState({
@@ -1598,18 +1853,40 @@ export function useDashboardData({ showNotice, clearNotice }) {
           }
         },
       })
+      streamTransportComplete = true
+      const streamCompletedAt = performance.now()
+      if (smoothSegmentedPacing) {
+        latestReceivedContent = streamed.content || ''
+        await waitForPacingToSettle()
+      }
       stopPacing()
       flushAssistantStreamPatch()
-      const elapsedMs = performance.now() - requestStartedAt
+      const targetVerifiedRenderDiagnostics = readExactTargetVerifiedRender(streamed.camelid)
+      const targetVerifiedSegmentedDiagnostics = readExactTargetVerifiedSegmentedRender(streamed.camelid)
+      if (segmentedTargetVerifiedRender && !targetVerifiedSegmentedDiagnostics) {
+        throw new Error('Gemma 4 segmented target verification did not reproduce every prepared section exactly')
+      }
+      if (targetVerifiedRender && !segmentedTargetVerifiedRender && !targetVerifiedRenderDiagnostics) {
+        throw new Error('Gemma 4 target verification did not reproduce the fresh planning draft exactly')
+      }
+      const elapsedMs = streamCompletedAt - requestStartedAt
       const modelTtftMs = firstTokenAt === null ? null : firstTokenAt - requestStartedAt
-      const decodeElapsedMs = firstTokenAt === null ? null : Math.max(0, performance.now() - firstTokenAt)
+      const decodeElapsedMs = firstTokenAt === null ? null : Math.max(0, streamCompletedAt - firstTokenAt)
       const completionTokenCount = streamed.completionTokens || estimateTokenCount(streamed.content)
       const decodedTokenCount = Math.max(0, completionTokenCount - decodeStartTokens)
+      // Native facts replace browser-arrival estimates after the backend has
+      // completed and attached the lossless verification record. A two-pass
+      // turn is fail-closed above, so it never falls through to client timing.
+      const nativeMtp12 = readTargetVerifiedMtp12(streamed.camelid)
+        || readTargetVerifiedMtp12(targetVerifiedPlannerCamelid)
       const assistantMessage = {
         ...assistantMessageBase,
         content: paceDrain(pacer, streamed.content || ''),
         tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, modelTtftMs),
-        tokens_out_per_sec: responseIsStreaming ? tokensPerSecond(decodedTokenCount, decodeElapsedMs) : null,
+        tokens_out_per_sec: targetVerifiedRender
+          ? (targetVerifiedSegmentedDiagnostics || targetVerifiedRenderDiagnostics).render_tokens_per_second
+          : nativeMtp12?.decode_tokens_per_second
+            ?? (responseIsStreaming ? tokensPerSecond(decodedTokenCount, decodeElapsedMs) : null),
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
         usage: streamed.usage || {
@@ -1620,7 +1897,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
         /* Footer labeling: backend-reported usage vs client estimate (I4). */
         usage_source: streamed.usage ? 'backend' : 'client_estimate',
         camelid: streamed.camelid || null,
+        planner_camelid: targetVerifiedPlannerCamelid,
         camelid_receipt: streamed.camelidReceipt || null,
+        planner_ms: targetVerifiedPlannerMs,
+        target_verified_render: targetVerifiedRender,
+        segmented_target_verified_render: segmentedTargetVerifiedRender,
         streaming: false,
         streaming_phase: null,
         first_byte_ms: streamed.firstByteMs ?? null,

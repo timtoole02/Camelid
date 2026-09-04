@@ -99,13 +99,17 @@ function WebResearchSources({ research }) {
 }
 
 /* Per-message metadata footer. Token counts are labeled by source (backend
-   usage vs client estimate); TTFT and tok/s are always client-measured and say
-   so — operational telemetry, never support evidence (I4). The Evidence Chip
-   cites the contract row that was active when this reply was generated. */
+   usage vs client estimate). TTFT and duration are browser measurements; an
+   explicitly target-verified MTP response may replace the browser tok/s
+   estimate with the native decode-clock result. The Evidence Chip cites the
+   contract row that was active when this reply was generated. */
 function MessageMetaFooter({ message }) {
   const usage = message.usage
   const ttft = formatMs(message.first_content_ms)
-  const rate = formatRate(message.tokens_out_per_sec)
+  // Exact target-verified turns show their native aggregate in the ordinary
+  // Developer Diagnostics control. Do not also label that native clock as the
+  // footer's browser-measured rate.
+  const rate = message.target_verified_render ? null : formatRate(message.tokens_out_per_sec)
   const duration = formatMs(message.elapsed_ms)
   const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
   const sentAt = formatTimeOfDay(message.created_at)
@@ -303,7 +307,13 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
         <WebResearchSources research={message.web_research} />
-        {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
+        {showLiveGenerationBadge && <LiveGenerationBadge
+          elapsedSeconds={generationElapsedSeconds}
+          label={liveStatusLabel}
+          tokensPerSec={message.tokens_out_per_sec}
+          nativeSegmentRate={message.streaming_native_segment_rate}
+          waitForNativeRate={message.synthesis_mode === 'prepared_web_research_multi_pass_lossless'}
+        />}
 
         {noVisibleResponse && (
           <div className="cxturn__warning" role="status">

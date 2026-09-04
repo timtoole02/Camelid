@@ -137,6 +137,7 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
       const choice = chunk?.choices?.[0]
       const role = choice?.delta?.role ?? null
       const delta = choice?.delta?.content ?? choice?.text ?? ''
+      const segment = choice?.delta?.camelid_segment
       // Reasoning deltas are GENERATED TOKENS even though they are not visible
       // content. A thinking model can spend an entire reply in `reasoning_content`
       // (LFM2's generation prompt opens a <think> block), so counting only
@@ -155,6 +156,17 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
         const metrics = streamMetrics()
         onStreamEvent?.({ type: 'content', delta, ...metrics })
         onDelta(delta, content, metrics)
+      }
+      if (segment && typeof segment === 'object') {
+        const boundary = typeof segment.boundary === 'string' ? segment.boundary : ''
+        onStreamEvent?.({ type: 'segment', segment, ...streamMetrics() })
+        // Segment separators are presentation-only Markdown. They are emitted
+        // separately from model content so they never inflate the exact token
+        // count or target-verification receipt.
+        if (boundary) {
+          content += boundary
+          onDelta(boundary, content, streamMetrics())
+        }
       }
       if (choice?.finish_reason) {
         finishReason = choice.finish_reason

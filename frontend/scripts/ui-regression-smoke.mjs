@@ -233,7 +233,7 @@ assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.
 assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
 assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
 assert.match(chatWorkspaceSource, /isBitNetB158ChatModel\(selectedModel, runtime, selectedModelId\)/, 'BitNet controls must use the exact causal-model detector rather than architecture display metadata alone')
-assert.match(dashboardHookSource, /const decodeElapsedMs = firstTokenAt === null \? 0 : now - firstTokenAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the first generated token and exclude its baseline count')
+assert.match(dashboardHookSource, /const decodeElapsedMs = liveWindowStartedAt === null \? 0 : now - liveWindowStartedAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the active generated-token window and exclude its baseline count')
 assert.match(dashboardHookSource, /effectiveGenerationTokenLimit\([\s\S]*runtime\?\.max_generation_tokens/, 'the outgoing max_tokens value must obey the same live server ceiling used by research budgeting')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
@@ -622,10 +622,27 @@ const {
   const complete = paceDrain(state, received)
   assert.equal(paceHasPendingText(complete, received), false, 'a caught-up display must stop requesting pacing frames')
 }
+{
+  const state = createPacerState({ steadyCharsPerSecond: 240 })
+  const received = 'x'.repeat(1000)
+  let shown = paceFirstVisiblePrefix(state, received, 0)
+  const firstLength = shown.length
+  for (let now = 16; now <= 1000; now += 16) shown = paceStep(state, received, now)
+  const advanced = shown.length - firstLength
+  assert.ok(advanced >= 235 && advanced <= 245, `steady reservoir advanced ${advanced} chars instead of ~240 in one second`)
+  assert.ok(shown.length < received.length, 'steady reservoir must not teleport to the received tail')
+  assert.equal(paceDrain(state, received), received, 'steady reservoir still drains byte-identical on abort/fallback')
+}
 assert.match(dashboardHookSource, /paceStep\(pacer, fullContent/, 'streaming display must go through the bounded pacer')
 assert.match(dashboardHookSource, /paceDrain\(pacer, streamed\.content/, 'final content must drain byte-identical from the real stream')
 assert.match(dashboardHookSource, /if \(paced !== lastPacedContent\)/, 'pacing ticks must not re-commit unchanged content')
-assert.match(dashboardHookSource, /if \(paceHasPendingText\(paced, fullContent\)\) startPacing\(\)/, 'the pacing loop must stop once displayed text catches the received stream')
+assert.match(dashboardHookSource, /if \(paceHasPendingText\(paced, fullContent\)\) \{\s*startPacing\(\)\s*\} else \{[\s\S]*if \(pacingSettle\)/, 'the pacing loop must stop or resolve its terminal wait once displayed text catches the received stream')
+assert.match(dashboardHookSource, /createPacerState\(smoothSegmentedPacing[\s\S]*steadyCharsPerSecond: 240/, 'the private segmented lane must opt into the visible-50 received-text reservoir')
+assert.match(dashboardHookSource, /completedVerifiedSegments >= 2/, 'visible-50 pacing must hold two exact sections before revealing the reservoir')
+assert.match(dashboardHookSource, /await waitForPacingToSettle\(\)[\s\S]*content: paceDrain\(pacer, streamed\.content/, 'steady completion must settle visibly before the byte-identical final message replaces it')
+assert.match(dashboardHookSource, /smoothSegmentedPacing && !streamTransportComplete && lastPacedContent[\s\S]*streaming_phase: 'thinking'/, 'an exhausted segmented reservoir must surface the stock thinking state instead of looking frozen')
+assert.match(streamingIndicatorSource, /THINKING_STREAMING_LABEL\s*=\s*'Thinking…'/, 'the exhausted-reservoir fallback must visibly say Thinking')
+assert.match(streamingIndicatorSource, /phase === 'thinking'\) return THINKING_STREAMING_LABEL/, 'the thinking phase must route through the stock streaming status component')
 
 /* ---- Streaming feel: paced by elapsed time, and scroll is never stolen ---- */
 // The pacer must advance on its own animation frame loop, not only when a
@@ -635,6 +652,7 @@ assert.match(dashboardHookSource, /stopPacing\(\)/, 'the pacing loop must be hal
 // Frame-rate independence: the advance comes from elapsed time, so 120Hz gets
 // smaller, more frequent steps rather than running twice as fast.
 assert.match(streamPacingSource, /Math\.exp\(-elapsed \/ CATCH_UP_TAU_MS\)/, 'the pacer must advance from elapsed time so motion is frame-rate independent')
+assert.match(streamPacingSource, /elapsed \* state\.steadyCharsPerMs/, 'a received-text reservoir must also use frame-time, never callback count')
 // Auto-follow must release on the user's gesture. Keying it to a distance
 // threshold is what made the view fight a small trackpad scroll.
 assert.match(chatWorkspaceSource, /releaseOnUpwardIntent/, 'auto-follow must release on upward scroll intent, not on a distance threshold')

@@ -14,6 +14,8 @@ import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
 import { classifyWebResearchNeed } from '../lib/webResearch.js'
+import { isGemma4Mtp12TargetVerifiedVideoOptedIn, shouldUseGemma4Mtp12TargetVerifiedRender } from '../lib/targetVerifiedRender.js'
+import { isGemma4Mtp12SegmentedVideoOptedIn, readGemma4Mtp12PreparedSegments } from '../lib/segmentedWebResearchSynthesis.js'
 
 const isBootstrapMessage = (message) =>
   message?.role === 'assistant' &&
@@ -565,11 +567,27 @@ export default function ChatWorkspace({
     runtime?.gemma4_serve_lane,
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
-  const sendBudget = validateSendBudget({
+  const rawSendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
     contextLength: runtime?.active_context_length || modelContextLength(selectedModel),
   })
+  const segmentedVideoComposerBypass = isGemma4Mtp12SegmentedVideoOptedIn()
+    && Boolean(readGemma4Mtp12PreparedSegments())
+    && shouldUseGemma4Mtp12TargetVerifiedRender({
+      runtime,
+      requestModelId: runtime?.active_model_id,
+      compatibilityRowId: selectedChatGate.hint?.target?.id,
+      research: { sources: [{}, {}] },
+      receiptMode,
+      videoRigOptIn: isGemma4Mtp12TargetVerifiedVideoOptedIn(),
+    })
+  // The private segmented lane verifies six independently bounded prompts;
+  // the long product brief itself is Web Auto input, not a 512-position model
+  // prompt. Keep the ordinary composer fail-closed everywhere else.
+  const sendBudget = segmentedVideoComposerBypass && rawSendBudget.level === 'error'
+    ? { ...rawSendBudget, level: 'ok', message: null }
+    : rawSendBudget
 
   /* Folded fine print: everything that used to stack under the composer now
      lives in the status line's tooltip. Error and budget notices still render
