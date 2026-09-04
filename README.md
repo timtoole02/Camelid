@@ -109,6 +109,7 @@ Good starting points:
 | Compact Windows CPU or tested M4 Metal chat (~2.9 GB) | LFM2.5 2.6B Q8_0 | `lfm2_5_2_6b` |
 | Local embeddings and semantic retrieval | Nomic Embed Text v1.5 Q8_0 | `nomic` |
 | Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
+| Fast 12B-class reasoning on a tested 16 GB M4 Mac | Gemma 4 12B-It QAT Q4_0 | `gemma4_12b_it_qat_q4_0` |
 | Reasoning and coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
 | Compact PrismML GPU model | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
 | PrismML browser/API vision | Bonsai 27B Q1_0 | `bonsai_27b_q1` |
@@ -134,8 +135,9 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Gemma 3 1B-It** | `Q8_0` | `gemma3` | 1.1 GB | `gemma_3_1b` | `gemma-3-1b-it-Q8_0.gguf` |
 | **Gemma 4 E2B-It** | `Q8_0` | `gemma4` | 5.0 GB | `gemma4_e2b` | `gemma-4-E2B-it-Q8_0.gguf` |
 | **Gemma 4 E4B-It** | `Q8_0` | `gemma4` | 8.2 GB | `gemma4_e4b` | `gemma-4-E4B-it-Q8_0.gguf` |
-| **Gemma 4 12B-It** — two-Mac distributed | `Q8_0` | `gemma4` | 12.7 GB | `gemma4_12b` | `gemma-4-12b-it-Q8_0.gguf` |
-| **Gemma 4 26B-A4B-It QAT** — two-Mac distributed MoE | `Q4_0` | `gemma4` | 14.4 GB | `gemma4_26b` | `gemma-4-26B_q4_0-it.gguf` |
+| **Gemma 4 12B-It QAT** — fast single-Mac Metal lane *(active validation)* | `Q4_0` | `gemma4` | 7.0 GB | `gemma4_12b_it_qat_q4_0` | `gemma-4-12b-it-qat-q4_0.gguf` |
+| **Gemma 4 12B-It** — legacy two-Mac distributed lane | `Q8_0` | `gemma4` | 12.7 GB | `gemma4_12b` | `gemma-4-12b-it-Q8_0.gguf` |
+| **Gemma 4 26B-A4B-It QAT** — single-Mac Ghost-MoE/MTP | `Q4_0` | `gemma4` | 14.4 GB | `gemma4_26b` | `gemma-4-26B_q4_0-it.gguf` |
 | **Qwen3 0.6B** | `Q8_0` | `qwen3` | 0.6 GB | `qwen3_0_6b` | `Qwen3-0.6B-Q8_0.gguf` |
 | **Qwen3 1.7B** | `Q8_0` | `qwen3` | 1.8 GB | `qwen3_1_7b` | `Qwen3-1.7B-Q8_0.gguf` |
 | **Qwen3 4B** | `Q8_0` | `qwen3` | 4.3 GB | `qwen3_4b_q8` | `Qwen3-4B-Q8_0.gguf` |
@@ -159,7 +161,7 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Bonsai 27B** | `Q1_0` | `qwen35` | 3.8 GB | `bonsai_27b_q1` | `Bonsai-27B-Q1_0.gguf` |
 | **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
-The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Nine hash-pinned Phase 2 rows are **Runnable with disclosed reference-output variance**: LFM2.5 1.2B Thinking Q8_0, Gemma 3 4B-It Q8_0, Llama 3.1 8B Instruct Q8_0, Qwen 2.5 0.5B/1.5B Instruct Q8_0, Qwen 3.5 4B/9B Q8_0, DeepSeek R1 Distill Qwen 1.5B Q8_0, and Aya Expanse 8B Q4_K_M. They use the normal download-and-start path and may be used for local chat; one or more strict greedy token-ID probes differ from pinned llama.cpp, so the UI keeps an amber warning and withholds Verified/Supported, tools, and broader-context claims.
+The 7.0 GB Gemma 4 12B QAT Q4_0 row is the recommended 12B download. It runs on a single tested 16 GB M4 Mac through Camelid's accelerated Metal path; its exact-row support promotion is still in progress, so the Models page labels it as validation pending. The older 12.7 GB Q8_0 artifact remains available for the validated two-host distributed lane. Nine hash-pinned Phase 2 rows are **Runnable with disclosed reference-output variance**: LFM2.5 1.2B Thinking Q8_0, Gemma 3 4B-It Q8_0, Llama 3.1 8B Instruct Q8_0, Qwen 2.5 0.5B/1.5B Instruct Q8_0, Qwen 3.5 4B/9B Q8_0, DeepSeek R1 Distill Qwen 1.5B Q8_0, and Aya Expanse 8B Q4_K_M. They use the normal download-and-start path and may be used for local chat; one or more strict greedy token-ID probes differ from pinned llama.cpp, so the UI keeps an amber warning and withholds Verified/Supported, tools, and broader-context claims.
 
 Mistral Nemo Instruct 2407 Q4_K_M, Qwen3 14B Q4_K_M, and DeepSeek R1 0528 Qwen3 8B Q4_K_M are downloadable catalog rows, not supported rows. The pinned bring-up evidence records Mistral Nemo cross-backend divergence and a blocked external comparator, Qwen3 14B without an external oracle or chat/API proof, and DeepSeek cross-backend divergence plus a missing native R1 marker/tool renderer. None inherits support from its architecture or a smaller sibling.
 
@@ -171,12 +173,13 @@ BitNet.cpp's separately permuted TL files. Reference parity and bounded-context 
 embedding-vector receipts remain outstanding. See
 [the BitNet runtime notes](docs/architecture/BITNET.md).
 
-Experimental exception: the Gemma 4 26B MoE row can also run on a single 16 GB
-Apple-silicon Mac through the opt-in Ghost-MoE Metal lane, which repacks the routed experts into a
+Gemma 4 26B-A4B QAT does **not** require two Macs. It runs on one 16 GB M4 Mac
+through the opt-in Ghost-MoE Metal lane, which repacks the routed experts into a
 paged `.cghost` artifact and keeps a bounded, persistent expert working set in unified memory
-(measured 17–20 tok/s steady-state decode on an M4). Replies on that lane are marked
-experimental with no parity guarantee. Setup, the recommended serve profile, and measured receipts
-live in [docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gemma-4-26b-a4b).
+(measured 17–20 tok/s steady-state decode on the tested M4). The distributed lane remains
+available as an alternative, but it is not a requirement. Replies on the single-Mac lane are
+currently marked experimental with no parity guarantee. Setup, the recommended serve profile,
+and measured receipts live in [docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gemma-4-26b-a4b).
 
 The full catalog, exact hashes, supported execution paths, and claim boundaries live in:
 
