@@ -16,8 +16,10 @@ use crate::inference::spec_tree::{
 use crate::inference::LlamaLoadedWeights;
 use crate::metal::{
     Eagle3AuthoritativeE1ShadowComparison, Eagle3MetalOutput, Eagle3MetalScoredRow,
-    Eagle3MetalState, Eagle3MetalWeights, ResidentIndexedHeadEarlyRow,
-    ResidentIndexedHeadEarlySnapshot, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
+    Eagle3MetalState, Eagle3MetalWeights, Eagle3SelectiveEdgePromotionAttempt,
+    Eagle3SelectiveEdgePromotionReceipt,
+    ResidentIndexedHeadEarlyRow, ResidentIndexedHeadEarlySnapshot, EAGLE3_AUX_WIDTH,
+    EAGLE3_DRAFT_VOCAB,
     RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
 };
 use crate::tensor::CpuTensor;
@@ -2126,6 +2128,14 @@ impl Eagle3AuthoritativeFusionTelemetry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Eagle3SelectiveEdgePromotionOutcome {
+    Promoted(Eagle3SelectiveEdgePromotionReceipt),
+    /// The candidate touched no visible watermark. The established serial update then
+    /// overwrote the complete accepted range and remains authoritative.
+    Fallback { reason: String },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Eagle3AuthoritativeE1ShadowCounters {
     requested: u64,
@@ -2936,6 +2946,128 @@ impl Eagle3Drafter {
             }
         }
         Ok(comparison)
+    }
+
+    /// Consume a descriptor-validated B4 device scratch after exact target acceptance.
+    ///
+    /// A successful candidate publishes only prepared prefix K/V rows, computes every miss and
+    /// the terminal row through the authoritative lane, and updates `stable_seed` from that late
+    /// terminal cell. An allowlisted precommit decline leaves the watermark at `serial_start`;
+    /// the established fused authoritative update then overwrites the complete accepted range
+    /// before returning a fallback receipt. Every other failure is fatal to the candidate run.
+    pub fn accept_authoritative_forest_with_selective_edge_promotion(
+        &mut self,
+        target_weights: &LlamaLoadedWeights,
+        all_row_captures: &[CpuTensor],
+        acceptance: &Eagle3ForestAcceptance,
+    ) -> Result<Eagle3SelectiveEdgePromotionOutcome> {
+        validate_authoritative_cb_fusion_dependencies(
+            eagle3_authoritative_cb_fusion_enabled(),
+            eagle3_batch_authoritative_kv_enabled(),
+            eagle3_full_authoritative_enabled(),
+        )?;
+        if !eagle3_authoritative_cb_fusion_enabled() {
+            return Err(invalid(
+                "selective edge promotion requires authoritative command-buffer fusion",
+            ));
+        }
+        let serial_start = self.head.filled();
+        let accepted_captures = acceptance.gather_layer_inputs(all_row_captures)?;
+        let features = interleave_target_layer_inputs(&accepted_captures)?;
+        let admitted_values = acceptance
+            .emitted_tokens
+            .len()
+            .checked_mul(EAGLE3_AUX_WIDTH)
+            .ok_or_else(|| invalid("selective promotion feature length overflow"))?;
+        if acceptance.emitted_tokens.is_empty() || admitted_values > features.len() {
+            return Err(invalid(
+                "selective promotion received an empty or truncated authoritative path",
+            ));
+        }
+        let embeddings = target_weights.token_embedding.embedding_lookup(
+            &acceptance.emitted_tokens,
+            "eagle3_selective_promotion_next_token_embeddings",
+        )?;
+        match self
+            .head
+            .forward_authoritative_features_last_output_selective_promotion(
+                &embeddings.data,
+                &features[..admitted_values],
+                &acceptance.emitted_tokens,
+                &acceptance.capture_rows,
+                serial_start,
+            ) {
+            Ok(Eagle3SelectiveEdgePromotionAttempt::Promoted { output, receipt }) => {
+                self.authoritative_fusion
+                    .note_fused_update(acceptance.emitted_tokens.len());
+                self.stable_seed = Some(output);
+                eprintln!(
+                    "[eagle3-selective-promotion] outcome=promoted base={serial_start} \
+                     authorization_generation={} authorized_stable_position={} \
+                     prepared_edge_rows={:?} authoritative_path_rows={:?} \
+                     promoted_edge_rows={:?} serial_miss_edge_rows={:?} \
+                     prepared_edges={} authoritative_edges={} promoted_hits={} serial_misses={} \
+                     full_coverage={} compacted_bytes={} additional_compaction_command_buffers={} \
+                     compaction_encode_us={} compaction_gpu_us={:?} authoritative_update_gpu_us={} \
+                     logical_serial_fc_rows_displaced={} saved_serial_kv_rows={} \
+                     serial_fc_logical_columns={} serial_fc_physical_columns={} \
+                     terminal_authoritative_rows={} proof_receipt_sha256={} \
+                     e1_kv_host_readback=false",
+                    receipt.authorization_generation,
+                    receipt.authorized_stable_position,
+                    receipt.prepared_edge_rows,
+                    receipt.authoritative_path_rows,
+                    receipt.promoted_edge_rows,
+                    receipt.serial_miss_edge_rows,
+                    receipt.prepared_edges,
+                    receipt.authoritative_edges,
+                    receipt.promoted_hits,
+                    receipt.serial_misses,
+                    receipt.authoritative_path_fully_covered,
+                    receipt.compacted_bytes,
+                    receipt.additional_compaction_command_buffers,
+                    receipt.compaction_encode_us,
+                    receipt.compaction_gpu_us,
+                    receipt.authoritative_update_gpu_us,
+                    receipt.logical_serial_fc_rows_displaced,
+                    receipt.saved_serial_kv_rows,
+                    receipt.serial_fc_logical_columns,
+                    receipt.serial_fc_physical_columns,
+                    receipt.terminal_authoritative_rows,
+                    receipt.proof_receipt_sha256,
+                );
+                Ok(Eagle3SelectiveEdgePromotionOutcome::Promoted(receipt))
+            }
+            Ok(Eagle3SelectiveEdgePromotionAttempt::Declined { reason }) => {
+                if self.head.filled() != serial_start {
+                    return Err(invalid(format!(
+                        "selective promotion decline advanced the EAGLE watermark from {serial_start} to {}",
+                        self.head.filled()
+                    )));
+                }
+                self.accept_authoritative(
+                    target_weights,
+                    &accepted_captures,
+                    &acceptance.emitted_tokens,
+                )?;
+                eprintln!(
+                    "[eagle3-selective-promotion] outcome=fallback route=serial-authoritative \
+                     base={serial_start} reason={reason:?}"
+                );
+                Ok(Eagle3SelectiveEdgePromotionOutcome::Fallback { reason })
+            }
+            Err(reason) => Err(invalid(format!(
+                "selective promotion failed outside its serial-fallback allowlist at EAGLE watermark {}/{}: {reason}",
+                serial_start,
+                self.head.filled(),
+            ))),
+        }
+    }
+
+    /// Consume an unobservable private promotion artifact when the request ends before the
+    /// authoritative head update. The caller records the explicit terminal-skip fallback.
+    pub fn abandon_selective_edge_promotion_for_terminal_skip(&mut self) -> bool {
+        self.head.abandon_authoritative_e1_shadow()
     }
 }
 

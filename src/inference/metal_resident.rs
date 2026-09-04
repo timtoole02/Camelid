@@ -1860,7 +1860,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], false, true, None, None, None)?
+            .verify_tree_metal_inner(tree, &[], false, true, None, None, None, None)?
             .map(|(emitted, _capture, _target_top_k, _indexed_head)| emitted))
     }
 
@@ -1875,7 +1875,16 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None, None, None)?
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                false,
+                true,
+                None,
+                None,
+                None,
+                None,
+            )?
             .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
     }
 
@@ -1902,6 +1911,7 @@ impl super::LlamaInferenceSession {
                 None,
                 Some(eagle3_head),
                 None,
+                None,
             )?
             .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
     }
@@ -1916,7 +1926,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<LlamaTargetTopKVerify>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, true, None, None, None)?
+            .verify_tree_metal_inner(tree, &[], true, true, None, None, None, None)?
             .map(|(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerify {
                 predictions: capture.predictions,
                 target_top_k,
@@ -1937,7 +1947,16 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None, None, None)?
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                true,
+                true,
+                None,
+                None,
+                None,
+                None,
+            )?
             .map(
                 |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerifyCapture {
                     predictions: capture.predictions,
@@ -1967,6 +1986,7 @@ impl super::LlamaInferenceSession {
                 Some(candidate_ids),
                 None,
                 None,
+                None,
             )?
         else {
             return Ok(None);
@@ -1994,6 +2014,7 @@ impl super::LlamaInferenceSession {
         candidate_ids: &[u32],
         eagle3_head: &mut metal::Eagle3MetalState,
         path_budget: usize,
+        selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
     ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
         let Some((_emitted, authoritative, _target_top_k, indexed_head)) = self
             .verify_tree_metal_inner(
@@ -2004,6 +2025,7 @@ impl super::LlamaInferenceSession {
                 Some(candidate_ids),
                 Some(eagle3_head),
                 Some(path_budget),
+                selective_promotion,
             )?
         else {
             return Ok(None);
@@ -2037,6 +2059,7 @@ impl super::LlamaInferenceSession {
                 Some(candidate_ids),
                 None,
                 None,
+                None,
             )?
         else {
             return Ok(None);
@@ -2067,6 +2090,7 @@ impl super::LlamaInferenceSession {
         candidate_ids: &[u32],
         eagle3_head: &mut metal::Eagle3MetalState,
         path_budget: usize,
+        selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
     ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
         let Some((emitted, capture, target_top_k, indexed_head)) = self
             .verify_tree_metal_inner(
@@ -2077,6 +2101,7 @@ impl super::LlamaInferenceSession {
                 Some(candidate_ids),
                 Some(eagle3_head),
                 Some(path_budget),
+                selective_promotion,
             )?
         else {
             return Ok(None);
@@ -2110,7 +2135,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, false, None, None, None)?
+            .verify_tree_metal_inner(tree, &[], true, false, None, None, None, None)?
             .map(|(_emitted, capture, target_top_k, _indexed_head)| {
                 (capture.predictions, target_top_k)
             }))
@@ -2126,6 +2151,7 @@ impl super::LlamaInferenceSession {
         indexed_head_shadow_candidates: Option<&[u32]>,
         mut eagle3_e1_shadow_head: Option<&mut metal::Eagle3MetalState>,
         selective_e1_path_budget: Option<usize>,
+        selective_e1_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
     ) -> Result<
         Option<(
             Vec<u32>,
@@ -2278,6 +2304,7 @@ impl super::LlamaInferenceSession {
                 selective_path_budget: selective_e1_path_budget,
                 target_tail_baseline_us: selective_e1_path_budget
                     .map(|_| metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US),
+                selective_promotion: selective_e1_promotion,
             };
             let Some((
                 predicted,
@@ -2631,6 +2658,7 @@ impl super::LlamaInferenceSession {
         _candidate_ids: &[u32],
         _eagle3_head: &mut metal::Eagle3MetalState,
         _path_budget: usize,
+        _selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
     ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
         Ok(None)
     }
@@ -2754,6 +2782,7 @@ impl super::LlamaInferenceSession {
         _candidate_ids: &[u32],
         _eagle3_head: &mut metal::Eagle3MetalState,
         _path_budget: usize,
+        _selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
     ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
         Ok(None)
     }

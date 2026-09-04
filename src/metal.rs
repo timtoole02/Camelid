@@ -38,6 +38,14 @@ pub const EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV: &str =
 pub const EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV: &str =
     "CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PREP_BUDGET";
 
+/// Separate production-candidate gate. The benchmark CLI validates the pinned B4 shadow
+/// receipt before it can construct an opaque verifier authorization; the low-level Metal seam
+/// repeats the B4/proof identity checks and otherwise leaves serial authority untouched.
+pub const EAGLE3_SELECTIVE_EDGE_PROMOTION_ENV: &str =
+    "CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PROMOTION";
+pub const EAGLE3_SELECTIVE_EDGE_PROMOTION_RECEIPT_ENV: &str =
+    "CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PROMOTION_RECEIPT";
+
 #[cfg(any(target_os = "macos", test))]
 fn eagle3_transaction_portfolio_shadow_setting_enables(raw: Option<&str>) -> bool {
     raw == Some("1")
@@ -249,6 +257,10 @@ pub struct Eagle3AuthoritativeE1ShadowPlan<'a> {
     /// Gate-off/all-edge receipts have no paired reference. The selective mini2 experiment uses
     /// the frozen 4.922 ms target-tail control recorded by checkpoint P.
     pub target_tail_baseline_us: Option<u128>,
+    /// Production candidate only. A value can be constructed only for the pinned B4 proof
+    /// receipt after the CLI has validated its complete descriptor and zero-mismatch evidence.
+    /// `None` is the ordinary state-inert shadow.
+    pub selective_promotion: Option<Eagle3SelectiveEdgePromotionAuthorization>,
 }
 
 /// Frozen target-tail reference for the mini2 N8 layer-25 split. Every receipt records this
@@ -256,6 +268,38 @@ pub struct Eagle3AuthoritativeE1ShadowPlan<'a> {
 /// counterfactual measurement.
 pub const EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US: u128 = 4_922;
 pub const EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS: usize = 8;
+pub const EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256: &str =
+    "ec2e156438bbeb15ce508ab3b583a22b5acca75414133570b94f13025d0c280f";
+pub const EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS: usize = 8;
+
+/// Capability carried from the strict receipt validator to each private device epoch.
+///
+/// Keeping this as an opaque value prevents the low-level Metal plan from treating an unrelated
+/// caller boolean as proof. Constructing the capability verifies the pinned receipt identity;
+/// the benchmark validator remains responsible for parsing and validating the complete receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eagle3SelectiveEdgePromotionAuthorization {
+    proof_receipt_sha256: &'static str,
+}
+
+impl Eagle3SelectiveEdgePromotionAuthorization {
+    pub fn from_validated_b4_receipt_sha256(
+        receipt_sha256: &str,
+    ) -> std::result::Result<Self, String> {
+        if receipt_sha256 != EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256 {
+            return Err(format!(
+                "selective edge promotion authorization rejected receipt SHA-256 {receipt_sha256}"
+            ));
+        }
+        Ok(Self {
+            proof_receipt_sha256: EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256,
+        })
+    }
+
+    pub fn proof_receipt_sha256(self) -> &'static str {
+        self.proof_receipt_sha256
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eagle3AuthoritativeE1ShadowFallbackReason {
@@ -272,6 +316,7 @@ pub enum Eagle3AuthoritativeE1ShadowFallbackReason {
     PendingReceipt,
     SerialOracleSkipped,
     SelectivePortfolioUnavailable,
+    SelectivePromotionContract,
 }
 
 impl Eagle3AuthoritativeE1ShadowFallbackReason {
@@ -290,6 +335,7 @@ impl Eagle3AuthoritativeE1ShadowFallbackReason {
             Self::PendingReceipt => "pending_receipt",
             Self::SerialOracleSkipped => "serial_oracle_skipped",
             Self::SelectivePortfolioUnavailable => "selective_portfolio_unavailable",
+            Self::SelectivePromotionContract => "selective_promotion_contract",
         }
     }
 }
@@ -337,7 +383,6 @@ pub struct Eagle3AuthoritativeE1ShadowTiming {
 /// State-inert E1 result retained until the established serial authoritative update provides
 /// its oracle. `scratch_{k,v}` use `[kv_head][dense_prepared_edge_slot][head_dim]` F16 layout;
 /// `prepared_edge_rows` preserves the exact dense-slot -> verifier-row identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Eagle3AuthoritativeE1Shadow {
     Encoded {
         stable_position: usize,
@@ -349,7 +394,63 @@ pub enum Eagle3AuthoritativeE1Shadow {
         scratch_v: Vec<u16>,
         timing: Eagle3AuthoritativeE1ShadowTiming,
     },
+    /// Device-resident B4 preparation. Unlike `Encoded`, these F16 bytes never cross the host;
+    /// exact target acceptance may compact matching edge rows into the live cache later.
+    #[cfg(target_os = "macos")]
+    Promotable(Eagle3SelectiveEdgePromotionScratch),
     Fallback(Eagle3AuthoritativeE1ShadowFallbackReason),
+}
+
+/// Per-round production-candidate evidence. `promoted_hits` is actual device reuse, not the
+/// shadow's theoretical count. A successful update always leaves one late authoritative terminal
+/// cell; only its independent prefix edge rows are eligible for compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Eagle3SelectiveEdgePromotionReceipt {
+    pub proof_receipt_sha256: &'static str,
+    pub authorization_generation: u64,
+    pub authorized_stable_position: usize,
+    /// Exact dense scratch-slot order authorized by the current verifier epoch.
+    pub prepared_edge_rows: Vec<usize>,
+    /// Exact root-first target-authoritative route resolved against that epoch.
+    pub authoritative_path_rows: Vec<usize>,
+    /// Prepared rows actually copied, retained in authoritative-path order.
+    pub promoted_edge_rows: Vec<usize>,
+    /// Unprepared nonterminal rows evaluated by the serial E1 lane, in path order.
+    pub serial_miss_edge_rows: Vec<usize>,
+    pub prepared_edges: usize,
+    pub authoritative_edges: usize,
+    pub promoted_hits: usize,
+    pub serial_misses: usize,
+    pub authoritative_path_fully_covered: bool,
+    pub compacted_bytes: usize,
+    /// Promotion stays inside the one authoritative update command buffer, so this is zero.
+    pub additional_compaction_command_buffers: usize,
+    /// CPU time used to encode the device-side scratch-to-live blits. Metal exposes only the
+    /// fused command-buffer GPU interval here, so no copy-only GPU duration is fabricated.
+    pub compaction_encode_us: u128,
+    pub compaction_gpu_us: Option<u128>,
+    pub authoritative_update_gpu_us: u128,
+    /// Logical FC columns removed from the serial input. V4 still evaluates an eight-column
+    /// physical tile, reported separately below; this is not a claim of physical tile savings.
+    pub logical_serial_fc_rows_displaced: usize,
+    pub saved_serial_kv_rows: usize,
+    pub serial_fc_logical_columns: usize,
+    pub serial_fc_physical_columns: usize,
+    pub terminal_authoritative_rows: usize,
+    pub preparation_timing: Eagle3AuthoritativeE1ShadowTiming,
+}
+
+/// A precommit decline is the only production-candidate outcome allowed to enter the unchanged
+/// serial authoritative path. `Err` is reserved for contract or postcommit failures and must be
+/// surfaced rather than normalized into a fallback receipt.
+pub enum Eagle3SelectiveEdgePromotionAttempt {
+    Promoted {
+        output: Eagle3MetalOutput,
+        receipt: Eagle3SelectiveEdgePromotionReceipt,
+    },
+    Declined {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,6 +590,113 @@ fn eagle3_authoritative_e1_selective_rows_valid(
             };
             parent == 0 || prepared_edge_rows.binary_search(&parent).is_ok()
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Eagle3SelectiveEdgePromotionCopy {
+    verifier_row: usize,
+    scratch_slot: usize,
+    serial_offset: usize,
+    live_position: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Eagle3SelectiveEdgePromotionPlan {
+    copies: Vec<Eagle3SelectiveEdgePromotionCopy>,
+    /// Accepted prefix offsets that have no prepared row, in exact autoregressive order.
+    serial_miss_offsets: Vec<usize>,
+    authoritative_edges: usize,
+    terminal_offset: usize,
+    serial_fc_logical_columns: usize,
+}
+
+/// Resolve exact target acceptance against a frozen sparse B4 preparation without observing or
+/// touching cache bytes. This CPU-only contract is shared by the production encoder and tests.
+/// It preserves accepted-path order even when prepared scratch slots are in verifier-row order.
+#[cfg(any(target_os = "macos", test))]
+fn eagle3_selective_edge_promotion_plan(
+    tree_tokens: &[u32],
+    tree_parent: &[i32],
+    tree_depth: &[u16],
+    prepared_edge_rows: &[usize],
+    accepted_path: &[usize],
+    emitted_tokens: &[u32],
+    stable_position: usize,
+    max_positions: usize,
+) -> std::result::Result<Eagle3SelectiveEdgePromotionPlan, &'static str> {
+    if tree_tokens.len() != tree_parent.len()
+        || tree_tokens.len() != tree_depth.len()
+        || tree_tokens.is_empty()
+        || tree_parent[0] != -1
+        || tree_depth[0] != 0
+        || accepted_path.first().copied() != Some(0)
+        || accepted_path.len() != emitted_tokens.len()
+        || !eagle3_authoritative_e1_selective_rows_valid(tree_parent, prepared_edge_rows)
+    {
+        return Err("shape_or_sparse_rows");
+    }
+    for row in 1..tree_tokens.len() {
+        let parent = usize::try_from(tree_parent[row]).map_err(|_| "tree_parent")?;
+        if parent >= row
+            || tree_depth[row] == 0
+            || tree_depth[parent].checked_add(1) != Some(tree_depth[row])
+        {
+            return Err("tree_parent_or_depth");
+        }
+    }
+    let selected = eagle3_authoritative_e1_selected_edge_slots(
+        tree_parent,
+        tree_depth,
+        accepted_path,
+    )
+    .map_err(|_| "accepted_path")?;
+    if emitted_tokens
+        .iter()
+        .take(emitted_tokens.len().saturating_sub(1))
+        .zip(accepted_path.iter().skip(1))
+        .any(|(token, row)| *row >= tree_tokens.len() || *token != tree_tokens[*row])
+    {
+        return Err("accepted_tokens");
+    }
+    if stable_position
+        .checked_add(emitted_tokens.len())
+        .is_none_or(|end| end > max_positions)
+    {
+        return Err("cache_capacity");
+    }
+
+    let mut copies = Vec::new();
+    let mut serial_miss_offsets = Vec::new();
+    for (all_edge_slot, serial_offset) in selected {
+        let verifier_row = all_edge_slot + 1;
+        match prepared_edge_rows.binary_search(&verifier_row) {
+            Ok(scratch_slot) => copies.push(Eagle3SelectiveEdgePromotionCopy {
+                verifier_row,
+                scratch_slot,
+                serial_offset,
+                live_position: stable_position + serial_offset,
+            }),
+            Err(_) => serial_miss_offsets.push(serial_offset),
+        }
+    }
+    let authoritative_edges = accepted_path.len().saturating_sub(1);
+    if copies.len() + serial_miss_offsets.len() != authoritative_edges {
+        return Err("coverage_partition");
+    }
+    // Missing prefix rows plus the terminal row are the only remaining FC columns. Promotion
+    // keeps this logical width exact; its encoder explicitly retains the proven V4 arithmetic
+    // when the active subset is one row instead of fabricating duplicate columns.
+    let serial_fc_logical_columns = serial_miss_offsets.len() + 1;
+    if serial_fc_logical_columns > KQUANT_V3_MAX_COLUMNS {
+        return Err("serial_projection_width");
+    }
+    Ok(Eagle3SelectiveEdgePromotionPlan {
+        copies,
+        serial_miss_offsets,
+        authoritative_edges,
+        terminal_offset: emitted_tokens.len() - 1,
+        serial_fc_logical_columns,
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -34650,6 +34858,9 @@ pub struct Eagle3MetalState {
     /// Default-off diagnostic receipt. It is installed only by a committing real target-tree
     /// verify and consumed immediately after the unchanged serial authoritative update.
     authoritative_e1_shadow: Option<Eagle3AuthoritativeE1Shadow>,
+    /// Monotonic per-head verifier epoch. A promotion artifact is valid only for the exact
+    /// generation that produced its route and dense scratch row order.
+    authoritative_e1_generation: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(target_os = "macos")]
@@ -34681,16 +34892,53 @@ struct Eagle3AuthoritativeE1Pending {
     scratch_v: Buffer,
     keep: Vec<Buffer>,
     stable_position: usize,
+    tree_tokens: Vec<u32>,
     tree_parent: Vec<i32>,
     tree_depth: Vec<u16>,
     prepared_edge_rows: Vec<usize>,
     selective_path_budget: Option<usize>,
+    selective_promotion: Option<Eagle3SelectiveEdgePromotionAuthorization>,
+    selective_promotion_generation: Option<u64>,
     target_tail_baseline_us: Option<u128>,
     portfolio_encode_us: u128,
     portfolio_commit_wait_us: u128,
     portfolio_gpu_us: u128,
     portfolio_kernel_window_us: u128,
     e1_encode_us: u128,
+}
+
+/// Per-head epoch authorization bound to the exact verifier generation, route, and dense scratch
+/// row order. This value is private and move-only with its two device buffers.
+#[cfg(target_os = "macos")]
+struct Eagle3SelectiveEdgePromotionEpochAuthorization {
+    proof: Eagle3SelectiveEdgePromotionAuthorization,
+    generation: u64,
+    stable_position: usize,
+    tree_tokens: Vec<u32>,
+    tree_parent: Vec<i32>,
+    tree_depth: Vec<u16>,
+    prepared_edge_rows: Vec<usize>,
+}
+
+/// Completed private E1 buffers retained only by the explicit B4 promotion path. All other E1
+/// temporaries have already been recycled, and the producing private-queue command buffer has
+/// completed before this value can be installed in the head.
+#[cfg(target_os = "macos")]
+pub struct Eagle3SelectiveEdgePromotionScratch {
+    scratch_k: Buffer,
+    scratch_v: Buffer,
+    epoch: Eagle3SelectiveEdgePromotionEpochAuthorization,
+    selective_path_budget: usize,
+    timing: Eagle3AuthoritativeE1ShadowTiming,
+}
+
+#[cfg(target_os = "macos")]
+fn recycle_authoritative_e1_artifact(artifact: Eagle3AuthoritativeE1Shadow) {
+    if let Eagle3AuthoritativeE1Shadow::Promotable(scratch) = artifact {
+        if let Some(k) = metal_linear_kernel() {
+            pool_recycle(k, [scratch.scratch_k, scratch.scratch_v]);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -34713,8 +34961,10 @@ impl Eagle3AuthoritativeE1Pending {
         let overlap_end = tail_end.min(e1_end);
         let edges = self.prepared_edge_rows.len();
         let values = EAGLE3_KV_HEADS * edges * EAGLE3_HEAD_DIM;
+        // The production candidate never maps either scratch buffer on the CPU. Shadow mode
+        // retains its established readback so mini2 can continue to falsify exact bits.
         let readback_started = std::time::Instant::now();
-        let scratch = completed.then(|| unsafe {
+        let scratch = (completed && self.selective_promotion.is_none()).then(|| unsafe {
             (
                 std::slice::from_raw_parts(self.scratch_k.contents().cast::<u16>(), values)
                     .to_vec(),
@@ -34722,7 +34972,11 @@ impl Eagle3AuthoritativeE1Pending {
                     .to_vec(),
             )
         });
-        let e1_readback_us = readback_started.elapsed().as_micros();
+        let e1_readback_us = if self.selective_promotion.is_some() {
+            0
+        } else {
+            readback_started.elapsed().as_micros()
+        };
         let timing = Eagle3AuthoritativeE1ShadowTiming {
             selective_path_budget: self.selective_path_budget,
             portfolio_encode_us: self.portfolio_encode_us,
@@ -34751,6 +35005,40 @@ impl Eagle3AuthoritativeE1Pending {
                 .target_tail_baseline_us
                 .map(|baseline| tail_end.saturating_sub(tail_start).saturating_sub(baseline)),
         };
+        if !completed {
+            let mut keep = self.keep;
+            keep.extend([self.scratch_k, self.scratch_v]);
+            pool_recycle(k, keep);
+            return Eagle3AuthoritativeE1Shadow::Fallback(
+                Eagle3AuthoritativeE1ShadowFallbackReason::CommandBufferFailed,
+            );
+        }
+        if let Some(authorization) = self.selective_promotion {
+            let budget = self
+                .selective_path_budget
+                .expect("promotion preflight requires a selective budget");
+            let generation = self
+                .selective_promotion_generation
+                .expect("promotion encode requires a bound head generation");
+            pool_recycle(k, self.keep);
+            return Eagle3AuthoritativeE1Shadow::Promotable(
+                Eagle3SelectiveEdgePromotionScratch {
+                    scratch_k: self.scratch_k,
+                    scratch_v: self.scratch_v,
+                    epoch: Eagle3SelectiveEdgePromotionEpochAuthorization {
+                        proof: authorization,
+                        generation,
+                        stable_position: self.stable_position,
+                        tree_tokens: self.tree_tokens,
+                        tree_parent: self.tree_parent,
+                        tree_depth: self.tree_depth,
+                        prepared_edge_rows: self.prepared_edge_rows,
+                    },
+                    selective_path_budget: budget,
+                    timing,
+                },
+            );
+        }
         let receipt = if let Some((scratch_k, scratch_v)) = scratch {
             Eagle3AuthoritativeE1Shadow::Encoded {
                 stable_position: self.stable_position,
@@ -34762,9 +35050,7 @@ impl Eagle3AuthoritativeE1Pending {
                 timing,
             }
         } else {
-            Eagle3AuthoritativeE1Shadow::Fallback(
-                Eagle3AuthoritativeE1ShadowFallbackReason::CommandBufferFailed,
-            )
+            unreachable!("completed shadow must have a host comparison snapshot")
         };
         let mut keep = self.keep;
         keep.extend([self.scratch_k, self.scratch_v]);
@@ -34910,6 +35196,44 @@ fn encode_eagle3_matmul_f32(
         scalar,
         input_width,
         rows,
+        n_tokens,
+    );
+}
+
+/// Promotion-only FC projection that never crosses into the unproven one-column V3 lane.
+///
+/// The certified B4 scratch rounds used the resident V4 arithmetic for every observed
+/// multi-column FC. A mixed accepted path can leave only one serial miss/terminal column; the
+/// ordinary EAGLE dispatcher would special-case that width to V3 and reproduce the rejected
+/// B1 arithmetic. This narrow helper retains the resident V4 route at the exact logical width --
+/// no duplicate or inactive feature row is introduced. The caller preflights the same Q4/V4
+/// descriptor before it is allowed to suppress any serial work.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_eagle3_selective_promotion_fc(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    y: &Buffer,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    n_tokens: usize,
+) {
+    debug_assert_eq!(weight.format, ResidentWeightFormat::Q4K);
+    debug_assert!(kquant_v4_enabled());
+    debug_assert!(kquant_v2_kernels().is_some());
+    debug_assert!((1..=KQUANT_V3_MAX_COLUMNS).contains(&n_tokens));
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        y,
+        weight,
+        out,
+        scalar,
+        EAGLE3_AUX_WIDTH,
+        EAGLE3_HIDDEN,
         n_tokens,
     );
 }
@@ -35304,6 +35628,7 @@ impl Eagle3MetalState {
             rope_theta: weights.rope_theta,
             sliding_window: weights.sliding_window,
             authoritative_e1_shadow: None,
+            authoritative_e1_generation: std::sync::atomic::AtomicU64::new(0),
         };
         if lm_head_plan.body != Eagle3DraftWire::Bf16
             || lm_head_plan.lm_head != Eagle3DraftWire::Bf16
@@ -35327,11 +35652,35 @@ impl Eagle3MetalState {
         self.filled
     }
 
+    fn issue_authoritative_e1_generation(
+        &self,
+    ) -> std::result::Result<u64, Eagle3AuthoritativeE1ShadowFallbackReason> {
+        self.authoritative_e1_generation
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |generation| generation.checked_add(1),
+            )
+            .map(|previous| previous + 1)
+            .map_err(|_| Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePromotionContract)
+    }
+
+    fn invalidate_authoritative_e1_generation(&self) {
+        let _ = self.authoritative_e1_generation.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |generation| generation.checked_add(1),
+        );
+    }
+
     /// Forget every draft-cache row.  Physical bytes need not be cleared: every future read
     /// is bounded by `filled`, and each newly admitted row overwrites its own slot first.
     pub fn reset(&mut self) {
+        self.invalidate_authoritative_e1_generation();
         self.filled = 0;
-        self.authoritative_e1_shadow = None;
+        if let Some(artifact) = self.authoritative_e1_shadow.take() {
+            recycle_authoritative_e1_artifact(artifact);
+        }
     }
 
     /// Drop an ephemeral/rejected suffix.  As with the target resident cache, rollback is a
@@ -35343,10 +35692,13 @@ impl Eagle3MetalState {
                 self.filled
             ));
         }
+        self.invalidate_authoritative_e1_generation();
         self.filled = position;
         // A receipt names one exact stable watermark. A rollback invalidates that epoch even
         // though its private bytes could not have affected the live cache.
-        self.authoritative_e1_shadow = None;
+        if let Some(artifact) = self.authoritative_e1_shadow.take() {
+            recycle_authoritative_e1_artifact(artifact);
+        }
         Ok(())
     }
 
@@ -35426,6 +35778,9 @@ impl Eagle3MetalState {
         {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
         }
+        if plan.selective_promotion.is_some() && plan.selective_path_budget != Some(4) {
+            return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePromotionContract);
+        }
         if rows.saturating_sub(1) > KQUANT_V3_MAX_COLUMNS {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::UnsupportedVerifierWidth);
         }
@@ -35440,6 +35795,18 @@ impl Eagle3MetalState {
             || self.v_proj.format != ResidentWeightFormat::Q4K
         {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::UnsupportedWeights);
+        }
+        if plan.selective_promotion.is_some()
+            && (self.fc.format != ResidentWeightFormat::Q4K
+                || !kquant_v4_enabled()
+                || kquant_v2_kernels().is_none()
+                || eagle3_authoritative_kv_batch_proj_enabled()
+                || eagle3_fused_qkv_enabled())
+        {
+            // Promotion's possibly one-column residual FC must stay in the exact resident V4
+            // arithmetic universe proven by B4. Shadow-only preparation retains its original
+            // wider format contract and can still report evidence on other configurations.
+            return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePromotionContract);
         }
         if kquant_v3_kernels().is_none() {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::KquantV3Unavailable);
@@ -35489,6 +35856,17 @@ impl Eagle3MetalState {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
         }
         let edges = prepared_edge_rows.len();
+        if plan.selective_promotion.is_some() && edges == 0 {
+            return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePromotionContract);
+        }
+        if edges > KQUANT_V3_MAX_COLUMNS {
+            return Err(Eagle3AuthoritativeE1ShadowFallbackReason::UnsupportedVerifierWidth);
+        }
+        let selective_promotion_generation = if plan.selective_promotion.is_some() {
+            Some(self.issue_authoritative_e1_generation()?)
+        } else {
+            None
+        };
         let kv_width = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
         let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
         let f32b = |values: usize| nb(values * std::mem::size_of::<f32>());
@@ -35694,10 +36072,13 @@ impl Eagle3MetalState {
             scratch_v,
             keep,
             stable_position: plan.stable_position,
+            tree_tokens: plan.tree_tokens.to_vec(),
             tree_parent: plan.tree_parent.to_vec(),
             tree_depth: plan.tree_depth.to_vec(),
             prepared_edge_rows,
             selective_path_budget: plan.selective_path_budget,
+            selective_promotion: plan.selective_promotion,
+            selective_promotion_generation,
             target_tail_baseline_us: plan.target_tail_baseline_us,
             portfolio_encode_us: selective_portfolio.map_or(0, |early| early.encode_us),
             portfolio_commit_wait_us: selective_portfolio
@@ -35717,6 +36098,10 @@ impl Eagle3MetalState {
             // A stale receipt is a lifetime invariant failure, but diagnostics must never make
             // the already-authoritative target transaction fail. Preserve a fail-closed receipt
             // for the serial path to count and discard both private epochs.
+            if let Some(stale) = self.authoritative_e1_shadow.take() {
+                recycle_authoritative_e1_artifact(stale);
+            }
+            recycle_authoritative_e1_artifact(shadow);
             self.authoritative_e1_shadow = Some(Eagle3AuthoritativeE1Shadow::Fallback(
                 Eagle3AuthoritativeE1ShadowFallbackReason::PendingReceipt,
             ));
@@ -35765,6 +36150,14 @@ impl Eagle3MetalState {
                 ),
                 Eagle3AuthoritativeE1Shadow::Fallback(reason) => {
                     return Some(Eagle3AuthoritativeE1ShadowComparison::Fallback(reason));
+                }
+                Eagle3AuthoritativeE1Shadow::Promotable(scratch) => {
+                    recycle_authoritative_e1_artifact(
+                        Eagle3AuthoritativeE1Shadow::Promotable(scratch),
+                    );
+                    return Some(Eagle3AuthoritativeE1ShadowComparison::Fallback(
+                        Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePromotionContract,
+                    ));
                 }
             };
         let prepared_edges = prepared_edge_rows.len();
@@ -35880,10 +36273,327 @@ impl Eagle3MetalState {
         })
     }
 
+    /// Consume one completed B4 preparation after exact target acceptance.
+    ///
+    /// Prepared-hit K/V rows are compacted GPU-to-GPU on the authoritative queue. Missing
+    /// prefix rows use the established single-row authoritative K/V encoder, and the terminal
+    /// row always runs the unchanged full recurrent cell after every prefix write. The head
+    /// watermark advances only after the fused command buffer and terminal output succeed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_authoritative_features_last_output_selective_promotion(
+        &mut self,
+        token_embeddings: &[f32],
+        features: &[f32],
+        emitted_tokens: &[u32],
+        accepted_path: &[usize],
+        start_position: usize,
+    ) -> std::result::Result<Eagle3SelectiveEdgePromotionAttempt, String> {
+        let rows = eagle3_validate_authoritative_fusion_shape(
+            features.len(),
+            token_embeddings.len(),
+            start_position,
+            self.filled,
+            self.max_positions,
+        )?;
+        if rows == 0 || emitted_tokens.len() != rows {
+            return Err("selective promotion requires one token per authoritative row".to_string());
+        }
+        let k = metal_linear_kernel().ok_or_else(|| "Metal is unavailable".to_string())?;
+        let artifact = self
+            .authoritative_e1_shadow
+            .take()
+            .ok_or_else(|| "selective promotion has no prepared E1 artifact".to_string())?;
+        let scratch = match artifact {
+            Eagle3AuthoritativeE1Shadow::Promotable(scratch) => scratch,
+            Eagle3AuthoritativeE1Shadow::Fallback(
+                Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable,
+            ) => {
+                return Ok(Eagle3SelectiveEdgePromotionAttempt::Declined {
+                    reason: "selective promotion preparation fell back: selective_portfolio_unavailable"
+                        .to_string(),
+                });
+            }
+            Eagle3AuthoritativeE1Shadow::Fallback(reason) => {
+                return Err(format!(
+                    "selective promotion preparation failed outside its allowlist: {}",
+                    reason.label()
+                ));
+            }
+            Eagle3AuthoritativeE1Shadow::Encoded { .. } => {
+                return Err(
+                    "selective promotion received a host-readback shadow artifact".to_string(),
+                );
+            }
+        };
+        let current_generation = self
+            .authoritative_e1_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if scratch.selective_path_budget != 4
+            || scratch.epoch.generation != current_generation
+            || scratch.epoch.tree_tokens.len() != EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS
+            || scratch.timing.selective_path_budget != Some(4)
+            || scratch.epoch.proof.proof_receipt_sha256()
+                != EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256
+        {
+            return Err(format!(
+                "selective promotion requires the exact proven B4 head epoch: artifact_generation={} current_generation={current_generation}",
+                scratch.epoch.generation,
+            ));
+        }
+        let plan = eagle3_selective_edge_promotion_plan(
+            &scratch.epoch.tree_tokens,
+            &scratch.epoch.tree_parent,
+            &scratch.epoch.tree_depth,
+            &scratch.epoch.prepared_edge_rows,
+            accepted_path,
+            emitted_tokens,
+            scratch.epoch.stable_position,
+            self.max_positions,
+        )
+        .map_err(|reason| format!("selective promotion plan failed: {reason}"))?;
+        if scratch.epoch.stable_position != start_position {
+            return Err(format!(
+                "selective promotion stable position {} does not match authoritative start {start_position}",
+                scratch.epoch.stable_position
+            ));
+        }
+
+        let prepared_edges = scratch.epoch.prepared_edge_rows.len();
+        if !(3..EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS).contains(&prepared_edges) {
+            return Err(format!(
+                "selective promotion B4 descriptor has {prepared_edges} prepared edges; the zero-mismatch receipt covers 3..=7"
+            ));
+        }
+        if plan.copies.is_empty() {
+            self.invalidate_authoritative_e1_generation();
+            pool_recycle(k, [scratch.scratch_k, scratch.scratch_v]);
+            return Ok(Eagle3SelectiveEdgePromotionAttempt::Declined {
+                reason: "selective promotion found no exact prepared authoritative edge"
+                    .to_string(),
+            });
+        }
+        if self.fc.format != ResidentWeightFormat::Q4K
+            || self.k_proj.format != ResidentWeightFormat::Q4K
+            || self.v_proj.format != ResidentWeightFormat::Q4K
+            || !kquant_v4_enabled()
+            || kquant_v2_kernels().is_none()
+            || kquant_v3_kernels().is_none()
+            || eagle3_authoritative_kv_batch_proj_enabled()
+            || eagle3_fused_qkv_enabled()
+        {
+            return Err(
+                "selective promotion head arithmetic is outside the proven FC-Q4/V4 and K/V-Q4/V3 descriptor"
+                    .to_string(),
+            );
+        }
+        let kv_width = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
+        let expected_scratch_bytes = prepared_edges
+            .checked_mul(kv_width)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| "selective promotion scratch size overflow".to_string())?;
+        if usize::try_from(scratch.scratch_k.length())
+            .ok()
+            .is_none_or(|bytes| bytes < expected_scratch_bytes)
+            || usize::try_from(scratch.scratch_v.length())
+                .ok()
+                .is_none_or(|bytes| bytes < expected_scratch_bytes)
+        {
+            return Err(format!(
+                "selective promotion scratch byte widths {}/{} are smaller than {expected_scratch_bytes}",
+                scratch.scratch_k.length(),
+                scratch.scratch_v.length()
+            ));
+        }
+
+        // Pack only serial misses plus the terminal feature. The promotion FC helper retains V4
+        // arithmetic even at a logical width of one; unlike B1, no V3 single-column dispatch is
+        // admitted, and unlike padding, no fabricated feature row is projected.
+        let projection_columns = plan.serial_fc_logical_columns;
+        let mut projected_features = vec![0.0f32; projection_columns * EAGLE3_AUX_WIDTH];
+        for (slot, &serial_offset) in plan.serial_miss_offsets.iter().enumerate() {
+            let source = serial_offset * EAGLE3_AUX_WIDTH;
+            let destination = slot * EAGLE3_AUX_WIDTH;
+            projected_features[destination..destination + EAGLE3_AUX_WIDTH]
+                .copy_from_slice(&features[source..source + EAGLE3_AUX_WIDTH]);
+        }
+        let terminal_slot = plan.serial_miss_offsets.len();
+        let terminal_source = plan.terminal_offset * EAGLE3_AUX_WIDTH;
+        let terminal_destination = terminal_slot * EAGLE3_AUX_WIDTH;
+        projected_features[terminal_destination..terminal_destination + EAGLE3_AUX_WIDTH]
+            .copy_from_slice(&features[terminal_source..terminal_source + EAGLE3_AUX_WIDTH]);
+
+        let embedding_row_offsets = (0..rows)
+            .map(eagle3_row_byte_offset)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let fused_row_offsets = (0..projection_columns)
+            .map(eagle3_row_byte_offset)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let compacted_bytes = plan
+            .copies
+            .len()
+            .checked_mul(kv_width)
+            .and_then(|values| values.checked_mul(2))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| "selective promotion compacted-byte count overflow".to_string())?;
+        let feature_bytes = std::mem::size_of_val(projected_features.as_slice()) as u64;
+        let embedding_bytes = std::mem::size_of_val(token_embeddings) as u64;
+        let fused_bytes = projection_columns
+            .checked_mul(EAGLE3_HIDDEN)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "selective promotion fused-buffer size overflow".to_string())?;
+        let feature_input = pool_get(k, feature_bytes);
+        let embedding_input = pool_get(k, embedding_bytes);
+        let fused = pool_get(k, fused_bytes as u64);
+        let fc_scalar = pool_get(k, 12);
+        write_buffer_f32(&feature_input, &projected_features);
+        write_buffer_f32(&embedding_input, token_embeddings);
+
+        // One authoritative command buffer owns both phases. Ending the blit encoder before
+        // opening the compute encoder is the device-side dependency: no extra submission or
+        // host fence is introduced, and the terminal cell cannot run ahead of a compacted hit.
+        let update_cb: metal::CommandBuffer = k.queue.new_command_buffer().to_owned();
+        let compaction_encode_started = std::time::Instant::now();
+        {
+            let blit = update_cb.new_blit_command_encoder();
+            let row_bytes = (EAGLE3_HEAD_DIM * std::mem::size_of::<u16>()) as u64;
+            for copy in &plan.copies {
+                for kv_head in 0..EAGLE3_KV_HEADS {
+                    let source = ((kv_head * prepared_edges + copy.scratch_slot)
+                        * EAGLE3_HEAD_DIM
+                        * std::mem::size_of::<u16>()) as u64;
+                    let destination = ((kv_head * self.max_positions + copy.live_position)
+                        * EAGLE3_HEAD_DIM
+                        * std::mem::size_of::<u16>()) as u64;
+                    blit.copy_from_buffer(
+                        &scratch.scratch_k,
+                        source,
+                        &self.cache_k,
+                        destination,
+                        row_bytes,
+                    );
+                    blit.copy_from_buffer(
+                        &scratch.scratch_v,
+                        source,
+                        &self.cache_v,
+                        destination,
+                        row_bytes,
+                    );
+                }
+            }
+            blit.end_encoding();
+        }
+        let compaction_encode_us = compaction_encode_started.elapsed().as_micros();
+        let encoder = update_cb.new_compute_command_encoder();
+        let mut keep = Vec::new();
+        encode_eagle3_selective_promotion_fc(
+            encoder,
+            k,
+            &mut keep,
+            &feature_input,
+            &self.fc,
+            &fused,
+            &fc_scalar,
+            projection_columns,
+        );
+        for (slot, &serial_offset) in plan.serial_miss_offsets.iter().enumerate() {
+            self.encode_authoritative_kv_row_from_buffers(
+                encoder,
+                k,
+                &mut keep,
+                &embedding_input,
+                embedding_row_offsets[serial_offset],
+                &fused,
+                fused_row_offsets[slot],
+                start_position + serial_offset,
+            );
+        }
+        let encoded = self.encode_forward_token_from_buffers_with(
+            encoder,
+            k,
+            &mut keep,
+            &embedding_input,
+            embedding_row_offsets[plan.terminal_offset],
+            &fused,
+            fused_row_offsets[terminal_slot],
+            start_position + plan.terminal_offset,
+            None,
+            false,
+        );
+        keep.extend([feature_input, embedding_input, fused, fc_scalar]);
+        encoder.end_encoding();
+        update_cb.commit();
+        wait_command_buffer_completed(&update_cb);
+        let update_completed = update_cb.status() == metal::MTLCommandBufferStatus::Completed;
+        let authoritative_update_gpu_us = command_buffer_gpu_times_us(&update_cb).0;
+        let proof_receipt_sha256 = scratch.epoch.proof.proof_receipt_sha256();
+        let authorization_generation = scratch.epoch.generation;
+        let authorized_stable_position = scratch.epoch.stable_position;
+        let preparation_timing = scratch.timing;
+        if !update_completed {
+            pool_recycle(k, keep);
+            pool_recycle(k, [scratch.scratch_k, scratch.scratch_v]);
+            return Err("selective promotion authoritative command buffer failed".to_string());
+        }
+        // Only a completed command buffer may be mapped for the terminal output. A failure after
+        // commit is fatal to the candidate run and is never rewritten as a serial fallback.
+        let output = self.finish_encoded_cell(k, encoded, keep);
+        pool_recycle(k, [scratch.scratch_k, scratch.scratch_v]);
+        let output = output?;
+        self.filled = start_position + rows;
+        let promoted_hits = plan.copies.len();
+        let serial_misses = plan.serial_miss_offsets.len();
+        let promoted_edge_rows = plan
+            .copies
+            .iter()
+            .map(|copy| copy.verifier_row)
+            .collect();
+        let serial_miss_edge_rows = plan
+            .serial_miss_offsets
+            .iter()
+            .map(|offset| accepted_path[*offset + 1])
+            .collect();
+        let prepared_edge_rows = scratch.epoch.prepared_edge_rows;
+        Ok(Eagle3SelectiveEdgePromotionAttempt::Promoted {
+            output,
+            receipt: Eagle3SelectiveEdgePromotionReceipt {
+                proof_receipt_sha256,
+                authorization_generation,
+                authorized_stable_position,
+                prepared_edge_rows,
+                authoritative_path_rows: accepted_path.to_vec(),
+                promoted_edge_rows,
+                serial_miss_edge_rows,
+                prepared_edges,
+                authoritative_edges: plan.authoritative_edges,
+                promoted_hits,
+                serial_misses,
+                authoritative_path_fully_covered: serial_misses == 0,
+                compacted_bytes,
+                additional_compaction_command_buffers: 0,
+                compaction_encode_us,
+                compaction_gpu_us: None,
+                authoritative_update_gpu_us,
+                logical_serial_fc_rows_displaced: promoted_hits,
+                saved_serial_kv_rows: promoted_hits,
+                serial_fc_logical_columns: projection_columns,
+                serial_fc_physical_columns:
+                    EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS,
+                terminal_authoritative_rows: 1,
+                preparation_timing,
+            },
+        })
+    }
+
     /// Drop a private E1 receipt when the caller intentionally skips the final serial head
     /// update (for example, the output budget is already exhausted). No live state is changed.
     pub fn abandon_authoritative_e1_shadow(&mut self) -> bool {
-        self.authoritative_e1_shadow.take().is_some()
+        let Some(artifact) = self.authoritative_e1_shadow.take() else {
+            return false;
+        };
+        self.invalidate_authoritative_e1_generation();
+        recycle_authoritative_e1_artifact(artifact);
+        true
     }
 
     /// Encode one exact authoritative K/V row into an existing command encoder.
@@ -37324,6 +38034,17 @@ impl Eagle3MetalState {
         Err("EAGLE-3 Metal is only available on macOS".to_string())
     }
 
+    pub fn forward_authoritative_features_last_output_selective_promotion(
+        &mut self,
+        _token_embeddings: &[f32],
+        _features: &[f32],
+        _emitted_tokens: &[u32],
+        _accepted_path: &[usize],
+        _start_position: usize,
+    ) -> std::result::Result<Eagle3SelectiveEdgePromotionAttempt, String> {
+        Err("EAGLE-3 Metal is only available on macOS".to_string())
+    }
+
     pub fn max_positions(&self) -> usize {
         0
     }
@@ -38637,6 +39358,7 @@ mod eagle3_metal_contract_tests {
             rope_theta: EAGLE3_ROPE_THETA,
             sliding_window: None,
             authoritative_e1_shadow: None,
+            authoritative_e1_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -38684,6 +39406,185 @@ mod eagle3_metal_contract_tests {
             bits(&b.raw_hidden),
             "{what}: raw_hidden"
         );
+    }
+
+    /// Real-Metal end-to-end contract for the production splice. Two identical synthetic heads
+    /// receive the same prefix and four-row authoritative update. The candidate reuses two
+    /// device-resident B4 scratch rows, recomputes one miss, and runs the terminal cell late; its
+    /// output, complete live-cache prefix, and watermark must exactly equal the full serial arm.
+    ///
+    /// Run only on mini2 with the frozen B4 arithmetic environment:
+    /// `cargo test --release --lib \
+    /// eagle3_metal_contract_tests::metal_eagle3_selective_b4_scratch_to_live_matches_serial \
+    /// -- --ignored --nocapture --test-threads=1`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_eagle3_selective_b4_scratch_to_live_matches_serial() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        assert!(kquant_v3_kernels().is_some(), "KQUANT_V3_SHADER");
+        assert!(kquant_v4_enabled(), "frozen B4 test requires K-quant V4");
+        assert!(kquant_v2_kernels().is_some(), "KQUANT_V4_SHADER");
+        assert!(
+            !eagle3_fused_qkv_enabled(),
+            "frozen B4 proof excludes CAMELID_EAGLE3_FUSED_QKV"
+        );
+
+        let max_positions = 48usize;
+        let mut control_weights_rng = TidyRng(0xb400_5eed_f00d_0001);
+        let mut candidate_weights_rng = TidyRng(0xb400_5eed_f00d_0001);
+        let mut control = synthetic_q4k_head(k, max_positions, &mut control_weights_rng);
+        let mut candidate = synthetic_q4k_head(k, max_positions, &mut candidate_weights_rng);
+        let mut input_rng = TidyRng(0xb400_5eed_f00d_0002);
+
+        let seed_rows = 5usize;
+        let seed_embeddings = input_rng.f32s(seed_rows * EAGLE3_HIDDEN, 0.0, 0.5);
+        let seed_features = input_rng.f32s(seed_rows * EAGLE3_AUX_WIDTH, 0.0, 0.5);
+        for head in [&mut control, &mut candidate] {
+            head.forward_authoritative_features_last_output_fused_impl(
+                &seed_embeddings,
+                &seed_features,
+                0,
+                false,
+                false,
+            )
+            .expect("identical authoritative seed");
+        }
+        let stable = control.filled();
+        assert_eq!(candidate.filled(), stable);
+
+        let rows = 4usize;
+        let embeddings = input_rng.f32s(rows * EAGLE3_HIDDEN, 0.0, 0.5);
+        let features = input_rng.f32s(rows * EAGLE3_AUX_WIDTH, 0.0, 0.5);
+        let serial_output = control
+            .forward_authoritative_features_last_output_fused_impl(
+                &embeddings,
+                &features,
+                stable,
+                false,
+                false,
+            )
+            .expect("full serial control");
+        assert_eq!(control.filled(), stable + rows);
+
+        // Exact B4-shaped descriptor with P=3, H=2, M=1. Scratch slots are verifier rows
+        // [1,3,4]; accepted rows [1,4] are copied from their exact serial-control bytes. Row 3
+        // is unconsumed and deliberately untouched, proving dense scratch slot != child-1.
+        let prepared_edge_rows = vec![1usize, 3, 4];
+        let prepared_edges = prepared_edge_rows.len();
+        let scratch_bytes = EAGLE3_KV_HEADS
+            * prepared_edges
+            * EAGLE3_HEAD_DIM
+            * std::mem::size_of::<u16>();
+        let scratch_k = pool_get(k, scratch_bytes as u64);
+        let scratch_v = pool_get(k, scratch_bytes as u64);
+        let setup = k.queue.new_command_buffer();
+        let blit = setup.new_blit_command_encoder();
+        let row_bytes = (EAGLE3_HEAD_DIM * std::mem::size_of::<u16>()) as u64;
+        for (scratch_slot, serial_offset) in [(0usize, 0usize), (2, 1)] {
+            for kv_head in 0..EAGLE3_KV_HEADS {
+                let source = ((kv_head * max_positions + stable + serial_offset)
+                    * EAGLE3_HEAD_DIM
+                    * std::mem::size_of::<u16>()) as u64;
+                let destination = ((kv_head * prepared_edges + scratch_slot)
+                    * EAGLE3_HEAD_DIM
+                    * std::mem::size_of::<u16>()) as u64;
+                blit.copy_from_buffer(
+                    &control.cache_k,
+                    source,
+                    &scratch_k,
+                    destination,
+                    row_bytes,
+                );
+                blit.copy_from_buffer(
+                    &control.cache_v,
+                    source,
+                    &scratch_v,
+                    destination,
+                    row_bytes,
+                );
+            }
+        }
+        blit.end_encoding();
+        setup.commit();
+        wait_command_buffer_completed(setup);
+        assert_eq!(setup.status(), metal::MTLCommandBufferStatus::Completed);
+
+        poison_cache_rows(&candidate, stable..stable + rows);
+        let mut timing = Eagle3AuthoritativeE1ShadowTiming::default();
+        timing.selective_path_budget = Some(4);
+        let authorization =
+            Eagle3SelectiveEdgePromotionAuthorization::from_validated_b4_receipt_sha256(
+                EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256,
+            )
+            .unwrap();
+        let generation = candidate.issue_authoritative_e1_generation().unwrap();
+        candidate
+            .install_authoritative_e1_shadow(Eagle3AuthoritativeE1Shadow::Promotable(
+                Eagle3SelectiveEdgePromotionScratch {
+                    scratch_k,
+                    scratch_v,
+                    epoch: Eagle3SelectiveEdgePromotionEpochAuthorization {
+                        proof: authorization,
+                        generation,
+                        stable_position: stable,
+                        tree_tokens: vec![10, 11, 12, 13, 14, 15, 16, 17],
+                        tree_parent: vec![-1, 0, 0, 1, 1, 2, 4, 4],
+                        tree_depth: vec![0, 1, 1, 2, 2, 2, 3, 3],
+                        prepared_edge_rows,
+                    },
+                    selective_path_budget: 4,
+                    timing,
+                },
+            ))
+            .unwrap();
+        let attempt = candidate
+            .forward_authoritative_features_last_output_selective_promotion(
+                &embeddings,
+                &features,
+                &[11, 14, 16, 99],
+                &[0, 1, 4, 6],
+                stable,
+            )
+            .expect("B4 scratch-to-live promotion");
+        let Eagle3SelectiveEdgePromotionAttempt::Promoted { output, receipt } = attempt else {
+            panic!("B4 mixed-hit parity fixture unexpectedly declined")
+        };
+
+        let cache_len = EAGLE3_KV_HEADS * max_positions * EAGLE3_HEAD_DIM;
+        assert_same_cell_output(&serial_output, &output, "B4 scratch-to-live terminal");
+        assert_eq!(
+            tidy_read_u16(&candidate.cache_k, cache_len),
+            tidy_read_u16(&control.cache_k, cache_len),
+            "B4 scratch-to-live cache_k"
+        );
+        assert_eq!(
+            tidy_read_u16(&candidate.cache_v, cache_len),
+            tidy_read_u16(&control.cache_v, cache_len),
+            "B4 scratch-to-live cache_v"
+        );
+        assert_eq!(candidate.filled(), stable + rows);
+        assert_eq!(receipt.prepared_edges, 3);
+        assert_eq!(receipt.authorization_generation, generation);
+        assert_eq!(receipt.authorized_stable_position, stable);
+        assert_eq!(receipt.prepared_edge_rows, vec![1, 3, 4]);
+        assert_eq!(receipt.authoritative_path_rows, vec![0, 1, 4, 6]);
+        assert_eq!(receipt.promoted_edge_rows, vec![1, 4]);
+        assert_eq!(receipt.serial_miss_edge_rows, vec![6]);
+        assert_eq!(receipt.authoritative_edges, 3);
+        assert_eq!(receipt.promoted_hits, 2);
+        assert_eq!(receipt.serial_misses, 1);
+        assert_eq!(receipt.logical_serial_fc_rows_displaced, 2);
+        assert_eq!(receipt.saved_serial_kv_rows, 2);
+        assert_eq!(receipt.serial_fc_logical_columns, 2);
+        assert_eq!(receipt.serial_fc_physical_columns, 8);
+        assert_eq!(receipt.compacted_bytes, 8_192);
+        assert_eq!(receipt.additional_compaction_command_buffers, 0);
+        assert_eq!(receipt.compaction_gpu_us, None);
+        assert_eq!(receipt.terminal_authoritative_rows, 1);
     }
 
     /// Replay-by-scatter bit-identity on a real Metal device: a child cell scored after
@@ -47301,6 +48202,159 @@ mod tests {
             &parent,
             &[0, 1]
         ));
+    }
+
+    #[test]
+    fn eagle3_selective_promotion_maps_sparse_b4_hits_in_authoritative_order() {
+        use super::*;
+
+        let tokens = [10, 11, 12, 13, 14, 15, 16, 17];
+        let parent = [-1, 0, 0, 1, 1, 2, 4, 4];
+        let depth = [0, 1, 1, 2, 2, 2, 3, 3];
+        let accepted = [0, 1, 4, 6];
+        let emitted = [11, 14, 16, 99];
+        let plan = eagle3_selective_edge_promotion_plan(
+            &tokens,
+            &parent,
+            &depth,
+            &[1, 3, 4, 6],
+            &accepted,
+            &emitted,
+            37,
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.copies,
+            vec![
+                Eagle3SelectiveEdgePromotionCopy {
+                    verifier_row: 1,
+                    scratch_slot: 0,
+                    serial_offset: 0,
+                    live_position: 37,
+                },
+                Eagle3SelectiveEdgePromotionCopy {
+                    verifier_row: 4,
+                    scratch_slot: 2,
+                    serial_offset: 1,
+                    live_position: 38,
+                },
+                Eagle3SelectiveEdgePromotionCopy {
+                    verifier_row: 6,
+                    scratch_slot: 3,
+                    serial_offset: 2,
+                    live_position: 39,
+                },
+            ]
+        );
+        assert!(plan.serial_miss_offsets.is_empty());
+        assert_eq!(plan.authoritative_edges, 3);
+        assert_eq!(plan.terminal_offset, 3);
+        assert_eq!(plan.serial_fc_logical_columns, 1);
+        assert_eq!(EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS, 8);
+    }
+
+    #[test]
+    fn eagle3_selective_promotion_partitions_mixed_hits_and_misses_without_padding() {
+        use super::*;
+
+        let tokens = [10, 11, 12, 13, 14, 15, 16, 17];
+        let parent = [-1, 0, 0, 1, 1, 2, 4, 4];
+        let depth = [0, 1, 1, 2, 2, 2, 3, 3];
+        let plan = eagle3_selective_edge_promotion_plan(
+            &tokens,
+            &parent,
+            &depth,
+            &[1, 3, 4],
+            &[0, 1, 4, 6],
+            &[11, 14, 16, 99],
+            20,
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.copies
+                .iter()
+                .map(|copy| (copy.verifier_row, copy.scratch_slot, copy.serial_offset))
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 0), (4, 2, 1)]
+        );
+        assert_eq!(plan.serial_miss_offsets, vec![2]);
+        assert_eq!(plan.serial_fc_logical_columns, 2);
+
+        assert_eq!(
+            eagle3_selective_edge_promotion_plan(
+                &tokens,
+                &parent,
+                &depth,
+                &[1, 3, 4],
+                &[0, 1, 4, 6],
+                &[11, 14, 17, 99],
+                20,
+                64,
+            ),
+            Err("accepted_tokens")
+        );
+        assert_eq!(
+            eagle3_selective_edge_promotion_plan(
+                &tokens,
+                &parent,
+                &depth,
+                &[3, 4],
+                &[0, 1, 4, 6],
+                &[11, 14, 16, 99],
+                20,
+                64,
+            ),
+            Err("shape_or_sparse_rows")
+        );
+        assert_eq!(
+            eagle3_selective_edge_promotion_plan(
+                &tokens,
+                &parent,
+                &depth,
+                &[1, 3, 4],
+                &[0, 2, 4],
+                &[12, 14, 99],
+                20,
+                64,
+            ),
+            Err("accepted_path")
+        );
+        assert_eq!(
+            eagle3_selective_edge_promotion_plan(
+                &tokens,
+                &parent,
+                &depth,
+                &[1, 3, 4],
+                &[0, 1, 4, 6],
+                &[11, 14, 16, 99],
+                61,
+                64,
+            ),
+            Err("cache_capacity")
+        );
+    }
+
+    #[test]
+    fn eagle3_selective_promotion_authorization_is_pinned_to_b4_proof() {
+        use super::*;
+
+        let authorization =
+            Eagle3SelectiveEdgePromotionAuthorization::from_validated_b4_receipt_sha256(
+                EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256,
+            )
+            .unwrap();
+        assert_eq!(
+            authorization.proof_receipt_sha256(),
+            EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256
+        );
+        assert!(
+            Eagle3SelectiveEdgePromotionAuthorization::from_validated_b4_receipt_sha256(
+                "wrong"
+            )
+            .is_err()
+        );
     }
 
     #[test]

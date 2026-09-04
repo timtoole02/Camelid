@@ -528,3 +528,75 @@ timing are established, replace serial K/V work only for prepared hits by a devi
 scratch-to-live compactor. Missing edges and the final terminal recurrent cell stay on the serial
 authoritative path. Until that seam exists, Q measures opportunity and contention but cannot
 improve end-to-end throughput.
+
+### Checkpoint R: proof-gated B4 scratch-to-live promotion (source candidate)
+
+Mini2's Q sweep admits exactly one preparation geometry for reuse: B4 matched every one of its 73
+eligible rounds bit-for-bit, with five shortened-round `selective_portfolio_unavailable`
+fallbacks. B1 and B2 are numerically invalid; B8 is an exact but higher-cost diagnostic control.
+R therefore has a separate default-off production gate and never promotes another budget:
+
+```text
+CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PROMOTION=1
+CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PROMOTION_RECEIPT=<exact B4 shadow receipt>
+CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PREP_BUDGET=4
+```
+
+The receipt path is mandatory. Its bytes must hash to
+`ec2e156438bbeb15ce508ab3b583a22b5acca75414133570b94f13025d0c280f`, and its parsed evidence
+must name source `8c66102ff5f9de903575afbcfefcc954b12ffdca`, proof binary
+`4057e9147bbe3c062137b8b53a4a0ac192748223e67de9c565eace408a8ea8dd`, the pinned target and
+EAGLE weights, the exact Pitch input/prompt, N8/K4/X5/draft-15, 73 matches, zero mismatches, and
+five portfolio-unavailable fallbacks. The validator also compares every arithmetic-affecting
+environment value with the proof. Only then can it construct the opaque authorization carried
+through the target verifier into a device scratch epoch; a caller boolean is not proof.
+That epoch also owns a monotonically issued per-head generation, the stable cache position, the
+complete verifier tree/token route, and the exact dense scratch-slot-to-row order. Consumption
+revalidates the generation and stable position, resolves the accepted target route against the
+owned tree, checks every nonterminal emitted token, and derives copies from the owned row order;
+a proof hash alone cannot authorize a stale or differently routed scratch result.
+
+For an accepted target path, R partitions its nonterminal edges by exact verifier-row identity.
+Each prepared hit is blitted directly from head-major private F16 scratch into the corresponding
+logical live-cache position. Missing edges retain the canonical serial K/V-only encoder. The
+terminal row always runs the canonical full recurrent cell last, with no speculative terminal
+state or precomputed terminal K/V. Blit, residual FC, miss K/V, and terminal work share one
+authoritative command buffer in that order, so promotion adds no submissions and advances the
+watermark only after successful GPU completion and terminal-output extraction. A no-hit round or
+the five proven portfolio-unavailable rounds decline before submission and run the unchanged full
+serial update. Every other descriptor, mapping, or device failure is fatal rather than disguised
+as a fallback.
+
+The B4 preparation retains its observed `P=prepared_edge_rows.len()` geometry (`P=3..7`); it never
+pads to four and never substitutes the path budget for the unique-row count. Residual FC projects
+exactly `M+1` logical columns (serial misses plus terminal) while explicitly staying on the proven
+V4 arithmetic at a one-column logical width. V4 still stages an eight-column physical tile, which
+is reported separately: `logical_serial_fc_rows_displaced` is an opportunity count, not a claim
+that an FC weight tile disappeared. Actual K/V suppression is reported as `saved_serial_kv_rows`.
+
+Receipts distinguish prepared opportunity from real reuse and include proof identity, verifier
+generation, stable position, the prepared-row order, accepted route, promoted/missed row lists,
+P/A/H/M, full-path coverage, compacted bytes, blit encode time, the fused authoritative-update GPU interval,
+logical and physical FC widths, target-tail penalty, and the explicit
+`e1_kv_host_readback=false` claim. Copy-only GPU time is `null`: the required one-command-buffer
+design exposes only the net fused interval, and does not fabricate encoder-level GPU timing.
+This claim is specific to EAGLE E1 K/V; the existing target-cache implementation is unchanged.
+
+The ignored real-Metal contract is:
+
+```text
+cargo test --release --lib \
+  eagle3_metal_contract_tests::metal_eagle3_selective_b4_scratch_to_live_matches_serial \
+  -- --ignored --nocapture --test-threads=1
+```
+
+It uses identical full-geometry Q4 heads to compare a mixed H=2/M=1 device promotion against the
+full serial update, including terminal output bits, every live K/V cache bit, and the final
+watermark. This source checkpoint intentionally does not run that test locally. The remaining
+promotion decision is mini2-only: run the ignored parity test, then alternating same-binary
+control/R Pitch pairs under the lock. A valid R receipt must remain lossless and reproduce the
+frozen transaction exactly: 63 promoted rounds, 10 no-hit serial fallbacks, five
+portfolio-unavailable serial fallbacks, zero terminal skips, P=281, A=175, H=167, M=8, 57 full
+paths, 684,032 compacted bytes, 71 residual logical FC columns, and zero additional command
+buffers. Promotion is not a general-prompt default until equivalent exact receipts cover broader
+workloads and the interleaved end-to-end result is a win.
