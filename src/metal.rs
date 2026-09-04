@@ -38192,6 +38192,23 @@ fn resident_indexed_head_shadow_fallback(
     }
 }
 
+/// Benchmark-only late-layer path-prediction diagnostic.
+///
+/// When the indexed-head shadow is already active, the verifier owns both the aligned
+/// candidate-weight slab machinery and the EAGLE capture buffers.  This gate reuses those
+/// pieces after the authoritative target command buffer has completed: each captured residual
+/// stream is passed through the target's final RMSNorm and the same indexed Q6 head, then its
+/// candidate-only top-1 is compared with the final target argmax.  Nothing from this diagnostic
+/// feeds target acceptance, KV compaction, or token emission.
+#[cfg(target_os = "macos")]
+fn eagle3_late_lens_shadow_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_BENCH_EAGLE3_LATE_LENS_SHADOW")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Replay only retained target-output rows after the authoritative full head has completed.
 ///
 /// Each candidate gets a complete copy of its original aligned eight-row Q6 wire tile. The
@@ -43171,6 +43188,99 @@ impl ResidentDecodeState {
                 candidate_ids,
             )
         });
+        // Diagnostic-only logit lens over the EAGLE capture layers.  The production target has
+        // already completed above, so these predictions cannot influence this round.  The
+        // purpose is to measure whether a late capture can name the eventual accepted path soon
+        // enough for a future second-queue implementation to prepare the next draft under the
+        // still-running target tail.
+        if eagle3_late_lens_shadow_enabled() {
+            if let Some(candidate_ids) = indexed_head_shadow_candidates {
+                for (capture_slot, &layer_id) in capture_layer_ids.iter().enumerate() {
+                    let lens_norm = pool_get(kern, (k * hidden * std::mem::size_of::<f32>()) as u64);
+                    let lens_cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
+                    {
+                        let lens_encoder = lens_cb.new_compute_command_encoder();
+                        encode_rms_norm_batch(
+                            kern,
+                            lens_encoder,
+                            &capture_bufs[capture_slot],
+                            &final_norm_buf,
+                            &lens_norm,
+                            &rms_scalar,
+                            k,
+                        );
+                        lens_encoder.end_encoding();
+                    }
+                    lens_cb.commit();
+                    lens_cb.wait_until_completed();
+                    if lens_cb.status() != metal::MTLCommandBufferStatus::Completed {
+                        eprintln!(
+                            "[eagle3-late-lens] base={base_position} layer={layer_id} rows={k} outcome=norm-command-buffer-failed"
+                        );
+                        pool_recycle(kern, [lens_norm]);
+                        continue;
+                    }
+                    let lens = run_resident_indexed_head_shadow(
+                        kern,
+                        &lens_norm,
+                        &logits_buf,
+                        &pred_buf,
+                        &ow_buf,
+                        logits.output_is_tied_embedding,
+                        hidden,
+                        vocab,
+                        k,
+                        candidate_ids,
+                    );
+                    let candidate_union_hits = lens
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            candidate_ids
+                                .binary_search(&row.authoritative_argmax_token)
+                                .is_ok()
+                        })
+                        .count();
+                    let prediction_hits = lens
+                        .rows
+                        .iter()
+                        .filter(|row| row.top1_matches_authoritative)
+                        .count();
+                    let prediction_hits_when_covered = lens
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.top1_matches_authoritative
+                                && candidate_ids
+                                    .binary_search(&row.authoritative_argmax_token)
+                                    .is_ok()
+                        })
+                        .count();
+                    let predicted_tokens = lens
+                        .rows
+                        .iter()
+                        .map(|row| row.candidate_top1_token.unwrap_or(u32::MAX))
+                        .collect::<Vec<_>>();
+                    let authoritative_tokens = lens
+                        .rows
+                        .iter()
+                        .map(|row| row.authoritative_argmax_token)
+                        .collect::<Vec<_>>();
+                    eprintln!(
+                        "[eagle3-late-lens] base={base_position} layer={layer_id} rows={k} candidates={} covered={candidate_union_hits} predicted={prediction_hits} predicted_when_covered={prediction_hits_when_covered} fallback={} lens_gpu_us={} lens_wall_us={} predicted_tokens={predicted_tokens:?} authoritative_tokens={authoritative_tokens:?}",
+                        candidate_ids.len(),
+                        lens.fallback_reason.map_or("none", ResidentIndexedHeadShadowFallbackReason::label),
+                        lens.gpu_busy_us,
+                        lens.commit_wait_us,
+                    );
+                    pool_recycle(kern, [lens_norm]);
+                }
+            } else {
+                eprintln!(
+                    "[eagle3-late-lens] base={base_position} rows={k} outcome=indexed-candidates-unavailable"
+                );
+            }
+        }
         // Note: `filled` is intentionally NOT advanced — the host accept loop sets it.
         let preds: Vec<u32> = (0..k)
             .map(|i| unsafe { *(pred_buf.contents() as *const u32).add(i) })
