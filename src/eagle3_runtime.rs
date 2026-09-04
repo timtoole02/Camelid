@@ -2882,19 +2882,26 @@ mod tests {
         frontier
             .record_expansion(2, &output(&[(15, 0.70)], 3.0))
             .unwrap();
+        // The scheduler ranks source node 3 at .55 * .60 = .33, just ahead of source node 5
+        // at .45 * .70 = .315.  Tests must follow that causal expansion order; verifier-row
+        // numbering is frozen only by `finish` below.
         frontier
-            .record_expansion(4, &output(&[(16, 0.65), (17, 0.35)], 4.0))
+            .record_expansion(3, &output(&[(16, 0.65), (17, 0.35)], 4.0))
             .unwrap();
         let forest = frontier.finish().unwrap();
         let plan = forest.plan_device_acceptance().unwrap();
         let nodes = forest.scored.tree.nodes();
         assert_eq!(nodes, 8);
+        assert_eq!(forest.scored.tree.tokens, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(forest.scored.tree.parent, vec![-1, 0, 0, 1, 1, 2, 3, 3]);
+        assert_eq!(forest.scored.tree.depth, vec![0, 1, 1, 2, 2, 2, 3, 3]);
 
         let mut cases = vec![
             vec![99, 0, 0, 0, 0, 0, 0, 0],
             vec![11, 13, 0, 97, 0, 0, 0, 0],
-            vec![11, 14, 0, 0, 16, 0, 96, 0],
-            vec![11, 14, 0, 0, 17, 0, 0, 95],
+            vec![11, 13, 0, 16, 0, 0, 96, 0],
+            vec![11, 13, 0, 17, 0, 0, 0, 95],
+            vec![11, 14, 0, 0, 93, 0, 0, 0],
             vec![12, 0, 15, 0, 0, 94, 0, 0],
             vec![u32::MAX, 0, 0, 0, 0, 0, 0, 0],
         ];
