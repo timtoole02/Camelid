@@ -12312,9 +12312,10 @@ fn run_eagle3_resident_greedy(
 
                 let verify_started = Instant::now();
                 let verified = session
-                    .verify_tree_metal_with_layer_inputs(
+                    .verify_tree_metal_with_layer_inputs_and_e1_shadow(
                         &forest.scored.tree,
                         &TARGET_LAYER_INPUT_IDS,
+                        drafter.authoritative_e1_shadow_head_mut(),
                     )?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
@@ -12351,6 +12352,7 @@ fn run_eagle3_resident_greedy(
                     run.terminal_head_updates_skipped = 1;
                     run.terminal_head_skip_reason = Some(reason);
                     terminal_head_update_skipped_this_round = true;
+                    drafter.abandon_authoritative_e1_shadow_for_terminal_skip();
                 } else {
                     let update_started = Instant::now();
                     drafter.accept_authoritative_forest(

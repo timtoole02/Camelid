@@ -5,6 +5,7 @@
 //! existing greedy speculative verifier before it can be emitted.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::eagle3::{Eagle3DraftModel, HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS, TARGET_VOCAB_SIZE};
 use crate::error::{BackendError, Result};
@@ -14,7 +15,8 @@ use crate::inference::spec_tree::{
 };
 use crate::inference::LlamaLoadedWeights;
 use crate::metal::{
-    Eagle3MetalOutput, Eagle3MetalScoredRow, Eagle3MetalState, Eagle3MetalWeights, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
+    Eagle3AuthoritativeE1ShadowComparison, Eagle3MetalOutput, Eagle3MetalScoredRow,
+    Eagle3MetalState, Eagle3MetalWeights, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
 };
 use crate::tensor::CpuTensor;
 
@@ -1457,6 +1459,65 @@ impl Eagle3AuthoritativeFusionTelemetry {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Eagle3AuthoritativeE1ShadowCounters {
+    requested: u64,
+    encoded: u64,
+    matched: u64,
+    mismatched: u64,
+    fallback: u64,
+    prepared_edges: u64,
+    selected_edges: u64,
+}
+
+static EAGLE3_E1_REQUESTED: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_ENCODED: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_MATCHED: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_MISMATCHED: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_PREPARED_EDGES: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_SELECTED_EDGES: AtomicU64 = AtomicU64::new(0);
+
+fn record_authoritative_e1_shadow(
+    comparison: &Eagle3AuthoritativeE1ShadowComparison,
+) -> Eagle3AuthoritativeE1ShadowCounters {
+    EAGLE3_E1_REQUESTED.fetch_add(1, Ordering::Relaxed);
+    match comparison {
+        Eagle3AuthoritativeE1ShadowComparison::Matched {
+            prepared_edges,
+            selected_edges,
+            ..
+        } => {
+            EAGLE3_E1_ENCODED.fetch_add(1, Ordering::Relaxed);
+            EAGLE3_E1_MATCHED.fetch_add(1, Ordering::Relaxed);
+            EAGLE3_E1_PREPARED_EDGES.fetch_add(*prepared_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_SELECTED_EDGES.fetch_add(*selected_edges as u64, Ordering::Relaxed);
+        }
+        Eagle3AuthoritativeE1ShadowComparison::Mismatched {
+            prepared_edges,
+            selected_edges,
+            ..
+        } => {
+            EAGLE3_E1_ENCODED.fetch_add(1, Ordering::Relaxed);
+            EAGLE3_E1_MISMATCHED.fetch_add(1, Ordering::Relaxed);
+            EAGLE3_E1_PREPARED_EDGES.fetch_add(*prepared_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_SELECTED_EDGES.fetch_add(*selected_edges as u64, Ordering::Relaxed);
+        }
+        Eagle3AuthoritativeE1ShadowComparison::Fallback(_) => {
+            EAGLE3_E1_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Eagle3AuthoritativeE1ShadowCounters {
+        requested: EAGLE3_E1_REQUESTED.load(Ordering::Relaxed),
+        encoded: EAGLE3_E1_ENCODED.load(Ordering::Relaxed),
+        matched: EAGLE3_E1_MATCHED.load(Ordering::Relaxed),
+        mismatched: EAGLE3_E1_MISMATCHED.load(Ordering::Relaxed),
+        fallback: EAGLE3_E1_FALLBACK.load(Ordering::Relaxed),
+        prepared_edges: EAGLE3_E1_PREPARED_EDGES.load(Ordering::Relaxed),
+        selected_edges: EAGLE3_E1_SELECTED_EDGES.load(Ordering::Relaxed),
+    }
+}
+
 /// Linear top-1 EAGLE-3 drafter. `stable_seed` is the output of the newest
 /// authoritative head-cache row and therefore predicts the first token of the next round.
 pub struct Eagle3Drafter {
@@ -1622,6 +1683,35 @@ impl Eagle3Drafter {
 
     pub fn filled(&self) -> usize {
         self.head.filled()
+    }
+
+    /// Narrow orchestration seam for the default-off target-overlapped E1 shadow. The target
+    /// verifier may install a private diagnostic receipt but cannot advance this head's
+    /// watermark, overwrite its cache, or replace `stable_seed`.
+    pub fn authoritative_e1_shadow_head_mut(&mut self) -> &mut Eagle3MetalState {
+        &mut self.head
+    }
+
+    /// Account for a deliberately skipped terminal serial update. E1 remains state-inert and
+    /// cannot be compared without that oracle, so consume it as an explicit fallback instead of
+    /// carrying the epoch into a later request.
+    pub fn abandon_authoritative_e1_shadow_for_terminal_skip(&mut self) {
+        if self.head.abandon_authoritative_e1_shadow() {
+            let comparison = Eagle3AuthoritativeE1ShadowComparison::Fallback(
+                crate::metal::Eagle3AuthoritativeE1ShadowFallbackReason::SerialOracleSkipped,
+            );
+            let counters = record_authoritative_e1_shadow(&comparison);
+            eprintln!(
+                "[eagle3-e1-shadow] outcome=fallback route=serial-authoritative \
+                 reason=serial_oracle_skipped requested_total={} encoded_total={} \
+                 matched_total={} mismatched_total={} fallback_total={}",
+                counters.requested,
+                counters.encoded,
+                counters.matched,
+                counters.mismatched,
+                counters.fallback,
+            );
+        }
     }
 
     /// Capacity of the private one-layer head cache, in positions.
@@ -2004,12 +2094,96 @@ impl Eagle3Drafter {
         all_row_captures: &[CpuTensor],
         acceptance: &Eagle3ForestAcceptance,
     ) -> Result<()> {
+        let serial_start = self.head.filled();
         let accepted_captures = acceptance.gather_layer_inputs(all_row_captures)?;
         self.accept_authoritative(
             target_weights,
             &accepted_captures,
             &acceptance.emitted_tokens,
-        )
+        )?;
+        if let Some(comparison) = self
+            .head
+            .finish_authoritative_e1_shadow(&acceptance.capture_rows, serial_start)
+        {
+            let counters = record_authoritative_e1_shadow(&comparison);
+            match comparison {
+                Eagle3AuthoritativeE1ShadowComparison::Matched {
+                    prepared_edges,
+                    selected_edges,
+                    compared_f16_values,
+                    timing,
+                } => eprintln!(
+                    "[eagle3-e1-shadow] outcome=match route=target-capture-wide-fc-private-kv-serial-oracle \
+                     base={serial_start} prepared_edges={prepared_edges} selected_edges={selected_edges} \
+                     compared_f16_values={compared_f16_values} target_gpu_us={} target_tail_gpu_us={} \
+                     e1_gpu_us={} overlap_us={} e1_encode_us={} e1_post_target_wait_us={} \
+                     e1_readback_us={} oracle_compare_us={} \
+                     target_prefix_interval={}..{} \
+                     target_tail_interval={}..{} e1_interval={}..{} requested_total={} encoded_total={} \
+                     matched_total={} mismatched_total={} fallback_total={} prepared_edges_total={} \
+                     selected_edges_total={}",
+                    timing.target_gpu_us,
+                    timing.target_tail_gpu_us,
+                    timing.e1_gpu_us,
+                    timing.overlap_us,
+                    timing.e1_encode_us,
+                    timing.e1_post_target_wait_us,
+                    timing.e1_readback_us,
+                    timing.oracle_compare_us,
+                    timing.target_prefix_start_us,
+                    timing.target_prefix_end_us,
+                    timing.target_tail_start_us,
+                    timing.target_tail_end_us,
+                    timing.e1_start_us,
+                    timing.e1_end_us,
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                    counters.prepared_edges,
+                    counters.selected_edges,
+                ),
+                Eagle3AuthoritativeE1ShadowComparison::Mismatched {
+                    reason,
+                    prepared_edges,
+                    selected_edges,
+                    timing,
+                } => eprintln!(
+                    "[eagle3-e1-shadow] outcome=mismatch route=serial-authoritative reason={reason:?} \
+                     base={serial_start} prepared_edges={prepared_edges} selected_edges={selected_edges} \
+                     target_gpu_us={} target_tail_gpu_us={} e1_gpu_us={} overlap_us={} \
+                     e1_post_target_wait_us={} e1_readback_us={} \
+                     oracle_compare_us={} \
+                     requested_total={} encoded_total={} matched_total={} mismatched_total={} \
+                     fallback_total={}",
+                    timing.target_gpu_us,
+                    timing.target_tail_gpu_us,
+                    timing.e1_gpu_us,
+                    timing.overlap_us,
+                    timing.e1_post_target_wait_us,
+                    timing.e1_readback_us,
+                    timing.oracle_compare_us,
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+                Eagle3AuthoritativeE1ShadowComparison::Fallback(reason) => eprintln!(
+                    "[eagle3-e1-shadow] outcome=fallback route=serial-authoritative reason={} \
+                     base={serial_start} requested_total={} encoded_total={} matched_total={} \
+                     mismatched_total={} fallback_total={}",
+                    reason.label(),
+                    counters.requested,
+                    counters.encoded,
+                    counters.matched,
+                    counters.mismatched,
+                    counters.fallback,
+                ),
+            }
+        }
+        Ok(())
     }
 }
 

@@ -75,6 +75,29 @@ fn eagle3_device_acceptance_shadow_enabled() -> bool {
     })
 }
 
+/// Stage-1 target-authoritative checkpoint. Exact spelling only: malformed campaign env cannot
+/// accidentally split the target queue or allocate E1 scratch.
+#[cfg(any(target_os = "macos", test))]
+const EAGLE3_AUTHORITATIVE_E1_SHADOW_ENV: &str =
+    "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_E1_SHADOW";
+
+#[cfg(any(target_os = "macos", test))]
+fn eagle3_authoritative_e1_shadow_setting_enables(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_authoritative_e1_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        eagle3_authoritative_e1_shadow_setting_enables(
+            std::env::var(EAGLE3_AUTHORITATIVE_E1_SHADOW_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Eagle3DeviceAcceptanceShadowCounters {
@@ -1837,7 +1860,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], false, true, None)?
+            .verify_tree_metal_inner(tree, &[], false, true, None, None)?
             .map(|(emitted, _capture, _target_top_k, _indexed_head)| emitted))
     }
 
@@ -1852,7 +1875,33 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None)?
+            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None, None)?
+            .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
+    }
+
+    /// Default-off production-shaped E1 shadow. With the gate absent this delegates directly to
+    /// [`Self::verify_tree_metal_with_layer_inputs`], preserving its allocation and dispatch
+    /// behavior. With the exact gate, the target verifier installs one private E1 receipt in the
+    /// supplied head for comparison after the unchanged serial authoritative update.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_and_e1_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        eagle3_head: &mut metal::Eagle3MetalState,
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        if !eagle3_authoritative_e1_shadow_enabled() {
+            return self.verify_tree_metal_with_layer_inputs(tree, capture_layer_ids);
+        }
+        Ok(self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                false,
+                true,
+                None,
+                Some(eagle3_head),
+            )?
             .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
     }
 
@@ -1866,7 +1915,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<LlamaTargetTopKVerify>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, true, None)?
+            .verify_tree_metal_inner(tree, &[], true, true, None, None)?
             .map(|(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerify {
                 predictions: capture.predictions,
                 target_top_k,
@@ -1887,7 +1936,7 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None)?
+            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None, None)?
             .map(
                 |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerifyCapture {
                     predictions: capture.predictions,
@@ -1915,6 +1964,7 @@ impl super::LlamaInferenceSession {
                 false,
                 true,
                 Some(candidate_ids),
+                None,
             )?
         else {
             return Ok(None);
@@ -1946,6 +1996,7 @@ impl super::LlamaInferenceSession {
                 true,
                 true,
                 Some(candidate_ids),
+                None,
             )?
         else {
             return Ok(None);
@@ -1979,7 +2030,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, false, None)?
+            .verify_tree_metal_inner(tree, &[], true, false, None, None)?
             .map(|(_emitted, capture, target_top_k, _indexed_head)| {
                 (capture.predictions, target_top_k)
             }))
@@ -1993,6 +2044,7 @@ impl super::LlamaInferenceSession {
         read_target_top_k: bool,
         commit: bool,
         indexed_head_shadow_candidates: Option<&[u32]>,
+        mut eagle3_e1_shadow_head: Option<&mut metal::Eagle3MetalState>,
     ) -> Result<
         Option<(
             Vec<u32>,
@@ -2115,6 +2167,9 @@ impl super::LlamaInferenceSession {
         let acceptance_shadow_requested = commit
             && capture_layer_ids == crate::eagle3::TARGET_LAYER_INPUT_IDS.as_slice()
             && eagle3_device_acceptance_shadow_enabled();
+        let eagle3_e1_shadow_requested = commit
+            && capture_layer_ids == crate::eagle3::TARGET_LAYER_INPUT_IDS.as_slice()
+            && eagle3_e1_shadow_head.is_some();
         // Established entry points remain on their original Metal APIs. Only the explicit
         // benchmark request reaches the post-authoritative indexed-head replay.
         let (
@@ -2123,7 +2178,59 @@ impl super::LlamaInferenceSession {
             target_top_k,
             indexed_head_shadow,
             device_acceptance_shadow,
-        ) = if acceptance_shadow_requested {
+            eagle3_e1_shadow,
+        ) = if eagle3_e1_shadow_requested {
+            let acceptance_plan = metal::ResidentTreeAcceptancePlan {
+                tree_tokens: &tree.tokens,
+                tree_parent: &tree.parent,
+                tree_depth: &tree.depth,
+            };
+            let eagle3_head = eagle3_e1_shadow_head
+                .as_deref()
+                .expect("requested E1 shadow has a head");
+            let e1_plan = metal::Eagle3AuthoritativeE1ShadowPlan {
+                head: eagle3_head,
+                tree_parent: &tree.parent,
+                tree_depth: &tree.depth,
+                stable_position: eagle3_head.filled(),
+            };
+            let Some((
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                device_acceptance_shadow,
+                eagle3_e1_shadow,
+            )) = session.verify_batch_tree_with_e1_shadow(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+                capture_layer_ids,
+                read_target_top_k,
+                indexed_head_shadow_candidates,
+                acceptance_shadow_requested.then_some(&acceptance_plan),
+                &e1_plan,
+            )
+            else {
+                return Ok(None);
+            };
+            (
+                predicted,
+                raw_layer_inputs,
+                target_top_k,
+                indexed_head_shadow,
+                device_acceptance_shadow,
+                Some(eagle3_e1_shadow),
+            )
+        } else if acceptance_shadow_requested {
             let acceptance_plan = metal::ResidentTreeAcceptancePlan {
                 tree_tokens: &tree.tokens,
                 tree_parent: &tree.parent,
@@ -2161,6 +2268,7 @@ impl super::LlamaInferenceSession {
                 target_top_k,
                 indexed_head_shadow,
                 Some(device_acceptance_shadow),
+                None,
             )
         } else if let Some(candidate_ids) = indexed_head_shadow_candidates {
             let Some((predicted, raw_layer_inputs, target_top_k, indexed_head_shadow)) = session
@@ -2189,6 +2297,7 @@ impl super::LlamaInferenceSession {
                 target_top_k,
                 Some(indexed_head_shadow),
                 None,
+                None,
             )
         } else if read_target_top_k {
             if capture_layer_ids.is_empty() {
@@ -2207,7 +2316,7 @@ impl super::LlamaInferenceSession {
                 ) else {
                     return Ok(None);
                 };
-                (predicted, Vec::new(), target_top_k, None, None)
+                (predicted, Vec::new(), target_top_k, None, None, None)
             } else {
                 let Some((predicted, raw_layer_inputs, target_top_k)) = session
                     .verify_batch_tree_with_layer_inputs_and_target_top_k(
@@ -2227,7 +2336,7 @@ impl super::LlamaInferenceSession {
                 else {
                     return Ok(None);
                 };
-                (predicted, raw_layer_inputs, target_top_k, None, None)
+                (predicted, raw_layer_inputs, target_top_k, None, None, None)
             }
         } else if capture_layer_ids.is_empty() {
             let Some(predicted) = session.verify_batch_tree(
@@ -2245,7 +2354,7 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (predicted, Vec::new(), Vec::new(), None, None)
+            (predicted, Vec::new(), Vec::new(), None, None, None)
         } else {
             let Some(captured) = session.verify_batch_tree_with_layer_inputs(
                 &embeddings.data,
@@ -2263,8 +2372,20 @@ impl super::LlamaInferenceSession {
             ) else {
                 return Ok(None);
             };
-            (captured.0, captured.1, Vec::new(), None, None)
+            (captured.0, captured.1, Vec::new(), None, None, None)
         };
+
+        if let Some(shadow) = eagle3_e1_shadow {
+            eagle3_e1_shadow_head
+                .as_deref_mut()
+                .expect("E1 receipt has an owning head")
+                .install_authoritative_e1_shadow(shadow)
+                .map_err(|error| {
+                    BackendError::RuntimeShapeMismatch(format!(
+                        "EAGLE-3 E1 shadow install failed: {error}"
+                    ))
+                })?;
+        }
 
         // Host accept: longest greedy-exact path through the tree. A committing call compacts the
         // accepted path's KV into contiguous slots base..base+L-1 and advances both positions.
@@ -2467,6 +2588,18 @@ impl super::LlamaInferenceSession {
         Ok(None)
     }
 
+    /// Non-macOS build: target-overlapped Metal E1 is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_and_e1_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _eagle3_head: &mut metal::Eagle3MetalState,
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(None)
+    }
+
     /// Non-macOS build: resident target top-k verification is unavailable.
     #[cfg(not(target_os = "macos"))]
     #[allow(dead_code)]
@@ -2526,6 +2659,17 @@ impl super::LlamaInferenceSession {
 #[cfg(test)]
 mod eagle3_device_acceptance_shadow_tests {
     use super::*;
+
+    #[test]
+    fn eagle3_authoritative_e1_shadow_gate_is_strict_and_default_off() {
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(None));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("")));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("0")));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("true")));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("01")));
+        assert!(eagle3_authoritative_e1_shadow_setting_enables(Some("1")));
+        assert!(eagle3_authoritative_e1_shadow_setting_enables(Some(" 1\n")));
+    }
 
     #[test]
     fn eagle3_device_acceptance_shadow_gate_is_strict_and_default_off() {

@@ -760,9 +760,10 @@ impl Eagle3ServingState {
                 )));
             }
             let verified = session
-                .verify_tree_metal_with_layer_inputs(
+                .verify_tree_metal_with_layer_inputs_and_e1_shadow(
                     &forest.scored.tree,
                     &TARGET_LAYER_INPUT_IDS,
+                    drafter.authoritative_e1_shadow_head_mut(),
                 )?
                 .ok_or_else(|| {
                     invalid(format!(

@@ -255,7 +255,10 @@ a partial commit.
 12. **Default off:** without `CAMELID_BENCH_EAGLE3_TARGET_COMMIT_PIPELINE=1`, there is no target
     split, E1/E2, extra queue, or changed update path. Without the separate
     `CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW=1` falsifier gate there is also no selector pipeline
-    lookup, allocation, dispatch, or receipt readback.
+    lookup, allocation, dispatch, or receipt readback. The staged E1 falsifier is independently
+    gated by exact value `CAMELID_BENCH_EAGLE3_AUTHORITATIVE_E1_SHADOW=1`; without it the ordinary
+    capture wrapper is called directly, so there is no target split, event, queue, E1 allocation,
+    dispatch, or timing readback.
 13. **Shadow isolation:** the device-acceptance shadow may add only the selector and parity receipt.
     It cannot arm E1/E2, select emitted tokens, or change either cache length.
 
@@ -269,18 +272,21 @@ a partial commit.
   - counters: rounds, selector parity, E1 edge rows, E2 full rows (must equal rounds), route-boundary
     fallbacks, target/EAGLE compact time, epoch failures.
 - `src/inference/metal_resident.rs`
-  - current slice: strict shadow gate, real verifier receipt comparison, cumulative route counters,
-    and reuse of the one host compaction path as the parity oracle;
-  - next slice: split/gated target verify handle retaining `pred_buf`, captures, tree K/V scratch,
-    and event;
+  - strict selector and E1 gates, real verifier receipts, and cumulative route counters;
+  - current E1 slice: split the target immediately after the layer-25 input copy, signal a shared
+    event, retain the three capture buffers until E1 completes, and leave target acceptance and
+    compaction unchanged; the post-split target tail owns disjoint mutable GEMV scalars, so host
+    encoding cannot race parameters still being read by the committed prefix;
   - encode selector and target two-stage path compactor after argmax;
   - leave ordinary tree verify untouched as gate-off oracle.
 - `src/metal.rs`
-  - current slice: lazily compile the proven selector source only for the shadow wrapper and bind
-    the unchanged production `pred_buf`;
+  - lazily compile the proven selector source only for the shadow wrapper and bind the unchanged
+    production `pred_buf`;
   - promote it into the permanent shader library only after real-model falsification;
   - fixed F32/rope/path-slot selected-row gathers;
-  - E1 K/V-only edge encoder;
+  - current E1 slice: row-interleave the real target capture buffers, run one wide authoritative
+    FC, pair every child embedding with its parent capture, run wide K/V projections, RoPE at
+    `stable + depth - 1`, and scatter F16 into a private `[head][edge][dim]` cache;
   - one-row authoritative E2 twin using buffer-backed leaf/token/count/path metadata;
   - disjoint EAGLE compactor and transaction finisher.
 - `src/main.rs` and `src/eagle3_serving.rs`
@@ -353,16 +359,50 @@ Every ordinary N8 line must say `rows=8`; a shortened final output-budget round 
 The control and shadow receipts must have identical target/EAGLE token arrays, `lossless=true`, and
 the same first-divergence result. Any mismatch or cache/token difference blocks the target split.
 
-### Checkpoint C: split target plus E1/E2 (next)
+### Checkpoint C1: split target plus state-inert E1 shadow (implemented, mini2 only)
+
+Run the protected Pitch command with the promoted environment plus:
+
+```text
+CAMELID_BENCH_EAGLE3_AUTHORITATIVE_E1_SHADOW=1
+```
+
+Every serially updated real tree round must print `outcome=match`; `mismatched_total` and
+`fallback_total` must remain zero. `prepared_edges` must be `rows - 1`, while `selected_edges`
+must be the accepted path length minus the terminal bonus. `compared_f16_values` must equal
+`selected_edges * 2 * kv_heads * head_dim`. The target token array and lossless receipt must be
+byte-identical to gate-off. Compare gate-off/on `target_gpu_us` distributions to enforce the
+0.25 ms median target-slowdown ceiling; `target_tail_interval`, `e1_interval`, and `overlap_us`
+prove whether the second queue actually overlapped rather than merely moving the same work.
+Treat `e1_encode_us` as host submission cost and `e1_post_target_wait_us`, `e1_readback_us`, and
+`oracle_compare_us` as shadow-only diagnostic cost. They must be reported separately from E1 GPU
+time and excluded when projecting the future device-resident production path.
+If the existing terminal-head-skip optimization suppresses the last serial update, exactly that
+round is instead accounted as `reason=serial_oracle_skipped`; it has no oracle and is not a K/V
+parity claim.
+
+This checkpoint deliberately does not expose E1 state to decoding. It waits for E1, runs the
+unchanged serial authoritative update, and compares every selected edge's private F16 K/V bits
+against the live serial rows. Non-selected edges have no mutation-free serial oracle and are not
+claimed by this test. Any route, capture, tree, position, capacity, weight, command-buffer, or
+pending-epoch failure produces a named fallback and leaves the serial path authoritative.
+
+The model-free admission checks are selected together by:
+
+```text
+cargo test --release --lib eagle3_authoritative_e1 -- --nocapture --test-threads=1
+```
+
+They prove the gate accepts only trimmed exact `1`, the fixed capture contract, width/hidden/tree
+and cache bounds, and sparse verifier-row to dense accepted-prefix edge mapping.
+
+### Checkpoint C2: E2 and commit visibility (next)
 
 Interleave control and candidate rounds under the mini2 lock:
 
-1. unsplit target control versus split A/B, byte-comparing predictions, captures, and target K/V;
-2. selector versus host `accept_longest_path` on every real Pitch round;
-3. every selected E1 edge K/V versus the serial authoritative edge bits;
-4. E2 N1 versus the current serial terminal cell for K/V, raw hidden, draft IDs/logits, and LSE;
-5. both compacted caches versus the current host-selected cache state; and
-6. GPU start/end times for target A/B, E1, selector, E2, compactors, and the wall-time union.
+1. E2 N1 versus the current serial terminal cell for K/V, raw hidden, draft IDs/logits, and LSE;
+2. both compacted caches versus the current host-selected cache state; and
+3. GPU start/end times for selector, E2, compactors, and the wall-time union.
 
 Stop this route immediately if any exact-state mismatch survives a buffer/position/ancestry audit.
 Also stop if median selector+gathers exceeds 0.12 ms, median E2 exceeds 0.88 ms, median total
