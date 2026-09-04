@@ -44955,6 +44955,270 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    /// Source-only falsifier for the selector that will sit between target argmax and the
+    /// pre-encoded N1 authoritative EAGLE cell.  It intentionally compiles a tiny standalone
+    /// library instead of adding a production pipeline: the experiment remains runtime-inert
+    /// until mini2 proves every selected row, token, and terminal bonus against the host oracle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_eagle3_device_acceptance_matches_host_oracle() {
+        use super::*;
+        use crate::inference::spec_tree::{TokenTree, TREE_MAX_NODES};
+
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let shader = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint EAGLE3_MAX_NODES = 16;
+
+kernel void eagle3_accept_tree_u32(
+    device const uint* tree_tokens [[buffer(0)]],
+    device const int* tree_parent [[buffer(1)]],
+    device const ushort* tree_depth [[buffer(2)]],
+    device const uint* predictions [[buffer(3)]],
+    constant uint& nodes [[buffer(4)]],
+    constant uint& cases [[buffer(5)]],
+    constant uint& vocab_size [[buffer(6)]],
+    device uint* selected_leaf [[buffer(7)]],
+    device uint* emitted_count [[buffer(8)]],
+    device uint* terminal_token [[buffer(9)]],
+    device uint* safe_terminal_token [[buffer(10)]],
+    device uint* terminal_depth [[buffer(11)]],
+    device uint* terminal_valid [[buffer(12)]],
+    device uint* path_rows [[buffer(13)]],
+    device uint* emitted_tokens [[buffer(14)]],
+    uint case_id [[thread_position_in_grid]]
+) {
+    if (case_id >= cases) return;
+    if (nodes == 0 || nodes > EAGLE3_MAX_NODES) {
+        terminal_valid[case_id] = 0;
+        return;
+    }
+
+    const uint prediction_base = case_id * nodes;
+    const uint output_base = case_id * EAGLE3_MAX_NODES;
+    uint current = 0;
+    for (uint emitted_index = 0; emitted_index < nodes; ++emitted_index) {
+        path_rows[output_base + emitted_index] = current;
+        const uint next = predictions[prediction_base + current];
+        emitted_tokens[output_base + emitted_index] = next;
+
+        uint matched = 0xffffffffu;
+        // This is deliberately the host oracle's increasing-row, first-match scan.  Production
+        // forests have unique child tokens; retaining first-match makes duplicate fixtures exact.
+        for (uint child = current + 1; child < nodes; ++child) {
+            if (tree_parent[child] == int(current) && tree_tokens[child] == next) {
+                matched = child;
+                break;
+            }
+        }
+        if (matched != 0xffffffffu) {
+            current = matched;
+            continue;
+        }
+
+        selected_leaf[case_id] = current;
+        emitted_count[case_id] = emitted_index + 1;
+        terminal_token[case_id] = next;
+        const bool valid = next < vocab_size;
+        safe_terminal_token[case_id] = valid ? next : 0;
+        terminal_depth[case_id] = uint(tree_depth[current]);
+        terminal_valid[case_id] = valid ? 1 : 0;
+        return;
+    }
+    terminal_valid[case_id] = 0;
+}
+"#;
+        let options = CompileOptions::new();
+        let library = device
+            .new_library_with_source(shader, &options)
+            .expect("EAGLE-3 acceptance falsifier shader compile");
+        let function = library
+            .get_function("eagle3_accept_tree_u32", None)
+            .expect("EAGLE-3 acceptance falsifier function");
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .expect("EAGLE-3 acceptance falsifier pipeline");
+        let queue = device.new_command_queue();
+        let opts = MTLResourceOptions::StorageModeShared;
+        let vocab_size = crate::eagle3::TARGET_VOCAB_SIZE as u32;
+
+        let run = |tree: &TokenTree, predictions: &[Vec<u32>]| {
+            assert!(!predictions.is_empty());
+            assert!((1..=TREE_MAX_NODES).contains(&tree.nodes()));
+            assert!(predictions.iter().all(|row| row.len() == tree.nodes()));
+            let cases = predictions.len();
+            let flat_predictions = predictions.concat();
+            let token_buf = device.new_buffer_with_data(
+                tree.tokens.as_ptr().cast(),
+                std::mem::size_of_val(tree.tokens.as_slice()) as u64,
+                opts,
+            );
+            let parent_buf = device.new_buffer_with_data(
+                tree.parent.as_ptr().cast(),
+                std::mem::size_of_val(tree.parent.as_slice()) as u64,
+                opts,
+            );
+            let depth_buf = device.new_buffer_with_data(
+                tree.depth.as_ptr().cast(),
+                std::mem::size_of_val(tree.depth.as_slice()) as u64,
+                opts,
+            );
+            let prediction_buf = device.new_buffer_with_data(
+                flat_predictions.as_ptr().cast(),
+                std::mem::size_of_val(flat_predictions.as_slice()) as u64,
+                opts,
+            );
+            let scalar_buf = device.new_buffer(12, opts);
+            unsafe {
+                let scalars = scalar_buf.contents().cast::<u32>();
+                *scalars = tree.nodes() as u32;
+                *scalars.add(1) = cases as u32;
+                *scalars.add(2) = vocab_size;
+            }
+            let new_u32 = |len: usize| {
+                let buffer = device.new_buffer((len * 4) as u64, opts);
+                write_buffer_bytes(&buffer, &vec![u32::MAX; len]);
+                buffer
+            };
+            let selected_leaf = new_u32(cases);
+            let emitted_count = new_u32(cases);
+            let terminal_token = new_u32(cases);
+            let safe_terminal_token = new_u32(cases);
+            let terminal_depth = new_u32(cases);
+            let terminal_valid = new_u32(cases);
+            let path_rows = new_u32(cases * TREE_MAX_NODES);
+            let emitted_tokens = new_u32(cases * TREE_MAX_NODES);
+
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_buffer(0, Some(&token_buf), 0);
+            encoder.set_buffer(1, Some(&parent_buf), 0);
+            encoder.set_buffer(2, Some(&depth_buf), 0);
+            encoder.set_buffer(3, Some(&prediction_buf), 0);
+            encoder.set_buffer(4, Some(&scalar_buf), 0);
+            encoder.set_buffer(5, Some(&scalar_buf), 4);
+            encoder.set_buffer(6, Some(&scalar_buf), 8);
+            encoder.set_buffer(7, Some(&selected_leaf), 0);
+            encoder.set_buffer(8, Some(&emitted_count), 0);
+            encoder.set_buffer(9, Some(&terminal_token), 0);
+            encoder.set_buffer(10, Some(&safe_terminal_token), 0);
+            encoder.set_buffer(11, Some(&terminal_depth), 0);
+            encoder.set_buffer(12, Some(&terminal_valid), 0);
+            encoder.set_buffer(13, Some(&path_rows), 0);
+            encoder.set_buffer(14, Some(&emitted_tokens), 0);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: cases.div_ceil(32) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+
+            let read_u32 = |buffer: &Buffer, len: usize| -> Vec<u32> {
+                unsafe { std::slice::from_raw_parts(buffer.contents().cast::<u32>(), len) }.to_vec()
+            };
+            let got_leaf = read_u32(&selected_leaf, cases);
+            let got_count = read_u32(&emitted_count, cases);
+            let got_terminal = read_u32(&terminal_token, cases);
+            let got_safe_terminal = read_u32(&safe_terminal_token, cases);
+            let got_depth = read_u32(&terminal_depth, cases);
+            let got_valid = read_u32(&terminal_valid, cases);
+            let got_path = read_u32(&path_rows, cases * TREE_MAX_NODES);
+            let got_emitted = read_u32(&emitted_tokens, cases * TREE_MAX_NODES);
+            for (case, predicted) in predictions.iter().enumerate() {
+                let (expected_emitted, expected_leaf) = tree.accept_longest_path(predicted);
+                let expected_path = tree
+                    .path_to(expected_leaf)
+                    .into_iter()
+                    .map(|row| row as u32)
+                    .collect::<Vec<_>>();
+                let count = expected_emitted.len();
+                let base = case * TREE_MAX_NODES;
+                let expected_terminal = *expected_emitted.last().unwrap();
+                let expected_valid = expected_terminal < vocab_size;
+                assert_eq!(got_leaf[case], expected_leaf as u32, "case {case}");
+                assert_eq!(got_count[case], count as u32, "case {case}");
+                assert_eq!(got_terminal[case], expected_terminal, "case {case}");
+                assert_eq!(
+                    got_safe_terminal[case],
+                    if expected_valid { expected_terminal } else { 0 },
+                    "case {case}"
+                );
+                assert_eq!(got_valid[case], u32::from(expected_valid), "case {case}");
+                assert_eq!(
+                    got_depth[case],
+                    u32::from(tree.depth[expected_leaf]),
+                    "case {case}"
+                );
+                assert_eq!(
+                    &got_path[base..base + count],
+                    expected_path.as_slice(),
+                    "case {case}"
+                );
+                assert_eq!(
+                    &got_emitted[base..base + count],
+                    expected_emitted.as_slice(),
+                    "case {case}"
+                );
+            }
+        };
+
+        let tree = TokenTree {
+            tokens: vec![10, 11, 12, 13, 14, 15, 16, 17],
+            parent: vec![-1, 0, 0, 1, 1, 2, 4, 4],
+            depth: vec![0, 1, 1, 2, 2, 2, 3, 3],
+        };
+        let mut cases = vec![
+            vec![99, 0, 0, 0, 0, 0, 0, 0],
+            vec![11, 13, 0, 97, 0, 0, 0, 0],
+            vec![11, 14, 0, 0, 16, 0, 96, 0],
+            vec![11, 14, 0, 0, 17, 0, 0, 95],
+            vec![12, 0, 15, 0, 0, 94, 0, 0],
+            vec![u32::MAX, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        let alphabet = [11, 12, 13, 14, 15, 16, 17, 98];
+        for seed in 0..256u32 {
+            let mut state = seed.wrapping_add(1);
+            let mut predicted = Vec::with_capacity(tree.nodes());
+            for row in 0..tree.nodes() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                predicted.push(alphabet[((state >> 24) as usize + row) % alphabet.len()]);
+            }
+            cases.push(predicted);
+        }
+        run(&tree, &cases);
+
+        // `DynamicDraftLattice` rejects this shape.  The synthetic duplicate proves the shader
+        // still mirrors the public TokenTree oracle's first-row tie behavior rather than relying
+        // on uniqueness for correctness: row 1 wins over duplicate sibling row 2.
+        let duplicate_sibling_tree = TokenTree {
+            tokens: vec![10, 11, 11, 13, 14],
+            parent: vec![-1, 0, 0, 1, 2],
+            depth: vec![0, 1, 1, 2, 2],
+        };
+        let duplicate_case = vec![vec![11, 13, 14, 97, 96]];
+        assert_eq!(
+            duplicate_sibling_tree
+                .accept_longest_path(&duplicate_case[0])
+                .1,
+            3
+        );
+        run(&duplicate_sibling_tree, &duplicate_case);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_copy_f32_preserves_resident_activation_bits() {

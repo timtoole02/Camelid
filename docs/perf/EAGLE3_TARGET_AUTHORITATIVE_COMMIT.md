@@ -1,237 +1,319 @@
-# EAGLE-3 target-authoritative commit pipeline
+# EAGLE-3 target-authoritative N1 commit pipeline
 
-Status: source-only architecture and host mapping contract.  It is default-inert.  Every build,
-test, Metal execution, and model measurement belongs on mini2.
+Status: source-only architecture, frozen-tree host contract, and standalone Metal selector
+falsifier. It is default-inert. Every build, test, Metal execution, and model measurement belongs
+on mini2.
 
-## Problem
+## Architectural correction
 
 The current N8 round is serialized as:
 
+```text
+draft forest -> target verify/wait -> host accept/capture gather -> EAGLE update/wait
 ```
-draft forest -> target verify/wait -> host accept and capture gather -> EAGLE update/wait
+
+The last stage costs about 2.024 ms/round on the pinned Pitch baseline. The first overlap design
+moved authoritative edge K/V under the target tail, but then ran a complete authoritative EAGLE
+cell for every possible endpoint. The measured N8 particle is about 3 ms, so that design makes the
+post-target path larger than the stage it replaces.
+
+The corrected design has only one complete post-target cell:
+
+```text
+ target layer-25 capture -> E1: FC all rows + edge K/V --------------------+
+ target layers 25..27 -> head -> argmax -> integer accept kernel          |
+                                           | selected leaf/token/path     |
+                                           v                              v
+                         E2: fixed-shape gathers -> one full EAGLE cell -> commit
 ```
 
-On the pinned Pitch baseline the last stage costs about 2.024 ms/round.  It also reconstructs a
-path the target verifier has just traversed: target tree K/V is compacted to the accepted path,
-then the same path's three capture rows are copied into new CPU tensors, interleaved, uploaded, FC
-projected, and replayed through the private EAGLE head.
+The target model and EAGLE model are unchanged. There is still one target verification pass. The
+target argmax remains the sole token authority.
 
-The tempting shortcut is invalid.  An ephemeral draft row uses its parent EAGLE cell's
-`raw_hidden` as recurrent `g`; a stable authoritative row uses `fc(target captures)`.  Therefore
-draft K/V is not commit K/V even when the draft token is accepted.
+## Why edge K/V is reusable
 
-The exact reusable object is an authoritative **edge cell**.  For target-tree edge `p -> c`:
+Speculative EAGLE K/V cannot be committed. An ephemeral draft row uses its parent draft cell's
+`raw_hidden` as recurrent `g`, while an authoritative row uses `fc(target captures)`. Even an
+accepted draft token therefore has the wrong recurrent input.
 
-```
+The exact reusable unit is an authoritative edge cell. For verifier edge `p -> c`:
+
+```text
 token input       = target embedding(tree.tokens[c])
 recurrent g       = fc(target captures[p])
 logical position  = stable_prefix + tree.depth[c] - 1
-attention history = stable prefix + authoritative edge cells on root..c
+attention history = stable prefix + authoritative edges on root..p
 ```
 
-If `c` is accepted, target prediction at `p` equals `tree.tokens[c]` by definition.  All inputs to
-this cell except the captures are known before target verification, and the captures are ready at
-the input of target layer 25, before layers 25--27 and the target output head run.
+Only this cell's K/V is needed. The next authoritative edge gets `g` from its own target capture,
+not from this cell's attention/MLP output, so Q, attention, O, MLP, raw hidden, and head work can be
+omitted for every non-root verifier row.
 
-The final emitted bonus is different.  At accepted endpoint `r`, its exact cell is:
+The final bonus at selected endpoint `r` is the only complete cell:
 
-```
+```text
 token input       = target embedding(target_predictions[r])
 recurrent g       = fc(target captures[r])
 logical position  = stable_prefix + tree.depth[r]
-attention history = stable prefix + authoritative edge cells on root..r
+attention history = stable prefix + selected authoritative edges + this terminal cell
 ```
 
-Its token is unknown until the ordinary target argmax.  The pipeline below overlaps everything
-else and evaluates all eight possible final endpoint cells in one multi-column EAGLE body stream
-as soon as that argmax buffer is ready.
+Its token is unknowable before target argmax, but its endpoint can be selected on the GPU before
+the CPU observes the target result.
 
-## Minimal exact pipeline
+## Exact dataflow
 
-### 1. Freeze an immutable row plan
+### 1. Freeze one tree contract
 
-`Eagle3DraftForest::plan_authoritative_precompute` pins the host-side edge arithmetic.  One entry
-exists for every non-root verifier row.  It records the child token, parent capture row, logical
-position offset, and predecessor edge rows.  `resolve_authoritative_precompute` proves that an
-accepted path maps to those entries without reinterpreting the target result.
+`Eagle3DraftForest::plan_authoritative_precompute` records every non-root edge's child token,
+parent capture row, depth-derived position, and predecessor edge rows. Its embedded
+`Eagle3DeviceAcceptancePlan` carries the exact token/parent/depth arrays consumed by device
+selection. Resolution rejects a plan from any different tree.
 
-The first implementation should use only `verified_edges`.  The optional virtual terminal token
-is a later optimization and must never be required for exactness.
+`plan_device_acceptance` also validates:
+
+- `1 <= nodes <= TREE_MAX_NODES`;
+- root parent/depth are `-1/0`;
+- every parent precedes its child and depth increments by one;
+- every tree token is in the target vocabulary; and
+- sibling token IDs are unique.
+
+The dynamic lattice already rejects duplicate child tokens at expansion and reranking preserves
+that property. The extra check is fail-closed admission for a future forest producer, not a new
+acceptance rule.
+
+The older optional terminal candidates remain a target-blind experiment. The N1 design supplies
+`None` for every row and never depends on candidate coverage.
 
 ### 2. Split target verification at the last EAGLE tap
 
-The three required target inputs are layers `[2, 14, 25]`.  In
-`ResidentDecodeState::verify_batch_inner`, at the top of iteration `l == 25`:
+The required target layer inputs are `[2, 14, 25]`. Under the default-off gate, split
+`ResidentDecodeState::verify_batch_inner` at the input of layer 25:
 
-1. encode the existing copy of `cur` into the layer-25 capture buffer;
-2. end target command buffer A;
-3. signal a `capture_ready` shared event;
-4. commit A on the existing target queue;
-5. continue layer 25 through target argmax in command buffer B on that same queue;
-6. signal `target_done` from B after the unchanged production argmax.
+1. command buffer A copies the layer-25 input capture and signals `capture_ready`;
+2. command buffer B, on the same target queue, runs unchanged layers 25--27 and the unchanged
+   output head/argmax, then the integer acceptance kernel;
+3. B signals `accept_done` immediately after all selector outputs are available; and
+4. a pre-encoded target compactor T follows B on the target queue and consumes that selected path
+   while E2 is free to start on the EAGLE queue.
 
-The existing queue ordering preserves target arithmetic.  The new split is default-off and must
-first prove that its predictions, captures, and target K/V are byte-identical to the one-buffer
-route.
+Queue ordering preserves target arithmetic. The split must first prove predictions, captures, and
+target K/V byte-identical to the unsplit route.
 
-### 3. Precompute authoritative edge K/V on an EAGLE queue
+### 3. E1 overlaps FC and every known edge K/V
 
-Add a private `overlap_queue` and typed pending-commit epoch to `Eagle3MetalState`.  Command buffer
-E1 waits for `capture_ready` and then:
+An EAGLE-private queue waits for `capture_ready`. Command buffer E1:
 
-1. packs the three target capture buffers into `[N, 3H]` on GPU;
-2. applies EAGLE `fc` once for all N verifier rows, producing `g[N,H]`;
-3. for every non-root child `c`, pairs the already-known child embedding with `g[parent[c]]`;
-4. runs the same input/hidden RMS norms and exact Q4 K/V projections used by
-   `encode_authoritative_kv_row_from_buffers`, multi-column where admitted;
-5. applies RoPE at `stable + depth[c] - 1`;
-6. scatters F16 K/V to one epoch-owned edge scratch slot.
+1. packs the three target capture buffers as `[N, 3H]`;
+2. applies EAGLE `fc` once to produce `g[N,H]`;
+3. pairs each non-root child embedding with `g[parent[child]]`;
+4. runs the exact authoritative input/hidden norms and K/V projections; and
+5. applies RoPE at `stable + depth[child] - 1` and scatters F16 K/V to private edge slots.
 
-Only K/V is needed for these intermediate cells.  Authoritative successor `g` comes from its own
-target captures, not from the predecessor cell's output, so Q, attention, O, MLP, raw hidden, and
-LM head are unnecessary for every verified edge.
+E1 ends before E2 on the same private queue, so E2 sees `g` and edge K/V without another event. It
+races only the target tail, never target argmax or acceptance.
 
-Use scratch slots disjoint from the possible commit destination:
+Use scratch slots disjoint from stable destinations:
 
-```
+```text
 commit reserve       [stable, stable + N)
 edge scratch         [stable + N, stable + 2N - 1)
-endpoint scratch     [stable + 2N - 1, stable + 3N - 1)
+terminal scratch     [stable + 2N - 1]
 ```
 
-The gap is intentional.  Selection can copy from scratch into the stable range with no in-place
-alias hazard.  Fewer than `3N - 1` remaining cache positions fails closed to the current update.
+Fewer than `2N` safe positions fails closed before either command is submitted. Scratch slot
+numbers never enter RoPE or causal-length arithmetic.
 
-### 4. Feed target argmax directly into one endpoint batch
+### 4. Reproduce `accept_longest_path` on device
 
-Command buffer E2 is encoded and committed ahead of time on `overlap_queue`.  It waits for
-`target_done`, so CPU encoding and scheduling are not on the post-target critical path.  It owns
-the target prediction and capture buffers until completion.  For every verifier row `r` it:
+The selector is a bounded integer kernel encoded immediately after production argmax. One thread
+is sufficient for N8/N16. It starts at root row zero; at row `c` it reads `pred_buf[c]`, scans rows
+`c+1..N` in increasing order for the first child whose parent is `c` and token equals that
+prediction, and either continues at that child or terminates.
 
-1. gathers `target_predictions[r]` from the unchanged target `pred_buf`;
-2. gathers/dequantizes that row from the target embedding wire table into a packed F32 embedding;
-3. pairs it with `g[r]` from E1;
-4. computes Q/K/V for all N rows with the particle batch's exact multi-column kernels;
-5. ropes each row at `stable + depth[r]` and scatters K/V to its endpoint scratch slot;
-6. runs branch-masked attention over the stable prefix, edge scratch slots for
-   `tree.path_to(r)[1..]`, and its own endpoint slot;
-7. runs O, residual, MLP, output norm, EAGLE LM head, and the existing GPU top-eight/LSE tail once
-   for the N packed rows.
+It writes fixed-capacity buffers:
 
-This is the particle batch with authoritative `g`, GPU-selected target embeddings, and static
-endpoint ancestry.  The target prediction is not approximated and no candidate coverage
-assumption exists.  N1 and N8 must both be compared bit-for-bit with the current serial
-authoritative cell before throughput is considered.
-
-### 5. Select, compact, and install
-
-While E2 runs, the CPU reads the completed target result, applies the existing
-`TokenTree::accept_longest_path`, and compacts target K/V exactly as today.  It does not gather
-EAGLE captures or launch an update.
-
-After E2 completes, accepted path `root, c1, ..., r` selects:
-
-```
-edge scratch(c1), ..., edge scratch(r), endpoint scratch(r)
+```text
+selected_leaf          last accepted verifier row r
+emitted_count          matched edge count + one terminal bonus
+terminal_token         raw pred_buf[r]
+safe_terminal_token    terminal_token, or zero when out of vocabulary
+terminal_depth         tree.depth[r]
+terminal_valid         terminal_token < target vocabulary
+path_rows[0..count]    root..r
+emitted_ids[0..count]  target predictions followed during acceptance
 ```
 
-There are exactly `emitted_tokens.len()` cells: one for every matched edge and one final target
-bonus.  Copy their raw F16 K/V rows into `[stable, stable + emitted_len)`, install endpoint row
-`r`'s `Eagle3MetalOutput` as `stable_seed`, set `filled = stable + emitted_len`, and invalidate the
-scratch epoch.  A failure before the copy mutates no stable byte and falls back to the established
-authoritative update.  A failure after stable copy starts must fail the request; silently replaying
-would risk observing a partial commit.
+This is semantically identical to `TokenTree::accept_longest_path`:
 
-The first implementation may use coherent-memory row copies after both commands finish.  A later
-GPU compactor needs a two-dispatch temporary gather/scatter; copying path ranks in parallel in
-place is racy because one rank's source can be another rank's destination.
+- There is no floating-point comparison or tie in acceptance. Production argmax has already
+  resolved score ties and written integer IDs.
+- Production siblings have unique token IDs, so a matching child is unique. The kernel still
+  scans increasing rows and takes the first match, exactly like the host oracle, making even a
+  synthetic duplicate-sibling tree deterministic.
+- On a match, the emitted target prediction equals the child token. On the first miss, that same
+  prediction is emitted as the guaranteed terminal bonus.
+- Valid parent/depth structure gives `path_rows.len == emitted_count == terminal_depth + 1`.
+
+The raw terminal ID is retained for parity. E2 binds `safe_terminal_token` to its embedding gather,
+and the transaction is never made visible unless `terminal_valid == 1`; this prevents an
+impossible all-invalid argmax sentinel from becoming an out-of-bounds embedding read.
+
+The source-only Metal falsifier in `src/metal.rs` compiles this selector as a standalone test
+library. It is not a production pipeline and changes no runtime path.
+
+### 5. Pre-encode one fixed-shape E2 cell
+
+E2 is encoded and committed ahead of target completion on the EAGLE queue. It follows E1 and waits
+for `accept_done`. Every dispatch dimension is fixed for one row; only buffer contents are selected
+on device:
+
+1. Existing quantized embedding gathers already take `device const uint* selected_id`; bind the
+   selector's `safe_terminal_token` buffer directly.
+2. Add a fixed-width F32 row gather from `g[N,H]`, indexed by `selected_leaf`, into `g_selected[H]`.
+3. Gather one cos/sin row from prebound tables using `terminal_depth` (or teach a one-row RoPE
+   wrapper to use a device position scalar).
+4. Convert `path_rows[1..count]` to the corresponding E1 edge scratch slots, append the fixed
+   terminal scratch slot, and write `position_count = stable + emitted_count`.
+5. Run exactly one existing authoritative full cell: Q/K/V, RoPE, terminal K/V scatter, selected
+   ancestry attention, O/residual/MLP, output norm, draft head, and top-k/LSE.
+
+No CPU offset and no Metal indirect command buffer is required. Metal buffer bindings are fixed
+when encoded, but their scalar contents are read when a kernel executes. Command-buffer order and
+the shared event make selector writes visible to the gather and cell kernels.
+
+Attention routing is the one non-obvious admission constraint. Current host code chooses v2,
+split-K, prefetch, and split count from `position_count`. Before encoding E2, the host knows
+`stable` and the possible interval `stable + 1 .. stable + max_depth + 1`. Admit this lane only if
+every count in that interval chooses the same existing pipeline and split geometry. Allocate
+scratch for the interval maximum, bind the device-written live count, and execute that one route. A
+round crossing a 128-position or split-count boundary falls back to the serial update. This keeps
+E2's arithmetic identical without waiting for the CPU or dispatching N endpoint cells.
+
+### 6. Reuse the one selected path for both caches
+
+Nothing reconstructs the accepted path on the host. The target and EAGLE committers consume the
+same `path_rows` and `emitted_count` buffers.
+
+Target verifier scratch may overlap its stable destination. Its compactor must therefore use a
+fixed-size gather into temporary selected K/V followed by a scatter into the stable rows; each
+kernel guards ranks `>= emitted_count`. EAGLE edge and terminal sources are disjoint from the
+stable reserve, so its fixed-size scatter can copy directly:
+
+```text
+edge_scratch(path_rows[1]), ..., edge_scratch(path_rows[count-1]), terminal_scratch
+    -> stable[0..count]
+```
+
+After E2 and both compactors complete, the CPU must eventually read emitted IDs to return them to
+the caller. That wait is no longer needed to schedule E2. It validates `terminal_valid`, epoch,
+count, leaf, and path bounds, then atomically installs the terminal `Eagle3MetalOutput`, advances
+both cache lengths, and invalidates scratch.
+
+A failure before visibility mutates no logical state and falls back to the established serial
+update. A failure after a stable copy begins fails the request rather than risking observation of
+a partial commit.
 
 ## Required invariants
 
-1. **Target authority:** emitted ids come only from the existing production `pred_buf` and
-   `accept_longest_path`.
-2. **Exact cell pairing:** matched edge `p -> c` uses `(embedding[token(c)], captures[p])`; terminal
-   endpoint `r` uses `(embedding[pred[r]], captures[r])`.
-3. **Logical/physical separation:** RoPE and sliding-window length use target-tree depth; scratch
-   slot number never enters positional math.
-4. **Private ancestry:** endpoint `r` sees only stable history, edge cells on its own path, and
-   itself.
-5. **F16 identity:** scratch and committed K/V use the same post-RoPE F16 scatter conversion as
-   the current authoritative row.
-6. **Atomic visibility:** `filled` and `stable_seed` move together only after a complete selected
-   path is available.
-7. **Lifetime:** prediction/capture/scratch buffers cannot return to the pool until target B, E1,
-   and E2 have completed.
-8. **Epoch safety:** reset, rollback, cancellation, or fallback invalidates every outstanding
-   scratch handle.
-9. **Default off:** without `CAMELID_BENCH_EAGLE3_TARGET_COMMIT_PIPELINE=1`, no target split,
-   second queue, extra allocation, or changed update path exists.
+1. **Target authority:** emitted IDs come only from production `pred_buf` under the existing
+   greedy argmax and `accept_longest_path` rule.
+2. **One tree epoch:** target verify, E1 edges, selection, E2, and compaction all carry the same
+   immutable token/parent/depth signature and generation epoch.
+3. **Exact edge pairing:** edge `p -> c` uses `(embedding[token(c)], captures[p])`; terminal row
+   `r` uses `(embedding[pred[r]], captures[r])`.
+4. **One complete tail:** E1 computes N-1 K/V-only edges; E2 computes exactly one full cell.
+5. **Logical/physical separation:** target depth controls RoPE and causal length; scratch slots
+   only control physical cache reads.
+6. **Private ancestry:** E2 sees stable history, only selected edge slots, and its terminal slot.
+7. **Route identity:** E2 uses the same attention implementation and partition as the serial N1
+   oracle or declines the lane for that round.
+8. **F16 identity:** scratch and committed K/V use the current post-RoPE F16 conversion.
+9. **Atomic visibility:** cache lengths and terminal seed advance together only after every
+   selected row is complete.
+10. **Lifetime:** prediction, capture, selection, `g`, and scratch buffers outlive target B, E1,
+    E2, and compaction.
+11. **Cancellation safety:** reset, rollback, cancellation, or fallback invalidates the epoch.
+12. **Default off:** without `CAMELID_BENCH_EAGLE3_TARGET_COMMIT_PIPELINE=1`, there is no target
+    split, extra queue/allocation, selector, or changed update path.
 
-## Code seams
+## Implementation seams
 
 - `src/eagle3_runtime.rs`
-  - keep `Eagle3AuthoritativePrecomputePlan` as the normative row map;
+  - keep `Eagle3DeviceAcceptancePlan` and `Eagle3AuthoritativePrecomputePlan` as the frozen host
+    contract;
   - add an opaque pending transaction to `Eagle3Drafter`;
-  - replace `accept_authoritative_forest` only under the new gate;
-  - receipt counters: rounds, edge rows, endpoint rows, post-target wait, compact time, fallbacks.
+  - install a completed transaction only under the new gate;
+  - counters: rounds, selector parity, E1 edge rows, E2 full rows (must equal rounds), route-boundary
+    fallbacks, target/EAGLE compact time, epoch failures.
 - `src/inference/metal_resident.rs`
-  - add one paired tree-verify entry point that passes the target embedding wire and frozen row
-    plan into Metal; ordinary tree verify stays untouched.
+  - split/gated target verify handle retaining `pred_buf`, captures, tree K/V scratch, and event;
+  - encode selector and target two-stage path compactor after argmax;
+  - leave ordinary tree verify untouched as gate-off oracle.
 - `src/metal.rs`
-  - split/gated target verify handle retaining `pred_buf` and capture buffers;
-  - capture-pack/gather kernel;
+  - promote the proven standalone selector into `ELEMENTWISE_SHADER` only after falsification;
+  - fixed F32/rope/path-slot selected-row gathers;
   - E1 K/V-only edge encoder;
-  - E2 authoritative endpoint twin of `forward_particle_batch`;
-  - selected path F16 compactor and endpoint-output finisher.
+  - one-row authoritative E2 twin using buffer-backed leaf/token/count/path metadata;
+  - disjoint EAGLE compactor and transaction finisher.
 - `src/main.rs` and `src/eagle3_serving.rs`
-  - select the paired entry point under the gate and record telemetry; keep current call sequence as
-    fallback and gate-off oracle.
+  - select the paired transaction path under the gate and record telemetry;
+  - preserve the current serial call sequence as fallback and parity oracle.
 
 ## Latency budget
 
-The 2.024 ms current update contains work in two classes:
+The N8 endpoint particle is closed: about 3 ms post-target is already slower than the measured
+2.024 ms update. The N1 pipeline budget is:
 
-- all-row FC and accepted-prefix K/V, which E1 moves under target layers 25--27 plus the target
-  output head;
-- one complete final EAGLE cell, which E2 retains after target argmax but executes as one N8
-  weight stream with its command already scheduled.
-
-The target tail after the layer-25 input is expected to provide several milliseconds of overlap,
-but both models consume unified-memory bandwidth.  Concurrency is a hypothesis, not a credit in
-the budget.  The architectural target is:
-
-```
-old post-target update       2.024 ms/round
-new post-target E2 + commit <= 1.05 ms/round
-target slowdown from E1     <= 0.25 ms/round
-net saving                  >= 0.70 ms/round
+```text
+device accept + selected gathers        <= 0.12 ms median
+one complete authoritative E2 cell      <= 0.88 ms median
+selected-path cache compaction/install  <= 0.20 ms median
+total post-target addition              <= 1.20 ms median
+target slowdown from concurrent E1      <= 0.25 ms median
+net saving versus current update        >= 0.70 ms/round
 ```
 
-At the parallel campaign targets (about 4.7 emitted/pass and a 24.0--24.6 ms target verifier),
-0.7--1.0 ms of update removal is useful margin: a 140 tok/s round may spend at most 33.57 ms.
-This pipeline is not sufficient by itself; it composes with the connected recurrent forest and
-the target verifier pipeline.
+At roughly 4.7 emitted tokens/pass, 140 tok/s allows 33.57 ms per round. This change must remove a
+serialized stage; concurrency by itself earns no budget credit because target and E1 share unified
+memory bandwidth.
 
-## Smallest falsification checkpoint
+## Smallest falsification checkpoints
 
-Do not build the integrated commit first.  Add a default-off mini2-only timing/parity shadow with
-the exact buffers and queue split, but discard every EAGLE scratch result:
+### Checkpoint A: selector semantics (implemented, mini2 only)
 
-1. target control: current one-command-buffer verify;
-2. split control: target A/B only, proving identical predictions, captures, and K/V;
-3. overlap shadow: target A/B plus E1 edge FC/K/V on the second queue;
-4. endpoint shadow: E2 N8 authoritative endpoint batch after `target_done`, compared against the
-   current accepted-path final cell for raw-hidden bits, draft ids/logits/LSE, and K/V bits.
+Run:
 
-Report target A busy time, target B busy time, E1/E2 busy time, union wall interval, event waits,
-and command-buffer status.  Interleave controls and candidates under the mini2 lock.
+```text
+cargo test --lib eagle3_device_acceptance -- --nocapture
+```
 
-Stop this route if either condition holds:
+On macOS this must run and pass exactly these two tests:
 
-- any exact-state mismatch survives a buffer/position/ancestry bug audit; or
-- median `(overlap target + E1 + E2 + compact) - target control` is at least 1.55 ms, leaving less
-  than 0.47 ms net saving versus the existing 2.024 ms update.
+```text
+eagle3_runtime::tests::eagle3_device_acceptance_matches_target_oracle
+metal::tests::metal_eagle3_device_acceptance_matches_host_oracle
+```
 
-Proceed to the integrated default-off lane if parity is exact and the added post-target critical
-path is at most 1.30 ms, with no more than 0.25 ms target slowdown from E1 contention.  Promote
-only after the ordinary Pitch lossless token equality and full mini2 regression suite pass.
+The assertions cover root misses, every branch/depth, terminal bonuses, 256 deterministic N8
+prediction vectors, an invalid UINT_MAX terminal made gather-safe, and a synthetic duplicate
+sibling whose lower row must win. Any leaf, count, path, emitted ID, terminal ID, safe ID, validity,
+or depth mismatch falsifies device acceptance.
+
+### Checkpoint B: default-off integrated shadow (next)
+
+Interleave control and candidate rounds under the mini2 lock:
+
+1. unsplit target control versus split A/B, byte-comparing predictions, captures, and target K/V;
+2. selector versus host `accept_longest_path` on every real Pitch round;
+3. every selected E1 edge K/V versus the serial authoritative edge bits;
+4. E2 N1 versus the current serial terminal cell for K/V, raw hidden, draft IDs/logits, and LSE;
+5. both compacted caches versus the current host-selected cache state; and
+6. GPU start/end times for target A/B, E1, selector, E2, compactors, and the wall-time union.
+
+Stop this route immediately if any exact-state mismatch survives a buffer/position/ancestry audit.
+Also stop if median selector+gathers exceeds 0.12 ms, median E2 exceeds 0.88 ms, median total
+post-target work exceeds 1.20 ms, or E1 adds more than 0.25 ms to target verification. Proceed to
+an integrated default-off lane only if parity is exact and the median net saving is at least
+0.70 ms/round. Promotion still requires ordinary Pitch lossless token equality and the full mini2
+regression suite.

@@ -1015,6 +1015,76 @@ impl Eagle3DraftForest {
         })
     }
 
+    /// Freeze the exact integer inputs for device-side target acceptance.
+    ///
+    /// The future Metal selector scans verifier rows in the same increasing-row order as
+    /// `TokenTree::accept_longest_path`.  Dynamic lattice expansion already rejects duplicate
+    /// tokens under one parent; this second check makes the default-off device lane fail closed
+    /// if a different forest producer ever violates that invariant.  Increasing-row selection
+    /// is nevertheless retained by the device ABI, so its result is also defined exactly for a
+    /// malformed duplicate-sibling fixture used by the Metal falsifier.
+    pub fn plan_device_acceptance(&self) -> Result<Eagle3DeviceAcceptancePlan> {
+        let tree = &self.scored.tree;
+        let nodes = tree.nodes();
+        if nodes == 0 || nodes > TREE_MAX_NODES {
+            return Err(invalid(format!(
+                "EAGLE-3 device acceptance requires 1..={TREE_MAX_NODES} rows, got {nodes}"
+            )));
+        }
+        if tree.parent.len() != nodes || tree.depth.len() != nodes {
+            return Err(invalid(format!(
+                "EAGLE-3 device acceptance tree has token/parent/depth lengths {}/{}/{}",
+                nodes,
+                tree.parent.len(),
+                tree.depth.len()
+            )));
+        }
+        if tree.parent[0] != -1 || tree.depth[0] != 0 {
+            return Err(invalid(
+                "EAGLE-3 device acceptance root must have parent -1 and depth 0",
+            ));
+        }
+        for row in 0..nodes {
+            if tree.tokens[row] as usize >= TARGET_VOCAB_SIZE {
+                return Err(invalid(format!(
+                    "EAGLE-3 device acceptance token {} at row {row} is outside target vocabulary 0..{TARGET_VOCAB_SIZE}",
+                    tree.tokens[row]
+                )));
+            }
+            if row == 0 {
+                continue;
+            }
+            let parent = usize::try_from(tree.parent[row]).map_err(|_| {
+                invalid(format!(
+                    "EAGLE-3 device acceptance row {row} has no verifier parent"
+                ))
+            })?;
+            let depth = usize::from(tree.depth[row]);
+            if parent >= row
+                || depth == 0
+                || usize::from(tree.depth[parent]).checked_add(1) != Some(depth)
+            {
+                return Err(invalid(format!(
+                    "EAGLE-3 device acceptance row {row} has invalid parent/depth {parent}/{depth}"
+                )));
+            }
+            if (1..row).any(|earlier| {
+                tree.parent[earlier] == tree.parent[row]
+                    && tree.tokens[earlier] == tree.tokens[row]
+            }) {
+                return Err(invalid(format!(
+                    "EAGLE-3 device acceptance parent {parent} has duplicate child token {}",
+                    tree.tokens[row]
+                )));
+            }
+        }
+        Ok(Eagle3DeviceAcceptancePlan {
+            tree_tokens: tree.tokens.clone(),
+            tree_parent: tree.parent.clone(),
+            tree_depth: tree.depth.clone(),
+        })
+    }
+
     /// Build the immutable row mapping for a target-overlapped authoritative precompute.
     ///
     /// A speculative EAGLE row cannot be committed as authoritative: its recurrent `g` is the
@@ -1042,6 +1112,7 @@ impl Eagle3DraftForest {
                 tree.nodes()
             )));
         }
+        let device_acceptance = self.plan_device_acceptance()?;
 
         let mut verified_edges = Vec::with_capacity(tree.nodes().saturating_sub(1));
         for verifier_row in 1..tree.nodes() {
@@ -1096,9 +1167,7 @@ impl Eagle3DraftForest {
         }
 
         Ok(Eagle3AuthoritativePrecomputePlan {
-            tree_tokens: tree.tokens.clone(),
-            tree_parent: tree.parent.clone(),
-            tree_depth: tree.depth.clone(),
+            device_acceptance,
             verified_edges,
             terminal_candidates,
         })
@@ -1116,9 +1185,9 @@ impl Eagle3DraftForest {
         acceptance: &Eagle3ForestAcceptance,
     ) -> Result<Eagle3AuthoritativeCommitResolution> {
         let tree = &self.scored.tree;
-        if plan.tree_tokens != tree.tokens
-            || plan.tree_parent != tree.parent
-            || plan.tree_depth != tree.depth
+        if plan.device_acceptance.tree_tokens != tree.tokens
+            || plan.device_acceptance.tree_parent != tree.parent
+            || plan.device_acceptance.tree_depth != tree.depth
             || plan.verified_edges.len() != tree.nodes().saturating_sub(1)
             || plan.terminal_candidates.len() != tree.nodes()
         {
@@ -1186,6 +1255,102 @@ impl Eagle3DraftForest {
     }
 }
 
+/// Frozen device ABI for exact target-authoritative tree acceptance.
+///
+/// Metal consumes these three arrays plus the production target `pred_buf`.  No scores or draft
+/// ranks enter selection.  Parent rows precede children, which bounds the single-thread selector
+/// to at most [`TREE_MAX_NODES`] iterations without a dynamic dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3DeviceAcceptancePlan {
+    pub tree_tokens: Vec<u32>,
+    pub tree_parent: Vec<i32>,
+    pub tree_depth: Vec<u16>,
+}
+
+impl Eagle3DeviceAcceptancePlan {
+    /// Host mirror of the proposed one-thread Metal selector.
+    ///
+    /// This is a falsification oracle and a safe fallback, not a second acceptance policy.  It
+    /// deliberately uses the same increasing child-row scan as `accept_longest_path`, including
+    /// its first-row behavior if a synthetic tree contains duplicate sibling tokens.
+    pub fn select_reference(&self, predictions: &[u32]) -> Result<Eagle3DeviceAcceptanceOutput> {
+        let nodes = self.tree_tokens.len();
+        if nodes == 0
+            || nodes > TREE_MAX_NODES
+            || self.tree_parent.len() != nodes
+            || self.tree_depth.len() != nodes
+            || predictions.len() != nodes
+        {
+            return Err(invalid(format!(
+                "EAGLE-3 device acceptance received tree/prediction lengths {}/{}/{}/{}",
+                nodes,
+                self.tree_parent.len(),
+                self.tree_depth.len(),
+                predictions.len()
+            )));
+        }
+
+        let mut path_rows = [u32::MAX; TREE_MAX_NODES];
+        let mut emitted_tokens = [u32::MAX; TREE_MAX_NODES];
+        let mut current = 0usize;
+        for emitted_index in 0..nodes {
+            path_rows[emitted_index] = current as u32;
+            let next = predictions[current];
+            emitted_tokens[emitted_index] = next;
+            let matched = (current + 1..nodes).find(|&child| {
+                self.tree_parent[child] == current as i32 && self.tree_tokens[child] == next
+            });
+            if let Some(child) = matched {
+                current = child;
+                continue;
+            }
+            let terminal_token_valid = (next as usize) < TARGET_VOCAB_SIZE;
+            return Ok(Eagle3DeviceAcceptanceOutput {
+                leaf_row: current as u32,
+                emitted_count: (emitted_index + 1) as u32,
+                terminal_token: next,
+                safe_terminal_token: if terminal_token_valid { next } else { 0 },
+                terminal_depth: u32::from(self.tree_depth[current]),
+                terminal_token_valid,
+                path_rows,
+                emitted_tokens,
+            });
+        }
+        Err(invalid(
+            "EAGLE-3 device acceptance did not terminate within the frozen tree",
+        ))
+    }
+}
+
+/// Fixed-width result written by device acceptance before the pre-encoded N1 terminal graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3DeviceAcceptanceOutput {
+    pub leaf_row: u32,
+    /// Matched edges plus the final target-only bonus.  This is also the live prefix length of
+    /// `path_rows` and `emitted_tokens`.
+    pub emitted_count: u32,
+    /// Raw target prediction at `leaf_row`, retained for parity diagnostics and token emission.
+    pub terminal_token: u32,
+    /// `terminal_token` when in vocabulary, otherwise zero.  The pre-encoded embedding gather
+    /// binds this device scalar so an impossible UINT_MAX argmax cannot read out of bounds; the
+    /// transaction is discarded unless `terminal_token_valid` is true.
+    pub safe_terminal_token: u32,
+    pub terminal_depth: u32,
+    pub terminal_token_valid: bool,
+    pub path_rows: [u32; TREE_MAX_NODES],
+    pub emitted_tokens: [u32; TREE_MAX_NODES],
+}
+
+impl Eagle3DeviceAcceptanceOutput {
+    pub fn selected_path(&self) -> &[u32] {
+        &self.path_rows[..self.emitted_count as usize]
+    }
+
+    pub fn emitted(&self) -> &[u32] {
+        &self.emitted_tokens[..self.emitted_count as usize]
+    }
+}
+
 /// One exact target-authoritative EAGLE cell that can be prepared before target acceptance.
 ///
 /// `predecessor_edge_rows` names the non-root verifier rows whose authoritative edge K/V must
@@ -1204,11 +1369,10 @@ pub struct Eagle3AuthoritativePrecomputeCell {
 /// Target-blind work available to a future overlapped authoritative EAGLE lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Eagle3AuthoritativePrecomputePlan {
-    /// Exact verifier-tree identity. Equal row counts are insufficient because token/parent/depth
-    /// changes alter every edge cell's input, ancestry, or RoPE position.
-    pub tree_tokens: Vec<u32>,
-    pub tree_parent: Vec<i32>,
-    pub tree_depth: Vec<u16>,
+    /// Exact verifier-tree identity and the immutable integer buffers consumed by the device
+    /// selector. Equal row counts are insufficient because token/parent/depth changes alter both
+    /// acceptance and every edge cell's input, ancestry, or RoPE position.
+    pub device_acceptance: Eagle3DeviceAcceptancePlan,
     /// One K/V cell per non-root verifier row, ordered by verifier row minus one.
     pub verified_edges: Vec<Eagle3AuthoritativePrecomputeCell>,
     /// At most one full virtual terminal cell per possible accepted endpoint.
@@ -2704,6 +2868,75 @@ mod tests {
         assert!(forest
             .plan_authoritative_precompute(&[None, None, None])
             .is_err());
+    }
+
+    #[test]
+    fn eagle3_device_acceptance_matches_target_oracle() {
+        let mut frontier = Eagle3DynamicFrontier::new(10, frontier_config(8, 16, 4)).unwrap();
+        frontier
+            .record_expansion(0, &output(&[(11, 0.55), (12, 0.45)], 1.0))
+            .unwrap();
+        frontier
+            .record_expansion(1, &output(&[(13, 0.60), (14, 0.40)], 2.0))
+            .unwrap();
+        frontier
+            .record_expansion(2, &output(&[(15, 0.70)], 3.0))
+            .unwrap();
+        frontier
+            .record_expansion(4, &output(&[(16, 0.65), (17, 0.35)], 4.0))
+            .unwrap();
+        let forest = frontier.finish().unwrap();
+        let plan = forest.plan_device_acceptance().unwrap();
+        let nodes = forest.scored.tree.nodes();
+        assert_eq!(nodes, 8);
+
+        let mut cases = vec![
+            vec![99, 0, 0, 0, 0, 0, 0, 0],
+            vec![11, 13, 0, 97, 0, 0, 0, 0],
+            vec![11, 14, 0, 0, 16, 0, 96, 0],
+            vec![11, 14, 0, 0, 17, 0, 0, 95],
+            vec![12, 0, 15, 0, 0, 94, 0, 0],
+            vec![u32::MAX, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        let alphabet = [11, 12, 13, 14, 15, 16, 17, 98];
+        for seed in 0..256u32 {
+            let mut state = seed.wrapping_add(1);
+            let mut predictions = Vec::with_capacity(nodes);
+            for row in 0..nodes {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                predictions.push(alphabet[((state >> 24) as usize + row) % alphabet.len()]);
+            }
+            cases.push(predictions);
+        }
+
+        for predictions in cases {
+            let selected = plan.select_reference(&predictions).unwrap();
+            let (emitted, leaf) = forest.scored.tree.accept_longest_path(&predictions);
+            let expected_path = forest
+                .scored
+                .tree
+                .path_to(leaf)
+                .into_iter()
+                .map(|row| row as u32)
+                .collect::<Vec<_>>();
+            assert_eq!(selected.leaf_row as usize, leaf);
+            assert_eq!(selected.selected_path(), expected_path.as_slice());
+            assert_eq!(selected.emitted(), emitted.as_slice());
+            assert_eq!(selected.terminal_token, *emitted.last().unwrap());
+            assert_eq!(
+                selected.terminal_depth,
+                u32::from(forest.scored.tree.depth[leaf])
+            );
+            assert_eq!(selected.terminal_token_valid, selected.terminal_token != u32::MAX);
+            assert_eq!(
+                selected.safe_terminal_token,
+                if selected.terminal_token_valid {
+                    selected.terminal_token
+                } else {
+                    0
+                }
+            );
+        }
     }
 
     #[test]
