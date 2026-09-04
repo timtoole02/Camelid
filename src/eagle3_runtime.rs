@@ -1014,6 +1014,210 @@ impl Eagle3DraftForest {
             source_nodes,
         })
     }
+
+    /// Build the immutable row mapping for a target-overlapped authoritative precompute.
+    ///
+    /// A speculative EAGLE row cannot be committed as authoritative: its recurrent `g` is the
+    /// parent draft cell's `raw_hidden`, while an authoritative row's `g` is `fc` applied to the
+    /// target captures.  The exact reusable unit is instead an *edge cell*.  For verifier edge
+    /// `parent -> child`, the authoritative cell consumes the child's token embedding and the
+    /// target captures from `parent`.  Its logical EAGLE position is
+    /// `stable_prefix + depth(child) - 1`.
+    ///
+    /// `terminal_candidate_tokens[row]` is an optional target-blind guess for the final bonus
+    /// token predicted at `row`.  It must not duplicate an already-verified child: such a token
+    /// would continue target acceptance rather than terminate there.  A future Metal lane can
+    /// project every verified edge's K/V plus these virtual terminal cells while the target tail
+    /// is still running, then use [`Self::resolve_authoritative_precompute`] after the ordinary
+    /// target argmax.  This helper owns no model state and cannot affect acceptance.
+    pub fn plan_authoritative_precompute(
+        &self,
+        terminal_candidate_tokens: &[Option<u32>],
+    ) -> Result<Eagle3AuthoritativePrecomputePlan> {
+        let tree = &self.scored.tree;
+        if terminal_candidate_tokens.len() != tree.nodes() {
+            return Err(invalid(format!(
+                "EAGLE-3 authoritative precompute has {} terminal candidates for {} verifier rows",
+                terminal_candidate_tokens.len(),
+                tree.nodes()
+            )));
+        }
+
+        let mut verified_edges = Vec::with_capacity(tree.nodes().saturating_sub(1));
+        for verifier_row in 1..tree.nodes() {
+            let parent = usize::try_from(tree.parent[verifier_row]).map_err(|_| {
+                invalid(format!(
+                    "EAGLE-3 authoritative edge row {verifier_row} has no verifier parent"
+                ))
+            })?;
+            let depth = usize::from(tree.depth[verifier_row]);
+            if parent >= verifier_row
+                || depth == 0
+                || usize::from(tree.depth[parent]).checked_add(1) != Some(depth)
+            {
+                return Err(invalid(format!(
+                    "EAGLE-3 authoritative edge row {verifier_row} has invalid parent/depth {parent}/{depth}"
+                )));
+            }
+            verified_edges.push(Eagle3AuthoritativePrecomputeCell {
+                verifier_row,
+                token: tree.tokens[verifier_row],
+                capture_row: parent,
+                logical_position_offset: depth - 1,
+                predecessor_edge_rows: tree.path_to(parent)[1..].to_vec(),
+            });
+        }
+
+        let mut terminal_candidates = Vec::with_capacity(tree.nodes());
+        for (verifier_row, candidate) in terminal_candidate_tokens.iter().copied().enumerate() {
+            let Some(token) = candidate else {
+                terminal_candidates.push(None);
+                continue;
+            };
+            if token as usize >= TARGET_VOCAB_SIZE {
+                return Err(invalid(format!(
+                    "EAGLE-3 authoritative terminal candidate {token} at row {verifier_row} is outside target vocabulary 0..{TARGET_VOCAB_SIZE}"
+                )));
+            }
+            if (verifier_row + 1..tree.nodes()).any(|child| {
+                tree.parent[child] == verifier_row as i32 && tree.tokens[child] == token
+            }) {
+                return Err(invalid(format!(
+                    "EAGLE-3 authoritative terminal candidate {token} at row {verifier_row} is already a verified child"
+                )));
+            }
+            terminal_candidates.push(Some(Eagle3AuthoritativePrecomputeCell {
+                verifier_row,
+                token,
+                capture_row: verifier_row,
+                logical_position_offset: usize::from(tree.depth[verifier_row]),
+                predecessor_edge_rows: tree.path_to(verifier_row)[1..].to_vec(),
+            }));
+        }
+
+        Ok(Eagle3AuthoritativePrecomputePlan {
+            verified_edges,
+            terminal_candidates,
+        })
+    }
+
+    /// Resolve an already-built authoritative precompute against the unchanged target result.
+    ///
+    /// A `Complete` result identifies a wholly precomputed exact commit path.  `PrefixOnly`
+    /// still reuses every accepted verified edge's authoritative K/V, but the final target bonus
+    /// missed the target-blind candidate and must run one ordinary terminal cell.  In both cases
+    /// the target's predictions remain the sole authority for emitted tokens.
+    pub fn resolve_authoritative_precompute(
+        &self,
+        plan: &Eagle3AuthoritativePrecomputePlan,
+        acceptance: &Eagle3ForestAcceptance,
+    ) -> Result<Eagle3AuthoritativeCommitResolution> {
+        let tree = &self.scored.tree;
+        if plan.verified_edges.len() != tree.nodes().saturating_sub(1)
+            || plan.terminal_candidates.len() != tree.nodes()
+        {
+            return Err(invalid(
+                "EAGLE-3 authoritative precompute plan belongs to a different verifier tree",
+            ));
+        }
+        if acceptance.emitted_tokens.is_empty()
+            || acceptance.emitted_tokens.len() != acceptance.capture_rows.len()
+            || acceptance.capture_rows.first() != Some(&0)
+            || acceptance.capture_rows.last() != Some(&acceptance.leaf_row)
+            || acceptance.capture_rows != tree.path_to(acceptance.leaf_row)
+        {
+            return Err(invalid(
+                "EAGLE-3 authoritative precompute received an invalid accepted path",
+            ));
+        }
+
+        let mut verified_edge_rows = Vec::with_capacity(acceptance.capture_rows.len() - 1);
+        for (emitted_index, &verifier_row) in
+            acceptance.capture_rows.iter().enumerate().skip(1)
+        {
+            let edge = plan
+                .verified_edges
+                .get(verifier_row - 1)
+                .ok_or_else(|| invalid("EAGLE-3 authoritative accepted edge is missing"))?;
+            let expected_parent = acceptance.capture_rows[emitted_index - 1];
+            let expected_token = acceptance.emitted_tokens[emitted_index - 1];
+            if edge.verifier_row != verifier_row
+                || edge.capture_row != expected_parent
+                || edge.token != expected_token
+                || edge.logical_position_offset != emitted_index - 1
+                || edge.predecessor_edge_rows != acceptance.capture_rows[1..emitted_index]
+            {
+                return Err(invalid(format!(
+                    "EAGLE-3 authoritative precompute edge {verifier_row} does not match accepted token {expected_token}"
+                )));
+            }
+            verified_edge_rows.push(verifier_row);
+        }
+
+        let terminal_capture_row = acceptance.leaf_row;
+        let terminal_token = *acceptance
+            .emitted_tokens
+            .last()
+            .expect("non-empty acceptance checked above");
+        let terminal = plan.terminal_candidates[terminal_capture_row].as_ref();
+        if terminal.is_some_and(|cell| {
+            cell.verifier_row == terminal_capture_row
+                && cell.capture_row == terminal_capture_row
+                && cell.token == terminal_token
+                && cell.logical_position_offset == acceptance.capture_rows.len() - 1
+                && cell.predecessor_edge_rows == acceptance.capture_rows[1..]
+        }) {
+            return Ok(Eagle3AuthoritativeCommitResolution::Complete {
+                verified_edge_rows,
+                terminal_candidate_row: terminal_capture_row,
+            });
+        }
+        Ok(Eagle3AuthoritativeCommitResolution::PrefixOnly {
+            verified_edge_rows,
+            terminal_capture_row,
+            terminal_token,
+        })
+    }
+}
+
+/// One exact target-authoritative EAGLE cell that can be prepared before target acceptance.
+///
+/// `predecessor_edge_rows` names the non-root verifier rows whose authoritative edge K/V must
+/// precede this cell.  The cell itself is not in that list.  Consequently a Metal implementation
+/// can scatter every edge to a private physical slot, use the row list as its tree-attention
+/// tail, and later compact only the resolved path into the stable prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3AuthoritativePrecomputeCell {
+    pub verifier_row: usize,
+    pub token: u32,
+    pub capture_row: usize,
+    pub logical_position_offset: usize,
+    pub predecessor_edge_rows: Vec<usize>,
+}
+
+/// Target-blind work available to a future overlapped authoritative EAGLE lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3AuthoritativePrecomputePlan {
+    /// One K/V cell per non-root verifier row, ordered by verifier row minus one.
+    pub verified_edges: Vec<Eagle3AuthoritativePrecomputeCell>,
+    /// At most one full virtual terminal cell per possible accepted endpoint.
+    pub terminal_candidates: Vec<Option<Eagle3AuthoritativePrecomputeCell>>,
+}
+
+/// Exact post-target disposition of a target-blind authoritative precompute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Eagle3AuthoritativeCommitResolution {
+    /// Every committed EAGLE K/V row and the final `stable_seed` were precomputed.
+    Complete {
+        verified_edge_rows: Vec<usize>,
+        terminal_candidate_row: usize,
+    },
+    /// Accepted-edge K/V is ready, but one final authoritative cell remains on the critical path.
+    PrefixOnly {
+        verified_edge_rows: Vec<usize>,
+        terminal_capture_row: usize,
+        terminal_token: u32,
+    },
 }
 
 /// Accepted target path through a draft forest.
@@ -2382,6 +2586,113 @@ mod tests {
         let gathered = acceptance.gather_layer_inputs(&[capture]).unwrap();
         assert_eq!(gathered[0].shape.dims, vec![2, 2]);
         assert_eq!(gathered[0].data, vec![0.0, 1.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn authoritative_precompute_maps_parent_captures_to_child_tokens() {
+        let mut frontier = Eagle3DynamicFrontier::new(10, frontier_config(4, 4, 2)).unwrap();
+        frontier
+            .record_expansion(0, &output(&[(11, 0.60), (12, 0.40)], 1.0))
+            .unwrap();
+        frontier
+            .record_expansion(1, &output(&[(13, 0.90)], 2.0))
+            .unwrap();
+        let forest = frontier.finish().unwrap();
+        assert_eq!(forest.scored.tree.tokens, vec![10, 11, 12, 13]);
+
+        let plan = forest
+            .plan_authoritative_precompute(&[Some(99), Some(88), Some(99), Some(77)])
+            .unwrap();
+        assert_eq!(
+            plan.verified_edges,
+            vec![
+                Eagle3AuthoritativePrecomputeCell {
+                    verifier_row: 1,
+                    token: 11,
+                    capture_row: 0,
+                    logical_position_offset: 0,
+                    predecessor_edge_rows: vec![],
+                },
+                Eagle3AuthoritativePrecomputeCell {
+                    verifier_row: 2,
+                    token: 12,
+                    capture_row: 0,
+                    logical_position_offset: 0,
+                    predecessor_edge_rows: vec![],
+                },
+                Eagle3AuthoritativePrecomputeCell {
+                    verifier_row: 3,
+                    token: 13,
+                    capture_row: 1,
+                    logical_position_offset: 1,
+                    predecessor_edge_rows: vec![1],
+                },
+            ]
+        );
+        assert_eq!(
+            plan.terminal_candidates[3],
+            Some(Eagle3AuthoritativePrecomputeCell {
+                verifier_row: 3,
+                token: 77,
+                capture_row: 3,
+                logical_position_offset: 2,
+                predecessor_edge_rows: vec![1, 3],
+            })
+        );
+
+        // Root -> row 1 -> row 3, then target-only bonus 77. Every authoritative cell is
+        // already represented: edge rows 1/3 followed by virtual terminal row 3.
+        let acceptance = forest
+            .accept_target_predictions(&[11, 13, 0, 77])
+            .unwrap();
+        assert_eq!(
+            forest
+                .resolve_authoritative_precompute(&plan, &acceptance)
+                .unwrap(),
+            Eagle3AuthoritativeCommitResolution::Complete {
+                verified_edge_rows: vec![1, 3],
+                terminal_candidate_row: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn authoritative_precompute_reuses_prefix_on_terminal_miss() {
+        let mut frontier = Eagle3DynamicFrontier::new(10, frontier_config(4, 4, 2)).unwrap();
+        frontier
+            .record_expansion(0, &output(&[(11, 0.60), (12, 0.40)], 1.0))
+            .unwrap();
+        frontier
+            .record_expansion(1, &output(&[(13, 0.90)], 2.0))
+            .unwrap();
+        let forest = frontier.finish().unwrap();
+        let plan = forest
+            .plan_authoritative_precompute(&[Some(98), Some(88), Some(98), None])
+            .unwrap();
+
+        // The target takes row 2 but predicts 99 there. Row 2's exact authoritative K/V is
+        // reusable; only `(embedding[99], captures[row 2])` needs a post-target full cell.
+        let acceptance = forest.accept_target_predictions(&[12, 0, 99, 0]).unwrap();
+        assert_eq!(
+            forest
+                .resolve_authoritative_precompute(&plan, &acceptance)
+                .unwrap(),
+            Eagle3AuthoritativeCommitResolution::PrefixOnly {
+                verified_edge_rows: vec![2],
+                terminal_capture_row: 2,
+                terminal_token: 99,
+            }
+        );
+
+        // A terminal candidate must be outside the row's verified children. If it equals a
+        // child, target acceptance would continue to that child and the virtual cell can never
+        // be selected as the endpoint commit.
+        assert!(forest
+            .plan_authoritative_precompute(&[Some(11), None, None, None])
+            .is_err());
+        assert!(forest
+            .plan_authoritative_precompute(&[None, None, None])
+            .is_err());
     }
 
     #[test]
