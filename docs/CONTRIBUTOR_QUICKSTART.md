@@ -17,7 +17,9 @@ Current public support is exact-row: TinyLlama Q8_0 is the supported gate; Llama
 
 Required local tools:
 
-- Rust/Cargo 1.87+
+- Rust/Cargo via `rustup` (the exact version is pinned in
+  [`rust-toolchain.toml`](../rust-toolchain.toml) and installed automatically on
+  first `cargo` invocation in this repo)
 - Node.js + npm for `frontend/`
 - Git
 
@@ -27,6 +29,16 @@ Helpful but not required for every contribution:
 - local GGUF model files for supported-row smoke or parity work
 
 If your host exposes an older distro `cargo`, source `$HOME/.cargo/env` first or use `scripts/with-rustup-cargo.sh ...` so the rustup-managed toolchain is used.
+
+This matters more than it looks. `rust-toolchain.toml` is a *rustup* mechanism:
+on a host with rustup it outranks `rustup default` and pins you to the same
+toolchain CI uses, but on a host whose `cargo` comes from a distro package or
+Homebrew with **no rustup installed**, the file is inert and you silently build
+and lint with whatever version that package ships. That is a real way to get
+`clippy` findings CI does not have — or to miss ones it does — so check
+`rustc -vV` against the pinned channel before concluding that CI and your
+machine disagree about the code. Every CI leg prints its own `rustc -vV` in the
+"Show effective toolchain" step for exactly this comparison.
 
 ## Backend quickstart
 

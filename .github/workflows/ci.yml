@@ -129,6 +129,12 @@ jobs:
       - name: Check for private operator details
         run: bash scripts/check-public-scrub.sh
 
+      # Cheap, and it gates every job that installs a toolchain (`rust` and
+      # `desktop` both `needs:` this one), so drift fails before three OS
+      # runners spin up.
+      - name: Check toolchain pins agree with rust-toolchain.toml
+        run: bash scripts/check-toolchain-pins.sh
+
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
@@ -209,10 +215,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; this ref only mirrors it. rustup treats the toolchain file as a
+      # directory override, which outranks the `rustup default` this action sets,
+      # so the version named here does NOT decide what the cargo steps below run
+      # -- the file does. Keeping them equal is what makes this step useful (it
+      # pre-installs the toolchain that will actually be used, instead of a second
+      # one nothing runs). The `public-scrub` job fails the run if they drift.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.89.0
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
+
+      # Print the toolchain that actually resolved, so a log answers "what did
+      # this run lint with?" without re-deriving it from rustup's override rules.
+      - name: Show effective toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo clippy --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -343,10 +364,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Mirrors rust-toolchain.toml; see the note on the `rust` job's copy of
+      # this step. The toolchain file wins regardless, and `public-scrub` fails
+      # the run if this ref drifts away from it.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.89.0
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
+
+      - name: Show effective toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo clippy --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
