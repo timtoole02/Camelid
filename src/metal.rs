@@ -17865,11 +17865,15 @@ fn try_attention_splitk_kv16_for_test(
     }
     let cb = kernel.queue.new_command_buffer();
     let e = cb.new_compute_command_encoder();
-    e.set_compute_pipeline_state(if direct {
-        &kernel.attention_decode_splitk_kv16_direct_pipeline
-    } else {
-        &kernel.attention_decode_splitk_kv16_pipeline
-    });
+    // A test may not dispatch the `_direct` kernel at a width production would refuse:
+    // it would write partials at stride (128 + 2) while this driver sized them at
+    // (head_dim + 2), and the assertion would then be reading its own scribble.
+    assert!(
+        !direct || splitk_kv16_direct_admits(head_dim),
+        "the _direct split-K kv16 kernel is a head_dim-128 specialization; \
+         head_dim {head_dim} must use the staged kernel"
+    );
+    e.set_compute_pipeline_state(splitk_kv16_pipeline(kernel, head_dim, false));
     e.set_buffer(0, Some(&q), 0);
     e.set_buffer(1, Some(&k), 0);
     e.set_buffer(2, Some(&v), 0);
@@ -18308,6 +18312,49 @@ fn splitk_kv_source(kv: KvOperand, mirrors_present: bool, mirrors_enabled: bool)
     }
 }
 
+/// Whether the `_direct` split-K kv16 kernels may be dispatched at this `head_dim`.
+///
+/// They are a **head_dim-128 specialization**, not a general kernel, and nothing in their
+/// signature says so. They load the query as `float4` at `query + qh * 128 + lane * 4`
+/// (32 lanes x 4 = 128), write partials at a hardcoded row stride of `(128 + 2)`, and
+/// store the running max at `dst[128]`.
+///
+/// The host disagrees at every other width. It sizes `partials` as
+/// `n_heads * n_splits * (head_dim + 2)`, and `attention_decode_splitk_merge_f32` reads it
+/// back at that same `head_dim`-derived stride (`base[s2 * (head_dim + 2) + head_dim]`).
+/// So for `head_dim != 128` the producer's stride and the consumer's stride disagree: the
+/// merge reads slots no producer wrote, and for `head_dim < 128` the kernel also writes
+/// past the end of the allocation.
+///
+/// That is the shape of CUDA #714 exactly — a kernel and its host disagreeing about a
+/// geometry that neither states. It has been correct here only because three separate
+/// call sites each remembered to write `if head_dim == 128`. This function is the one
+/// place that decision lives, so a fourth call site cannot forget it.
+#[cfg(target_os = "macos")]
+fn splitk_kv16_direct_admits(head_dim: usize) -> bool {
+    head_dim == 128
+}
+
+/// Select the split-K kv16 pipeline: the head_dim-128 `_direct` twin where admitted,
+/// otherwise the staged kernel, which is general in `head_dim`.
+///
+/// The `_direct` variant skips threadgroup staging and barriers, so more threadgroups stay
+/// resident and GQA re-reads hit the SLC: 11.4ms vs 14.3ms staged at 7.7k positions, and
+/// better at every shallower depth.
+#[cfg(target_os = "macos")]
+fn splitk_kv16_pipeline(
+    k: &MetalLinearKernel,
+    head_dim: usize,
+    tree: bool,
+) -> &ComputePipelineState {
+    match (tree, splitk_kv16_direct_admits(head_dim)) {
+        (false, true) => &k.attention_decode_splitk_kv16_direct_pipeline,
+        (false, false) => &k.attention_decode_splitk_kv16_pipeline,
+        (true, true) => &k.attention_decode_splitk_kv16_direct_tree_pipeline,
+        (true, false) => &k.attention_decode_splitk_kv16_tree_pipeline,
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention(
@@ -18398,26 +18445,14 @@ fn encode_attention(
             // while a session still holds an engine built under the previous format), the
             // hazard `kv_roundtrips_through_cpu_exactly` documents. The buffer's owner is
             // the only trustworthy witness to its element type.
-            if head_dim == 128 {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_pipeline);
-            } else {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
-            }
+            e.set_compute_pipeline_state(splitk_kv16_pipeline(k, head_dim, false));
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
         } else if source == SplitkKvSource::MirrorsF16 {
             // F32 primary with f16 mirrors staged: half the KV traffic at depth.
             let (mk, mv) = kv16_mirrors.expect("MirrorsF16 implies mirrors_present");
-            // Direct-read variant for head_dim 128: no threadgroup staging or
-            // barriers -> more resident threadgroups; GQA re-reads hit the SLC.
-            // Probe @7.7k positions: 11.4ms vs 14.3ms staged (and better at
-            // every shallower depth). Staged kernel remains the general fallback.
-            if head_dim == 128 {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_pipeline);
-            } else {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
-            }
+            e.set_compute_pipeline_state(splitk_kv16_pipeline(k, head_dim, false));
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(mk), 0);
             e.set_buffer(2, Some(mv), 0);
@@ -18606,11 +18641,7 @@ fn encode_attention_tree(
         // split-K kernel has no tree clone). Under the default config the linear path
         // also reads the mirrors, so the two stay byte-identical.
         let (mk, mv) = kv16_mirrors.expect("gated on is_some above");
-        if head_dim == 128 {
-            e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_tree_pipeline);
-        } else {
-            e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_tree_pipeline);
-        }
+        e.set_compute_pipeline_state(splitk_kv16_pipeline(k, head_dim, true));
         e.set_buffer(0, Some(query), query_off);
         e.set_buffer(1, Some(mk), 0);
         e.set_buffer(2, Some(mv), 0);
@@ -32783,6 +32814,121 @@ mod tests {
             for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
                 assert!(
                     (a - b).abs() < 1.0e-4,
+                    "head_dim {head_dim} / {positions} positions, dim {i}: {a} != {b}"
+                );
+            }
+        }
+    }
+
+    /// The `_direct` split-K kv16 kernels are a head_dim-128 SPECIALIZATION, and nothing in
+    /// their signature or name enforces it.
+    ///
+    /// They write partials at a hardcoded row stride of `(128 + 2)` with the running max at
+    /// `dst[128]`, while the host sizes `partials` as `n_heads * n_splits * (head_dim + 2)`
+    /// and `attention_decode_splitk_merge_f32` reads back at that `head_dim`-derived stride.
+    /// The two coincide at 128 and nowhere else: elsewhere the merge reads slots no producer
+    /// wrote, and below 128 the kernel writes past the allocation.
+    ///
+    /// This is CUDA #714's shape — a kernel and its host disagreeing about a geometry
+    /// neither states. It was correct only because three separate call sites each remembered
+    /// `if head_dim == 128`. The decision now lives in one predicate; this pins it.
+    ///
+    /// Needs no GPU: policy, not dispatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn splitk_kv16_direct_is_a_head_dim_128_specialization() {
+        use super::splitk_kv16_direct_admits;
+
+        assert!(splitk_kv16_direct_admits(128));
+
+        // Every other width the v2 gate admits (`head_dim % 32 == 0 && head_dim <= 128`)
+        // must fall to the staged kernel, which is general in head_dim. 64 is LFM2's
+        // width and 96 is phi-3's — both shipped shapes.
+        for hd in [32usize, 64, 96] {
+            assert!(
+                !splitk_kv16_direct_admits(hd),
+                "head_dim {hd} must not reach the _direct kernel"
+            );
+        }
+        // And widths beyond the specialization, in case the v2 cap ever moves.
+        for hd in [160usize, 192, 256, 512] {
+            assert!(!splitk_kv16_direct_admits(hd));
+        }
+    }
+
+    /// The STAGED split-K kv16 kernel at the widths production actually dispatches it at.
+    ///
+    /// `metal_attention_decode_splitk_kv16_matches_cpu_reference` below covers head_dim 128
+    /// — the one width where `splitk_kv16_direct_admits` sends production to the `_direct`
+    /// twin instead. So the staged kernel, which is what runs for every other admitted
+    /// width, had no coverage at any width it is actually used at.
+    ///
+    /// head_dim 64 is LFM2's and 96 is phi-3's; 96 gives `dpl = 3`, leaving the fourth
+    /// per-lane dim inactive — the under-subscribed shape that made the CUDA sibling race.
+    /// Positions cross the `position_count >= 128` admission threshold and the `n_splits`
+    /// clamp, with chunk tails that do not divide the staging tile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_splitk_kv16_staged_matches_cpu_at_the_non_128_widths() {
+        if !detect_metal_device().available {
+            return;
+        }
+        for &(n_heads, n_kv_heads, head_dim, positions) in &[
+            (8usize, 4usize, 64usize, 128usize),
+            (8, 4, 64, 200),
+            (6, 2, 64, 131),
+            (6, 2, 96, 131),
+            (6, 2, 96, 257),
+        ] {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            // Steps of 0.25 are exactly representable in f16, so the f32 CPU reference sees
+            // the same values the kernel reads back from the half cache.
+            let query: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| ((i as f32 % 5.0) - 2.0) * 0.25)
+                .collect();
+            let keys: Vec<f32> = (0..n_kv_heads * positions * head_dim)
+                .map(|i| ((i as f32 % 7.0) - 3.0) * 0.25)
+                .collect();
+            let values: Vec<f32> = (0..n_kv_heads * positions * head_dim)
+                .map(|i| ((i as f32 % 9.0) - 4.0) * 0.25)
+                .collect();
+
+            let group = n_heads / n_kv_heads;
+            let mut expected = vec![0.0f32; n_heads * head_dim];
+            for h in 0..n_heads {
+                let qb = h * head_dim;
+                let kvb = (h / group) * positions * head_dim;
+                let mut scores = vec![0.0f32; positions];
+                let mut m = f32::NEG_INFINITY;
+                for (p, sc) in scores.iter_mut().enumerate() {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += query[qb + d] * keys[kvb + p * head_dim + d];
+                    }
+                    *sc = dot * scale;
+                    m = m.max(*sc);
+                }
+                let mut sum = 0.0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - m).exp();
+                    sum += *sc;
+                }
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (p, sc) in scores.iter().enumerate() {
+                        acc += (sc / sum) * values[kvb + p * head_dim + d];
+                    }
+                    expected[qb + d] = acc;
+                }
+            }
+
+            let got = try_attention_splitk_kv16_for_test(
+                &query, &keys, &values, n_heads, n_kv_heads, head_dim, positions, scale, false,
+            )
+            .expect("staged split-K kv16 attention");
+            for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (a - b).abs() < 1.0e-3,
                     "head_dim {head_dim} / {positions} positions, dim {i}: {a} != {b}"
                 );
             }
