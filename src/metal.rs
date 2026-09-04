@@ -17656,16 +17656,6 @@ fn resident_kv_format() -> ResidentKvFormat {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn kv16_enabled() -> bool {
-    resident_kv_format() == ResidentKvFormat::F16
-}
-
-#[cfg(target_os = "macos")]
-fn kvq8_enabled() -> bool {
-    resident_kv_format() == ResidentKvFormat::Q8
-}
-
 /// Admit an F16-PRIMARY resident KV cache to the split-K decode attention.
 ///
 /// The split-K gate historically read `!kv16_enabled()`, which excluded every K-quant
@@ -19177,13 +19167,10 @@ fn encode_attention_block(
     cache_k_buf: &Buffer,
     cache_v_buf: &Buffer,
     kv16_mirrors: Option<(&Buffer, &Buffer)>,
-    // Primary KV format for THIS session, threaded from `self.kv16`/`self.kvq8`
-    // rather than re-read from the process-global gates: the caller, the KV
-    // readback and the KV seed all use the per-session fields, and the window
-    // offset now rides in the same scalar as the stride (see byte 28 below).
-    // Two sources of truth here is a time-of-check/time-of-use hazard.
-    kv16: bool,
-    kvq8: bool,
+    // Primary KV format owned by this caller. Keeping this as one witness prevents an
+    // impossible `(kv16, kvq8) == (true, true)` state and stops the standalone helpers,
+    // whose inputs are always f32, from consulting resident-session global policy.
+    kv: KvOperand,
     max_positions: usize,
     write_position: usize,
     n_heads: usize,
@@ -19202,6 +19189,8 @@ fn encode_attention_block(
     split_half_pairing: bool,
     qk_l2_norm_after_rope: bool,
 ) {
+    let kv16 = kv == KvOperand::F16;
+    let kvq8 = kv == KvOperand::Q8;
     let hidden = attn_norm.len();
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
@@ -19547,7 +19536,7 @@ fn encode_attention_block(
         &query_buf,
         cache_k_buf,
         cache_v_buf,
-        KvOperand::from_flags(kv16, kvq8),
+        kv,
         kv16_mirrors,
         &scores_buf,
         &ctx_buf,
@@ -22894,8 +22883,9 @@ pub fn try_attention_block_resident(
         &cache_k_buf,
         &cache_v_buf,
         None,
-        kv16_enabled(),
-        kvq8_enabled(),
+        // `upload_cache_buffer` copied `&[f32]`; resident-session policy must not
+        // reinterpret this standalone helper's caller-owned bytes.
+        KvOperand::F32,
         position_count,
         position_count - 1,
         n_heads,
@@ -23032,8 +23022,9 @@ pub fn try_decode_layer_resident(
         &cache_k_buf,
         &cache_v_buf,
         None,
-        kv16_enabled(),
-        kvq8_enabled(),
+        // `upload_cache_buffer` copied `&[f32]`; resident-session policy must not
+        // reinterpret this standalone helper's caller-owned bytes.
+        KvOperand::F32,
         position_count,
         position_count - 1,
         n_heads,
@@ -23212,8 +23203,9 @@ pub fn try_decode_forward_resident(
             &cache_k_buf,
             &cache_v_buf,
             None,
-            kv16_enabled(),
-            kvq8_enabled(),
+            // `ResidentDecodeLayer` exposes f32 cache slices, so this transient
+            // standalone path always owns an f32 primary.
+            KvOperand::F32,
             position_count,
             position_count - 1,
             n_heads,
@@ -24759,8 +24751,7 @@ impl ResidentDecodeState {
                 } else {
                     Some((&self.cache_k16[i], &self.cache_v16[i]))
                 },
-                self.kv16,
-                self.kvq8,
+                KvOperand::from_flags(self.kv16, self.kvq8),
                 self.max_positions,
                 position,
                 self.n_heads,
