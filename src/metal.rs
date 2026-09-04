@@ -17925,6 +17925,96 @@ fn try_attention_splitk_kv16_for_test(
     Some(result)
 }
 
+/// Test-only direct driver for the **f32** split-K decode attention, the kernel the
+/// gemma4 / qwen35 / LFM2 lanes reach now that `encode_attention` routes on the caller's
+/// `KvOperand` witness instead of inferring "f16 primary" from absent mirrors. Mirrors
+/// `try_attention_splitk_kv16_for_test`, but binds f32 K/V and the f32 pipeline.
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn try_attention_splitk_f32_for_test(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    positions: usize,
+    scale: f32,
+) -> Option<Vec<f32>> {
+    let kernel = metal_linear_kernel()?;
+    let device = &kernel.device;
+    let opts = MTLResourceOptions::StorageModeShared;
+    let q = device.new_buffer(std::mem::size_of_val(query) as u64, opts);
+    let k = device.new_buffer(std::mem::size_of_val(keys) as u64, opts);
+    let v = device.new_buffer(std::mem::size_of_val(values) as u64, opts);
+    let out = device.new_buffer((n_heads * head_dim * 4) as u64, opts);
+    let scalar = device.new_buffer(32, opts);
+    write_buffer_f32(&q, query);
+    write_buffer_f32(&k, keys);
+    write_buffer_f32(&v, values);
+    let n_splits = positions.div_ceil(64).clamp(2, 64);
+    let partials = device.new_buffer((n_heads * n_splits * (head_dim + 2) * 4) as u64, opts);
+    let splits_scalar = device.new_buffer(4, opts);
+    unsafe {
+        *(splits_scalar.contents() as *mut u32) = n_splits as u32;
+        let p = scalar.contents() as *mut u32;
+        *p = n_heads as u32;
+        *p.add(1) = head_dim as u32;
+        *p.add(2) = positions as u32;
+        *p.add(3) = (n_heads / n_kv_heads) as u32;
+        *(p.add(4) as *mut f32) = scale;
+        *p.add(5) = head_dim as u32; // position_stride (contiguous)
+        *p.add(6) = (positions * head_dim) as u32; // kv_head_stride
+        *p.add(7) = 0; // kv_base_offset
+    }
+    let cb = kernel.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&kernel.attention_decode_splitk_pipeline);
+    e.set_buffer(0, Some(&q), 0);
+    e.set_buffer(1, Some(&k), 0);
+    e.set_buffer(2, Some(&v), 0);
+    e.set_buffer(3, Some(&partials), 0);
+    for i in 0..8u64 {
+        e.set_buffer(5 + i, Some(&scalar), i * 4);
+    }
+    e.set_buffer(13, Some(&splits_scalar), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_kv_heads as u64,
+            height: n_splits as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.set_compute_pipeline_state(&kernel.attention_decode_splitk_merge_pipeline);
+    e.set_buffer(0, Some(&partials), 0);
+    e.set_buffer(1, Some(&out), 0);
+    e.set_buffer(2, Some(&scalar), 4); // head_dim
+    e.set_buffer(3, Some(&splits_scalar), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    let mut result = vec![0.0f32; n_heads * head_dim];
+    read_buffer_f32(&out, &mut result);
+    Some(result)
+}
+
 /// Test-only direct driver for the K-split GEMV pipeline (bypasses the env gate and the
 /// weight-buffer cache so parity tests control exactly what runs).
 #[cfg(all(test, target_os = "macos"))]
@@ -32615,6 +32705,96 @@ mod tests {
         .expect("v2 attention");
         for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
             assert!((a - b).abs() < 1.0e-4, "dim {i}: {a} != {b}");
+        }
+    }
+
+    /// The **f32** split-K decode attention against a CPU f32 reference, at the shapes the
+    /// gemma4 / qwen35 / LFM2 lanes actually dispatch.
+    ///
+    /// This kernel previously had no correctness test of its own. It also had almost no
+    /// production traffic from those lanes: `encode_attention` inferred "f16 primary" from
+    /// `kv16_mirrors.is_none()`, and all three pass `None` unconditionally, so they were
+    /// misrouted to the half-typed kernel. Fixing the routing sends real traffic here, so
+    /// pin the arithmetic.
+    ///
+    /// head_dim 64 is the load-bearing width: it is LFM2's, and `Lfm2MetalDecode::new`
+    /// admits any `head_dim <= 128`. `positions` is swept either side of the split-K
+    /// admission threshold (`position_count >= 128`) and across the `n_splits` clamp, so a
+    /// coverage gap in the partials — the failure mode CUDA PR #714 hit, where slots that
+    /// no producer wrote were summed back uninitialised — shows up as a mismatch rather
+    /// than as plausible garbage.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_splitk_f32_matches_cpu_reference_across_the_threshold() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // (n_heads, n_kv_heads, head_dim, positions)
+        //   64/128  -- LFM2's width, exactly at the admission threshold, 2 splits
+        //   64/200  -- 4 splits, chunk 50, last split covers 50: uneven PT=8 tail
+        //   64/131  -- 3 splits of chunk 44 where the last covers 43
+        //   96/131  -- head_dim not a multiple of 64; dpl = 3, so lane dim 3 is inactive
+        //  128/131  -- full MAX_DPL = 4 width
+        for &(n_heads, n_kv_heads, head_dim, positions) in &[
+            (8usize, 4usize, 64usize, 128usize),
+            (8, 4, 64, 200),
+            (6, 2, 64, 131),
+            (6, 2, 96, 131),
+            (6, 2, 128, 131),
+        ] {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            // Exactly-representable steps keep the CPU reference and the kernel reading
+            // identical values; this lane is f32 end to end, so there is no f16 rounding
+            // to hide a real mismatch.
+            let query: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| ((i as f32 % 5.0) - 2.0) * 0.25)
+                .collect();
+            let keys: Vec<f32> = (0..n_kv_heads * positions * head_dim)
+                .map(|i| ((i as f32 % 7.0) - 3.0) * 0.25)
+                .collect();
+            let values: Vec<f32> = (0..n_kv_heads * positions * head_dim)
+                .map(|i| ((i as f32 % 9.0) - 4.0) * 0.25)
+                .collect();
+
+            let group = n_heads / n_kv_heads;
+            let mut expected = vec![0.0f32; n_heads * head_dim];
+            for h in 0..n_heads {
+                let qb = h * head_dim;
+                let kvb = (h / group) * positions * head_dim;
+                let mut scores = vec![0.0f32; positions];
+                let mut m = f32::NEG_INFINITY;
+                for (p, sc) in scores.iter_mut().enumerate() {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += query[qb + d] * keys[kvb + p * head_dim + d];
+                    }
+                    *sc = dot * scale;
+                    m = m.max(*sc);
+                }
+                let mut sum = 0.0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - m).exp();
+                    sum += *sc;
+                }
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (p, sc) in scores.iter().enumerate() {
+                        acc += (sc / sum) * values[kvb + p * head_dim + d];
+                    }
+                    expected[qb + d] = acc;
+                }
+            }
+
+            let got = try_attention_splitk_f32_for_test(
+                &query, &keys, &values, n_heads, n_kv_heads, head_dim, positions, scale,
+            )
+            .expect("f32 split-K attention");
+            for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (a - b).abs() < 1.0e-4,
+                    "head_dim {head_dim} / {positions} positions, dim {i}: {a} != {b}"
+                );
+            }
         }
     }
 
