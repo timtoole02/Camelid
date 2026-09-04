@@ -179,7 +179,7 @@ fn attention_matmul_prefill_q8_stage_bytes(
 mod attention_matmul_prefill_shape_tests {
     use super::{
         attention_matmul_prefill_head_dim_supported, attention_matmul_prefill_q8_stage_bytes,
-        attention_matmul_prefill_rows_fit, kquant_mm_stage_bytes,
+        attention_matmul_prefill_rows_fit,
     };
 
     #[test]
@@ -230,8 +230,15 @@ mod attention_matmul_prefill_shape_tests {
     /// largest projection in the model rather than to the prompt -- an 8B's ffn pair is
     /// ~117 MB. It must decline the lane rather than allocate past the cap, and it must not
     /// wrap: `rows * k * 2` overflows usize for a shape a corrupt header could claim.
+    ///
+    /// Gated with its import: `kquant_mm_stage_bytes` is macOS-only, and this module is not,
+    /// so a module-level `use` of it breaks the ubuntu and windows legs — which is the one
+    /// failure mode a macOS-only build can never reproduce locally.
+    #[cfg(target_os = "macos")]
     #[test]
     fn kquant_staging_fails_closed_before_an_oversized_or_overflowed_panel() {
+        use super::kquant_mm_stage_bytes;
+
         // Llama-3.2-3B's ffn pair: 8192 rows contracting over 3072.
         let needed = 8192 * 3072 * std::mem::size_of::<u16>();
         assert_eq!(kquant_mm_stage_bytes(8192, 3072, needed), Some(needed));
