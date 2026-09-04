@@ -8916,7 +8916,10 @@ const GEMMA4_MTP12_QUALIFIED_TARGET_SHA256: &str =
 const GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256: &str =
     "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6";
 const DEFAULT_GEMMA4_MTP12_MAX_POSITIONS: usize = 4096;
-const DEFAULT_GEMMA4_MTP12_VERIFY_WIDTH: usize = 16;
+// Ordinary chat rarely accepts all fifteen drafts. W8 amortizes the target
+// pass without paying for long rejected tails; explicit W16 remains available
+// for workloads with sustained high acceptance.
+const DEFAULT_GEMMA4_MTP12_VERIFY_WIDTH: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Gemma4Mtp12ServeConfig {
@@ -10061,7 +10064,7 @@ mod gemma4_template_tests {
             Some(Gemma4Mtp12ServeConfig {
                 assistant_path: path.clone(),
                 max_positions: 4096,
-                verify_width: 16,
+                verify_width: 8,
             })
         );
         assert_eq!(
@@ -11360,6 +11363,11 @@ fn gemma4_mtp12_diagnostics(
         "mtp12": {
             "lossless_target_verified": true,
             "decode_us": stats.decode_us,
+            "prefill_us": stats.prefill_us,
+            "assistant_us": stats.assistant_us,
+            "target_verify_us": stats.target_verify_us,
+            "rounds": stats.rounds,
+            "target_verify_rows": stats.target_verify_rows,
             "decode_output_tokens": decode_output_tokens,
             "decode_tokens_per_second": stats.decode_tokens_per_second(),
             "configured_verify_width": stats.configured_verify_width,

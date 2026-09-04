@@ -8717,6 +8717,44 @@ impl Gemma4GpuRuntime {
         candidate_tokens: &[u32],
         start_position: usize,
     ) -> Result<Gemma4DenseVerifierBatch> {
+        let (ticket, (greedy_ids, final_hidden)) = self.with_consecutive_hidden_ordered_q4(
+            candidate_tokens,
+            start_position,
+            |head, hidden_flat| {
+                let greedy_ids = head.forward_argmax_spec50_batch(hidden_flat).ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "SPEC50 K-wide Q6_K target head failed".into(),
+                    )
+                })?;
+                if greedy_ids.len() != candidate_tokens.len() {
+                    return Err(BackendError::RuntimeShapeMismatch(
+                        "verifier head returned an invalid row count".into(),
+                    ));
+                }
+                let final_hidden = hidden_flat
+                    .chunks_exact(self.hidden)
+                    .map(<[f32]>::to_vec)
+                    .collect();
+                Ok((greedy_ids, final_hidden))
+            },
+        )?;
+        Ok(Gemma4DenseVerifierBatch {
+            ticket,
+            start_position,
+            greedy_ids,
+            final_hidden,
+        })
+    }
+
+    /// Execute causal target rows, allowing the caller to project only the
+    /// predictions it needs. Hold the cursor lock through projection and issue
+    /// a ticket only after both decoder and projection succeed.
+    fn with_consecutive_hidden_ordered_q4<R>(
+        &self,
+        candidate_tokens: &[u32],
+        start_position: usize,
+        project: impl FnOnce(&crate::metal::Gemma4Q6KHead, &[f32]) -> Result<R>,
+    ) -> Result<(u64, R)> {
         let width = candidate_tokens.len();
         if !gemma4_dense_verify_width_admitted(width) || !self.head_on_cpu {
             return Err(BackendError::UnsupportedModelArchitecture(
@@ -8761,22 +8799,12 @@ impl Gemma4GpuRuntime {
                     "ordered-Q4 K-wide target verifier refused the model or dispatch".into(),
                 )
             })?;
-        let greedy_ids = head
-            .forward_argmax_spec50_batch(&hidden_flat)
-            .ok_or_else(|| {
-                BackendError::UnsupportedModelArchitecture(
-                    "SPEC50 K-wide Q6_K target head failed".into(),
-                )
-            })?;
-        if greedy_ids.len() != width || hidden_flat.len() != width * self.hidden {
-            return Err(BackendError::UnsupportedModelArchitecture(
-                "verifier returned an invalid row count".into(),
+        if hidden_flat.len() != width * self.hidden {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "verifier returned an invalid hidden row count".into(),
             ));
         }
-        let final_hidden = hidden_flat
-            .chunks_exact(self.hidden)
-            .map(<[f32]>::to_vec)
-            .collect();
+        let result = project(head, &hidden_flat)?;
         let ticket = state
             .record_completed_batch(start_position, width)
             .ok_or_else(|| {
@@ -8784,12 +8812,7 @@ impl Gemma4GpuRuntime {
                     "verifier cursor changed while the target batch was executing".into(),
                 )
             })?;
-        Ok(Gemma4DenseVerifierBatch {
-            ticket,
-            start_position,
-            greedy_ids,
-            final_hidden,
-        })
+        Ok((ticket, result))
     }
 
     /// Resolve a tentative verifier batch. `consumed_input_rows` counts target
@@ -8851,6 +8874,8 @@ impl Gemma4GpuRuntime {
     /// target's intermediate argmax, so every physical row is authoritative and
     /// committed. The final prompt prediction is the first output token; the
     /// matching final hidden row is returned for the first MTP recurrence.
+    /// Only that final row is projected into the vocabulary. Set
+    /// `CAMELID_GEMMA4_PREFILL_LAST_HEAD=0` to compare with all-row projection.
     pub fn prefill_ordered_q4(&self, prompt: &str) -> Result<Gemma4OrderedQ4Prefill> {
         let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
         if prompt_tokens.is_empty() {
@@ -8863,25 +8888,60 @@ impl Gemma4GpuRuntime {
         let mut first_greedy_id = 0u32;
         let mut pending_target_raw_hidden = Vec::new();
         let mut position = 0usize;
+        let project_all_prompt_rows =
+            std::env::var("CAMELID_GEMMA4_PREFILL_LAST_HEAD").as_deref() == Ok("0");
         while position < prompt_tokens.len() {
             let remaining = prompt_tokens.len() - position;
             let width = gemma4_ordered_q4_prefill_chunk_width(remaining)
                 .expect("non-empty prompt tail has an admitted verifier width");
-            let batch = self.verify_consecutive_greedy(
+            if project_all_prompt_rows {
+                let batch = self.verify_consecutive_greedy(
+                    &prompt_tokens[position..position + width],
+                    position,
+                )?;
+                let Some((&last_greedy_id, last_hidden)) =
+                    batch.greedy_ids.last().zip(batch.final_hidden.last())
+                else {
+                    let _ = self.rollback_verifier_batch(batch.ticket);
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "ordered-Q4 prompt batch W{width} returned no final prediction or hidden row"
+                    )));
+                };
+                first_greedy_id = last_greedy_id;
+                pending_target_raw_hidden = last_hidden.clone();
+                position = self.commit_verifier_prefix(batch.ticket, width)?;
+                continue;
+            }
+            let final_chunk = position + width == prompt_tokens.len();
+            let (ticket, prediction) = self.with_consecutive_hidden_ordered_q4(
                 &prompt_tokens[position..position + width],
                 position,
+                |head, hidden_flat| {
+                    if !final_chunk {
+                        return Ok(None);
+                    }
+                    // Prompt tokens are authoritative: only the very last
+                    // prompt row needs a vocabulary projection. K1 uses the
+                    // same ordered head arithmetic as each row of K2/4/8/16.
+                    let last_hidden = &hidden_flat[hidden_flat.len() - self.hidden..];
+                    let ids = head.forward_argmax_spec50_batch(last_hidden).ok_or_else(|| {
+                        BackendError::UnsupportedModelArchitecture(
+                            "SPEC50 final prompt Q6_K target head failed".into(),
+                        )
+                    })?;
+                    if ids.len() != 1 {
+                        return Err(BackendError::RuntimeShapeMismatch(
+                            "final prompt head returned an invalid row count".into(),
+                        ));
+                    }
+                    Ok(Some((ids[0], last_hidden.to_vec())))
+                },
             )?;
-            let Some((&last_greedy_id, last_hidden)) =
-                batch.greedy_ids.last().zip(batch.final_hidden.last())
-            else {
-                let _ = self.rollback_verifier_batch(batch.ticket);
-                return Err(BackendError::RuntimeShapeMismatch(format!(
-                    "ordered-Q4 prompt batch W{width} returned no final prediction or hidden row"
-                )));
-            };
-            first_greedy_id = last_greedy_id;
-            pending_target_raw_hidden = last_hidden.clone();
-            position = self.commit_verifier_prefix(batch.ticket, width)?;
+            if let Some((id, hidden)) = prediction {
+                first_greedy_id = id;
+                pending_target_raw_hidden = hidden;
+            }
+            position = self.commit_verifier_prefix(ticket, width)?;
         }
         Ok(Gemma4OrderedQ4Prefill {
             prompt_token_count: prompt_tokens.len(),
@@ -23363,5 +23423,40 @@ mod ghost_moe_wire_tests {
             &final_k,
             &final_v,
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mtp12_prefill_projection_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the official 12B QAT target and native sidecar"]
+    fn final_prompt_projection_preserves_hidden_and_continuation() {
+        let path = std::env::var("CAMELID_MTP12_TEST_MODEL").expect("12B fixture path");
+        let runtime = Gemma4GpuRuntime::load(std::path::Path::new(&path), 512).unwrap();
+        for prompt in [
+            "<|turn>user\nExplain how speculative decoding speeds up a language model.<turn|>\n<|turn>model\n",
+            "Write a detailed technical explanation of speculative decoding and its performance tradeoffs.",
+        ] {
+            unsafe { std::env::set_var("CAMELID_GEMMA4_PREFILL_LAST_HEAD", "0") };
+            let full = runtime.prefill_ordered_q4(prompt).unwrap();
+            unsafe { std::env::set_var("CAMELID_GEMMA4_PREFILL_LAST_HEAD", "1") };
+            let last = runtime.prefill_ordered_q4(prompt).unwrap();
+            assert_eq!(full.prompt_token_count, last.prompt_token_count);
+            assert_eq!(full.first_greedy_id, last.first_greedy_id);
+            assert_eq!(
+                full.pending_target_raw_hidden.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                last.pending_target_raw_hidden.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+            eprintln!("prefill exact: prompt_tokens={} full_us={} last_us={}",
+                full.prompt_token_count, full.prefill_us, last.prefill_us);
+            unsafe { std::env::set_var("CAMELID_GEMMA4_PREFILL_LAST_HEAD", "0") };
+            let full = runtime.generate_greedy_ordered_q4(prompt, 64).unwrap();
+            unsafe { std::env::set_var("CAMELID_GEMMA4_PREFILL_LAST_HEAD", "1") };
+            let last = runtime.generate_greedy_ordered_q4(prompt, 64).unwrap();
+            assert_eq!(full.token_ids, last.token_ids);
+            eprintln!("continuation exact: {} output tokens", full.token_ids.len());
+        }
     }
 }
