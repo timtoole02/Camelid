@@ -14293,9 +14293,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .get_function("attention_decode_v2_kv16_tree", None)
                 .ok()?;
             let attention_decode_v2_kv16_tree_pipeline = device
-                .new_compute_pipeline_state_with_function(
-                    &attention_decode_v2_kv16_tree_function,
-                )
+                .new_compute_pipeline_state_with_function(&attention_decode_v2_kv16_tree_function)
                 .ok()?;
             let attention_decode_splitk_kv16_tree_function = elementwise_library
                 .get_function("attention_decode_splitk_kv16_tree", None)
@@ -14323,9 +14321,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .get_function("argmax_f32_greedy_batch_partial", None)
                 .ok()?;
             let argmax_f32_greedy_batch_partial_pipeline = device
-                .new_compute_pipeline_state_with_function(
-                    &argmax_f32_greedy_batch_partial_function,
-                )
+                .new_compute_pipeline_state_with_function(&argmax_f32_greedy_batch_partial_function)
                 .ok()?;
             let argmax_f32_greedy_batch_merge_function = elementwise_library
                 .get_function("argmax_f32_greedy_batch_merge", None)
@@ -19715,7 +19711,13 @@ fn encode_kquant_v4_prepared_projection(
     } else {
         KquantV4ProjectionRoute::Synchronized
     };
-    trace_kquant_v4_dispatch(weight.format, stage.n_tokens, rows, route, stage.fragment_major);
+    trace_kquant_v4_dispatch(
+        weight.format,
+        stage.n_tokens,
+        rows,
+        route,
+        stage.fragment_major,
+    );
 }
 
 /// Rows one segmented register-exact tile owns on a [position][k_pad] stage:
@@ -19762,8 +19764,7 @@ fn kquant_v4_fused_segments_format_for(
     n_tokens: usize,
     fragment_major: bool,
 ) -> Option<ResidentWeightFormat> {
-    if !(2..=KQUANT_V4_FUSED_MAX_SEGMENTS).contains(&segments.len())
-        || !(1..=8).contains(&n_tokens)
+    if !(2..=KQUANT_V4_FUSED_MAX_SEGMENTS).contains(&segments.len()) || !(1..=8).contains(&n_tokens)
     {
         return None;
     }
@@ -19995,14 +19996,12 @@ fn encode_shared_kquant_v4_activation_with_layout(
 
     // A shared verifier preparation always includes ysums: a mixed Q4/Q6
     // projection group can then reuse one panel, while Q6 simply ignores it.
-    let stage =
-        allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true, fragment_major);
+    let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true, fragment_major);
     let fused = encode_kquant_v4_strict_fused_stage(e, k, y, &scales, &stage);
     let quants = if fused {
         None
     } else {
-        static WARNED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
                 "[metal] CAMELID_KQUANT_V4_STRICT_PREP_FUSION requested, but the narrow \
@@ -20797,10 +20796,8 @@ fn encode_resident_kquant_matmul_f32(
                 // Q4K stages y as half (values exact, half the traffic); Q6K
                 // stages f32 (its w16 exceeds half's exact-integer range, so
                 // the whole MMA lane runs f32 fragments).
-                let y_stage = pool_get(
-                    k,
-                    (input_width * k_pad * if is_q6k { 4 } else { 2 }) as u64,
-                );
+                let y_stage =
+                    pool_get(k, (input_width * k_pad * if is_q6k { 4 } else { 2 }) as u64);
                 let mma_scalar = pool_get(k, 24);
                 unsafe {
                     let p = mma_scalar.contents() as *mut u32;
@@ -20866,7 +20863,11 @@ fn encode_resident_kquant_matmul_f32(
                 t0 += gn;
                 continue;
             }
-            e.set_compute_pipeline_state(if gn == 1 { single_pipeline } else { mc_pipeline });
+            e.set_compute_pipeline_state(if gn == 1 {
+                single_pipeline
+            } else {
+                mc_pipeline
+            });
             e.set_buffer(0, Some(scales), (t0 * n_sb * 4) as u64);
             e.set_buffer(1, Some(quants), (t0 * input_width) as u64);
             e.set_buffer(2, Some(&weight.buffer), 0);
@@ -20959,9 +20960,7 @@ fn verify_layer0_early_commit_split_after(requested: bool, n_layers: usize) -> O
 
 #[cfg(test)]
 mod verify_layer0_early_commit_contract_tests {
-    use super::{
-        verify_layer0_early_commit_from_env, verify_layer0_early_commit_split_after,
-    };
+    use super::{verify_layer0_early_commit_from_env, verify_layer0_early_commit_split_after};
 
     #[test]
     fn verify_layer0_early_commit_gate_is_default_off_and_fails_closed() {
@@ -21330,9 +21329,7 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q4k_v4_register_exact: pipeline("q4k_linear_mma_combined_reg2_v4"),
                 q4k_v4_register_exact_seg3: pipeline("q4k_linear_mma_combined_reg2_seg3_v4"),
                 q4k_v4_register_exact_v2: pipeline("q4k_linear_mma_combined_reg_yg_v4"),
-                q4k_v4_register_exact_v2_seg3: pipeline(
-                    "q4k_linear_mma_combined_reg_yg_seg3_v4",
-                ),
+                q4k_v4_register_exact_v2_seg3: pipeline("q4k_linear_mma_combined_reg_yg_seg3_v4"),
                 q4k_v4_soa8: pipeline("q4k_linear_mma_combined_soa8_v4"),
                 q4k_v4_w16: pipeline("q4k_linear_mma_combined_w16_v4")?,
                 q6k_v4: pipeline("q6k_linear_mma_combined_v4")?,
@@ -21343,9 +21340,7 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
                 q6k_v4_register_exact: pipeline("q6k_linear_mma_combined_afrag_v4"),
                 q6k_v4_register_exact_seg3: pipeline("q6k_linear_mma_combined_afrag_seg3_v4"),
                 q6k_v4_register_exact_v2: pipeline("q6k_linear_mma_combined_afrag_yg_v4"),
-                q6k_v4_register_exact_v2_seg3: pipeline(
-                    "q6k_linear_mma_combined_afrag_yg_seg3_v4",
-                ),
+                q6k_v4_register_exact_v2_seg3: pipeline("q6k_linear_mma_combined_afrag_yg_seg3_v4"),
                 q6k_v4_soa8: pipeline("q6k_linear_mma_combined_soa8_v4"),
                 q6k_v4_w16: pipeline("q6k_linear_mma_combined_w16_v4")?,
             })
@@ -21647,8 +21642,7 @@ fn trace_kquant_v4_fused_dispatch(
         (true, ResidentWeightFormat::Q6K) => "combined-mma-v4-register-exact-v2-q6-afrag-yg-seg3",
         _ => pipeline,
     };
-    let bit =
-        1u32 << (shape * KQUANT_V4_FUSED_MAX_SEGMENTS as u32 + segments.len() as u32 - 2);
+    let bit = 1u32 << (shape * KQUANT_V4_FUSED_MAX_SEGMENTS as u32 + segments.len() as u32 - 2);
     if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
         let rows = segments
             .iter()
@@ -24612,8 +24606,11 @@ fn attention_splitk_kv16_shared_prefix_pipeline(
     if !attention_splitk_kv16_shared_prefix_shape_allowed(rows, head_dim, group) {
         return None;
     }
-    admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_shared_pipeline.as_ref())
-        .filter(|pipeline| pipeline.max_total_threads_per_threadgroup() >= (rows * 32) as u64)
+    admitted_32_lane_pipeline(
+        k.attention_decode_splitk_kv16_direct_shared_pipeline
+            .as_ref(),
+    )
+    .filter(|pipeline| pipeline.max_total_threads_per_threadgroup() >= (rows * 32) as u64)
 }
 
 /// Experimental verifier-only row-colocated F16 split-K attention
@@ -24660,7 +24657,6 @@ fn verify_attention_rowshare_rows_per_tg() -> usize {
         verify_attention_rowshare_rows_per_tg_from_env(value.as_deref())
     })
 }
-
 
 /// `CAMELID_METAL_ATTN_PREFETCH=1` — the re-certification switch for decode attention.
 ///
@@ -24718,6 +24714,10 @@ struct AttentionPrefetchGeometry {
     merge_w32: bool,
     /// Threads per threadgroup of the partial dispatch (bit-invariant; probe-only variation).
     threadgroup: u64,
+    /// `CAMELID_METAL_ATTN_PREFETCH_SPLIT` pinned the partition, so every depth uses
+    /// `chunk` verbatim and the depth rule below is bypassed (probes and A/Bs need one
+    /// geometry for the whole run).
+    pinned: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -24726,7 +24726,29 @@ const ATTN_PREFETCH_CERTIFIED: AttentionPrefetchGeometry = AttentionPrefetchGeom
     step: 4,
     merge_w32: false,
     threadgroup: 128,
+    pinned: false,
 };
+
+/// At or above this many positions a row partitions on `ATTN_PREFETCH_WIDE_CHUNK` instead of
+/// the certified 64, and the partials fold with the `w32` merge twin.
+///
+/// Measured on the 3B + EAGLE-3 lane (mini2, interleaved pairs, verify ms is the structural
+/// term because tok/s at these depths also moves with acceptance):
+///
+/// | positions | verify 64-chunk | verify 128-chunk | |
+/// |---|---|---|---|
+/// | 543 (Pitch) | 29.47 | 29.09 | -1.3%, and tok/s FELL 1.1% on the acceptance flip |
+/// | 1 916 | 35.57-36.24 | 34.89-35.60 | -1.8%, inside the acceptance noise |
+/// | 3 834 | 53.81-54.01 | 47.40-48.08 | **-12%, +13.1% tok/s over five pairs** |
+///
+/// The win arrives when the 64-position chunk drives the split count into the merge's
+/// expensive range (60 splits per row at 3 834 positions against 30), so the threshold sits
+/// above every depth where the change is noise — which also leaves the certified Pitch token
+/// array untouched, since that workload never exceeds ~800 positions.
+#[cfg(target_os = "macos")]
+const ATTN_PREFETCH_WIDE_MIN_POSITIONS: usize = 2048;
+#[cfg(target_os = "macos")]
+const ATTN_PREFETCH_WIDE_CHUNK: usize = 128;
 /// Partials are sized per (row, head, split); the cap bounds them and matches the row-wise
 /// kernels' `clamp(2, 64)`.
 #[cfg(target_os = "macos")]
@@ -24768,6 +24790,7 @@ fn attention_prefetch_geometry() -> AttentionPrefetchGeometry {
             (Some(_), Some((chunk, step))) => {
                 geometry.chunk = chunk;
                 geometry.step = step;
+                geometry.pinned = true;
             }
             (Some(raw), None) => eprintln!(
                 "[metal-attn] CAMELID_METAL_ATTN_PREFETCH_SPLIT={raw:?} is not <chunk>[:<step>] with \
@@ -24822,8 +24845,99 @@ fn attention_prefetch_geometry() -> AttentionPrefetchGeometry {
 #[cfg(target_os = "macos")]
 fn attention_prefetch_split_count(position_count: usize) -> usize {
     position_count
-        .div_ceil(attention_prefetch_geometry().chunk)
+        .div_ceil(attention_prefetch_chunk_for(position_count))
         .clamp(2, ATTN_PREFETCH_MAX_SPLITS)
+}
+
+/// The chunk THIS row partitions on.  A row's own `position_count` selects it, and both the
+/// plain decode row and every verify row reach it through `attention_prefetch_split_count`,
+/// so a verify row at position `p` still partitions exactly as the plain row at `p` — which
+/// is the whole exactness contract of the universe.  The partition is already a function of
+/// depth (`n_splits` grows every token), so making the chunk one too introduces no new kind
+/// of variation.  An explicit `CAMELID_METAL_ATTN_PREFETCH_SPLIT` pins one chunk everywhere.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_chunk_for(position_count: usize) -> usize {
+    let geometry = attention_prefetch_geometry();
+    if geometry.pinned || position_count < ATTN_PREFETCH_WIDE_MIN_POSITIONS {
+        geometry.chunk
+    } else {
+        ATTN_PREFETCH_WIDE_CHUNK
+    }
+}
+
+/// Whether this dispatch folds its partials with the `w32` merge twin.  The twin is
+/// bit-identical to the 128-thread merge (`metal_attention_prefetch_plain_row_matches_verify_rows`
+/// asserts `w32 == t128` word for word), so this is a throughput choice with no bearing on
+/// the token stream, and a batch may pick it from its deepest row without any row's
+/// arithmetic depending on its neighbours.
+#[cfg(target_os = "macos")]
+fn attention_prefetch_merge_w32_for(position_count: usize) -> bool {
+    let geometry = attention_prefetch_geometry();
+    geometry.merge_w32 || (!geometry.pinned && position_count >= ATTN_PREFETCH_WIDE_MIN_POSITIONS)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod attention_prefetch_depth_tests {
+    use super::{
+        attention_prefetch_chunk_for, attention_prefetch_merge_w32_for,
+        attention_prefetch_split_count, ATTN_PREFETCH_CERTIFIED, ATTN_PREFETCH_WIDE_CHUNK,
+        ATTN_PREFETCH_WIDE_MIN_POSITIONS,
+    };
+
+    /// Every workload at or below the certified Pitch envelope keeps the 64-position chunk,
+    /// so its token array is the one the universe was certified on; only rows deep enough for
+    /// the measured win partition wider.
+    #[test]
+    fn the_wide_chunk_starts_exactly_at_the_measured_threshold() {
+        for pc in [
+            1,
+            127,
+            128,
+            543,
+            799,
+            800,
+            1916,
+            ATTN_PREFETCH_WIDE_MIN_POSITIONS - 1,
+        ] {
+            assert_eq!(
+                attention_prefetch_chunk_for(pc),
+                ATTN_PREFETCH_CERTIFIED.chunk,
+                "pc={pc} must keep the certified chunk"
+            );
+            assert!(!attention_prefetch_merge_w32_for(pc), "pc={pc}");
+        }
+        for pc in [ATTN_PREFETCH_WIDE_MIN_POSITIONS, 3834, 4137, 8192] {
+            assert_eq!(
+                attention_prefetch_chunk_for(pc),
+                ATTN_PREFETCH_WIDE_CHUNK,
+                "pc={pc} must take the wide chunk"
+            );
+            assert!(attention_prefetch_merge_w32_for(pc), "pc={pc}");
+        }
+    }
+
+    /// The split count is a pure function of one row's own depth, which is what lets a verify
+    /// row at position `p` partition exactly as the plain row at `p`.
+    #[test]
+    fn the_split_count_depends_only_on_this_rows_depth() {
+        for (pc, splits) in [
+            (128usize, 2usize),
+            (543, 9),
+            (800, 13),
+            (1916, 30),
+            (2048, 16),
+            (3834, 30),
+            (8192, 64),
+        ] {
+            assert_eq!(attention_prefetch_split_count(pc), splits, "pc={pc}");
+        }
+        // Crossing the threshold HALVES the split count rather than growing it: that drop is
+        // the mechanism, since the merge folds one (m, l, acc) triple per split per head.
+        assert!(
+            attention_prefetch_split_count(ATTN_PREFETCH_WIDE_MIN_POSITIONS)
+                < attention_prefetch_split_count(ATTN_PREFETCH_WIDE_MIN_POSITIONS - 1)
+        );
+    }
 }
 
 /// The partial kernel of the geometry (`_pf` for step 4, `_pf_s8` for step 8), admitted for
@@ -24832,8 +24946,12 @@ fn attention_prefetch_split_count(position_count: usize) -> usize {
 #[cfg(target_os = "macos")]
 fn attention_prefetch_partial_pipeline(k: &MetalLinearKernel) -> Option<&ComputePipelineState> {
     let pipeline = match attention_prefetch_geometry().step {
-        8 => k.attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline.as_ref(),
-        _ => k.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref(),
+        8 => k
+            .attention_decode_splitk_kv16_direct_batch_pf_s8_pipeline
+            .as_ref(),
+        _ => k
+            .attention_decode_splitk_kv16_direct_batch_pf_pipeline
+            .as_ref(),
     };
     admitted_32_lane_pipeline(pipeline)
 }
@@ -24844,13 +24962,18 @@ fn attention_prefetch_partial_pipeline(k: &MetalLinearKernel) -> Option<&Compute
 fn attention_prefetch_merge_dispatch(
     k: &MetalLinearKernel,
     n_heads: usize,
+    position_count: usize,
 ) -> (&ComputePipelineState, u64, u64) {
-    if attention_prefetch_geometry().merge_w32 {
+    if attention_prefetch_merge_w32_for(position_count) {
         if let Some(pipeline) = k.attention_decode_splitk_merge_batch_w32_pipeline.as_ref() {
             return (pipeline, n_heads.div_ceil(4) as u64, 128);
         }
     }
-    (&k.attention_decode_splitk_merge_batch_pipeline, n_heads as u64, 128)
+    (
+        &k.attention_decode_splitk_merge_batch_pipeline,
+        n_heads as u64,
+        128,
+    )
 }
 
 /// Threads per threadgroup of the prefetch partial dispatch.  The kernels activate
@@ -24893,7 +25016,11 @@ fn attention_splitk_kv16_rowshare_shape_allowed(
 
 /// Threads per rowshare threadgroup: `min(rows, rows_per_tg) * group` simdgroups.
 #[cfg(target_os = "macos")]
-fn attention_splitk_kv16_rowshare_threadgroup(rows: usize, group: usize, rows_per_tg: usize) -> usize {
+fn attention_splitk_kv16_rowshare_threadgroup(
+    rows: usize,
+    group: usize,
+    rows_per_tg: usize,
+) -> usize {
     rows.min(rows_per_tg) * group * 32
 }
 
@@ -24928,8 +25055,11 @@ fn attention_splitk_kv16_rowshare_pipeline(
         return None;
     }
     let threads = attention_splitk_kv16_rowshare_threadgroup(rows, group, rows_per_tg);
-    admitted_32_lane_pipeline(k.attention_decode_splitk_kv16_direct_rowshare_pipeline.as_ref())
-        .filter(|pipeline| pipeline.max_total_threads_per_threadgroup() >= threads as u64)
+    admitted_32_lane_pipeline(
+        k.attention_decode_splitk_kv16_direct_rowshare_pipeline
+            .as_ref(),
+    )
+    .filter(|pipeline| pipeline.max_total_threads_per_threadgroup() >= threads as u64)
 }
 
 #[cfg(target_os = "macos")]
@@ -25333,20 +25463,16 @@ fn try_attention_splitk_kv16_rows_for_test(
         SplitkRowsEncode::Prefetch | SplitkRowsEncode::PrefetchNoMerge => {
             Some(attention_prefetch_partial_pipeline(metal_linear_kernel()?)?)
         }
-        SplitkRowsEncode::Prefetch2 => Some(
-            admitted_32_lane_pipeline(
-                metal_linear_kernel()?
-                    .attention_decode_splitk_kv16_direct_batch_pf2_pipeline
-                    .as_ref(),
-            )?,
-        ),
-        SplitkRowsEncode::PrefetchV => Some(
-            admitted_32_lane_pipeline(
-                metal_linear_kernel()?
-                    .attention_decode_splitk_kv16_direct_batch_pfv_pipeline
-                    .as_ref(),
-            )?,
-        ),
+        SplitkRowsEncode::Prefetch2 => Some(admitted_32_lane_pipeline(
+            metal_linear_kernel()?
+                .attention_decode_splitk_kv16_direct_batch_pf2_pipeline
+                .as_ref(),
+        )?),
+        SplitkRowsEncode::PrefetchV => Some(admitted_32_lane_pipeline(
+            metal_linear_kernel()?
+                .attention_decode_splitk_kv16_direct_batch_pfv_pipeline
+                .as_ref(),
+        )?),
         _ => None,
     };
     if (prefetch_pipeline.is_some() || encode == SplitkRowsEncode::PrefetchRow)
@@ -25594,11 +25720,8 @@ fn try_attention_splitk_kv16_rows_for_test(
                         depth: max_splits as u64,
                     },
                     metal::MTLSize {
-                        width: attention_splitk_kv16_rowshare_threadgroup(
-                            rows,
-                            group,
-                            rows_per_tg,
-                        ) as u64,
+                        width: attention_splitk_kv16_rowshare_threadgroup(rows, group, rows_per_tg)
+                            as u64,
                         height: 1,
                         depth: 1,
                     },
@@ -25639,7 +25762,11 @@ fn try_attention_splitk_kv16_rows_for_test(
                 continue;
             }
             let (merge_pipeline, merge_groups, merge_threads) = if prefetch_pipeline.is_some() {
-                attention_prefetch_merge_dispatch(kernel, n_heads)
+                attention_prefetch_merge_dispatch(
+                    kernel,
+                    n_heads,
+                    position_counts.iter().copied().max().unwrap_or(0),
+                )
             } else {
                 (
                     &kernel.attention_decode_splitk_merge_batch_pipeline,
@@ -26110,10 +26237,8 @@ fn encode_attention(
     // long position range serially, and GQA re-reads every K/V row once per
     // query head". Measured: attention was 52.8 ms of the 78.4 ms each verify
     // column cost on an 8B Q4_K_M at 4k depth -- ~10x its own KV bandwidth.
-    let splitk = v2
-        && splitk_attention_enabled()
-        && (1..=4).contains(&group)
-        && position_count >= 128;
+    let splitk =
+        v2 && splitk_attention_enabled() && (1..=4).contains(&group) && position_count >= 128;
     if splitk {
         // Half-mirror reads halve the dominant KV traffic at depth; opt out with
         // CAMELID_METAL_ATTN_SPLITK_KV16=0 to keep the f32 split-K reads.
@@ -26360,10 +26485,8 @@ fn encode_attention_tree(
 ) {
     let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-    let splitk = v2
-        && splitk_attention_enabled()
-        && (1..=4).contains(&group)
-        && position_count >= 128;
+    let splitk =
+        v2 && splitk_attention_enabled() && (1..=4).contains(&group) && position_count >= 128;
     if splitk {
         let n_splits = position_count.div_ceil(64).clamp(2, 64);
         let partials = pool_get(k, (n_heads * n_splits * (head_dim + 2) * 4) as u64);
@@ -26629,7 +26752,7 @@ fn encode_attention_prefetch_row(
         },
     );
     let (merge_pipeline, merge_groups, merge_threads) =
-        attention_prefetch_merge_dispatch(k, n_heads);
+        attention_prefetch_merge_dispatch(k, n_heads, position_count);
     e.set_compute_pipeline_state(merge_pipeline);
     e.set_buffer(0, Some(&partials), 0);
     e.set_buffer(1, Some(out), out_off);
@@ -26747,8 +26870,8 @@ fn encode_attention_splitk_kv16_batch(
     let shared_pipeline = (rowshare.is_none()
         && prefetch_pipeline.is_none()
         && verify_attention_shared_prefix_enabled())
-        .then(|| attention_splitk_kv16_shared_prefix_pipeline(k, rows, head_dim, group))
-        .flatten();
+    .then(|| attention_splitk_kv16_shared_prefix_pipeline(k, rows, head_dim, group))
+    .flatten();
     let shared_prefix = shared_pipeline.is_some();
     #[cfg(test)]
     if shared_prefix {
@@ -26759,10 +26882,7 @@ fn encode_attention_splitk_kv16_batch(
     if rowshare_routed {
         VERIFY_ROWSHARE_KV16_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let partials = pool_get(
-        k,
-        (rows * n_heads * max_splits * (head_dim + 2) * 4) as u64,
-    );
+    let partials = pool_get(k, (rows * n_heads * max_splits * (head_dim + 2) * 4) as u64);
     let row_meta = pool_get(k, (rows * 8) as u64);
     let batch_scalars = pool_get(k, 32);
 
@@ -26846,8 +26966,7 @@ fn encode_attention_splitk_kv16_batch(
                 depth: max_splits as u64,
             },
             metal::MTLSize {
-                width: attention_splitk_kv16_rowshare_threadgroup(rows, group, rows_per_tg)
-                    as u64,
+                width: attention_splitk_kv16_rowshare_threadgroup(rows, group, rows_per_tg) as u64,
                 height: 1,
                 depth: 1,
             },
@@ -26889,9 +27008,17 @@ fn encode_attention_splitk_kv16_batch(
     // The prefetch universe folds with its geometry's merge; the exact geometries keep the
     // established 128-thread merge.
     let (merge_pipeline, merge_groups, merge_threads) = if prefetch_pipeline.is_some() {
-        attention_prefetch_merge_dispatch(k, n_heads)
+        attention_prefetch_merge_dispatch(
+            k,
+            n_heads,
+            position_counts.iter().copied().max().unwrap_or(0),
+        )
     } else {
-        (&k.attention_decode_splitk_merge_batch_pipeline, n_heads as u64, 128)
+        (
+            &k.attention_decode_splitk_merge_batch_pipeline,
+            n_heads as u64,
+            128,
+        )
     };
     e.set_compute_pipeline_state(merge_pipeline);
     e.set_buffer(0, Some(&partials), 0);
@@ -31345,9 +31472,7 @@ fn resident_indexed_head_format_label(format: ResidentWeightFormat) -> &'static 
 #[cfg(any(target_os = "macos", test))]
 fn resident_indexed_head_candidate_union_valid(candidate_ids: &[u32], vocab: usize) -> bool {
     !candidate_ids.is_empty()
-        && candidate_ids
-            .iter()
-            .all(|&token| (token as usize) < vocab)
+        && candidate_ids.iter().all(|&token| (token as usize) < vocab)
         && candidate_ids.windows(2).all(|pair| pair[0] < pair[1])
 }
 
@@ -31414,8 +31539,8 @@ fn resident_indexed_head_tile_plan(
     let mut copies = Vec::with_capacity(candidate_ids.len());
     for (candidate_index, &token_id) in candidate_ids.iter().enumerate() {
         let token = token_id as usize;
-        let source_tile_row = token / RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS
-            * RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS;
+        let source_tile_row =
+            token / RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS * RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS;
         if source_tile_row
             .checked_add(RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS)
             .is_none_or(|tile_end| tile_end > vocab)
@@ -31565,10 +31690,7 @@ mod resident_indexed_head_shadow_contract_tests {
             Some((7, 2.0))
         );
         assert_eq!(
-            resident_indexed_head_strict_argmax_sorted(&[
-                (3, f32::NAN),
-                (7, f32::NEG_INFINITY),
-            ]),
+            resident_indexed_head_strict_argmax_sorted(&[(3, f32::NAN), (7, f32::NEG_INFINITY),]),
             None
         );
     }
@@ -31632,11 +31754,7 @@ impl ResidentWeightBytes<'_> {
 }
 
 #[cfg(target_os = "macos")]
-fn kquant_soa8_packed_len(
-    format: ResidentWeightFormat,
-    rows: usize,
-    n_sb: usize,
-) -> Option<usize> {
+fn kquant_soa8_packed_len(format: ResidentWeightFormat, rows: usize, n_sb: usize) -> Option<usize> {
     if rows == 0
         || n_sb == 0
         || !matches!(
@@ -31835,9 +31953,9 @@ fn emit_kquant_soa8_prewarm_failure(
     requirements: &[KquantSoa8Requirement],
 ) {
     let actual = error.prepared();
-    let required_bytes = requirements
-        .iter()
-        .fold(0u64, |sum, requirement| sum.saturating_add(requirement.bytes));
+    let required_bytes = requirements.iter().fold(0u64, |sum, requirement| {
+        sum.saturating_add(requirement.bytes)
+    });
     eprintln!(
         "[metal-kquant-v4-soa8-prewarm] status=failed scope=ffn_head \
          actual_buffers={} actual_bytes={} required_buffers={} required_bytes={} reason={error:?}",
@@ -31886,15 +32004,13 @@ fn repack_kquant_soa8_into(
                 }
             }
             if tail_bytes != 0 {
-                let plane_base = tile_base
-                    + n_sb * word_bytes * tile_rows
-                    + sb * tail_bytes * tile_rows;
+                let plane_base =
+                    tile_base + n_sb * word_bytes * tile_rows + sb * tail_bytes * tile_rows;
                 for tile_row in 0..tile_rows {
                     let row = tile_row0 + tile_row;
                     let src = (row * n_sb + sb) * block_bytes + word_bytes;
                     let dst = plane_base + tile_row * tail_bytes;
-                    packed[dst..dst + tail_bytes]
-                        .copy_from_slice(&wire[src..src + tail_bytes]);
+                    packed[dst..dst + tail_bytes].copy_from_slice(&wire[src..src + tail_bytes]);
                 }
             }
         }
@@ -32049,10 +32165,7 @@ pub fn prewarm_resident_weights_cache(
         return false;
     }
     if soa8_requested && !kquant_v4_enabled() {
-        emit_kquant_soa8_prewarm_failure(
-            KquantSoa8PrewarmFailure::Prerequisite("KQUANT V4"),
-            &[],
-        );
+        emit_kquant_soa8_prewarm_failure(KquantSoa8PrewarmFailure::Prerequisite("KQUANT V4"), &[]);
         return false;
     }
     let soa8_support = soa8_requested.then(kquant_v4_soa8_pipeline_support);
@@ -32075,12 +32188,7 @@ pub fn prewarm_resident_weights_cache(
                     geometry.ffn_dim,
                     true,
                 ),
-                (
-                    &l.up_weight_blocks,
-                    geometry.hidden,
-                    geometry.ffn_dim,
-                    true,
-                ),
+                (&l.up_weight_blocks, geometry.hidden, geometry.ffn_dim, true),
                 (
                     &l.down_weight_blocks,
                     geometry.ffn_dim,
@@ -32848,9 +32956,7 @@ fn eagle3_parse_env_bool(name: &str, value: Option<&str>) -> std::result::Result
         None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
         | Some("disabled") => Ok(false),
         Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
-        Some(value) => Err(format!(
-            "EAGLE-3 {name} must be a boolean, got {value:?}"
-        )),
+        Some(value) => Err(format!("EAGLE-3 {name} must be a boolean, got {value:?}")),
     }
 }
 
@@ -33015,7 +33121,11 @@ fn eagle3_quantize_q4k_superblock(x: &[f32], out: &mut [u8]) {
         max_scale = max_scale.max(scale);
         max_min = max_min.max(min);
     }
-    let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+    let inv_scale = if max_scale > 0.0 {
+        63.0 / max_scale
+    } else {
+        0.0
+    };
     let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
     let mut ls = [0u8; 8];
     let mut lm = [0u8; 8];
@@ -33392,8 +33502,7 @@ fn eagle3_rank_top_candidates_legacy(
                 let mut insert_idx = limit - 1;
                 for i in 0..limit - 1 {
                     let (ranked_logit, ranked_token) = top_logits[i];
-                    if logit > ranked_logit
-                        || (logit == ranked_logit && draft_token < ranked_token)
+                    if logit > ranked_logit || (logit == ranked_logit && draft_token < ranked_token)
                     {
                         insert_idx = i;
                         break;
@@ -35824,8 +35933,7 @@ impl Eagle3MetalState {
         wait_command_buffer_completed(cb);
         if cb.status() != metal::MTLCommandBufferStatus::Completed {
             return Err(
-                "EAGLE-3 fused authoritative update command buffer did not complete"
-                    .to_string(),
+                "EAGLE-3 fused authoritative update command buffer did not complete".to_string(),
             );
         }
 
@@ -36336,7 +36444,10 @@ mod eagle3_metal_contract_tests {
             .collect();
         let bf16 = eagle3_bf16_bytes_from_f32(&values);
         let wire = eagle3_bf16_to_q4k_wire(&bf16, rows, cols).unwrap();
-        assert_eq!(wire.len(), rows * (cols / 256) * EAGLE3_Q4K_SUPERBLOCK_BYTES);
+        assert_eq!(
+            wire.len(),
+            rows * (cols / 256) * EAGLE3_Q4K_SUPERBLOCK_BYTES
+        );
 
         // The packed 6-bit scales/mins read back through the shared unpacker
         // must be what the encoder used to requantize: every sub-block with a
@@ -36345,18 +36456,24 @@ mod eagle3_metal_contract_tests {
         assert_eq!(decoded.len(), values.len());
         let mut sq_err = 0.0f64;
         let mut sq_ref = 0.0f64;
-        for (block_index, (block, block_ref)) in
-            wire.chunks_exact(EAGLE3_Q4K_SUPERBLOCK_BYTES).zip(values.chunks_exact(256)).enumerate()
+        for (block_index, (block, block_ref)) in wire
+            .chunks_exact(EAGLE3_Q4K_SUPERBLOCK_BYTES)
+            .zip(values.chunks_exact(256))
+            .enumerate()
         {
             let (scales, mins) = crate::tensor::q4_k_unpack_kmask_scales(&block[4..16]);
             let d = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let dmin = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[2], block[3]]));
-            assert!(scales.iter().any(|&scale| scale == 63), "block {block_index} has no 63 scale");
+            assert!(
+                scales.iter().any(|&scale| scale == 63),
+                "block {block_index} has no 63 scale"
+            );
             for j in 0..8 {
                 let step = d * scales[j] as f32;
                 assert!(step >= 0.0 && dmin * mins[j] as f32 >= 0.0);
                 let sub = &block_ref[j * 32..(j + 1) * 32];
-                let sub_dec = &decoded[block_index * 256 + j * 32..block_index * 256 + (j + 1) * 32];
+                let sub_dec =
+                    &decoded[block_index * 256 + j * 32..block_index * 256 + (j + 1) * 32];
                 let sub_min = sub.iter().cloned().fold(f32::INFINITY, f32::min);
                 let sub_max = sub.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 // Half a code step plus room for the weighted fit to clip an
@@ -36385,8 +36502,8 @@ mod eagle3_metal_contract_tests {
         let cols = 256;
         let step = 2f32.powi(-6);
         let grid: [u8; 32] = [
-            0, 1, 2, 4, 8, 15, 8, 4, 2, 1, 0, 15, 1, 0, 8, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13,
-            14, 15, 0, 15, 0, 1, 14,
+            0, 1, 2, 4, 8, 15, 8, 4, 2, 1, 0, 15, 1, 0, 8, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14,
+            15, 0, 15, 0, 1, 14,
         ];
         let values: Vec<f32> = (0..8 * cols)
             .map(|index| step * grid[index % grid.len()] as f32)
@@ -36420,11 +36537,12 @@ mod eagle3_metal_contract_tests {
     fn eagle3_q4k_zero_and_constant_blocks_are_well_defined() {
         let zeros = vec![0.0f32; 8 * 256];
         let wire = eagle3_bf16_to_q4k_wire(&eagle3_bf16_bytes_from_f32(&zeros), 8, 256).unwrap();
-        assert!(eagle3_q4k_dequantize_wire(&wire, 256).iter().all(|v| *v == 0.0));
+        assert!(eagle3_q4k_dequantize_wire(&wire, 256)
+            .iter()
+            .all(|v| *v == 0.0));
         // A constant negative block is carried entirely by the min term.
         let constant = vec![-0.5f32; 8 * 256];
-        let wire =
-            eagle3_bf16_to_q4k_wire(&eagle3_bf16_bytes_from_f32(&constant), 8, 256).unwrap();
+        let wire = eagle3_bf16_to_q4k_wire(&eagle3_bf16_bytes_from_f32(&constant), 8, 256).unwrap();
         for v in eagle3_q4k_dequantize_wire(&wire, 256) {
             assert!((v + 0.5).abs() < 1e-3, "{v}");
         }
@@ -36438,9 +36556,7 @@ mod eagle3_metal_contract_tests {
 
     #[test]
     fn eagle3_q8_head_transform_matches_the_runtime_quantizer() {
-        let values: Vec<f32> = (0..64)
-            .map(|index| (index as f32 - 31.0) / 8.0)
-            .collect();
+        let values: Vec<f32> = (0..64).map(|index| (index as f32 - 31.0) / 8.0).collect();
         let bf16: Vec<u8> = values
             .iter()
             .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
@@ -36582,8 +36698,21 @@ mod eagle3_metal_contract_tests {
 
     #[test]
     fn metal_spin_wait_gate_is_default_off_and_fails_closed() {
-        for value in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("yes"), Some("on"), Some(" 1"), Some("spin")] {
-            assert!(!metal_spin_wait_from_env(value), "{value:?} must keep wait_until_completed");
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("on"),
+            Some(" 1"),
+            Some("spin"),
+        ] {
+            assert!(
+                !metal_spin_wait_from_env(value),
+                "{value:?} must keep wait_until_completed"
+            );
         }
         for value in ["1", "true", "TRUE"] {
             assert!(metal_spin_wait_from_env(Some(value)));
@@ -36604,7 +36733,10 @@ mod eagle3_metal_contract_tests {
             Some(" 1"),
             Some("garbage"),
         ] {
-            assert!(!eagle3_gpu_tail_from_env(value), "{value:?} must keep the host tail");
+            assert!(
+                !eagle3_gpu_tail_from_env(value),
+                "{value:?} must keep the host tail"
+            );
         }
         for value in ["1", "true", "TRUE"] {
             assert!(eagle3_gpu_tail_from_env(Some(value)));
@@ -36631,11 +36763,31 @@ mod eagle3_metal_contract_tests {
         )
         .is_err());
         assert!(eagle3_finish_gpu_tail(&[0; 8], &[0.0; 8], &[9.0, 0.0, 0.0], &d2t).is_err());
-        assert!(eagle3_finish_gpu_tail(&[0; 8], &[0.0; 8], &[9.0, f32::INFINITY, 0.0], &d2t).is_err());
+        assert!(
+            eagle3_finish_gpu_tail(&[0; 8], &[0.0; 8], &[9.0, f32::INFINITY, 0.0], &d2t).is_err()
+        );
         // Sentinel ids end the candidate list.
         let short = eagle3_finish_gpu_tail(
-            &[5, 2, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX],
-            &[1.0, 0.5, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
+            &[
+                5,
+                2,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+            ],
+            &[
+                1.0,
+                0.5,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
             &[1.0, 2.0, 0.0],
             &d2t,
         )
@@ -36679,16 +36831,26 @@ mod eagle3_metal_contract_tests {
             let e = cb.new_compute_command_encoder();
             for _ in 0..reps {
                 encode_eagle3_draft_tail(
-                    e, pipeline, &logits_buf, &ids_buf, &vals_buf, &stats_buf, &count_buf,
+                    e,
+                    pipeline,
+                    &logits_buf,
+                    &ids_buf,
+                    &vals_buf,
+                    &stats_buf,
+                    &count_buf,
                 );
             }
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
             let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
-            let ids = unsafe { std::slice::from_raw_parts(ids_buf.contents() as *const u32, 8) }.to_vec();
-            let vals = unsafe { std::slice::from_raw_parts(vals_buf.contents() as *const f32, 8) }.to_vec();
-            let stats = unsafe { std::slice::from_raw_parts(stats_buf.contents() as *const f32, 3) }.to_vec();
+            let ids =
+                unsafe { std::slice::from_raw_parts(ids_buf.contents() as *const u32, 8) }.to_vec();
+            let vals = unsafe { std::slice::from_raw_parts(vals_buf.contents() as *const f32, 8) }
+                .to_vec();
+            let stats =
+                unsafe { std::slice::from_raw_parts(stats_buf.contents() as *const f32, 3) }
+                    .to_vec();
             (ids, vals, stats, busy_us)
         };
         for case in 0..6 {
@@ -36721,7 +36883,10 @@ mod eagle3_metal_contract_tests {
                     for v in &mut logits {
                         *v = f32::NEG_INFINITY;
                     }
-                    for (rank, i) in [8_000usize, 1, 31_998, 400, 4_096, 2, 12_345, 30_000].iter().enumerate() {
+                    for (rank, i) in [8_000usize, 1, 31_998, 400, 4_096, 2, 12_345, 30_000]
+                        .iter()
+                        .enumerate()
+                    {
                         logits[*i] = 10.0 - rank as f32;
                     }
                 }
@@ -36735,13 +36900,21 @@ mod eagle3_metal_contract_tests {
             let gpu = eagle3_finish_gpu_tail(&ids, &vals, &stats, &d2t);
             if case == 5 {
                 assert!(host_lse.is_err(), "host must fail closed on NaN");
-                assert!(gpu.is_err(), "GPU tail must fail closed on NaN (flag={})", stats[2]);
+                assert!(
+                    gpu.is_err(),
+                    "GPU tail must fail closed on NaN (flag={})",
+                    stats[2]
+                );
                 continue;
             }
             let host_rank = eagle3_rank_top_candidates_legacy(&logits, &d2t).unwrap();
             let (gpu_rank, gpu_lse) = gpu.expect("gpu tail");
             let host_lse = host_lse.unwrap();
-            assert_eq!(gpu_rank.len(), host_rank.len(), "case {case}: candidate count");
+            assert_eq!(
+                gpu_rank.len(),
+                host_rank.len(),
+                "case {case}: candidate count"
+            );
             for (rank, (g, h)) in gpu_rank.iter().zip(&host_rank).enumerate() {
                 assert_eq!(
                     (g.draft_token, g.logit.to_bits()),
@@ -36770,8 +36943,14 @@ mod eagle3_metal_contract_tests {
             let (ids, vals, stats, _) = run(&logits, 1);
             assert!(
                 ids == ids0
-                    && vals.iter().zip(&vals0).all(|(a, b)| a.to_bits() == b.to_bits())
-                    && stats.iter().zip(&stats0).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    && vals
+                        .iter()
+                        .zip(&vals0)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && stats
+                        .iter()
+                        .zip(&stats0)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "repeat {repeat}: GPU tail is not deterministic"
             );
         }
@@ -37177,7 +37356,10 @@ mod eagle3_metal_contract_tests {
     fn assert_same_cell_output(a: &Eagle3MetalOutput, b: &Eagle3MetalOutput, what: &str) {
         assert_eq!(a.draft_token, b.draft_token, "{what}: draft_token");
         assert_eq!(a.target_token, b.target_token, "{what}: target_token");
-        assert_eq!(a.evaluated_vocab_rows, b.evaluated_vocab_rows, "{what}: rows");
+        assert_eq!(
+            a.evaluated_vocab_rows, b.evaluated_vocab_rows,
+            "{what}: rows"
+        );
         assert_eq!(
             a.evaluated_vocab_logsumexp.to_bits(),
             b.evaluated_vocab_logsumexp.to_bits(),
@@ -37191,7 +37373,11 @@ mod eagle3_metal_contract_tests {
         };
         assert_eq!(candidates(a), candidates(b), "{what}: top candidates");
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
-        assert_eq!(bits(&a.raw_hidden), bits(&b.raw_hidden), "{what}: raw_hidden");
+        assert_eq!(
+            bits(&a.raw_hidden),
+            bits(&b.raw_hidden),
+            "{what}: raw_hidden"
+        );
     }
 
     /// Replay-by-scatter bit-identity on a real Metal device: a child cell scored after
@@ -37274,7 +37460,11 @@ mod eagle3_metal_contract_tests {
             .expect("scatter-only commit");
         assert_eq!(head.filled(), stable + 1, "a commit is exactly one row");
         let child_after_commit = head
-            .forward_token(&child_embedding, &parent_scored.output.raw_hidden, stable + 1)
+            .forward_token(
+                &child_embedding,
+                &parent_scored.output.raw_hidden,
+                stable + 1,
+            )
             .expect("child after commit");
         assert_eq!(
             child_after_commit, child_reference,
@@ -37284,12 +37474,20 @@ mod eagle3_metal_contract_tests {
 
         // Fail closed: wrong widths and a position off the watermark commit nothing.
         assert!(head
-            .commit_scored_row(&parent_scored.key[..kv_dim - 1], &parent_scored.value, stable)
+            .commit_scored_row(
+                &parent_scored.key[..kv_dim - 1],
+                &parent_scored.value,
+                stable
+            )
             .is_err());
         assert!(head
             .commit_scored_row(&parent_scored.key, &parent_scored.value, stable + 1)
             .is_err());
-        assert_eq!(head.filled(), stable, "rejected commits leave the watermark alone");
+        assert_eq!(
+            head.filled(),
+            stable,
+            "rejected commits leave the watermark alone"
+        );
         eprintln!(
             "[replay-scatter] child after scatter-only commit bit-equals the sequential replay; scored forward bit-equals forward_token"
         );
@@ -37514,7 +37712,11 @@ mod eagle3_metal_contract_tests {
                 keep,
                 &combined_all,
                 0,
-                &[(&q, &q_out, EAGLE3_HIDDEN), (&kw, &k_out, kv), (&vw, &v_out, kv)],
+                &[
+                    (&q, &q_out, EAGLE3_HIDDEN),
+                    (&kw, &k_out, kv),
+                    (&vw, &v_out, kv)
+                ],
                 EAGLE3_ATTN_INPUT,
             ));
         });
@@ -37970,10 +38172,10 @@ fn run_resident_indexed_head_shadow(
         let mut exact_logit_agreements = 0usize;
         let mut first_logit_mismatch = None;
         for copy in &plan.copies {
-            let indexed_score = replay_logits[verifier_row * plan.slab_rows + copy.selected_slab_row];
-            let full_score = unsafe {
-                *full_logits_ptr.add(verifier_row * vocab + copy.token_id as usize)
-            };
+            let indexed_score =
+                replay_logits[verifier_row * plan.slab_rows + copy.selected_slab_row];
+            let full_score =
+                unsafe { *full_logits_ptr.add(verifier_row * vocab + copy.token_id as usize) };
             if indexed_score.to_bits() == full_score.to_bits() {
                 exact_logit_agreements += 1;
             } else if first_logit_mismatch.is_none() {
@@ -37987,11 +38189,10 @@ fn run_resident_indexed_head_shadow(
         }
         let top1 = resident_indexed_head_strict_argmax_sorted(&scores);
         let authoritative_argmax_token = unsafe { *predictions_ptr.add(verifier_row) };
-        let authoritative_argmax_logit_bits = ((authoritative_argmax_token as usize) < vocab)
-            .then(|| unsafe {
-                (*full_logits_ptr
-                    .add(verifier_row * vocab + authoritative_argmax_token as usize))
-                .to_bits()
+        let authoritative_argmax_logit_bits =
+            ((authoritative_argmax_token as usize) < vocab).then(|| unsafe {
+                (*full_logits_ptr.add(verifier_row * vocab + authoritative_argmax_token as usize))
+                    .to_bits()
             });
         rows.push(ResidentIndexedHeadShadowRow {
             verifier_row,
@@ -38896,16 +39097,8 @@ impl ResidentDecodeState {
         sin_all: &[f32],
         scale: f32,
     ) -> Option<()> {
-        self.prefill_tokens_inner(
-            embeddings,
-            n_tokens,
-            layers,
-            cos_all,
-            sin_all,
-            scale,
-            &[],
-        )
-        .map(|_| ())
+        self.prefill_tokens_inner(embeddings, n_tokens, layers, cos_all, sin_all, scale, &[])
+            .map(|_| ())
     }
 
     /// Resident prompt prefill with snapshots of selected target decoder layer inputs.
@@ -38958,9 +39151,7 @@ impl ResidentDecodeState {
             || capture_layer_ids
                 .last()
                 .is_some_and(|&layer_id| layer_id >= self.n_layers)
-            || capture_layer_ids
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+            || capture_layer_ids.windows(2).any(|pair| pair[0] >= pair[1])
             || self.filled != 0
             || !self.ensure_capacity(n_tokens)
         {
@@ -41685,9 +41876,7 @@ impl ResidentDecodeState {
         if capture_layer_ids
             .last()
             .is_some_and(|&layer_id| layer_id >= self.n_layers)
-            || capture_layer_ids
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+            || capture_layer_ids.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return None;
         }
@@ -41899,8 +42088,7 @@ impl ResidentDecodeState {
         let fnorm_buf = nb(k * hidden * 4);
         let logits_buf = nb(k * vocab * 4);
         let pred_buf = nb(k * 4);
-        let target_topk_buf =
-            read_target_top_k.then(|| nb(k * RESIDENT_VERIFY_TARGET_TOP_K * 4));
+        let target_topk_buf = read_target_top_k.then(|| nb(k * RESIDENT_VERIFY_TARGET_TOP_K * 4));
         let cos_buf = nb(cos_all.len() * 4);
         let sin_buf = nb(sin_all.len() * 4);
         let capture_bufs: Vec<Buffer> = capture_layer_ids
@@ -42059,8 +42247,7 @@ impl ResidentDecodeState {
         let verify_trace = std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some();
         let encode_started = std::time::Instant::now();
         let mut cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
-        let mut encoder: metal::ComputeCommandEncoder =
-            cb.new_compute_command_encoder().to_owned();
+        let mut encoder: metal::ComputeCommandEncoder = cb.new_compute_command_encoder().to_owned();
         // Retaining the early command until the tail completes makes its lifetime explicit;
         // more importantly, every pooled buffer it references remains in `keep` until then.
         let mut layer0_cb: Option<metal::CommandBuffer> = None;
@@ -42096,15 +42283,7 @@ impl ResidentDecodeState {
             let w = &resident[l];
             // --- Attention block ---
             // 1. input RMSNorm (batched, byte-exact vs single rms_norm_f32 per row)
-            encode_rms_norm_batch(
-                kern,
-                e,
-                cur,
-                &attn_norm_bufs[l],
-                &norm_buf,
-                &rms_scalar,
-                k,
-            );
+            encode_rms_norm_batch(kern, e, cur, &attn_norm_bufs[l], &norm_buf, &rms_scalar, k);
             // 2. Q/K/V projections (batched-column GEMV; column t == single-token row t)
             if !encode_resident_kquant_v4_shared_group(
                 e,
@@ -42916,9 +43095,7 @@ impl ResidentDecodeState {
             capture_layer_ids,
             None,
         )
-        .map(|(preds, _, layer_inputs, target_top_k, _, _)| {
-            (preds, layer_inputs, target_top_k)
-        })
+        .map(|(preds, _, layer_inputs, target_top_k, _, _)| (preds, layer_inputs, target_top_k))
     }
 
     /// Benchmark-only tree verifier with an exact tied-Q6 indexed-output-head replay.
@@ -44430,17 +44607,7 @@ mod tests {
         let cos_all = vec![1.0f32; tokens * (head_dim / 2)];
         let sin_all = vec![0.0f32; cos_all.len()];
         let mut session = ResidentDecodeState::new(
-            n_layers,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            hidden,
-            ffn,
-            16,
-            16,
-            1.0e-5,
-            false,
-            None,
+            n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn, 16, 16, 1.0e-5, false, None,
         )
         .expect("resident session");
         let captures = session
@@ -46039,9 +46206,7 @@ mod tests {
             ResidentKvFormat::Q8,
         ] {
             for n in 1..=8 {
-                assert!(verify_batch_rope_scatter_supported(
-                    n, 4, 2, 64, 32, format
-                ));
+                assert!(verify_batch_rope_scatter_supported(n, 4, 2, 64, 32, format));
             }
             assert!(!verify_batch_rope_scatter_supported(
                 0, 4, 2, 64, 32, format
@@ -46123,9 +46288,8 @@ mod tests {
             let mut sin = vec![0.0f32; n_tokens * half_rope];
             for row in 0..n_tokens {
                 for pair in 0..half_rope {
-                    let theta = 0.013
-                        * (base_position + tree_depth[row]) as f32
-                        + 0.021 * pair as f32;
+                    let theta =
+                        0.013 * (base_position + tree_depth[row]) as f32 + 0.021 * pair as f32;
                     cos[row * half_rope + pair] = theta.cos();
                     sin[row * half_rope + pair] = theta.sin();
                 }
@@ -46167,9 +46331,7 @@ mod tests {
                     let cache_bytes = match kv_format {
                         ResidentKvFormat::F32 => n_kv_heads * max_positions * head_dim * 4,
                         ResidentKvFormat::F16 => n_kv_heads * max_positions * head_dim * 2,
-                        ResidentKvFormat::Q8 => {
-                            n_kv_heads * max_positions * (head_dim / 32) * 34
-                        }
+                        ResidentKvFormat::Q8 => n_kv_heads * max_positions * (head_dim / 32) * 34,
                     };
                     let scatter_units = if kv_format == ResidentKvFormat::Q8 {
                         n_kv_heads * (head_dim / 32)
@@ -46216,8 +46378,7 @@ mod tests {
                         });
                         (query, key, value, cache_k, cache_v, mirrors)
                     };
-                    let (row_q, row_k, row_v, row_cache_k, row_cache_v, row_mirrors) =
-                        make_route();
+                    let (row_q, row_k, row_v, row_cache_k, row_cache_v, row_mirrors) = make_route();
                     let (batch_q, batch_k, batch_v, batch_cache_k, batch_cache_v, batch_mirrors) =
                         make_route();
 
@@ -47228,12 +47389,11 @@ mod tests {
             let quants_len = n_tokens * input_width;
             let y_len = input_width * k_pad * 2;
             let ysums_len = n_sb * 16 * k_pad * 2;
-            let control_scales = device
-                .new_buffer(scales_len as u64, MTLResourceOptions::StorageModeShared);
-            let control_quants = device
-                .new_buffer(quants_len as u64, MTLResourceOptions::StorageModeShared);
-            let control_y =
-                device.new_buffer(y_len as u64, MTLResourceOptions::StorageModeShared);
+            let control_scales =
+                device.new_buffer(scales_len as u64, MTLResourceOptions::StorageModeShared);
+            let control_quants =
+                device.new_buffer(quants_len as u64, MTLResourceOptions::StorageModeShared);
+            let control_y = device.new_buffer(y_len as u64, MTLResourceOptions::StorageModeShared);
             let control_ysums =
                 device.new_buffer(ysums_len as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&control_scales, &vec![0xff; scales_len]);
@@ -47313,9 +47473,8 @@ mod tests {
                 "strict fused ysums bytes differ at n={n_tokens}"
             );
 
-            let half_at = |raw: &[u8], cell: usize| {
-                u16::from_le_bytes([raw[cell * 2], raw[cell * 2 + 1]])
-            };
+            let half_at =
+                |raw: &[u8], cell: usize| u16::from_le_bytes([raw[cell * 2], raw[cell * 2 + 1]]);
             for row in 0..n_tokens {
                 for pos in 0..input_width {
                     let q = control_quant_bytes[row * input_width + pos] as i8;
@@ -47678,11 +47837,7 @@ mod tests {
 
                 let mut wrong = vec![0u8; packed_len.saturating_sub(1)];
                 assert!(!repack_kquant_soa8_into(
-                    &wire,
-                    format,
-                    rows,
-                    n_sb,
-                    &mut wrong,
+                    &wire, format, rows, n_sb, &mut wrong,
                 ));
             }
         }
@@ -47705,8 +47860,7 @@ mod tests {
     fn llama32_3b_soa8_ffn_head_scope_is_85_buffers_and_byte_exact() {
         let q4_gate_or_up =
             kquant_soa8_packed_len(ResidentWeightFormat::Q4K, 8192, 3072 / 256).unwrap();
-        let q6_down =
-            kquant_soa8_packed_len(ResidentWeightFormat::Q6K, 3072, 8192 / 256).unwrap();
+        let q6_down = kquant_soa8_packed_len(ResidentWeightFormat::Q6K, 3072, 8192 / 256).unwrap();
         let q6_head =
             kquant_soa8_packed_len(ResidentWeightFormat::Q6K, 128256, 3072 / 256).unwrap();
         let buffers = 28 * 3 + 1;
@@ -47737,7 +47891,10 @@ mod tests {
         });
         let (prepared, audit) = execute_kquant_soa8_prewarm(
             &requirements,
-            KquantSoa8PipelineSupport { q4k: true, q6k: true },
+            KquantSoa8PipelineSupport {
+                q4k: true,
+                q6k: true,
+            },
             u64::MAX,
             |_, requirement| Some(requirement.bytes),
             |prepared| *prepared,
@@ -47784,14 +47941,23 @@ mod tests {
             )
         };
         assert_eq!(
-            run(KquantSoa8PipelineSupport { q4k: true, q6k: false }, u64::MAX),
+            run(
+                KquantSoa8PipelineSupport {
+                    q4k: true,
+                    q6k: false
+                },
+                u64::MAX
+            ),
             Err(KquantSoa8PrewarmFailure::PipelineUnavailable(
                 ResidentWeightFormat::Q6K
             ))
         );
         assert_eq!(
             run(
-                KquantSoa8PipelineSupport { q4k: true, q6k: true },
+                KquantSoa8PipelineSupport {
+                    q4k: true,
+                    q6k: true
+                },
                 requirements[1].bytes - 1,
             ),
             Err(KquantSoa8PrewarmFailure::BufferTooLarge {
@@ -47823,7 +47989,10 @@ mod tests {
         let mut builds = 0;
         let result = execute_kquant_soa8_prewarm(
             &requirements,
-            KquantSoa8PipelineSupport { q4k: true, q6k: true },
+            KquantSoa8PipelineSupport {
+                q4k: true,
+                q6k: true,
+            },
             u64::MAX,
             |index, requirement| {
                 builds += 1;
@@ -48036,52 +48205,51 @@ mod tests {
         let physical_columns = 8usize;
         let mut cache = MetalLinearCache::new();
 
-        let make_weight = |cache: &mut MetalLinearCache,
-                           format: ResidentWeightFormat,
-                           salt: usize| {
-            let block_bytes = format.wire_bytes_per_block();
-            let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
-                .map(|i| ((i * 197 + i / 11 + salt * 43 + 0xa7) & 0xff) as u8)
-                .collect();
-            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
-                let magnitude = 0.0025 + (block_index % 29) as f32 * 0.00031;
-                let d = if block_index & 1 == 0 {
-                    magnitude
-                } else {
-                    -magnitude
-                };
-                match format {
-                    ResidentWeightFormat::Q4K => {
-                        let dm = if block_index % 3 == 0 {
-                            -magnitude * 0.375
-                        } else {
-                            magnitude * 0.625
-                        };
-                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-                        block[2..4].copy_from_slice(&f32_to_f16_bits(dm).to_le_bytes());
+        let make_weight =
+            |cache: &mut MetalLinearCache, format: ResidentWeightFormat, salt: usize| {
+                let block_bytes = format.wire_bytes_per_block();
+                let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                    .map(|i| ((i * 197 + i / 11 + salt * 43 + 0xa7) & 0xff) as u8)
+                    .collect();
+                for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                    let magnitude = 0.0025 + (block_index % 29) as f32 * 0.00031;
+                    let d = if block_index & 1 == 0 {
+                        magnitude
+                    } else {
+                        -magnitude
+                    };
+                    match format {
+                        ResidentWeightFormat::Q4K => {
+                            let dm = if block_index % 3 == 0 {
+                                -magnitude * 0.375
+                            } else {
+                                magnitude * 0.625
+                            };
+                            block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                            block[2..4].copy_from_slice(&f32_to_f16_bits(dm).to_le_bytes());
+                        }
+                        ResidentWeightFormat::Q6K => {
+                            block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        }
+                        _ => unreachable!(),
                     }
-                    ResidentWeightFormat::Q6K => {
-                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-                    }
-                    _ => unreachable!(),
                 }
-            }
-            let canonical = cache.raw_wire_weight_buffer(device, &wire);
-            let soa8 = cache
-                .kquant_soa8_weight_buffer(device, &wire, format, rows, n_sb)
-                .expect("valid SOA8 repack");
-            let hit = cache
-                .kquant_soa8_weight_buffer(device, &wire, format, rows, n_sb)
-                .expect("SOA8 cache hit");
-            assert_eq!(soa8.contents(), hit.contents(), "cache must reuse sidecar");
-            assert_eq!(soa8.length() as usize, wire.len());
-            ResidentLinearWeight {
-                format,
-                buffer: canonical,
-                soa8_buffer: Some(soa8),
-                q8_wire: false,
-            }
-        };
+                let canonical = cache.raw_wire_weight_buffer(device, &wire);
+                let soa8 = cache
+                    .kquant_soa8_weight_buffer(device, &wire, format, rows, n_sb)
+                    .expect("valid SOA8 repack");
+                let hit = cache
+                    .kquant_soa8_weight_buffer(device, &wire, format, rows, n_sb)
+                    .expect("SOA8 cache hit");
+                assert_eq!(soa8.contents(), hit.contents(), "cache must reuse sidecar");
+                assert_eq!(soa8.length() as usize, wire.len());
+                ResidentLinearWeight {
+                    format,
+                    buffer: canonical,
+                    soa8_buffer: Some(soa8),
+                    q8_wire: false,
+                }
+            };
         let q4_weight = make_weight(&mut cache, ResidentWeightFormat::Q4K, 5);
         let q6_weight = make_weight(&mut cache, ResidentWeightFormat::Q6K, 13);
 
@@ -48181,10 +48349,9 @@ mod tests {
             cb.commit();
             cb.wait_until_completed();
 
-            for (format, control, candidate) in [
-                ("Q4", &q4_control, &q4_soa8),
-                ("Q6", &q6_control, &q6_soa8),
-            ] {
+            for (format, control, candidate) in
+                [("Q4", &q4_control, &q4_soa8), ("Q6", &q6_control, &q6_soa8)]
+            {
                 let mut control_values = vec![0.0f32; physical_columns * rows];
                 let mut candidate_values = vec![0.0f32; physical_columns * rows];
                 read_buffer_f32(control, &mut control_values);
@@ -49016,7 +49183,10 @@ mod tests {
             None,
             "a ragged tensor would let a tile straddle two segments"
         );
-        assert_eq!(kquant_v4_fused_segments_format(&[(&q, &probe, 48)], 8), None);
+        assert_eq!(
+            kquant_v4_fused_segments_format(&[(&q, &probe, 48)], 8),
+            None
+        );
         assert_eq!(
             kquant_v4_fused_segments_format(
                 &[
@@ -49577,32 +49747,33 @@ mod tests {
             fill_buffer_sentinel(&output, physical_columns * rows);
             output
         };
-        let compare = |label: &str, n_tokens: usize, rows: usize, control: &Buffer, candidate: &Buffer| {
-            let mut control_values = vec![0.0f32; physical_columns * rows];
-            let mut candidate_values = vec![0.0f32; physical_columns * rows];
-            read_buffer_f32(control, &mut control_values);
-            read_buffer_f32(candidate, &mut candidate_values);
-            let active = n_tokens * rows;
-            assert_no_sentinel(&candidate_values[..active], label, n_tokens);
-            for i in 0..active {
-                assert_eq!(
-                    candidate_values[i].to_bits(),
-                    control_values[i].to_bits(),
-                    "{label} n={n_tokens} element={i}: {} ({:#010x}) != control {} ({:#010x})",
-                    candidate_values[i],
-                    candidate_values[i].to_bits(),
-                    control_values[i],
-                    control_values[i].to_bits(),
-                );
-            }
-            for i in active..physical_columns * rows {
-                assert_eq!(
-                    candidate_values[i].to_bits(),
-                    KQUANT_TEST_SENTINEL.to_bits(),
-                    "{label} wrote padded output n={n_tokens} element={i}"
-                );
-            }
-        };
+        let compare =
+            |label: &str, n_tokens: usize, rows: usize, control: &Buffer, candidate: &Buffer| {
+                let mut control_values = vec![0.0f32; physical_columns * rows];
+                let mut candidate_values = vec![0.0f32; physical_columns * rows];
+                read_buffer_f32(control, &mut control_values);
+                read_buffer_f32(candidate, &mut candidate_values);
+                let active = n_tokens * rows;
+                assert_no_sentinel(&candidate_values[..active], label, n_tokens);
+                for i in 0..active {
+                    assert_eq!(
+                        candidate_values[i].to_bits(),
+                        control_values[i].to_bits(),
+                        "{label} n={n_tokens} element={i}: {} ({:#010x}) != control {} ({:#010x})",
+                        candidate_values[i],
+                        candidate_values[i].to_bits(),
+                        control_values[i],
+                        control_values[i].to_bits(),
+                    );
+                }
+                for i in active..physical_columns * rows {
+                    assert_eq!(
+                        candidate_values[i].to_bits(),
+                        KQUANT_TEST_SENTINEL.to_bits(),
+                        "{label} wrote padded output n={n_tokens} element={i}"
+                    );
+                }
+            };
 
         for n_tokens in [1usize, 3, 7, 8] {
             let input: Vec<f32> = (0..n_tokens * input_width)
@@ -49768,8 +49939,20 @@ mod tests {
             cb.commit();
             cb.wait_until_completed();
 
-            compare("Q4 register exact V2", n_tokens, rows, &q4_control, &q4_candidate);
-            compare("Q6 register exact V2", n_tokens, rows, &q6_control, &q6_candidate);
+            compare(
+                "Q4 register exact V2",
+                n_tokens,
+                rows,
+                &q4_control,
+                &q4_candidate,
+            );
+            compare(
+                "Q6 register exact V2",
+                n_tokens,
+                rows,
+                &q6_control,
+                &q6_candidate,
+            );
             for (label, member_rows, separate, fused) in &fused_checks {
                 compare(label, n_tokens, *member_rows, separate, fused);
             }
@@ -50105,8 +50288,10 @@ mod tests {
             let c = i % cols;
             *y = ((((t * 131 + c * 17) % 251) as f32) - 125.0) * 0.017 + t as f32 * 0.0011;
         }
-        let y_buf =
-            device.new_buffer((y_flat.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let y_buf = device.new_buffer(
+            (y_flat.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         write_buffer_f32(&y_buf, &y_flat);
 
         // One shared Q8K staging for all columns; the reference dispatches
@@ -50116,10 +50301,8 @@ mod tests {
             (max_k * n_sb * 4) as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let quants_buf = device.new_buffer(
-            (max_k * cols) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let quants_buf =
+            device.new_buffer((max_k * cols) as u64, MTLResourceOptions::StorageModeShared);
         let qscalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
         unsafe {
             let p = qscalar.contents() as *mut u32;
@@ -50186,8 +50369,7 @@ mod tests {
             for (i, b) in wire.iter_mut().enumerate() {
                 *b = ((i * 13 + i / 97 + 5) % 256) as u8;
             }
-            let w_buf =
-                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let w_buf = device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
             for k in [2usize, 3, 8, 16] {
@@ -50205,8 +50387,8 @@ mod tests {
                 // Metal tests in the binary, which then read untouched output
                 // and fail as a bogus bit mismatch (see the queue-occupancy note
                 // at metal_resident_window_start_beyond_512).
-                let ref_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let ref_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&ref_buf, k * rows);
                 {
                     let cb = kernel.queue.new_command_buffer();
@@ -50219,8 +50401,7 @@ mod tests {
                         e.set_buffer(3, Some(&ref_buf), (t * rows * 4) as u64);
                         e.set_buffer(4, Some(&scalar), 0);
                         e.set_buffer(5, Some(&scalar), 4);
-                        let tg_bytes =
-                            (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
+                        let tg_bytes = (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
                         e.set_threadgroup_memory_length(0, tg_bytes as u64);
                         e.dispatch_thread_groups(
                             metal::MTLSize {
@@ -50244,8 +50425,8 @@ mod tests {
                 assert_no_sentinel(&reference, case.name, k);
 
                 // Candidate: one multi-column dispatch over the same staging.
-                let out_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let out_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&out_buf, k * rows);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
@@ -50257,8 +50438,7 @@ mod tests {
                 e.set_buffer(4, Some(&scalar), 0);
                 e.set_buffer(5, Some(&scalar), 4);
                 e.set_buffer(6, Some(&scalar), 8);
-                let tg_bytes =
-                    (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
+                let tg_bytes = (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
                 e.set_threadgroup_memory_length(0, tg_bytes as u64);
                 e.dispatch_thread_groups(
                     metal::MTLSize {
@@ -50286,7 +50466,9 @@ mod tests {
                 // replay is a scheduling/visibility artifact of the shared
                 // serial queue under parallel tests. Without this, a rare
                 // failure carries no evidence about which it was.
-                if let Some(bad) = (0..k * rows).find(|&i| batched[i].to_bits() != reference[i].to_bits()) {
+                if let Some(bad) =
+                    (0..k * rows).find(|&i| batched[i].to_bits() != reference[i].to_bits())
+                {
                     let replay_mc = device
                         .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                     let replay_single = device
@@ -50308,8 +50490,16 @@ mod tests {
                             (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16) as u64,
                         );
                         e.dispatch_thread_groups(
-                            metal::MTLSize { width: rows as u64, height: 1, depth: 1 },
-                            metal::MTLSize { width: 32, height: 1, depth: 1 },
+                            metal::MTLSize {
+                                width: rows as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32,
+                                height: 1,
+                                depth: 1,
+                            },
                         );
                     }
                     e.set_compute_pipeline_state(mc_pipeline);
@@ -50325,8 +50515,16 @@ mod tests {
                         (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16) as u64,
                     );
                     e.dispatch_thread_groups(
-                        metal::MTLSize { width: rows as u64, height: 1, depth: 1 },
-                        metal::MTLSize { width: 32, height: 1, depth: 1 },
+                        metal::MTLSize {
+                            width: rows as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
                     );
                     e.end_encoding();
                     cb.commit();
@@ -50402,8 +50600,10 @@ mod tests {
                 let c = i % cols;
                 *y = ((((t * 131 + c * 17) % 251) as f32) - 125.0) * 0.017 + t as f32 * 0.0011;
             }
-            let y_buf =
-                device.new_buffer((y_flat.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_buf = device.new_buffer(
+                (y_flat.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             write_buffer_f32(&y_buf, &y_flat);
             let scales_buf = device.new_buffer(
                 (max_k * n_sb * 4) as u64,
@@ -50437,8 +50637,7 @@ mod tests {
             for (i, b) in wire.iter_mut().enumerate() {
                 *b = ((i * 13 + i / 97 + 5) % 256) as u8;
             }
-            let w_buf =
-                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let w_buf = device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
             for k in [2usize, 3, 8, 16] {
@@ -50456,8 +50655,8 @@ mod tests {
                 // Metal test in the binary — they read back untouched output and
                 // fail as a bogus "bit mismatch" (see the note on queue
                 // occupancy at metal_resident_window_start_beyond_512).
-                let ref_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let ref_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&ref_buf, k * rows);
                 {
                     let cb = kernel.queue.new_command_buffer();
@@ -50493,8 +50692,8 @@ mod tests {
                 read_buffer_f32(&ref_buf, &mut reference);
                 assert_no_sentinel(&reference, "q4k_v2 reference", k);
 
-                let out_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let out_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q4k_mc);
@@ -50568,8 +50767,8 @@ mod tests {
                     *p.add(3) = width as u32;
                     *p.add(4) = k_pad as u32;
                 }
-                let mma_out = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let mma_out =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q4k_mma_stage_y);
@@ -50655,8 +50854,10 @@ mod tests {
                 let c = i % cols;
                 *y = ((((t * 137 + c * 19) % 249) as f32) - 124.0) * 0.019 + t as f32 * 0.0013;
             }
-            let y_buf =
-                device.new_buffer((y_flat.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_buf = device.new_buffer(
+                (y_flat.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             write_buffer_f32(&y_buf, &y_flat);
             let scales_buf = device.new_buffer(
                 (max_k * n_sb * 4) as u64,
@@ -50689,8 +50890,7 @@ mod tests {
             for (i, b) in wire.iter_mut().enumerate() {
                 *b = ((i * 17 + i / 89 + 3) % 256) as u8;
             }
-            let w_buf =
-                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let w_buf = device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
             for k in [2usize, 3, 8, 16] {
@@ -50704,8 +50904,8 @@ mod tests {
                 // ONE command buffer for all k reference dispatches (shared
                 // serial queue — see the q4k sibling and the queue-occupancy
                 // note at metal_resident_window_start_beyond_512).
-                let ref_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let ref_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&ref_buf, k * rows);
                 {
                     let cb = kernel.queue.new_command_buffer();
@@ -50744,8 +50944,8 @@ mod tests {
                 assert_no_sentinel(&reference, "q6k_v2 reference", k);
 
                 // Scalar mc_v2.
-                let out_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let out_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q6k_mc);
@@ -50802,8 +51002,8 @@ mod tests {
                     *p.add(3) = width as u32;
                     *p.add(4) = k_pad as u32;
                 }
-                let mma_out = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let mma_out =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q6k_mma_stage_y);
@@ -51071,8 +51271,13 @@ mod tests {
         for rows in 2..=16 {
             assert!(attention_splitk_kv16_rowshare_shape_allowed(rows, 128, 3));
         }
-        for (rows, head_dim, group) in [(1, 128, 3), (17, 128, 3), (8, 64, 3), (8, 128, 5), (8, 128, 0)]
-        {
+        for (rows, head_dim, group) in [
+            (1, 128, 3),
+            (17, 128, 3),
+            (8, 64, 3),
+            (8, 128, 5),
+            (8, 128, 0),
+        ] {
             assert!(!attention_splitk_kv16_rowshare_shape_allowed(
                 rows, head_dim, group
             ));
@@ -51151,14 +51356,41 @@ mod tests {
         assert_eq!(ATTN_PREFETCH_CERTIFIED.step, 4);
         assert!(!ATTN_PREFETCH_CERTIFIED.merge_w32);
         assert_eq!(ATTN_PREFETCH_MAX_SPLITS, 64);
-        let probe = |chunk| AttentionPrefetchGeometry { chunk, ..ATTN_PREFETCH_CERTIFIED };
+        // A probe sweeping the chunk wants that chunk at EVERY depth, which is what
+        // pinning means; the depth rule is what the production default uses.
+        let probe = |chunk| AttentionPrefetchGeometry {
+            chunk,
+            pinned: true,
+            ..ATTN_PREFETCH_CERTIFIED
+        };
         ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(probe(64))));
-        for (pc, splits) in [(128usize, 2usize), (543, 9), (551, 9), (800, 13), (4137, 64), (8, 2)] {
-            assert_eq!(attention_prefetch_split_count(pc), splits, "pc={pc} chunk=64");
+        for (pc, splits) in [
+            (128usize, 2usize),
+            (543, 9),
+            (551, 9),
+            (800, 13),
+            (4137, 64),
+            (8, 2),
+        ] {
+            assert_eq!(
+                attention_prefetch_split_count(pc),
+                splits,
+                "pc={pc} chunk=64"
+            );
         }
         ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(probe(32))));
-        for (pc, splits) in [(128usize, 4usize), (543, 17), (551, 18), (800, 25), (4137, 64)] {
-            assert_eq!(attention_prefetch_split_count(pc), splits, "pc={pc} chunk=32");
+        for (pc, splits) in [
+            (128usize, 4usize),
+            (543, 17),
+            (551, 18),
+            (800, 25),
+            (4137, 64),
+        ] {
+            assert_eq!(
+                attention_prefetch_split_count(pc),
+                splits,
+                "pc={pc} chunk=32"
+            );
         }
         ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(None));
     }
@@ -51255,97 +51487,120 @@ mod tests {
             (256, 8, true, 96),
         ]
         .into_iter()
-        .map(|(chunk, step, merge_w32, threadgroup)| AttentionPrefetchGeometry {
-            chunk,
-            step,
-            merge_w32,
-            threadgroup,
-        })
+        .map(
+            |(chunk, step, merge_w32, threadgroup)| AttentionPrefetchGeometry {
+                chunk,
+                step,
+                merge_w32,
+                threadgroup,
+                pinned: true,
+            },
+        )
         .collect();
         for geometry in geometries {
-        let (chunk, threadgroup) = (geometry.chunk, geometry.threadgroup);
-        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(geometry)));
-        let k = metal_linear_kernel().expect("metal kernel");
-        assert!(
-            attention_prefetch_partial_pipeline(k).is_some(),
-            "prefetch partial kernel for step {} did not build",
-            geometry.step
-        );
-        if geometry.merge_w32 {
+            let (chunk, threadgroup) = (geometry.chunk, geometry.threadgroup);
+            ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(geometry)));
+            let k = metal_linear_kernel().expect("metal kernel");
             assert!(
-                k.attention_decode_splitk_merge_batch_w32_pipeline.is_some(),
-                "prefetch merge w32 did not build"
+                attention_prefetch_partial_pipeline(k).is_some(),
+                "prefetch partial kernel for step {} did not build",
+                geometry.step
             );
-        }
-        for base in [128usize, 543] {
-            for rows in 2..=8usize {
-                let query: Vec<f32> = (0..rows * n_heads * head_dim)
-                    .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
-                    .collect();
-                let (tree_pcs, tree_slots) = prefetch_tree_rows(base, rows);
-                let linear_pcs: Vec<usize> = (1..=rows).map(|r| base + r).collect();
-                let cases: [(&str, Vec<usize>, Option<(usize, &[Vec<u32>])>); 2] = [
-                    ("linear", linear_pcs, None),
-                    ("branching-tree", tree_pcs, Some((base, tree_slots.as_slice()))),
-                ];
-                for (label, pcs, tree) in cases {
-                    let run = |encode| {
-                        try_attention_splitk_kv16_rows_for_test(
-                            &query, &keys, &values, n_heads, n_kv_heads, head_dim,
-                            max_positions, &pcs, scale, tree, encode, true, 1, 1,
-                        )
-                        .expect("prefetch encode")
-                    };
-                    let (verify, _, _) = run(SplitkRowsEncode::Prefetch);
-                    let (plain, _, _) = run(SplitkRowsEncode::PrefetchRow);
-                    assert_eq!(verify.len(), plain.len());
-                    let words = n_heads * head_dim;
-                    for row in 0..rows {
-                        let v = &verify[row * words..(row + 1) * words];
-                        let p = &plain[row * words..(row + 1) * words];
-                        let bad = v.iter().zip(p).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                        assert_eq!(
+            if geometry.merge_w32 {
+                assert!(
+                    k.attention_decode_splitk_merge_batch_w32_pipeline.is_some(),
+                    "prefetch merge w32 did not build"
+                );
+            }
+            for base in [128usize, 543] {
+                for rows in 2..=8usize {
+                    let query: Vec<f32> = (0..rows * n_heads * head_dim)
+                        .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03125)
+                        .collect();
+                    let (tree_pcs, tree_slots) = prefetch_tree_rows(base, rows);
+                    let linear_pcs: Vec<usize> = (1..=rows).map(|r| base + r).collect();
+                    let cases: [(&str, Vec<usize>, Option<(usize, &[Vec<u32>])>); 2] = [
+                        ("linear", linear_pcs, None),
+                        (
+                            "branching-tree",
+                            tree_pcs,
+                            Some((base, tree_slots.as_slice())),
+                        ),
+                    ];
+                    for (label, pcs, tree) in cases {
+                        let run = |encode| {
+                            try_attention_splitk_kv16_rows_for_test(
+                                &query,
+                                &keys,
+                                &values,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_positions,
+                                &pcs,
+                                scale,
+                                tree,
+                                encode,
+                                true,
+                                1,
+                                1,
+                            )
+                            .expect("prefetch encode")
+                        };
+                        let (verify, _, _) = run(SplitkRowsEncode::Prefetch);
+                        let (plain, _, _) = run(SplitkRowsEncode::PrefetchRow);
+                        assert_eq!(verify.len(), plain.len());
+                        let words = n_heads * head_dim;
+                        for row in 0..rows {
+                            let v = &verify[row * words..(row + 1) * words];
+                            let p = &plain[row * words..(row + 1) * words];
+                            let bad = v
+                                .iter()
+                                .zip(p)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                            assert_eq!(
                             bad, 0,
                             "prefetch {label} base={base} k={rows}: verify row {row} (pc={}) differs from the plain single-row encode in {bad} of {words} words",
                             pcs[row]
                         );
-                    }
-                    eprintln!(
+                        }
+                        eprintln!(
                         "metal_attention_prefetch_plain_row_matches_verify_rows: chunk={chunk} step={} merge={} tg={threadgroup} {label} base={base} k={rows} PLAIN==VERIFY BIT-IDENTICAL ({} words)",
                         geometry.step,
                         if geometry.merge_w32 { "w32" } else { "t128" },
                         plain.len()
                     );
-                    // The w32 merge must reproduce the 128-thread merge bit for bit at the
-                    // same partition and step: it is admitted as exact, not as a new universe.
-                    if geometry.merge_w32 {
-                        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| {
-                            cell.set(Some(AttentionPrefetchGeometry {
-                                merge_w32: false,
-                                ..geometry
-                            }))
-                        });
-                        let (t128, _, _) = run(SplitkRowsEncode::Prefetch);
-                        ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(geometry)));
-                        let bad = t128
-                            .iter()
-                            .zip(&verify)
-                            .filter(|(a, b)| a.to_bits() != b.to_bits())
-                            .count();
-                        assert_eq!(
+                        // The w32 merge must reproduce the 128-thread merge bit for bit at the
+                        // same partition and step: it is admitted as exact, not as a new universe.
+                        if geometry.merge_w32 {
+                            ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| {
+                                cell.set(Some(AttentionPrefetchGeometry {
+                                    merge_w32: false,
+                                    ..geometry
+                                }))
+                            });
+                            let (t128, _, _) = run(SplitkRowsEncode::Prefetch);
+                            ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(Some(geometry)));
+                            let bad = t128
+                                .iter()
+                                .zip(&verify)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                            assert_eq!(
                             bad, 0,
                             "prefetch merge w32 {label} base={base} k={rows} chunk={chunk} step={}: differs from the 128-thread merge in {bad} of {} words",
                             geometry.step,
                             t128.len()
                         );
-                        eprintln!(
+                            eprintln!(
                             "metal_attention_prefetch_plain_row_matches_verify_rows: chunk={chunk} step={} {label} base={base} k={rows} MERGE w32==t128 BIT-IDENTICAL",
                             geometry.step
                         );
+                        }
                     }
                 }
             }
-        }
         }
         ATTN_PREFETCH_PROBE_GEOMETRY.with(|cell| cell.set(None));
     }
@@ -51371,7 +51626,11 @@ mod tests {
         let linear_pcs: Vec<usize> = (1..=rows).map(|r| base + r).collect();
         let cases: [(&str, Vec<usize>, Option<(usize, &[Vec<u32>])>); 2] = [
             ("linear", linear_pcs, None),
-            ("branching-tree", tree_pcs, Some((base, tree_slots.as_slice()))),
+            (
+                "branching-tree",
+                tree_pcs,
+                Some((base, tree_slots.as_slice())),
+            ),
         ];
         for (label, pcs, tree) in cases {
             for (encode_label, encode) in [
@@ -51380,8 +51639,20 @@ mod tests {
             ] {
                 let run = || {
                     try_attention_splitk_kv16_rows_for_test(
-                        &query, &keys, &values, n_heads, n_kv_heads, head_dim,
-                        max_positions, &pcs, scale, tree, encode, true, 1, 1,
+                        &query,
+                        &keys,
+                        &values,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_positions,
+                        &pcs,
+                        scale,
+                        tree,
+                        encode,
+                        true,
+                        1,
+                        1,
                     )
                     .expect("prefetch encode")
                     .0
@@ -51389,7 +51660,11 @@ mod tests {
                 let first = run();
                 for repeat in 1..20 {
                     let again = run();
-                    let bad = first.iter().zip(&again).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    let bad = first
+                        .iter()
+                        .zip(&again)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
                     assert_eq!(
                         bad, 0,
                         "prefetch {label} {encode_label} repeat {repeat}: {bad} of {} words changed between runs",
@@ -51559,10 +51834,7 @@ mod tests {
                     path
                 })
                 .collect();
-            let tree_pc: Vec<usize> = tail_slots
-                .iter()
-                .map(|slots| base + slots.len())
-                .collect();
+            let tree_pc: Vec<usize> = tail_slots.iter().map(|slots| base + slots.len()).collect();
             assert_case(
                 &format!("branching-tree-k{rows}"),
                 &tree_pc,
@@ -51614,23 +51886,33 @@ mod tests {
         );
         report(
             "direct_shared",
-            kernel.attention_decode_splitk_kv16_direct_shared_pipeline.as_ref(),
+            kernel
+                .attention_decode_splitk_kv16_direct_shared_pipeline
+                .as_ref(),
         );
         report(
             "direct_rowshare",
-            kernel.attention_decode_splitk_kv16_direct_rowshare_pipeline.as_ref(),
+            kernel
+                .attention_decode_splitk_kv16_direct_rowshare_pipeline
+                .as_ref(),
         );
         report(
             "direct_batch_pf",
-            kernel.attention_decode_splitk_kv16_direct_batch_pf_pipeline.as_ref(),
+            kernel
+                .attention_decode_splitk_kv16_direct_batch_pf_pipeline
+                .as_ref(),
         );
         report(
             "direct_batch_pf2",
-            kernel.attention_decode_splitk_kv16_direct_batch_pf2_pipeline.as_ref(),
+            kernel
+                .attention_decode_splitk_kv16_direct_batch_pf2_pipeline
+                .as_ref(),
         );
         report(
             "direct_batch_pfv",
-            kernel.attention_decode_splitk_kv16_direct_batch_pfv_pipeline.as_ref(),
+            kernel
+                .attention_decode_splitk_kv16_direct_batch_pfv_pipeline
+                .as_ref(),
         );
         for base in [543usize, 800, 4_137] {
             let max_positions = base + rows;
@@ -51798,45 +52080,49 @@ mod tests {
             (256, 8, true, 128, true),
         ];
         // CAMELID_PROBE_GEOMETRIES=c:s:m:tg[:nomerge],... overrides the sweep (m = 0|1).
-        let variants: Vec<(String, AttentionPrefetchGeometry, bool)> = std::env::var(
-            "CAMELID_PROBE_GEOMETRIES",
-        )
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .filter_map(|spec| {
-                    let f: Vec<&str> = spec.trim().split(':').collect();
-                    Some((
-                        f.first()?.parse().ok()?,
-                        f.get(1)?.parse().ok()?,
-                        f.get(2)? == &"1",
-                        f.get(3)?.parse().ok()?,
-                        f.get(4) != Some(&"nomerge"),
-                    ))
+        let variants: Vec<(String, AttentionPrefetchGeometry, bool)> =
+            std::env::var("CAMELID_PROBE_GEOMETRIES")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|spec| {
+                            let f: Vec<&str> = spec.trim().split(':').collect();
+                            Some((
+                                f.first()?.parse().ok()?,
+                                f.get(1)?.parse().ok()?,
+                                f.get(2)? == &"1",
+                                f.get(3)?.parse().ok()?,
+                                f.get(4) != Some(&"nomerge"),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty())
-        .unwrap_or(default_variants)
-        .into_iter()
-        .map(|(chunk, step, merge_w32, threadgroup, merged)| {
-            (
-                format!(
-                    "c{chunk}/s{step}/{}{}{}",
-                    if merge_w32 { "w32" } else { "t128" },
-                    if threadgroup != 128 { format!("/tg{threadgroup}") } else { String::new() },
-                    if merged { "" } else { "/NOMERGE" }
-                ),
-                AttentionPrefetchGeometry {
-                    chunk,
-                    step,
-                    merge_w32,
-                    threadgroup,
-                },
-                merged,
-            )
-        })
-        .collect();
+                .filter(|v| !v.is_empty())
+                .unwrap_or(default_variants)
+                .into_iter()
+                .map(|(chunk, step, merge_w32, threadgroup, merged)| {
+                    (
+                        format!(
+                            "c{chunk}/s{step}/{}{}{}",
+                            if merge_w32 { "w32" } else { "t128" },
+                            if threadgroup != 128 {
+                                format!("/tg{threadgroup}")
+                            } else {
+                                String::new()
+                            },
+                            if merged { "" } else { "/NOMERGE" }
+                        ),
+                        AttentionPrefetchGeometry {
+                            chunk,
+                            step,
+                            merge_w32,
+                            threadgroup,
+                            pinned: true,
+                        },
+                        merged,
+                    )
+                })
+                .collect();
         let depths: Vec<usize> = std::env::var("CAMELID_PROBE_DEPTHS")
             .ok()
             .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect())
@@ -51982,7 +52268,10 @@ mod tests {
         let count = 128_256usize;
         let opts = MTLResourceOptions::StorageModeShared;
         let logits = k.device.new_buffer((count * 4) as u64, opts);
-        write_buffer_f32(&logits, &(0..count).map(|i| (i % 977) as f32).collect::<Vec<_>>());
+        write_buffer_f32(
+            &logits,
+            &(0..count).map(|i| (i % 977) as f32).collect::<Vec<_>>(),
+        );
         let out = k.device.new_buffer(4, opts);
         let count_buf = k.device.new_buffer(4, opts);
         unsafe { *(count_buf.contents() as *mut u32) = count as u32 };
@@ -51999,8 +52288,16 @@ mod tests {
                         e.set_buffer(1, Some(&out), 0);
                         e.set_buffer(2, Some(&count_buf), 0);
                         e.dispatch_thread_groups(
-                            metal::MTLSize { width: 1, height: 1, depth: 1 },
-                            metal::MTLSize { width: 1024, height: 1, depth: 1 },
+                            metal::MTLSize {
+                                width: 1,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 1024,
+                                height: 1,
+                                depth: 1,
+                            },
                         );
                     }
                     e.end_encoding();
@@ -63275,7 +63572,10 @@ mod tests {
                     &emb_all, &cos_all, &sin_all, &weights, &stage, base, k, scale,
                 )
                 .expect("verify target top-k eligible");
-            assert_eq!(topk_preds, preds, "k={k}: opt-in must not change predictions");
+            assert_eq!(
+                topk_preds, preds,
+                "k={k}: opt-in must not change predictions"
+            );
             assert_eq!(target_top_k.len(), k);
             for (row, logits) in ref_logits.iter().enumerate() {
                 let mut expected = [u32::MAX; RESIDENT_VERIFY_TARGET_TOP_K];
@@ -63321,10 +63621,7 @@ mod tests {
                     "base={base} layer-0 capture element {i}: {actual} != {expected}"
                 );
             }
-            for (i, (&actual, &expected)) in captures[1]
-                .iter()
-                .zip(&ref_layer1_inputs)
-                .enumerate()
+            for (i, (&actual, &expected)) in captures[1].iter().zip(&ref_layer1_inputs).enumerate()
             {
                 assert_eq!(
                     actual.to_bits(),
@@ -63338,19 +63635,20 @@ mod tests {
             // one complete hidden row per verifier input.
             let mut training_session = mk_session();
             let stage = make_stage();
-            let (training_preds, training_captures, output_norm, training_logits) = training_session
-                .verify_batch_with_training_features(
-                    &emb_all,
-                    &cos_all,
-                    &sin_all,
-                    &weights,
-                    &stage,
-                    base,
-                    k,
-                    scale,
-                    &[0, 1],
-                )
-                .expect("verify training capture eligible");
+            let (training_preds, training_captures, output_norm, training_logits) =
+                training_session
+                    .verify_batch_with_training_features(
+                        &emb_all,
+                        &cos_all,
+                        &sin_all,
+                        &weights,
+                        &stage,
+                        base,
+                        k,
+                        scale,
+                        &[0, 1],
+                    )
+                    .expect("verify training capture eligible");
             assert_eq!(training_preds, preds);
             assert_eq!(training_captures, captures);
             assert_eq!(output_norm.len(), k * hidden);
@@ -63850,23 +64148,22 @@ mod tests {
 
             let mut combined_tree_session = mk_session();
             let stage = make_stage();
-            let (combined_predictions, combined_captures, combined_top_k) =
-                combined_tree_session
-                    .verify_batch_tree_with_layer_inputs_and_target_top_k(
-                        &emb_node,
-                        &cos_all,
-                        &sin_all,
-                        &weights,
-                        &stage,
-                        &node_kvslot,
-                        &ancestor_bits,
-                        words,
-                        base,
-                        n,
-                        scale,
-                        &[0],
-                    )
-                    .expect("branching combined tree capture/target-top-k eligible");
+            let (combined_predictions, combined_captures, combined_top_k) = combined_tree_session
+                .verify_batch_tree_with_layer_inputs_and_target_top_k(
+                    &emb_node,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    base,
+                    n,
+                    scale,
+                    &[0],
+                )
+                .expect("branching combined tree capture/target-top-k eligible");
             assert_eq!(combined_predictions, predicted);
             assert_eq!(combined_top_k, target_top_k);
             assert_eq!(combined_captures, vec![emb_node.clone()]);
@@ -64055,10 +64352,7 @@ mod tests {
         );
         assert!(f32y_gemv_enabled(), "CAMELID_METAL_F32Y=1 required");
         assert!(wire_weights_enabled(), "CAMELID_METAL_WIRE=1 required");
-        assert!(
-            wire_nsg8_enabled(),
-            "CAMELID_METAL_WIRE_NSG8=1 required"
-        );
+        assert!(wire_nsg8_enabled(), "CAMELID_METAL_WIRE_NSG8=1 required");
         assert!(attn2_enabled(), "CAMELID_METAL_ATTN2=1 required");
         assert!(
             splitk_attention_enabled(),
@@ -64111,7 +64405,7 @@ mod tests {
             (0..1000)
                 .map(|i| if i == 999 { 10.0 } else { 0.0 })
                 .collect(), // max at end
-            vec![42.0],                    // single element
+            vec![42.0], // single element
         ];
         for logits in cases {
             // Repeated application of the production sampler contract is the exact top-8
@@ -64191,13 +64485,17 @@ mod tests {
             let got = unsafe { *(ib.contents() as *const u32) };
             assert_eq!(got, expected[0], "greedy len {}", logits.len());
             for repeat in 0..2 {
-                let got_topk: [u32; RESIDENT_VERIFY_TARGET_TOP_K] = std::array::from_fn(|rank| {
-                    unsafe {
+                let got_topk: [u32; RESIDENT_VERIFY_TARGET_TOP_K] =
+                    std::array::from_fn(|rank| unsafe {
                         *(topk_ib.contents() as *const u32)
                             .add(repeat * RESIDENT_VERIFY_TARGET_TOP_K + rank)
-                    }
-                });
-                assert_eq!(got_topk, expected, "top-k len {} repeat {repeat}", logits.len());
+                    });
+                assert_eq!(
+                    got_topk,
+                    expected,
+                    "top-k len {} repeat {repeat}",
+                    logits.len()
+                );
                 assert_eq!(got_topk[0], got, "top-1 must equal production greedy");
             }
         }
