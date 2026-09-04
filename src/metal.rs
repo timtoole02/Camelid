@@ -919,6 +919,10 @@ struct MetalLinearKernel {
     /// verifier preparation does not materialize the transient i8 panel or
     /// dispatch the two generic staging kernels.
     quantize_q8k_v4_stage_pipeline: Option<ComputePipelineState>,
+    /// Default-off tiled fragment-major strict V4 preparation. Mini2 proved
+    /// every downstream word identical and a material dispatch-cost win; the
+    /// process gate still fails closed to the established staged path.
+    quantize_q8k_v4_stage_reg_tiled_pipeline: Option<ComputePipelineState>,
     /// Ordered Q4_0 x Q8_0 row dot used by disk-paged Gemma 4 experts. Unlike
     /// the resident f32-activation Q4 kernel, this preserves the CPU Ghost-MoE
     /// comparator's per-block integer dot and left-to-right f32 accumulation.
@@ -3975,6 +3979,155 @@ kernel void quantize_q8k_v4_stage_strict(
     }
     for (uint j16 = 0; j16 < 16; ++j16) {
         ysums[(sb * 16 + j16) * k_pad + row] = half(int(sums[j16]));
+    }
+}
+
+// Default-off tiled twin of quantize_q8k_rows_strict followed by the two
+// fragment-major V2 staging kernels. One 256-thread group owns one activation
+// superblock across all eight physical columns.  Its eight SIMD groups each
+// own one column, so input reads and Q8 writes remain contiguous while the
+// final fragment-major stores are coalesced by the whole threadgroup.
+//
+// The reference quantizer chooses the first value with strictly greatest
+// absolute magnitude in an increasing 0..255 scan.  Parallel arithmetic would
+// change that rule, so every SIMD lane first performs only comparisons over its
+// increasing subsequence and records the source index. Lane zero then selects
+// (greatest abs, least index) from those candidates.  This is exactly the
+// reference result, including equal-magnitude opposite-sign ties; no floating
+// reduction is reassociated. Quantization and each signed-short 16-sum retain
+// the reference statements and increasing element order verbatim.
+kernel void quantize_q8k_v4_stage_reg_tiled_strict(
+    device const float* input [[buffer(0)]],
+    device float* scales [[buffer(1)]],
+    device half* y_reg [[buffer(2)]],
+    device half* ysums_reg [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& n_rows [[buffer(5)]],
+    constant uint& write_ysums [[buffer(6)]],
+    uint sb [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint column [[simdgroup_index_in_threadgroup]]
+) {
+    if (sb >= n_sb) return;
+
+    threadgroup float candidate_abs[8 * 32];
+    threadgroup float candidate_value[8 * 32];
+    threadgroup uint candidate_index[8 * 32];
+    threadgroup float inverse_scale[8];
+    threadgroup uint nonzero[8];
+    threadgroup char q8[8 * 256];
+
+    float local_abs = 0.0f;
+    float local_value = 0.0f;
+    uint local_index = 0xffffffffu;
+    if (column < n_rows) {
+        const uint input_base = column * n_sb * 256 + sb * 256;
+        for (uint i = lane; i < 256; i += 32) {
+            const float v = input[input_base + i];
+            const float a = fabs(v);
+            if (a > local_abs) {
+                local_abs = a;
+                local_value = v;
+                local_index = i;
+            }
+        }
+    }
+    const uint candidate = column * 32 + lane;
+    candidate_abs[candidate] = local_abs;
+    candidate_value[candidate] = local_value;
+    candidate_index[candidate] = local_index;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float best_abs = 0.0f;
+        float best_value = 0.0f;
+        uint best_index = 0xffffffffu;
+        for (uint source_lane = 0; source_lane < 32; ++source_lane) {
+            const uint source = column * 32 + source_lane;
+            const float a = candidate_abs[source];
+            const uint index = candidate_index[source];
+            if (a > best_abs || (a == best_abs && index < best_index)) {
+                best_abs = a;
+                best_value = candidate_value[source];
+                best_index = index;
+            }
+        }
+        if (column < n_rows) {
+            if (best_abs == 0.0f) {
+                scales[column * n_sb + sb] = 0.0f;
+                inverse_scale[column] = 0.0f;
+                nonzero[column] = 0u;
+            } else {
+                const float iscale = -127.0f / best_value;
+                scales[column * n_sb + sb] = 1.0f / iscale;
+                inverse_scale[column] = iscale;
+                nonzero[column] = 1u;
+            }
+        } else {
+            inverse_scale[column] = 0.0f;
+            nonzero[column] = 0u;
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (column < n_rows) {
+        const uint input_base = column * n_sb * 256 + sb * 256;
+        const float iscale = inverse_scale[column];
+        if (nonzero[column] == 0u) {
+            for (uint i = lane; i < 256; i += 32) {
+                q8[column * 256 + i] = 0;
+            }
+        } else {
+            for (uint i = lane; i < 256; i += 32) {
+                q8[column * 256 + i] = char(min(
+                    nearest_int_q8k_strict(iscale * input[input_base + i]), 127));
+            }
+        }
+    } else {
+        for (uint i = lane; i < 256; i += 32) {
+            q8[column * 256 + i] = 0;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reproduce q4k_mma_stage_y_reg's physical order. Each local gid is one
+    // half, and the 256 threads cooperatively cover the 2048-half superblock.
+    for (uint local_gid = tid; local_gid < 2048; local_gid += 256) {
+        const uint e = local_gid & 1u;
+        const uint word = local_gid >> 1;
+        const uint c = word & 3u;
+        const uint fragment_lane = (word >> 2) & 31u;
+        const uint q = (word >> 7) & 7u;
+        const uint kk = q * 4 + c;
+        const uint fragment_row =
+            4u * (fragment_lane >> 4) + ((fragment_lane & 7u) >> 1);
+        const uint fragment_column0 =
+            4u * ((fragment_lane >> 3) & 1u) + 2u * (fragment_lane & 1u);
+        const uint source_column = fragment_column0 + e;
+        const uint source_position = kk * 8 + fragment_row;
+        y_reg[sb * 2048 + local_gid] =
+            half(int(q8[source_column * 256 + source_position]));
+    }
+
+    // Reproduce q4k_mma_stage_ysums_reg's physical order. Each sum remains a
+    // left-to-right signed-short fold of exactly the same sixteen Q8 codes.
+    if (write_ysums != 0u && tid < 128) {
+        const uint e = tid & 1u;
+        const uint word = tid >> 1;
+        const uint m = word & 1u;
+        const uint fragment_lane = (word >> 1) & 31u;
+        const uint fragment_row =
+            4u * (fragment_lane >> 4) + ((fragment_lane & 7u) >> 1);
+        const uint fragment_column0 =
+            4u * ((fragment_lane >> 3) & 1u) + 2u * (fragment_lane & 1u);
+        const uint source_column = fragment_column0 + e;
+        const uint j16 = m * 8 + fragment_row;
+        short sum = 0;
+        for (uint i = 0; i < 16; ++i) {
+            sum += short(q8[source_column * 256 + j16 * 16 + i]);
+        }
+        ysums_reg[sb * 128 + tid] = half(int(sum));
     }
 }
 
@@ -15210,6 +15363,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let quantize_q8k_v4_stage_reg_tiled_pipeline = strict_q8k_library
+                .get_function("quantize_q8k_v4_stage_reg_tiled_strict", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let q4_0_q8_ordered_function = strict_q8k_library
                 .get_function("q4_0_q8_ordered_rows", None)
                 .ok()?;
@@ -15420,6 +15581,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_wire_mm_f16o_pipeline,
                 quantize_q8k_rows_pipeline,
                 quantize_q8k_v4_stage_pipeline,
+                quantize_q8k_v4_stage_reg_tiled_pipeline,
                 q4_0_q8_ordered_pipeline,
                 q4_0_q8_ordered_simd_pipeline,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
@@ -20129,6 +20291,7 @@ fn allocate_kquant_v4_activation_stage(
         *p.add(2) = n_tokens as u32; //  @8
         *p.add(3) = input_width as u32; // @12
         *p.add(4) = k_pad as u32; //     @16
+        *p.add(5) = u32::from(with_ysums); // @20
     }
     KquantV4ActivationStage {
         y_stage,
@@ -20180,6 +20343,258 @@ fn encode_kquant_v4_activation_stage(
         e.set_buffer(4, Some(&stage.scalar), 16);
         dispatch_1d(e, stage_ysums, stage.n_sb * 16 * stage.k_pad);
     }
+}
+
+/// Explicit opt-in for the tiled fragment-major V2 preparation.  It is a
+/// scheduling twin, not a new arithmetic route: both plain N=1 and verifier
+/// N<=8 enter only while the process-wide register-exact V2 route owns the
+/// fragment-major representation. Any other value leaves the established
+/// quantize + stage dispatches untouched.
+#[cfg(any(target_os = "macos", test))]
+fn kquant_v4_tiled_prep_fusion_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_tiled_prep_fusion_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("CAMELID_KQUANT_V4_TILED_PREP_FUSION").ok();
+        kquant_v4_tiled_prep_fusion_from_env(value.as_deref())
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MetalKquantV4TiledPrepStats {
+    pub attempts: u64,
+    pub routed: u64,
+    pub fallbacks: u64,
+    pub shared_routes: u64,
+    pub single_routes: u64,
+    pub plain_routes: u64,
+    pub verifier_routes: u64,
+}
+
+#[cfg(target_os = "macos")]
+static KQUANT_V4_TILED_PREP_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static KQUANT_V4_TILED_PREP_ROUTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static KQUANT_V4_TILED_PREP_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static KQUANT_V4_TILED_PREP_SHARED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static KQUANT_V4_TILED_PREP_SINGLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static KQUANT_V4_TILED_PREP_PLAIN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static KQUANT_V4_TILED_PREP_VERIFIER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_kquant_v4_tiled_prep_stats() -> MetalKquantV4TiledPrepStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    MetalKquantV4TiledPrepStats {
+        attempts: KQUANT_V4_TILED_PREP_ATTEMPTS.load(Relaxed),
+        routed: KQUANT_V4_TILED_PREP_ROUTED.load(Relaxed),
+        fallbacks: KQUANT_V4_TILED_PREP_FALLBACKS.load(Relaxed),
+        shared_routes: KQUANT_V4_TILED_PREP_SHARED.load(Relaxed),
+        single_routes: KQUANT_V4_TILED_PREP_SINGLE.load(Relaxed),
+        plain_routes: KQUANT_V4_TILED_PREP_PLAIN.load(Relaxed),
+        verifier_routes: KQUANT_V4_TILED_PREP_VERIFIER.load(Relaxed),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+enum KquantV4TiledPrepScope {
+    Shared,
+    Single,
+}
+
+#[cfg(target_os = "macos")]
+fn record_kquant_v4_tiled_prep_route(
+    scope: KquantV4TiledPrepScope,
+    stage: &KquantV4ActivationStage,
+    routed: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let attempt = KQUANT_V4_TILED_PREP_ATTEMPTS.fetch_add(1, Relaxed) + 1;
+    if !routed {
+        KQUANT_V4_TILED_PREP_FALLBACKS.fetch_add(1, Relaxed);
+        let stats = metal_kquant_v4_tiled_prep_stats();
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        let first = !WARNED.swap(true, Relaxed);
+        let trace_checkpoint = *TRACE
+            .get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some())
+            && stats.fallbacks.is_power_of_two();
+        if first || trace_checkpoint {
+            eprintln!(
+                "[metal-kquant-v4-tiled-prep] route=fallback scope={scope:?} \
+                 reason=pipeline_or_invariant \
+                 n_tokens={} input_width={} ysums={} attempts={} \
+                 routed={} fallbacks={} fallback=exact_staged_v2",
+                stage.n_tokens,
+                stage.input_width,
+                stage.ysums.is_some(),
+                attempt,
+                stats.routed,
+                stats.fallbacks,
+            );
+        }
+        return;
+    }
+
+    let routed_count = KQUANT_V4_TILED_PREP_ROUTED.fetch_add(1, Relaxed) + 1;
+    match scope {
+        KquantV4TiledPrepScope::Shared => {
+            KQUANT_V4_TILED_PREP_SHARED.fetch_add(1, Relaxed);
+        }
+        KquantV4TiledPrepScope::Single => {
+            KQUANT_V4_TILED_PREP_SINGLE.fetch_add(1, Relaxed);
+        }
+    }
+    if stage.n_tokens == 1 {
+        KQUANT_V4_TILED_PREP_PLAIN.fetch_add(1, Relaxed);
+    } else {
+        KQUANT_V4_TILED_PREP_VERIFIER.fetch_add(1, Relaxed);
+    }
+
+    // One unconditional engagement record makes receipts self-describing.
+    // Optional V4 tracing adds one line per scope/width class and logarithmic
+    // counter checkpoints, never one line per layer.
+    static ACTIVE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static TRACE_SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    let first = !ACTIVE_LOGGED.swap(true, Relaxed);
+    let class = match (scope, stage.ysums.is_some(), stage.input_width > 3072) {
+        (KquantV4TiledPrepScope::Shared, _, _) => 1u8,
+        (KquantV4TiledPrepScope::Single, true, _) => 2u8,
+        (KquantV4TiledPrepScope::Single, false, false) => 4u8,
+        (KquantV4TiledPrepScope::Single, false, true) => 8u8,
+    };
+    let trace_enabled =
+        *TRACE.get_or_init(|| std::env::var_os("CAMELID_KQUANT_V4_TRACE").is_some());
+    let trace_first = trace_enabled && TRACE_SEEN.fetch_or(class, Relaxed) & class == 0;
+    let trace_checkpoint = trace_enabled && routed_count.is_power_of_two();
+    if first || trace_first || trace_checkpoint {
+        let stats = metal_kquant_v4_tiled_prep_stats();
+        eprintln!(
+            "[metal-kquant-v4-tiled-prep] route=fused scope={scope:?} n_tokens={} \
+             input_width={} ysums={} attempts={} routed={} fallbacks={} \
+             shared={} single={} plain={} verifier={}",
+            stage.n_tokens,
+            stage.input_width,
+            stage.ysums.is_some(),
+            attempt,
+            routed_count,
+            stats.fallbacks,
+            stats.shared_routes,
+            stats.single_routes,
+            stats.plain_routes,
+            stats.verifier_routes,
+        );
+    }
+}
+
+/// Encode the admitted tiled preparation without consulting its environment
+/// gate. Callers first establish that the stage is the process's fragment-major
+/// V2 representation. Every shape and buffer condition is checked before any
+/// command is emitted, so false is a clean fallback boundary.
+#[cfg(target_os = "macos")]
+fn encode_kquant_v4_tiled_fragment_stage(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    scales: &Buffer,
+    stage: &KquantV4ActivationStage,
+) -> bool {
+    let Some(pipeline) = k
+        .quantize_q8k_v4_stage_reg_tiled_pipeline
+        .as_ref()
+        .filter(|pipeline| {
+            pipeline.thread_execution_width() == 32
+                && pipeline.max_total_threads_per_threadgroup() >= 256
+        })
+    else {
+        return false;
+    };
+    let Some(input_elements) = stage.input_width.checked_mul(stage.n_tokens) else {
+        return false;
+    };
+    let Some(input_bytes) = input_elements.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(scale_bytes) = stage
+        .n_sb
+        .checked_mul(stage.n_tokens)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(stage_bytes) = stage
+        .input_width
+        .checked_mul(stage.k_pad)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
+    else {
+        return false;
+    };
+    let sums_fit = stage.ysums.as_ref().is_none_or(|ysums| {
+        stage
+            .n_sb
+            .checked_mul(16 * stage.k_pad)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
+            .is_some_and(|bytes| ysums.length() >= bytes as u64)
+    });
+    if !stage.fragment_major
+        || stage.k_pad != 8
+        || !(1..=8).contains(&stage.n_tokens)
+        || stage.input_width == 0
+        || !stage.input_width.is_multiple_of(256)
+        || stage.n_sb != stage.input_width / 256
+        || stage.scalar.length() < 24
+        || y.length() < input_bytes as u64
+        || scales.length() < scale_bytes as u64
+        || stage.y_stage.length() < stage_bytes as u64
+        || !sums_fit
+    {
+        return false;
+    }
+
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(1, Some(scales), 0);
+    e.set_buffer(2, Some(&stage.y_stage), 0);
+    e.set_buffer(
+        3,
+        Some(stage.ysums.as_ref().unwrap_or(&stage.y_stage)),
+        0,
+    );
+    e.set_buffer(4, Some(&stage.scalar), 0);
+    e.set_buffer(5, Some(&stage.scalar), 8);
+    e.set_buffer(6, Some(&stage.scalar), 20);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: stage.n_sb as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    true
 }
 
 /// Emit the exact V4 verifier activation representation in one strict kernel.
@@ -20801,6 +21216,45 @@ fn encode_shared_kquant_v4_activation_with_layout(
 ) -> SharedKquantV4Activation {
     let n_sb = input_width / 256;
     let scales = pool_get(k, (n_tokens * n_sb * 4) as u64);
+
+    // The tiled kernel is a strict scheduling replacement only for the
+    // fragment-major V2 representation. Check every invariant before it emits
+    // work; a missing pipeline or unsupported shape then falls through to the
+    // established quantize + staging sequence in the same arithmetic universe.
+    if fragment_major && kquant_v4_tiled_prep_fusion_enabled() {
+        // A shared projection group may mix Q4 and Q6 weights, so its immutable
+        // activation panel always includes the Q4 min-term sums.
+        let stage =
+            allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true, true);
+        let routed = encode_kquant_v4_tiled_fragment_stage(e, k, y, &scales, &stage);
+        record_kquant_v4_tiled_prep_route(KquantV4TiledPrepScope::Shared, &stage, routed);
+        if routed {
+            return SharedKquantV4Activation {
+                scales,
+                quants: None,
+                stage,
+            };
+        }
+
+        // `encode_kquant_v4_tiled_fragment_stage` promises that false is
+        // returned before setting pipeline state or dispatching. Therefore this
+        // is a clean, exact fallback rather than a duplicate write.
+        let quants = pool_get(k, (n_tokens * input_width) as u64);
+        e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
+        e.set_buffer(0, Some(y), 0);
+        e.set_buffer(1, Some(&scales), 0);
+        e.set_buffer(2, Some(&quants), 0);
+        e.set_buffer(3, Some(&stage.scalar), 0);
+        e.set_buffer(4, Some(&stage.scalar), 8);
+        dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+        encode_kquant_v4_activation_stage(e, v4, &quants, &stage);
+        return SharedKquantV4Activation {
+            scales,
+            quants: Some(quants),
+            stage,
+        };
+    }
+
     let fusion_requested = kquant_v4_strict_prep_fusion_enabled();
     if !fusion_requested {
         // Keep the flag-off allocation and dispatch sequence exactly as it was:
@@ -20886,7 +21340,7 @@ fn trace_kquant_v4_shared_prep(
     projections: usize,
     n_tokens: usize,
     input_width: usize,
-    strict_fused: bool,
+    prep_fused: bool,
 ) {
     static TRACE: OnceLock<bool> = OnceLock::new();
     static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -20897,7 +21351,7 @@ fn trace_kquant_v4_shared_prep(
     if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
         eprintln!(
             "[metal-kquant-v4] shared_prep projections={projections} \
-             n_tokens={n_tokens} input_width={input_width} strict_fused={strict_fused}"
+             n_tokens={n_tokens} input_width={input_width} prep_fused={prep_fused}"
         );
     }
 }
@@ -20906,9 +21360,10 @@ fn trace_kquant_v4_shared_prep(
 /// Returns false before emitting anything unless the complete group is eligible
 /// for the narrow V4 lane, so callers can safely fall back projection-by-
 /// projection. At N=8 the ordinary shared preparation turns Q/K/V from 11
-/// dispatches into 6 and gate/up from 8 into 5. The separately opted-in strict
-/// fusion reduces those groups again to 4 and 3 dispatches, respectively,
-/// without changing either V4 projection kernel or its operands.
+/// dispatches into 6 and gate/up from 8 into 5. The separately opted-in tiled
+/// V2 preparation reduces those groups again to 4 and 3 dispatches,
+/// respectively, without changing either V4 projection kernel or its operands.
+/// The older standard-layout strict fusion remains a distinct experiment.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_resident_kquant_v4_shared_group(
@@ -21486,6 +21941,66 @@ fn encode_resident_kquant_matmul_f32(
         }
         return;
     }
+    if let Some(v4) = v4 {
+        let is_q6k = matches!(weight.format, ResidentWeightFormat::Q6K);
+        let fragment_major = kquant_v4_stage_fragment_major(v4, n_tokens);
+        let tiled_requested = fragment_major && kquant_v4_tiled_prep_fusion_enabled();
+        if tiled_requested {
+            // Both v4 formats stage quantized activations as half: every Q8_K
+            // code is exactly representable. Q6's intentional rounding happens
+            // only when its row-dependent dequantized weights enter half A.
+            let stage = allocate_kquant_v4_activation_stage(
+                k,
+                input_width,
+                n_tokens,
+                !is_q6k,
+                fragment_major,
+            );
+            let tiled = encode_kquant_v4_tiled_fragment_stage(e, k, y, scales, &stage);
+            record_kquant_v4_tiled_prep_route(KquantV4TiledPrepScope::Single, &stage, tiled);
+            if !tiled {
+                // The candidate refuses before encoding any work, so the
+                // established strict Q8_K quantizer and fragment staging form
+                // a clean exact fallback in the same arithmetic universe.
+                e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
+                e.set_buffer(0, Some(y), 0);
+                e.set_buffer(1, Some(scales), 0);
+                e.set_buffer(2, Some(quants), 0);
+                e.set_buffer(3, Some(scalar), 0);
+                e.set_buffer(4, Some(scalar), 8);
+                dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+                encode_kquant_v4_activation_stage(e, v4, quants, &stage);
+            }
+            encode_kquant_v4_prepared_projection(
+                e, v4, scales, &stage, weight, out, scalar, rows,
+            );
+            stage.recycle_into(keep);
+            return;
+        }
+
+        // Keep the flag-off allocation and dispatch sequence exactly as it
+        // was: quantize into the caller's scratch, allocate/stage, project.
+        e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
+        e.set_buffer(0, Some(y), 0);
+        e.set_buffer(1, Some(scales), 0);
+        e.set_buffer(2, Some(quants), 0);
+        e.set_buffer(3, Some(scalar), 0);
+        e.set_buffer(4, Some(scalar), 8);
+        dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+        let stage = allocate_kquant_v4_activation_stage(
+            k,
+            input_width,
+            n_tokens,
+            !is_q6k,
+            fragment_major,
+        );
+        encode_kquant_v4_activation_stage(e, v4, quants, &stage);
+        encode_kquant_v4_prepared_projection(e, v4, scales, &stage, weight, out, scalar, rows);
+        stage.recycle_into(keep);
+        return;
+    }
+
+    // Non-V4 K-quant routes continue to consume the canonical quant buffers.
     e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
     e.set_buffer(0, Some(y), 0);
     e.set_buffer(1, Some(scales), 0);
@@ -21493,24 +22008,6 @@ fn encode_resident_kquant_matmul_f32(
     e.set_buffer(3, Some(scalar), 0);
     e.set_buffer(4, Some(scalar), 8);
     dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
-
-    if let Some(v4) = v4 {
-        let is_q6k = matches!(weight.format, ResidentWeightFormat::Q6K);
-        // Both v4 formats stage quantized activations as half: every Q8_K
-        // code is exactly representable. Q6's intentional rounding happens
-        // only when its row-dependent dequantized weights enter half A.
-        let stage = allocate_kquant_v4_activation_stage(
-            k,
-            input_width,
-            n_tokens,
-            !is_q6k,
-            kquant_v4_stage_fragment_major(v4, n_tokens),
-        );
-        encode_kquant_v4_activation_stage(e, v4, quants, &stage);
-        encode_kquant_v4_prepared_projection(e, v4, scales, &stage, weight, out, scalar, rows);
-        stage.recycle_into(keep);
-        return;
-    }
 
     let scratch_ints_per_column = n_sb
         * match weight.format {
@@ -52898,6 +53395,388 @@ mod tests {
         }
     }
 
+    /// Smallest model-free falsifier for eliminating the activation-preparation
+    /// dispatch tax exposed by the failed two-queue FFN DAG.  The current V2
+    /// path runs strict Q8_K quantization, fragment-major y staging, and
+    /// fragment-major 16-sum staging as three serial dispatches.  The candidate
+    /// is one 256-thread tiled dispatch per activation superblock: eight SIMD
+    /// groups quantize the eight N=8 columns, then cooperatively write the exact
+    /// V2 physical layouts. It has no event, extra queue, or intermediate i8
+    /// device buffer. Q4 consumers include y-sums (three current dispatches);
+    /// Q6 FFN-down and tied-head consumers do not (two current dispatches).
+    ///
+    /// Scale f32 words and every half word of both downstream panels are checked
+    /// by bits on every timed sample.  Sixteen preparations are encoded per
+    /// command buffer so GPU timing measures dispatch throughput rather than a
+    /// sub-100-us command-buffer envelope.  The 3072 Q4, 8192 Q6, and 3072 Q6
+    /// cases cover the three hidden-width plus one FFN-width preparations in
+    /// every Llama layer and the final tied head.
+    ///
+    /// cargo test --release --lib metal_kquant_v4_fragment_prep_tiled_fusion_microbench -- --ignored --nocapture --test-threads=1
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_kquant_v4_fragment_prep_tiled_fusion_microbench() {
+        const N_TOKENS: usize = 8;
+        const REPEATS: usize = 16;
+
+        #[derive(Clone)]
+        struct PrepBits {
+            scales: Vec<u32>,
+            y: Vec<u16>,
+            ysums: Vec<u16>,
+        }
+
+        struct PrepRun {
+            bits: PrepBits,
+            gpu_us: f64,
+            wall_us: f64,
+        }
+
+        fn gpu_interval_seconds(cb: &metal::CommandBuffer) -> (f64, f64) {
+            use metal::foreign_types::ForeignType;
+            use metal::objc::{msg_send, sel, sel_impl};
+
+            unsafe {
+                let p = cb.as_ptr();
+                let start: f64 = msg_send![p, GPUStartTime];
+                let end: f64 = msg_send![p, GPUEndTime];
+                assert!(
+                    start.is_finite() && end.is_finite() && start > 0.0 && end >= start,
+                    "Metal returned an invalid GPU interval: {start}..{end}"
+                );
+                (start, end)
+            }
+        }
+
+        fn median(samples: &mut [f64]) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            let middle = samples.len() / 2;
+            if samples.len().is_multiple_of(2) {
+                (samples[middle - 1] + samples[middle]) * 0.5
+            } else {
+                samples[middle]
+            }
+        }
+
+        fn read_u16_bits(buffer: &Buffer, len: usize) -> Vec<u16> {
+            let mut words = vec![0u16; len];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.contents().cast::<u16>(),
+                    words.as_mut_ptr(),
+                    len,
+                );
+            }
+            words
+        }
+
+        fn read_f32_bits(buffer: &Buffer, len: usize) -> Vec<u32> {
+            let mut words = vec![0u32; len];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.contents().cast::<u32>(),
+                    words.as_mut_ptr(),
+                    len,
+                );
+            }
+            words
+        }
+
+        fn assert_words_equal<T: Copy + Eq + std::fmt::Debug>(
+            label: &str,
+            expected: &[T],
+            actual: &[T],
+        ) {
+            assert_eq!(expected.len(), actual.len(), "{label} length");
+            if let Some(index) = expected
+                .iter()
+                .zip(actual)
+                .position(|(expected, actual)| expected != actual)
+            {
+                panic!(
+                    "{label} word {index} changed: expected={:?} actual={:?}",
+                    expected[index], actual[index]
+                );
+            }
+        }
+
+        fn assert_prep_equal(expected: &PrepBits, actual: &PrepBits) {
+            assert_words_equal("scales", &expected.scales, &actual.scales);
+            assert_words_equal("fragment y", &expected.y, &actual.y);
+            assert_words_equal("fragment ysums", &expected.ysums, &actual.ysums);
+        }
+
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        assert!(
+            kquant_v4_register_exact_v2_pipelines_admitted(v4),
+            "fragment preparation requires the complete register-exact V2 pipeline set"
+        );
+        let tiled_pipeline = kernel
+            .quantize_q8k_v4_stage_reg_tiled_pipeline
+            .as_ref()
+            .expect("strict tiled fragment-preparation pipeline");
+        assert_eq!(
+            tiled_pipeline.thread_execution_width(),
+            32,
+            "the tiled preparation maps one N=8 column to each Apple SIMD group"
+        );
+        assert!(tiled_pipeline.max_total_threads_per_threadgroup() >= 256);
+        let device = &kernel.device;
+        let mut saved_by_width = Vec::new();
+
+        for (label, width, with_ysums) in [
+            ("hidden-q4", 3072usize, true),
+            ("ffn-q6", 8192, false),
+            ("head-q6", 3072, false),
+        ] {
+            let n_sb = width / 256;
+            let mut input: Vec<f32> = (0..N_TOKENS * width)
+                .map(|index| {
+                    let token = index / width;
+                    let column = index % width;
+                    ((((column * 43 + token * 137) % 257) as f32) - 128.0) * 0.005
+                })
+                .collect();
+            // Exercise both exact-zero handling and the reference quantizer's
+            // first-index rule for equal-magnitude, opposite-sign maxima.
+            for token in 0..N_TOKENS {
+                for sb in 0..n_sb {
+                    let base = token * width + sb * 256;
+                    if token == 0 && sb == 0 {
+                        input[base..base + 256].fill(0.0);
+                    } else {
+                        input[base + 7] = 1.25;
+                        input[base + 200] = -1.25;
+                    }
+                }
+            }
+            let input_buffer = device.new_buffer(
+                (input.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_f32(&input_buffer, &input);
+
+            let run_current = || -> PrepRun {
+                let cb = kernel.queue.new_command_buffer().to_owned();
+                let encoder = cb.new_compute_command_encoder();
+                let mut prepared = Vec::with_capacity(REPEATS);
+                for _ in 0..REPEATS {
+                    let scales = pool_get(kernel, (N_TOKENS * n_sb * 4) as u64);
+                    let quants = pool_get(kernel, (N_TOKENS * width) as u64);
+                    let stage = allocate_kquant_v4_activation_stage(
+                        kernel,
+                        width,
+                        N_TOKENS,
+                        with_ysums,
+                        true,
+                    );
+                    encoder.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
+                    encoder.set_buffer(0, Some(&input_buffer), 0);
+                    encoder.set_buffer(1, Some(&scales), 0);
+                    encoder.set_buffer(2, Some(&quants), 0);
+                    encoder.set_buffer(3, Some(&stage.scalar), 0);
+                    encoder.set_buffer(4, Some(&stage.scalar), 8);
+                    dispatch_1d(
+                        encoder,
+                        &kernel.quantize_q8k_rows_pipeline,
+                        N_TOKENS * n_sb,
+                    );
+                    encode_kquant_v4_activation_stage(encoder, v4, &quants, &stage);
+                    prepared.push(SharedKquantV4Activation {
+                        scales,
+                        quants: Some(quants),
+                        stage,
+                    });
+                }
+                encoder.end_encoding();
+                let wall_started = std::time::Instant::now();
+                cb.commit();
+                cb.wait_until_completed();
+                let wall_us = wall_started.elapsed().as_secs_f64() * 1.0e6 / REPEATS as f64;
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                let (gpu_start, gpu_end) = gpu_interval_seconds(&cb);
+                let last = prepared.last().expect("at least one preparation");
+                let bits = PrepBits {
+                    scales: read_f32_bits(&last.scales, N_TOKENS * n_sb),
+                    y: read_u16_bits(&last.stage.y_stage, N_TOKENS * width),
+                    ysums: last.stage.ysums.as_ref().map_or_else(Vec::new, |ysums| {
+                        read_u16_bits(ysums, n_sb * 16 * N_TOKENS)
+                    }),
+                };
+                let mut recycle = Vec::new();
+                for activation in prepared {
+                    activation.recycle_into(&mut recycle);
+                }
+                pool_recycle(kernel, recycle);
+                PrepRun {
+                    bits,
+                    gpu_us: (gpu_end - gpu_start) * 1.0e6 / REPEATS as f64,
+                    wall_us,
+                }
+            };
+
+            let run_tiled = || -> PrepRun {
+                let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = scalar.contents() as *mut u32;
+                    *p = n_sb as u32;
+                    *p.add(1) = N_TOKENS as u32;
+                    *p.add(2) = if with_ysums { 1 } else { 0 };
+                }
+                let cb = kernel.queue.new_command_buffer().to_owned();
+                let encoder = cb.new_compute_command_encoder();
+                let mut outputs = Vec::with_capacity(REPEATS);
+                for _ in 0..REPEATS {
+                    let scales = device.new_buffer(
+                        (N_TOKENS * n_sb * 4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    let y = device.new_buffer(
+                        (N_TOKENS * width * 2) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    let ysums = device.new_buffer(
+                        if with_ysums {
+                            (n_sb * 16 * N_TOKENS * 2) as u64
+                        } else {
+                            2
+                        },
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    encoder.set_compute_pipeline_state(tiled_pipeline);
+                    encoder.set_buffer(0, Some(&input_buffer), 0);
+                    encoder.set_buffer(1, Some(&scales), 0);
+                    encoder.set_buffer(2, Some(&y), 0);
+                    encoder.set_buffer(3, Some(&ysums), 0);
+                    encoder.set_buffer(4, Some(&scalar), 0);
+                    encoder.set_buffer(5, Some(&scalar), 4);
+                    encoder.set_buffer(6, Some(&scalar), 8);
+                    encoder.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: n_sb as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 256,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    outputs.push((scales, y, ysums));
+                }
+                encoder.end_encoding();
+                let wall_started = std::time::Instant::now();
+                cb.commit();
+                cb.wait_until_completed();
+                let wall_us = wall_started.elapsed().as_secs_f64() * 1.0e6 / REPEATS as f64;
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                let (gpu_start, gpu_end) = gpu_interval_seconds(&cb);
+                let (scales, y, ysums) = outputs.last().expect("at least one preparation");
+                let bits = PrepBits {
+                    scales: read_f32_bits(scales, N_TOKENS * n_sb),
+                    y: read_u16_bits(y, N_TOKENS * width),
+                    ysums: if with_ysums {
+                        read_u16_bits(ysums, n_sb * 16 * N_TOKENS)
+                    } else {
+                        Vec::new()
+                    },
+                };
+                drop(outputs);
+                drop(scalar);
+                PrepRun {
+                    bits,
+                    gpu_us: (gpu_end - gpu_start) * 1.0e6 / REPEATS as f64,
+                    wall_us,
+                }
+            };
+
+            let canonical = run_current();
+            let warm = run_tiled();
+            assert_prep_equal(&canonical.bits, &warm.bits);
+            let mut current_gpu = Vec::with_capacity(10);
+            let mut current_wall = Vec::with_capacity(10);
+            let mut tiled_gpu = Vec::with_capacity(10);
+            let mut tiled_wall = Vec::with_capacity(10);
+            for round in 0..10 {
+                let (current, tiled) = if round % 2 == 0 {
+                    (run_current(), run_tiled())
+                } else {
+                    let tiled = run_tiled();
+                    (run_current(), tiled)
+                };
+                assert_prep_equal(&canonical.bits, &current.bits);
+                assert_prep_equal(&canonical.bits, &tiled.bits);
+                eprintln!(
+                    "[v4-fragment-prep-tiled] case={label} width={width} round={round:02} \
+                     current_gpu_us={:.2} tiled_gpu_us={:.2} \
+                     current_wall_us={:.2} tiled_wall_us={:.2}",
+                    current.gpu_us, tiled.gpu_us, current.wall_us, tiled.wall_us,
+                );
+                current_gpu.push(current.gpu_us);
+                current_wall.push(current.wall_us);
+                tiled_gpu.push(tiled.gpu_us);
+                tiled_wall.push(tiled.wall_us);
+            }
+            let current_gpu_median = median(&mut current_gpu);
+            let current_wall_median = median(&mut current_wall);
+            let tiled_gpu_median = median(&mut tiled_gpu);
+            let tiled_wall_median = median(&mut tiled_wall);
+            let gpu_ratio = tiled_gpu_median / current_gpu_median;
+            let wall_ratio = tiled_wall_median / current_wall_median;
+            let saved_gpu_us = current_gpu_median - tiled_gpu_median;
+            saved_by_width.push((label, saved_gpu_us));
+            let current_dispatches = if with_ysums { 3 } else { 2 };
+            let verdict = if gpu_ratio <= 0.70 && wall_ratio <= 0.80 {
+                "GO"
+            } else if gpu_ratio < 0.90 && wall_ratio < 0.95 {
+                "MARGINAL"
+            } else {
+                "STOP"
+            };
+            eprintln!(
+                "[v4-fragment-prep-tiled] summary case={label} width={width} \
+                 n_tokens={N_TOKENS} \
+                 with_ysums={with_ysums} repetitions_per_cb={REPEATS} \
+                 current_dispatches={current_dispatches} tiled_dispatches=1 \
+                 current_gpu_median_us={current_gpu_median:.2} \
+                 tiled_gpu_median_us={tiled_gpu_median:.2} saved_gpu_us={saved_gpu_us:.2} \
+                 current_wall_median_us={current_wall_median:.2} \
+                 tiled_wall_median_us={tiled_wall_median:.2} gpu_ratio={gpu_ratio:.4} \
+                 wall_ratio={wall_ratio:.4} all_downstream_words_bit_identical=true \
+                 verdict={verdict}"
+            );
+        }
+
+        let hidden_saved = saved_by_width
+            .iter()
+            .find_map(|&(label, saved)| (label == "hidden-q4").then_some(saved))
+            .expect("hidden-width result");
+        let ffn_saved = saved_by_width
+            .iter()
+            .find_map(|&(label, saved)| (label == "ffn-q6").then_some(saved))
+            .expect("FFN-width result");
+        let head_saved = saved_by_width
+            .iter()
+            .find_map(|&(label, saved)| (label == "head-q6").then_some(saved))
+            .expect("head-width Q6 result");
+        let projected_pass_saved_ms =
+            (28.0 * (3.0 * hidden_saved + ffn_saved) + head_saved) / 1.0e3;
+        eprintln!(
+            "[v4-fragment-prep-tiled] projection hidden_preps_per_layer=3 \
+             ffn_preps_per_layer=1 layers=28 final_head_hidden_preps=1 \
+             projected_target_pass_saved_ms={projected_pass_saved_ms:.3} \
+             note=dispatch-only_model_free_upper_bound"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_kquant_v4_soa8_cache_is_byte_neutral_and_immutable_on_alias() {
@@ -53758,6 +54637,329 @@ mod tests {
         assert!(!kquant_v4_register_exact_v2_requested(true, false, false));
         assert!(!kquant_v4_register_exact_v2_requested(true, true, true));
         assert!(!kquant_v4_register_exact_v2_requested(false, false, false));
+    }
+
+    #[test]
+    fn kquant_v4_tiled_prep_fusion_gate_is_default_off_and_fails_closed() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("on"),
+            Some("2"),
+            Some(" 1"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !kquant_v4_tiled_prep_fusion_from_env(value),
+                "{value:?} must retain the staged V2 preparation"
+            );
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(kquant_v4_tiled_prep_fusion_from_env(Some(value)));
+        }
+    }
+
+    /// Production-route qualification for the tiled fragment preparation. The
+    /// current strict quantizer plus fragment staging is the oracle; the
+    /// candidate is encoded through the same helper used by both production
+    /// call sites, and both feed the current register-exact V2 projection.
+    /// Real Llama-3.2-3B hidden, FFN, and head input widths cover shared Q4
+    /// preparation and both single Q6 preparation classes. N=1 proves ordinary
+    /// decode and N=8 proves the fixed authoritative verifier window. Every
+    /// f32 scale/output word, every half panel word, and every physical pad cell
+    /// must match by bits.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_v4_tiled_prep_production_route_is_bit_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let Some(v4) = kquant_v2_kernels() else {
+            panic!("KQUANT_V2_SHADER failed to compile");
+        };
+        assert!(
+            kquant_v4_register_exact_v2_pipelines_admitted(v4),
+            "fragment-major production route requires the complete V2 pipeline set"
+        );
+        assert!(
+            kernel
+                .quantize_q8k_v4_stage_reg_tiled_pipeline
+                .is_some(),
+            "tiled strict preparation pipeline"
+        );
+
+        let device = &kernel.device;
+        let rows = 19usize;
+        let physical_columns = 8usize;
+        let read_u32 = |buffer: &Buffer, len: usize| unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u32>(), len).to_vec()
+        };
+        let read_u16 = |buffer: &Buffer, len: usize| unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u16>(), len).to_vec()
+        };
+        let assert_words = |label: &str, expected: &[u32], actual: &[u32]| {
+            assert_eq!(expected.len(), actual.len(), "{label} length");
+            if let Some(index) = expected
+                .iter()
+                .zip(actual)
+                .position(|(expected, actual)| expected != actual)
+            {
+                panic!(
+                    "{label} word {index}: expected={:#010x} actual={:#010x}",
+                    expected[index], actual[index]
+                );
+            }
+        };
+        let assert_half_words = |label: &str, expected: &[u16], actual: &[u16]| {
+            assert_eq!(expected.len(), actual.len(), "{label} length");
+            if let Some(index) = expected
+                .iter()
+                .zip(actual)
+                .position(|(expected, actual)| expected != actual)
+            {
+                panic!(
+                    "{label} half {index}: expected={:#06x} actual={:#06x}",
+                    expected[index], actual[index]
+                );
+            }
+        };
+
+        for (case, format, input_width, with_ysums) in [
+            (
+                "shared-hidden-q4",
+                ResidentWeightFormat::Q4K,
+                3072usize,
+                true,
+            ),
+            (
+                "single-ffn-q6",
+                ResidentWeightFormat::Q6K,
+                8192usize,
+                false,
+            ),
+            (
+                "single-head-q6",
+                ResidentWeightFormat::Q6K,
+                3072usize,
+                false,
+            ),
+        ] {
+            let n_sb = input_width / 256;
+            let block_bytes = format.wire_bytes_per_block();
+            let mut wire: Vec<u8> = (0..rows * n_sb * block_bytes)
+                .map(|index| ((index * 61 + index / 19 + input_width / 256) & 0xff) as u8)
+                .collect();
+            for (block_index, block) in wire.chunks_exact_mut(block_bytes).enumerate() {
+                let d = 0.003 + (block_index % 29) as f32 * 0.00007;
+                match format {
+                    ResidentWeightFormat::Q4K => {
+                        block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                        block[2..4]
+                            .copy_from_slice(&f32_to_f16_bits(d * 0.375).to_le_bytes());
+                    }
+                    ResidentWeightFormat::Q6K => {
+                        block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let weight_buffer = device.new_buffer(
+                wire.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            write_buffer_u8(&weight_buffer, &wire);
+            let weight = ResidentLinearWeight {
+                format,
+                buffer: weight_buffer,
+                soa8_buffer: None,
+                q8_wire: false,
+            };
+
+            for n_tokens in [1usize, 8] {
+                let mut input: Vec<f32> = (0..n_tokens * input_width)
+                    .map(|index| {
+                        let token = index / input_width;
+                        let column = index % input_width;
+                        ((((column * 43 + token * 137) % 257) as f32) - 128.0) * 0.005
+                    })
+                    .collect();
+                // Exercise exact-zero superblocks and the reference's first-
+                // index rule for equal-magnitude opposite-sign maxima.
+                for token in 0..n_tokens {
+                    for sb in 0..n_sb {
+                        let base = token * input_width + sb * 256;
+                        if token == 0 && sb == 0 {
+                            input[base..base + 256].fill(0.0);
+                        } else {
+                            input[base + 7] = 1.25;
+                            input[base + 200] = -1.25;
+                        }
+                    }
+                }
+                let input_buffer = device.new_buffer(
+                    (input.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                write_buffer_f32(&input_buffer, &input);
+
+                let canonical_scales = pool_get(kernel, (n_tokens * n_sb * 4) as u64);
+                let canonical_quants = pool_get(kernel, (n_tokens * input_width) as u64);
+                let canonical_stage = allocate_kquant_v4_activation_stage(
+                    kernel,
+                    input_width,
+                    n_tokens,
+                    with_ysums,
+                    true,
+                );
+                let tiled_scales = pool_get(kernel, (n_tokens * n_sb * 4) as u64);
+                let tiled_stage = allocate_kquant_v4_activation_stage(
+                    kernel,
+                    input_width,
+                    n_tokens,
+                    with_ysums,
+                    true,
+                );
+                for buffer in [&canonical_stage.y_stage, &tiled_stage.y_stage] {
+                    unsafe {
+                        std::ptr::write_bytes(
+                            buffer.contents().cast::<u8>(),
+                            0xa5,
+                            buffer.length() as usize,
+                        );
+                    }
+                }
+                for sums in [canonical_stage.ysums.as_ref(), tiled_stage.ysums.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    unsafe {
+                        std::ptr::write_bytes(
+                            sums.contents().cast::<u8>(),
+                            0xa5,
+                            sums.length() as usize,
+                        );
+                    }
+                }
+
+                let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = scalar.contents().cast::<u32>();
+                    *p = n_sb as u32;
+                    *p.add(1) = rows as u32;
+                    *p.add(2) = n_tokens as u32;
+                }
+                let canonical_output = device.new_buffer(
+                    (physical_columns * rows * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let tiled_output = device.new_buffer(
+                    (physical_columns * rows * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                fill_buffer_sentinel(&canonical_output, physical_columns * rows);
+                fill_buffer_sentinel(&tiled_output, physical_columns * rows);
+
+                let cb = kernel.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                e.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
+                e.set_buffer(0, Some(&input_buffer), 0);
+                e.set_buffer(1, Some(&canonical_scales), 0);
+                e.set_buffer(2, Some(&canonical_quants), 0);
+                e.set_buffer(3, Some(&canonical_stage.scalar), 0);
+                e.set_buffer(4, Some(&canonical_stage.scalar), 8);
+                dispatch_1d(
+                    e,
+                    &kernel.quantize_q8k_rows_pipeline,
+                    n_tokens * n_sb,
+                );
+                encode_kquant_v4_activation_stage(e, v4, &canonical_quants, &canonical_stage);
+                assert!(
+                    encode_kquant_v4_tiled_fragment_stage(
+                        e,
+                        kernel,
+                        &input_buffer,
+                        &tiled_scales,
+                        &tiled_stage,
+                    ),
+                    "{case} N={n_tokens}: production tiled preparation must route"
+                );
+                for (scales, stage, output) in [
+                    (&canonical_scales, &canonical_stage, &canonical_output),
+                    (&tiled_scales, &tiled_stage, &tiled_output),
+                ] {
+                    assert!(encode_kquant_v4_prepared_projection_route(
+                        e,
+                        v4,
+                        scales,
+                        stage,
+                        &weight,
+                        output,
+                        &scalar,
+                        rows,
+                        KquantV4ProjectionRoute::RegisterExact,
+                    ));
+                }
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+                assert_words(
+                    &format!("{case} N={n_tokens} scales"),
+                    &read_u32(&canonical_scales, n_tokens * n_sb),
+                    &read_u32(&tiled_scales, n_tokens * n_sb),
+                );
+                assert_half_words(
+                    &format!("{case} N={n_tokens} fragment y"),
+                    &read_u16(&canonical_stage.y_stage, input_width * physical_columns),
+                    &read_u16(&tiled_stage.y_stage, input_width * physical_columns),
+                );
+                if with_ysums {
+                    assert_half_words(
+                        &format!("{case} N={n_tokens} fragment ysums"),
+                        &read_u16(
+                            canonical_stage.ysums.as_ref().expect("canonical ysums"),
+                            n_sb * 16 * physical_columns,
+                        ),
+                        &read_u16(
+                            tiled_stage.ysums.as_ref().expect("tiled ysums"),
+                            n_sb * 16 * physical_columns,
+                        ),
+                    );
+                }
+                let canonical_projection =
+                    read_u32(&canonical_output, physical_columns * rows);
+                let tiled_projection = read_u32(&tiled_output, physical_columns * rows);
+                let sentinel = KQUANT_TEST_SENTINEL.to_bits();
+                for (route, projection) in [
+                    ("canonical", canonical_projection.as_slice()),
+                    ("tiled", tiled_projection.as_slice()),
+                ] {
+                    assert!(
+                        projection[..n_tokens * rows]
+                            .iter()
+                            .all(|&word| word != sentinel),
+                        "{case} N={n_tokens} {route} projection left an active word untouched"
+                    );
+                    assert!(
+                        projection[n_tokens * rows..]
+                            .iter()
+                            .all(|&word| word == sentinel),
+                        "{case} N={n_tokens} {route} projection wrote a padded word"
+                    );
+                }
+                assert_words(
+                    &format!("{case} N={n_tokens} projection"),
+                    &canonical_projection,
+                    &tiled_projection,
+                );
+            }
+        }
     }
 
     /// Model-free exactness gate for the fragment-major register-exact V2

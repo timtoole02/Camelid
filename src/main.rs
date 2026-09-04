@@ -14575,6 +14575,20 @@ const EAGLE3_SELECTIVE_EDGE_B4_PROOF_PROMPT_SHA256: &str =
 const EAGLE3_SELECTIVE_EDGE_B4_PROOF_ROUNDS: u64 = 78;
 const EAGLE3_SELECTIVE_EDGE_B4_PROOF_MATCHED_ROUNDS: u64 = 73;
 const EAGLE3_SELECTIVE_EDGE_B4_PROOF_FALLBACK_ROUNDS: u64 = 5;
+const EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV: &str =
+    "CAMELID_KQUANT_V4_TILED_PREP_FUSION";
+const EAGLE3_SELECTIVE_EDGE_TILED_PREP_CERTIFICATION_COMMIT: &str =
+    "4124bb6792f5355b1501600773fa51c09b138a1b";
+
+fn validate_eagle3_selective_edge_tiled_prep_overlay(value: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.is_none() || value == Some("1"),
+        "selective B4 promotion admits {EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV} only as exact `1`, \
+         the bit-identical scheduling overlay certified at \
+         {EAGLE3_SELECTIVE_EDGE_TILED_PREP_CERTIFICATION_COMMIT}"
+    );
+    Ok(())
+}
 
 fn parse_eagle3_selective_edge_promotion_env(value: Option<&str>) -> anyhow::Result<bool> {
     match value {
@@ -14736,6 +14750,22 @@ fn validate_eagle3_selective_edge_b4_proof(
     current_model_sha256: &str,
     current_eagle3_sha256: &str,
 ) -> anyhow::Result<Eagle3SelectiveEdgePromotionProof> {
+    // The frozen B4 receipt predates the tiled V4 preparer.  Do not weaken that receipt's
+    // arithmetic descriptor or silently treat arbitrary later gates as proven.  The sole
+    // overlay admitted here is the independently certified, bit-identical scheduling twin;
+    // exact `1` also keeps combined-run receipts unambiguous.
+    let tiled_prep_overlay = std::env::var_os(EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV);
+    let tiled_prep_overlay = tiled_prep_overlay
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{EAGLE3_SELECTIVE_EDGE_TILED_PREP_ENV} is not valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    validate_eagle3_selective_edge_tiled_prep_overlay(tiled_prep_overlay)?;
     let receipt_sha256 = camelid::receipt::sha256_file_hex(path)
         .with_context(|| format!("hashing selective B4 proof {}", path.display()))?;
     anyhow::ensure!(
@@ -14973,6 +15003,14 @@ mod eagle3_transaction_portfolio_shadow_config_tests {
         assert!(!parse_eagle3_selective_edge_promotion_env(Some("0")).unwrap());
         assert!(parse_eagle3_selective_edge_promotion_env(Some("1")).unwrap());
         assert!(parse_eagle3_selective_edge_promotion_env(Some("true")).is_err());
+        assert!(validate_eagle3_selective_edge_tiled_prep_overlay(None).is_ok());
+        assert!(validate_eagle3_selective_edge_tiled_prep_overlay(Some("1")).is_ok());
+        for value in ["", "0", "true", "TRUE", "01", " 1"] {
+            assert!(
+                validate_eagle3_selective_edge_tiled_prep_overlay(Some(value)).is_err(),
+                "unexpectedly admitted tiled-prep overlay {value:?}"
+            );
+        }
         let proof = std::path::Path::new("b4-zero-mismatch.json");
         assert!(validate_eagle3_selective_edge_promotion_config(
             false, None, None, false, false
@@ -16530,6 +16568,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_KQUANT_V4_SOA8",
         "CAMELID_KQUANT_V4_SHARED_PREP",
         "CAMELID_KQUANT_V4_STRICT_PREP_FUSION",
+        "CAMELID_KQUANT_V4_TILED_PREP_FUSION",
         "CAMELID_METAL_VERIFY_BATCH_ROPE_SCATTER",
         "CAMELID_KQUANT_V4_TRACE",
         "CAMELID_KQUANT_MMA",
