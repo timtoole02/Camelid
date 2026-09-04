@@ -1,8 +1,9 @@
 # EAGLE-3 target-authoritative N1 commit pipeline
 
-Status: source-only architecture, frozen-tree host contract, standalone Metal falsifier, and a
-default-off real-model selector shadow. The shadow changes no authoritative state. Every build,
-test, Metal execution, and model measurement belongs on mini2.
+Status: source-only architecture, frozen-tree host contract, standalone Metal falsifier,
+default-off real-model selector/E1 shadows, and a target-blind layer-25 transaction-portfolio
+diagnostic. The shadows change no authoritative state. Every build, test, Metal execution, and
+model measurement belongs on mini2.
 
 ## Architectural correction
 
@@ -410,3 +411,62 @@ post-target work exceeds 1.20 ms, or E1 adds more than 0.25 ms to target verific
 an integrated default-off lane only if parity is exact and the median net saving is at least
 0.70 ms/round. Promotion still requires ordinary Pitch lossless token equality and the full mini2
 regression suite.
+
+### Checkpoint P: layer-25 k-best transaction portfolio (implemented diagnostic, mini2 only)
+
+C1 proved that wide edge K/V can fit completely under the target tail, but its additional unified-
+memory traffic slowed the target enough to lose end-to-end throughput. Before building another
+queue variant, this diagnostic asks a different architectural question: can layer 25 name a small
+set of complete future acceptance transactions early enough to compute those transactions during
+the measured 4.922 ms remaining target-tail interval?
+
+The exact-value gate is:
+
+```text
+CAMELID_BENCH_EAGLE3_TRANSACTION_PORTFOLIO_SHADOW=1
+```
+
+It additionally requires the fixed-N8 certified indexed-head shadow. With the gate absent there is
+no layer-25 RMSNorm, indexed projection, retained score/rank allocation, enumeration, or receipt.
+The scorer's Rust signature accepts only the layer-25 residual buffer, immutable tied output
+weights, dimensions, and the already-frozen candidate union. Full-head logits and target
+predictions are not parameters. Before any CPU comparison reads those authority buffers, the
+scorer emits an authority-free snapshot containing every candidate's exact f32 bits and its
+deterministic rank for every verifier row. Portfolio construction accepts only that snapshot and
+the frozen token/parent/depth tree; acceptance truth first appears in a separate evaluation call.
+
+Scores are candidate-restricted log-softmax probabilities. For each structurally possible
+endpoint, the primary joint candidate is:
+
+```text
+P(accepted child edge 1) * ... * P(accepted child edge d) * P(non-child terminal token)
+```
+
+Sibling token uniqueness makes every edge decision unambiguous. A terminal equal to any child
+token is excluded because the authoritative walk would continue rather than stop. Rankings are
+descending score, then lexicographic path/row and lower terminal token for exact ties. The frozen
+portfolio retains the top joint transactions for B=1,2,4,8. It also reports path-only coverage,
+global `(endpoint row, terminal token)` coverage, exact global ranks (including ranks beyond 8),
+and terminal-token rank conditional on the eventual authoritative leaf. That last conditional
+rank is diagnostic decomposition only and never selects a primary candidate.
+
+The focused source tests are:
+
+```text
+cargo test --release --lib transaction_portfolio -- --nocapture --test-threads=1
+cargo test --release --bin camelid transaction_portfolio -- --nocapture --test-threads=1
+```
+
+On one protected Pitch control/candidate pair, require identical token-array SHA256 and
+`lossless=true`, one scored portfolio receipt per round, zero fallbacks, exact budgets
+`[1,2,4,8]`, and monotone coverage at increasing B. Preserve diagnostic projection/readback time
+separately from production throughput.
+
+The coverage-only go/no-go threshold follows the existing 0.70 ms/round net-saving target. A hit
+can remove at most the measured 2.024 ms serial update; allowing the 0.25 ms target-slowdown ceiling
+requires `hit_rate >= (0.70 + 0.25) / 2.024 = 46.9%` even before miss recovery or transaction-
+preparation residue. Therefore B=8 joint coverage below 50% falsifies this transaction-ahead route.
+If one of B=1,2,4,8 reaches at least 50%, prototype the smallest passing B and then require its
+whole batched transaction GPU interval to fit within 4.922 ms without exceeding the target-
+slowdown ceiling. Endpoint-only, path-only, or truth-conditional coverage cannot satisfy this
+gate; they only identify which component caused a joint miss.

@@ -28,6 +28,29 @@ pub const RESIDENT_INDEXED_HEAD_SHADOW_TILE_ROWS: usize = 8;
 /// while an unbounded caller-supplied union still cannot turn the shadow into a second full head.
 pub const RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES: usize = 1_024;
 
+/// Exact-spelling gate for the layer-25 transaction-portfolio diagnostic.  This is intentionally
+/// stricter than the older exploratory late-lens switch: a malformed campaign environment must
+/// not allocate another indexed projection or retain its readback.
+pub const EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV: &str =
+    "CAMELID_BENCH_EAGLE3_TRANSACTION_PORTFOLIO_SHADOW";
+
+#[cfg(any(target_os = "macos", test))]
+fn eagle3_transaction_portfolio_shadow_setting_enables(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+#[cfg(target_os = "macos")]
+fn eagle3_transaction_portfolio_shadow_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        eagle3_transaction_portfolio_shadow_setting_enables(
+            std::env::var(EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidentIndexedHeadShadowFallbackReason {
     UntiedOutputHead,
@@ -37,6 +60,7 @@ pub enum ResidentIndexedHeadShadowFallbackReason {
     Soa8RouteUnsupported,
     UnsupportedVerifierWidth,
     UnsupportedHiddenWidth,
+    EarlyLayerCaptureUnavailable,
     CandidateBudgetExceeded,
     PartialVocabTile,
     ShapeOverflow,
@@ -54,6 +78,7 @@ impl ResidentIndexedHeadShadowFallbackReason {
             Self::Soa8RouteUnsupported => "soa8_route_not_proven_for_indexed_shadow",
             Self::UnsupportedVerifierWidth => "unsupported_verifier_width",
             Self::UnsupportedHiddenWidth => "unsupported_hidden_width",
+            Self::EarlyLayerCaptureUnavailable => "early_layer_capture_unavailable",
             Self::CandidateBudgetExceeded => "candidate_budget_exceeded",
             Self::PartialVocabTile => "candidate_occupies_partial_vocab_tile",
             Self::ShapeOverflow => "candidate_slab_shape_overflow",
@@ -86,6 +111,35 @@ pub struct ResidentIndexedHeadShadowRow {
     pub first_logit_mismatch: Option<ResidentIndexedHeadShadowLogitMismatch>,
 }
 
+/// Target-blind layer-25 evidence.  Deliberately contains no full-head token, target prediction,
+/// accepted row, or emitted token, so the transaction portfolio can be frozen through an API
+/// that cannot observe current-round authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentIndexedHeadEarlyRow {
+    pub verifier_row: usize,
+    pub candidate_logit_bits: Vec<u32>,
+    pub ranked_candidate_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentIndexedHeadEarlySnapshot {
+    pub layer_id: usize,
+    pub compile_fast_math_enabled: bool,
+    pub candidate_union: Vec<u32>,
+    pub encode_us: u128,
+    pub commit_wait_us: u128,
+    pub gpu_busy_us: u128,
+    pub kernel_window_us: u128,
+    pub fallback_reason: Option<ResidentIndexedHeadShadowFallbackReason>,
+    pub rows: Vec<ResidentIndexedHeadEarlyRow>,
+}
+
+impl ResidentIndexedHeadEarlySnapshot {
+    pub fn scored(&self) -> bool {
+        self.fallback_reason.is_none()
+    }
+}
+
 /// Result of the default-off indexed output-head replay.
 ///
 /// The ordinary full-vocabulary projection and argmax always complete before this diagnostic
@@ -106,6 +160,9 @@ pub struct ResidentIndexedHeadShadow {
     pub kernel_window_us: u128,
     pub fallback_reason: Option<ResidentIndexedHeadShadowFallbackReason>,
     pub rows: Vec<ResidentIndexedHeadShadowRow>,
+    /// Populated only under `EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV`; `None` preserves the
+    /// established indexed-head allocation and scoring path byte-for-byte.
+    pub early_layer25: Option<ResidentIndexedHeadEarlySnapshot>,
 }
 
 /// Immutable verifier-tree arrays consumed by the default-off device-acceptance shadow.
@@ -32095,6 +32152,29 @@ fn resident_indexed_head_strict_argmax_sorted(
     best_token.map(|token| (token, best_score))
 }
 
+/// Complete deterministic rank used by the early transaction diagnostic. This deliberately
+/// mirrors the production argmax's selectable domain, while retaining the rejected score bits
+/// separately: NaN and negative infinity have no rank; exact score ties prefer lower token id.
+#[cfg(any(target_os = "macos", test))]
+fn resident_indexed_head_ranked_tokens(candidate_scores: &[(u32, f32)]) -> Vec<u32> {
+    debug_assert!(candidate_scores
+        .windows(2)
+        .all(|pair| pair[0].0 < pair[1].0));
+    let mut ranked = candidate_scores
+        .iter()
+        .copied()
+        .filter(|(_, score)| *score > f32::NEG_INFINITY)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_token, left_score), (right_token, right_score)| {
+        if left_score == right_score {
+            left_token.cmp(right_token)
+        } else {
+            right_score.total_cmp(left_score)
+        }
+    });
+    ranked.into_iter().map(|(token, _)| token).collect()
+}
+
 #[cfg(test)]
 mod resident_indexed_head_shadow_contract_tests {
     use super::*;
@@ -32188,6 +32268,27 @@ mod resident_indexed_head_shadow_contract_tests {
             resident_indexed_head_strict_argmax_sorted(&[(3, f32::NAN), (7, f32::NEG_INFINITY),]),
             None
         );
+        assert_eq!(
+            resident_indexed_head_ranked_tokens(&[
+                (3, 2.0),
+                (7, f32::NAN),
+                (9, 2.0),
+                (11, f32::NEG_INFINITY),
+                (13, 3.0),
+            ]),
+            vec![13, 3, 9]
+        );
+    }
+
+    #[test]
+    fn transaction_portfolio_gate_is_exact_and_default_off() {
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(None));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("")));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("0")));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("true")));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("01")));
+        assert!(eagle3_transaction_portfolio_shadow_setting_enables(Some("1")));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some(" 1\n")));
     }
 }
 
@@ -39317,6 +39418,7 @@ fn resident_indexed_head_shadow_fallback(
         kernel_window_us: 0,
         fallback_reason: Some(reason),
         rows: Vec::new(),
+        early_layer25: None,
     }
 }
 
@@ -39337,84 +39439,75 @@ fn eagle3_late_lens_shadow_enabled() -> bool {
     })
 }
 
-/// Replay only retained target-output rows after the authoritative full head has completed.
+/// Authority-free output of one indexed projection.  The projection lane owns only the supplied
+/// residual rows, immutable output weights, and the caller's frozen candidate ids.  In
+/// particular, this type and its producer cannot receive or retain the full-head logits or
+/// predictions that decide the current round.
+#[cfg(target_os = "macos")]
+struct ResidentIndexedHeadProjectionRow {
+    verifier_row: usize,
+    candidate_scores: Vec<(u32, f32)>,
+}
+
+#[cfg(target_os = "macos")]
+struct ResidentIndexedHeadProjection {
+    candidate_union: Vec<u32>,
+    candidate_tile_rows: usize,
+    candidate_weight_bytes: usize,
+    output_weight_format: &'static str,
+    encode_us: u128,
+    commit_wait_us: u128,
+    gpu_busy_us: u128,
+    kernel_window_us: u128,
+    rows: Vec<ResidentIndexedHeadProjectionRow>,
+}
+
+/// Project only the supplied residual rows over a frozen candidate union.
 ///
 /// Each candidate gets a complete copy of its original aligned eight-row Q6 wire tile. The
 /// existing resident matmul helper therefore sees the same bytes at the same local matrix row,
 /// runs the same strict Q8_K quantization, half staging, active V4 route, and increasing-
-/// superblock f32 fold, and writes a score that can be compared directly with the full logits.
-/// No score from this function is allowed to feed target acceptance or token emission.
+/// superblock f32 fold. This primitive has no authority inputs; a caller may either retain an
+/// early snapshot or compare the scores with a completed full head in a separate function.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn run_resident_indexed_head_shadow(
+fn run_resident_indexed_head_projection(
     kern: &MetalLinearKernel,
-    final_norm: &Buffer,
-    full_logits: &Buffer,
-    authoritative_predictions: &Buffer,
+    residual_rows: &Buffer,
     output_weight: &ResidentLinearWeight,
     output_is_tied_embedding: bool,
     hidden: usize,
     vocab: usize,
     n_tokens: usize,
     candidate_ids: &[u32],
-) -> ResidentIndexedHeadShadow {
+) -> Result<ResidentIndexedHeadProjection, ResidentIndexedHeadShadowFallbackReason> {
     let format = output_weight.format;
     if !output_is_tied_embedding {
-        return resident_indexed_head_shadow_fallback(
-            format,
-            candidate_ids,
-            ResidentIndexedHeadShadowFallbackReason::UntiedOutputHead,
-        );
+        return Err(ResidentIndexedHeadShadowFallbackReason::UntiedOutputHead);
     }
     if format != ResidentWeightFormat::Q6K {
-        return resident_indexed_head_shadow_fallback(
-            format,
-            candidate_ids,
-            ResidentIndexedHeadShadowFallbackReason::OutputHeadFormat,
-        );
+        return Err(ResidentIndexedHeadShadowFallbackReason::OutputHeadFormat);
     }
     if !kquant_v4_enabled() {
-        return resident_indexed_head_shadow_fallback(
-            format,
-            candidate_ids,
-            ResidentIndexedHeadShadowFallbackReason::KquantV4Disabled,
-        );
+        return Err(ResidentIndexedHeadShadowFallbackReason::KquantV4Disabled);
     }
     if !(1..=8).contains(&n_tokens) {
-        return resident_indexed_head_shadow_fallback(
-            format,
-            candidate_ids,
-            ResidentIndexedHeadShadowFallbackReason::UnsupportedVerifierWidth,
-        );
+        return Err(ResidentIndexedHeadShadowFallbackReason::UnsupportedVerifierWidth);
     }
     // The current SOA experiment owns an independently validated sidecar and route precedence.
     // This first diagnostic has no compact SOA sidecar, so decline it instead of silently mixing
     // arithmetic routes. The authoritative full head above remains unchanged.
     if kquant_v4_soa8_enabled() {
-        return resident_indexed_head_shadow_fallback(
-            format,
-            candidate_ids,
-            ResidentIndexedHeadShadowFallbackReason::Soa8RouteUnsupported,
-        );
+        return Err(ResidentIndexedHeadShadowFallbackReason::Soa8RouteUnsupported);
     }
     // The full projection resolves this same lazy library. A miss means it fell through to an
     // older arithmetic universe, so replaying V4 would not be an exact comparison.
     if kquant_v2_kernels().is_none() {
-        return resident_indexed_head_shadow_fallback(
-            format,
-            candidate_ids,
-            ResidentIndexedHeadShadowFallbackReason::KquantV4PipelinesUnavailable,
-        );
+        return Err(ResidentIndexedHeadShadowFallbackReason::KquantV4PipelinesUnavailable);
     }
     let source_buffer_bytes = match usize::try_from(output_weight.buffer.length()) {
         Ok(bytes) => bytes,
-        Err(_) => {
-            return resident_indexed_head_shadow_fallback(
-                format,
-                candidate_ids,
-                ResidentIndexedHeadShadowFallbackReason::ShapeOverflow,
-            );
-        }
+        Err(_) => return Err(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow),
     };
     let plan = match resident_indexed_head_tile_plan(
         format,
@@ -39424,22 +39517,14 @@ fn run_resident_indexed_head_shadow(
         candidate_ids,
     ) {
         Ok(plan) => plan,
-        Err(reason) => {
-            return resident_indexed_head_shadow_fallback(format, candidate_ids, reason);
-        }
+        Err(reason) => return Err(reason),
     };
     let candidate_logits_bytes = match n_tokens
         .checked_mul(plan.slab_rows)
         .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
     {
         Some(bytes) => bytes,
-        None => {
-            return resident_indexed_head_shadow_fallback(
-                format,
-                candidate_ids,
-                ResidentIndexedHeadShadowFallbackReason::ShapeOverflow,
-            );
-        }
+        None => return Err(ResidentIndexedHeadShadowFallbackReason::ShapeOverflow),
     };
 
     let weight_slab = pool_get(kern, plan.slab_bytes as u64);
@@ -39475,7 +39560,7 @@ fn run_resident_indexed_head_shadow(
             encoder,
             kern,
             &mut keep,
-            final_norm,
+            residual_rows,
             &candidate_weight,
             &candidate_logits,
             &projection_scalar,
@@ -39493,65 +39578,29 @@ fn run_resident_indexed_head_shadow(
     if cb.status() != metal::MTLCommandBufferStatus::Completed {
         keep.extend([weight_slab, candidate_logits, projection_scalar]);
         pool_recycle(kern, keep);
-        return resident_indexed_head_shadow_fallback(
-            format,
-            candidate_ids,
-            ResidentIndexedHeadShadowFallbackReason::CommandBufferFailed,
-        );
+        return Err(ResidentIndexedHeadShadowFallbackReason::CommandBufferFailed);
     }
     let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb);
 
     let mut replay_logits = vec![0.0f32; n_tokens * plan.slab_rows];
     read_buffer_f32(&candidate_logits, &mut replay_logits);
-    let full_logits_ptr = full_logits.contents() as *const f32;
-    let predictions_ptr = authoritative_predictions.contents() as *const u32;
     let mut rows = Vec::with_capacity(n_tokens);
     for verifier_row in 0..n_tokens {
         let mut scores = Vec::with_capacity(candidate_ids.len());
-        let mut exact_logit_agreements = 0usize;
-        let mut first_logit_mismatch = None;
         for copy in &plan.copies {
             let indexed_score =
                 replay_logits[verifier_row * plan.slab_rows + copy.selected_slab_row];
-            let full_score =
-                unsafe { *full_logits_ptr.add(verifier_row * vocab + copy.token_id as usize) };
-            if indexed_score.to_bits() == full_score.to_bits() {
-                exact_logit_agreements += 1;
-            } else if first_logit_mismatch.is_none() {
-                first_logit_mismatch = Some(ResidentIndexedHeadShadowLogitMismatch {
-                    token_id: copy.token_id,
-                    indexed_logit_bits: indexed_score.to_bits(),
-                    full_head_logit_bits: full_score.to_bits(),
-                });
-            }
             scores.push((copy.token_id, indexed_score));
         }
-        let top1 = resident_indexed_head_strict_argmax_sorted(&scores);
-        let authoritative_argmax_token = unsafe { *predictions_ptr.add(verifier_row) };
-        let authoritative_argmax_logit_bits =
-            ((authoritative_argmax_token as usize) < vocab).then(|| unsafe {
-                (*full_logits_ptr.add(verifier_row * vocab + authoritative_argmax_token as usize))
-                    .to_bits()
-            });
-        rows.push(ResidentIndexedHeadShadowRow {
+        rows.push(ResidentIndexedHeadProjectionRow {
             verifier_row,
-            candidate_top1_token: top1.map(|(token, _)| token),
-            candidate_top1_logit_bits: top1.map(|(_, score)| score.to_bits()),
-            authoritative_argmax_token,
-            authoritative_argmax_logit_bits,
-            top1_matches_authoritative: top1
-                .is_some_and(|(token, _)| token == authoritative_argmax_token),
-            compared_logits: candidate_ids.len(),
-            exact_logit_agreements,
-            all_candidate_logits_exact: exact_logit_agreements == candidate_ids.len(),
-            first_logit_mismatch,
+            candidate_scores: scores,
         });
     }
 
     keep.extend([weight_slab, candidate_logits, projection_scalar]);
     pool_recycle(kern, keep);
-    ResidentIndexedHeadShadow {
-        compile_fast_math_enabled: false,
+    Ok(ResidentIndexedHeadProjection {
         candidate_union: candidate_ids.to_vec(),
         candidate_tile_rows: plan.slab_rows,
         candidate_weight_bytes: plan.slab_bytes,
@@ -39560,8 +39609,206 @@ fn run_resident_indexed_head_shadow(
         commit_wait_us,
         gpu_busy_us,
         kernel_window_us,
+        rows,
+    })
+}
+
+/// Compare an authority-free projection with the completed production head.  Keeping this
+/// boundary separate is important: the early portfolio calls the projection primitive directly
+/// and has no way to invoke this comparison without being handed authority buffers explicitly.
+#[cfg(target_os = "macos")]
+fn resident_indexed_head_shadow_from_projection(
+    projection: ResidentIndexedHeadProjection,
+    full_logits: &Buffer,
+    authoritative_predictions: &Buffer,
+    vocab: usize,
+) -> ResidentIndexedHeadShadow {
+    let ResidentIndexedHeadProjection {
+        candidate_union,
+        candidate_tile_rows,
+        candidate_weight_bytes,
+        output_weight_format,
+        encode_us,
+        commit_wait_us,
+        gpu_busy_us,
+        kernel_window_us,
+        rows: projection_rows,
+    } = projection;
+    let full_logits_ptr = full_logits.contents() as *const f32;
+    let predictions_ptr = authoritative_predictions.contents() as *const u32;
+    let mut rows = Vec::with_capacity(projection_rows.len());
+    for projected in projection_rows {
+        let mut exact_logit_agreements = 0usize;
+        let mut first_logit_mismatch = None;
+        for &(token_id, indexed_score) in &projected.candidate_scores {
+            let full_score = unsafe {
+                *full_logits_ptr.add(projected.verifier_row * vocab + token_id as usize)
+            };
+            if indexed_score.to_bits() == full_score.to_bits() {
+                exact_logit_agreements += 1;
+            } else if first_logit_mismatch.is_none() {
+                first_logit_mismatch = Some(ResidentIndexedHeadShadowLogitMismatch {
+                    token_id,
+                    indexed_logit_bits: indexed_score.to_bits(),
+                    full_head_logit_bits: full_score.to_bits(),
+                });
+            }
+        }
+        let top1 = resident_indexed_head_strict_argmax_sorted(&projected.candidate_scores);
+        let authoritative_argmax_token =
+            unsafe { *predictions_ptr.add(projected.verifier_row) };
+        let authoritative_argmax_logit_bits =
+            ((authoritative_argmax_token as usize) < vocab).then(|| unsafe {
+                (*full_logits_ptr.add(
+                    projected.verifier_row * vocab + authoritative_argmax_token as usize,
+                ))
+                .to_bits()
+            });
+        let compared_logits = projected.candidate_scores.len();
+        rows.push(ResidentIndexedHeadShadowRow {
+            verifier_row: projected.verifier_row,
+            candidate_top1_token: top1.map(|(token, _)| token),
+            candidate_top1_logit_bits: top1.map(|(_, score)| score.to_bits()),
+            authoritative_argmax_token,
+            authoritative_argmax_logit_bits,
+            top1_matches_authoritative: top1
+                .is_some_and(|(token, _)| token == authoritative_argmax_token),
+            compared_logits,
+            exact_logit_agreements,
+            all_candidate_logits_exact: exact_logit_agreements == compared_logits,
+            first_logit_mismatch,
+        });
+    }
+    ResidentIndexedHeadShadow {
+        compile_fast_math_enabled: false,
+        candidate_union,
+        candidate_tile_rows,
+        candidate_weight_bytes,
+        output_weight_format,
+        encode_us,
+        commit_wait_us,
+        gpu_busy_us,
+        kernel_window_us,
         fallback_reason: None,
         rows,
+        early_layer25: None,
+    }
+}
+
+/// Replay retained final-normalized rows and compare them with the authoritative full head.
+/// This preserves the established indexed-head diagnostic; none of its comparison fields are
+/// exposed through the early-portfolio scorer.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_resident_indexed_head_shadow(
+    kern: &MetalLinearKernel,
+    final_norm: &Buffer,
+    full_logits: &Buffer,
+    authoritative_predictions: &Buffer,
+    output_weight: &ResidentLinearWeight,
+    output_is_tied_embedding: bool,
+    hidden: usize,
+    vocab: usize,
+    n_tokens: usize,
+    candidate_ids: &[u32],
+) -> ResidentIndexedHeadShadow {
+    match run_resident_indexed_head_projection(
+        kern,
+        final_norm,
+        output_weight,
+        output_is_tied_embedding,
+        hidden,
+        vocab,
+        n_tokens,
+        candidate_ids,
+    ) {
+        Ok(projection) => resident_indexed_head_shadow_from_projection(
+            projection,
+            full_logits,
+            authoritative_predictions,
+            vocab,
+        ),
+        Err(reason) => {
+            resident_indexed_head_shadow_fallback(output_weight.format, candidate_ids, reason)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resident_indexed_head_early_fallback(
+    layer_id: usize,
+    candidate_ids: &[u32],
+    reason: ResidentIndexedHeadShadowFallbackReason,
+) -> ResidentIndexedHeadEarlySnapshot {
+    ResidentIndexedHeadEarlySnapshot {
+        layer_id,
+        compile_fast_math_enabled: false,
+        candidate_union: candidate_ids.to_vec(),
+        encode_us: 0,
+        commit_wait_us: 0,
+        gpu_busy_us: 0,
+        kernel_window_us: 0,
+        fallback_reason: Some(reason),
+        rows: Vec::new(),
+    }
+}
+
+/// Score the layer-25 rows without any access to current-round target authority.  Its signature
+/// is the causal contract: only the early residual buffer, immutable head weights, dimensions,
+/// and the candidate union cross this boundary.  Full logits and predictions are not optional
+/// parameters; they are absent.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_resident_indexed_head_early_snapshot(
+    kern: &MetalLinearKernel,
+    layer_id: usize,
+    layer25_norm: &Buffer,
+    output_weight: &ResidentLinearWeight,
+    output_is_tied_embedding: bool,
+    hidden: usize,
+    vocab: usize,
+    n_tokens: usize,
+    candidate_ids: &[u32],
+) -> ResidentIndexedHeadEarlySnapshot {
+    let projection = match run_resident_indexed_head_projection(
+        kern,
+        layer25_norm,
+        output_weight,
+        output_is_tied_embedding,
+        hidden,
+        vocab,
+        n_tokens,
+        candidate_ids,
+    ) {
+        Ok(projection) => projection,
+        Err(reason) => {
+            return resident_indexed_head_early_fallback(layer_id, candidate_ids, reason);
+        }
+    };
+    ResidentIndexedHeadEarlySnapshot {
+        layer_id,
+        compile_fast_math_enabled: false,
+        candidate_union: projection.candidate_union,
+        encode_us: projection.encode_us,
+        commit_wait_us: projection.commit_wait_us,
+        gpu_busy_us: projection.gpu_busy_us,
+        kernel_window_us: projection.kernel_window_us,
+        fallback_reason: None,
+        rows: projection
+            .rows
+            .into_iter()
+            .map(|row| ResidentIndexedHeadEarlyRow {
+                verifier_row: row.verifier_row,
+                candidate_logit_bits: row
+                    .candidate_scores
+                    .iter()
+                    .map(|(_, score)| score.to_bits())
+                    .collect(),
+                ranked_candidate_tokens: resident_indexed_head_ranked_tokens(
+                    &row.candidate_scores,
+                ),
+            })
+            .collect(),
     }
 }
 
@@ -44516,9 +44763,72 @@ impl ResidentDecodeState {
                 ATTN_PREFETCH_ROW_ENCODES.load(std::sync::atomic::Ordering::Relaxed)
             );
         }
+        let transaction_portfolio_shadow = eagle3_transaction_portfolio_shadow_enabled();
+        // Freeze the authority-free layer-25 evidence before any CPU code below reads or compares
+        // the full-head logits/predictions. The target command buffer has completed, but neither
+        // authority buffer crosses the scorer's signature. This remains a state-inert diagnostic.
+        let early_layer25 = if transaction_portfolio_shadow {
+            indexed_head_shadow_candidates.map(|candidate_ids| {
+                let layer_id = *crate::eagle3::TARGET_LAYER_INPUT_IDS
+                    .last()
+                    .expect("EAGLE capture contract is non-empty");
+                let capture_slot = match capture_layer_ids.binary_search(&layer_id) {
+                    Ok(slot) if slot < capture_bufs.len() => slot,
+                    _ => {
+                        return resident_indexed_head_early_fallback(
+                            layer_id,
+                            candidate_ids,
+                            ResidentIndexedHeadShadowFallbackReason::EarlyLayerCaptureUnavailable,
+                        );
+                    }
+                };
+                let lens_norm =
+                    pool_get(kern, (k * hidden * std::mem::size_of::<f32>()) as u64);
+                let lens_cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
+                {
+                    let lens_encoder = lens_cb.new_compute_command_encoder();
+                    encode_rms_norm_batch(
+                        kern,
+                        lens_encoder,
+                        &capture_bufs[capture_slot],
+                        &final_norm_buf,
+                        &lens_norm,
+                        &rms_scalar,
+                        k,
+                    );
+                    lens_encoder.end_encoding();
+                }
+                lens_cb.commit();
+                lens_cb.wait_until_completed();
+                let snapshot = if lens_cb.status() == metal::MTLCommandBufferStatus::Completed {
+                    run_resident_indexed_head_early_snapshot(
+                        kern,
+                        layer_id,
+                        &lens_norm,
+                        &ow_buf,
+                        logits.output_is_tied_embedding,
+                        hidden,
+                        vocab,
+                        k,
+                        candidate_ids,
+                    )
+                } else {
+                    resident_indexed_head_early_fallback(
+                        layer_id,
+                        candidate_ids,
+                        ResidentIndexedHeadShadowFallbackReason::CommandBufferFailed,
+                    )
+                };
+                pool_recycle(kern, [lens_norm]);
+                snapshot
+            })
+        } else {
+            None
+        };
+
         // Strictly post-authoritative diagnostic. The full head, production argmax, and their
         // completed command buffer above remain the sole source of predictions.
-        let indexed_head_shadow = indexed_head_shadow_candidates.map(|candidate_ids| {
+        let mut indexed_head_shadow = indexed_head_shadow_candidates.map(|candidate_ids| {
             run_resident_indexed_head_shadow(
                 kern,
                 &fnorm_buf,
@@ -44532,15 +44842,17 @@ impl ResidentDecodeState {
                 candidate_ids,
             )
         });
-        // Diagnostic-only logit lens over the EAGLE capture layers.  The production target has
-        // already completed above, so these predictions cannot influence this round.  The
-        // purpose is to measure whether a late capture can name the eventual accepted path soon
-        // enough for a future second-queue implementation to prepare the next draft under the
-        // still-running target tail.
+        if let (Some(shadow), Some(early)) = (indexed_head_shadow.as_mut(), early_layer25) {
+            shadow.early_layer25 = Some(early);
+        }
+
+        // Legacy diagnostic-only logit lens over all EAGLE capture layers. The production target
+        // has already completed above, so these comparisons cannot influence this round.
         if eagle3_late_lens_shadow_enabled() {
             if let Some(candidate_ids) = indexed_head_shadow_candidates {
                 for (capture_slot, &layer_id) in capture_layer_ids.iter().enumerate() {
-                    let lens_norm = pool_get(kern, (k * hidden * std::mem::size_of::<f32>()) as u64);
+                    let lens_norm =
+                        pool_get(kern, (k * hidden * std::mem::size_of::<f32>()) as u64);
                     let lens_cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
                     {
                         let lens_encoder = lens_cb.new_compute_command_encoder();

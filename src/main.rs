@@ -10710,6 +10710,341 @@ fn eagle3_indexed_head_direct_emission_predictions(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioEarlyRowReceipt {
+    verifier_row: usize,
+    /// Exact layer-25 indexed logits in `candidate_union` order.
+    candidate_logit_bits: Vec<u32>,
+    /// Selectable candidates in deterministic descending-score/lower-id-tie order.
+    ranked_candidate_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioCandidateReceipt {
+    path_rows: Vec<usize>,
+    terminal_token: u32,
+    candidate_restricted_log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioPathReceipt {
+    path_rows: Vec<usize>,
+    marginalized_log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioEndpointReceipt {
+    verifier_row: usize,
+    terminal_token: u32,
+    candidate_restricted_log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct Eagle3TransactionPortfolioCoverageReceipt {
+    budget: usize,
+    transaction_covered: bool,
+    path_covered: bool,
+    endpoint_covered: bool,
+    /// Uses the authoritative leaf only after the target-blind portfolio is frozen.
+    terminal_at_authoritative_leaf_covered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum Eagle3TransactionPortfolioRoundReceipt {
+    Scored {
+        round: u64,
+        layer_id: usize,
+        score_policy: &'static str,
+        portfolio_frozen_before_authority_evaluation: bool,
+        tree_tokens: Vec<u32>,
+        tree_parent: Vec<i32>,
+        tree_depth: Vec<u16>,
+        candidate_union: Vec<u32>,
+        early_rows: Vec<Eagle3TransactionPortfolioEarlyRowReceipt>,
+        transaction_candidates_considered: usize,
+        path_candidates_considered: usize,
+        endpoint_candidates_considered: usize,
+        top_transactions: Vec<Eagle3TransactionPortfolioCandidateReceipt>,
+        top_paths: Vec<Eagle3TransactionPortfolioPathReceipt>,
+        top_endpoints: Vec<Eagle3TransactionPortfolioEndpointReceipt>,
+        indexed_head_encode_us: u128,
+        indexed_head_commit_wait_us: u128,
+        indexed_head_gpu_busy_us: u128,
+        indexed_head_kernel_window_us: u128,
+        authoritative_path_rows: Vec<usize>,
+        authoritative_leaf_row: usize,
+        authoritative_terminal_token: u32,
+        transaction_rank: Option<usize>,
+        path_rank: Option<usize>,
+        endpoint_rank: Option<usize>,
+        terminal_rank_at_authoritative_leaf: Option<usize>,
+        coverage: [Eagle3TransactionPortfolioCoverageReceipt; 4],
+    },
+    Fallback {
+        round: u64,
+        reason: String,
+    },
+}
+
+type Eagle3PendingTransactionPortfolio = std::result::Result<
+    camelid::eagle3_runtime::Eagle3EarlyTransactionPortfolio,
+    String,
+>;
+
+fn freeze_eagle3_transaction_portfolio(
+    enabled: bool,
+    tree: &camelid::inference::spec_tree::TokenTree,
+    early_layer25: Option<&camelid::metal::ResidentIndexedHeadEarlySnapshot>,
+) -> anyhow::Result<Option<Eagle3PendingTransactionPortfolio>> {
+    if !enabled {
+        anyhow::ensure!(
+            early_layer25.is_none(),
+            "layer-25 transaction evidence was retained while its gate was disabled"
+        );
+        return Ok(None);
+    }
+    let frozen = early_layer25
+        .ok_or_else(|| "layer-25 early snapshot unavailable".to_string())
+        .and_then(|early| {
+            camelid::eagle3_runtime::Eagle3EarlyTransactionPortfolio::freeze(tree, early)
+                .map_err(|error| error.to_string())
+        });
+    Ok(Some(frozen))
+}
+
+fn record_eagle3_transaction_portfolio_round(
+    enabled: bool,
+    round: u64,
+    frozen: Option<Eagle3PendingTransactionPortfolio>,
+    acceptance: &camelid::eagle3_runtime::Eagle3ForestAcceptance,
+    receipts: &mut Vec<Eagle3TransactionPortfolioRoundReceipt>,
+) -> anyhow::Result<()> {
+    if !enabled {
+        anyhow::ensure!(
+            frozen.is_none(),
+            "transaction portfolio was frozen while its gate was disabled"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        receipts.last().is_none_or(|previous| match previous {
+            Eagle3TransactionPortfolioRoundReceipt::Scored { round: prior, .. }
+            | Eagle3TransactionPortfolioRoundReceipt::Fallback { round: prior, .. } => {
+                *prior < round
+            }
+        }),
+        "transaction portfolio round ids are not strictly increasing"
+    );
+    let receipt = match frozen.expect("enabled transaction portfolio must carry a freeze result") {
+        Err(reason) => Eagle3TransactionPortfolioRoundReceipt::Fallback { round, reason },
+        Ok(portfolio) => match portfolio.evaluate(acceptance) {
+            Err(error) => Eagle3TransactionPortfolioRoundReceipt::Fallback {
+                round,
+                reason: error.to_string(),
+            },
+            Ok(evaluation) => {
+                let coverage = evaluation.coverage.map(|coverage| {
+                    Eagle3TransactionPortfolioCoverageReceipt {
+                        budget: coverage.budget,
+                        transaction_covered: coverage.transaction_covered,
+                        path_covered: coverage.path_covered,
+                        endpoint_covered: coverage.endpoint_covered,
+                        terminal_at_authoritative_leaf_covered: coverage
+                            .terminal_at_authoritative_leaf_covered,
+                    }
+                });
+                Eagle3TransactionPortfolioRoundReceipt::Scored {
+                    round,
+                    layer_id: portfolio.layer_id,
+                    score_policy: "candidate_restricted_log_softmax_joint_probability",
+                    portfolio_frozen_before_authority_evaluation: true,
+                    tree_tokens: portfolio.tree_tokens,
+                    tree_parent: portfolio.tree_parent,
+                    tree_depth: portfolio.tree_depth,
+                    candidate_union: portfolio.candidate_union,
+                    early_rows: portfolio
+                        .early_rows
+                        .into_iter()
+                        .map(|row| Eagle3TransactionPortfolioEarlyRowReceipt {
+                            verifier_row: row.verifier_row,
+                            candidate_logit_bits: row.candidate_logit_bits,
+                            ranked_candidate_tokens: row.ranked_candidate_tokens,
+                        })
+                        .collect(),
+                    transaction_candidates_considered: portfolio
+                        .transaction_candidates_considered,
+                    path_candidates_considered: portfolio.path_candidates_considered,
+                    endpoint_candidates_considered: portfolio.endpoint_candidates_considered,
+                    top_transactions: portfolio
+                        .top_transactions
+                        .into_iter()
+                        .map(|candidate| Eagle3TransactionPortfolioCandidateReceipt {
+                            path_rows: candidate.path_rows,
+                            terminal_token: candidate.terminal_token,
+                            candidate_restricted_log_probability_bits: candidate
+                                .log_probability_bits,
+                        })
+                        .collect(),
+                    top_paths: portfolio
+                        .top_paths
+                        .into_iter()
+                        .map(|candidate| Eagle3TransactionPortfolioPathReceipt {
+                            path_rows: candidate.path_rows,
+                            marginalized_log_probability_bits: candidate.log_probability_bits,
+                        })
+                        .collect(),
+                    top_endpoints: portfolio
+                        .top_endpoints
+                        .into_iter()
+                        .map(|candidate| Eagle3TransactionPortfolioEndpointReceipt {
+                            verifier_row: candidate.verifier_row,
+                            terminal_token: candidate.terminal_token,
+                            candidate_restricted_log_probability_bits: candidate
+                                .log_probability_bits,
+                        })
+                        .collect(),
+                    indexed_head_encode_us: portfolio.indexed_head_encode_us,
+                    indexed_head_commit_wait_us: portfolio.indexed_head_commit_wait_us,
+                    indexed_head_gpu_busy_us: portfolio.indexed_head_gpu_busy_us,
+                    indexed_head_kernel_window_us: portfolio.indexed_head_kernel_window_us,
+                    authoritative_path_rows: evaluation.authoritative_path_rows,
+                    authoritative_leaf_row: evaluation.authoritative_leaf_row,
+                    authoritative_terminal_token: evaluation.authoritative_terminal_token,
+                    transaction_rank: evaluation.transaction_rank,
+                    path_rank: evaluation.path_rank,
+                    endpoint_rank: evaluation.endpoint_rank,
+                    terminal_rank_at_authoritative_leaf: evaluation
+                        .terminal_rank_at_authoritative_leaf,
+                    coverage,
+                }
+            }
+        },
+    };
+    match &receipt {
+        Eagle3TransactionPortfolioRoundReceipt::Scored {
+            transaction_rank,
+            path_rank,
+            endpoint_rank,
+            terminal_rank_at_authoritative_leaf,
+            coverage,
+            ..
+        } => eprintln!(
+            "[eagle3-transaction-portfolio] round={round} outcome=scored transaction_rank={transaction_rank:?} path_rank={path_rank:?} endpoint_rank={endpoint_rank:?} conditional_terminal_rank={terminal_rank_at_authoritative_leaf:?} metric_order=transaction/path/endpoint/conditional-terminal b1={}/{}/{}/{} b2={}/{}/{}/{} b4={}/{}/{}/{} b8={}/{}/{}/{}",
+            u8::from(coverage[0].transaction_covered),
+            u8::from(coverage[0].path_covered),
+            u8::from(coverage[0].endpoint_covered),
+            u8::from(coverage[0].terminal_at_authoritative_leaf_covered),
+            u8::from(coverage[1].transaction_covered),
+            u8::from(coverage[1].path_covered),
+            u8::from(coverage[1].endpoint_covered),
+            u8::from(coverage[1].terminal_at_authoritative_leaf_covered),
+            u8::from(coverage[2].transaction_covered),
+            u8::from(coverage[2].path_covered),
+            u8::from(coverage[2].endpoint_covered),
+            u8::from(coverage[2].terminal_at_authoritative_leaf_covered),
+            u8::from(coverage[3].transaction_covered),
+            u8::from(coverage[3].path_covered),
+            u8::from(coverage[3].endpoint_covered),
+            u8::from(coverage[3].terminal_at_authoritative_leaf_covered),
+        ),
+        Eagle3TransactionPortfolioRoundReceipt::Fallback { reason, .. } => eprintln!(
+            "[eagle3-transaction-portfolio] round={round} outcome=fallback reason={reason:?}"
+        ),
+    }
+    receipts.push(receipt);
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_transaction_portfolio_receipt_tests {
+    use super::*;
+
+    fn root_only_fixture() -> (
+        camelid::inference::spec_tree::TokenTree,
+        camelid::metal::ResidentIndexedHeadEarlySnapshot,
+    ) {
+        (
+            camelid::inference::spec_tree::TokenTree {
+                tokens: vec![1],
+                parent: vec![-1],
+                depth: vec![0],
+            },
+            camelid::metal::ResidentIndexedHeadEarlySnapshot {
+                layer_id: 25,
+                compile_fast_math_enabled: false,
+                candidate_union: vec![2, 3],
+                encode_us: 5,
+                commit_wait_us: 7,
+                gpu_busy_us: 3,
+                kernel_window_us: 4,
+                fallback_reason: None,
+                rows: vec![camelid::metal::ResidentIndexedHeadEarlyRow {
+                    verifier_row: 0,
+                    candidate_logit_bits: vec![2.0f32.to_bits(), 1.0f32.to_bits()],
+                    ranked_candidate_tokens: vec![2, 3],
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn transaction_portfolio_freezes_then_records_authority_separately() {
+        let (tree, early) = root_only_fixture();
+        let frozen = freeze_eagle3_transaction_portfolio(true, &tree, Some(&early))
+            .unwrap()
+            .expect("enabled diagnostic carries a frozen result");
+        let acceptance = camelid::eagle3_runtime::Eagle3ForestAcceptance {
+            emitted_tokens: vec![2],
+            leaf_row: 0,
+            capture_rows: vec![0],
+            source_nodes: Vec::new(),
+        };
+        let mut receipts = Vec::new();
+        record_eagle3_transaction_portfolio_round(
+            true,
+            1,
+            Some(frozen),
+            &acceptance,
+            &mut receipts,
+        )
+        .unwrap();
+        match &receipts[0] {
+            Eagle3TransactionPortfolioRoundReceipt::Scored {
+                portfolio_frozen_before_authority_evaluation,
+                transaction_rank,
+                path_rank,
+                endpoint_rank,
+                terminal_rank_at_authoritative_leaf,
+                coverage,
+                ..
+            } => {
+                assert!(*portfolio_frozen_before_authority_evaluation);
+                assert_eq!(*transaction_rank, Some(1));
+                assert_eq!(*path_rank, Some(1));
+                assert_eq!(*endpoint_rank, Some(1));
+                assert_eq!(*terminal_rank_at_authoritative_leaf, Some(1));
+                assert!(coverage.iter().all(|entry| {
+                    entry.transaction_covered
+                        && entry.path_covered
+                        && entry.endpoint_covered
+                        && entry.terminal_at_authoritative_leaf_covered
+                }));
+            }
+            receipt => panic!("expected scored transaction receipt, got {receipt:?}"),
+        }
+    }
+
+    #[test]
+    fn transaction_portfolio_gate_off_rejects_retained_early_evidence() {
+        let (tree, early) = root_only_fixture();
+        assert!(freeze_eagle3_transaction_portfolio(false, &tree, Some(&early)).is_err());
+        assert!(freeze_eagle3_transaction_portfolio(false, &tree, None)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Eagle3ArgmaxShadowExpansionReceipt {
     parent_source_node: usize,
     candidate_target_tokens: Vec<u32>,
@@ -11125,6 +11460,7 @@ struct Eagle3BenchRun {
     dual_eagle_shadow_update_us: u128,
     dual_eagle_selected_head: Option<DualEagleHead>,
     argmax_shadow_rounds: Vec<Eagle3ArgmaxShadowRoundReceipt>,
+    transaction_portfolio_rounds: Vec<Eagle3TransactionPortfolioRoundReceipt>,
 }
 
 impl Eagle3BenchRun {
@@ -11249,6 +11585,7 @@ fn run_eagle3_resident_greedy(
     certified_argmax_shadow: bool,
     indexed_head_shadow: bool,
     indexed_head_direct_emission: bool,
+    transaction_portfolio_shadow: bool,
     indexed_head_target_top8_history_rounds: usize,
     indexed_head_candidate_recency_rounds: usize,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
@@ -12048,6 +12385,17 @@ fn run_eagle3_resident_greedy(
                     "target-row hedge target returned {} predictions for {actual_nodes} verifier rows",
                     predictions.len(),
                 );
+                // Freeze through an authority-free type before either the host acceptance walk
+                // or its eventual terminal token is observed by the diagnostic. The target has
+                // already computed its result in this state-inert shadow implementation, but no
+                // current-round truth crosses this API boundary.
+                let frozen_transaction_portfolio = freeze_eagle3_transaction_portfolio(
+                    transaction_portfolio_shadow,
+                    &fused.tree,
+                    indexed_head_result
+                        .as_ref()
+                        .and_then(|shadow| shadow.early_layer25.as_ref()),
+                )?;
                 let direct_emission = eagle3_indexed_head_direct_emission_predictions(
                     indexed_head_direct_emission,
                     &predictions,
@@ -12078,6 +12426,13 @@ fn run_eagle3_resident_greedy(
                     capture_rows: fused_acceptance.capture_rows.clone(),
                     source_nodes: Vec::new(),
                 };
+                record_eagle3_transaction_portfolio_round(
+                    transaction_portfolio_shadow,
+                    run.rounds + 1,
+                    frozen_transaction_portfolio,
+                    &acceptance,
+                    &mut run.transaction_portfolio_rounds,
+                )?;
                 let terminal_reason = eagle3_terminal_head_skip_reason(
                     terminal_head_skip,
                     run.generated.len(),
@@ -12620,6 +12975,95 @@ fn run_eagle3_resident_greedy(
             "argmax shadow emitted receipts while default-off"
         );
     }
+    if transaction_portfolio_shadow {
+        anyhow::ensure!(
+            run.transaction_portfolio_rounds.len() as u64 == run.rounds,
+            "transaction portfolio recorded {} of {} fixed-lattice rounds",
+            run.transaction_portfolio_rounds.len(),
+            run.rounds,
+        );
+        for (index, receipt) in run.transaction_portfolio_rounds.iter().enumerate() {
+            let expected_round = index as u64 + 1;
+            match receipt {
+                Eagle3TransactionPortfolioRoundReceipt::Scored {
+                    round,
+                    layer_id,
+                    portfolio_frozen_before_authority_evaluation,
+                    tree_tokens,
+                    tree_parent,
+                    tree_depth,
+                    candidate_union,
+                    early_rows,
+                    transaction_candidates_considered,
+                    path_candidates_considered,
+                    endpoint_candidates_considered,
+                    top_transactions,
+                    top_paths,
+                    top_endpoints,
+                    transaction_rank,
+                    path_rank,
+                    endpoint_rank,
+                    terminal_rank_at_authoritative_leaf,
+                    coverage,
+                    ..
+                } => anyhow::ensure!(
+                    *round == expected_round
+                        && *layer_id
+                            == *camelid::eagle3::TARGET_LAYER_INPUT_IDS
+                                .last()
+                                .expect("capture contract is non-empty")
+                        && *portfolio_frozen_before_authority_evaluation
+                        && tree_tokens.len() == tree_parent.len()
+                        && tree_tokens.len() == tree_depth.len()
+                        && tree_tokens.len() == early_rows.len()
+                        && early_rows.iter().enumerate().all(|(row, evidence)| {
+                            evidence.verifier_row == row
+                                && evidence.candidate_logit_bits.len()
+                                    == candidate_union.len()
+                        })
+                        && top_transactions.len()
+                            == (*transaction_candidates_considered).min(8)
+                        && top_paths.len() == (*path_candidates_considered).min(8)
+                        && top_endpoints.len() == (*endpoint_candidates_considered).min(8)
+                        && transaction_rank
+                            .is_none_or(|rank| rank <= *transaction_candidates_considered)
+                        && path_rank.is_none_or(|rank| rank <= *path_candidates_considered)
+                        && endpoint_rank
+                            .is_none_or(|rank| rank <= *endpoint_candidates_considered)
+                        && terminal_rank_at_authoritative_leaf
+                            .is_none_or(|rank| rank <= candidate_union.len())
+                        && coverage
+                            .iter()
+                            .map(|entry| entry.budget)
+                            .eq(camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS)
+                        && coverage.iter().all(|entry| {
+                            entry.transaction_covered
+                                == transaction_rank
+                                    .is_some_and(|rank| rank <= entry.budget)
+                                && entry.path_covered
+                                    == path_rank.is_some_and(|rank| rank <= entry.budget)
+                                && entry.endpoint_covered
+                                    == endpoint_rank.is_some_and(|rank| rank <= entry.budget)
+                                && entry.terminal_at_authoritative_leaf_covered
+                                    == terminal_rank_at_authoritative_leaf
+                                        .is_some_and(|rank| rank <= entry.budget)
+                        }),
+                    "transaction portfolio round {expected_round} has incomplete evidence"
+                ),
+                Eagle3TransactionPortfolioRoundReceipt::Fallback { round, .. } => {
+                    anyhow::ensure!(
+                        *round == expected_round,
+                        "transaction portfolio fallback round id diverged"
+                    );
+                }
+            }
+        }
+    } else {
+        anyhow::ensure!(
+            run.transaction_portfolio_rounds.is_empty(),
+            "transaction portfolio emitted receipts while default-off"
+        );
+    }
     if adaptive_expansions {
         anyhow::ensure!(
             run.adaptive_expansions.shallow_rounds + run.adaptive_expansions.deep_rounds
@@ -12945,6 +13389,25 @@ struct BenchEagle3Record {
     indexed_head_shadow_kernel_window_us: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_head_shadow_compile_fast_math_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_shadow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_budgets: Option<[usize; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_scored_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_transaction_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_path_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_endpoint_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_conditional_terminal_hits: Option<[u64; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_portfolio_round_evidence:
+        Option<Vec<Eagle3TransactionPortfolioRoundReceipt>>,
     dual_eagle_selector: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     dual_eagle_race_rounds: Option<u8>,
@@ -13218,6 +13681,64 @@ fn eagle3_argmax_shadow_env(name: &str) -> anyhow::Result<bool> {
         })
         .transpose()?;
     parse_eagle3_argmax_shadow_env(name, value)
+}
+
+fn parse_eagle3_transaction_portfolio_shadow_env(value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => anyhow::bail!(
+            "{} must be exactly 0 or 1, got {value:?}",
+            camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV
+        ),
+    }
+}
+
+fn eagle3_transaction_portfolio_shadow_enabled() -> anyhow::Result<bool> {
+    let raw = std::env::var_os(camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is not valid UTF-8",
+                    camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_transaction_portfolio_shadow_env(value)
+}
+
+fn validate_eagle3_transaction_portfolio_shadow_config(
+    enabled: bool,
+    indexed_head_shadow: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !enabled || indexed_head_shadow,
+        "{}=1 requires CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW=1",
+        camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod eagle3_transaction_portfolio_shadow_config_tests {
+    use super::*;
+
+    #[test]
+    fn gate_is_strict_default_off_and_requires_indexed_head() {
+        assert!(!parse_eagle3_transaction_portfolio_shadow_env(None).unwrap());
+        assert!(!parse_eagle3_transaction_portfolio_shadow_env(Some("")).unwrap());
+        assert!(!parse_eagle3_transaction_portfolio_shadow_env(Some("0")).unwrap());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some("1")).unwrap());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some("true")).is_err());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some("01")).is_err());
+        assert!(parse_eagle3_transaction_portfolio_shadow_env(Some(" 1")).is_err());
+        assert!(validate_eagle3_transaction_portfolio_shadow_config(false, false).is_ok());
+        assert!(validate_eagle3_transaction_portfolio_shadow_config(true, true).is_ok());
+        assert!(validate_eagle3_transaction_portfolio_shadow_config(true, false).is_err());
+    }
 }
 
 fn parse_eagle3_indexed_head_target_top8_history_rounds_env(
@@ -13732,6 +14253,7 @@ fn indexed_head_receipt_preserves_exact_bits_timing_and_compile_identity() {
             all_candidate_logits_exact: true,
             first_logit_mismatch: None,
         }],
+        early_layer25: None,
     };
     let receipt =
         eagle3_indexed_head_shadow_receipt(&[3, 7], &[7], &shadow, false, 0, 0).unwrap();
@@ -14707,6 +15229,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_ARGMAX_SHADOW_CANDIDATES",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS",
+        camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV,
         "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW",
         camelid::eagle3_runtime::EAGLE3_DRAFT_EARLY_EXIT_ENV,
     ] {
@@ -15042,6 +15565,7 @@ fn run_bench_eagle3(
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_SHADOW")?;
     let indexed_head_direct_emission =
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION")?;
+    let transaction_portfolio_shadow = eagle3_transaction_portfolio_shadow_enabled()?;
     let indexed_head_target_top8_history_rounds =
         eagle3_indexed_head_target_top8_history_rounds()?;
     let indexed_head_candidate_recency_rounds =
@@ -15195,6 +15719,10 @@ fn run_bench_eagle3(
         argmax_shadow_candidate_limit,
         indexed_head_target_top8_history_rounds,
         indexed_head_candidate_recency_rounds,
+    )?;
+    validate_eagle3_transaction_portfolio_shadow_config(
+        transaction_portfolio_shadow,
+        indexed_head_shadow,
     )?;
     validate_eagle3_terminal_head_skip_config(
         terminal_head_skip,
@@ -15441,6 +15969,7 @@ fn run_bench_eagle3(
         certified_argmax_shadow,
         indexed_head_shadow,
         indexed_head_direct_emission,
+        transaction_portfolio_shadow,
         indexed_head_target_top8_history_rounds,
         indexed_head_candidate_recency_rounds,
         primary_drafter,
@@ -15573,6 +16102,49 @@ fn run_bench_eagle3(
         .iter()
         .map(|receipt| receipt.kernel_window_us)
         .sum::<u128>();
+    anyhow::ensure!(
+        (!transaction_portfolio_shadow && eagle.transaction_portfolio_rounds.is_empty())
+            || (transaction_portfolio_shadow
+                && eagle.transaction_portfolio_rounds.len() as u64
+                    == eagle.dynamic_tree_rounds),
+        "transaction portfolio receipt count does not match its gate"
+    );
+    let transaction_portfolio_scored_rounds = eagle
+        .transaction_portfolio_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(receipt, Eagle3TransactionPortfolioRoundReceipt::Scored { .. })
+        })
+        .count() as u64;
+    let mut transaction_portfolio_transaction_hits = [0u64; 4];
+    let mut transaction_portfolio_path_hits = [0u64; 4];
+    let mut transaction_portfolio_endpoint_hits = [0u64; 4];
+    let mut transaction_portfolio_conditional_terminal_hits = [0u64; 4];
+    for receipt in &eagle.transaction_portfolio_rounds {
+        if let Eagle3TransactionPortfolioRoundReceipt::Scored { coverage, .. } = receipt {
+            for (slot, covered) in coverage.iter().enumerate() {
+                transaction_portfolio_transaction_hits[slot] +=
+                    u64::from(covered.transaction_covered);
+                transaction_portfolio_path_hits[slot] += u64::from(covered.path_covered);
+                transaction_portfolio_endpoint_hits[slot] += u64::from(covered.endpoint_covered);
+                transaction_portfolio_conditional_terminal_hits[slot] +=
+                    u64::from(covered.terminal_at_authoritative_leaf_covered);
+            }
+        }
+    }
+    if transaction_portfolio_shadow {
+        eprintln!(
+            "[bench-eagle3-transaction-portfolio] budgets={:?} scored={} fallback={} transaction-hits={:?} path-hits={:?} endpoint-hits={:?} conditional-terminal-hits={:?}",
+            camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS,
+            transaction_portfolio_scored_rounds,
+            eagle.transaction_portfolio_rounds.len() as u64
+                - transaction_portfolio_scored_rounds,
+            transaction_portfolio_transaction_hits,
+            transaction_portfolio_path_hits,
+            transaction_portfolio_endpoint_hits,
+            transaction_portfolio_conditional_terminal_hits,
+        );
+    }
     let record = BenchEagle3Record {
         runtime: "camelid-eagle3-resident-metal",
         commit: benchmark_commit(),
@@ -15841,6 +16413,26 @@ fn run_bench_eagle3(
         indexed_head_shadow_kernel_window_us: indexed_head_shadow
             .then_some(indexed_kernel_window_us),
         indexed_head_shadow_compile_fast_math_enabled: indexed_head_shadow.then_some(false),
+        transaction_portfolio_shadow: transaction_portfolio_shadow.then_some(true),
+        transaction_portfolio_budgets: transaction_portfolio_shadow.then_some(
+            camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS,
+        ),
+        transaction_portfolio_scored_rounds: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_scored_rounds),
+        transaction_portfolio_fallback_rounds: transaction_portfolio_shadow.then_some(
+            eagle.transaction_portfolio_rounds.len() as u64
+                - transaction_portfolio_scored_rounds,
+        ),
+        transaction_portfolio_transaction_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_transaction_hits),
+        transaction_portfolio_path_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_path_hits),
+        transaction_portfolio_endpoint_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_endpoint_hits),
+        transaction_portfolio_conditional_terminal_hits: transaction_portfolio_shadow
+            .then_some(transaction_portfolio_conditional_terminal_hits),
+        transaction_portfolio_round_evidence: transaction_portfolio_shadow
+            .then(|| eagle.transaction_portfolio_rounds.clone()),
         dual_eagle_selector,
         dual_eagle_race_rounds: dual_eagle_selector.then_some(DUAL_EAGLE_RACE_ROUNDS),
         dual_eagle_root_ranking: dual_eagle_selector.then_some(DUAL_EAGLE_ROOT_RANKING),

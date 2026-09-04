@@ -11,12 +11,14 @@ use crate::eagle3::{Eagle3DraftModel, HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS, TARGE
 use crate::error::{BackendError, Result};
 use crate::inference::spec_tree::{
     normalize_draft_top_logits, DynamicDraftLattice, PackedForestPlan, ScoredTokenTree,
-    TREE_MAX_NODES,
+    TokenTree, TREE_MAX_NODES,
 };
 use crate::inference::LlamaLoadedWeights;
 use crate::metal::{
     Eagle3AuthoritativeE1ShadowComparison, Eagle3MetalOutput, Eagle3MetalScoredRow,
-    Eagle3MetalState, Eagle3MetalWeights, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
+    Eagle3MetalState, Eagle3MetalWeights, ResidentIndexedHeadEarlyRow,
+    ResidentIndexedHeadEarlySnapshot, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
+    RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
 };
 use crate::tensor::CpuTensor;
 
@@ -1435,6 +1437,480 @@ impl Eagle3ForestAcceptance {
                 )
             })
             .collect()
+    }
+}
+
+/// Portfolio widths measured by the target-blind layer-25 transaction diagnostic.
+pub const EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS: [usize; 4] = [1, 2, 4, 8];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3EarlyTransactionCandidate {
+    pub path_rows: Vec<usize>,
+    pub terminal_token: u32,
+    /// Candidate-restricted joint log probability encoded exactly as host f64 bits.
+    pub log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3EarlyPathCandidate {
+    pub path_rows: Vec<usize>,
+    /// Accepted-edge probability times the marginalized non-child terminal mass.
+    pub log_probability_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3EarlyEndpointCandidate {
+    pub verifier_row: usize,
+    pub terminal_token: u32,
+    /// Layer-25 candidate-restricted token log probability at `verifier_row`.
+    pub log_probability_bits: u64,
+}
+
+/// Authority-free portfolio frozen from one immutable verifier tree and one layer-25 snapshot.
+/// The type intentionally has no target-prediction or acceptance field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3EarlyTransactionPortfolio {
+    pub layer_id: usize,
+    pub tree_tokens: Vec<u32>,
+    pub tree_parent: Vec<i32>,
+    pub tree_depth: Vec<u16>,
+    pub candidate_union: Vec<u32>,
+    pub early_rows: Vec<ResidentIndexedHeadEarlyRow>,
+    pub transaction_candidates_considered: usize,
+    pub path_candidates_considered: usize,
+    pub endpoint_candidates_considered: usize,
+    pub top_transactions: Vec<Eagle3EarlyTransactionCandidate>,
+    pub top_paths: Vec<Eagle3EarlyPathCandidate>,
+    pub top_endpoints: Vec<Eagle3EarlyEndpointCandidate>,
+    pub indexed_head_encode_us: u128,
+    pub indexed_head_commit_wait_us: u128,
+    pub indexed_head_gpu_busy_us: u128,
+    pub indexed_head_kernel_window_us: u128,
+    /// Complete deterministic rank keys retained privately so post-authority evaluation can
+    /// report exact global ranks, including misses beyond the largest measured B=8 portfolio.
+    ranked_transactions: Vec<(Vec<usize>, u32)>,
+    ranked_paths: Vec<Vec<usize>>,
+    ranked_endpoints: Vec<(usize, u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eagle3EarlyTransactionCoverageAtBudget {
+    pub budget: usize,
+    pub transaction_covered: bool,
+    pub path_covered: bool,
+    pub endpoint_covered: bool,
+    /// Diagnostic decomposition only: terminal rank after the authoritative leaf is known.
+    pub terminal_at_authoritative_leaf_covered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3EarlyTransactionPortfolioEvaluation {
+    pub authoritative_path_rows: Vec<usize>,
+    pub authoritative_leaf_row: usize,
+    pub authoritative_terminal_token: u32,
+    pub transaction_rank: Option<usize>,
+    pub path_rank: Option<usize>,
+    pub endpoint_rank: Option<usize>,
+    /// One-based layer-25 terminal-token rank among non-child candidates at the true leaf.
+    /// This is never an input to the primary target-blind portfolio.
+    pub terminal_rank_at_authoritative_leaf: Option<usize>,
+    pub coverage: [Eagle3EarlyTransactionCoverageAtBudget; 4],
+}
+
+fn eagle3_early_ranked_tokens(candidate_union: &[u32], logit_bits: &[u32]) -> Vec<u32> {
+    let mut scores = candidate_union
+        .iter()
+        .copied()
+        .zip(logit_bits.iter().copied().map(f32::from_bits))
+        .filter(|(_, score)| *score > f32::NEG_INFINITY)
+        .collect::<Vec<_>>();
+    scores.sort_by(|(left_token, left_score), (right_token, right_score)| {
+        if left_score == right_score {
+            left_token.cmp(right_token)
+        } else {
+            right_score.total_cmp(left_score)
+        }
+    });
+    scores.into_iter().map(|(token, _)| token).collect()
+}
+
+fn eagle3_candidate_log_probabilities(logit_bits: &[u32]) -> Vec<Option<f64>> {
+    let scores = logit_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect::<Vec<_>>();
+    let positive_infinities = scores
+        .iter()
+        .filter(|score| **score == f32::INFINITY)
+        .count();
+    if positive_infinities > 0 {
+        let winner_log_probability = -(positive_infinities as f64).ln();
+        return scores
+            .into_iter()
+            .map(|score| {
+                (score == f32::INFINITY).then_some(winner_log_probability)
+            })
+            .collect();
+    }
+    let maximum = scores
+        .iter()
+        .copied()
+        .filter(|score| *score > f32::NEG_INFINITY)
+        .max_by(f32::total_cmp);
+    let Some(maximum) = maximum else {
+        return vec![None; scores.len()];
+    };
+    let denominator = scores
+        .iter()
+        .copied()
+        .filter(|score| *score > f32::NEG_INFINITY)
+        .map(|score| (f64::from(score) - f64::from(maximum)).exp())
+        .sum::<f64>();
+    let log_denominator = denominator.ln();
+    scores
+        .into_iter()
+        .map(|score| {
+            (score > f32::NEG_INFINITY).then_some(
+                f64::from(score) - f64::from(maximum) - log_denominator,
+            )
+        })
+        .collect()
+}
+
+fn eagle3_logsumexp(values: &[f64]) -> Option<f64> {
+    let maximum = values.iter().copied().max_by(f64::total_cmp)?;
+    let sum = values
+        .iter()
+        .map(|value| (*value - maximum).exp())
+        .sum::<f64>();
+    Some(maximum + sum.ln())
+}
+
+impl Eagle3EarlyTransactionPortfolio {
+    /// Freeze all portfolio rankings using only the immutable N8 tree and layer-25 candidate
+    /// scores. Current-round target predictions are absent from this signature by construction.
+    pub fn freeze(
+        tree: &TokenTree,
+        early: &ResidentIndexedHeadEarlySnapshot,
+    ) -> Result<Self> {
+        let nodes = tree.nodes();
+        if nodes == 0
+            || nodes > 8
+            || tree.parent.len() != nodes
+            || tree.depth.len() != nodes
+            || tree.parent[0] != -1
+            || tree.depth[0] != 0
+            || tree
+                .tokens
+                .iter()
+                .any(|token| *token as usize >= TARGET_VOCAB_SIZE)
+        {
+            return Err(invalid("EAGLE-3 transaction portfolio received an invalid tree"));
+        }
+        for row in 1..nodes {
+            let parent = usize::try_from(tree.parent[row]).map_err(|_| {
+                invalid(format!(
+                    "EAGLE-3 transaction portfolio row {row} has no parent"
+                ))
+            })?;
+            if parent >= row
+                || tree.depth[row] == 0
+                || tree.depth[parent].checked_add(1) != Some(tree.depth[row])
+                || (1..row).any(|earlier| {
+                    tree.parent[earlier] == tree.parent[row]
+                        && tree.tokens[earlier] == tree.tokens[row]
+                })
+            {
+                return Err(invalid(format!(
+                    "EAGLE-3 transaction portfolio row {row} has invalid or duplicate ancestry"
+                )));
+            }
+        }
+        if let Some(reason) = early.fallback_reason {
+            return Err(invalid(format!(
+                "EAGLE-3 transaction portfolio layer-25 projection fell back: {}",
+                reason.label()
+            )));
+        }
+        if early.layer_id != *TARGET_LAYER_INPUT_IDS.last().expect("capture contract is non-empty")
+            || early.compile_fast_math_enabled
+            || early.rows.len() != nodes
+            || early.candidate_union.is_empty()
+            || early.candidate_union.len() > RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES
+            || !early
+                .candidate_union
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || early
+                .candidate_union
+                .iter()
+                .any(|token| *token as usize >= TARGET_VOCAB_SIZE)
+        {
+            return Err(invalid(
+                "EAGLE-3 transaction portfolio layer-25 snapshot is unavailable or malformed",
+            ));
+        }
+        for (row, evidence) in early.rows.iter().enumerate() {
+            if evidence.verifier_row != row
+                || evidence.candidate_logit_bits.len() != early.candidate_union.len()
+                || evidence.ranked_candidate_tokens
+                    != eagle3_early_ranked_tokens(
+                        &early.candidate_union,
+                        &evidence.candidate_logit_bits,
+                    )
+            {
+                return Err(invalid(format!(
+                    "EAGLE-3 transaction portfolio layer-25 row {row} lost exact scores or rank order"
+                )));
+            }
+        }
+
+        let log_probabilities = early
+            .rows
+            .iter()
+            .map(|row| eagle3_candidate_log_probabilities(&row.candidate_logit_bits))
+            .collect::<Vec<_>>();
+        let candidate_index = |token: u32| early.candidate_union.binary_search(&token).ok();
+        let mut transactions = Vec::<(Eagle3EarlyTransactionCandidate, f64)>::new();
+        let mut paths = Vec::<(Eagle3EarlyPathCandidate, f64)>::new();
+        let mut endpoints = Vec::<(Eagle3EarlyEndpointCandidate, f64)>::new();
+        for verifier_row in 0..nodes {
+            let path_rows = tree.path_to(verifier_row);
+            let mut edge_log_probability = 0.0f64;
+            let mut path_possible = true;
+            for edge in path_rows.windows(2) {
+                let parent = edge[0];
+                let child_token = tree.tokens[edge[1]];
+                let Some(log_probability) = candidate_index(child_token)
+                    .and_then(|index| log_probabilities[parent][index])
+                else {
+                    path_possible = false;
+                    break;
+                };
+                edge_log_probability += log_probability;
+            }
+            let child_tokens = (verifier_row + 1..nodes)
+                .filter(|child| tree.parent[*child] == verifier_row as i32)
+                .map(|child| tree.tokens[child])
+                .collect::<BTreeSet<_>>();
+            let terminal_candidates = early
+                .candidate_union
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(candidate, token)| {
+                    if child_tokens.contains(&token) {
+                        None
+                    } else {
+                        log_probabilities[verifier_row][candidate]
+                            .map(|score| (token, score))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let terminal_scores = terminal_candidates
+                .iter()
+                .map(|(_, score)| *score)
+                .collect::<Vec<_>>();
+            for (terminal_token, terminal_log_probability) in &terminal_candidates {
+                endpoints.push((
+                    Eagle3EarlyEndpointCandidate {
+                        verifier_row,
+                        terminal_token: *terminal_token,
+                        log_probability_bits: terminal_log_probability.to_bits(),
+                    },
+                    *terminal_log_probability,
+                ));
+            }
+            if !path_possible {
+                continue;
+            }
+            if let Some(terminal_mass) = eagle3_logsumexp(&terminal_scores) {
+                let score = edge_log_probability + terminal_mass;
+                paths.push((
+                    Eagle3EarlyPathCandidate {
+                        path_rows: path_rows.clone(),
+                        log_probability_bits: score.to_bits(),
+                    },
+                    score,
+                ));
+            }
+            for (terminal_token, terminal_log_probability) in terminal_candidates {
+                let transaction_score = edge_log_probability + terminal_log_probability;
+                transactions.push((
+                    Eagle3EarlyTransactionCandidate {
+                        path_rows: path_rows.clone(),
+                        terminal_token,
+                        log_probability_bits: transaction_score.to_bits(),
+                    },
+                    transaction_score,
+                ));
+            }
+        }
+        transactions.sort_by(|(left, left_score), (right, right_score)| {
+            if left_score == right_score {
+                left.path_rows
+                    .cmp(&right.path_rows)
+                    .then_with(|| left.terminal_token.cmp(&right.terminal_token))
+            } else {
+                right_score.total_cmp(left_score)
+            }
+        });
+        paths.sort_by(|(left, left_score), (right, right_score)| {
+            if left_score == right_score {
+                left.path_rows.cmp(&right.path_rows)
+            } else {
+                right_score.total_cmp(left_score)
+            }
+        });
+        endpoints.sort_by(|(left, left_score), (right, right_score)| {
+            if left_score == right_score {
+                left.verifier_row
+                    .cmp(&right.verifier_row)
+                    .then_with(|| left.terminal_token.cmp(&right.terminal_token))
+            } else {
+                right_score.total_cmp(left_score)
+            }
+        });
+        let transaction_candidates_considered = transactions.len();
+        let path_candidates_considered = paths.len();
+        let endpoint_candidates_considered = endpoints.len();
+        let ranked_transactions = transactions
+            .iter()
+            .map(|(candidate, _)| (candidate.path_rows.clone(), candidate.terminal_token))
+            .collect();
+        let ranked_paths = paths
+            .iter()
+            .map(|(candidate, _)| candidate.path_rows.clone())
+            .collect();
+        let ranked_endpoints = endpoints
+            .iter()
+            .map(|(candidate, _)| (candidate.verifier_row, candidate.terminal_token))
+            .collect();
+        let keep = *EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS
+            .last()
+            .expect("portfolio budgets are non-empty");
+        Ok(Self {
+            layer_id: early.layer_id,
+            tree_tokens: tree.tokens.clone(),
+            tree_parent: tree.parent.clone(),
+            tree_depth: tree.depth.clone(),
+            candidate_union: early.candidate_union.clone(),
+            early_rows: early.rows.clone(),
+            transaction_candidates_considered,
+            path_candidates_considered,
+            endpoint_candidates_considered,
+            top_transactions: transactions
+                .into_iter()
+                .take(keep)
+                .map(|(candidate, _)| candidate)
+                .collect(),
+            top_paths: paths
+                .into_iter()
+                .take(keep)
+                .map(|(candidate, _)| candidate)
+                .collect(),
+            top_endpoints: endpoints
+                .into_iter()
+                .take(keep)
+                .map(|(candidate, _)| candidate)
+                .collect(),
+            indexed_head_encode_us: early.encode_us,
+            indexed_head_commit_wait_us: early.commit_wait_us,
+            indexed_head_gpu_busy_us: early.gpu_busy_us,
+            indexed_head_kernel_window_us: early.kernel_window_us,
+            ranked_transactions,
+            ranked_paths,
+            ranked_endpoints,
+        })
+    }
+
+    /// Compare a previously frozen portfolio with the target-authoritative transaction. This is
+    /// the first API in the pipeline allowed to observe acceptance truth.
+    pub fn evaluate(
+        &self,
+        acceptance: &Eagle3ForestAcceptance,
+    ) -> Result<Eagle3EarlyTransactionPortfolioEvaluation> {
+        let tree = TokenTree {
+            tokens: self.tree_tokens.clone(),
+            parent: self.tree_parent.clone(),
+            depth: self.tree_depth.clone(),
+        };
+        if acceptance.emitted_tokens.is_empty()
+            || acceptance.leaf_row >= tree.nodes()
+            || acceptance.capture_rows != tree.path_to(acceptance.leaf_row)
+            || acceptance.emitted_tokens.len() != acceptance.capture_rows.len()
+            || acceptance
+                .emitted_tokens
+                .iter()
+                .take(acceptance.emitted_tokens.len() - 1)
+                .zip(acceptance.capture_rows.iter().skip(1))
+                .any(|(token, row)| *token != tree.tokens[*row])
+        {
+            return Err(invalid(
+                "EAGLE-3 transaction portfolio received malformed authoritative acceptance",
+            ));
+        }
+        let terminal_token = *acceptance
+            .emitted_tokens
+            .last()
+            .expect("non-empty acceptance checked above");
+        let child_tokens = (acceptance.leaf_row + 1..tree.nodes())
+            .filter(|child| tree.parent[*child] == acceptance.leaf_row as i32)
+            .map(|child| tree.tokens[child])
+            .collect::<BTreeSet<_>>();
+        if child_tokens.contains(&terminal_token) {
+            return Err(invalid(
+                "EAGLE-3 transaction portfolio acceptance stopped on a matching child token",
+            ));
+        }
+        let transaction_rank = self
+            .ranked_transactions
+            .iter()
+            .position(|(path_rows, candidate_terminal)| {
+                path_rows.as_slice() == acceptance.capture_rows.as_slice()
+                    && *candidate_terminal == terminal_token
+            })
+            .map(|rank| rank + 1);
+        let path_rank = self
+            .ranked_paths
+            .iter()
+            .position(|path_rows| path_rows.as_slice() == acceptance.capture_rows.as_slice())
+            .map(|rank| rank + 1);
+        let endpoint_rank = self
+            .ranked_endpoints
+            .iter()
+            .position(|(verifier_row, candidate_terminal)| {
+                *verifier_row == acceptance.leaf_row
+                    && *candidate_terminal == terminal_token
+            })
+            .map(|rank| rank + 1);
+        let terminal_rank_at_authoritative_leaf = self.early_rows[acceptance.leaf_row]
+            .ranked_candidate_tokens
+            .iter()
+            .filter(|token| !child_tokens.contains(token))
+            .position(|token| *token == terminal_token)
+            .map(|rank| rank + 1);
+        let coverage = EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS.map(|budget| {
+            Eagle3EarlyTransactionCoverageAtBudget {
+                budget,
+                transaction_covered: transaction_rank.is_some_and(|rank| rank <= budget),
+                path_covered: path_rank.is_some_and(|rank| rank <= budget),
+                endpoint_covered: endpoint_rank.is_some_and(|rank| rank <= budget),
+                terminal_at_authoritative_leaf_covered: terminal_rank_at_authoritative_leaf
+                    .is_some_and(|rank| rank <= budget),
+            }
+        });
+        Ok(Eagle3EarlyTransactionPortfolioEvaluation {
+            authoritative_path_rows: acceptance.capture_rows.clone(),
+            authoritative_leaf_row: acceptance.leaf_row,
+            authoritative_terminal_token: terminal_token,
+            transaction_rank,
+            path_rank,
+            endpoint_rank,
+            terminal_rank_at_authoritative_leaf,
+            coverage,
+        })
     }
 }
 
@@ -3041,6 +3517,202 @@ mod tests {
             .is_err());
         assert!(forest
             .plan_authoritative_precompute(&[None, None, None])
+            .is_err());
+    }
+
+    fn transaction_portfolio_fixture() -> (TokenTree, ResidentIndexedHeadEarlySnapshot) {
+        let tree = TokenTree {
+            tokens: vec![10, 11, 12, 13],
+            parent: vec![-1, 0, 0, 1],
+            depth: vec![0, 1, 1, 2],
+        };
+        let candidate_union = vec![11, 12, 13, 90, 91];
+        let rows = [
+            [f32::INFINITY, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, f32::INFINITY, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, f32::INFINITY],
+            [0.0, 0.0, 0.0, f32::INFINITY, 0.0],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(verifier_row, logits)| {
+            let candidate_logit_bits = logits.map(f32::to_bits).to_vec();
+            ResidentIndexedHeadEarlyRow {
+                verifier_row,
+                ranked_candidate_tokens: eagle3_early_ranked_tokens(
+                    &candidate_union,
+                    &candidate_logit_bits,
+                ),
+                candidate_logit_bits,
+            }
+        })
+        .collect();
+        (
+            tree,
+            ResidentIndexedHeadEarlySnapshot {
+                layer_id: 25,
+                compile_fast_math_enabled: false,
+                candidate_union,
+                encode_us: 11,
+                commit_wait_us: 22,
+                gpu_busy_us: 19,
+                kernel_window_us: 20,
+                fallback_reason: None,
+                rows,
+            },
+        )
+    }
+
+    #[test]
+    fn transaction_portfolio_freezes_joint_path_and_endpoint_rankings_without_truth() {
+        let (tree, early) = transaction_portfolio_fixture();
+        let portfolio = Eagle3EarlyTransactionPortfolio::freeze(&tree, &early).unwrap();
+        assert_eq!(portfolio.transaction_candidates_considered, 1);
+        assert_eq!(portfolio.path_candidates_considered, 1);
+        assert_eq!(portfolio.endpoint_candidates_considered, 2);
+        assert_eq!(portfolio.top_transactions[0].path_rows, vec![0, 1, 3]);
+        assert_eq!(portfolio.top_transactions[0].terminal_token, 90);
+        assert_eq!(portfolio.top_paths[0].path_rows, vec![0, 1, 3]);
+        assert_eq!(portfolio.top_endpoints[0].verifier_row, 2);
+        assert_eq!(portfolio.top_endpoints[0].terminal_token, 91);
+        assert_eq!(portfolio.top_endpoints[1].verifier_row, 3);
+        assert_eq!(portfolio.top_endpoints[1].terminal_token, 90);
+        assert_eq!(portfolio.early_rows, early.rows);
+
+        let authority = Eagle3ForestAcceptance {
+            emitted_tokens: vec![11, 13, 90],
+            leaf_row: 3,
+            capture_rows: vec![0, 1, 3],
+            source_nodes: Vec::new(),
+        };
+        let evaluated = portfolio.evaluate(&authority).unwrap();
+        assert_eq!(evaluated.transaction_rank, Some(1));
+        assert_eq!(evaluated.path_rank, Some(1));
+        assert_eq!(evaluated.endpoint_rank, Some(2));
+        assert_eq!(evaluated.terminal_rank_at_authoritative_leaf, Some(1));
+        assert!(evaluated.coverage[0].transaction_covered);
+        assert!(evaluated.coverage[0].path_covered);
+        assert!(!evaluated.coverage[0].endpoint_covered);
+        assert!(evaluated.coverage[0].terminal_at_authoritative_leaf_covered);
+        assert!(evaluated.coverage[1].endpoint_covered);
+    }
+
+    #[test]
+    fn transaction_portfolio_coverage_decomposes_path_and_terminal_misses() {
+        let (tree, early) = transaction_portfolio_fixture();
+        let portfolio = Eagle3EarlyTransactionPortfolio::freeze(&tree, &early).unwrap();
+
+        // The early head ranks this terminal cell first globally but assigns zero candidate-
+        // restricted probability to the edge leading there. Endpoint coverage therefore does
+        // not imply either path or complete-transaction coverage.
+        let endpoint_only = Eagle3ForestAcceptance {
+            emitted_tokens: vec![12, 91],
+            leaf_row: 2,
+            capture_rows: vec![0, 2],
+            source_nodes: Vec::new(),
+        };
+        let endpoint_only = portfolio.evaluate(&endpoint_only).unwrap();
+        assert_eq!(endpoint_only.transaction_rank, None);
+        assert_eq!(endpoint_only.path_rank, None);
+        assert_eq!(endpoint_only.endpoint_rank, Some(1));
+        assert_eq!(endpoint_only.terminal_rank_at_authoritative_leaf, Some(1));
+        assert!(!endpoint_only.coverage[3].transaction_covered);
+        assert!(!endpoint_only.coverage[3].path_covered);
+        assert!(endpoint_only.coverage[0].endpoint_covered);
+        assert!(endpoint_only.coverage[0].terminal_at_authoritative_leaf_covered);
+
+        // A token absent from the frozen candidate union can retain path coverage, but it can
+        // never be credited to the joint, endpoint, or truth-conditional terminal metrics.
+        let path_only = Eagle3ForestAcceptance {
+            emitted_tokens: vec![11, 13, 99],
+            leaf_row: 3,
+            capture_rows: vec![0, 1, 3],
+            source_nodes: Vec::new(),
+        };
+        let path_only = portfolio.evaluate(&path_only).unwrap();
+        assert_eq!(path_only.transaction_rank, None);
+        assert_eq!(path_only.path_rank, Some(1));
+        assert_eq!(path_only.endpoint_rank, None);
+        assert_eq!(path_only.terminal_rank_at_authoritative_leaf, None);
+        assert!(!path_only.coverage[3].transaction_covered);
+        assert!(path_only.coverage[0].path_covered);
+        assert!(!path_only.coverage[3].endpoint_covered);
+        assert!(!path_only.coverage[3].terminal_at_authoritative_leaf_covered);
+    }
+
+    #[test]
+    fn transaction_portfolio_reports_exact_ranks_beyond_retained_top_eight() {
+        let tree = TokenTree {
+            tokens: vec![1],
+            parent: vec![-1],
+            depth: vec![0],
+        };
+        let candidate_union = (10..20).collect::<Vec<u32>>();
+        let candidate_logit_bits = (0..10)
+            .rev()
+            .map(|score| (score as f32).to_bits())
+            .collect::<Vec<_>>();
+        let early = ResidentIndexedHeadEarlySnapshot {
+            layer_id: 25,
+            compile_fast_math_enabled: false,
+            candidate_union: candidate_union.clone(),
+            encode_us: 0,
+            commit_wait_us: 0,
+            gpu_busy_us: 0,
+            kernel_window_us: 0,
+            fallback_reason: None,
+            rows: vec![ResidentIndexedHeadEarlyRow {
+                verifier_row: 0,
+                ranked_candidate_tokens: eagle3_early_ranked_tokens(
+                    &candidate_union,
+                    &candidate_logit_bits,
+                ),
+                candidate_logit_bits,
+            }],
+        };
+        let portfolio = Eagle3EarlyTransactionPortfolio::freeze(&tree, &early).unwrap();
+        assert_eq!(portfolio.transaction_candidates_considered, 10);
+        assert_eq!(portfolio.top_transactions.len(), 8);
+        assert_eq!(portfolio.top_endpoints.len(), 8);
+
+        let evaluated = portfolio
+            .evaluate(&Eagle3ForestAcceptance {
+                emitted_tokens: vec![19],
+                leaf_row: 0,
+                capture_rows: vec![0],
+                source_nodes: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(evaluated.transaction_rank, Some(10));
+        assert_eq!(evaluated.path_rank, Some(1));
+        assert_eq!(evaluated.endpoint_rank, Some(10));
+        assert_eq!(evaluated.terminal_rank_at_authoritative_leaf, Some(10));
+        assert!(!evaluated.coverage[3].transaction_covered);
+        assert!(evaluated.coverage[0].path_covered);
+        assert!(!evaluated.coverage[3].endpoint_covered);
+        assert!(!evaluated.coverage[3].terminal_at_authoritative_leaf_covered);
+    }
+
+    #[test]
+    fn transaction_portfolio_rejects_unranked_or_wrong_layer_evidence() {
+        let (tree, early) = transaction_portfolio_fixture();
+        let mut wrong_rank = early.clone();
+        wrong_rank.rows[0].ranked_candidate_tokens.swap(0, 1);
+        assert!(Eagle3EarlyTransactionPortfolio::freeze(&tree, &wrong_rank).is_err());
+
+        let mut wrong_layer = early;
+        wrong_layer.layer_id = 24;
+        assert!(Eagle3EarlyTransactionPortfolio::freeze(&tree, &wrong_layer).is_err());
+
+        let (_, valid_early) = transaction_portfolio_fixture();
+        let portfolio = Eagle3EarlyTransactionPortfolio::freeze(&tree, &valid_early).unwrap();
+        assert!(portfolio
+            .evaluate(&Eagle3ForestAcceptance {
+                emitted_tokens: vec![12, 13, 90],
+                leaf_row: 3,
+                capture_rows: vec![0, 1, 3],
+                source_nodes: Vec::new(),
+            })
             .is_err());
     }
 
