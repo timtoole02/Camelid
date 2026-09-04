@@ -34,6 +34,10 @@ pub const RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES: usize = 1_024;
 pub const EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV: &str =
     "CAMELID_BENCH_EAGLE3_TRANSACTION_PORTFOLIO_SHADOW";
 
+/// Exact budget gate for the state-inert selective FC + K/V preparation experiment.
+pub const EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV: &str =
+    "CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PREP_BUDGET";
+
 #[cfg(any(target_os = "macos", test))]
 fn eagle3_transaction_portfolio_shadow_setting_enables(raw: Option<&str>) -> bool {
     raw == Some("1")
@@ -226,18 +230,32 @@ pub enum ResidentTreeAcceptanceShadow {
 /// Immutable inputs for the default-off target-overlapped EAGLE E1 shadow.
 ///
 /// The target verifier owns the GPU-resident token embeddings and three capture buffers.  E1
-/// consumes those buffers after the last capture is ready, projects every verifier edge into a
-/// private F16 K/V cache, and never touches `head`'s live watermark or cache.  The tree arrays are
-/// retained here so the edge's child embedding, parent capture, depth position, and later
-/// accepted-path comparison all share one frozen identity.
+/// consumes those buffers after the last capture is ready, projects either every verifier edge
+/// or the frozen selective path union into a private F16 K/V cache, and never touches `head`'s
+/// live watermark or cache. The tree arrays are retained here so the edge's child embedding,
+/// parent capture, depth position, and later accepted-path comparison all share one frozen
+/// identity.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 pub struct Eagle3AuthoritativeE1ShadowPlan<'a> {
     pub head: &'a Eagle3MetalState,
+    pub tree_tokens: &'a [u32],
     pub tree_parent: &'a [i32],
     pub tree_depth: &'a [u16],
     pub stable_position: usize,
+    /// `None` retains the C1 all-edge falsifier. B=1/2/4/8 asks the layer-25 portfolio to
+    /// select a deduplicated path-only edge set before E1 is encoded.
+    pub selective_path_budget: Option<usize>,
+    /// Gate-off/all-edge receipts have no paired reference. The selective mini2 experiment uses
+    /// the frozen 4.922 ms target-tail control recorded by checkpoint P.
+    pub target_tail_baseline_us: Option<u128>,
 }
+
+/// Frozen target-tail reference for the mini2 N8 layer-25 split. Every receipt records this
+/// value beside its derived delta so a future campaign cannot mistake it for an on-device
+/// counterfactual measurement.
+pub const EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US: u128 = 4_922;
+pub const EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eagle3AuthoritativeE1ShadowFallbackReason {
@@ -253,6 +271,7 @@ pub enum Eagle3AuthoritativeE1ShadowFallbackReason {
     CommandBufferFailed,
     PendingReceipt,
     SerialOracleSkipped,
+    SelectivePortfolioUnavailable,
 }
 
 impl Eagle3AuthoritativeE1ShadowFallbackReason {
@@ -270,6 +289,7 @@ impl Eagle3AuthoritativeE1ShadowFallbackReason {
             Self::CommandBufferFailed => "command_buffer_failed",
             Self::PendingReceipt => "pending_receipt",
             Self::SerialOracleSkipped => "serial_oracle_skipped",
+            Self::SelectivePortfolioUnavailable => "selective_portfolio_unavailable",
         }
     }
 }
@@ -279,6 +299,11 @@ impl Eagle3AuthoritativeE1ShadowFallbackReason {
 /// forcing receipt parsers to repeat saturating arithmetic.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Eagle3AuthoritativeE1ShadowTiming {
+    pub selective_path_budget: Option<usize>,
+    pub portfolio_encode_us: u128,
+    pub portfolio_commit_wait_us: u128,
+    pub portfolio_gpu_us: u128,
+    pub portfolio_kernel_window_us: u128,
     pub target_prefix_start_us: u128,
     pub target_prefix_end_us: u128,
     pub target_tail_start_us: u128,
@@ -288,6 +313,9 @@ pub struct Eagle3AuthoritativeE1ShadowTiming {
     pub target_gpu_us: u128,
     pub target_tail_gpu_us: u128,
     pub e1_gpu_us: u128,
+    /// Layer-25 RMSNorm/indexed scoring plus selective FC + K/V projection. The two command
+    /// buffers are serial on the private EAGLE queue, so summing their GPU windows is exact.
+    pub total_selective_prep_gpu_us: u128,
     pub overlap_us: u128,
     pub e1_encode_us: u128,
     /// CPU time spent waiting after the authoritative target tail had already completed. This is
@@ -299,16 +327,24 @@ pub struct Eagle3AuthoritativeE1ShadowTiming {
     /// CPU time spent mapping the accepted path and scanning the live serial cache. This field is
     /// populated only after a receipt exists, so gate-off pays no clock/readback cost.
     pub oracle_compare_us: u128,
+    /// Fixed paired-control reference supplied by the experiment plan, when available.
+    pub target_tail_baseline_us: Option<u128>,
+    /// Per-round tail duration minus the paired-control reference, saturated at zero. `None`
+    /// means no valid reference was supplied; it must never be presented as a zero penalty.
+    pub target_tail_penalty_us: Option<u128>,
 }
 
 /// State-inert E1 result retained until the established serial authoritative update provides
-/// its oracle. `scratch_{k,v}` use `[kv_head][verifier_row - 1][head_dim]` F16 layout.
+/// its oracle. `scratch_{k,v}` use `[kv_head][dense_prepared_edge_slot][head_dim]` F16 layout;
+/// `prepared_edge_rows` preserves the exact dense-slot -> verifier-row identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Eagle3AuthoritativeE1Shadow {
     Encoded {
         stable_position: usize,
         tree_parent: Vec<i32>,
         tree_depth: Vec<u16>,
+        /// Dense scratch slot -> original non-root verifier row.
+        prepared_edge_rows: Vec<usize>,
         scratch_k: Vec<u16>,
         scratch_v: Vec<u16>,
         timing: Eagle3AuthoritativeE1ShadowTiming,
@@ -320,14 +356,24 @@ pub enum Eagle3AuthoritativeE1Shadow {
 pub enum Eagle3AuthoritativeE1ShadowComparison {
     Matched {
         prepared_edges: usize,
-        selected_edges: usize,
+        authoritative_edges: usize,
+        prepared_hits: usize,
+        prepared_misses: usize,
+        authoritative_path_fully_covered: bool,
+        theoretical_serial_edge_rows_displaced: usize,
+        actually_reused_edge_rows: usize,
         compared_f16_values: usize,
         timing: Eagle3AuthoritativeE1ShadowTiming,
     },
     Mismatched {
         reason: String,
         prepared_edges: usize,
-        selected_edges: usize,
+        authoritative_edges: usize,
+        prepared_hits: usize,
+        prepared_misses: usize,
+        authoritative_path_fully_covered: bool,
+        theoretical_serial_edge_rows_displaced: usize,
+        actually_reused_edge_rows: usize,
         timing: Eagle3AuthoritativeE1ShadowTiming,
     },
     Fallback(Eagle3AuthoritativeE1ShadowFallbackReason),
@@ -420,6 +466,29 @@ fn eagle3_authoritative_e1_selected_edge_slots(
         slots.push((child - 1, serial_offset));
     }
     Ok(slots)
+}
+
+/// Validate the sparse verifier-row -> dense private-slot mapping produced by the frozen
+/// path-only portfolio. Parent closure is required even though E1 cells are independent: it
+/// proves that the selector really is a union of complete root-first paths and prevents a later
+/// reuse implementation from silently accepting an ancestry hole.
+#[cfg(any(target_os = "macos", test))]
+fn eagle3_authoritative_e1_selective_rows_valid(
+    tree_parent: &[i32],
+    prepared_edge_rows: &[usize],
+) -> bool {
+    prepared_edge_rows
+        .windows(2)
+        .all(|rows| rows[0] < rows[1])
+        && prepared_edge_rows.iter().all(|&row| {
+            if row == 0 || row >= tree_parent.len() {
+                return false;
+            }
+            let Ok(parent) = usize::try_from(tree_parent[row]) else {
+                return false;
+            };
+            parent == 0 || prepared_edge_rows.binary_search(&parent).is_ok()
+        })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -34614,6 +34683,13 @@ struct Eagle3AuthoritativeE1Pending {
     stable_position: usize,
     tree_parent: Vec<i32>,
     tree_depth: Vec<u16>,
+    prepared_edge_rows: Vec<usize>,
+    selective_path_budget: Option<usize>,
+    target_tail_baseline_us: Option<u128>,
+    portfolio_encode_us: u128,
+    portfolio_commit_wait_us: u128,
+    portfolio_gpu_us: u128,
+    portfolio_kernel_window_us: u128,
     e1_encode_us: u128,
 }
 
@@ -34635,7 +34711,7 @@ impl Eagle3AuthoritativeE1Pending {
         let (e1_start, e1_end) = command_buffer_gpu_interval_us(&self.cb);
         let overlap_start = tail_start.max(e1_start);
         let overlap_end = tail_end.min(e1_end);
-        let edges = self.tree_parent.len().saturating_sub(1);
+        let edges = self.prepared_edge_rows.len();
         let values = EAGLE3_KV_HEADS * edges * EAGLE3_HEAD_DIM;
         let readback_started = std::time::Instant::now();
         let scratch = completed.then(|| unsafe {
@@ -34648,6 +34724,11 @@ impl Eagle3AuthoritativeE1Pending {
         });
         let e1_readback_us = readback_started.elapsed().as_micros();
         let timing = Eagle3AuthoritativeE1ShadowTiming {
+            selective_path_budget: self.selective_path_budget,
+            portfolio_encode_us: self.portfolio_encode_us,
+            portfolio_commit_wait_us: self.portfolio_commit_wait_us,
+            portfolio_gpu_us: self.portfolio_gpu_us,
+            portfolio_kernel_window_us: self.portfolio_kernel_window_us,
             target_prefix_start_us: prefix_start,
             target_prefix_end_us: prefix_end,
             target_tail_start_us: tail_start,
@@ -34657,17 +34738,25 @@ impl Eagle3AuthoritativeE1Pending {
             target_gpu_us,
             target_tail_gpu_us: tail_end.saturating_sub(tail_start),
             e1_gpu_us: e1_end.saturating_sub(e1_start),
+            total_selective_prep_gpu_us: self
+                .portfolio_gpu_us
+                .saturating_add(e1_end.saturating_sub(e1_start)),
             overlap_us: overlap_end.saturating_sub(overlap_start),
             e1_encode_us: self.e1_encode_us,
             e1_post_target_wait_us,
             e1_readback_us,
             oracle_compare_us: 0,
+            target_tail_baseline_us: self.target_tail_baseline_us,
+            target_tail_penalty_us: self
+                .target_tail_baseline_us
+                .map(|baseline| tail_end.saturating_sub(tail_start).saturating_sub(baseline)),
         };
         let receipt = if let Some((scratch_k, scratch_v)) = scratch {
             Eagle3AuthoritativeE1Shadow::Encoded {
                 stable_position: self.stable_position,
                 tree_parent: self.tree_parent,
                 tree_depth: self.tree_depth,
+                prepared_edge_rows: self.prepared_edge_rows,
                 scratch_k,
                 scratch_v,
                 timing,
@@ -35323,6 +35412,20 @@ impl Eagle3MetalState {
         ) {
             return Err(reason);
         }
+        if plan.tree_tokens.len() != rows
+            || plan
+                .tree_tokens
+                .iter()
+                .any(|token| *token as usize >= crate::eagle3::TARGET_VOCAB_SIZE)
+            || plan.selective_path_budget.is_some_and(|budget| {
+                !crate::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS.contains(&budget)
+            })
+            || (plan.selective_path_budget.is_some() != plan.target_tail_baseline_us.is_some())
+            || (plan.selective_path_budget.is_some()
+                && rows != EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS)
+        {
+            return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
+        }
         if rows.saturating_sub(1) > KQUANT_V3_MAX_COLUMNS {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::UnsupportedVerifierWidth);
         }
@@ -35357,6 +35460,8 @@ impl Eagle3MetalState {
         capture_bufs: &[Buffer],
         plan: &Eagle3AuthoritativeE1ShadowPlan<'_>,
         rows: usize,
+        selective_edge_rows: Option<&[usize]>,
+        selective_portfolio: Option<&ResidentIndexedHeadEarlySnapshot>,
     ) -> std::result::Result<
         Eagle3AuthoritativeE1Pending,
         Eagle3AuthoritativeE1ShadowFallbackReason,
@@ -35367,12 +35472,28 @@ impl Eagle3MetalState {
         let Some(v3) = kquant_v3_kernels() else {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::KquantV3Unavailable);
         };
-        let edges = rows - 1;
+        let prepared_edge_rows = selective_edge_rows
+            .map(Vec::from)
+            .unwrap_or_else(|| (1..rows).collect());
+        if plan.selective_path_budget.is_some() != selective_edge_rows.is_some()
+            || plan.selective_path_budget.is_some() != selective_portfolio.is_some()
+        {
+            // A selective request must never silently widen to C1's all-edge work, and an
+            // all-edge request must never inherit a stale portfolio receipt.
+            return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
+        }
+        if !eagle3_authoritative_e1_selective_rows_valid(
+            plan.tree_parent,
+            &prepared_edge_rows,
+        ) {
+            return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
+        }
+        let edges = prepared_edge_rows.len();
         let kv_width = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
         let nb = |bytes: usize| pool_get(k, bytes.max(4) as u64);
         let f32b = |values: usize| nb(values * std::mem::size_of::<f32>());
-        let feature_input = f32b(rows * EAGLE3_AUX_WIDTH);
-        let fused = f32b(rows * EAGLE3_HIDDEN);
+        let feature_input = f32b(edges * EAGLE3_AUX_WIDTH);
+        let fused = f32b(edges * EAGLE3_HIDDEN);
         let combined_all = f32b(edges * EAGLE3_ATTN_INPUT);
         let key_all = f32b(edges * kv_width);
         let value_all = f32b(edges * kv_width);
@@ -35394,18 +35515,20 @@ impl Eagle3MetalState {
             .to_owned();
         cb.encode_wait_for_event(capture_ready, capture_event_value);
         {
-            // Captures are tap-major `[tap][row][H]`; FC consumes row-major
-            // `[row][tap0 || tap1 || tap2]`. A blit preserves every f32 bit.
+            // Captures are tap-major `[tap][verifier_row][H]`; FC consumes dense edge-major
+            // `[edge_slot][tap0 || tap1 || tap2]`. Each edge uses its parent capture. A blit
+            // preserves every f32 bit, and shared prefixes are deduplicated by verifier row.
             let blit = cb.new_blit_command_encoder();
             let tap_bytes = (EAGLE3_HIDDEN * std::mem::size_of::<f32>()) as u64;
             let feature_row_bytes = (EAGLE3_AUX_WIDTH * std::mem::size_of::<f32>()) as u64;
-            for row in 0..rows {
+            for (edge_slot, &child) in prepared_edge_rows.iter().enumerate() {
+                let parent = plan.tree_parent[child] as usize;
                 for (tap, capture) in capture_bufs.iter().enumerate() {
                     blit.copy_from_buffer(
                         capture,
-                        row as u64 * tap_bytes,
+                        parent as u64 * tap_bytes,
                         &feature_input,
-                        row as u64 * feature_row_bytes + tap as u64 * tap_bytes,
+                        edge_slot as u64 * feature_row_bytes + tap as u64 * tap_bytes,
                         tap_bytes,
                     );
                 }
@@ -35416,26 +35539,26 @@ impl Eagle3MetalState {
         let mut keep = Vec::new();
         {
             let e = cb.new_compute_command_encoder();
-            // One authoritative FC over all verifier rows. Every edge then pairs child row
-            // `r`'s target embedding with parent(r)'s projected target capture.
-            encode_eagle3_matmul_f32(
-                e,
-                k,
-                &mut keep,
-                &feature_input,
-                &self.fc,
-                &fused,
-                &fc_scalar,
-                EAGLE3_AUX_WIDTH,
-                EAGLE3_HIDDEN,
-                rows,
-            );
+            // One authoritative FC column per selected edge. The terminal recurrent cell stays
+            // late and authoritative; this shadow projects no terminal token or stable seed.
+            if edges > 0 {
+                encode_eagle3_matmul_f32(
+                    e,
+                    k,
+                    &mut keep,
+                    &feature_input,
+                    &self.fc,
+                    &fused,
+                    &fc_scalar,
+                    EAGLE3_AUX_WIDTH,
+                    EAGLE3_HIDDEN,
+                    edges,
+                );
+            }
             let hidden_row_bytes = (EAGLE3_HIDDEN * std::mem::size_of::<f32>()) as u64;
             let combined_row_bytes = (EAGLE3_ATTN_INPUT * std::mem::size_of::<f32>()) as u64;
-            for child in 1..rows {
-                let parent = plan.tree_parent[child] as usize;
-                let edge = child - 1;
-                let combined_offset = edge as u64 * combined_row_bytes;
+            for (edge_slot, &child) in prepared_edge_rows.iter().enumerate() {
+                let combined_offset = edge_slot as u64 * combined_row_bytes;
                 encode_eagle3_rms_norm_off(
                     e,
                     k,
@@ -35450,7 +35573,7 @@ impl Eagle3MetalState {
                     e,
                     k,
                     &fused,
-                    parent as u64 * hidden_row_bytes,
+                    edge_slot as u64 * hidden_row_bytes,
                     &self.hidden_norm,
                     &combined_all,
                     combined_offset + hidden_row_bytes,
@@ -35480,7 +35603,7 @@ impl Eagle3MetalState {
                     EAGLE3_ATTN_INPUT,
                     kv_width,
                 );
-            } else {
+            } else if edges > 1 {
                 encode_eagle3_q4k_multi_column(
                     e,
                     v3,
@@ -35506,8 +35629,7 @@ impl Eagle3MetalState {
             }
 
             let kv_row_bytes = (kv_width * std::mem::size_of::<f32>()) as u64;
-            for child in 1..rows {
-                let edge = child - 1;
+            for (edge_slot, &child) in prepared_edge_rows.iter().enumerate() {
                 let logical_position = plan.stable_position + plan.tree_depth[child] as usize - 1;
                 let k_rope_scalar = nb(16);
                 let scatter_scalar = nb(16);
@@ -35525,10 +35647,10 @@ impl Eagle3MetalState {
                     let scatter = scatter_scalar.contents().cast::<u32>();
                     *scatter = EAGLE3_HEAD_DIM as u32;
                     *scatter.add(1) = edges as u32;
-                    *scatter.add(2) = edge as u32;
+                    *scatter.add(2) = edge_slot as u32;
                     *scatter.add(3) = kv_width as u32;
                 }
-                let kv_offset = edge as u64 * kv_row_bytes;
+                let kv_offset = edge_slot as u64 * kv_row_bytes;
                 encode_rope(
                     e,
                     k,
@@ -35574,6 +35696,15 @@ impl Eagle3MetalState {
             stable_position: plan.stable_position,
             tree_parent: plan.tree_parent.to_vec(),
             tree_depth: plan.tree_depth.to_vec(),
+            prepared_edge_rows,
+            selective_path_budget: plan.selective_path_budget,
+            target_tail_baseline_us: plan.target_tail_baseline_us,
+            portfolio_encode_us: selective_portfolio.map_or(0, |early| early.encode_us),
+            portfolio_commit_wait_us: selective_portfolio
+                .map_or(0, |early| early.commit_wait_us),
+            portfolio_gpu_us: selective_portfolio.map_or(0, |early| early.gpu_busy_us),
+            portfolio_kernel_window_us: selective_portfolio
+                .map_or(0, |early| early.kernel_window_us),
             e1_encode_us: encode_started.elapsed().as_micros(),
         })
     }
@@ -35605,12 +35736,21 @@ impl Eagle3MetalState {
     ) -> Option<Eagle3AuthoritativeE1ShadowComparison> {
         let shadow = self.authoritative_e1_shadow.take()?;
         let oracle_compare_started = std::time::Instant::now();
-        let (stable_position, tree_parent, tree_depth, scratch_k, scratch_v, timing) =
+        let (
+            stable_position,
+            tree_parent,
+            tree_depth,
+            prepared_edge_rows,
+            scratch_k,
+            scratch_v,
+            timing,
+        ) =
             match shadow {
                 Eagle3AuthoritativeE1Shadow::Encoded {
                     stable_position,
                     tree_parent,
                     tree_depth,
+                    prepared_edge_rows,
                     scratch_k,
                     scratch_v,
                     timing,
@@ -35618,6 +35758,7 @@ impl Eagle3MetalState {
                     stable_position,
                     tree_parent,
                     tree_depth,
+                    prepared_edge_rows,
                     scratch_k,
                     scratch_v,
                     timing,
@@ -35626,8 +35767,38 @@ impl Eagle3MetalState {
                     return Some(Eagle3AuthoritativeE1ShadowComparison::Fallback(reason));
                 }
             };
-        let prepared_edges = tree_parent.len().saturating_sub(1);
-        let selected_edges = accepted_path.len().saturating_sub(1);
+        let prepared_edges = prepared_edge_rows.len();
+        let authoritative_edges = accepted_path.len().saturating_sub(1);
+        let accepted_edge_rows = match eagle3_authoritative_e1_selected_edge_slots(
+            &tree_parent,
+            &tree_depth,
+            accepted_path,
+        ) {
+            Ok(slots) => slots,
+            Err(reason) => {
+                return Some(Eagle3AuthoritativeE1ShadowComparison::Mismatched {
+                    reason: format!("selected path: {reason}"),
+                    prepared_edges,
+                    authoritative_edges,
+                    prepared_hits: 0,
+                    prepared_misses: authoritative_edges,
+                    authoritative_path_fully_covered: false,
+                    theoretical_serial_edge_rows_displaced: 0,
+                    actually_reused_edge_rows: 0,
+                    timing,
+                });
+            }
+        };
+        let prepared_hits = accepted_edge_rows
+            .iter()
+            .filter(|(all_edge_slot, _)| {
+                prepared_edge_rows
+                    .binary_search(&(*all_edge_slot + 1))
+                    .is_ok()
+            })
+            .count();
+        let prepared_misses = authoritative_edges.saturating_sub(prepared_hits);
+        let authoritative_path_fully_covered = prepared_misses == 0;
         let timed = |mut timing: Eagle3AuthoritativeE1ShadowTiming| {
             timing.oracle_compare_us = oracle_compare_started.elapsed().as_micros();
             timing
@@ -35635,9 +35806,17 @@ impl Eagle3MetalState {
         let mismatch = |reason: String| Eagle3AuthoritativeE1ShadowComparison::Mismatched {
             reason,
             prepared_edges,
-            selected_edges,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
+            theoretical_serial_edge_rows_displaced: prepared_hits,
+            actually_reused_edge_rows: 0,
             timing: timed(timing),
         };
+        if !eagle3_authoritative_e1_selective_rows_valid(&tree_parent, &prepared_edge_rows) {
+            return Some(mismatch("invalid selective edge-row map".to_string()));
+        }
         if stable_position != serial_start {
             return Some(mismatch(format!(
                 "receipt stable position {stable_position} != serial start {serial_start}"
@@ -35650,14 +35829,6 @@ impl Eagle3MetalState {
                 self.filled
             )));
         }
-        let selected_slots = match eagle3_authoritative_e1_selected_edge_slots(
-            &tree_parent,
-            &tree_depth,
-            accepted_path,
-        ) {
-            Ok(slots) => slots,
-            Err(reason) => return Some(mismatch(format!("selected path: {reason}"))),
-        };
         let kv_width = EAGLE3_KV_HEADS * EAGLE3_HEAD_DIM;
         let expected_values = prepared_edges * kv_width;
         if scratch_k.len() != expected_values || scratch_v.len() != expected_values {
@@ -35667,8 +35838,11 @@ impl Eagle3MetalState {
                 scratch_v.len()
             )));
         }
-        for (scratch_position, serial_offset) in selected_slots {
-            let child = scratch_position + 1;
+        for (all_edge_slot, serial_offset) in accepted_edge_rows {
+            let child = all_edge_slot + 1;
+            let Ok(scratch_position) = prepared_edge_rows.binary_search(&child) else {
+                continue;
+            };
             let live_position = serial_start + serial_offset;
             for kv_head in 0..EAGLE3_KV_HEADS {
                 for dim in 0..EAGLE3_HEAD_DIM {
@@ -35695,8 +35869,13 @@ impl Eagle3MetalState {
         }
         Some(Eagle3AuthoritativeE1ShadowComparison::Matched {
             prepared_edges,
-            selected_edges,
-            compared_f16_values: selected_edges * kv_width * 2,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
+            theoretical_serial_edge_rows_displaced: prepared_hits,
+            actually_reused_edge_rows: 0,
+            compared_f16_values: prepared_hits * kv_width * 2,
             timing: timed(timing),
         })
     }
@@ -39471,8 +39650,9 @@ struct ResidentIndexedHeadProjection {
 /// early snapshot or compare the scores with a completed full head in a separate function.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn run_resident_indexed_head_projection(
+fn run_resident_indexed_head_projection_on_queue(
     kern: &MetalLinearKernel,
+    queue: &CommandQueue,
     residual_rows: &Buffer,
     output_weight: &ResidentLinearWeight,
     output_is_tied_embedding: bool,
@@ -39538,7 +39718,7 @@ fn run_resident_indexed_head_projection(
     };
     let mut keep = Vec::new();
     let encode_started = std::time::Instant::now();
-    let cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
+    let cb: metal::CommandBuffer = queue.new_command_buffer().to_owned();
     {
         let blit = cb.new_blit_command_encoder();
         for copy in &plan.copies {
@@ -39611,6 +39791,34 @@ fn run_resident_indexed_head_projection(
         kernel_window_us,
         rows,
     })
+}
+
+/// Established post-target projection wrapper. The selective target-tail experiment calls the
+/// queue-explicit primitive above with the private EAGLE queue; all older callers stay on the
+/// target's serial queue byte for byte.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_resident_indexed_head_projection(
+    kern: &MetalLinearKernel,
+    residual_rows: &Buffer,
+    output_weight: &ResidentLinearWeight,
+    output_is_tied_embedding: bool,
+    hidden: usize,
+    vocab: usize,
+    n_tokens: usize,
+    candidate_ids: &[u32],
+) -> Result<ResidentIndexedHeadProjection, ResidentIndexedHeadShadowFallbackReason> {
+    run_resident_indexed_head_projection_on_queue(
+        kern,
+        &kern.queue,
+        residual_rows,
+        output_weight,
+        output_is_tied_embedding,
+        hidden,
+        vocab,
+        n_tokens,
+        candidate_ids,
+    )
 }
 
 /// Compare an authority-free projection with the completed production head.  Keeping this
@@ -39793,6 +40001,103 @@ fn run_resident_indexed_head_early_snapshot(
         commit_wait_us: projection.commit_wait_us,
         gpu_busy_us: projection.gpu_busy_us,
         kernel_window_us: projection.kernel_window_us,
+        fallback_reason: None,
+        rows: projection
+            .rows
+            .into_iter()
+            .map(|row| ResidentIndexedHeadEarlyRow {
+                verifier_row: row.verifier_row,
+                candidate_logit_bits: row
+                    .candidate_scores
+                    .iter()
+                    .map(|(_, score)| score.to_bits())
+                    .collect(),
+                ranked_candidate_tokens: resident_indexed_head_ranked_tokens(
+                    &row.candidate_scores,
+                ),
+            })
+            .collect(),
+    }
+}
+
+/// Selective-edge sibling that normalizes and scores the frozen layer-25 capture on the private
+/// EAGLE queue. The caller commits target B first and fences target A before entering here, so
+/// this work races only the already-running target tail and cannot observe final logits or ids.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_resident_indexed_head_early_snapshot_on_queue(
+    kern: &MetalLinearKernel,
+    queue: &CommandQueue,
+    layer_id: usize,
+    layer25_residual: &Buffer,
+    final_norm: &Buffer,
+    rms_scalar: &Buffer,
+    output_weight: &ResidentLinearWeight,
+    output_is_tied_embedding: bool,
+    hidden: usize,
+    vocab: usize,
+    n_tokens: usize,
+    candidate_ids: &[u32],
+) -> ResidentIndexedHeadEarlySnapshot {
+    let lens_norm = pool_get(
+        kern,
+        (n_tokens * hidden * std::mem::size_of::<f32>()) as u64,
+    );
+    let norm_encode_started = std::time::Instant::now();
+    let norm_cb: metal::CommandBuffer = queue.new_command_buffer().to_owned();
+    {
+        let encoder = norm_cb.new_compute_command_encoder();
+        encode_rms_norm_batch(
+            kern,
+            encoder,
+            layer25_residual,
+            final_norm,
+            &lens_norm,
+            rms_scalar,
+            n_tokens,
+        );
+        encoder.end_encoding();
+    }
+    let norm_encode_us = norm_encode_started.elapsed().as_micros();
+    let norm_wait_started = std::time::Instant::now();
+    norm_cb.commit();
+    norm_cb.wait_until_completed();
+    let norm_wait_us = norm_wait_started.elapsed().as_micros();
+    if norm_cb.status() != metal::MTLCommandBufferStatus::Completed {
+        pool_recycle(kern, [lens_norm]);
+        return resident_indexed_head_early_fallback(
+            layer_id,
+            candidate_ids,
+            ResidentIndexedHeadShadowFallbackReason::CommandBufferFailed,
+        );
+    }
+    let (norm_gpu_us, norm_kernel_window_us) = command_buffer_gpu_times_us(&norm_cb);
+    let projection = run_resident_indexed_head_projection_on_queue(
+        kern,
+        queue,
+        &lens_norm,
+        output_weight,
+        output_is_tied_embedding,
+        hidden,
+        vocab,
+        n_tokens,
+        candidate_ids,
+    );
+    pool_recycle(kern, [lens_norm]);
+    let projection = match projection {
+        Ok(projection) => projection,
+        Err(reason) => {
+            return resident_indexed_head_early_fallback(layer_id, candidate_ids, reason);
+        }
+    };
+    ResidentIndexedHeadEarlySnapshot {
+        layer_id,
+        compile_fast_math_enabled: false,
+        candidate_union: projection.candidate_union,
+        encode_us: norm_encode_us.saturating_add(projection.encode_us),
+        commit_wait_us: norm_wait_us.saturating_add(projection.commit_wait_us),
+        gpu_busy_us: norm_gpu_us.saturating_add(projection.gpu_busy_us),
+        kernel_window_us: norm_kernel_window_us.saturating_add(projection.kernel_window_us),
         fallback_reason: None,
         rows: projection
             .rows
@@ -43763,8 +44068,19 @@ impl ResidentDecodeState {
         let bpr_hidden = hidden / 32;
         let bpr_q = q_dim / 32;
         let bpr_ffn = ffn_dim / 32;
+        let transaction_portfolio_shadow = eagle3_transaction_portfolio_shadow_enabled();
         let mut eagle3_e1_fallback = None;
         let eagle3_e1_armed = match eagle3_e1_shadow_plan {
+            Some(plan)
+                if plan.selective_path_budget.is_some()
+                    && (!transaction_portfolio_shadow
+                        || indexed_head_shadow_candidates.is_none()) =>
+            {
+                eagle3_e1_fallback = Some(
+                    Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable,
+                );
+                false
+            }
             Some(plan) => match plan.head.authoritative_e1_shadow_preflight(
                 plan,
                 k,
@@ -44636,10 +44952,104 @@ impl ResidentDecodeState {
         let tail_commit_started = std::time::Instant::now();
         let commit_started = first_commit_started.unwrap_or_else(|| tail_commit_started.clone());
         cb.commit();
+        let mut selective_early_layer25 = None;
+        let mut selective_edge_rows = None;
+        if let Some(plan) = eagle3_e1_shadow_plan.filter(|plan| {
+            eagle3_e1_armed && plan.selective_path_budget.is_some()
+        }) {
+            let candidate_ids = indexed_head_shadow_candidates
+                .expect("armed selective E1 preflight requires indexed candidates");
+            let layer_id = *crate::eagle3::TARGET_LAYER_INPUT_IDS
+                .last()
+                .expect("EAGLE capture contract is non-empty");
+            let capture_slot = capture_layer_ids.binary_search(&layer_id).ok();
+            let prefix_completed = eagle3_e1_capture_cb.as_ref().is_some_and(|prefix| {
+                // Target B is already queued behind A. Fencing A here releases the private
+                // scorer while B continues on the target queue; no final-head buffer is read.
+                wait_command_buffer_completed(prefix);
+                prefix.status() == metal::MTLCommandBufferStatus::Completed
+            });
+            if !prefix_completed {
+                eagle3_e1_fallback = Some(
+                    Eagle3AuthoritativeE1ShadowFallbackReason::CommandBufferFailed,
+                );
+            } else if let Some(capture_slot) = capture_slot.filter(|slot| *slot < capture_bufs.len())
+            {
+                let early = run_resident_indexed_head_early_snapshot_on_queue(
+                    kern,
+                    eagle3_authoritative_e1_shadow_queue(kern),
+                    layer_id,
+                    &capture_bufs[capture_slot],
+                    &final_norm_buf,
+                    &rms_scalar,
+                    &ow_buf,
+                    logits.output_is_tied_embedding,
+                    hidden,
+                    vocab,
+                    k,
+                    candidate_ids,
+                );
+                if early.scored() {
+                    let frozen_tree = crate::inference::spec_tree::TokenTree {
+                        tokens: plan.tree_tokens.to_vec(),
+                        parent: plan.tree_parent.to_vec(),
+                        depth: plan.tree_depth.to_vec(),
+                    };
+                    match crate::eagle3_runtime::Eagle3EarlyTransactionPortfolio::freeze(
+                        &frozen_tree,
+                        &early,
+                    )
+                    .and_then(|portfolio| {
+                        portfolio.plan_selective_edge_prep(
+                            plan.selective_path_budget
+                                .expect("selective plan has a budget"),
+                        )
+                    }) {
+                        Ok(edge_plan)
+                            if edge_plan.tree_tokens.as_slice() == plan.tree_tokens
+                                && edge_plan.tree_parent.as_slice() == plan.tree_parent
+                                && edge_plan.tree_depth.as_slice() == plan.tree_depth =>
+                        {
+                            eprintln!(
+                                "[eagle3-selective-edge-prep] phase=authority-free-freeze \
+                                 budget={} predicted_paths={} predicted_unique_edge_rows={} \
+                                 portfolio_encode_us={} portfolio_commit_wait_us={} \
+                                 portfolio_gpu_us={} portfolio_kernel_window_us={} \
+                                 target_tail_baseline_us={}",
+                                edge_plan.budget,
+                                edge_plan.predicted_paths.len(),
+                                edge_plan.prepared_edge_rows.len(),
+                                early.encode_us,
+                                early.commit_wait_us,
+                                early.gpu_busy_us,
+                                early.kernel_window_us,
+                                plan.target_tail_baseline_us
+                                    .expect("selective preflight requires a tail baseline"),
+                            );
+                            selective_edge_rows = Some(edge_plan.prepared_edge_rows);
+                        }
+                        _ => {
+                            eagle3_e1_fallback = Some(
+                                Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable,
+                            );
+                        }
+                    }
+                } else {
+                    eagle3_e1_fallback = Some(
+                        Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable,
+                    );
+                }
+                selective_early_layer25 = Some(early);
+            } else {
+                eagle3_e1_fallback = Some(
+                    Eagle3AuthoritativeE1ShadowFallbackReason::CaptureContract,
+                );
+            }
+        }
         // Submit E1 only after target B is already queued. Its event wait may release as soon as
         // target A's last capture copy completes, so neither host encoding nor queue submission
         // delays the target tail. The result remains diagnostic and private.
-        let eagle3_e1_pending = if eagle3_e1_armed {
+        let eagle3_e1_pending = if eagle3_e1_armed && eagle3_e1_fallback.is_none() {
             match (
                 eagle3_e1_shadow_plan,
                 eagle3_e1_capture_event.as_ref(),
@@ -44655,6 +45065,8 @@ impl ResidentDecodeState {
                         &capture_bufs,
                         plan,
                         k,
+                        selective_edge_rows.as_deref(),
+                        selective_early_layer25.as_ref(),
                     ) {
                         Ok(pending) => Some(pending),
                         Err(reason) => {
@@ -44763,11 +45175,13 @@ impl ResidentDecodeState {
                 ATTN_PREFETCH_ROW_ENCODES.load(std::sync::atomic::Ordering::Relaxed)
             );
         }
-        let transaction_portfolio_shadow = eagle3_transaction_portfolio_shadow_enabled();
         // Freeze the authority-free layer-25 evidence before any CPU code below reads or compares
-        // the full-head logits/predictions. The target command buffer has completed, but neither
-        // authority buffer crosses the scorer's signature. This remains a state-inert diagnostic.
-        let early_layer25 = if transaction_portfolio_shadow {
+        // the full-head logits/predictions. A selective E1 run already produced this snapshot on
+        // the private queue while target B was live; the established portfolio-only run computes
+        // it here after target completion. Neither path crosses an authority buffer.
+        let early_layer25 = if selective_early_layer25.is_some() {
+            selective_early_layer25
+        } else if transaction_portfolio_shadow {
             indexed_head_shadow_candidates.map(|candidate_ids| {
                 let layer_id = *crate::eagle3::TARGET_LAYER_INPUT_IDS
                     .last()
@@ -46866,6 +47280,27 @@ mod tests {
             eagle3_authoritative_e1_selected_edge_slots(&parent, &depth, &[0, 2, 4]),
             Err("edge_parent_or_depth")
         );
+
+        assert!(eagle3_authoritative_e1_selective_rows_valid(
+            &parent,
+            &[1, 3, 4, 6]
+        ));
+        assert!(eagle3_authoritative_e1_selective_rows_valid(
+            &parent,
+            &[1, 4, 7]
+        ));
+        assert!(!eagle3_authoritative_e1_selective_rows_valid(
+            &parent,
+            &[4, 7]
+        ));
+        assert!(!eagle3_authoritative_e1_selective_rows_valid(
+            &parent,
+            &[1, 4, 4]
+        ));
+        assert!(!eagle3_authoritative_e1_selective_rows_valid(
+            &parent,
+            &[0, 1]
+        ));
     }
 
     #[test]

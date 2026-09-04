@@ -1860,7 +1860,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], false, true, None, None)?
+            .verify_tree_metal_inner(tree, &[], false, true, None, None, None)?
             .map(|(emitted, _capture, _target_top_k, _indexed_head)| emitted))
     }
 
@@ -1875,7 +1875,7 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None, None)?
+            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None, None, None)?
             .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
     }
 
@@ -1901,6 +1901,7 @@ impl super::LlamaInferenceSession {
                 true,
                 None,
                 Some(eagle3_head),
+                None,
             )?
             .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
     }
@@ -1915,7 +1916,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<LlamaTargetTopKVerify>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, true, None, None)?
+            .verify_tree_metal_inner(tree, &[], true, true, None, None, None)?
             .map(|(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerify {
                 predictions: capture.predictions,
                 target_top_k,
@@ -1936,7 +1937,7 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None, None)?
+            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None, None, None)?
             .map(
                 |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerifyCapture {
                     predictions: capture.predictions,
@@ -1965,6 +1966,7 @@ impl super::LlamaInferenceSession {
                 true,
                 Some(candidate_ids),
                 None,
+                None,
             )?
         else {
             return Ok(None);
@@ -1972,6 +1974,43 @@ impl super::LlamaInferenceSession {
         let shadow = indexed_head.ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(
                 "indexed-head verifier completed without its requested shadow receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative,
+            shadow,
+        }))
+    }
+
+    /// Default-off selective E1 falsifier. Layer-25 indexed scoring runs on the private EAGLE
+    /// queue while the unchanged target tail is live, freezes the top-B path portfolio, and
+    /// prepares only its unique edge rows. The receipt is installed for comparison after the
+    /// established serial authoritative update; no private row is consumed here.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+        eagle3_head: &mut metal::Eagle3MetalState,
+        path_budget: usize,
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        let Some((_emitted, authoritative, _target_top_k, indexed_head)) = self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                false,
+                true,
+                Some(candidate_ids),
+                Some(eagle3_head),
+                Some(path_budget),
+            )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "selective E1 verifier completed without its indexed-head receipt".into(),
             )
         })?;
         Ok(Some(LlamaIndexedHeadShadowVerify {
@@ -1997,6 +2036,7 @@ impl super::LlamaInferenceSession {
                 true,
                 Some(candidate_ids),
                 None,
+                None,
             )?
         else {
             return Ok(None);
@@ -2004,6 +2044,46 @@ impl super::LlamaInferenceSession {
         let shadow = indexed_head.ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(
                 "indexed-head verifier completed without its requested shadow receipt".into(),
+            )
+        })?;
+        Ok(Some(LlamaIndexedHeadShadowVerify {
+            authoritative: LlamaTargetTopKVerifyCapture {
+                predictions: capture.predictions,
+                target_top_k,
+                emitted,
+                layer_inputs: capture.layer_inputs,
+                timings: capture.timings,
+            },
+            shadow,
+        }))
+    }
+
+    /// Token-Recycling-capable twin of the selective E1 falsifier above.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+        candidate_ids: &[u32],
+        eagle3_head: &mut metal::Eagle3MetalState,
+        path_budget: usize,
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
+        let Some((emitted, capture, target_top_k, indexed_head)) = self
+            .verify_tree_metal_inner(
+                tree,
+                capture_layer_ids,
+                true,
+                true,
+                Some(candidate_ids),
+                Some(eagle3_head),
+                Some(path_budget),
+            )?
+        else {
+            return Ok(None);
+        };
+        let shadow = indexed_head.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "selective E1 verifier completed without its indexed-head receipt".into(),
             )
         })?;
         Ok(Some(LlamaIndexedHeadShadowVerify {
@@ -2030,7 +2110,7 @@ impl super::LlamaInferenceSession {
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<(Vec<u32>, Vec<[u32; metal::RESIDENT_VERIFY_TARGET_TOP_K]>)>> {
         Ok(self
-            .verify_tree_metal_inner(tree, &[], true, false, None, None)?
+            .verify_tree_metal_inner(tree, &[], true, false, None, None, None)?
             .map(|(_emitted, capture, target_top_k, _indexed_head)| {
                 (capture.predictions, target_top_k)
             }))
@@ -2045,6 +2125,7 @@ impl super::LlamaInferenceSession {
         commit: bool,
         indexed_head_shadow_candidates: Option<&[u32]>,
         mut eagle3_e1_shadow_head: Option<&mut metal::Eagle3MetalState>,
+        selective_e1_path_budget: Option<usize>,
     ) -> Result<
         Option<(
             Vec<u32>,
@@ -2190,9 +2271,13 @@ impl super::LlamaInferenceSession {
                 .expect("requested E1 shadow has a head");
             let e1_plan = metal::Eagle3AuthoritativeE1ShadowPlan {
                 head: eagle3_head,
+                tree_tokens: &tree.tokens,
                 tree_parent: &tree.parent,
                 tree_depth: &tree.depth,
                 stable_position: eagle3_head.filled(),
+                selective_path_budget: selective_e1_path_budget,
+                target_tail_baseline_us: selective_e1_path_budget
+                    .map(|_| metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US),
             };
             let Some((
                 predicted,
@@ -2536,6 +2621,20 @@ impl super::LlamaInferenceSession {
         Ok(None)
     }
 
+    /// Non-macOS build: selective edge preparation is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+        _eagle3_head: &mut metal::Eagle3MetalState,
+        _path_budget: usize,
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaGreedyVerifyCapture>>> {
+        Ok(None)
+    }
+
     /// Non-macOS build: resident teacher-feature capture is unavailable.
     #[cfg(not(target_os = "macos"))]
     #[allow(dead_code)]
@@ -2641,6 +2740,20 @@ impl super::LlamaInferenceSession {
         _tree: &spec_tree::TokenTree,
         _capture_layer_ids: &[usize],
         _candidate_ids: &[u32],
+    ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: target-top-k selective edge preparation is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs_target_top_k_indexed_head_and_selective_e1_shadow(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+        _candidate_ids: &[u32],
+        _eagle3_head: &mut metal::Eagle3MetalState,
+        _path_budget: usize,
     ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
         Ok(None)
     }

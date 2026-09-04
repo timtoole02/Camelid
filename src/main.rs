@@ -10955,6 +10955,221 @@ fn record_eagle3_transaction_portfolio_round(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Eagle3SelectiveEdgePrepEvidenceReceipt {
+    configured_path_budget: usize,
+    measured_path_budget: Option<usize>,
+    predicted_unique_edge_rows: usize,
+    authoritative_edge_rows: usize,
+    prepared_hits: usize,
+    prepared_misses: usize,
+    authoritative_path_fully_covered: bool,
+    theoretical_serial_edge_rows_displaced: usize,
+    actually_reused_edge_rows: usize,
+    portfolio_encode_us: u128,
+    portfolio_commit_wait_us: u128,
+    portfolio_gpu_us: u128,
+    portfolio_kernel_window_us: u128,
+    target_gpu_us: u128,
+    target_tail_gpu_us: u128,
+    target_tail_baseline_us: Option<u128>,
+    target_tail_penalty_us: Option<u128>,
+    e1_gpu_us: u128,
+    total_selective_prep_gpu_us: u128,
+    overlap_us: u128,
+    e1_encode_us: u128,
+    e1_post_target_wait_us: u128,
+    e1_readback_us: u128,
+    oracle_compare_us: u128,
+    target_prefix_interval_us: [u128; 2],
+    target_tail_interval_us: [u128; 2],
+    e1_interval_us: [u128; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum Eagle3SelectiveEdgePrepRoundReceipt {
+    Matched {
+        round: u64,
+        compared_f16_values: usize,
+        evidence: Eagle3SelectiveEdgePrepEvidenceReceipt,
+    },
+    Mismatched {
+        round: u64,
+        reason: String,
+        evidence: Eagle3SelectiveEdgePrepEvidenceReceipt,
+    },
+    Fallback {
+        round: u64,
+        reason: String,
+    },
+    SerialOracleSkipped {
+        round: u64,
+        reason: &'static str,
+    },
+}
+
+impl Eagle3SelectiveEdgePrepRoundReceipt {
+    fn round(&self) -> u64 {
+        match self {
+            Self::Matched { round, .. }
+            | Self::Mismatched { round, .. }
+            | Self::Fallback { round, .. }
+            | Self::SerialOracleSkipped { round, .. } => *round,
+        }
+    }
+}
+
+fn eagle3_selective_edge_prep_evidence(
+    configured_path_budget: usize,
+    prepared_edges: usize,
+    authoritative_edges: usize,
+    prepared_hits: usize,
+    prepared_misses: usize,
+    authoritative_path_fully_covered: bool,
+    theoretical_serial_edge_rows_displaced: usize,
+    actually_reused_edge_rows: usize,
+    timing: camelid::metal::Eagle3AuthoritativeE1ShadowTiming,
+) -> Eagle3SelectiveEdgePrepEvidenceReceipt {
+    Eagle3SelectiveEdgePrepEvidenceReceipt {
+        configured_path_budget,
+        measured_path_budget: timing.selective_path_budget,
+        predicted_unique_edge_rows: prepared_edges,
+        authoritative_edge_rows: authoritative_edges,
+        prepared_hits,
+        prepared_misses,
+        authoritative_path_fully_covered,
+        theoretical_serial_edge_rows_displaced,
+        actually_reused_edge_rows,
+        portfolio_encode_us: timing.portfolio_encode_us,
+        portfolio_commit_wait_us: timing.portfolio_commit_wait_us,
+        portfolio_gpu_us: timing.portfolio_gpu_us,
+        portfolio_kernel_window_us: timing.portfolio_kernel_window_us,
+        target_gpu_us: timing.target_gpu_us,
+        target_tail_gpu_us: timing.target_tail_gpu_us,
+        target_tail_baseline_us: timing.target_tail_baseline_us,
+        target_tail_penalty_us: timing.target_tail_penalty_us,
+        e1_gpu_us: timing.e1_gpu_us,
+        total_selective_prep_gpu_us: timing.total_selective_prep_gpu_us,
+        overlap_us: timing.overlap_us,
+        e1_encode_us: timing.e1_encode_us,
+        e1_post_target_wait_us: timing.e1_post_target_wait_us,
+        e1_readback_us: timing.e1_readback_us,
+        oracle_compare_us: timing.oracle_compare_us,
+        target_prefix_interval_us: [
+            timing.target_prefix_start_us,
+            timing.target_prefix_end_us,
+        ],
+        target_tail_interval_us: [timing.target_tail_start_us, timing.target_tail_end_us],
+        e1_interval_us: [timing.e1_start_us, timing.e1_end_us],
+    }
+}
+
+fn record_eagle3_selective_edge_prep_round(
+    configured_path_budget: usize,
+    round: u64,
+    comparison: Option<camelid::metal::Eagle3AuthoritativeE1ShadowComparison>,
+    receipts: &mut Vec<Eagle3SelectiveEdgePrepRoundReceipt>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipts.last().is_none_or(|previous| previous.round() < round),
+        "selective edge-preparation round ids are not strictly increasing"
+    );
+    use camelid::metal::Eagle3AuthoritativeE1ShadowComparison as Comparison;
+    let receipt = match comparison {
+        Some(Comparison::Matched {
+            prepared_edges,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
+            theoretical_serial_edge_rows_displaced,
+            actually_reused_edge_rows,
+            compared_f16_values,
+            timing,
+        }) => {
+            let evidence = eagle3_selective_edge_prep_evidence(
+                configured_path_budget,
+                prepared_edges,
+                authoritative_edges,
+                prepared_hits,
+                prepared_misses,
+                authoritative_path_fully_covered,
+                theoretical_serial_edge_rows_displaced,
+                actually_reused_edge_rows,
+                timing,
+            );
+            if evidence.measured_path_budget == Some(configured_path_budget)
+                && evidence.target_tail_baseline_us
+                    == Some(camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US)
+            {
+                Eagle3SelectiveEdgePrepRoundReceipt::Matched {
+                    round,
+                    compared_f16_values,
+                    evidence,
+                }
+            } else {
+                Eagle3SelectiveEdgePrepRoundReceipt::Mismatched {
+                    round,
+                    reason: "selective timing identity did not match configured budget/baseline"
+                        .to_string(),
+                    evidence,
+                }
+            }
+        }
+        Some(Comparison::Mismatched {
+            reason,
+            prepared_edges,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
+            theoretical_serial_edge_rows_displaced,
+            actually_reused_edge_rows,
+            timing,
+        }) => Eagle3SelectiveEdgePrepRoundReceipt::Mismatched {
+            round,
+            reason,
+            evidence: eagle3_selective_edge_prep_evidence(
+                configured_path_budget,
+                prepared_edges,
+                authoritative_edges,
+                prepared_hits,
+                prepared_misses,
+                authoritative_path_fully_covered,
+                theoretical_serial_edge_rows_displaced,
+                actually_reused_edge_rows,
+                timing,
+            ),
+        },
+        Some(Comparison::Fallback(reason)) => Eagle3SelectiveEdgePrepRoundReceipt::Fallback {
+            round,
+            reason: reason.label().to_string(),
+        },
+        None => Eagle3SelectiveEdgePrepRoundReceipt::Fallback {
+            round,
+            reason: "comparison_receipt_unavailable".to_string(),
+        },
+    };
+    receipts.push(receipt);
+    Ok(())
+}
+
+fn record_eagle3_selective_edge_prep_serial_skip(
+    round: u64,
+    receipts: &mut Vec<Eagle3SelectiveEdgePrepRoundReceipt>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipts.last().is_none_or(|previous| previous.round() < round),
+        "selective edge-preparation round ids are not strictly increasing"
+    );
+    receipts.push(Eagle3SelectiveEdgePrepRoundReceipt::SerialOracleSkipped {
+        round,
+        reason: "terminal_head_skip",
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod eagle3_transaction_portfolio_receipt_tests {
     use super::*;
@@ -11041,6 +11256,56 @@ mod eagle3_transaction_portfolio_receipt_tests {
         assert!(freeze_eagle3_transaction_portfolio(false, &tree, None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn selective_edge_prep_receipt_preserves_coverage_timing_and_zero_reuse() {
+        let timing = camelid::metal::Eagle3AuthoritativeE1ShadowTiming {
+            selective_path_budget: Some(4),
+            portfolio_gpu_us: 10,
+            target_tail_start_us: 100,
+            target_tail_end_us: 5_100,
+            e1_start_us: 200,
+            e1_end_us: 220,
+            target_tail_gpu_us: 5_000,
+            e1_gpu_us: 20,
+            total_selective_prep_gpu_us: 30,
+            target_tail_baseline_us: Some(
+                camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US,
+            ),
+            target_tail_penalty_us: Some(78),
+            ..Default::default()
+        };
+        let comparison = camelid::metal::Eagle3AuthoritativeE1ShadowComparison::Matched {
+            prepared_edges: 5,
+            authoritative_edges: 3,
+            prepared_hits: 2,
+            prepared_misses: 1,
+            authoritative_path_fully_covered: false,
+            theoretical_serial_edge_rows_displaced: 2,
+            actually_reused_edge_rows: 0,
+            compared_f16_values: 2
+                * camelid::metal::EAGLE3_KV_HEADS
+                * camelid::metal::EAGLE3_HEAD_DIM
+                * 2,
+            timing,
+        };
+        let mut receipts = Vec::new();
+        record_eagle3_selective_edge_prep_round(4, 1, Some(comparison), &mut receipts)
+            .unwrap();
+        match &receipts[0] {
+            Eagle3SelectiveEdgePrepRoundReceipt::Matched { evidence, .. } => {
+                assert_eq!(evidence.predicted_unique_edge_rows, 5);
+                assert_eq!(evidence.prepared_hits, 2);
+                assert_eq!(evidence.prepared_misses, 1);
+                assert_eq!(evidence.target_tail_penalty_us, Some(78));
+                assert_eq!(evidence.total_selective_prep_gpu_us, 30);
+                assert_eq!(evidence.actually_reused_edge_rows, 0);
+            }
+            receipt => panic!("expected matched selective receipt, got {receipt:?}"),
+        }
+        record_eagle3_selective_edge_prep_serial_skip(2, &mut receipts).unwrap();
+        assert_eq!(receipts[1].round(), 2);
     }
 }
 
@@ -11461,6 +11726,7 @@ struct Eagle3BenchRun {
     dual_eagle_selected_head: Option<DualEagleHead>,
     argmax_shadow_rounds: Vec<Eagle3ArgmaxShadowRoundReceipt>,
     transaction_portfolio_rounds: Vec<Eagle3TransactionPortfolioRoundReceipt>,
+    selective_edge_prep_rounds: Vec<Eagle3SelectiveEdgePrepRoundReceipt>,
 }
 
 impl Eagle3BenchRun {
@@ -11586,6 +11852,7 @@ fn run_eagle3_resident_greedy(
     indexed_head_shadow: bool,
     indexed_head_direct_emission: bool,
     transaction_portfolio_shadow: bool,
+    selective_edge_prep_budget: Option<usize>,
     indexed_head_target_top8_history_rounds: usize,
     indexed_head_candidate_recency_rounds: usize,
     mut drafter: camelid::eagle3_runtime::Eagle3Drafter,
@@ -12329,12 +12596,23 @@ fn run_eagle3_resident_greedy(
                 let (predictions, layer_inputs, indexed_head_result, current_target_top_k) =
                     if let Some(candidates) = indexed_head_candidates.as_ref() {
                         if indexed_head_target_top8_history.is_some() {
-                            let result = session
-                                .verify_tree_metal_with_layer_inputs_target_top_k_and_indexed_head_shadow(
-                                    &fused.tree,
-                                    &TARGET_LAYER_INPUT_IDS,
-                                    &candidates.candidate_ids,
-                                )?
+                            let result = if let Some(path_budget) = selective_edge_prep_budget {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_target_top_k_indexed_head_and_selective_e1_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                        drafter.authoritative_e1_shadow_head_mut(),
+                                        path_budget,
+                                    )?
+                            } else {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_target_top_k_and_indexed_head_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                    )?
+                            }
                                 .ok_or_else(|| {
                                     anyhow::anyhow!(
                                         "resident Metal indexed-head target-top-8 shadow became unavailable at position {target_before}"
@@ -12348,12 +12626,23 @@ fn run_eagle3_resident_greedy(
                                 Some(authoritative.target_top_k),
                             )
                         } else {
-                            let result = session
-                                .verify_tree_metal_with_layer_inputs_and_indexed_head_shadow(
-                                    &fused.tree,
-                                    &TARGET_LAYER_INPUT_IDS,
-                                    &candidates.candidate_ids,
-                                )?
+                            let result = if let Some(path_budget) = selective_edge_prep_budget {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_indexed_head_and_selective_e1_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                        drafter.authoritative_e1_shadow_head_mut(),
+                                        path_budget,
+                                    )?
+                            } else {
+                                session
+                                    .verify_tree_metal_with_layer_inputs_and_indexed_head_shadow(
+                                        &fused.tree,
+                                        &TARGET_LAYER_INPUT_IDS,
+                                        &candidates.candidate_ids,
+                                    )?
+                            }
                                 .ok_or_else(|| {
                                     anyhow::anyhow!(
                                         "resident Metal indexed-head shadow became unavailable at position {target_before}"
@@ -12450,13 +12739,35 @@ fn run_eagle3_resident_greedy(
                     run.terminal_head_updates_skipped = 1;
                     run.terminal_head_skip_reason = Some(reason);
                     terminal_head_update_skipped_this_round = true;
+                    if selective_edge_prep_budget.is_some() {
+                        drafter.abandon_authoritative_e1_shadow_for_terminal_skip();
+                        record_eagle3_selective_edge_prep_serial_skip(
+                            run.rounds + 1,
+                            &mut run.selective_edge_prep_rounds,
+                        )?;
+                    }
                 } else {
                     let update_started = Instant::now();
-                    drafter.accept_authoritative_forest(
-                        weights,
-                        &layer_inputs,
-                        &acceptance,
-                    )?;
+                    if let Some(path_budget) = selective_edge_prep_budget {
+                        let comparison = drafter
+                            .accept_authoritative_forest_with_e1_receipt(
+                                weights,
+                                &layer_inputs,
+                                &acceptance,
+                            )?;
+                        record_eagle3_selective_edge_prep_round(
+                            path_budget,
+                            run.rounds + 1,
+                            comparison,
+                            &mut run.selective_edge_prep_rounds,
+                        )?;
+                    } else {
+                        drafter.accept_authoritative_forest(
+                            weights,
+                            &layer_inputs,
+                            &acceptance,
+                        )?;
+                    }
                     run.head_update_us += update_started.elapsed().as_micros();
                 }
 
@@ -13064,6 +13375,79 @@ fn run_eagle3_resident_greedy(
             "transaction portfolio emitted receipts while default-off"
         );
     }
+    if let Some(path_budget) = selective_edge_prep_budget {
+        anyhow::ensure!(
+            run.selective_edge_prep_rounds.len() as u64 == run.rounds,
+            "selective edge preparation recorded {} of {} fixed-lattice rounds",
+            run.selective_edge_prep_rounds.len(),
+            run.rounds,
+        );
+        for (index, receipt) in run.selective_edge_prep_rounds.iter().enumerate() {
+            let expected_round = index as u64 + 1;
+            anyhow::ensure!(
+                receipt.round() == expected_round,
+                "selective edge-preparation round id diverged at {expected_round}"
+            );
+            let evidence = match receipt {
+                Eagle3SelectiveEdgePrepRoundReceipt::Matched {
+                    compared_f16_values,
+                    evidence,
+                    ..
+                } => {
+                    anyhow::ensure!(
+                        *compared_f16_values
+                            == evidence.prepared_hits
+                                * camelid::metal::EAGLE3_KV_HEADS
+                                * camelid::metal::EAGLE3_HEAD_DIM
+                                * 2,
+                        "selective edge-preparation match compared the wrong K/V width"
+                    );
+                    Some(evidence)
+                }
+                Eagle3SelectiveEdgePrepRoundReceipt::Mismatched { evidence, .. } => {
+                    Some(evidence)
+                }
+                Eagle3SelectiveEdgePrepRoundReceipt::Fallback { .. }
+                | Eagle3SelectiveEdgePrepRoundReceipt::SerialOracleSkipped { .. } => None,
+            };
+            if let Some(evidence) = evidence {
+                anyhow::ensure!(
+                    evidence.configured_path_budget == path_budget
+                        && evidence.measured_path_budget == Some(path_budget)
+                        && evidence.target_tail_baseline_us
+                            == Some(
+                                camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US
+                            )
+                        && evidence.target_tail_penalty_us
+                            == Some(evidence.target_tail_gpu_us.saturating_sub(
+                                camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US,
+                            ))
+                        && evidence.prepared_hits + evidence.prepared_misses
+                            == evidence.authoritative_edge_rows
+                        && evidence.prepared_hits <= evidence.predicted_unique_edge_rows
+                        && evidence.authoritative_path_fully_covered
+                            == (evidence.prepared_misses == 0)
+                        && evidence.theoretical_serial_edge_rows_displaced
+                            == evidence.prepared_hits
+                        && evidence.actually_reused_edge_rows == 0
+                        && evidence.total_selective_prep_gpu_us
+                            == evidence.portfolio_gpu_us.saturating_add(evidence.e1_gpu_us)
+                        && evidence.target_tail_gpu_us
+                            == evidence.target_tail_interval_us[1]
+                                .saturating_sub(evidence.target_tail_interval_us[0])
+                        && evidence.e1_gpu_us
+                            == evidence.e1_interval_us[1]
+                                .saturating_sub(evidence.e1_interval_us[0]),
+                    "selective edge-preparation round {expected_round} has inconsistent evidence"
+                );
+            }
+        }
+    } else {
+        anyhow::ensure!(
+            run.selective_edge_prep_rounds.is_empty(),
+            "selective edge-preparation emitted receipts while default-off"
+        );
+    }
     if adaptive_expansions {
         anyhow::ensure!(
             run.adaptive_expansions.shallow_rounds + run.adaptive_expansions.deep_rounds
@@ -13408,6 +13792,20 @@ struct BenchEagle3Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     transaction_portfolio_round_evidence:
         Option<Vec<Eagle3TransactionPortfolioRoundReceipt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_budget: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_target_tail_baseline_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_matched_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_mismatched_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_fallback_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_serial_oracle_skipped_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selective_edge_prep_round_evidence: Option<Vec<Eagle3SelectiveEdgePrepRoundReceipt>>,
     dual_eagle_selector: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     dual_eagle_race_rounds: Option<u8>,
@@ -13722,6 +14120,70 @@ fn validate_eagle3_transaction_portfolio_shadow_config(
     Ok(())
 }
 
+fn parse_eagle3_selective_edge_prep_budget_env(
+    value: Option<&str>,
+) -> anyhow::Result<Option<usize>> {
+    match value {
+        None | Some("") | Some("0") => Ok(None),
+        Some("1") => Ok(Some(1)),
+        Some("2") => Ok(Some(2)),
+        Some("4") => Ok(Some(4)),
+        Some("8") => Ok(Some(8)),
+        Some(value) => anyhow::bail!(
+            "{} must be exactly 0, 1, 2, 4, or 8, got {value:?}",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        ),
+    }
+}
+
+fn eagle3_selective_edge_prep_budget() -> anyhow::Result<Option<usize>> {
+    let raw = std::env::var_os(camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV);
+    let value = raw
+        .as_ref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is not valid UTF-8",
+                    camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+                )
+            })
+        })
+        .transpose()?;
+    parse_eagle3_selective_edge_prep_budget_env(value)
+}
+
+fn validate_eagle3_selective_edge_prep_config(
+    budget: Option<usize>,
+    transaction_portfolio_shadow: bool,
+    indexed_head_shadow: bool,
+    indexed_head_direct_emission: bool,
+    target_row_lattice_promotion: bool,
+    tree_nodes: Option<usize>,
+) -> anyhow::Result<()> {
+    if let Some(budget) = budget {
+        anyhow::ensure!(
+            camelid::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS.contains(&budget),
+            "selective edge-preparation budget {budget} is not a measured portfolio width"
+        );
+        anyhow::ensure!(
+            transaction_portfolio_shadow && indexed_head_shadow && target_row_lattice_promotion,
+            "{} requires the transaction portfolio, indexed-head shadow, and target-row lattice-promotion gates",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        );
+        anyhow::ensure!(
+            !indexed_head_direct_emission,
+            "{} requires the ordinary target full-head predictions to remain authoritative",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        );
+        anyhow::ensure!(
+            tree_nodes == Some(camelid::metal::EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS),
+            "{} requires the frozen N8 verifier tree",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod eagle3_transaction_portfolio_shadow_config_tests {
     use super::*;
@@ -13738,6 +14200,65 @@ mod eagle3_transaction_portfolio_shadow_config_tests {
         assert!(validate_eagle3_transaction_portfolio_shadow_config(false, false).is_ok());
         assert!(validate_eagle3_transaction_portfolio_shadow_config(true, true).is_ok());
         assert!(validate_eagle3_transaction_portfolio_shadow_config(true, false).is_err());
+    }
+
+    #[test]
+    fn selective_edge_prep_gate_is_exact_default_off_and_requires_the_frozen_n8_lane() {
+        assert_eq!(parse_eagle3_selective_edge_prep_budget_env(None).unwrap(), None);
+        assert_eq!(parse_eagle3_selective_edge_prep_budget_env(Some("")).unwrap(), None);
+        assert_eq!(parse_eagle3_selective_edge_prep_budget_env(Some("0")).unwrap(), None);
+        assert_eq!(parse_eagle3_selective_edge_prep_budget_env(Some("1")).unwrap(), Some(1));
+        assert_eq!(parse_eagle3_selective_edge_prep_budget_env(Some("2")).unwrap(), Some(2));
+        assert_eq!(parse_eagle3_selective_edge_prep_budget_env(Some("4")).unwrap(), Some(4));
+        assert_eq!(parse_eagle3_selective_edge_prep_budget_env(Some("8")).unwrap(), Some(8));
+        assert!(parse_eagle3_selective_edge_prep_budget_env(Some("true")).is_err());
+        assert!(parse_eagle3_selective_edge_prep_budget_env(Some(" 4")).is_err());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4), true, true, false, true, Some(8)
+        )
+        .is_ok());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4), false, true, false, true, Some(8)
+        )
+        .is_err());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4), true, true, false, true, Some(7)
+        )
+        .is_err());
+        assert!(validate_eagle3_selective_edge_prep_config(
+            Some(4), true, true, true, true, Some(8)
+        )
+        .is_err());
+
+        // Exercise the surrounding validators as one configuration, so this experiment cannot
+        // accidentally depend on mutually-exclusive campaign lanes.
+        assert!(validate_eagle3_argmax_shadow_config(
+            true,
+            true,
+            false,
+            true,
+            Some(8),
+            8,
+            camelid::metal::EAGLE3_TOP_K_CANDIDATES,
+            0,
+            0,
+        )
+        .is_ok());
+        assert!(validate_eagle3_target_row_lattice_promotion_config(
+            true,
+            false,
+            Some(8),
+            2,
+            2,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .is_ok());
     }
 }
 
@@ -15230,6 +15751,7 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_TARGET_TOP8_HISTORY_ROUNDS",
         "CAMELID_BENCH_EAGLE3_INDEXED_HEAD_CANDIDATE_RECENCY_ROUNDS",
         camelid::metal::EAGLE3_TRANSACTION_PORTFOLIO_SHADOW_ENV,
+        camelid::metal::EAGLE3_SELECTIVE_EDGE_PREP_BUDGET_ENV,
         "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW",
         camelid::eagle3_runtime::EAGLE3_DRAFT_EARLY_EXIT_ENV,
     ] {
@@ -15566,6 +16088,7 @@ fn run_bench_eagle3(
     let indexed_head_direct_emission =
         eagle3_argmax_shadow_env("CAMELID_BENCH_EAGLE3_INDEXED_HEAD_DIRECT_EMISSION")?;
     let transaction_portfolio_shadow = eagle3_transaction_portfolio_shadow_enabled()?;
+    let selective_edge_prep_budget = eagle3_selective_edge_prep_budget()?;
     let indexed_head_target_top8_history_rounds =
         eagle3_indexed_head_target_top8_history_rounds()?;
     let indexed_head_candidate_recency_rounds =
@@ -15723,6 +16246,14 @@ fn run_bench_eagle3(
     validate_eagle3_transaction_portfolio_shadow_config(
         transaction_portfolio_shadow,
         indexed_head_shadow,
+    )?;
+    validate_eagle3_selective_edge_prep_config(
+        selective_edge_prep_budget,
+        transaction_portfolio_shadow,
+        indexed_head_shadow,
+        indexed_head_direct_emission,
+        target_row_lattice_promotion,
+        tree_nodes,
     )?;
     validate_eagle3_terminal_head_skip_config(
         terminal_head_skip,
@@ -15970,6 +16501,7 @@ fn run_bench_eagle3(
         indexed_head_shadow,
         indexed_head_direct_emission,
         transaction_portfolio_shadow,
+        selective_edge_prep_budget,
         indexed_head_target_top8_history_rounds,
         indexed_head_candidate_recency_rounds,
         primary_drafter,
@@ -16143,6 +16675,53 @@ fn run_bench_eagle3(
             transaction_portfolio_path_hits,
             transaction_portfolio_endpoint_hits,
             transaction_portfolio_conditional_terminal_hits,
+        );
+    }
+    let selective_edge_prep_matched_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(receipt, Eagle3SelectiveEdgePrepRoundReceipt::Matched { .. })
+        })
+        .count() as u64;
+    let selective_edge_prep_mismatched_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                receipt,
+                Eagle3SelectiveEdgePrepRoundReceipt::Mismatched { .. }
+            )
+        })
+        .count() as u64;
+    let selective_edge_prep_fallback_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(receipt, Eagle3SelectiveEdgePrepRoundReceipt::Fallback { .. })
+        })
+        .count() as u64;
+    let selective_edge_prep_serial_oracle_skipped_rounds = eagle
+        .selective_edge_prep_rounds
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                receipt,
+                Eagle3SelectiveEdgePrepRoundReceipt::SerialOracleSkipped { .. }
+            )
+        })
+        .count() as u64;
+    if let Some(budget) = selective_edge_prep_budget {
+        eprintln!(
+            "[bench-eagle3-selective-edge-prep] budget={budget} \
+             target-tail-baseline-us={} matched={} mismatched={} fallback={} \
+             serial-oracle-skipped={} terminal-cell=serial-authoritative \
+             prepared-cache-consumption=disabled",
+            camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US,
+            selective_edge_prep_matched_rounds,
+            selective_edge_prep_mismatched_rounds,
+            selective_edge_prep_fallback_rounds,
+            selective_edge_prep_serial_oracle_skipped_rounds,
         );
     }
     let record = BenchEagle3Record {
@@ -16433,6 +17012,19 @@ fn run_bench_eagle3(
             .then_some(transaction_portfolio_conditional_terminal_hits),
         transaction_portfolio_round_evidence: transaction_portfolio_shadow
             .then(|| eagle.transaction_portfolio_rounds.clone()),
+        selective_edge_prep_budget,
+        selective_edge_prep_target_tail_baseline_us: selective_edge_prep_budget
+            .map(|_| camelid::metal::EAGLE3_SELECTIVE_EDGE_TARGET_TAIL_BASELINE_US),
+        selective_edge_prep_matched_rounds: selective_edge_prep_budget
+            .map(|_| selective_edge_prep_matched_rounds),
+        selective_edge_prep_mismatched_rounds: selective_edge_prep_budget
+            .map(|_| selective_edge_prep_mismatched_rounds),
+        selective_edge_prep_fallback_rounds: selective_edge_prep_budget
+            .map(|_| selective_edge_prep_fallback_rounds),
+        selective_edge_prep_serial_oracle_skipped_rounds: selective_edge_prep_budget
+            .map(|_| selective_edge_prep_serial_oracle_skipped_rounds),
+        selective_edge_prep_round_evidence: selective_edge_prep_budget
+            .map(|_| eagle.selective_edge_prep_rounds.clone()),
         dual_eagle_selector,
         dual_eagle_race_rounds: dual_eagle_selector.then_some(DUAL_EAGLE_RACE_ROUNDS),
         dual_eagle_root_ranking: dual_eagle_selector.then_some(DUAL_EAGLE_ROOT_RANKING),

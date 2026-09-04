@@ -1517,6 +1517,95 @@ pub struct Eagle3EarlyTransactionPortfolioEvaluation {
     pub coverage: [Eagle3EarlyTransactionCoverageAtBudget; 4],
 }
 
+/// Authority-free edge set selected from the top path-only portfolio entries.
+///
+/// Rows are verifier-row ids, not dense scratch slots. They are strictly increasing, exclude
+/// the root, and retain the complete verifier-tree identity that produced them. This prevents a
+/// same-width plan from being replayed against a different forest. The terminal recurrent cell
+/// is deliberately absent: this plan can prepare only independent FC + K/V edge work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3SelectiveEdgePrepPlan {
+    pub budget: usize,
+    pub tree_tokens: Vec<u32>,
+    pub tree_parent: Vec<i32>,
+    pub tree_depth: Vec<u16>,
+    pub predicted_paths: Vec<Vec<usize>>,
+    pub prepared_edge_rows: Vec<usize>,
+}
+
+/// Post-authority coverage accounting for a selective edge-preparation plan.
+///
+/// `theoretical_serial_edge_rows_displaced` counts exact edge rows whose FC + K/V work could be
+/// removed after a future byte-identical scratch-to-live commit. The current shadow consumes no
+/// private cache bytes, so `actually_reused_edge_rows` must remain zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eagle3SelectiveEdgePrepEvaluation {
+    pub budget: usize,
+    pub predicted_unique_edge_rows: usize,
+    pub authoritative_edge_rows: usize,
+    pub prepared_hits: usize,
+    pub prepared_misses: usize,
+    pub authoritative_path_fully_covered: bool,
+    pub theoretical_serial_edge_rows_displaced: usize,
+    pub actually_reused_edge_rows: usize,
+}
+
+fn eagle3_selective_edge_tree_valid(tree: &TokenTree) -> bool {
+    let nodes = tree.nodes();
+    if nodes == 0
+        || nodes > 8
+        || tree.parent.len() != nodes
+        || tree.depth.len() != nodes
+        || tree.parent[0] != -1
+        || tree.depth[0] != 0
+        || tree
+            .tokens
+            .iter()
+            .any(|token| *token as usize >= TARGET_VOCAB_SIZE)
+    {
+        return false;
+    }
+    (1..nodes).all(|row| {
+        usize::try_from(tree.parent[row]).is_ok_and(|parent| {
+            parent < row
+                && tree.depth[row] > 0
+                && tree.depth[parent].checked_add(1) == Some(tree.depth[row])
+        })
+    })
+}
+
+fn eagle3_selective_edge_rows_valid(tree: &TokenTree, rows: &[usize]) -> bool {
+    rows.windows(2).all(|pair| pair[0] < pair[1])
+        && rows.iter().all(|&row| {
+            if row == 0 || row >= tree.nodes() {
+                return false;
+            }
+            let parent = tree.parent[row] as usize;
+            parent == 0 || rows.binary_search(&parent).is_ok()
+        })
+}
+
+fn eagle3_selective_edge_path_union(
+    tree: &TokenTree,
+    predicted_paths: &[Vec<usize>],
+) -> Option<Vec<usize>> {
+    if !eagle3_selective_edge_tree_valid(tree) {
+        return None;
+    }
+    let mut prepared_edge_rows = BTreeSet::new();
+    for path in predicted_paths {
+        let leaf = path.last().copied()?;
+        if path.first().copied() != Some(0)
+            || path.iter().any(|&row| row >= tree.nodes())
+            || path.as_slice() != tree.path_to(leaf)
+        {
+            return None;
+        }
+        prepared_edge_rows.extend(path.iter().copied().skip(1));
+    }
+    Some(prepared_edge_rows.into_iter().collect())
+}
+
 fn eagle3_early_ranked_tokens(candidate_union: &[u32], logit_bits: &[u32]) -> Vec<u32> {
     let mut scores = candidate_union
         .iter()
@@ -1825,6 +1914,53 @@ impl Eagle3EarlyTransactionPortfolio {
         })
     }
 
+    /// Union the non-root verifier rows from the top-B path-only candidates.
+    ///
+    /// The ranking was frozen before target authority was observed. A `BTreeSet` both removes
+    /// shared-prefix duplication and produces the verifier-row order used by the dense private
+    /// scratch mapping. Only the measured B=1/2/4/8 portfolio widths are admitted.
+    pub fn plan_selective_edge_prep(&self, budget: usize) -> Result<Eagle3SelectiveEdgePrepPlan> {
+        if !EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS.contains(&budget) {
+            return Err(invalid(format!(
+                "EAGLE-3 selective edge preparation budget must be one of {:?}, got {budget}",
+                EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS
+            )));
+        }
+        let tree = TokenTree {
+            tokens: self.tree_tokens.clone(),
+            parent: self.tree_parent.clone(),
+            depth: self.tree_depth.clone(),
+        };
+        if !eagle3_selective_edge_tree_valid(&tree)
+            || self.top_paths.len() != self.path_candidates_considered.min(8)
+        {
+            return Err(invalid(
+                "EAGLE-3 selective edge preparation received a malformed frozen portfolio",
+            ));
+        }
+
+        let predicted_paths = self
+            .top_paths
+            .iter()
+            .take(budget)
+            .map(|candidate| candidate.path_rows.clone())
+            .collect::<Vec<_>>();
+        let prepared_edge_rows = eagle3_selective_edge_path_union(&tree, &predicted_paths)
+            .ok_or_else(|| {
+                invalid(
+                    "EAGLE-3 selective edge preparation found a non-canonical predicted path",
+                )
+            })?;
+        Ok(Eagle3SelectiveEdgePrepPlan {
+            budget,
+            tree_tokens: self.tree_tokens.clone(),
+            tree_parent: self.tree_parent.clone(),
+            tree_depth: self.tree_depth.clone(),
+            predicted_paths,
+            prepared_edge_rows,
+        })
+    }
+
     /// Compare a previously frozen portfolio with the target-authoritative transaction. This is
     /// the first API in the pipeline allowed to observe acceptance truth.
     pub fn evaluate(
@@ -1836,7 +1972,9 @@ impl Eagle3EarlyTransactionPortfolio {
             parent: self.tree_parent.clone(),
             depth: self.tree_depth.clone(),
         };
-        if acceptance.emitted_tokens.is_empty()
+        if !eagle3_selective_edge_tree_valid(&tree)
+            || self.early_rows.len() != tree.nodes()
+            || acceptance.emitted_tokens.is_empty()
             || acceptance.leaf_row >= tree.nodes()
             || acceptance.capture_rows != tree.path_to(acceptance.leaf_row)
             || acceptance.emitted_tokens.len() != acceptance.capture_rows.len()
@@ -1914,6 +2052,59 @@ impl Eagle3EarlyTransactionPortfolio {
     }
 }
 
+impl Eagle3SelectiveEdgePrepPlan {
+    /// Measure coverage only after the target-authoritative path is known. No prepared row is
+    /// consumed here; the existing serial update remains the sole cache mutation.
+    pub fn evaluate(
+        &self,
+        acceptance: &Eagle3ForestAcceptance,
+    ) -> Result<Eagle3SelectiveEdgePrepEvaluation> {
+        let tree = TokenTree {
+            tokens: self.tree_tokens.clone(),
+            parent: self.tree_parent.clone(),
+            depth: self.tree_depth.clone(),
+        };
+        let derived_edge_rows = eagle3_selective_edge_path_union(&tree, &self.predicted_paths);
+        if !EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS.contains(&self.budget)
+            || self.predicted_paths.len() > self.budget
+            || derived_edge_rows.as_deref() != Some(self.prepared_edge_rows.as_slice())
+            || acceptance.emitted_tokens.is_empty()
+            || acceptance.leaf_row >= tree.nodes()
+            || acceptance.capture_rows != tree.path_to(acceptance.leaf_row)
+            || acceptance.emitted_tokens.len() != acceptance.capture_rows.len()
+            || acceptance
+                .emitted_tokens
+                .iter()
+                .take(acceptance.emitted_tokens.len().saturating_sub(1))
+                .zip(acceptance.capture_rows.iter().skip(1))
+                .any(|(token, row)| *token != tree.tokens[*row])
+            || !eagle3_selective_edge_rows_valid(&tree, &self.prepared_edge_rows)
+        {
+            return Err(invalid(
+                "EAGLE-3 selective edge preparation received a mismatched plan or acceptance",
+            ));
+        }
+        let authoritative_edge_rows = acceptance.capture_rows.len().saturating_sub(1);
+        let prepared_hits = acceptance
+            .capture_rows
+            .iter()
+            .skip(1)
+            .filter(|row| self.prepared_edge_rows.binary_search(row).is_ok())
+            .count();
+        let prepared_misses = authoritative_edge_rows.saturating_sub(prepared_hits);
+        Ok(Eagle3SelectiveEdgePrepEvaluation {
+            budget: self.budget,
+            predicted_unique_edge_rows: self.prepared_edge_rows.len(),
+            authoritative_edge_rows,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered: prepared_misses == 0,
+            theoretical_serial_edge_rows_displaced: prepared_hits,
+            actually_reused_edge_rows: 0,
+        })
+    }
+}
+
 /// Receipt-facing counters for the benchmark-only authoritative command-buffer fusion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Eagle3AuthoritativeFusionTelemetry {
@@ -1943,7 +2134,10 @@ struct Eagle3AuthoritativeE1ShadowCounters {
     mismatched: u64,
     fallback: u64,
     prepared_edges: u64,
-    selected_edges: u64,
+    authoritative_edges: u64,
+    prepared_hits: u64,
+    prepared_misses: u64,
+    fully_covered_rounds: u64,
 }
 
 static EAGLE3_E1_REQUESTED: AtomicU64 = AtomicU64::new(0);
@@ -1952,7 +2146,10 @@ static EAGLE3_E1_MATCHED: AtomicU64 = AtomicU64::new(0);
 static EAGLE3_E1_MISMATCHED: AtomicU64 = AtomicU64::new(0);
 static EAGLE3_E1_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static EAGLE3_E1_PREPARED_EDGES: AtomicU64 = AtomicU64::new(0);
-static EAGLE3_E1_SELECTED_EDGES: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_AUTHORITATIVE_EDGES: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_PREPARED_HITS: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_PREPARED_MISSES: AtomicU64 = AtomicU64::new(0);
+static EAGLE3_E1_FULLY_COVERED_ROUNDS: AtomicU64 = AtomicU64::new(0);
 
 fn record_authoritative_e1_shadow(
     comparison: &Eagle3AuthoritativeE1ShadowComparison,
@@ -1961,23 +2158,39 @@ fn record_authoritative_e1_shadow(
     match comparison {
         Eagle3AuthoritativeE1ShadowComparison::Matched {
             prepared_edges,
-            selected_edges,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
             ..
         } => {
             EAGLE3_E1_ENCODED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_MATCHED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_EDGES.fetch_add(*prepared_edges as u64, Ordering::Relaxed);
-            EAGLE3_E1_SELECTED_EDGES.fetch_add(*selected_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_AUTHORITATIVE_EDGES
+                .fetch_add(*authoritative_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_PREPARED_HITS.fetch_add(*prepared_hits as u64, Ordering::Relaxed);
+            EAGLE3_E1_PREPARED_MISSES.fetch_add(*prepared_misses as u64, Ordering::Relaxed);
+            EAGLE3_E1_FULLY_COVERED_ROUNDS
+                .fetch_add(u64::from(*authoritative_path_fully_covered), Ordering::Relaxed);
         }
         Eagle3AuthoritativeE1ShadowComparison::Mismatched {
             prepared_edges,
-            selected_edges,
+            authoritative_edges,
+            prepared_hits,
+            prepared_misses,
+            authoritative_path_fully_covered,
             ..
         } => {
             EAGLE3_E1_ENCODED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_MISMATCHED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_EDGES.fetch_add(*prepared_edges as u64, Ordering::Relaxed);
-            EAGLE3_E1_SELECTED_EDGES.fetch_add(*selected_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_AUTHORITATIVE_EDGES
+                .fetch_add(*authoritative_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_PREPARED_HITS.fetch_add(*prepared_hits as u64, Ordering::Relaxed);
+            EAGLE3_E1_PREPARED_MISSES.fetch_add(*prepared_misses as u64, Ordering::Relaxed);
+            EAGLE3_E1_FULLY_COVERED_ROUNDS
+                .fetch_add(u64::from(*authoritative_path_fully_covered), Ordering::Relaxed);
         }
         Eagle3AuthoritativeE1ShadowComparison::Fallback(_) => {
             EAGLE3_E1_FALLBACK.fetch_add(1, Ordering::Relaxed);
@@ -1990,7 +2203,10 @@ fn record_authoritative_e1_shadow(
         mismatched: EAGLE3_E1_MISMATCHED.load(Ordering::Relaxed),
         fallback: EAGLE3_E1_FALLBACK.load(Ordering::Relaxed),
         prepared_edges: EAGLE3_E1_PREPARED_EDGES.load(Ordering::Relaxed),
-        selected_edges: EAGLE3_E1_SELECTED_EDGES.load(Ordering::Relaxed),
+        authoritative_edges: EAGLE3_E1_AUTHORITATIVE_EDGES.load(Ordering::Relaxed),
+        prepared_hits: EAGLE3_E1_PREPARED_HITS.load(Ordering::Relaxed),
+        prepared_misses: EAGLE3_E1_PREPARED_MISSES.load(Ordering::Relaxed),
+        fully_covered_rounds: EAGLE3_E1_FULLY_COVERED_ROUNDS.load(Ordering::Relaxed),
     }
 }
 
@@ -2570,6 +2786,22 @@ impl Eagle3Drafter {
         all_row_captures: &[CpuTensor],
         acceptance: &Eagle3ForestAcceptance,
     ) -> Result<()> {
+        self.accept_authoritative_forest_with_e1_receipt(
+            target_weights,
+            all_row_captures,
+            acceptance,
+        )
+        .map(|_| ())
+    }
+
+    /// Receipt-returning twin used only by the selective-edge benchmark. The ordinary serving
+    /// API above deliberately discards this diagnostic value and keeps its established shape.
+    pub fn accept_authoritative_forest_with_e1_receipt(
+        &mut self,
+        target_weights: &LlamaLoadedWeights,
+        all_row_captures: &[CpuTensor],
+        acceptance: &Eagle3ForestAcceptance,
+    ) -> Result<Option<Eagle3AuthoritativeE1ShadowComparison>> {
         let serial_start = self.head.filled();
         let accepted_captures = acceptance.gather_layer_inputs(all_row_captures)?;
         self.accept_authoritative(
@@ -2577,29 +2809,50 @@ impl Eagle3Drafter {
             &accepted_captures,
             &acceptance.emitted_tokens,
         )?;
-        if let Some(comparison) = self
+        let comparison = self
             .head
-            .finish_authoritative_e1_shadow(&acceptance.capture_rows, serial_start)
-        {
-            let counters = record_authoritative_e1_shadow(&comparison);
+            .finish_authoritative_e1_shadow(&acceptance.capture_rows, serial_start);
+        if let Some(comparison) = comparison.as_ref() {
+            let counters = record_authoritative_e1_shadow(comparison);
             match comparison {
                 Eagle3AuthoritativeE1ShadowComparison::Matched {
                     prepared_edges,
-                    selected_edges,
+                    authoritative_edges,
+                    prepared_hits,
+                    prepared_misses,
+                    authoritative_path_fully_covered,
+                    theoretical_serial_edge_rows_displaced,
+                    actually_reused_edge_rows,
                     compared_f16_values,
                     timing,
                 } => eprintln!(
-                    "[eagle3-e1-shadow] outcome=match route=target-capture-wide-fc-private-kv-serial-oracle \
-                     base={serial_start} prepared_edges={prepared_edges} selected_edges={selected_edges} \
+                    "[eagle3-e1-shadow] outcome=match route=target-tail-selective-or-wide-fc-private-kv-serial-oracle \
+                     base={serial_start} prepared_edges={prepared_edges} authoritative_edges={authoritative_edges} \
+                     prepared_hits={prepared_hits} prepared_misses={prepared_misses} \
+                     authoritative_path_fully_covered={authoritative_path_fully_covered} \
+                     theoretical_serial_edge_rows_displaced={theoretical_serial_edge_rows_displaced} \
+                     actually_reused_edge_rows={actually_reused_edge_rows} \
                      compared_f16_values={compared_f16_values} target_gpu_us={} target_tail_gpu_us={} \
+                     target_tail_baseline_us={:?} target_tail_penalty_us={:?} \
+                     selective_path_budget={:?} portfolio_encode_us={} portfolio_commit_wait_us={} \
+                     portfolio_gpu_us={} portfolio_kernel_window_us={} total_selective_prep_gpu_us={} \
                      e1_gpu_us={} overlap_us={} e1_encode_us={} e1_post_target_wait_us={} \
                      e1_readback_us={} oracle_compare_us={} \
                      target_prefix_interval={}..{} \
                      target_tail_interval={}..{} e1_interval={}..{} requested_total={} encoded_total={} \
                      matched_total={} mismatched_total={} fallback_total={} prepared_edges_total={} \
-                     selected_edges_total={}",
+                     authoritative_edges_total={} prepared_hits_total={} prepared_misses_total={} \
+                     fully_covered_rounds_total={}",
                     timing.target_gpu_us,
                     timing.target_tail_gpu_us,
+                    timing.target_tail_baseline_us,
+                    timing.target_tail_penalty_us,
+                    timing.selective_path_budget,
+                    timing.portfolio_encode_us,
+                    timing.portfolio_commit_wait_us,
+                    timing.portfolio_gpu_us,
+                    timing.portfolio_kernel_window_us,
+                    timing.total_selective_prep_gpu_us,
                     timing.e1_gpu_us,
                     timing.overlap_us,
                     timing.e1_encode_us,
@@ -2618,17 +2871,32 @@ impl Eagle3Drafter {
                     counters.mismatched,
                     counters.fallback,
                     counters.prepared_edges,
-                    counters.selected_edges,
+                    counters.authoritative_edges,
+                    counters.prepared_hits,
+                    counters.prepared_misses,
+                    counters.fully_covered_rounds,
                 ),
                 Eagle3AuthoritativeE1ShadowComparison::Mismatched {
                     reason,
                     prepared_edges,
-                    selected_edges,
+                    authoritative_edges,
+                    prepared_hits,
+                    prepared_misses,
+                    authoritative_path_fully_covered,
+                    theoretical_serial_edge_rows_displaced,
+                    actually_reused_edge_rows,
                     timing,
                 } => eprintln!(
                     "[eagle3-e1-shadow] outcome=mismatch route=serial-authoritative reason={reason:?} \
-                     base={serial_start} prepared_edges={prepared_edges} selected_edges={selected_edges} \
+                     base={serial_start} prepared_edges={prepared_edges} authoritative_edges={authoritative_edges} \
+                     prepared_hits={prepared_hits} prepared_misses={prepared_misses} \
+                     authoritative_path_fully_covered={authoritative_path_fully_covered} \
+                     theoretical_serial_edge_rows_displaced={theoretical_serial_edge_rows_displaced} \
+                     actually_reused_edge_rows={actually_reused_edge_rows} \
                      target_gpu_us={} target_tail_gpu_us={} e1_gpu_us={} overlap_us={} \
+                     target_tail_baseline_us={:?} target_tail_penalty_us={:?} \
+                     selective_path_budget={:?} portfolio_encode_us={} portfolio_commit_wait_us={} \
+                     portfolio_gpu_us={} portfolio_kernel_window_us={} total_selective_prep_gpu_us={} \
                      e1_post_target_wait_us={} e1_readback_us={} \
                      oracle_compare_us={} \
                      requested_total={} encoded_total={} matched_total={} mismatched_total={} \
@@ -2637,6 +2905,14 @@ impl Eagle3Drafter {
                     timing.target_tail_gpu_us,
                     timing.e1_gpu_us,
                     timing.overlap_us,
+                    timing.target_tail_baseline_us,
+                    timing.target_tail_penalty_us,
+                    timing.selective_path_budget,
+                    timing.portfolio_encode_us,
+                    timing.portfolio_commit_wait_us,
+                    timing.portfolio_gpu_us,
+                    timing.portfolio_kernel_window_us,
+                    timing.total_selective_prep_gpu_us,
                     timing.e1_post_target_wait_us,
                     timing.e1_readback_us,
                     timing.oracle_compare_us,
@@ -2659,7 +2935,7 @@ impl Eagle3Drafter {
                 ),
             }
         }
-        Ok(())
+        Ok(comparison)
     }
 }
 
@@ -3714,6 +3990,101 @@ mod tests {
                 source_nodes: Vec::new(),
             })
             .is_err());
+    }
+
+    fn selective_edge_portfolio_fixture() -> Eagle3EarlyTransactionPortfolio {
+        let paths = [
+            vec![0, 1, 4, 6],
+            vec![0, 1, 3],
+            vec![0, 2, 5],
+            vec![0, 1, 4, 7],
+        ];
+        Eagle3EarlyTransactionPortfolio {
+            layer_id: 25,
+            tree_tokens: vec![10, 11, 12, 13, 14, 15, 16, 17],
+            tree_parent: vec![-1, 0, 0, 1, 1, 2, 4, 4],
+            tree_depth: vec![0, 1, 1, 2, 2, 2, 3, 3],
+            candidate_union: vec![11, 12, 13, 14, 15, 16, 17, 90],
+            early_rows: Vec::new(),
+            transaction_candidates_considered: 0,
+            path_candidates_considered: paths.len(),
+            endpoint_candidates_considered: 0,
+            top_transactions: Vec::new(),
+            top_paths: paths
+                .into_iter()
+                .enumerate()
+                .map(|(rank, path_rows)| Eagle3EarlyPathCandidate {
+                    path_rows,
+                    log_probability_bits: (-(rank as f64)).to_bits(),
+                })
+                .collect(),
+            top_endpoints: Vec::new(),
+            indexed_head_encode_us: 0,
+            indexed_head_commit_wait_us: 0,
+            indexed_head_gpu_busy_us: 0,
+            indexed_head_kernel_window_us: 0,
+            ranked_transactions: Vec::new(),
+            ranked_paths: Vec::new(),
+            ranked_endpoints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selective_edge_prep_unions_complete_top_paths_without_root_or_duplicates() {
+        let portfolio = selective_edge_portfolio_fixture();
+        let b1 = portfolio.plan_selective_edge_prep(1).unwrap();
+        let b2 = portfolio.plan_selective_edge_prep(2).unwrap();
+        let b4 = portfolio.plan_selective_edge_prep(4).unwrap();
+        assert_eq!(b1.prepared_edge_rows, vec![1, 4, 6]);
+        assert_eq!(b2.prepared_edge_rows, vec![1, 3, 4, 6]);
+        assert_eq!(b4.prepared_edge_rows, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert!(b1.prepared_edge_rows.iter().all(|row| *row != 0));
+        assert!(portfolio.plan_selective_edge_prep(3).is_err());
+
+        let mut malformed = portfolio.clone();
+        malformed.tree_parent[4] = 7;
+        assert!(malformed.plan_selective_edge_prep(1).is_err());
+
+        let mut out_of_range_path = portfolio.clone();
+        out_of_range_path.top_paths[0].path_rows.push(99);
+        assert!(out_of_range_path.plan_selective_edge_prep(1).is_err());
+    }
+
+    #[test]
+    fn selective_edge_prep_reports_hits_misses_and_never_claims_shadow_reuse() {
+        let portfolio = selective_edge_portfolio_fixture();
+        let acceptance = Eagle3ForestAcceptance {
+            emitted_tokens: vec![11, 14, 17, 90],
+            leaf_row: 7,
+            capture_rows: vec![0, 1, 4, 7],
+            source_nodes: Vec::new(),
+        };
+        let b2 = portfolio
+            .plan_selective_edge_prep(2)
+            .unwrap()
+            .evaluate(&acceptance)
+            .unwrap();
+        assert_eq!(b2.predicted_unique_edge_rows, 4);
+        assert_eq!(b2.authoritative_edge_rows, 3);
+        assert_eq!(b2.prepared_hits, 2);
+        assert_eq!(b2.prepared_misses, 1);
+        assert!(!b2.authoritative_path_fully_covered);
+        assert_eq!(b2.theoretical_serial_edge_rows_displaced, 2);
+        assert_eq!(b2.actually_reused_edge_rows, 0);
+
+        let b4 = portfolio
+            .plan_selective_edge_prep(4)
+            .unwrap()
+            .evaluate(&acceptance)
+            .unwrap();
+        assert_eq!(b4.prepared_hits, 3);
+        assert_eq!(b4.prepared_misses, 0);
+        assert!(b4.authoritative_path_fully_covered);
+        assert_eq!(b4.actually_reused_edge_rows, 0);
+
+        let mut ancestry_hole = portfolio.plan_selective_edge_prep(1).unwrap();
+        ancestry_hole.prepared_edge_rows.remove(0);
+        assert!(ancestry_hole.evaluate(&acceptance).is_err());
     }
 
     #[test]

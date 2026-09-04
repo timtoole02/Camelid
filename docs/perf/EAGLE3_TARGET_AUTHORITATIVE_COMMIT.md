@@ -369,9 +369,10 @@ CAMELID_BENCH_EAGLE3_AUTHORITATIVE_E1_SHADOW=1
 ```
 
 Every serially updated real tree round must print `outcome=match`; `mismatched_total` and
-`fallback_total` must remain zero. `prepared_edges` must be `rows - 1`, while `selected_edges`
-must be the accepted path length minus the terminal bonus. `compared_f16_values` must equal
-`selected_edges * 2 * kv_heads * head_dim`. The target token array and lossless receipt must be
+`fallback_total` must remain zero. `prepared_edges` must be `rows - 1`, while
+`authoritative_edges` and `prepared_hits` must be the accepted path length minus the terminal
+bonus; `prepared_misses` must be zero. `compared_f16_values` must equal
+`prepared_hits * 2 * kv_heads * head_dim`. The target token array and lossless receipt must be
 byte-identical to gate-off. Compare gate-off/on `target_gpu_us` distributions to enforce the
 0.25 ms median target-slowdown ceiling; `target_tail_interval`, `e1_interval`, and `overlap_us`
 prove whether the second queue actually overlapped rather than merely moving the same work.
@@ -470,3 +471,60 @@ If one of B=1,2,4,8 reaches at least 50%, prototype the smallest passing B and t
 whole batched transaction GPU interval to fit within 4.922 ms without exceeding the target-
 slowdown ceiling. Endpoint-only, path-only, or truth-conditional coverage cannot satisfy this
 gate; they only identify which component caused a joint miss.
+
+### Checkpoint Q: selective path-only edge preparation (source checkpoint, unmeasured)
+
+The P receipt showed that the union of the top four path-only candidates covers the complete
+authoritative edge path far more often than a complete early terminal transaction, while naming
+fewer rows than C1's all-edge E1. Q turns that result into a default-off, state-inert timing lane:
+
+```text
+CAMELID_BENCH_EAGLE3_SELECTIVE_EDGE_PREP_BUDGET=1|2|4|8
+```
+
+This gate requires the existing transaction-portfolio, indexed-head, target-row
+lattice-promotion, and fixed N8 gates, and rejects indexed-head direct emission so the ordinary
+target full head remains the only acceptance authority. Absent or `0` means off; whitespace,
+boolean aliases, and all other budgets fail before model load. Q is not a terminal-transaction
+experiment:
+
+1. target A copies the layer-25 residual and completes;
+2. target B is committed on the unchanged target queue;
+3. the private EAGLE queue applies final RMSNorm and the exact indexed Q6 projection to the
+   layer-25 capture while target B runs;
+4. before any target prediction is read, the frozen portfolio unions non-root verifier rows from
+   its top-B path candidates, deduplicating shared prefixes in increasing verifier-row order;
+5. E1 gathers only those edge-parent captures, runs exactly one FC column per unique edge, pairs
+   each with its original child embedding, and projects/scatters private K/V in a dense scratch
+   slot mapped back to the original verifier row; and
+6. the ordinary target acceptance and serial authoritative EAGLE update run unchanged. The
+   shadow compares only prepared hits byte-for-byte and treats every missing edge as serial work.
+
+No terminal candidate, recurrent cell, stable seed, target token, target cache entry, or live
+EAGLE cache entry is written by Q. `actually_reused_edge_rows` is hard-coded to zero. A matched
+receipt reports the predicted unique row count, authoritative edge count, prepared hits/misses,
+full-path coverage, theoretical serial edge rows displaced, portfolio and E1 GPU time, overlap,
+and target-tail duration. `target_tail_penalty_us` is the per-round saturated delta against the
+4,922 us checkpoint-P paired-control reference; the reference is included in the top-level JSON
+and every evidence-bearing round receipt, and must be re-pinned if the target-tail control
+changes.
+
+The benchmark JSON carries matched/mismatched/fallback/serial-oracle-skipped totals plus the full
+per-round selective evidence. A gate-on JSON therefore cannot look successfully armed when every
+round fell back, and its target-tail penalty, prepared coverage, exact K/V comparison width, and
+permanent zero-reuse claim can be checked without scraping stderr.
+
+The source tests cover B=1/2/4 union/deduplication, root exclusion, complete-path closure,
+hit/miss/full-coverage accounting, the permanent zero-reuse claim, strict gate parsing, fixed-N8
+admission, and sparse verifier-row mapping. An output-budget-shortened verifier round fails the
+selective lane closed instead of applying the N8 tail baseline to a different width; its ordinary
+target and serial EAGLE update still run and the JSON receipt records the fallback. This checkpoint
+has intentionally not been built or run outside mini2. Before interpreting timings, mini2 must
+build the exact commit, run those tests, and perform protected Pitch control/B1/B2/B4 trials with
+token SHA equality and `lossless=true`.
+
+The remaining promotion seam is deliberately narrow: after exact scratch parity and a winning
+timing are established, replace serial K/V work only for prepared hits by a device-side
+scratch-to-live compactor. Missing edges and the final terminal recurrent cell stay on the serial
+authoritative path. Until that seam exists, Q measures opportunity and contention but cannot
+improve end-to-end throughput.
