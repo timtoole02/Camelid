@@ -131,7 +131,8 @@ jobs:
 
       # Cheap, and it gates every job that installs a toolchain (`rust` and
       # `desktop` both `needs:` this one), so drift fails before three OS
-      # runners spin up.
+      # runners spin up. Covers release.yml's four pins too — those builds ship
+      # artifacts, so they earn the same guard.
       - name: Check toolchain pins agree with rust-toolchain.toml
         run: bash scripts/check-toolchain-pins.sh
 
