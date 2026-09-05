@@ -1204,7 +1204,115 @@ kernel void mtp12_argmax(
     }
     if (tid == 0u) output_id[0] = indices[0];
 }
+
+// Two-stage form of `mtp12_argmax` for the 1 MiB assistant vocabulary, with
+// the identical first-index rule.  Stage one gives every threadgroup one
+// contiguous `chunk` of logits and writes its (max, first index) partial;
+// stage two merges the partials in a single threadgroup.  A chunk whose
+// logits are all NaN or -inf reports (-inf, 0), which is exactly the state the
+// single-threadgroup scan is left in for such a span, so the merge reproduces
+// its answer in every case (`assistant_argmax_chunked_matches_single_
+// threadgroup_on_adversarial_logits` gates this).
+kernel void mtp12_argmax_partial(
+    device const float* logits [[buffer(0)]],
+    device float* partial_values [[buffer(1)]],
+    device uint* partial_ids [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    constant uint& chunk [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]) {
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+    const uint begin = group * chunk;
+    const uint end = min(begin + chunk, count);
+    float best = -INFINITY;
+    uint best_id = 0u;
+    for (uint i = begin + tid; i < end; i += tgsize) {
+        const float candidate = logits[i];
+        if (!isnan(candidate) &&
+            (candidate > best || (candidate == best && i < best_id))) {
+            best = candidate;
+            best_id = i;
+        }
+    }
+    values[tid] = best;
+    indices[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsize >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            const float other = values[tid + stride];
+            const uint other_id = indices[tid + stride];
+            if (other > values[tid] ||
+                (other == values[tid] && other_id < indices[tid])) {
+                values[tid] = other;
+                indices[tid] = other_id;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        partial_values[group] = values[0];
+        partial_ids[group] = indices[0];
+    }
+}
+
+kernel void mtp12_argmax_merge(
+    device const float* partial_values [[buffer(0)]],
+    device const uint* partial_ids [[buffer(1)]],
+    device uint* output_id [[buffer(2)]],
+    constant uint& partials [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]) {
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+    float best = -INFINITY;
+    uint best_id = 0u;
+    for (uint p = tid; p < partials; p += tgsize) {
+        const float candidate = partial_values[p];
+        const uint candidate_id = partial_ids[p];
+        if (candidate > best || (candidate == best && candidate_id < best_id)) {
+            best = candidate;
+            best_id = candidate_id;
+        }
+    }
+    values[tid] = best;
+    indices[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsize >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            const float other = values[tid + stride];
+            const uint other_id = indices[tid + stride];
+            if (other > values[tid] ||
+                (other == values[tid] && other_id < indices[tid])) {
+                values[tid] = other;
+                indices[tid] = other_id;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) output_id[0] = indices[0];
+}
 "#;
+
+/// Logits per stage-one threadgroup of the chunked assistant argmax: the
+/// 262,144-entry vocabulary becomes 256 partials, one per merge lane.
+const MTP12_ARGMAX_CHUNK: usize = 1024;
+
+/// Partial slots the assistant scratch reserves for the chunked argmax.
+const MTP12_ARGMAX_MAX_PARTIALS: usize = (VOCAB + MTP12_ARGMAX_CHUNK - 1) / MTP12_ARGMAX_CHUNK;
+
+/// `CAMELID_GEMMA4_MTP12_ARGMAX_LEGACY=1` restores the single-threadgroup
+/// `mtp12_argmax` scan (an A/B control).  The chunked form is the default
+/// because it is bit-identical by construction and by test; it never changes
+/// which token the assistant proposes.
+fn mtp12_argmax_legacy_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_MTP12_ARGMAX_LEGACY")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
 
 struct Mtp12Pipelines {
     gather_q6k_embedding: ComputePipelineState,
@@ -1222,6 +1330,8 @@ struct Mtp12Pipelines {
     add_scale: ComputePipelineState,
     gelu_mul: ComputePipelineState,
     argmax: ComputePipelineState,
+    argmax_partial: ComputePipelineState,
+    argmax_merge: ComputePipelineState,
 }
 
 impl Mtp12Pipelines {
@@ -1257,6 +1367,8 @@ impl Mtp12Pipelines {
             add_scale: pipeline("mtp12_add_scale_bf16")?,
             gelu_mul: pipeline("mtp12_gelu_mul")?,
             argmax: pipeline("mtp12_argmax")?,
+            argmax_partial: pipeline("mtp12_argmax_partial")?,
+            argmax_merge: pipeline("mtp12_argmax_merge")?,
         })
     }
 }
@@ -1301,6 +1413,9 @@ struct Mtp12Scratch {
     chain_recurrent_hidden: Buffer,
     logits: Buffer,
     output_token: Buffer,
+    /// Stage-one (max, first index) partials of the chunked vocabulary argmax.
+    argmax_partial_values: Buffer,
+    argmax_partial_ids: Buffer,
     local_cos: Buffer,
     local_sin: Buffer,
     full_cos: Buffer,
@@ -1974,6 +2089,11 @@ impl Mtp12Scratch {
                 device,
                 MTP12_CHAIN_TOKEN_SLOTS * std::mem::size_of::<u32>(),
             ),
+            argmax_partial_values: f32s(MTP12_ARGMAX_MAX_PARTIALS),
+            argmax_partial_ids: shared_buffer(
+                device,
+                MTP12_ARGMAX_MAX_PARTIALS * std::mem::size_of::<u32>(),
+            ),
             // Row zero remains the K=1 scratch.  The resident chain binds one
             // precomputed RoPE row per advancing proposal position.
             local_cos: f32s(MTP12_CHAIN_LOCAL_ROPE_ELEMENTS),
@@ -2005,6 +2125,8 @@ impl Mtp12Scratch {
             &self.chain_recurrent_hidden,
             &self.logits,
             &self.output_token,
+            &self.argmax_partial_values,
+            &self.argmax_partial_ids,
             &self.local_cos,
             &self.local_sin,
             &self.full_cos,
@@ -2308,13 +2430,7 @@ impl Gemma4Mtp12AssistantMetal {
             self.layout.embedding,
             false,
         );
-        encode_argmax(
-            encoder,
-            &self.pipelines.argmax,
-            &self.scratch.logits,
-            &self.scratch.output_token,
-            VOCAB,
-        );
+        self.encode_vocab_argmax(encoder, 0);
         encoder.end_encoding();
         let encode_us = encode_started.elapsed().as_micros();
         command_buffer.commit();
@@ -2554,13 +2670,7 @@ impl Gemma4Mtp12AssistantMetal {
             self.layout.embedding,
             false,
         );
-        encode_argmax(
-            encoder,
-            &self.pipelines.argmax,
-            &self.scratch.logits,
-            &self.scratch.output_token,
-            VOCAB,
-        );
+        self.encode_vocab_argmax(encoder, 0);
         encoder.end_encoding();
         let encode_us = encode_started.elapsed().as_micros();
         command_buffer.commit();
@@ -2612,6 +2722,37 @@ impl Gemma4Mtp12AssistantMetal {
     /// assistant Metal scratch for exact tests and are never part of this public
     /// CPU result.  No borrowed buffer reference escapes the synchronous call.
     #[allow(clippy::too_many_arguments)]
+    /// Vocabulary argmax of `scratch.logits` into `scratch.output_token` at
+    /// `output_byte_offset`.  Chunked two-stage kernel by default;
+    /// `CAMELID_GEMMA4_MTP12_ARGMAX_LEGACY=1` keeps the single-threadgroup scan.
+    fn encode_vocab_argmax(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        output_byte_offset: u64,
+    ) {
+        if mtp12_argmax_legacy_enabled() {
+            encode_argmax_at_offset(
+                encoder,
+                &self.pipelines.argmax,
+                &self.scratch.logits,
+                &self.scratch.output_token,
+                output_byte_offset,
+                VOCAB,
+            );
+        } else {
+            encode_argmax_chunked_at_offset(
+                encoder,
+                &self.pipelines,
+                &self.scratch.logits,
+                &self.scratch.argmax_partial_values,
+                &self.scratch.argmax_partial_ids,
+                &self.scratch.output_token,
+                output_byte_offset,
+                VOCAB,
+            );
+        }
+    }
+
     pub fn propose_chain_device_resident(
         &mut self,
         anchor_token: u32,
@@ -2796,13 +2937,9 @@ impl Gemma4Mtp12AssistantMetal {
                 self.layout.embedding,
                 false,
             );
-            encode_argmax_at_offset(
+            self.encode_vocab_argmax(
                 encoder,
-                &self.pipelines.argmax,
-                &self.scratch.logits,
-                &self.scratch.output_token,
                 ((step + 1) * std::mem::size_of::<u32>()) as u64,
-                VOCAB,
             );
         }
         encoder.end_encoding();
@@ -3566,14 +3703,65 @@ fn encode_gelu_mul(
     dispatch_1d(encoder, pipeline, count);
 }
 
-fn encode_argmax(
+/// Chunked two-stage vocabulary argmax (`mtp12_argmax_partial` +
+/// `mtp12_argmax_merge`), bit-identical to [`encode_argmax_at_offset`].
+/// `partial_values` / `partial_ids` need `count.div_ceil(MTP12_ARGMAX_CHUNK)`
+/// slots each.
+#[allow(clippy::too_many_arguments)]
+fn encode_argmax_chunked_at_offset(
     encoder: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
+    pipelines: &Mtp12Pipelines,
     logits: &Buffer,
+    partial_values: &Buffer,
+    partial_ids: &Buffer,
     output: &Buffer,
+    output_byte_offset: u64,
     count: usize,
 ) {
-    encode_argmax_at_offset(encoder, pipeline, logits, output, 0, count);
+    let partials = count.div_ceil(MTP12_ARGMAX_CHUNK).max(1);
+    debug_assert!(
+        partials as u64 * std::mem::size_of::<u32>() as u64 <= partial_ids.length()
+            && partials as u64 * std::mem::size_of::<f32>() as u64 <= partial_values.length(),
+        "chunked argmax partial scratch is too small for {count} logits"
+    );
+    let count_u32 = count as u32;
+    let chunk_u32 = MTP12_ARGMAX_CHUNK as u32;
+    let partials_u32 = partials as u32;
+    encoder.set_compute_pipeline_state(&pipelines.argmax_partial);
+    encoder.set_buffer(0, Some(logits), 0);
+    encoder.set_buffer(1, Some(partial_values), 0);
+    encoder.set_buffer(2, Some(partial_ids), 0);
+    encoder.set_bytes(3, 4, &count_u32 as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &chunk_u32 as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: partials as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.set_compute_pipeline_state(&pipelines.argmax_merge);
+    encoder.set_buffer(0, Some(partial_values), 0);
+    encoder.set_buffer(1, Some(partial_ids), 0);
+    encoder.set_buffer(2, Some(output), output_byte_offset);
+    encoder.set_bytes(3, 4, &partials_u32 as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 fn encode_argmax_at_offset(
@@ -4798,7 +4986,7 @@ mod tests {
         let queue = device.new_command_queue();
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        encode_argmax(encoder, &pipelines.argmax, &logits, &output, 16);
+        encode_argmax_at_offset(encoder, &pipelines.argmax, &logits, &output, 0, 16);
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
@@ -5078,6 +5266,224 @@ mod tests {
             );
         }
     }
+
+    /// CPU model of the assistant argmax rule: NaN skipped, first index on an
+    /// exact tie (+0 and -0 compare equal), 0 when nothing exceeds -inf.
+    fn reference_first_index_argmax(logits: &[f32]) -> u32 {
+        let mut best = f32::NEG_INFINITY;
+        let mut best_id = 0u32;
+        for (index, &value) in logits.iter().enumerate() {
+            let index = index as u32;
+            if !value.is_nan() && (value > best || (value == best && index < best_id)) {
+                best = value;
+                best_id = index;
+            }
+        }
+        best_id
+    }
+
+    /// Run the single-threadgroup and the chunked argmax on `logits` in one
+    /// command buffer; returns (single, chunked).
+    fn run_argmax_pair(
+        device: &Device,
+        queue: &metal::CommandQueue,
+        pipelines: &Mtp12Pipelines,
+        logits: &[f32],
+    ) -> (u32, u32) {
+        let count = logits.len();
+        let logits_buffer = f32_buffer(device, logits).expect("argmax fixture");
+        let output = shared_buffer(device, 2 * std::mem::size_of::<u32>());
+        let slots = count.div_ceil(MTP12_ARGMAX_CHUNK).max(1);
+        let partial_values = shared_buffer(device, slots * std::mem::size_of::<f32>());
+        let partial_ids = shared_buffer(device, slots * std::mem::size_of::<u32>());
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_argmax_at_offset(encoder, &pipelines.argmax, &logits_buffer, &output, 0, count);
+        encode_argmax_chunked_at_offset(
+            encoder,
+            pipelines,
+            &logits_buffer,
+            &partial_values,
+            &partial_ids,
+            &output,
+            std::mem::size_of::<u32>() as u64,
+            count,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+        let out = unsafe { std::slice::from_raw_parts(output.contents().cast::<u32>(), 2) };
+        (out[0], out[1])
+    }
+
+    /// The chunked argmax must return the identical token to the
+    /// single-threadgroup scan (and to the CPU rule) on every adversarial
+    /// layout: ties across chunk boundaries, all-equal, all -inf, all NaN,
+    /// signed zero, f32 extremes, +inf, and pseudo-random logits with the
+    /// maximum duplicated.  Odd lengths exercise the partial last chunk.
+    #[test]
+    fn assistant_argmax_chunked_matches_single_threadgroup_on_adversarial_logits() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping Gemma 4 12B assistant chunked argmax test");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("MTP12 argmax pipelines");
+        let queue = device.new_command_queue();
+        let mut cases: Vec<(String, Vec<f32>)> = Vec::new();
+        let with = |base: f32, count: usize, sets: &[(usize, f32)]| {
+            let mut logits = vec![base; count];
+            for &(index, value) in sets {
+                logits[index] = value;
+            }
+            logits
+        };
+        cases.push(("existing tie 3/9".into(), with(-8.0, 16, &[(3, 4.0), (9, 4.0)])));
+        cases.push((
+            "tie across chunk boundary".into(),
+            with(-1.0, VOCAB, &[(1023, 7.5), (1024, 7.5)]),
+        ));
+        cases.push(("tie first/last".into(), with(-1.0, VOCAB, &[(0, 7.5), (VOCAB - 1, 7.5)])));
+        cases.push((
+            "tie mid/last".into(),
+            with(-1.0, VOCAB, &[(1024, 7.5), (VOCAB - 1, 7.5)]),
+        ));
+        cases.push(("all equal".into(), vec![0.0; VOCAB]));
+        cases.push(("all -inf".into(), vec![f32::NEG_INFINITY; VOCAB]));
+        cases.push(("all nan".into(), vec![f32::NAN; VOCAB]));
+        cases.push(("max at last".into(), with(-1.0, VOCAB, &[(VOCAB - 1, 2.0)])));
+        {
+            let mut logits = vec![-3.0f32; VOCAB];
+            for value in logits.iter_mut().take(10) {
+                *value = f32::NAN;
+            }
+            for value in logits.iter_mut().take(2048).skip(10) {
+                *value = f32::NEG_INFINITY;
+            }
+            logits[200_000] = 1.0e30;
+            logits[200_001] = 1.0e30;
+            cases.push(("nan/-inf prefix, 1e30 pair".into(), logits));
+        }
+        cases.push((
+            "signed zero tie".into(),
+            with(-1.0, VOCAB, &[(5000, -0.0), (70, 0.0)]),
+        ));
+        cases.push((
+            "f32::MAX pair".into(),
+            with(f32::MIN, VOCAB, &[(131_072, f32::MAX), (131_071, f32::MAX)]),
+        ));
+        cases.push((
+            "+inf pair".into(),
+            with(-1.0e38, VOCAB, &[(9_000, f32::INFINITY), (8_999, f32::INFINITY)]),
+        ));
+        cases.push(("-f32::MAX floor, one -1".into(), with(-f32::MAX, VOCAB, &[(77_777, -1.0)])));
+        for (seed, count) in [
+            (1u64, VOCAB),
+            (2, VOCAB),
+            (3, 1),
+            (4, 1023),
+            (5, 1025),
+            (6, 4097),
+            (7, 100_001),
+        ] {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678);
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / 16_777_216.0 * 40.0 - 20.0
+            };
+            let mut logits: Vec<f32> = (0..count).map(|_| next()).collect();
+            let peak = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) + 1.0;
+            let dupes = 37.min(count);
+            for d in 0..dupes {
+                let index = ((d * 7919 + 13) * 31) % count;
+                logits[index] = peak;
+            }
+            cases.push((format!("xorshift seed {seed} count {count} x{dupes} peaks"), logits));
+        }
+        for (label, logits) in &cases {
+            let expected = reference_first_index_argmax(logits);
+            let (single, chunked) = run_argmax_pair(&device, &queue, &pipelines, logits);
+            assert_eq!(single, expected, "{label}: single-threadgroup argmax vs CPU rule");
+            assert_eq!(chunked, expected, "{label}: chunked argmax vs CPU rule");
+        }
+        eprintln!(
+            "[mtp12-argmax] chunked == single-threadgroup == CPU rule on {} adversarial cases",
+            cases.len()
+        );
+    }
+
+    /// GPU time per vocabulary argmax, single-threadgroup vs chunked (30
+    /// encodes per command buffer, hardware timestamps).
+    #[test]
+    #[ignore]
+    fn assistant_argmax_bench_single_vs_chunked() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping assistant argmax bench");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("MTP12 argmax pipelines");
+        let queue = device.new_command_queue();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let logits: Vec<f32> = (0..VOCAB)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / 16_777_216.0 * 40.0 - 20.0
+            })
+            .collect();
+        let logits_buffer = f32_buffer(&device, &logits).expect("bench logits");
+        let output = shared_buffer(&device, std::mem::size_of::<u32>());
+        let partial_values = f32_buffer(&device, &vec![0.0; MTP12_ARGMAX_MAX_PARTIALS]).unwrap();
+        let partial_ids = shared_buffer(&device, MTP12_ARGMAX_MAX_PARTIALS * 4);
+        const REPS: usize = 30;
+        for (label, chunked) in [("single-threadgroup mtp12_argmax", false), ("chunked partial+merge", true)] {
+            for pass in 0..2 {
+                let reps = if pass == 0 { 1 } else { REPS };
+                let command_buffer = queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                for _ in 0..reps {
+                    if chunked {
+                        encode_argmax_chunked_at_offset(
+                            encoder,
+                            &pipelines,
+                            &logits_buffer,
+                            &partial_values,
+                            &partial_ids,
+                            &output,
+                            0,
+                            VOCAB,
+                        );
+                    } else {
+                        encode_argmax_at_offset(
+                            encoder,
+                            &pipelines.argmax,
+                            &logits_buffer,
+                            &output,
+                            0,
+                            VOCAB,
+                        );
+                    }
+                }
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+                if pass == 1 {
+                    let (gpu_us, _) =
+                        super::super::command_buffer_gpu_times_us(&command_buffer.to_owned());
+                    eprintln!(
+                        "[mtp12-argmax] {label:<34} {:8.1} us per argmax (token {})",
+                        gpu_us as f64 / REPS as f64,
+                        unsafe { *output.contents().cast::<u32>() }
+                    );
+                }
+            }
+        }
+    }
+
 
     #[test]
     fn production_mtp12_shader_compiles() {
