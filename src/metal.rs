@@ -18068,6 +18068,11 @@ pub(crate) struct Gemma4ResidentKvDeviceView<'a> {
 
 #[cfg(target_os = "macos")]
 impl Gemma4ResidentModel {
+    /// Physical KV capacity, including any uncommitted verifier padding rows.
+    pub(crate) fn max_positions(&self) -> usize {
+        self.max_positions
+    }
+
     /// Build the resident model. `token_embd_wire` is the vocab-major Q8 table in
     /// 34-byte wire blocks for the GPU logits head (copied once into a resident buffer;
     /// in the production runtime pass a nocopy WirePages buffer instead). Pass an EMPTY

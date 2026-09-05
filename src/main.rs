@@ -2611,6 +2611,9 @@ enum Command {
     /// `CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1` is a mutually-exclusive
     /// experiment: run one W8 bootstrap, stay W16 regardless of its acceptance,
     /// and admit a causally padded physical-W16 tail when it replaces two tails.
+    /// With configured W8, `CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL=1` executes
+    /// remaining budgets 5–8 as a padded physical W8, reserves the exact bonus
+    /// anchor, and falls back to the existing tail if eight KV slots do not fit.
     Gemma4Mtp12Gpu {
         path: PathBuf,
         /// Exact official 12B assistant `model.safetensors` file.
@@ -5401,6 +5404,7 @@ async fn main() -> anyhow::Result<()> {
                     "environment": {
                         "CAMELID_GEMMA4_MTP_W16_WARMUP8": std::env::var("CAMELID_GEMMA4_MTP_W16_WARMUP8").ok(),
                         "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16": std::env::var("CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16").ok(),
+                        "CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL": std::env::var("CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL").ok(),
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
