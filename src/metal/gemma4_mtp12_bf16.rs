@@ -145,11 +145,13 @@ impl Bf16Dense {
         self.weights.length()
     }
 
+    /// `output_byte_offset` lands the row vector inside a larger buffer.
     pub(super) fn encode(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
         input: &Buffer,
         output: &Buffer,
+        output_byte_offset: u64,
         matrix: Q4TensorRef,
         round_output_bf16: bool,
     ) {
@@ -161,7 +163,7 @@ impl Bf16Dense {
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&self.weights), 0);
         encoder.set_buffer(1, Some(input), 0);
-        encoder.set_buffer(2, Some(output), 0);
+        encoder.set_buffer(2, Some(output), output_byte_offset);
         encoder.set_bytes(3, 4, &matrix.cols as *const u32 as *const c_void);
         encoder.set_bytes(4, 4, &matrix.rows as *const u32 as *const c_void);
         encoder.set_bytes(5, 8, offset as *const u64 as *const c_void);
@@ -284,7 +286,7 @@ mod tests {
                 for round in [false, true] {
                     let cb = queue.new_command_buffer();
                     let encoder = cb.new_compute_command_encoder();
-                    dense.encode(encoder, &input_buffer, &output_buffer, matrix, round);
+                    dense.encode(encoder, &input_buffer, &output_buffer, 0, matrix, round);
                     encoder.end_encoding();
                     cb.commit();
                     cb.wait_until_completed();

@@ -845,6 +845,235 @@ kernel void mtp12_q4_0_gemv(
     }
 }
 
+// ---- Draft-side fused/regeometried kernels (opt-in, default off) ---------------
+// Every kernel below is an order-preserving re-arrangement of the established
+// kernels above: the per-element expressions, the sequential accumulation
+// statements and the reduction/fold orders are copied verbatim, so the drafts
+// they produce are bit-identical.  Each is selected independently by one
+// CAMELID_GEMMA4_MTP12_FUSE_* variable (unset = established path).
+
+// Four rows per 128-thread threadgroup, one simdgroup per row
+// (CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4=1).  Each simdgroup runs exactly the
+// per-row program of mtp12_q4_0_gemv: the same lane->block map, the same
+// sequential `partial +=` statement, the same shuffle fold and lane-0
+// rounding.  The only addition is a register prefetch of the lane's next
+// block, guarded so it never reads past the row; it changes load scheduling,
+// never arithmetic.
+kernel void mtp12_q4_0_gemv_x4(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tg * 4u + sg;
+    if (row >= rows) return;
+    const uint blocks_per_row = cols / 32u;
+    device const uchar* row_bytes = q4_weights + weight_byte_offset
+        + ulong(row) * ulong(blocks_per_row) * 18ul;
+    float partial = 0.0f;
+    half next_d = half(0.0f);
+    uchar4 next_q0 = uchar4(0), next_q1 = uchar4(0), next_q2 = uchar4(0), next_q3 = uchar4(0);
+    if (lane < blocks_per_row) {
+        device const uchar* first = row_bytes + ulong(lane) * 18ul;
+        next_d = *reinterpret_cast<device const half*>(first);
+        device const packed_uchar4* first_q4 =
+            reinterpret_cast<device const packed_uchar4*>(first + 2);
+        next_q0 = uchar4(first_q4[0]);
+        next_q1 = uchar4(first_q4[1]);
+        next_q2 = uchar4(first_q4[2]);
+        next_q3 = uchar4(first_q4[3]);
+    }
+    for (uint block_index = lane; block_index < blocks_per_row; block_index += 32u) {
+        const float d = float(next_d);
+        const uchar4 q[4] = {next_q0, next_q1, next_q2, next_q3};
+        if (block_index + 32u < blocks_per_row) {
+            device const uchar* next = row_bytes + ulong(block_index + 32u) * 18ul;
+            next_d = *reinterpret_cast<device const half*>(next);
+            device const packed_uchar4* next_q4 =
+                reinterpret_cast<device const packed_uchar4*>(next + 2);
+            next_q0 = uchar4(next_q4[0]);
+            next_q1 = uchar4(next_q4[1]);
+            next_q2 = uchar4(next_q4[2]);
+            next_q3 = uchar4(next_q4[3]);
+        }
+        const uint input_base = block_index * 32u;
+        #pragma unroll
+        for (uint k = 0u; k < 4u; ++k) {
+            const uchar4 packed = q[k];
+            const uint offset = k * 4u;
+            partial += d * (
+                float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+              + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+              + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+              + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+              + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+              + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+              + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+              + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+        }
+    }
+    partial += simd_shuffle_down(partial, ushort(16));
+    partial += simd_shuffle_down(partial, ushort(8));
+    partial += simd_shuffle_down(partial, ushort(4));
+    const float pair01 =
+        simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+    const float pair23 =
+        simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+    const float value = pair01 + pair23;
+    if (lane == 0u) {
+        output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+    }
+}
+
+// Gate row, up row and the GELU gate in one dispatch
+// (CAMELID_GEMMA4_MTP12_FUSE_GATEUP=1), x4 geometry.  The simdgroup computes
+// the gate row and then the up row with two independent copies of the
+// mtp12_q4_0_gemv_x4 per-row program (no shared temporaries), rounds each to
+// BF16 exactly as round_output_bf16=1 does, and lane 0 applies the
+// mtp12_gelu_mul expression verbatim (its input rounds are identities on the
+// already-rounded values).
+kernel void mtp12_q4_0_gemv_gate_up_gelu(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& gate_byte_offset [[buffer(5)]],
+    constant ulong& up_byte_offset [[buffer(6)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tg * 4u + sg;
+    if (row >= rows) return;
+    const uint blocks_per_row = cols / 32u;
+    float gate_value;
+    float up_value;
+    {
+        device const uchar* row_bytes = q4_weights + gate_byte_offset
+            + ulong(row) * ulong(blocks_per_row) * 18ul;
+        float partial = 0.0f;
+        half next_d = half(0.0f);
+        uchar4 next_q0 = uchar4(0), next_q1 = uchar4(0), next_q2 = uchar4(0), next_q3 = uchar4(0);
+        if (lane < blocks_per_row) {
+            device const uchar* first = row_bytes + ulong(lane) * 18ul;
+            next_d = *reinterpret_cast<device const half*>(first);
+            device const packed_uchar4* first_q4 =
+                reinterpret_cast<device const packed_uchar4*>(first + 2);
+            next_q0 = uchar4(first_q4[0]);
+            next_q1 = uchar4(first_q4[1]);
+            next_q2 = uchar4(first_q4[2]);
+            next_q3 = uchar4(first_q4[3]);
+        }
+        for (uint block_index = lane; block_index < blocks_per_row; block_index += 32u) {
+            const float d = float(next_d);
+            const uchar4 q[4] = {next_q0, next_q1, next_q2, next_q3};
+            if (block_index + 32u < blocks_per_row) {
+                device const uchar* next = row_bytes + ulong(block_index + 32u) * 18ul;
+                next_d = *reinterpret_cast<device const half*>(next);
+                device const packed_uchar4* next_q4 =
+                    reinterpret_cast<device const packed_uchar4*>(next + 2);
+                next_q0 = uchar4(next_q4[0]);
+                next_q1 = uchar4(next_q4[1]);
+                next_q2 = uchar4(next_q4[2]);
+                next_q3 = uchar4(next_q4[3]);
+            }
+            const uint input_base = block_index * 32u;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = q[k];
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+                  + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+            }
+        }
+        partial += simd_shuffle_down(partial, ushort(16));
+        partial += simd_shuffle_down(partial, ushort(8));
+        partial += simd_shuffle_down(partial, ushort(4));
+        const float pair01 =
+            simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+        const float pair23 =
+            simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+        const float value = pair01 + pair23;
+        gate_value = value;
+    }
+    {
+        device const uchar* row_bytes = q4_weights + up_byte_offset
+            + ulong(row) * ulong(blocks_per_row) * 18ul;
+        float partial = 0.0f;
+        half next_d = half(0.0f);
+        uchar4 next_q0 = uchar4(0), next_q1 = uchar4(0), next_q2 = uchar4(0), next_q3 = uchar4(0);
+        if (lane < blocks_per_row) {
+            device const uchar* first = row_bytes + ulong(lane) * 18ul;
+            next_d = *reinterpret_cast<device const half*>(first);
+            device const packed_uchar4* first_q4 =
+                reinterpret_cast<device const packed_uchar4*>(first + 2);
+            next_q0 = uchar4(first_q4[0]);
+            next_q1 = uchar4(first_q4[1]);
+            next_q2 = uchar4(first_q4[2]);
+            next_q3 = uchar4(first_q4[3]);
+        }
+        for (uint block_index = lane; block_index < blocks_per_row; block_index += 32u) {
+            const float d = float(next_d);
+            const uchar4 q[4] = {next_q0, next_q1, next_q2, next_q3};
+            if (block_index + 32u < blocks_per_row) {
+                device const uchar* next = row_bytes + ulong(block_index + 32u) * 18ul;
+                next_d = *reinterpret_cast<device const half*>(next);
+                device const packed_uchar4* next_q4 =
+                    reinterpret_cast<device const packed_uchar4*>(next + 2);
+                next_q0 = uchar4(next_q4[0]);
+                next_q1 = uchar4(next_q4[1]);
+                next_q2 = uchar4(next_q4[2]);
+                next_q3 = uchar4(next_q4[3]);
+            }
+            const uint input_base = block_index * 32u;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = q[k];
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+                  + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+            }
+        }
+        partial += simd_shuffle_down(partial, ushort(16));
+        partial += simd_shuffle_down(partial, ushort(8));
+        partial += simd_shuffle_down(partial, ushort(4));
+        const float pair01 =
+            simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+        const float pair23 =
+            simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+        const float value = pair01 + pair23;
+        up_value = value;
+    }
+    if (lane == 0u) {
+        const float gate = mtp12_round_bf16(gate_value);
+        const float up = mtp12_round_bf16(up_value);
+        const float x = mtp12_round_bf16(gate);
+        const float x3 = x * x * x;
+        const float activated = mtp12_round_bf16(
+            0.5f * x * (1.0f + tanh(0.7978845608028654f * (x + 0.044715f * x3))));
+        output[row] = mtp12_round_bf16(activated * mtp12_round_bf16(up));
+    }
+}
+
 // Draft-only shortlist: score all 2048 raw-mean centroids and select the
 // largest T scores with stable first-index tie breaking. The target verifier
 // remains authoritative; these kernels only change proposed draft tokens.
@@ -1020,6 +1249,132 @@ kernel void mtp12_q4_0_gemv_compact_local(
     }
 }
 
+// mtp12_q4_0_gemv_compact_local with an order-preserving register prefetch
+// in its serial retained-row loop (CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH=1).
+// Before folding row ids[index], each lane loads its FIRST block (block
+// `lane`) of row ids[index + 8] into registers; blocks beyond the first
+// (cols > 1024) are loaded in place exactly as before.  The compaction, the
+// lane->block map, the accumulation statement and the fold are verbatim.
+kernel void mtp12_q4_0_gemv_compact_local_prefetch(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    device const ushort4* token_clusters [[buffer(7)]],
+    device const uint* selected_clusters [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint ids[256];
+    threadgroup uint counts[8];
+    threadgroup uint offsets[8];
+    threadgroup uint total;
+    const uint candidate = group * 256u + tid;
+    uint keep = 0u;
+    if (candidate < rows) {
+        const ushort4 c = token_clusters[candidate];
+        keep = uint(selected_clusters[c.x] || selected_clusters[c.y] || selected_clusters[c.z]);
+        output[candidate] = -INFINITY;
+    }
+    const uint within_sg = simd_prefix_exclusive_sum(keep);
+    const uint sg_count = simd_sum(keep);
+    if (lane == 0u) counts[sg] = sg_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        const uint n = lane < 8u ? counts[lane] : 0u;
+        const uint preceding = simd_prefix_exclusive_sum(n);
+        const uint sum = simd_sum(n);
+        if (lane < 8u) offsets[lane] = preceding;
+        if (lane == 0u) total = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (keep != 0u) ids[offsets[sg] + within_sg] = candidate;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    const uint blocks_per_row = cols / 32u;
+    half next_d = half(0.0f);
+    uchar4 next_q0 = uchar4(0), next_q1 = uchar4(0), next_q2 = uchar4(0), next_q3 = uchar4(0);
+    if (sg < total && lane < blocks_per_row) {
+        device const uchar* first = q4_weights + weight_byte_offset
+            + ulong(ids[sg]) * ulong(blocks_per_row) * 18ul + ulong(lane) * 18ul;
+        next_d = *reinterpret_cast<device const half*>(first);
+        device const packed_uchar4* first_q4 =
+            reinterpret_cast<device const packed_uchar4*>(first + 2);
+        next_q0 = uchar4(first_q4[0]);
+        next_q1 = uchar4(first_q4[1]);
+        next_q2 = uchar4(first_q4[2]);
+        next_q3 = uchar4(first_q4[3]);
+    }
+    for (uint index = sg; index < total; index += 8u) {
+        const uint row = ids[index];
+        device const uchar* row_bytes = q4_weights + weight_byte_offset
+            + ulong(row) * ulong(blocks_per_row) * 18ul;
+        const float first_d = float(next_d);
+        const uchar4 first_q[4] = {next_q0, next_q1, next_q2, next_q3};
+        if (index + 8u < total && lane < blocks_per_row) {
+            device const uchar* next = q4_weights + weight_byte_offset
+                + ulong(ids[index + 8u]) * ulong(blocks_per_row) * 18ul + ulong(lane) * 18ul;
+            next_d = *reinterpret_cast<device const half*>(next);
+            device const packed_uchar4* next_q4 =
+                reinterpret_cast<device const packed_uchar4*>(next + 2);
+            next_q0 = uchar4(next_q4[0]);
+            next_q1 = uchar4(next_q4[1]);
+            next_q2 = uchar4(next_q4[2]);
+            next_q3 = uchar4(next_q4[3]);
+        }
+        float partial = 0.0f;
+        for (uint block_index = lane; block_index < blocks_per_row; block_index += 32u) {
+            float d;
+            uchar4 q[4];
+            if (block_index == lane) {
+                d = first_d;
+                q[0] = first_q[0];
+                q[1] = first_q[1];
+                q[2] = first_q[2];
+                q[3] = first_q[3];
+            } else {
+                device const uchar* block = row_bytes + ulong(block_index) * 18ul;
+                d = float(*reinterpret_cast<device const half*>(block));
+                device const packed_uchar4* q4 =
+                    reinterpret_cast<device const packed_uchar4*>(block + 2);
+                q[0] = uchar4(q4[0]);
+                q[1] = uchar4(q4[1]);
+                q[2] = uchar4(q4[2]);
+                q[3] = uchar4(q4[3]);
+            }
+            const uint input_base = block_index * 32u;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = q[k];
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+                  + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+            }
+        }
+        partial += simd_shuffle_down(partial, ushort(16));
+        partial += simd_shuffle_down(partial, ushort(8));
+        partial += simd_shuffle_down(partial, ushort(4));
+        const float pair01 =
+            simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+        const float pair23 =
+            simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+        const float value = pair01 + pair23;
+        if (lane == 0u) {
+            output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+        }
+    }
+}
+
 // Pinned ATen-style contiguous f32 RMS geometry for all production widths
 // (256/512/1024). One threadgroup owns a row/head.
 kernel void mtp12_rms_norm(
@@ -1062,6 +1417,92 @@ kernel void mtp12_rms_norm(
     }
 }
 
+// The mtp12_rms_norm reduction recipe over `width` contiguous floats, shared
+// by the fused norm kernels below: the same 16-thread slab/item order, the
+// same four-way fold and the same final sum.  `input` is a device or a
+// threadgroup pointer; the loaded values, not their address space, decide
+// the bits.  All 256 threads must call it (three barriers).
+template <typename InputPointer>
+inline float mtp12_rms_norm_inverse(
+    InputPointer input,
+    uint width,
+    float eps,
+    uint tid,
+    threadgroup float* residue,
+    threadgroup float* inverse_rms) {
+    if (tid < 16u) {
+        float row_residue = 0.0f;
+        for (uint slab = 0u; slab < width; slab += 256u) {
+            float slab_residue = 0.0f;
+            for (uint item = 0u; item < 16u; ++item) {
+                const float value = input[slab + tid + item * 16u];
+                slab_residue += value * value;
+            }
+            row_residue += slab_residue;
+        }
+        residue[tid] = row_residue;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 4u) {
+        residue[tid] = residue[tid] + residue[4u + tid]
+            + residue[8u + tid] + residue[12u + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        const float sum = ((residue[0] + residue[1]) + residue[2]) + residue[3];
+        *inverse_rms = 1.0f / sqrt(sum / float(width) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return *inverse_rms;
+}
+
+// post-norm -> residual add [-> scale] -> next norm in one 256-thread
+// threadgroup (CAMELID_GEMMA4_MTP12_FUSE_NORM=1).  Replaces
+// mtp12_rms_norm(input, weight) + mtp12_add_bf16 / mtp12_add_scale_bf16 +
+// mtp12_rms_norm(sum, next_weight) with the identical expressions and
+// rounding points: normalized = round((x * inv) * w); sum = round(a + b);
+// [sum = round(sum * scale)]; next = round((sum * inv2) * w2).  The summed
+// row is both written to `out_residual` and staged in threadgroup memory for
+// the second reduction (the same bits the established path re-reads from
+// device memory).
+kernel void mtp12_norm_add_norm(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* residual [[buffer(2)]],
+    device const float* next_weight [[buffer(3)]],
+    device float* out_residual [[buffer(4)]],
+    device float* out_normed [[buffer(5)]],
+    constant uint& width [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    constant float& scale [[buffer(8)]],
+    constant uint& apply_scale [[buffer(9)]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float residue[16];
+    threadgroup float inverse_rms;
+    threadgroup float next_inverse_rms;
+    threadgroup float summed[1024];
+    if (width > 1024u) return;
+    const float inv = mtp12_rms_norm_inverse(input, width, eps, tid, residue, &inverse_rms);
+    for (uint index = tid; index < width; index += 256u) {
+        const float normalized = mtp12_round_bf16(input[index] * inv * weight[index]);
+        float value;
+        if (apply_scale != 0u) {
+            const float sum = mtp12_round_bf16(residual[index] + normalized);
+            value = mtp12_round_bf16(sum * scale);
+        } else {
+            value = mtp12_round_bf16(residual[index] + normalized);
+        }
+        out_residual[index] = value;
+        summed[index] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float next_inv =
+        mtp12_rms_norm_inverse(summed, width, eps, tid, residue, &next_inverse_rms);
+    for (uint index = tid; index < width; index += 256u) {
+        out_normed[index] = mtp12_round_bf16(summed[index] * next_inv * next_weight[index]);
+    }
+}
+
 kernel void mtp12_rope_split(
     device float* data [[buffer(0)]],
     device const float* cos_table [[buffer(1)]],
@@ -1084,6 +1525,48 @@ kernel void mtp12_rope_split(
         mtp12_round_bf16(x0 * c) + mtp12_round_bf16((-x1) * s));
     data[dim1] = mtp12_round_bf16(
         mtp12_round_bf16(x1 * c) + mtp12_round_bf16(x0 * s));
+}
+
+// Per-head query RMS norm + split RoPE in one dispatch
+// (CAMELID_GEMMA4_MTP12_FUSE_QROPE=1): grid N_HEADS x 256 threads.  The head
+// is normalized with the mtp12_rms_norm recipe into threadgroup memory, then
+// the mtp12_rope_split expressions are applied verbatim from that staging
+// (its round of the already-BF16 normalized value is an identity and is kept
+// textually).  `cos_table` / `sin_table` are bound at the query step's row.
+kernel void mtp12_qnorm_rope(
+    device const float* query [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* cos_table [[buffer(2)]],
+    device const float* sin_table [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float residue[16];
+    threadgroup float inverse_rms;
+    threadgroup float normed[512];
+    if (head_dim > 512u || (head_dim & 255u) != 0u) return;
+    const uint base = head * head_dim;
+    const float inv =
+        mtp12_rms_norm_inverse(query + base, head_dim, eps, tid, residue, &inverse_rms);
+    for (uint index = tid; index < head_dim; index += 256u) {
+        normed[index] = mtp12_round_bf16(query[base + index] * inv * weight[index]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint half_head = head_dim / 2u;
+    for (uint pair = tid; pair < half_head; pair += 256u) {
+        const uint dim0 = base + pair;
+        const uint dim1 = dim0 + half_head;
+        const float x0 = mtp12_round_bf16(normed[pair]);
+        const float x1 = mtp12_round_bf16(normed[pair + half_head]);
+        const float c = mtp12_round_bf16(cos_table[pair]);
+        const float s = mtp12_round_bf16(sin_table[pair]);
+        output[dim0] = mtp12_round_bf16(
+            mtp12_round_bf16(x0 * c) + mtp12_round_bf16((-x1) * s));
+        output[dim1] = mtp12_round_bf16(
+            mtp12_round_bf16(x1 * c) + mtp12_round_bf16(x0 * s));
+    }
 }
 
 kernel void mtp12_gelu_mul(
@@ -1351,6 +1834,115 @@ kernel void mtp12_attention_context_v2(
     output[output_base + d + 3u] = mtp12_round_bf16(folded.w);
 }
 
+// Softmax folded into the V2 context kernel
+// (CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX=1).  Same grid and bindings as
+// mtp12_attention_context_v2 except buffer(1) holds the RAW scores, which are
+// never written.  Prologue = mtp12_attention_softmax verbatim (lane-strided
+// max, lane-strided exp sum, simd_max / simd_sum) and runs before any
+// per-lane exit so all 32 lanes take part.  Probabilities are then produced
+// once per position per 32-position chunk (lane l computes position p+l with
+// the softmax kernel's expression round(exp(s - max) / denominator)) and
+// broadcast with simd_shuffle; the context accumulation is the V2 form with
+// the load phase unrolled sixteen positions ahead and the per-parity partials
+// accumulated in position order, so the output bits match softmax +
+// context_v2.
+kernel void mtp12_attention_softmax_context_v2(
+    device const float* values [[buffer(0)]],
+    device const float* scores [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    constant uint& compact_base [[buffer(10)]],
+    constant uint& physical_logical_k [[buffer(11)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint head = tg.x;
+    if (head >= n_heads || compact_base + position_count != physical_logical_k) return;
+    const uint score_base = head * position_count;
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32u) {
+        local_max = max(local_max, scores[score_base + p]);
+    }
+    const float max_score = simd_max(local_max);
+    float local_sum = 0.0f;
+    for (uint p = lane; p < position_count; p += 32u) {
+        const float value = exp(scores[score_base + p] - max_score);
+        local_sum += value;
+    }
+    const float denominator = simd_sum(local_sum);
+    // Lanes past the head stay resident (they take part in every shuffle)
+    // but read dim 0 and never write.
+    const uint lane_dim = tg.y * 128u + lane * 4u;
+    const bool active = lane_dim + 4u <= head_dim;
+    const uint d = active ? lane_dim : 0u;
+    const uint kv_head = head / group;
+    const uint output_base = head * head_dim;
+    const uint kv_base = kv_base_offset + kv_head * kv_head_stride + d;
+    const uint vector_end = physical_logical_k & ~3u;
+    float4 p0 = 0.0f;
+    float4 p1 = 0.0f;
+    float4 p2 = 0.0f;
+    float4 p3 = 0.0f;
+    uint p = 0u;
+    for (; p + 32u <= position_count; p += 32u) {
+        const float value = exp(scores[score_base + p + lane] - max_score);
+        const float e = mtp12_round_bf16(value / denominator);
+        {
+            float pr[16];
+            float4 v[16];
+            #pragma unroll
+            for (uint j = 0u; j < 16u; ++j) {
+                pr[j] = mtp12_round_bf16(simd_shuffle(e, ushort(j)));
+                v[j] = mtp12_load_bf16x4(values, kv_base + (p + j) * position_stride);
+            }
+            #pragma unroll
+            for (uint j = 0u; j < 16u; ++j) {
+                const float4 product = pr[j] * v[j];
+                mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + j, vector_end, product);
+            }
+        }
+        {
+            float pr[16];
+            float4 v[16];
+            #pragma unroll
+            for (uint j = 0u; j < 16u; ++j) {
+                pr[j] = mtp12_round_bf16(simd_shuffle(e, ushort(16u + j)));
+                v[j] = mtp12_load_bf16x4(values, kv_base + (p + 16u + j) * position_stride);
+            }
+            #pragma unroll
+            for (uint j = 0u; j < 16u; ++j) {
+                const float4 product = pr[j] * v[j];
+                mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + 16u + j, vector_end, product);
+            }
+        }
+    }
+    if (p < position_count) {
+        const uint remaining = position_count - p;
+        float e = 0.0f;
+        if (lane < remaining) {
+            const float value = exp(scores[score_base + p + lane] - max_score);
+            e = mtp12_round_bf16(value / denominator);
+        }
+        for (uint j = 0u; j < remaining; ++j) {
+            const float pr = mtp12_round_bf16(simd_shuffle(e, ushort(j)));
+            const float4 v = mtp12_load_bf16x4(values, kv_base + (p + j) * position_stride);
+            const float4 product = pr * v;
+            mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + j, vector_end, product);
+        }
+    }
+    if (!active) return;
+    const float4 folded = ((p0 + p1) + p2) + p3;
+    output[output_base + d] = mtp12_round_bf16(folded.x);
+    output[output_base + d + 1u] = mtp12_round_bf16(folded.y);
+    output[output_base + d + 2u] = mtp12_round_bf16(folded.z);
+    output[output_base + d + 3u] = mtp12_round_bf16(folded.w);
+}
+
 kernel void mtp12_argmax(
     device const float* logits [[buffer(0)]],
     device uint* output_id [[buffer(1)]],
@@ -1515,6 +2107,78 @@ fn mtp12_dump_draft_queries_path() -> Option<&'static std::path::Path> {
     .as_deref()
 }
 
+/// Independent draft-side fusion selectors for the W8 tree lane's assistant
+/// steps.  Each is read once per process and parsed strictly like
+/// `CAMELID_GEMMA4_MTP12_TREE_W8`: unset or `0` keeps the established kernel
+/// sequence byte-for-byte, `1` selects the fused / regeometried kernel, and
+/// anything else fails the assistant load.  Every fused kernel is
+/// order-preserving (see the shader notes), so the drafts do not change; the
+/// selectors exist so a bit mismatch can be bisected without a rebuild.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Mtp12FuseFlags {
+    /// `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4`: `mtp12_q4_0_gemv_x4` for every dense
+    /// GEMV routed through [`Gemma4Mtp12AssistantMetal::encode_dense_gemv`]
+    /// (tree, resident chain and K=1 paths alike; never the BF16 dense route).
+    gemv_x4: bool,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_GATEUP`: gate + up + GELU in one dispatch on
+    /// the tree path (skipped while the BF16 dense route is active).
+    gate_up: bool,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_NORM`: post-norm -> add [-> scale] -> next
+    /// norm in one dispatch on the tree path.
+    norm: bool,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_QROPE`: per-head query norm + RoPE in one
+    /// dispatch on the tree path.
+    qrope: bool,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX`: softmax folded into the V2
+    /// context kernel on the tree path.
+    softmax_ctx: bool,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH`: row prefetch in the compact
+    /// shortlist head GEMV (tree and resident-chain draft heads).
+    head_prefetch: bool,
+}
+
+const MTP12_FUSE_GEMV_X4_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4";
+const MTP12_FUSE_GATEUP_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_GATEUP";
+const MTP12_FUSE_NORM_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_NORM";
+const MTP12_FUSE_QROPE_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_QROPE";
+const MTP12_FUSE_SOFTMAX_CTX_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX";
+const MTP12_FUSE_HEAD_PREFETCH_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH";
+
+fn mtp12_fuse_flag(name: &str, value: Option<&str>) -> std::result::Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!("{name} must be exactly 0 or 1; got {other:?}")),
+    }
+}
+
+fn mtp12_fuse_flags_from_env() -> std::result::Result<Mtp12FuseFlags, String> {
+    let read = |name: &str| match std::env::var(name) {
+        Ok(value) => mtp12_fuse_flag(name, Some(&value)),
+        Err(std::env::VarError::NotPresent) => mtp12_fuse_flag(name, None),
+        Err(error) => Err(format!("{name}: {error}")),
+    };
+    Ok(Mtp12FuseFlags {
+        gemv_x4: read(MTP12_FUSE_GEMV_X4_ENV)?,
+        gate_up: read(MTP12_FUSE_GATEUP_ENV)?,
+        norm: read(MTP12_FUSE_NORM_ENV)?,
+        qrope: read(MTP12_FUSE_QROPE_ENV)?,
+        softmax_ctx: read(MTP12_FUSE_SOFTMAX_CTX_ENV)?,
+        head_prefetch: read(MTP12_FUSE_HEAD_PREFETCH_ENV)?,
+    })
+}
+
+/// The process-wide fusion selectors, read once; a malformed value is an
+/// assistant-load error rather than a silent default.
+fn mtp12_fuse_flags() -> Result<Mtp12FuseFlags> {
+    static FLAGS: std::sync::OnceLock<std::result::Result<Mtp12FuseFlags, String>> =
+        std::sync::OnceLock::new();
+    FLAGS
+        .get_or_init(mtp12_fuse_flags_from_env)
+        .clone()
+        .map_err(invalid)
+}
+
 struct Mtp12Pipelines {
     gather_q6k_embedding: ComputePipelineState,
     gather_q6k_embedding_and_recurrent: ComputePipelineState,
@@ -1531,6 +2195,13 @@ struct Mtp12Pipelines {
     attention_context: ComputePipelineState,
     attention_scores_v2: ComputePipelineState,
     attention_context_v2: ComputePipelineState,
+    /// Draft-side fused / regeometried kernels (`CAMELID_GEMMA4_MTP12_FUSE_*`).
+    q4_gemv_x4: ComputePipelineState,
+    q4_gemv_gate_up_gelu: ComputePipelineState,
+    q4_gemv_shortlist_compact_prefetch: ComputePipelineState,
+    norm_add_norm: ComputePipelineState,
+    qnorm_rope: ComputePipelineState,
+    attention_softmax_context_v2: ComputePipelineState,
     add: ComputePipelineState,
     add_scale: ComputePipelineState,
     gelu_mul: ComputePipelineState,
@@ -1572,6 +2243,14 @@ impl Mtp12Pipelines {
             attention_context: pipeline("mtp12_attention_context")?,
             attention_scores_v2: pipeline("mtp12_attention_scores_v2")?,
             attention_context_v2: pipeline("mtp12_attention_context_v2")?,
+            q4_gemv_x4: pipeline("mtp12_q4_0_gemv_x4")?,
+            q4_gemv_gate_up_gelu: pipeline("mtp12_q4_0_gemv_gate_up_gelu")?,
+            q4_gemv_shortlist_compact_prefetch: pipeline(
+                "mtp12_q4_0_gemv_compact_local_prefetch",
+            )?,
+            norm_add_norm: pipeline("mtp12_norm_add_norm")?,
+            qnorm_rope: pipeline("mtp12_qnorm_rope")?,
+            attention_softmax_context_v2: pipeline("mtp12_attention_softmax_context_v2")?,
             add: pipeline("mtp12_add_bf16")?,
             add_scale: pipeline("mtp12_add_scale_bf16")?,
             gelu_mul: pipeline("mtp12_gelu_mul")?,
@@ -1955,6 +2634,7 @@ fn validate_device_chain_positions(
 /// matrices, retaining the Q4 tied head and the established activation rounding.
 pub struct Gemma4Mtp12AssistantMetal {
     single_position: bool,
+    fuse: Mtp12FuseFlags,
     shortlist: Option<Mtp12Shortlist>,
     dense_bf16: Option<dense_bf16::Bf16Dense>,
     tree_state: Option<tree::TreeState>,
@@ -2556,6 +3236,7 @@ impl Gemma4Mtp12AssistantMetal {
         Ok(Self {
             single_position: std::env::var("CAMELID_GEMMA4_MTP12_SINGLE_POSITION")
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            fuse: mtp12_fuse_flags()?,
             shortlist,
             dense_bf16,
             tree_state: None,
@@ -3057,8 +3738,13 @@ impl Gemma4Mtp12AssistantMetal {
             encoder.set_buffer(7, Some(&shortlist.token_clusters), 0);
             encoder.set_buffer(8, Some(&shortlist.selected), 0);
             if mtp12_shortlist_compact_enabled() {
+                let compact = if self.fuse.head_prefetch {
+                    &self.pipelines.q4_gemv_shortlist_compact_prefetch
+                } else {
+                    &self.pipelines.q4_gemv_shortlist_compact
+                };
                 encode_q4_gemv_shortlist_compact(
-                    encoder, &self.pipelines.q4_gemv_shortlist_compact,
+                    encoder, compact,
                     &self.packed_q4, &self.scratch.final_normalized,
                     &self.scratch.logits, self.layout.embedding,
                 );
@@ -3491,11 +4177,31 @@ impl Gemma4Mtp12AssistantMetal {
         matrix: Q4TensorRef,
         round_output_bf16: bool,
     ) {
+        self.encode_dense_gemv_at_offset(encoder, input, output, 0, matrix, round_output_bf16);
+    }
+
+    /// One dense GEMV whose row vector lands at `output_byte_offset` inside
+    /// `output`.  Routes to the BF16 dense experiment when it is active,
+    /// otherwise to `mtp12_q4_0_gemv_x4` under
+    /// `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4=1` and to the established
+    /// `mtp12_q4_0_gemv` by default; all three produce the same bits.
+    fn encode_dense_gemv_at_offset(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input: &Buffer,
+        output: &Buffer,
+        output_byte_offset: u64,
+        matrix: Q4TensorRef,
+        round_output_bf16: bool,
+    ) {
         if let Some(dense) = &self.dense_bf16 {
-            dense.encode(encoder, input, output, matrix, round_output_bf16);
+            dense.encode(encoder, input, output, output_byte_offset, matrix, round_output_bf16);
+        } else if self.fuse.gemv_x4 {
+            encode_q4_gemv_at_offset(encoder, &self.pipelines.q4_gemv_x4, &self.packed_q4,
+                input, output, output_byte_offset, matrix, round_output_bf16, true);
         } else {
-            encode_q4_gemv(encoder, &self.pipelines.q4_gemv, &self.packed_q4,
-                input, output, matrix, round_output_bf16);
+            encode_q4_gemv_at_offset(encoder, &self.pipelines.q4_gemv, &self.packed_q4,
+                input, output, output_byte_offset, matrix, round_output_bf16, false);
         }
     }
 
@@ -3689,6 +4395,238 @@ impl Gemma4Mtp12AssistantMetal {
             layer.scale,
         );
     }
+
+    /// The W8 tree step's layer: [`Self::encode_layer_k1_from_views`]
+    /// re-sequenced around the `CAMELID_GEMMA4_MTP12_FUSE_*` kernels.  Every
+    /// selector unset reproduces that function's dispatch list exactly (the
+    /// four established callers keep using it directly).
+    ///
+    /// Contract under `fuse.norm`: the caller has already normalized
+    /// `scratch.hidden` into `scratch.normed` with this layer's `input_norm`
+    /// (layer 0: a standalone rms_norm; layer l>0: the previous layer's fused
+    /// tail), and this layer's tail writes the next input norm
+    /// (`next_norm`, `next_normed` = `layers[l+1].input_norm` -> `normed`, or
+    /// `final_norm` -> `final_normalized` for the last layer) so the caller
+    /// must NOT encode a final rms_norm.  With `fuse.norm` unset the layer
+    /// encodes its own input norm and the caller encodes the final norm.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_layer_k1_fused(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer_index: usize,
+        key: &BufferRef,
+        value: &BufferRef,
+        key_byte_offset: u64,
+        value_byte_offset: u64,
+        kv_capacity: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        logical_len: usize,
+        compact_base: usize,
+        position_count: usize,
+        cos: &Buffer,
+        sin: &Buffer,
+        rope_byte_offset: u64,
+        attention_scores: &Buffer,
+        next_norm: &Buffer,
+        next_normed: &Buffer,
+    ) {
+        let layer = &self.layers[layer_index];
+        let matrices = layer.matrices;
+        let fuse = self.fuse;
+        if !fuse.norm {
+            encode_rms_norm(
+                encoder,
+                &self.pipelines.rms_norm,
+                &self.scratch.hidden,
+                &layer.input_norm,
+                &self.scratch.normed,
+                ASSISTANT_HIDDEN,
+                1,
+            );
+        }
+        self.encode_dense_gemv(
+            encoder,
+            &self.scratch.normed,
+            &self.scratch.query,
+            matrices.q,
+            true,
+        );
+        if fuse.qrope {
+            encode_qnorm_rope(
+                encoder,
+                &self.pipelines.qnorm_rope,
+                &self.scratch.query,
+                &layer.q_norm,
+                cos,
+                sin,
+                rope_byte_offset,
+                &self.scratch.query_normed,
+                head_dim,
+            );
+        } else {
+            encode_rms_norm(
+                encoder,
+                &self.pipelines.rms_norm,
+                &self.scratch.query,
+                &layer.q_norm,
+                &self.scratch.query_normed,
+                head_dim,
+                N_HEADS,
+            );
+            encode_rope_at_offset(
+                encoder,
+                &self.pipelines.rope,
+                &self.scratch.query_normed,
+                cos,
+                sin,
+                rope_byte_offset,
+                head_dim,
+            );
+        }
+        let covers = mtp12_attention_v2_covers(head_dim);
+        encode_attention_impl_ex(
+            encoder,
+            &self.pipelines,
+            &self.scratch.query_normed,
+            key,
+            value,
+            key_byte_offset,
+            value_byte_offset,
+            kv_capacity,
+            attention_scores,
+            &self.scratch.context,
+            kv_heads,
+            head_dim,
+            logical_len,
+            compact_base,
+            position_count,
+            mtp12_attention_v2_enabled() && covers,
+            fuse.softmax_ctx && covers,
+        );
+        self.encode_dense_gemv(
+            encoder,
+            &self.scratch.context,
+            &self.scratch.attention_projection,
+            matrices.o,
+            true,
+        );
+        if fuse.norm {
+            encode_norm_add_norm(
+                encoder,
+                &self.pipelines.norm_add_norm,
+                &self.scratch.attention_projection,
+                &layer.post_attention_norm,
+                &self.scratch.hidden,
+                &layer.pre_feedforward_norm,
+                &self.scratch.attention_residual,
+                &self.scratch.normed,
+                ASSISTANT_HIDDEN,
+                None,
+            );
+        } else {
+            encode_rms_norm(
+                encoder,
+                &self.pipelines.rms_norm,
+                &self.scratch.attention_projection,
+                &layer.post_attention_norm,
+                &self.scratch.attention_normalized,
+                ASSISTANT_HIDDEN,
+                1,
+            );
+            encode_add(
+                encoder,
+                &self.pipelines.add,
+                &self.scratch.hidden,
+                &self.scratch.attention_normalized,
+                &self.scratch.attention_residual,
+                ASSISTANT_HIDDEN,
+            );
+            encode_rms_norm(
+                encoder,
+                &self.pipelines.rms_norm,
+                &self.scratch.attention_residual,
+                &layer.pre_feedforward_norm,
+                &self.scratch.normed,
+                ASSISTANT_HIDDEN,
+                1,
+            );
+        }
+        if fuse.gate_up && self.dense_bf16.is_none() {
+            encode_q4_gemv_gate_up_gelu(
+                encoder,
+                &self.pipelines.q4_gemv_gate_up_gelu,
+                &self.packed_q4,
+                &self.scratch.normed,
+                &self.scratch.gated,
+                matrices.gate,
+                matrices.up,
+            );
+        } else {
+            self.encode_dense_gemv(
+                encoder,
+                &self.scratch.normed,
+                &self.scratch.gate,
+                matrices.gate,
+                true,
+            );
+            self.encode_dense_gemv(
+                encoder,
+                &self.scratch.normed,
+                &self.scratch.up,
+                matrices.up,
+                true,
+            );
+            encode_gelu_mul(
+                encoder,
+                &self.pipelines.gelu_mul,
+                &self.scratch.gate,
+                &self.scratch.up,
+                &self.scratch.gated,
+                FFN_HIDDEN,
+            );
+        }
+        self.encode_dense_gemv(
+            encoder,
+            &self.scratch.gated,
+            &self.scratch.down,
+            matrices.down,
+            true,
+        );
+        if fuse.norm {
+            encode_norm_add_norm(
+                encoder,
+                &self.pipelines.norm_add_norm,
+                &self.scratch.down,
+                &layer.post_feedforward_norm,
+                &self.scratch.attention_residual,
+                next_norm,
+                &self.scratch.hidden,
+                next_normed,
+                ASSISTANT_HIDDEN,
+                Some(layer.scale),
+            );
+        } else {
+            encode_rms_norm(
+                encoder,
+                &self.pipelines.rms_norm,
+                &self.scratch.down,
+                &layer.post_feedforward_norm,
+                &self.scratch.down_normalized,
+                ASSISTANT_HIDDEN,
+                1,
+            );
+            encode_add_scale(
+                encoder,
+                &self.pipelines.add_scale,
+                &self.scratch.attention_residual,
+                &self.scratch.down_normalized,
+                &self.scratch.hidden,
+                ASSISTANT_HIDDEN,
+                layer.scale,
+            );
+        }
+    }
 }
 
 fn dispatch_1d(
@@ -3803,23 +4741,85 @@ fn encode_q4_gemv(
     matrix: Q4TensorRef,
     round_output_bf16: bool,
 ) {
+    encode_q4_gemv_at_offset(
+        encoder, pipeline, weights, input, output, 0, matrix, round_output_bf16, false,
+    );
+}
+
+/// `output_byte_offset` lands the row vector inside a larger buffer.  `x4`
+/// selects the four-rows-per-128-thread geometry (`pipeline` must then be
+/// `mtp12_q4_0_gemv_x4`); otherwise one 32-thread group per row as the
+/// established `mtp12_q4_0_gemv` / `_shortlist` kernels expect.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_gemv_at_offset(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    output_byte_offset: u64,
+    matrix: Q4TensorRef,
+    round_output_bf16: bool,
+    x4: bool,
+) {
     let round = u32::from(round_output_bf16);
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(weights), 0);
     encoder.set_buffer(1, Some(input), 0);
-    encoder.set_buffer(2, Some(output), 0);
+    encoder.set_buffer(2, Some(output), output_byte_offset);
     encoder.set_bytes(3, 4, &matrix.cols as *const u32 as *const c_void);
     encoder.set_bytes(4, 4, &matrix.rows as *const u32 as *const c_void);
     encoder.set_bytes(5, 8, &matrix.byte_offset as *const u64 as *const c_void);
     encoder.set_bytes(6, 4, &round as *const u32 as *const c_void);
+    let (groups, threads) = if x4 {
+        ((matrix.rows as u64).div_ceil(4), 128)
+    } else {
+        (matrix.rows as u64, 32)
+    };
     encoder.dispatch_thread_groups(
         MTLSize {
-            width: matrix.rows as u64,
+            width: groups,
             height: 1,
             depth: 1,
         },
         MTLSize {
-            width: 32,
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Fused gate/up GEMV + GELU gate (`mtp12_q4_0_gemv_gate_up_gelu`): `gate` and
+/// `up` share `input`, and `output[row]` receives what
+/// `mtp12_gelu_mul(gate_row, up_row)` would after both rows were BF16-rounded.
+fn encode_q4_gemv_gate_up_gelu(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    gate: Q4TensorRef,
+    up: Q4TensorRef,
+) {
+    debug_assert_eq!(gate.rows, up.rows);
+    debug_assert_eq!(gate.cols, up.cols);
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(weights), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), 0);
+    encoder.set_bytes(3, 4, &gate.cols as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &gate.rows as *const u32 as *const c_void);
+    encoder.set_bytes(5, 8, &gate.byte_offset as *const u64 as *const c_void);
+    encoder.set_bytes(6, 8, &up.byte_offset as *const u64 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: (gate.rows as u64).div_ceil(4),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
             height: 1,
             depth: 1,
         },
@@ -3987,7 +4987,54 @@ fn encode_attention_impl(
     position_count: usize,
     v2: bool,
 ) {
+    encode_attention_impl_ex(
+        encoder,
+        pipelines,
+        query,
+        key,
+        value,
+        key_byte_offset,
+        value_byte_offset,
+        kv_capacity,
+        scores,
+        output,
+        kv_heads,
+        head_dim,
+        logical_len,
+        compact_base,
+        position_count,
+        v2,
+        false,
+    );
+}
+
+/// `fused_softmax_ctx` replaces the softmax + context pair with
+/// `mtp12_attention_softmax_context_v2` (V2 grid; requires
+/// [`mtp12_attention_v2_covers`]), leaving the scores buffer holding raw
+/// scores.  Bit-identical to the pair (pinned by
+/// `mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit`).
+#[allow(clippy::too_many_arguments)]
+fn encode_attention_impl_ex(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipelines: &Mtp12Pipelines,
+    query: &Buffer,
+    key: &BufferRef,
+    value: &BufferRef,
+    key_byte_offset: u64,
+    value_byte_offset: u64,
+    kv_capacity: usize,
+    scores: &Buffer,
+    output: &Buffer,
+    kv_heads: usize,
+    head_dim: usize,
+    logical_len: usize,
+    compact_base: usize,
+    position_count: usize,
+    v2: bool,
+    fused_softmax_ctx: bool,
+) {
     debug_assert!(position_count > 0);
+    debug_assert!(!fused_softmax_ctx || mtp12_attention_v2_covers(head_dim));
     debug_assert_eq!(compact_base + position_count, logical_len);
     let n_heads = N_HEADS as u32;
     let head_dim = head_dim as u32;
@@ -4032,20 +5079,24 @@ fn encode_attention_impl(
         tg32,
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
-    encoder.set_buffer(0, Some(scores), 0);
-    encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
-    encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
-    encoder.dispatch_thread_groups(
-        MTLSize {
-            width: N_HEADS as u64,
-            height: 1,
-            depth: 1,
-        },
-        tg32,
-    );
+    if !fused_softmax_ctx {
+        encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
+        encoder.set_buffer(0, Some(scores), 0);
+        encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+        encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: N_HEADS as u64,
+                height: 1,
+                depth: 1,
+            },
+            tg32,
+        );
+    }
 
-    encoder.set_compute_pipeline_state(if v2 {
+    encoder.set_compute_pipeline_state(if fused_softmax_ctx {
+        &pipelines.attention_softmax_context_v2
+    } else if v2 {
         &pipelines.attention_context_v2
     } else {
         &pipelines.attention_context
@@ -4065,7 +5116,7 @@ fn encode_attention_impl(
     encoder.dispatch_thread_groups(
         MTLSize {
             width: N_HEADS as u64,
-            height: if v2 {
+            height: if v2 || fused_softmax_ctx {
                 (head_dim as usize / 128) as u64
             } else {
                 1
@@ -4127,6 +5178,93 @@ fn encode_gelu_mul(
     encoder.set_buffer(2, Some(output), 0);
     encoder.set_bytes(3, 4, &count_u32 as *const u32 as *const c_void);
     dispatch_1d(encoder, pipeline, count);
+}
+
+/// `mtp12_norm_add_norm`: `out_residual = round(residual + rms(input, weight))`
+/// (then `round(. * scale)` when `scale` is `Some`) and
+/// `out_normed = rms(out_residual, next_weight)`, replacing the
+/// rms_norm + add[_scale] + rms_norm dispatch chain bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn encode_norm_add_norm(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input: &Buffer,
+    weight: &Buffer,
+    residual: &Buffer,
+    next_weight: &Buffer,
+    out_residual: &Buffer,
+    out_normed: &Buffer,
+    width: usize,
+    scale: Option<f32>,
+) {
+    debug_assert!(width <= 1024 && width.is_multiple_of(256));
+    let width_u32 = width as u32;
+    let (scale_value, apply_scale) = match scale {
+        Some(scale) => (scale, 1u32),
+        None => (0.0f32, 0u32),
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input), 0);
+    encoder.set_buffer(1, Some(weight), 0);
+    encoder.set_buffer(2, Some(residual), 0);
+    encoder.set_buffer(3, Some(next_weight), 0);
+    encoder.set_buffer(4, Some(out_residual), 0);
+    encoder.set_buffer(5, Some(out_normed), 0);
+    encoder.set_bytes(6, 4, &width_u32 as *const u32 as *const c_void);
+    encoder.set_bytes(7, 4, &RMS_EPS as *const f32 as *const c_void);
+    encoder.set_bytes(8, 4, &scale_value as *const f32 as *const c_void);
+    encoder.set_bytes(9, 4, &apply_scale as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// `mtp12_qnorm_rope`: per-head RMS norm of `query` with `weight` followed by
+/// the split RoPE at `table_byte_offset` into `output`, replacing
+/// rms_norm(head_dim x N_HEADS) + rope bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn encode_qnorm_rope(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    query: &Buffer,
+    weight: &Buffer,
+    cos: &Buffer,
+    sin: &Buffer,
+    table_byte_offset: u64,
+    output: &Buffer,
+    head_dim: usize,
+) {
+    debug_assert!(head_dim <= 512 && head_dim.is_multiple_of(256));
+    let head_dim_u32 = head_dim as u32;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(query), 0);
+    encoder.set_buffer(1, Some(weight), 0);
+    encoder.set_buffer(2, Some(cos), table_byte_offset);
+    encoder.set_buffer(3, Some(sin), table_byte_offset);
+    encoder.set_buffer(4, Some(output), 0);
+    encoder.set_bytes(5, 4, &head_dim_u32 as *const u32 as *const c_void);
+    encoder.set_bytes(6, 4, &RMS_EPS as *const f32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: N_HEADS as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 /// Chunked two-stage vocabulary argmax (`mtp12_argmax_partial` +
@@ -4519,6 +5657,7 @@ mod tests {
         };
         Gemma4Mtp12AssistantMetal {
             single_position: false,
+            fuse: Mtp12FuseFlags::default(),
             shortlist: None,
             dense_bf16: None,
             tree_state: None,
@@ -5537,6 +6676,29 @@ mod tests {
         compact_base: usize,
         position_count: usize,
     ) -> Vec<f32> {
+        mtp12_attention_run_ex(
+            device, pipelines, v2, false, query, keys, values, kv_heads, head_dim, capacity,
+            compact_base, position_count,
+        )
+    }
+
+    /// As [`mtp12_attention_run`], with `fused` selecting
+    /// `mtp12_attention_softmax_context_v2` in place of softmax + context.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp12_attention_run_ex(
+        device: &Device,
+        pipelines: &Mtp12Pipelines,
+        v2: bool,
+        fused: bool,
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        compact_base: usize,
+        position_count: usize,
+    ) -> Vec<f32> {
         let logical_len = compact_base + position_count;
         assert!(logical_len <= capacity);
         let query_buf = f32_buffer(device, query).expect("query buffer");
@@ -5548,7 +6710,7 @@ mod tests {
         let queue = device.new_command_queue();
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
-        encode_attention_impl(
+        encode_attention_impl_ex(
             encoder,
             pipelines,
             &query_buf,
@@ -5565,6 +6727,7 @@ mod tests {
             compact_base,
             position_count,
             v2,
+            fused,
         );
         encoder.end_encoding();
         command.commit();
@@ -6091,6 +7254,491 @@ mod tests {
         let empty = unsafe { std::slice::from_raw_parts(compact_logits.contents().cast::<f32>(), ROWS) };
         assert!(empty.iter().all(|&value| value == f32::NEG_INFINITY));
         assert_eq!(run_argmax_pair(&device, &queue, &pipelines, empty), (0, 0));
+    }
+
+    // ---- CAMELID_GEMMA4_MTP12_FUSE_* kernels: bit-for-bit against the established
+    // dispatch chains, plus an ignored bandwidth bench --------------------------------
+
+    #[test]
+    fn fuse_selectors_parse_strictly() {
+        assert!(!mtp12_fuse_flag("X", None).unwrap());
+        assert!(!mtp12_fuse_flag("X", Some("0")).unwrap());
+        assert!(mtp12_fuse_flag("X", Some("1")).unwrap());
+        for bad in ["", " 1", "1 ", "true", "false", "on", "2", "01"] {
+            assert!(mtp12_fuse_flag("X", Some(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(Mtp12FuseFlags::default(), Mtp12FuseFlags {
+            gemv_x4: false, gate_up: false, norm: false, qrope: false,
+            softmax_ctx: false, head_prefetch: false,
+        });
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn round_bf16_cpu(value: f32) -> f32 {
+        let bits = value.to_bits();
+        if bits & 0x7fff_ffff > 0x7f80_0000 {
+            return f32::from_bits(((bits >> 16) | 0x40) << 16);
+        }
+        let bias = 0x7fff + ((bits >> 16) & 1);
+        f32::from_bits(bits.wrapping_add(bias) & 0xffff_0000)
+    }
+
+    /// BF16-valued activations in roughly [-4, 4] with zeros, negative zeros,
+    /// BF16 denormals and tiny normals sprinkled in when `specials` is set.
+    fn random_bf16_values(count: usize, seed: u64, specials: bool) -> Vec<f32> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..count)
+            .map(|i| {
+                let r = xorshift(&mut state);
+                if specials {
+                    match i % 53 {
+                        0 => return 0.0,
+                        17 => return -0.0,
+                        // BF16 denormals: exponent 0, upper mantissa bits only.
+                        29 => return f32::from_bits((((r >> 8) as u32) & 0x007f) << 16 | 0x0001_0000),
+                        41 => return -f32::from_bits((((r >> 8) as u32) & 0x007f) << 16 | 0x0001_0000),
+                        47 => return f32::from_bits(0x0080_0000 + ((((r >> 8) as u32) & 0x3f) << 16)),
+                        _ => {}
+                    }
+                }
+                round_bf16_cpu((r >> 40) as f32 / 16_777_216.0 * 8.0 - 4.0)
+            })
+            .collect()
+    }
+
+    /// Random Q4_0 blocks (f16 scale in about [-1, 1), random nibbles) at
+    /// `byte_offset` inside a fresh buffer.
+    fn random_q4_weights(device: &Device, byte_offset: usize, byte_len: usize, seed: u64) -> Buffer {
+        let weights = shared_buffer(device, byte_offset + byte_len);
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(weights.contents().cast::<u8>(), weights.length() as usize)
+        };
+        let mut state = 0x9876_4321_abcdu64 ^ seed.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        for block in bytes[byte_offset..byte_offset + byte_len].chunks_exact_mut(18) {
+            let scale = (xorshift(&mut state) as i16) as f32 / 32768.0;
+            block[..2].copy_from_slice(&crate::tensor::f32_to_f16_bits(scale).to_le_bytes());
+            for byte in &mut block[2..] {
+                *byte = xorshift(&mut state) as u8;
+            }
+        }
+        weights
+    }
+
+    fn read_f32s(buffer: &Buffer, count: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; count];
+        read_buffer_f32(buffer, &mut out).expect("read");
+        out
+    }
+
+    fn assert_bits_equal(label: &str, expected: &[f32], actual: &[f32]) {
+        assert_eq!(expected.len(), actual.len(), "{label}: length");
+        for (i, (e, a)) in expected.iter().zip(actual).enumerate() {
+            assert_eq!(
+                a.to_bits(), e.to_bits(),
+                "{label} element {i}: fused={a} ({:#010x}) != established={e} ({:#010x})",
+                a.to_bits(), e.to_bits(),
+            );
+        }
+    }
+
+    const FUSE_GEMV_SHAPES: [(usize, usize); 6] =
+        [(1_024, 3_840), (4_096, 1_024), (8_192, 1_024), (1_024, 4_096), (1_024, 8_192), (3_840, 1_024)];
+
+    /// `mtp12_q4_0_gemv_x4` (four rows per 128-thread group, guarded prefetch)
+    /// must reproduce `mtp12_q4_0_gemv` bit-for-bit at the six production
+    /// shapes, both rounding modes, a nonzero weight offset, a nonzero output
+    /// offset, and BF16 inputs including zeros and denormals.
+    #[test]
+    fn gemv_x4_matches_gemv_bit_for_bit() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const WEIGHT_OFFSET: usize = 18 * 7;
+        const OUTPUT_OFFSET: usize = 4 * 9;
+        for (index, &(rows, cols)) in FUSE_GEMV_SHAPES.iter().enumerate() {
+            let matrix = Q4TensorRef {
+                byte_offset: WEIGHT_OFFSET as u64,
+                byte_len: (rows * cols / 32 * 18) as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+            };
+            let weights = random_q4_weights(&device, WEIGHT_OFFSET, matrix.byte_len as usize, index as u64);
+            let input = f32_buffer(&device, &random_bf16_values(cols, 100 + index as u64, true)).unwrap();
+            for round in [false, true] {
+                let established = f32_buffer(&device, &vec![f32::NAN; rows]).unwrap();
+                let candidate = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &established, matrix, round);
+                encode_q4_gemv_at_offset(
+                    encoder, &pipelines.q4_gemv_x4, &weights, &input, &candidate,
+                    OUTPUT_OFFSET as u64, matrix, round, true,
+                );
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                let expected = read_f32s(&established, rows);
+                assert!(expected.iter().all(|v| v.is_finite()), "{rows}x{cols}: fixture not finite");
+                let actual = read_f32s(&candidate, rows + OUTPUT_OFFSET / 4);
+                assert!(actual[..OUTPUT_OFFSET / 4].iter().all(|v| v.is_nan()), "offset prefix clobbered");
+                assert_bits_equal(&format!("gemv_x4 {rows}x{cols} round={round}"), &expected, &actual[OUTPUT_OFFSET / 4..]);
+            }
+        }
+    }
+
+    /// `mtp12_q4_0_gemv_gate_up_gelu` == gemv(gate) + gemv(up) + gelu_mul.
+    #[test]
+    fn gate_up_gelu_fused_matches_three_dispatch() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        let byte_len = (FFN_HIDDEN * ASSISTANT_HIDDEN / 32 * 18) as u64;
+        let gate = Q4TensorRef { byte_offset: 18, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+        let up = Q4TensorRef { byte_offset: 18 + byte_len, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+        let weights = random_q4_weights(&device, 18, 2 * byte_len as usize, 0x6a7e);
+        for (seed, specials) in [(1u64, true), (2, false), (3, true)] {
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 900 + seed, specials)).unwrap();
+            let gate_out = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let up_out = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let established = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let candidate = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &gate_out, gate, true);
+            encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &up_out, up, true);
+            encode_gelu_mul(encoder, &pipelines.gelu_mul, &gate_out, &up_out, &established, FFN_HIDDEN);
+            encode_q4_gemv_gate_up_gelu(
+                encoder, &pipelines.q4_gemv_gate_up_gelu, &weights, &input, &candidate, gate, up,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            let expected = read_f32s(&established, FFN_HIDDEN);
+            assert!(expected.iter().all(|v| v.is_finite()));
+            assert_bits_equal(&format!("gate_up_gelu seed={seed}"), &expected, &read_f32s(&candidate, FFN_HIDDEN));
+        }
+    }
+
+    /// `mtp12_norm_add_norm` == rms_norm + add (or add_scale) + rms_norm on both
+    /// outputs, with and without the layer scale.
+    #[test]
+    fn norm_add_norm_matches_chain() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        let near_one = |seed: u64| -> Vec<f32> {
+            random_bf16_values(ASSISTANT_HIDDEN, seed, false)
+                .into_iter().map(|v| round_bf16_cpu(1.0 + v * 0.25)).collect()
+        };
+        for (case, scale) in [None, Some(0.707_106_8f32), Some(1.0), Some(-1.5), Some(0.0)].into_iter().enumerate() {
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 10 + case as u64, true)).unwrap();
+            let residual = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 20 + case as u64, true)).unwrap();
+            let weight = f32_buffer(&device, &near_one(30 + case as u64)).unwrap();
+            let next_weight = f32_buffer(&device, &near_one(40 + case as u64)).unwrap();
+            let normed = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let summed = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let established = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let out_residual = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let out_normed = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_rms_norm(encoder, &pipelines.rms_norm, &input, &weight, &normed, ASSISTANT_HIDDEN, 1);
+            match scale {
+                Some(scale) => encode_add_scale(
+                    encoder, &pipelines.add_scale, &residual, &normed, &summed, ASSISTANT_HIDDEN, scale,
+                ),
+                None => encode_add(encoder, &pipelines.add, &residual, &normed, &summed, ASSISTANT_HIDDEN),
+            }
+            encode_rms_norm(encoder, &pipelines.rms_norm, &summed, &next_weight, &established, ASSISTANT_HIDDEN, 1);
+            encode_norm_add_norm(
+                encoder, &pipelines.norm_add_norm, &input, &weight, &residual, &next_weight,
+                &out_residual, &out_normed, ASSISTANT_HIDDEN, scale,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            let expected_normed = read_f32s(&established, ASSISTANT_HIDDEN);
+            assert!(expected_normed.iter().all(|v| v.is_finite()));
+            assert_bits_equal(&format!("norm_add_norm residual scale={scale:?}"), &read_f32s(&summed, ASSISTANT_HIDDEN), &read_f32s(&out_residual, ASSISTANT_HIDDEN));
+            assert_bits_equal(&format!("norm_add_norm normed scale={scale:?}"), &expected_normed, &read_f32s(&out_normed, ASSISTANT_HIDDEN));
+        }
+    }
+
+    /// `mtp12_qnorm_rope` == per-head rms_norm + rope_split at both head dims
+    /// and a nonzero rope-table row offset.
+    #[test]
+    fn qnorm_rope_matches_pair() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        for (case, head_dim) in [LOCAL_HEAD_DIM, FULL_HEAD_DIM].into_iter().enumerate() {
+            let half = head_dim / 2;
+            let query = f32_buffer(&device, &random_bf16_values(N_HEADS * head_dim, 50 + case as u64, true)).unwrap();
+            let weight: Vec<f32> = random_bf16_values(head_dim, 60 + case as u64, false)
+                .into_iter().map(|v| round_bf16_cpu(1.0 + v * 0.25)).collect();
+            let weight = f32_buffer(&device, &weight).unwrap();
+            // Three rope rows of raw (un-rounded) f32 angles; bind the third.
+            let mut state = 0xabcd_ef01u64 ^ case as u64;
+            let tables: Vec<f32> = (0..3 * half)
+                .map(|_| (xorshift(&mut state) >> 40) as f32 / 16_777_216.0 * 2.0 - 1.0)
+                .collect();
+            let cos = f32_buffer(&device, &tables).unwrap();
+            let sin = f32_buffer(&device, &tables.iter().map(|v| -v * 0.5).collect::<Vec<_>>()).unwrap();
+            let table_byte_offset = (2 * half * 4) as u64;
+            let established = f32_buffer(&device, &vec![f32::NAN; N_HEADS * head_dim]).unwrap();
+            let candidate = f32_buffer(&device, &vec![f32::NAN; N_HEADS * head_dim]).unwrap();
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_rms_norm(encoder, &pipelines.rms_norm, &query, &weight, &established, head_dim, N_HEADS);
+            encode_rope_at_offset(encoder, &pipelines.rope, &established, &cos, &sin, table_byte_offset, head_dim);
+            encode_qnorm_rope(
+                encoder, &pipelines.qnorm_rope, &query, &weight, &cos, &sin, table_byte_offset,
+                &candidate, head_dim,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            let expected = read_f32s(&established, N_HEADS * head_dim);
+            assert!(expected.iter().all(|v| v.is_finite()));
+            assert_bits_equal(&format!("qnorm_rope head_dim={head_dim}"), &expected, &read_f32s(&candidate, N_HEADS * head_dim));
+        }
+    }
+
+    /// `mtp12_attention_softmax_context_v2` must reproduce softmax + context_v2
+    /// (and the established pair) bit-for-bit on both head shapes at position
+    /// counts around the 32-lane chunk boundaries and at production depth.
+    #[test]
+    fn mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        const CAPACITY: usize = 1_100;
+        for (shape_index, &(kv_heads, head_dim)) in
+            [(LOCAL_KV_HEADS, LOCAL_HEAD_DIM), (FULL_KV_HEADS, FULL_HEAD_DIM)].iter().enumerate()
+        {
+            let (query, keys, values) =
+                mtp12_attention_fixture(kv_heads, head_dim, CAPACITY, 40 + shape_index as u64);
+            for &position_count in &[1usize, 31, 32, 33, 127, 128, 129, 620, 1_024] {
+                for compact_base in [0usize, 3] {
+                    let run = |v2: bool, fused: bool| {
+                        mtp12_attention_run_ex(
+                            &device, &pipelines, v2, fused, &query, &keys, &values,
+                            kv_heads, head_dim, CAPACITY, compact_base, position_count,
+                        )
+                    };
+                    let established = run(false, false);
+                    let pair_v2 = run(true, false);
+                    let fused = run(true, true);
+                    assert!(established.iter().all(|v| v.is_finite()));
+                    let label = format!("softmax_ctx kv {kv_heads}x{head_dim} base {compact_base} count {position_count}");
+                    assert_bits_equal(&format!("{label} (v2 pair)"), &pair_v2, &fused);
+                    assert_bits_equal(&format!("{label} (established)"), &established, &fused);
+                }
+            }
+        }
+    }
+
+    /// Synthetic compact-head fixture: `rows` tokens with three random clusters
+    /// each and a random `top`-of-2048 selection (about the production retained
+    /// fraction).  Returns (token_clusters, selected).
+    fn synthetic_head_selection(device: &Device, rows: usize, top: usize, seed: u64) -> (Buffer, Buffer) {
+        let mut state = 0x5eed_5eedu64 ^ seed;
+        let clusters: Vec<u16> = (0..rows)
+            .flat_map(|_| {
+                let a = (xorshift(&mut state) % MTP12_SHORTLIST_CLUSTERS as u64) as u16;
+                let b = (xorshift(&mut state) % MTP12_SHORTLIST_CLUSTERS as u64) as u16;
+                let c = (xorshift(&mut state) % MTP12_SHORTLIST_CLUSTERS as u64) as u16;
+                [a, b, c, 0]
+            })
+            .collect();
+        let cluster_buffer = shared_buffer(device, clusters.len() * 2);
+        unsafe {
+            std::ptr::copy_nonoverlapping(clusters.as_ptr(), cluster_buffer.contents().cast::<u16>(), clusters.len());
+        }
+        let mut order: Vec<usize> = (0..MTP12_SHORTLIST_CLUSTERS).collect();
+        for i in (1..order.len()).rev() {
+            let j = (xorshift(&mut state) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        let mut selected = vec![0u32; MTP12_SHORTLIST_CLUSTERS];
+        for &index in &order[..top] {
+            selected[index] = 1;
+        }
+        let selected_buffer = shared_buffer(device, selected.len() * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(selected.as_ptr(), selected_buffer.contents().cast::<u32>(), selected.len());
+        }
+        (cluster_buffer, selected_buffer)
+    }
+
+    /// `mtp12_q4_0_gemv_compact_local_prefetch` == `mtp12_q4_0_gemv_compact_local`
+    /// at cols 1024 (one block per lane) and 2048 (a second in-place block).
+    #[test]
+    fn head_prefetch_matches_compact_local_bit_for_bit() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const ROWS: usize = 8_193;
+        for (case, cols) in [1_024usize, 2_048].into_iter().enumerate() {
+            let matrix = Q4TensorRef {
+                byte_offset: 18,
+                byte_len: (ROWS * cols / 32 * 18) as u64,
+                rows: ROWS as u32,
+                cols: cols as u32,
+            };
+            let weights = random_q4_weights(&device, 18, matrix.byte_len as usize, 0x4ead + case as u64);
+            let input = f32_buffer(&device, &random_bf16_values(cols, 700 + case as u64, true)).unwrap();
+            for top in [1usize, 384, 2_048] {
+                let (clusters, selected) = synthetic_head_selection(&device, ROWS, top, top as u64);
+                let established = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
+                let candidate = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                encoder.set_buffer(7, Some(&clusters), 0);
+                encoder.set_buffer(8, Some(&selected), 0);
+                encode_q4_gemv_shortlist_compact(
+                    encoder, &pipelines.q4_gemv_shortlist_compact, &weights, &input, &established, matrix,
+                );
+                encoder.set_buffer(7, Some(&clusters), 0);
+                encoder.set_buffer(8, Some(&selected), 0);
+                encode_q4_gemv_shortlist_compact(
+                    encoder, &pipelines.q4_gemv_shortlist_compact_prefetch, &weights, &input, &candidate, matrix,
+                );
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                let expected = read_f32s(&established, ROWS);
+                assert!(expected.iter().any(|v| v.is_finite()) || top == 1, "fixture retained nothing");
+                assert!(expected.iter().all(|v| !v.is_nan()));
+                assert_bits_equal(&format!("head_prefetch cols={cols} top={top}"), &expected, &read_f32s(&candidate, ROWS));
+            }
+        }
+    }
+
+    /// GB/s per production GEMV shape, established one-row-per-group vs x4
+    /// (30 encodes per command buffer, hardware timestamps), plus the fused
+    /// gate/up/GELU vs three dispatches and a synthetic 262,144-row compact
+    /// head (random 384-of-2048 selection) with and without the row prefetch.
+    #[test]
+    #[ignore]
+    fn assistant_gemv_bench_shapes() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping assistant GEMV bench");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const REPS: usize = 30;
+        let time = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
+            let mut gpu_us = 0.0;
+            for pass in 0..2 {
+                let reps = if pass == 0 { 1 } else { REPS };
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                for _ in 0..reps {
+                    encode(encoder);
+                }
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                if pass == 1 {
+                    let (us, _) = super::super::command_buffer_gpu_times_us(&cb.to_owned());
+                    gpu_us = us as f64 / REPS as f64;
+                }
+            }
+            gpu_us
+        };
+        for (index, &(rows, cols)) in FUSE_GEMV_SHAPES.iter().enumerate() {
+            let matrix = Q4TensorRef {
+                byte_offset: 0,
+                byte_len: (rows * cols / 32 * 18) as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+            };
+            let weights = random_q4_weights(&device, 0, matrix.byte_len as usize, 500 + index as u64);
+            let input = f32_buffer(&device, &random_bf16_values(cols, 600 + index as u64, false)).unwrap();
+            let output = shared_buffer(&device, rows * 4);
+            for (label, x4) in [("gemv", false), ("gemv_x4", true)] {
+                let pipeline = if x4 { &pipelines.q4_gemv_x4 } else { &pipelines.q4_gemv };
+                let us = time(&|encoder| {
+                    encode_q4_gemv_at_offset(encoder, pipeline, &weights, &input, &output, 0, matrix, true, x4);
+                });
+                eprintln!(
+                    "[mtp12-gemv-bench] {rows:>5}x{cols:<5} {label:<8} {us:8.1} us  {:6.1} GB/s",
+                    matrix.byte_len as f64 / us / 1.0e3
+                );
+            }
+        }
+        {
+            let byte_len = (FFN_HIDDEN * ASSISTANT_HIDDEN / 32 * 18) as u64;
+            let gate = Q4TensorRef { byte_offset: 0, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+            let up = Q4TensorRef { byte_offset: byte_len, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+            let weights = random_q4_weights(&device, 0, 2 * byte_len as usize, 0x9a7e);
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 0x9a7e, false)).unwrap();
+            let gate_out = shared_buffer(&device, FFN_HIDDEN * 4);
+            let up_out = shared_buffer(&device, FFN_HIDDEN * 4);
+            let gated = shared_buffer(&device, FFN_HIDDEN * 4);
+            let three = time(&|encoder| {
+                encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &gate_out, gate, true);
+                encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &up_out, up, true);
+                encode_gelu_mul(encoder, &pipelines.gelu_mul, &gate_out, &up_out, &gated, FFN_HIDDEN);
+            });
+            let three_x4 = time(&|encoder| {
+                encode_q4_gemv_at_offset(encoder, &pipelines.q4_gemv_x4, &weights, &input, &gate_out, 0, gate, true, true);
+                encode_q4_gemv_at_offset(encoder, &pipelines.q4_gemv_x4, &weights, &input, &up_out, 0, up, true, true);
+                encode_gelu_mul(encoder, &pipelines.gelu_mul, &gate_out, &up_out, &gated, FFN_HIDDEN);
+            });
+            let fused = time(&|encoder| {
+                encode_q4_gemv_gate_up_gelu(encoder, &pipelines.q4_gemv_gate_up_gelu, &weights, &input, &gated, gate, up);
+            });
+            let bytes = 2.0 * byte_len as f64;
+            eprintln!("[mtp12-gemv-bench] gate+up+gelu three-dispatch    {three:8.1} us  {:6.1} GB/s", bytes / three / 1.0e3);
+            eprintln!("[mtp12-gemv-bench] gate+up+gelu three-dispatch x4 {three_x4:8.1} us  {:6.1} GB/s", bytes / three_x4 / 1.0e3);
+            eprintln!("[mtp12-gemv-bench] gate+up+gelu fused             {fused:8.1} us  {:6.1} GB/s", bytes / fused / 1.0e3);
+        }
+        {
+            let matrix = Q4TensorRef {
+                byte_offset: 0,
+                byte_len: (VOCAB * ASSISTANT_HIDDEN / 32 * 18) as u64,
+                rows: VOCAB as u32,
+                cols: ASSISTANT_HIDDEN as u32,
+            };
+            let weights = random_q4_weights(&device, 0, matrix.byte_len as usize, 0xead);
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 0xead, false)).unwrap();
+            let logits = shared_buffer(&device, VOCAB * 4);
+            let (clusters, selected) = synthetic_head_selection(&device, VOCAB, 384, 0xead);
+            let cluster_ids = unsafe { std::slice::from_raw_parts(clusters.contents().cast::<u16>(), VOCAB * 4) };
+            let selected_ids = unsafe { std::slice::from_raw_parts(selected.contents().cast::<u32>(), MTP12_SHORTLIST_CLUSTERS) };
+            let retained = cluster_ids.chunks_exact(4)
+                .filter(|c| c[..3].iter().any(|&id| selected_ids[id as usize] != 0))
+                .count();
+            for (label, pipeline) in [
+                ("compact_local", &pipelines.q4_gemv_shortlist_compact),
+                ("compact_local_prefetch", &pipelines.q4_gemv_shortlist_compact_prefetch),
+            ] {
+                let us = time(&|encoder| {
+                    encoder.set_buffer(7, Some(&clusters), 0);
+                    encoder.set_buffer(8, Some(&selected), 0);
+                    encode_q4_gemv_shortlist_compact(encoder, pipeline, &weights, &input, &logits, matrix);
+                });
+                eprintln!(
+                    "[mtp12-gemv-bench] head {label:<22} {us:8.1} us  retained {retained} rows ({:.1}%)  {:6.1} GB/s over retained bytes",
+                    retained as f64 * 100.0 / VOCAB as f64,
+                    (retained * ASSISTANT_HIDDEN / 32 * 18) as f64 / us / 1.0e3
+                );
+            }
+        }
     }
 
     #[test]
