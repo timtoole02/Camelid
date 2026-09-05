@@ -6676,6 +6676,29 @@ mod tests {
         compact_base: usize,
         position_count: usize,
     ) -> Vec<f32> {
+        mtp12_attention_run_ex(
+            device, pipelines, v2, false, query, keys, values, kv_heads, head_dim, capacity,
+            compact_base, position_count,
+        )
+    }
+
+    /// As [`mtp12_attention_run`], with `fused` selecting
+    /// `mtp12_attention_softmax_context_v2` in place of softmax + context.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp12_attention_run_ex(
+        device: &Device,
+        pipelines: &Mtp12Pipelines,
+        v2: bool,
+        fused: bool,
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        compact_base: usize,
+        position_count: usize,
+    ) -> Vec<f32> {
         let logical_len = compact_base + position_count;
         assert!(logical_len <= capacity);
         let query_buf = f32_buffer(device, query).expect("query buffer");
@@ -6687,7 +6710,7 @@ mod tests {
         let queue = device.new_command_queue();
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
-        encode_attention_impl(
+        encode_attention_impl_ex(
             encoder,
             pipelines,
             &query_buf,
@@ -6704,6 +6727,7 @@ mod tests {
             compact_base,
             position_count,
             v2,
+            fused,
         );
         encoder.end_encoding();
         command.commit();
@@ -7230,6 +7254,491 @@ mod tests {
         let empty = unsafe { std::slice::from_raw_parts(compact_logits.contents().cast::<f32>(), ROWS) };
         assert!(empty.iter().all(|&value| value == f32::NEG_INFINITY));
         assert_eq!(run_argmax_pair(&device, &queue, &pipelines, empty), (0, 0));
+    }
+
+    // ---- CAMELID_GEMMA4_MTP12_FUSE_* kernels: bit-for-bit against the established
+    // dispatch chains, plus an ignored bandwidth bench --------------------------------
+
+    #[test]
+    fn fuse_selectors_parse_strictly() {
+        assert!(!mtp12_fuse_flag("X", None).unwrap());
+        assert!(!mtp12_fuse_flag("X", Some("0")).unwrap());
+        assert!(mtp12_fuse_flag("X", Some("1")).unwrap());
+        for bad in ["", " 1", "1 ", "true", "false", "on", "2", "01"] {
+            assert!(mtp12_fuse_flag("X", Some(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(Mtp12FuseFlags::default(), Mtp12FuseFlags {
+            gemv_x4: false, gate_up: false, norm: false, qrope: false,
+            softmax_ctx: false, head_prefetch: false,
+        });
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn round_bf16_cpu(value: f32) -> f32 {
+        let bits = value.to_bits();
+        if bits & 0x7fff_ffff > 0x7f80_0000 {
+            return f32::from_bits(((bits >> 16) | 0x40) << 16);
+        }
+        let bias = 0x7fff + ((bits >> 16) & 1);
+        f32::from_bits(bits.wrapping_add(bias) & 0xffff_0000)
+    }
+
+    /// BF16-valued activations in roughly [-4, 4] with zeros, negative zeros,
+    /// BF16 denormals and tiny normals sprinkled in when `specials` is set.
+    fn random_bf16_values(count: usize, seed: u64, specials: bool) -> Vec<f32> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..count)
+            .map(|i| {
+                let r = xorshift(&mut state);
+                if specials {
+                    match i % 53 {
+                        0 => return 0.0,
+                        17 => return -0.0,
+                        // BF16 denormals: exponent 0, upper mantissa bits only.
+                        29 => return f32::from_bits((((r >> 8) as u32) & 0x007f) << 16 | 0x0001_0000),
+                        41 => return -f32::from_bits((((r >> 8) as u32) & 0x007f) << 16 | 0x0001_0000),
+                        47 => return f32::from_bits(0x0080_0000 + ((((r >> 8) as u32) & 0x3f) << 16)),
+                        _ => {}
+                    }
+                }
+                round_bf16_cpu((r >> 40) as f32 / 16_777_216.0 * 8.0 - 4.0)
+            })
+            .collect()
+    }
+
+    /// Random Q4_0 blocks (f16 scale in about [-1, 1), random nibbles) at
+    /// `byte_offset` inside a fresh buffer.
+    fn random_q4_weights(device: &Device, byte_offset: usize, byte_len: usize, seed: u64) -> Buffer {
+        let weights = shared_buffer(device, byte_offset + byte_len);
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(weights.contents().cast::<u8>(), weights.length() as usize)
+        };
+        let mut state = 0x9876_4321_abcdu64 ^ seed.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        for block in bytes[byte_offset..byte_offset + byte_len].chunks_exact_mut(18) {
+            let scale = (xorshift(&mut state) as i16) as f32 / 32768.0;
+            block[..2].copy_from_slice(&crate::tensor::f32_to_f16_bits(scale).to_le_bytes());
+            for byte in &mut block[2..] {
+                *byte = xorshift(&mut state) as u8;
+            }
+        }
+        weights
+    }
+
+    fn read_f32s(buffer: &Buffer, count: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; count];
+        read_buffer_f32(buffer, &mut out).expect("read");
+        out
+    }
+
+    fn assert_bits_equal(label: &str, expected: &[f32], actual: &[f32]) {
+        assert_eq!(expected.len(), actual.len(), "{label}: length");
+        for (i, (e, a)) in expected.iter().zip(actual).enumerate() {
+            assert_eq!(
+                a.to_bits(), e.to_bits(),
+                "{label} element {i}: fused={a} ({:#010x}) != established={e} ({:#010x})",
+                a.to_bits(), e.to_bits(),
+            );
+        }
+    }
+
+    const FUSE_GEMV_SHAPES: [(usize, usize); 6] =
+        [(1_024, 3_840), (4_096, 1_024), (8_192, 1_024), (1_024, 4_096), (1_024, 8_192), (3_840, 1_024)];
+
+    /// `mtp12_q4_0_gemv_x4` (four rows per 128-thread group, guarded prefetch)
+    /// must reproduce `mtp12_q4_0_gemv` bit-for-bit at the six production
+    /// shapes, both rounding modes, a nonzero weight offset, a nonzero output
+    /// offset, and BF16 inputs including zeros and denormals.
+    #[test]
+    fn gemv_x4_matches_gemv_bit_for_bit() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const WEIGHT_OFFSET: usize = 18 * 7;
+        const OUTPUT_OFFSET: usize = 4 * 9;
+        for (index, &(rows, cols)) in FUSE_GEMV_SHAPES.iter().enumerate() {
+            let matrix = Q4TensorRef {
+                byte_offset: WEIGHT_OFFSET as u64,
+                byte_len: (rows * cols / 32 * 18) as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+            };
+            let weights = random_q4_weights(&device, WEIGHT_OFFSET, matrix.byte_len as usize, index as u64);
+            let input = f32_buffer(&device, &random_bf16_values(cols, 100 + index as u64, true)).unwrap();
+            for round in [false, true] {
+                let established = f32_buffer(&device, &vec![f32::NAN; rows]).unwrap();
+                let candidate = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &established, matrix, round);
+                encode_q4_gemv_at_offset(
+                    encoder, &pipelines.q4_gemv_x4, &weights, &input, &candidate,
+                    OUTPUT_OFFSET as u64, matrix, round, true,
+                );
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                let expected = read_f32s(&established, rows);
+                assert!(expected.iter().all(|v| v.is_finite()), "{rows}x{cols}: fixture not finite");
+                let actual = read_f32s(&candidate, rows + OUTPUT_OFFSET / 4);
+                assert!(actual[..OUTPUT_OFFSET / 4].iter().all(|v| v.is_nan()), "offset prefix clobbered");
+                assert_bits_equal(&format!("gemv_x4 {rows}x{cols} round={round}"), &expected, &actual[OUTPUT_OFFSET / 4..]);
+            }
+        }
+    }
+
+    /// `mtp12_q4_0_gemv_gate_up_gelu` == gemv(gate) + gemv(up) + gelu_mul.
+    #[test]
+    fn gate_up_gelu_fused_matches_three_dispatch() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        let byte_len = (FFN_HIDDEN * ASSISTANT_HIDDEN / 32 * 18) as u64;
+        let gate = Q4TensorRef { byte_offset: 18, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+        let up = Q4TensorRef { byte_offset: 18 + byte_len, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+        let weights = random_q4_weights(&device, 18, 2 * byte_len as usize, 0x6a7e);
+        for (seed, specials) in [(1u64, true), (2, false), (3, true)] {
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 900 + seed, specials)).unwrap();
+            let gate_out = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let up_out = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let established = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let candidate = f32_buffer(&device, &vec![f32::NAN; FFN_HIDDEN]).unwrap();
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &gate_out, gate, true);
+            encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &up_out, up, true);
+            encode_gelu_mul(encoder, &pipelines.gelu_mul, &gate_out, &up_out, &established, FFN_HIDDEN);
+            encode_q4_gemv_gate_up_gelu(
+                encoder, &pipelines.q4_gemv_gate_up_gelu, &weights, &input, &candidate, gate, up,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            let expected = read_f32s(&established, FFN_HIDDEN);
+            assert!(expected.iter().all(|v| v.is_finite()));
+            assert_bits_equal(&format!("gate_up_gelu seed={seed}"), &expected, &read_f32s(&candidate, FFN_HIDDEN));
+        }
+    }
+
+    /// `mtp12_norm_add_norm` == rms_norm + add (or add_scale) + rms_norm on both
+    /// outputs, with and without the layer scale.
+    #[test]
+    fn norm_add_norm_matches_chain() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        let near_one = |seed: u64| -> Vec<f32> {
+            random_bf16_values(ASSISTANT_HIDDEN, seed, false)
+                .into_iter().map(|v| round_bf16_cpu(1.0 + v * 0.25)).collect()
+        };
+        for (case, scale) in [None, Some(0.707_106_8f32), Some(1.0), Some(-1.5), Some(0.0)].into_iter().enumerate() {
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 10 + case as u64, true)).unwrap();
+            let residual = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 20 + case as u64, true)).unwrap();
+            let weight = f32_buffer(&device, &near_one(30 + case as u64)).unwrap();
+            let next_weight = f32_buffer(&device, &near_one(40 + case as u64)).unwrap();
+            let normed = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let summed = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let established = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let out_residual = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let out_normed = f32_buffer(&device, &vec![f32::NAN; ASSISTANT_HIDDEN]).unwrap();
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_rms_norm(encoder, &pipelines.rms_norm, &input, &weight, &normed, ASSISTANT_HIDDEN, 1);
+            match scale {
+                Some(scale) => encode_add_scale(
+                    encoder, &pipelines.add_scale, &residual, &normed, &summed, ASSISTANT_HIDDEN, scale,
+                ),
+                None => encode_add(encoder, &pipelines.add, &residual, &normed, &summed, ASSISTANT_HIDDEN),
+            }
+            encode_rms_norm(encoder, &pipelines.rms_norm, &summed, &next_weight, &established, ASSISTANT_HIDDEN, 1);
+            encode_norm_add_norm(
+                encoder, &pipelines.norm_add_norm, &input, &weight, &residual, &next_weight,
+                &out_residual, &out_normed, ASSISTANT_HIDDEN, scale,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            let expected_normed = read_f32s(&established, ASSISTANT_HIDDEN);
+            assert!(expected_normed.iter().all(|v| v.is_finite()));
+            assert_bits_equal(&format!("norm_add_norm residual scale={scale:?}"), &read_f32s(&summed, ASSISTANT_HIDDEN), &read_f32s(&out_residual, ASSISTANT_HIDDEN));
+            assert_bits_equal(&format!("norm_add_norm normed scale={scale:?}"), &expected_normed, &read_f32s(&out_normed, ASSISTANT_HIDDEN));
+        }
+    }
+
+    /// `mtp12_qnorm_rope` == per-head rms_norm + rope_split at both head dims
+    /// and a nonzero rope-table row offset.
+    #[test]
+    fn qnorm_rope_matches_pair() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        for (case, head_dim) in [LOCAL_HEAD_DIM, FULL_HEAD_DIM].into_iter().enumerate() {
+            let half = head_dim / 2;
+            let query = f32_buffer(&device, &random_bf16_values(N_HEADS * head_dim, 50 + case as u64, true)).unwrap();
+            let weight: Vec<f32> = random_bf16_values(head_dim, 60 + case as u64, false)
+                .into_iter().map(|v| round_bf16_cpu(1.0 + v * 0.25)).collect();
+            let weight = f32_buffer(&device, &weight).unwrap();
+            // Three rope rows of raw (un-rounded) f32 angles; bind the third.
+            let mut state = 0xabcd_ef01u64 ^ case as u64;
+            let tables: Vec<f32> = (0..3 * half)
+                .map(|_| (xorshift(&mut state) >> 40) as f32 / 16_777_216.0 * 2.0 - 1.0)
+                .collect();
+            let cos = f32_buffer(&device, &tables).unwrap();
+            let sin = f32_buffer(&device, &tables.iter().map(|v| -v * 0.5).collect::<Vec<_>>()).unwrap();
+            let table_byte_offset = (2 * half * 4) as u64;
+            let established = f32_buffer(&device, &vec![f32::NAN; N_HEADS * head_dim]).unwrap();
+            let candidate = f32_buffer(&device, &vec![f32::NAN; N_HEADS * head_dim]).unwrap();
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_rms_norm(encoder, &pipelines.rms_norm, &query, &weight, &established, head_dim, N_HEADS);
+            encode_rope_at_offset(encoder, &pipelines.rope, &established, &cos, &sin, table_byte_offset, head_dim);
+            encode_qnorm_rope(
+                encoder, &pipelines.qnorm_rope, &query, &weight, &cos, &sin, table_byte_offset,
+                &candidate, head_dim,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            let expected = read_f32s(&established, N_HEADS * head_dim);
+            assert!(expected.iter().all(|v| v.is_finite()));
+            assert_bits_equal(&format!("qnorm_rope head_dim={head_dim}"), &expected, &read_f32s(&candidate, N_HEADS * head_dim));
+        }
+    }
+
+    /// `mtp12_attention_softmax_context_v2` must reproduce softmax + context_v2
+    /// (and the established pair) bit-for-bit on both head shapes at position
+    /// counts around the 32-lane chunk boundaries and at production depth.
+    #[test]
+    fn mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        const CAPACITY: usize = 1_100;
+        for (shape_index, &(kv_heads, head_dim)) in
+            [(LOCAL_KV_HEADS, LOCAL_HEAD_DIM), (FULL_KV_HEADS, FULL_HEAD_DIM)].iter().enumerate()
+        {
+            let (query, keys, values) =
+                mtp12_attention_fixture(kv_heads, head_dim, CAPACITY, 40 + shape_index as u64);
+            for &position_count in &[1usize, 31, 32, 33, 127, 128, 129, 620, 1_024] {
+                for compact_base in [0usize, 3] {
+                    let run = |v2: bool, fused: bool| {
+                        mtp12_attention_run_ex(
+                            &device, &pipelines, v2, fused, &query, &keys, &values,
+                            kv_heads, head_dim, CAPACITY, compact_base, position_count,
+                        )
+                    };
+                    let established = run(false, false);
+                    let pair_v2 = run(true, false);
+                    let fused = run(true, true);
+                    assert!(established.iter().all(|v| v.is_finite()));
+                    let label = format!("softmax_ctx kv {kv_heads}x{head_dim} base {compact_base} count {position_count}");
+                    assert_bits_equal(&format!("{label} (v2 pair)"), &pair_v2, &fused);
+                    assert_bits_equal(&format!("{label} (established)"), &established, &fused);
+                }
+            }
+        }
+    }
+
+    /// Synthetic compact-head fixture: `rows` tokens with three random clusters
+    /// each and a random `top`-of-2048 selection (about the production retained
+    /// fraction).  Returns (token_clusters, selected).
+    fn synthetic_head_selection(device: &Device, rows: usize, top: usize, seed: u64) -> (Buffer, Buffer) {
+        let mut state = 0x5eed_5eedu64 ^ seed;
+        let clusters: Vec<u16> = (0..rows)
+            .flat_map(|_| {
+                let a = (xorshift(&mut state) % MTP12_SHORTLIST_CLUSTERS as u64) as u16;
+                let b = (xorshift(&mut state) % MTP12_SHORTLIST_CLUSTERS as u64) as u16;
+                let c = (xorshift(&mut state) % MTP12_SHORTLIST_CLUSTERS as u64) as u16;
+                [a, b, c, 0]
+            })
+            .collect();
+        let cluster_buffer = shared_buffer(device, clusters.len() * 2);
+        unsafe {
+            std::ptr::copy_nonoverlapping(clusters.as_ptr(), cluster_buffer.contents().cast::<u16>(), clusters.len());
+        }
+        let mut order: Vec<usize> = (0..MTP12_SHORTLIST_CLUSTERS).collect();
+        for i in (1..order.len()).rev() {
+            let j = (xorshift(&mut state) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        let mut selected = vec![0u32; MTP12_SHORTLIST_CLUSTERS];
+        for &index in &order[..top] {
+            selected[index] = 1;
+        }
+        let selected_buffer = shared_buffer(device, selected.len() * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(selected.as_ptr(), selected_buffer.contents().cast::<u32>(), selected.len());
+        }
+        (cluster_buffer, selected_buffer)
+    }
+
+    /// `mtp12_q4_0_gemv_compact_local_prefetch` == `mtp12_q4_0_gemv_compact_local`
+    /// at cols 1024 (one block per lane) and 2048 (a second in-place block).
+    #[test]
+    fn head_prefetch_matches_compact_local_bit_for_bit() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const ROWS: usize = 8_193;
+        for (case, cols) in [1_024usize, 2_048].into_iter().enumerate() {
+            let matrix = Q4TensorRef {
+                byte_offset: 18,
+                byte_len: (ROWS * cols / 32 * 18) as u64,
+                rows: ROWS as u32,
+                cols: cols as u32,
+            };
+            let weights = random_q4_weights(&device, 18, matrix.byte_len as usize, 0x4ead + case as u64);
+            let input = f32_buffer(&device, &random_bf16_values(cols, 700 + case as u64, true)).unwrap();
+            for top in [1usize, 384, 2_048] {
+                let (clusters, selected) = synthetic_head_selection(&device, ROWS, top, top as u64);
+                let established = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
+                let candidate = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                encoder.set_buffer(7, Some(&clusters), 0);
+                encoder.set_buffer(8, Some(&selected), 0);
+                encode_q4_gemv_shortlist_compact(
+                    encoder, &pipelines.q4_gemv_shortlist_compact, &weights, &input, &established, matrix,
+                );
+                encoder.set_buffer(7, Some(&clusters), 0);
+                encoder.set_buffer(8, Some(&selected), 0);
+                encode_q4_gemv_shortlist_compact(
+                    encoder, &pipelines.q4_gemv_shortlist_compact_prefetch, &weights, &input, &candidate, matrix,
+                );
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                let expected = read_f32s(&established, ROWS);
+                assert!(expected.iter().any(|v| v.is_finite()) || top == 1, "fixture retained nothing");
+                assert!(expected.iter().all(|v| !v.is_nan()));
+                assert_bits_equal(&format!("head_prefetch cols={cols} top={top}"), &expected, &read_f32s(&candidate, ROWS));
+            }
+        }
+    }
+
+    /// GB/s per production GEMV shape, established one-row-per-group vs x4
+    /// (30 encodes per command buffer, hardware timestamps), plus the fused
+    /// gate/up/GELU vs three dispatches and a synthetic 262,144-row compact
+    /// head (random 384-of-2048 selection) with and without the row prefetch.
+    #[test]
+    #[ignore]
+    fn assistant_gemv_bench_shapes() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping assistant GEMV bench");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const REPS: usize = 30;
+        let time = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
+            let mut gpu_us = 0.0;
+            for pass in 0..2 {
+                let reps = if pass == 0 { 1 } else { REPS };
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                for _ in 0..reps {
+                    encode(encoder);
+                }
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                if pass == 1 {
+                    let (us, _) = super::super::command_buffer_gpu_times_us(&cb.to_owned());
+                    gpu_us = us as f64 / REPS as f64;
+                }
+            }
+            gpu_us
+        };
+        for (index, &(rows, cols)) in FUSE_GEMV_SHAPES.iter().enumerate() {
+            let matrix = Q4TensorRef {
+                byte_offset: 0,
+                byte_len: (rows * cols / 32 * 18) as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+            };
+            let weights = random_q4_weights(&device, 0, matrix.byte_len as usize, 500 + index as u64);
+            let input = f32_buffer(&device, &random_bf16_values(cols, 600 + index as u64, false)).unwrap();
+            let output = shared_buffer(&device, rows * 4);
+            for (label, x4) in [("gemv", false), ("gemv_x4", true)] {
+                let pipeline = if x4 { &pipelines.q4_gemv_x4 } else { &pipelines.q4_gemv };
+                let us = time(&|encoder| {
+                    encode_q4_gemv_at_offset(encoder, pipeline, &weights, &input, &output, 0, matrix, true, x4);
+                });
+                eprintln!(
+                    "[mtp12-gemv-bench] {rows:>5}x{cols:<5} {label:<8} {us:8.1} us  {:6.1} GB/s",
+                    matrix.byte_len as f64 / us / 1.0e3
+                );
+            }
+        }
+        {
+            let byte_len = (FFN_HIDDEN * ASSISTANT_HIDDEN / 32 * 18) as u64;
+            let gate = Q4TensorRef { byte_offset: 0, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+            let up = Q4TensorRef { byte_offset: byte_len, byte_len, rows: FFN_HIDDEN as u32, cols: ASSISTANT_HIDDEN as u32 };
+            let weights = random_q4_weights(&device, 0, 2 * byte_len as usize, 0x9a7e);
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 0x9a7e, false)).unwrap();
+            let gate_out = shared_buffer(&device, FFN_HIDDEN * 4);
+            let up_out = shared_buffer(&device, FFN_HIDDEN * 4);
+            let gated = shared_buffer(&device, FFN_HIDDEN * 4);
+            let three = time(&|encoder| {
+                encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &gate_out, gate, true);
+                encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &up_out, up, true);
+                encode_gelu_mul(encoder, &pipelines.gelu_mul, &gate_out, &up_out, &gated, FFN_HIDDEN);
+            });
+            let three_x4 = time(&|encoder| {
+                encode_q4_gemv_at_offset(encoder, &pipelines.q4_gemv_x4, &weights, &input, &gate_out, 0, gate, true, true);
+                encode_q4_gemv_at_offset(encoder, &pipelines.q4_gemv_x4, &weights, &input, &up_out, 0, up, true, true);
+                encode_gelu_mul(encoder, &pipelines.gelu_mul, &gate_out, &up_out, &gated, FFN_HIDDEN);
+            });
+            let fused = time(&|encoder| {
+                encode_q4_gemv_gate_up_gelu(encoder, &pipelines.q4_gemv_gate_up_gelu, &weights, &input, &gated, gate, up);
+            });
+            let bytes = 2.0 * byte_len as f64;
+            eprintln!("[mtp12-gemv-bench] gate+up+gelu three-dispatch    {three:8.1} us  {:6.1} GB/s", bytes / three / 1.0e3);
+            eprintln!("[mtp12-gemv-bench] gate+up+gelu three-dispatch x4 {three_x4:8.1} us  {:6.1} GB/s", bytes / three_x4 / 1.0e3);
+            eprintln!("[mtp12-gemv-bench] gate+up+gelu fused             {fused:8.1} us  {:6.1} GB/s", bytes / fused / 1.0e3);
+        }
+        {
+            let matrix = Q4TensorRef {
+                byte_offset: 0,
+                byte_len: (VOCAB * ASSISTANT_HIDDEN / 32 * 18) as u64,
+                rows: VOCAB as u32,
+                cols: ASSISTANT_HIDDEN as u32,
+            };
+            let weights = random_q4_weights(&device, 0, matrix.byte_len as usize, 0xead);
+            let input = f32_buffer(&device, &random_bf16_values(ASSISTANT_HIDDEN, 0xead, false)).unwrap();
+            let logits = shared_buffer(&device, VOCAB * 4);
+            let (clusters, selected) = synthetic_head_selection(&device, VOCAB, 384, 0xead);
+            let cluster_ids = unsafe { std::slice::from_raw_parts(clusters.contents().cast::<u16>(), VOCAB * 4) };
+            let selected_ids = unsafe { std::slice::from_raw_parts(selected.contents().cast::<u32>(), MTP12_SHORTLIST_CLUSTERS) };
+            let retained = cluster_ids.chunks_exact(4)
+                .filter(|c| c[..3].iter().any(|&id| selected_ids[id as usize] != 0))
+                .count();
+            for (label, pipeline) in [
+                ("compact_local", &pipelines.q4_gemv_shortlist_compact),
+                ("compact_local_prefetch", &pipelines.q4_gemv_shortlist_compact_prefetch),
+            ] {
+                let us = time(&|encoder| {
+                    encoder.set_buffer(7, Some(&clusters), 0);
+                    encoder.set_buffer(8, Some(&selected), 0);
+                    encode_q4_gemv_shortlist_compact(encoder, pipeline, &weights, &input, &logits, matrix);
+                });
+                eprintln!(
+                    "[mtp12-gemv-bench] head {label:<22} {us:8.1} us  retained {retained} rows ({:.1}%)  {:6.1} GB/s over retained bytes",
+                    retained as f64 * 100.0 / VOCAB as f64,
+                    (retained * ASSISTANT_HIDDEN / 32 * 18) as f64 / us / 1.0e3
+                );
+            }
+        }
     }
 
     #[test]
