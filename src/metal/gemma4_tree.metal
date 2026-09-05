@@ -174,8 +174,8 @@ kernel void gemma4_tree_context_hd256_p2(
     // The prefix is the original PAIRS2 loop: one shared V load, no tree
     // address selection in the long walk. Every pair retains its same scalar
     // accumulator and reciprocal across the following <=8 suffix positions.
-    // Explicit FMA retains the qualified per-term score*inv multiply followed
-    // by value/acc contraction; do not factor inv outside either loop.
+    // Exact fixture diagnostics identify the original compiler form as
+    // score*value followed by inverse/acc FMA; pin that form in both loops.
     const uint prefix_end = min(args.union_end, tree_base);
     for (uint p = args.union_start; p < prefix_end; ++p) {
         const float v = vbase[p * position_stride];
@@ -183,7 +183,7 @@ kernel void gemma4_tree_context_hd256_p2(
         for (uint j = 0u; j < PAIRS; ++j) {
             const uint rel = p - ws[j];
             if (p >= ws[j] && rel < cnt[j]) {
-                acc[j] = metal::fma(scores[sbase[j] + rel] * inv[j], v, acc[j]);
+                acc[j] = metal::fma(scores[sbase[j] + rel] * v, inv[j], acc[j]);
             }
         }
     }
@@ -194,7 +194,7 @@ kernel void gemma4_tree_context_hd256_p2(
             if (p >= ws[j] && rel < cnt[j]) {
                 const uint physical = tree_base + ancestors[node[j] * 8u + p - tree_base];
                 const float v = vbase[physical * position_stride];
-                acc[j] = metal::fma(scores[sbase[j] + rel] * inv[j], v, acc[j]);
+                acc[j] = metal::fma(scores[sbase[j] + rel] * v, inv[j], acc[j]);
             }
         }
     }
