@@ -926,6 +926,78 @@ mod tests {
     }
 
     #[test]
+    fn tree_menu_reproduces_the_legacy_row_order_and_fork_topology() {
+        // The menu's 4+1+2 must be the SAME physical tree the qualified V3
+        // proposal emits, node for node, or the two lanes are not comparable.
+        let gated = menu::gate_topologies();
+        for step in 0..PRIMARY {
+            let (parents, depths, primary_rows) = topology(Some(step));
+            if step < menu::ALT_STEPS {
+                let plan = menu::layout(menu::Shape::P4A1C2, &[step]).unwrap();
+                assert_eq!(plan.parents, parents, "fork {step} parents");
+                assert_eq!(plan.depths, depths, "fork {step} depths");
+                assert_eq!(plan.primary_rows, primary_rows, "fork {step} primary rows");
+                assert_eq!(plan.fork_forwards, vec![step]);
+                assert_eq!(plan.runner_up_write, Some((menu::runner_up_slot(step), step)));
+            }
+            // Legacy may still fork at the fourth primary, which the menu
+            // itself never does; the gate covers that topology all the same.
+            assert!(
+                gated.iter().any(|(p, d)| *p == parents && *d == depths),
+                "legacy fork {step} is emittable but not gated"
+            );
+        }
+        let (parents, depths, primary_rows) = topology(None);
+        let plan = menu::layout(menu::Shape::Lin7, &[]).unwrap();
+        assert_eq!(plan.parents, parents);
+        assert_eq!(plan.depths, depths);
+        assert_eq!(plan.primary_rows, primary_rows);
+        assert!(plan.runner_up_write.is_none());
+        // The legacy linear fallback encodes exactly these three forwards.
+        assert_eq!(plan.cb2.len(), 3);
+        for (index, spec) in plan.cb2.iter().enumerate() {
+            let forward = PRIMARY + index;
+            assert_eq!(spec.history_step, forward);
+            assert_eq!(spec.input_slot, forward);
+            assert_eq!(spec.query_step, forward);
+            assert_eq!(spec.recurrent_slot, forward - 1);
+        }
+    }
+
+    #[test]
+    fn tree_menu_forward_slots_fit_the_resident_chain_scratch() {
+        for shape in menu::Shape::ALL {
+            for steps in menu::alt_step_sets(shape.alts()) {
+                let plan = menu::layout(shape, &steps).unwrap();
+                let forwards = shape.forwards();
+                // The top-2 merge writes output_token[history_step + 1] and
+                // results[history_step]; the CPU owns slots 8 and up only.
+                let gpu_slots: Vec<usize> = (0..forwards).map(|f| f + 1).collect();
+                if let Some((slot, step)) = plan.runner_up_write {
+                    assert_eq!(slot, menu::runner_up_slot(step));
+                    assert!(!gpu_slots.contains(&slot), "{shape} clobbers slot {slot}");
+                    assert!(slot < MTP12_CHAIN_TOKEN_SLOTS);
+                }
+                for spec in &plan.cb2 {
+                    assert!(spec.history_step + 1 < MTP12_CHAIN_TOKEN_SLOTS);
+                    assert!(spec.history_step < MTP12_CHAIN_MAX_DRAFTS);
+                    assert!(
+                        gpu_slots.contains(&spec.input_slot) || spec.input_slot >= 8,
+                        "{shape} reads an unwritten slot {}",
+                        spec.input_slot
+                    );
+                    // The parent's hidden must already exist when this runs.
+                    assert!(spec.recurrent_slot < spec.history_step);
+                    // Chain RoPE tables are written for seven query steps.
+                    assert!(spec.query_step < 7);
+                }
+                let state_bytes = (forwards * 16) as u64;
+                assert!(state_bytes <= (MTP12_CHAIN_MAX_DRAFTS * 16) as u64);
+            }
+        }
+    }
+
+    #[test]
     fn tree_top2_gpu_matches_stable_vocabulary_order() {
         let Some(device) = Device::system_default() else {
             return;

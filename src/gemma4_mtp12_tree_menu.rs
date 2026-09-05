@@ -16,8 +16,9 @@
 //!   top-2 pairs, so the whole decision path is unit-testable without a device.
 //!
 //! Rank-two siblings are only taken from the first `ALT_STEPS` primary
-//! forwards; that bound is what keeps `gate_topologies()` at eighteen entries
-//! instead of several dozen.
+//! forwards; that bound is what keeps `gate_topologies()` at seventeen entries
+//! instead of the thirty-five a free fork step would produce, which is what
+//! keeps the model-level gate affordable per build cycle.
 
 use std::fmt;
 
@@ -81,7 +82,7 @@ impl Shape {
     }
 
     /// Length of the top-1 chain rooted at the anchor, excluding the anchor.
-    fn chain(self) -> usize {
+    pub(crate) fn chain(self) -> usize {
         match self {
             Shape::Lin7 => 7,
             Shape::P6A1 => 6,
@@ -91,7 +92,7 @@ impl Shape {
     }
 
     /// Rank-two siblings kept, all of them children of chain nodes 0..3.
-    fn alts(self) -> usize {
+    pub(crate) fn alts(self) -> usize {
         match self {
             Shape::Lin7 => 0,
             Shape::P6A1 | Shape::P5A1C1 | Shape::P4A1C2 => 1,
@@ -101,7 +102,7 @@ impl Shape {
     }
 
     /// Nodes chained behind the expanded sibling.
-    fn continuations(self) -> usize {
+    pub(crate) fn continuations(self) -> usize {
         match self {
             Shape::P4A1C2 => 2,
             Shape::P5A1C1 | Shape::P4A2C1 => 1,

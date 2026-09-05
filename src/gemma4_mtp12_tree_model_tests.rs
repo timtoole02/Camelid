@@ -170,21 +170,34 @@ fn target_tree_w8_model_paths_logits_kv_and_compaction_are_bit_exact() {
     assert_eq!(tokens.len(), 8);
     let started = std::time::Instant::now();
     let mut node_checks = 0;
-    for base in [529, 1023, 1024, 1025] {
+    // Exactly the topologies the draft policy can emit, in the same order the
+    // menu enumerates them: the four legacy fork steps first, then every
+    // named shape the dyn/fixed selectors can produce. The runtime's finalize
+    // is shape preserving, so this enumeration IS the emittable set.
+    let mut shapes: Vec<(Vec<i32>, Vec<u32>)> = crate::gemma4_mtp12_tree_menu::gate_topologies();
+    // Interleave independent branches in physical storage. No policy emits
+    // this one; it stays as an extra generality proof for the verifier.
+    shapes.push((vec![-1, 0, 0, 1, 2, 3, 4, 5], vec![0, 1, 1, 2, 2, 3, 3, 4]));
+    // Two bases per build cycle. Run all four, which adds the sliding-window
+    // boundary, once for the finally adopted policy before qualification:
+    // CAMELID_GEMMA4_TREE_GATE_ALL_BASES=1.
+    let bases: Vec<usize> =
+        if std::env::var("CAMELID_GEMMA4_TREE_GATE_ALL_BASES").as_deref() == Ok("1") {
+            vec![529, 1023, 1024, 1025]
+        } else {
+            vec![529, 1024]
+        };
+    eprintln!(
+        "[tree-model] {} topologies x {} bases = {} node comparisons",
+        shapes.len(),
+        bases.len(),
+        shapes.len() * bases.len() * 8
+    );
+    for base in bases {
         prepare_prefix(&runtime, prompt, &prompt_ids, base);
         // Also check prefix guard rows before/after every tentative comparison.
         let guard_positions = [0, base.saturating_sub(1024), base - 1];
         let guard = kv_rows(&runtime, &guard_positions);
-        let mut shapes: Vec<(Vec<i32>, Vec<u32>)> = (0..4)
-            .map(|step| {
-                (
-                    vec![-1, 0, 1, 2, 3, step as i32, 5, 6],
-                    vec![0, 1, 2, 3, 4, step + 1, step + 2, step + 3],
-                )
-            })
-            .collect();
-        // Interleave independent branches in physical storage.
-        shapes.push((vec![-1, 0, 0, 1, 2, 3, 4, 5], vec![0, 1, 1, 2, 2, 3, 3, 4]));
         for (shape, (parents, depths)) in shapes.iter().enumerate() {
             poison_tentative_rows(&runtime, base);
             let tree = runtime
@@ -330,9 +343,16 @@ fn target_tree_w8_model_paths_logits_kv_and_compaction_are_bit_exact() {
             "post-compaction K1 all-layer KV"
         );
         runtime.rollback_verifier_batch(next_tree.ticket).unwrap();
-        eprintln!("[tree-model] base={base}: all five shapes, sibling isolation and compacted continuation EXACT");
+        eprintln!(
+            "[tree-model] base={base}: all {} topologies, sibling isolation and compacted continuation EXACT ({:?} elapsed)",
+            shapes.len(),
+            started.elapsed()
+        );
     }
-    eprintln!("[tree-model] qualified {node_checks} node comparisons, 4 compacted K1 continuations in {:?}", started.elapsed());
+    eprintln!(
+        "[tree-model] qualified {node_checks} node comparisons and one compacted K1 continuation per base in {:?}",
+        started.elapsed()
+    );
 }
 
 /// One verify call shape for the fused-glue A/B: a linear K-row batch or one
