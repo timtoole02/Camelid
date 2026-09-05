@@ -976,42 +976,181 @@ kernel void q6k_spec50_argmax_rows(
 }
 "#;
 
-/// Vocab rows each simdgroup owns; mirrors `SPEC50_ROWS_PER_SG` in the shader.
-/// One threadgroup covers `SPEC50_SG_PER_TG * this` rows. These five constants
-/// are prepended to the shader source at compile time, so the host-side grid and
-/// the kernel geometry cannot drift apart.
-pub(crate) const SPEC50_ROWS_PER_SG: usize = 8;
+/// One lane geometry of the SPEC50 head. The five values are prepended to the
+/// shader source as `#define`s at compile time AND drive the host-side grid, so
+/// the two cannot drift apart. None of them changes the arithmetic (see the
+/// module comment: the per-lane unit partition, the fold order and the
+/// accumulate expression are all held fixed), which is exactly why they may be
+/// swept and selected at run time; every geometry still has to pass the
+/// bit-exact gates (`spec50_batch_is_bitwise_identical_*`) before it is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Spec50Geometry {
+    pub(crate) name: &'static str,
+    /// Vocab rows each simdgroup owns; mirrors `SPEC50_ROWS_PER_SG`. One
+    /// threadgroup covers `sg_per_tg * rows_per_sg` rows.
+    pub(crate) rows_per_sg: usize,
+    /// Rows a single flat step handles together; mirrors `SPEC50_ROWS_PER_STEP`.
+    pub(crate) rows_per_step: usize,
+    /// Simdgroups per threadgroup; mirrors `SPEC50_SG_PER_TG`.
+    pub(crate) sg_per_tg: usize,
+    /// Mirrors `SPEC50_FLAT`: 1 = flat (row-group, unit) lane mapping.
+    pub(crate) flat: u32,
+    /// Activation repack format, mirroring `SPEC50_YFMT`: 0 = int8, 1 = f32,
+    /// 2 = f16.
+    pub(crate) yfmt: u32,
+}
 
-/// Rows a single flat step handles together; mirrors `SPEC50_ROWS_PER_STEP`.
-const SPEC50_ROWS_PER_STEP: usize = 1;
-
-/// Mirrors `SPEC50_FLAT`: 1 = flat (row-group, unit) lane mapping.
-const SPEC50_FLAT: u32 = 1;
-
-/// Simdgroups per threadgroup; mirrors `SPEC50_SG_PER_TG`.
-const SPEC50_SG_PER_TG: usize = 4;
-
-/// Activation repack format, mirroring `SPEC50_YFMT`: 0 = int8, 1 = f32, 2 = f16.
-const SPEC50_YFMT: u32 = 2;
-
-/// Scratch bytes per activation element for `SPEC50_YFMT`.
-const SPEC50_YFMT_STRIDE: usize = match SPEC50_YFMT {
-    1 => 4,
-    2 => 2,
-    _ => 1,
+/// The established geometry, tuned on the 26B head (hidden 2816 = 44 units per
+/// row): eight rows per simdgroup, one row per flat step, four simdgroups per
+/// threadgroup, flat mapping, f16 activations. This is the default and the
+/// only geometry the default path ever compiles.
+pub(crate) const SPEC50_GEOMETRY_DEFAULT: Spec50Geometry = Spec50Geometry {
+    name: "26b",
+    rows_per_sg: 8,
+    rows_per_step: 1,
+    sg_per_tg: 4,
+    flat: 1,
+    yfmt: 2,
 };
 
-/// Name of the repack kernel matching `SPEC50_YFMT`.
-const SPEC50_EXPAND_KERNEL: &str = match SPEC50_YFMT {
-    1 => "q6k_spec50_expand_f32",
-    2 => "q6k_spec50_expand_f16",
-    _ => "q6k_spec50_expand",
-};
+/// Geometries selectable by name through `CAMELID_GEMMA4_SPEC50_GEOMETRY`.
+/// `12b` is the winner of `spec50_sweep_geometry_12b` on the 12B head
+/// (hidden 3840 = 60 units per row, 15 superblocks). The generic form
+/// `rb<R>-rg<G>-sg<S>-flat<F>-y<Y>` (for example `rb8-rg2-sg4-flat1-y2`) is
+/// accepted as well, so a sweep candidate can be driven in situ without a
+/// rebuild.
+const SPEC50_NAMED_GEOMETRIES: &[Spec50Geometry] = &[
+    SPEC50_GEOMETRY_DEFAULT,
+    Spec50Geometry {
+        name: "12b",
+        rows_per_sg: 8,
+        rows_per_step: 2,
+        sg_per_tg: 4,
+        flat: 1,
+        yfmt: 2,
+    },
+];
+
+impl Spec50Geometry {
+    /// Vocab rows one threadgroup covers.
+    pub(crate) fn rows_per_tg(&self) -> usize {
+        self.sg_per_tg * self.rows_per_sg
+    }
+
+    /// Threads per threadgroup (32-lane simdgroups).
+    pub(crate) fn threads_per_tg(&self) -> usize {
+        32 * self.sg_per_tg
+    }
+
+    /// Name of the repack kernel matching `yfmt`.
+    fn expand_kernel(&self) -> &'static str {
+        match self.yfmt {
+            1 => "q6k_spec50_expand_f32",
+            2 => "q6k_spec50_expand_f16",
+            _ => "q6k_spec50_expand",
+        }
+    }
+
+    /// The `#define` prologue prepended to `SPEC50_HEAD_SHADER`.
+    fn shader_defines(&self) -> String {
+        format!(
+            "#define SPEC50_ROWS_PER_SG {}\n\
+             #define SPEC50_ROWS_PER_STEP {}\n\
+             #define SPEC50_FLAT {}\n\
+             #define SPEC50_SG_PER_TG {}\n\
+             #define SPEC50_YFMT {}\n",
+            self.rows_per_sg, self.rows_per_step, self.flat, self.sg_per_tg, self.yfmt
+        )
+    }
+
+    /// Shapes the shader templates can be instantiated with: `rows_per_step`
+    /// must divide `rows_per_sg`, a threadgroup must fit Metal's 1024 threads.
+    fn admitted(&self) -> bool {
+        (1..=32).contains(&self.rows_per_sg)
+            && self.rows_per_step >= 1
+            && self.rows_per_sg.is_multiple_of(self.rows_per_step)
+            && (1..=32).contains(&self.sg_per_tg)
+            && self.flat <= 1
+            && self.yfmt <= 2
+    }
+
+    /// Parse a selector: a name from [`SPEC50_NAMED_GEOMETRIES`] or the generic
+    /// `rb<R>-rg<G>-sg<S>-flat<F>-y<Y>` form (every field required).
+    pub(crate) fn parse(spec: &str) -> Option<Self> {
+        let spec = spec.trim();
+        if let Some(named) = SPEC50_NAMED_GEOMETRIES
+            .iter()
+            .find(|geometry| geometry.name.eq_ignore_ascii_case(spec))
+        {
+            return Some(*named);
+        }
+        let mut geometry = Spec50Geometry {
+            name: "custom",
+            rows_per_sg: 0,
+            rows_per_step: 0,
+            sg_per_tg: 0,
+            flat: u32::MAX,
+            yfmt: u32::MAX,
+        };
+        for field in spec.split('-') {
+            let (prefix, digits) = field.split_at(field.find(|c: char| c.is_ascii_digit())?);
+            let value: usize = digits.parse().ok()?;
+            match prefix {
+                "rb" => geometry.rows_per_sg = value,
+                "rg" => geometry.rows_per_step = value,
+                "sg" => geometry.sg_per_tg = value,
+                "flat" => geometry.flat = u32::try_from(value).ok()?,
+                "y" => geometry.yfmt = u32::try_from(value).ok()?,
+                _ => return None,
+            }
+        }
+        (geometry.flat != u32::MAX && geometry.yfmt != u32::MAX && geometry.admitted())
+            .then_some(geometry)
+    }
+}
+
+/// The geometry the process compiles the SPEC50 head with: the default unless
+/// `CAMELID_GEMMA4_SPEC50_GEOMETRY` names an admitted one. Read once; the
+/// pipelines are compiled once, so a later change of the variable is ignored.
+pub(crate) fn spec50_selected_geometry() -> Spec50Geometry {
+    static SELECTED: OnceLock<Spec50Geometry> = OnceLock::new();
+    *SELECTED.get_or_init(|| {
+        let Some(spec) = std::env::var("CAMELID_GEMMA4_SPEC50_GEOMETRY")
+            .ok()
+            .filter(|spec| !spec.trim().is_empty())
+        else {
+            return SPEC50_GEOMETRY_DEFAULT;
+        };
+        match Spec50Geometry::parse(&spec) {
+            Some(geometry) => {
+                eprintln!(
+                    "[metal] spec50 head geometry {:?}: rb{} rg{} sg{} flat{} y{}",
+                    geometry.name,
+                    geometry.rows_per_sg,
+                    geometry.rows_per_step,
+                    geometry.sg_per_tg,
+                    geometry.flat,
+                    geometry.yfmt,
+                );
+                geometry
+            }
+            None => {
+                eprintln!(
+                    "[metal] CAMELID_GEMMA4_SPEC50_GEOMETRY={spec:?} is not admitted; keeping {:?}",
+                    SPEC50_GEOMETRY_DEFAULT.name
+                );
+                SPEC50_GEOMETRY_DEFAULT
+            }
+        }
+    })
+}
 
 /// Compiled pipelines for the speculative Q6_K tied head.
 pub(crate) struct Spec50HeadKernels {
     pub(crate) device: Device,
     pub(crate) queue: CommandQueue,
+    /// Geometry these pipelines were compiled with; the encode grid follows it.
+    pub(crate) geometry: Spec50Geometry,
     /// Index `k - 1` for `k` in `1..=8`.
     batch: [ComputePipelineState; 8],
     expand: ComputePipelineState,
@@ -1026,18 +1165,13 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
     SPEC50_HEAD_KERNELS
         .get_or_init(|| {
             let device = Device::system_default()?;
+            let geometry = spec50_selected_geometry();
             // Same options as STRICT_Q8K_SHADER, which owns the kernels this
             // replaces: fast math off, so the surviving float expressions and
             // the softcap `tanh` compile identically.
             let options = CompileOptions::new();
             options.set_fast_math_enabled(false);
-            let source = format!(
-                "#define SPEC50_ROWS_PER_SG {SPEC50_ROWS_PER_SG}\n\
-                 #define SPEC50_ROWS_PER_STEP {SPEC50_ROWS_PER_STEP}\n\
-                 #define SPEC50_FLAT {SPEC50_FLAT}\n\
-                 #define SPEC50_SG_PER_TG {SPEC50_SG_PER_TG}\n\
-                 #define SPEC50_YFMT {SPEC50_YFMT}\n{SPEC50_HEAD_SHADER}"
-            );
+            let source = format!("{}{SPEC50_HEAD_SHADER}", geometry.shader_defines());
             let library = device
                 .new_library_with_source(&source, &options)
                 .map_err(|err| eprintln!("[metal] SPEC50_HEAD_SHADER compile failed: {err}"))
@@ -1060,14 +1194,14 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
             // The lane -> unit partition this kernel inherits is only correct on
             // a 32-wide simdgroup, exactly like `admitted_32_lane_pipeline`.
             if batch.iter().any(|p| p.thread_execution_width() != 32)
-                || batch
-                    .iter()
-                    .any(|p| p.max_total_threads_per_threadgroup() < 32 * SPEC50_SG_PER_TG as u64)
+                || batch.iter().any(|p| {
+                    p.max_total_threads_per_threadgroup() < geometry.threads_per_tg() as u64
+                })
             {
                 eprintln!("[metal] spec50 head: simd width or threadgroup size not admitted");
                 return None;
             }
-            let expand = pipeline(SPEC50_EXPAND_KERNEL)?;
+            let expand = pipeline(geometry.expand_kernel())?;
             let argmax = pipeline("q6k_spec50_argmax_rows")?;
             if argmax.max_total_threads_per_threadgroup() < 1024 {
                 eprintln!("[metal] spec50 head: argmax threadgroup < 1024");
@@ -1077,6 +1211,7 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
             Some(Spec50HeadKernels {
                 device,
                 queue,
+                geometry,
                 batch,
                 expand,
                 argmax,
@@ -1086,11 +1221,13 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
 }
 
 /// Bytes the integrator must allocate for the one new buffer, `activation_perm`:
-/// a coalescing-friendly repack of the Q8_K activation quants, `max_k * hidden`
-/// bytes (45 KB at the 26B row's `max_k = 16`, `hidden = 2816`). Shared storage,
-/// written GPU-side by `q6k_spec50_expand` at the head of every encode.
+/// a coalescing-friendly repack of the Q8_K activation quants. Sized for the
+/// widest repack format (f32, 4 bytes per element: 180 KB at the 26B row's
+/// `max_k = 16`, `hidden = 2816`) so one allocation serves every selectable
+/// geometry. Shared storage, written GPU-side by the expand kernel at the head
+/// of every encode.
 pub(crate) fn spec50_activation_scratch_bytes(max_k: usize, hidden: usize) -> usize {
-    max_k * hidden * SPEC50_YFMT_STRIDE
+    max_k * hidden * 4
 }
 
 /// Encode the K<=8 speculative Q6_K tied-head projection.
@@ -1156,12 +1293,12 @@ pub(crate) fn encode_q6k_spec50_batch(
     encoder.set_bytes(6, 4, &softcap as *const f32 as *const _);
     encoder.dispatch_thread_groups(
         metal::MTLSize {
-            width: rows.div_ceil(SPEC50_SG_PER_TG * SPEC50_ROWS_PER_SG) as u64,
+            width: rows.div_ceil(kernels.geometry.rows_per_tg()) as u64,
             height: 1,
             depth: 1,
         },
         metal::MTLSize {
-            width: 32 * SPEC50_SG_PER_TG as u64,
+            width: kernels.geometry.threads_per_tg() as u64,
             height: 1,
             depth: 1,
         },
@@ -1980,6 +2117,356 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Geometry sweep at an arbitrary head width. Every variant is first
+    /// checked bitwise against the reference on a small table (a variant that
+    /// is not exact is reported and NOT timed), then timed on a `rows`-row
+    /// table. Prints GPU ms and effective GB/s per (geometry, K) for `ks`.
+    /// `configs` entries are (rows/sg, rows/step, simdgroups/tg, flat, ablate,
+    /// yfmt), the shader's `#define` order.
+    fn sweep_geometry_at(
+        hidden: usize,
+        rows: usize,
+        reps: usize,
+        ks: &[usize],
+        configs: &[(usize, usize, usize, u32, u32, u32)],
+    ) {
+        let n_sb = hidden / 256;
+        let refs = reference_kernels();
+        let bytes = rows * n_sb * Q6K_WIRE;
+        let wbuf = shared(&refs.device, bytes);
+        {
+            let mut rng = Rng(0x2718_2818_2845_9045);
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), bytes) };
+            for block in dst.chunks_exact_mut(Q6K_WIRE) {
+                fill_q6k_block(&mut rng, block);
+            }
+        }
+        let mut rng = Rng(0x3141_5926_5358_9793);
+        let (scales, quants) = build_activations_for(&mut rng, 8, hidden, n_sb);
+        let sbuf = shared(&refs.device, scales.len() * 4);
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let fbuf = shared(&refs.device, spec50_activation_scratch_bytes(8, hidden));
+        let out = shared(&refs.device, 8 * rows * 4);
+
+        // Small table for the per-variant exactness gate.
+        const SROWS: usize = 1024;
+        let mut srng = Rng(0x0f0f_1234_5678_9abc);
+        let sweights = build_weights_for(&mut srng, SROWS, n_sb);
+        let swbuf = shared(&refs.device, sweights.len());
+        write_buffer_u8(&swbuf, &sweights);
+        let sout_ref = shared(&refs.device, 8 * SROWS * 4);
+        let sout_new = shared(&refs.device, 8 * SROWS * 4);
+
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
+        eprintln!(
+            "[spec50] sweep hidden={hidden} n_sb={n_sb} rows={rows} table={:.1} MB reps={reps}",
+            bytes as f64 / 1.0e6
+        );
+        for &(rb, rg, sg, flat, ablate, yfmt) in configs {
+            let src = format!(
+                "#define SPEC50_ROWS_PER_SG {rb}\n#define SPEC50_ROWS_PER_STEP {rg}\n#define SPEC50_SG_PER_TG {sg}\n#define SPEC50_FLAT {flat}\n#define SPEC50_ABLATE {ablate}\n#define SPEC50_YFMT {yfmt}\n{SPEC50_HEAD_SHADER}"
+            );
+            let library = match refs.device.new_library_with_source(&src, &options) {
+                Ok(l) => l,
+                Err(err) => {
+                    eprintln!("[spec50] sweep rb={rb} rg={rg} sg={sg} flat={flat} ablate={ablate} yfmt={yfmt}: compile failed: {err}");
+                    continue;
+                }
+            };
+            let expand = {
+                let name = match yfmt {
+                    1 => "q6k_spec50_expand_f32",
+                    2 => "q6k_spec50_expand_f16",
+                    _ => "q6k_spec50_expand",
+                };
+                let f = library.get_function(name, None).unwrap();
+                refs.device
+                    .new_compute_pipeline_state_with_function(&f)
+                    .unwrap()
+            };
+            for &k in ks {
+                let f = library
+                    .get_function(&format!("q6k_spec50_batch_k{k}"), None)
+                    .unwrap();
+                let pipe = match refs.device.new_compute_pipeline_state_with_function(&f) {
+                    Ok(pipe) => pipe,
+                    Err(err) => {
+                        eprintln!("[spec50] sweep rb={rb} rg={rg} sg={sg} flat={flat} yfmt={yfmt} K={k}: pipeline failed: {err}");
+                        continue;
+                    }
+                };
+                let encode = |e: &metal::ComputeCommandEncoderRef,
+                              w: &Buffer,
+                              o: &Buffer,
+                              n_rows: usize| {
+                    let count = (k * hidden) as u32;
+                    let n_sb_e = n_sb as u32;
+                    let k_e = k as u32;
+                    e.set_compute_pipeline_state(&expand);
+                    e.set_buffer(0, Some(&qbuf), 0);
+                    e.set_buffer(1, Some(&fbuf), 0);
+                    e.set_bytes(2, 4, &n_sb_e as *const u32 as *const _);
+                    e.set_bytes(3, 4, &k_e as *const u32 as *const _);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize { width: (count as u64).div_ceil(256), height: 1, depth: 1 },
+                        metal::MTLSize { width: 256, height: 1, depth: 1 },
+                    );
+                    e.set_compute_pipeline_state(&pipe);
+                    e.set_buffer(0, Some(&sbuf), 0);
+                    e.set_buffer(1, Some(&fbuf), 0);
+                    e.set_buffer(2, Some(w), 0);
+                    e.set_buffer(3, Some(o), 0);
+                    let n_sb_u32 = n_sb as u32;
+                    let rows_u32 = n_rows as u32;
+                    let cap = SOFTCAP;
+                    e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
+                    e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+                    e.set_bytes(6, 4, &cap as *const f32 as *const _);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: n_rows.div_ceil(sg * rb) as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize { width: 32 * sg as u64, height: 1, depth: 1 },
+                    );
+                };
+                // Exactness gate: bitwise against the reference on the small table.
+                let cb = refs.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                encode_reference_n_sb(
+                    e, &refs, &sbuf, &qbuf, &swbuf, &sout_ref, SROWS, n_sb, k, SOFTCAP, false,
+                );
+                encode(e, &swbuf, &sout_new, SROWS);
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let mut a = vec![0f32; k * SROWS];
+                let mut b = vec![0f32; k * SROWS];
+                read_buffer_f32(&sout_ref, &mut a);
+                read_buffer_f32(&sout_new, &mut b);
+                let bad = (0..k * SROWS).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
+                if ablate == 0 && bad != 0 {
+                    eprintln!("[spec50] sweep rb={rb} rg={rg} sg={sg} flat={flat} yfmt={yfmt} K={k}: NOT EXACT ({bad} values differ), not timed");
+                    continue;
+                }
+
+                for pass in 0..2 {
+                    let cb = refs.queue.new_command_buffer();
+                    let e = cb.new_compute_command_encoder();
+                    let n = if pass == 0 { 1 } else { reps };
+                    for _ in 0..n {
+                        encode(e, &wbuf, &out, rows);
+                    }
+                    e.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    if pass == 1 {
+                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                        let ms = gpu_us as f64 / 1000.0 / reps as f64;
+                        eprintln!(
+                            "[spec50] sweep rb={rb} rg={rg} sg={sg} flat={flat} ablate={ablate} yfmt={yfmt} K={k}: {ms:7.2} ms  {:6.1} GB/s  exact",
+                            (bytes as f64 / 1.0e9) / (ms / 1000.0)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 12B geometry sweep: hidden 3840 = 60 units per row (fifteen
+    /// superblocks), the full 262,144-row table (826 MB). Rows-per-simdgroup x
+    /// rows-per-step x simdgroups-per-threadgroup x activation format, plus the
+    /// blocked mapping. Run with `--ignored --nocapture`; the exact-and-fastest
+    /// K=8 line is the `12b` entry of `SPEC50_NAMED_GEOMETRIES`.
+    #[test]
+    #[ignore]
+    fn spec50_sweep_geometry_12b() {
+        const HIDDEN_12B: usize = 3840;
+        let mut configs = Vec::new();
+        // Flat mapping, f16 activations: the main grid.
+        for rb in [4usize, 8] {
+            for rg in [1usize, 2, 4] {
+                for sg in [2usize, 4, 8] {
+                    configs.push((rb, rg, sg, 1u32, 0u32, 2u32));
+                }
+            }
+        }
+        // int8 / f32 activation formats on the middle of the grid.
+        for yfmt in [0u32, 1] {
+            for rb in [4usize, 8] {
+                for rg in [1usize, 2] {
+                    for sg in [2usize, 4] {
+                        configs.push((rb, rg, sg, 1, 0, yfmt));
+                    }
+                }
+            }
+        }
+        // Blocked mapping (60 units over 32 lanes is already 93.75% occupancy).
+        for rb in [4usize, 8] {
+            for sg in [2usize, 4, 8] {
+                configs.push((rb, 1, sg, 0, 0, 2));
+            }
+        }
+        // Wider and narrower row ownership per simdgroup.
+        for rg in [1usize, 2, 4] {
+            for sg in [2usize, 4] {
+                configs.push((16, rg, sg, 1, 0, 2));
+            }
+        }
+        for sg in [4usize, 8] {
+            configs.push((2, 1, sg, 1, 0, 2));
+        }
+        sweep_geometry_at(HIDDEN_12B, 262_144, 10, &[4, 8], &configs);
+    }
+
+    /// 12B-shaped benchmark: the full 262144 x 3840 Q6_K table (826 MB)
+    /// through the reference kernels and the SPEC50 kernels of the SELECTED
+    /// geometry (honours `CAMELID_GEMMA4_SPEC50_GEOMETRY`), with and without
+    /// the row argmax, 20 encodes per measurement. Every SPEC50 output is also
+    /// checked bitwise against the reference on the full table.
+    #[test]
+    #[ignore]
+    fn spec50_bench_full_12b_head() {
+        const HIDDEN_12B: usize = 3840;
+        const N_SB_12B: usize = HIDDEN_12B / 256;
+        const ROWS: usize = 262_144;
+        const REPS: usize = 20;
+        let refs = reference_kernels();
+        let kernels = spec50_head_kernels().expect("spec50 pipelines");
+        let bytes = ROWS * N_SB_12B * Q6K_WIRE;
+        let wbuf = shared(&refs.device, bytes);
+        {
+            let mut rng = Rng(0x2718_2818_2845_9045);
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), bytes) };
+            for block in dst.chunks_exact_mut(Q6K_WIRE) {
+                fill_q6k_block(&mut rng, block);
+            }
+        }
+        let mut rng = Rng(0x3141_5926_5358_9793);
+        let (scales, quants) = build_activations_for(&mut rng, 8, HIDDEN_12B, N_SB_12B);
+        let sbuf = shared(&refs.device, scales.len() * 4);
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let fbuf = shared(&refs.device, spec50_activation_scratch_bytes(8, HIDDEN_12B));
+        let out_ref = shared(&refs.device, 8 * ROWS * 4);
+        let out = shared(&refs.device, 8 * ROWS * 4);
+        let ids = shared(&refs.device, 8 * 4);
+        let vals = shared(&refs.device, 8 * 4);
+
+        let gb = bytes as f64 / 1.0e9;
+        let g = kernels.geometry;
+        eprintln!(
+            "[spec50] 12B head bench: {ROWS} rows x {HIDDEN_12B} Q6_K = {:.1} MB, {REPS} encodes/measure, geometry {:?} rb{} rg{} sg{} flat{} y{}",
+            bytes as f64 / 1.0e6, g.name, g.rows_per_sg, g.rows_per_step, g.sg_per_tg, g.flat, g.yfmt
+        );
+        for &k in &[1usize, 2, 4, 8] {
+            // Full-table exactness of the selected geometry against the reference.
+            {
+                let cb = refs.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                encode_reference_n_sb(
+                    e, &refs, &sbuf, &qbuf, &wbuf, &out_ref, ROWS, N_SB_12B, k, SOFTCAP, k == 1,
+                );
+                assert!(encode_q6k_spec50_batch(
+                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k,
+                    HIDDEN_12B, SOFTCAP,
+                ));
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                let mut a = vec![0f32; k * ROWS];
+                let mut b = vec![0f32; k * ROWS];
+                read_buffer_f32(&out_ref, &mut a);
+                read_buffer_f32(&out, &mut b);
+                let bad = (0..k * ROWS).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
+                assert_eq!(bad, 0, "geometry {:?} K={k}: {bad} logits differ from the reference", g.name);
+            }
+            let run = |label: &str, new: bool, with_argmax: bool| {
+                for pass in 0..2 {
+                    let cb = refs.queue.new_command_buffer();
+                    let e = cb.new_compute_command_encoder();
+                    let reps = if pass == 0 { 1 } else { REPS };
+                    for _ in 0..reps {
+                        if new {
+                            assert!(encode_q6k_spec50_batch(
+                                e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS,
+                                k, HIDDEN_12B, SOFTCAP,
+                            ));
+                            if with_argmax {
+                                encode_q6k_spec50_argmax(e, kernels, &out, &ids, &vals, ROWS, k);
+                            }
+                        } else {
+                            encode_reference_n_sb(
+                                e, &refs, &sbuf, &qbuf, &wbuf, &out, ROWS, N_SB_12B, k, SOFTCAP,
+                                false,
+                            );
+                        }
+                    }
+                    e.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                    if pass == 1 {
+                        let (gpu_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                        let ms = gpu_us as f64 / 1000.0 / REPS as f64;
+                        eprintln!(
+                            "[spec50] 12B K={k} {label:<26} {ms:7.2} ms  {:6.1} GB/s",
+                            gb / (ms / 1000.0)
+                        );
+                    }
+                }
+            };
+            let old_label = if k == 1 {
+                "OLD q6k_linear_turbo"
+            } else if k == 8 {
+                "OLD ..._batch_k8"
+            } else {
+                "OLD ..._batch_k"
+            };
+            run(old_label, false, false);
+            run("NEW q6k_spec50_batch", true, false);
+            run("NEW spec50 + argmax", true, true);
+        }
+    }
+
+    /// The selector parser: names, the generic form, and refusals.
+    #[test]
+    fn spec50_geometry_selector_parses_names_and_generic_form() {
+        assert_eq!(Spec50Geometry::parse("26b"), Some(SPEC50_GEOMETRY_DEFAULT));
+        assert_eq!(Spec50Geometry::parse(" 26B "), Some(SPEC50_GEOMETRY_DEFAULT));
+        let twelve = Spec50Geometry::parse("12b").expect("12b is named");
+        assert!(twelve.admitted());
+        assert_eq!(twelve.name, "12b");
+        let custom = Spec50Geometry::parse("rb8-rg2-sg4-flat1-y2").expect("generic form");
+        assert_eq!(
+            custom,
+            Spec50Geometry { name: "custom", rows_per_sg: 8, rows_per_step: 2, sg_per_tg: 4, flat: 1, yfmt: 2 }
+        );
+        assert_eq!(custom.rows_per_tg(), 32);
+        assert_eq!(custom.threads_per_tg(), 128);
+        // rg must divide rb; every field is required; unknown fields refuse.
+        assert!(Spec50Geometry::parse("rb8-rg3-sg4-flat1-y2").is_none());
+        assert!(Spec50Geometry::parse("rb8-rg1-sg4-flat1").is_none());
+        assert!(Spec50Geometry::parse("rb8-rg1-sg4-flat1-y3").is_none());
+        assert!(Spec50Geometry::parse("rb8-rg1-sg4-flat2-y2").is_none());
+        assert!(Spec50Geometry::parse("rb8-rg1-sg64-flat1-y2").is_none());
+        assert!(Spec50Geometry::parse("zz8-rg1-sg4-flat1-y2").is_none());
+        assert!(Spec50Geometry::parse("").is_none());
+        // The default's defines are the text the established build prepended.
+        assert_eq!(
+            SPEC50_GEOMETRY_DEFAULT.shader_defines(),
+            "#define SPEC50_ROWS_PER_SG 8\n#define SPEC50_ROWS_PER_STEP 1\n#define SPEC50_FLAT 1\n#define SPEC50_SG_PER_TG 4\n#define SPEC50_YFMT 2\n"
+        );
     }
 
     /// 26B-shaped benchmark: the full 262144 x 2816 Q6_K table, 30 encodes of
