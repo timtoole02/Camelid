@@ -8415,6 +8415,247 @@ mod tests {
         }
     }
 
+
+    /// One attention dispatch, bound exactly as `encode_attention_impl_ex`
+    /// binds it.  The bench needs the phases separately, so the bindings are
+    /// mirrored here; any binding change must be mirrored back.
+    #[derive(Clone, Copy, Debug)]
+    enum AttentionPhase {
+        Scores { v2: bool },
+        Softmax,
+        SoftmaxStats,
+        /// `mtp12_attention_context_v2`, `_softmax_context_v2`,
+        /// `_context_v2_stats16` or `_context_v2_stats4`.
+        Context { softmax_ctx: u8 },
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bench_encode_attention_phase(
+        encoder: &metal::ComputeCommandEncoderRef,
+        pipelines: &Mtp12Pipelines,
+        phase: AttentionPhase,
+        query: &Buffer,
+        key: &Buffer,
+        value: &Buffer,
+        scores: &Buffer,
+        output: &Buffer,
+        stats: &Buffer,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        position_count: usize,
+    ) {
+        let n_heads = N_HEADS as u32;
+        let head_dim_u32 = head_dim as u32;
+        let position_count_u32 = position_count as u32;
+        let group = (N_HEADS / kv_heads) as u32;
+        let position_stride = head_dim_u32;
+        let kv_head_stride = (capacity * head_dim) as u32;
+        let kv_base_offset = 0u32;
+        let compact_base = 0u32;
+        let logical_len = position_count_u32;
+        let tg32 = MTLSize { width: 32, height: 1, depth: 1 };
+        match phase {
+            AttentionPhase::Scores { v2 } => {
+                encoder.set_compute_pipeline_state(if v2 {
+                    &pipelines.attention_scores_v2
+                } else {
+                    &pipelines.attention_scores
+                });
+                encoder.set_buffer(0, Some(query), 0);
+                encoder.set_buffer(1, Some(key), 0);
+                encoder.set_buffer(2, Some(scores), 0);
+                encoder.set_bytes(3, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(4, 4, &head_dim_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(5, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(6, 4, &group as *const u32 as *const c_void);
+                encoder.set_bytes(7, 4, &position_stride as *const u32 as *const c_void);
+                encoder.set_bytes(8, 4, &kv_head_stride as *const u32 as *const c_void);
+                encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
+                encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: N_HEADS as u64,
+                        height: if v2 { position_count.div_ceil(32) as u64 } else { 1 },
+                        depth: 1,
+                    },
+                    tg32,
+                );
+            }
+            AttentionPhase::Softmax => {
+                encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
+                encoder.set_buffer(0, Some(scores), 0);
+                encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.dispatch_thread_groups(
+                    MTLSize { width: N_HEADS as u64, height: 1, depth: 1 },
+                    tg32,
+                );
+            }
+            AttentionPhase::SoftmaxStats => {
+                encoder.set_compute_pipeline_state(&pipelines.attention_softmax_stats);
+                encoder.set_buffer(0, Some(scores), 0);
+                encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_buffer(3, Some(stats), 0);
+                encoder.dispatch_thread_groups(
+                    MTLSize { width: N_HEADS as u64, height: 1, depth: 1 },
+                    tg32,
+                );
+            }
+            AttentionPhase::Context { softmax_ctx } => {
+                encoder.set_compute_pipeline_state(match softmax_ctx {
+                    1 => &pipelines.attention_softmax_context_v2,
+                    2 => &pipelines.attention_context_v2_stats16,
+                    3 => &pipelines.attention_context_v2_stats4,
+                    _ => &pipelines.attention_context_v2,
+                });
+                encoder.set_buffer(0, Some(value), 0);
+                encoder.set_buffer(1, Some(scores), 0);
+                encoder.set_buffer(2, Some(output), 0);
+                encoder.set_bytes(3, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(4, 4, &head_dim_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(5, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(6, 4, &group as *const u32 as *const c_void);
+                encoder.set_bytes(7, 4, &position_stride as *const u32 as *const c_void);
+                encoder.set_bytes(8, 4, &kv_head_stride as *const u32 as *const c_void);
+                encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
+                encoder.set_bytes(10, 4, &compact_base as *const u32 as *const c_void);
+                encoder.set_bytes(11, 4, &logical_len as *const u32 as *const c_void);
+                if softmax_ctx >= 2 {
+                    encoder.set_buffer(12, Some(stats), 0);
+                }
+                encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: N_HEADS as u64,
+                        height: (head_dim / 128) as u64,
+                        depth: 1,
+                    },
+                    tg32,
+                );
+            }
+        }
+    }
+
+    /// Per-kernel GPU cost of the assistant's attention phases on both 12B head
+    /// shapes at the tree lane's production prefixes: the established
+    /// softmax + `context_v2` pair against the fused `softmax_context_v2` and
+    /// against the stats pre-pass + stats-fed context at both load depths.
+    /// Prefix lengths come from `CAMELID_MTP12_BENCH_PREFIX` (default
+    /// "620,1500"); every prefix is measured with `compact_base` 0, so
+    /// `position_count` is the prefix itself.
+    ///
+    /// Invoke (release, on the rig):
+    ///   cargo test --release --lib assistant_attention_kernel_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn assistant_attention_kernel_bench() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping assistant attention bench");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const REPS: usize = 20;
+        const BUFFERS: usize = 5;
+        let median = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
+            let mut samples = Vec::with_capacity(BUFFERS);
+            for pass in 0..=BUFFERS {
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                for _ in 0..REPS {
+                    encode(encoder);
+                }
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                if pass > 0 {
+                    let (us, _) = super::super::command_buffer_gpu_times_us(&cb.to_owned());
+                    samples.push(us as f64 / REPS as f64);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+        let prefixes: Vec<usize> = std::env::var("CAMELID_MTP12_BENCH_PREFIX")
+            .unwrap_or_else(|_| "620,1500".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.parse::<usize>().expect("prefix must be an integer"))
+            .collect();
+        eprintln!(
+            "[mtp12-attn-bench] {REPS} encodes/buffer, median of {BUFFERS} buffers, compact_base 0"
+        );
+        for (index, &(kv_heads, head_dim)) in
+            [(LOCAL_KV_HEADS, LOCAL_HEAD_DIM), (FULL_KV_HEADS, FULL_HEAD_DIM)].iter().enumerate()
+        {
+            for &position_count in &prefixes {
+                let capacity = position_count;
+                let (query, keys, values) =
+                    mtp12_attention_fixture(kv_heads, head_dim, capacity, 900 + index as u64);
+                let query = f32_buffer(&device, &query).unwrap();
+                let keys = f32_buffer(&device, &keys).unwrap();
+                let values = f32_buffer(&device, &values).unwrap();
+                let scores = shared_buffer(&device, N_HEADS * position_count * 4);
+                let output = shared_buffer(&device, N_HEADS * head_dim * 4);
+                let stats = shared_buffer(&device, N_HEADS * 2 * 4);
+                let run = |phases: &[AttentionPhase]| -> f64 {
+                    median(&|encoder| {
+                        for &phase in phases {
+                            bench_encode_attention_phase(
+                                encoder, &pipelines, phase, &query, &keys, &values, &scores,
+                                &output, &stats, kv_heads, head_dim, capacity, position_count,
+                            );
+                        }
+                    })
+                };
+                let group = N_HEADS / kv_heads;
+                eprintln!(
+                    "[mtp12-attn-bench] ---- HD{head_dim} ({kv_heads} KV heads, group {group}), \
+                     prefix {position_count} ----"
+                );
+                let scores_v2 = run(&[AttentionPhase::Scores { v2: true }]);
+                let softmax = run(&[AttentionPhase::Softmax]);
+                let stats_pass = run(&[AttentionPhase::SoftmaxStats]);
+                let context_v2 = run(&[AttentionPhase::Context { softmax_ctx: 0 }]);
+                let fused = run(&[AttentionPhase::Context { softmax_ctx: 1 }]);
+                let ctx16 = run(&[AttentionPhase::Context { softmax_ctx: 2 }]);
+                let ctx4 = run(&[AttentionPhase::Context { softmax_ctx: 3 }]);
+                for (label, us) in [
+                    ("scores_v2", scores_v2),
+                    ("softmax", softmax),
+                    ("softmax_stats", stats_pass),
+                    ("context_v2", context_v2),
+                    ("softmax_context_v2 (fused)", fused),
+                    ("context_v2_stats16", ctx16),
+                    ("context_v2_stats4", ctx4),
+                ] {
+                    eprintln!("[mtp12-attn-bench]   kernel {label:<28} {us:8.1} us");
+                }
+                let pair = softmax + context_v2;
+                for (label, us) in [
+                    ("softmax + context_v2 (level 0)", pair),
+                    ("softmax_context_v2 (level 1)", fused),
+                    ("stats + context_v2_stats16 (level 2)", stats_pass + ctx16),
+                    ("stats + context_v2_stats4 (level 3)", stats_pass + ctx4),
+                ] {
+                    eprintln!(
+                        "[mtp12-attn-bench]   phase  {label:<38} {us:8.1} us  {:+6.1}% vs pair",
+                        (us - pair) * 100.0 / pair
+                    );
+                }
+                eprintln!(
+                    "[mtp12-attn-bench]   whole  {:<38} {:8.1} us",
+                    "scores_v2 + best phase",
+                    scores_v2 + [pair, fused, stats_pass + ctx16, stats_pass + ctx4]
+                        .into_iter()
+                        .fold(f64::INFINITY, f64::min)
+                );
+            }
+        }
+    }
+
     #[test]
     fn production_mtp12_shader_compiles() {
         let Some(device) = Device::system_default() else {
