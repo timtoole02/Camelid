@@ -4070,7 +4070,7 @@ kernel void q4_0_q8_ordered_columns_mma_stage16_fm(
 // One V2 batch: N consecutive blocks for TILES eight-row tiles and GROUPS
 // eight-column groups. All loads of the batch are issued before its MMAs;
 // the fold then visits the N blocks in increasing order per cell.
-template <uint TILES, uint N, uint GROUPS, bool FM>
+template <uint TILES, uint N, uint GROUPS, bool FM, bool HALF_BITS>
 inline void q4_0_q8_native_register_v2_blocks(
     device const float* input_scales,
     device const uchar* native_weight_bytes,
@@ -4175,12 +4175,25 @@ inline void q4_0_q8_native_register_v2_blocks(
                 const uchar2 packed = (k_tile & 1u) == 0u
                     ? packed_first[u][t]
                     : packed_second[u][t];
-                weights[t].thread_elements()[0] = high_nibble
-                    ? half(int(packed.x >> 4) - 8)
-                    : half(int(packed.x & 0x0fu) - 8);
-                weights[t].thread_elements()[1] = high_nibble
-                    ? half(int(packed.y >> 4) - 8)
-                    : half(int(packed.y & 0x0fu) - 8);
+                if (HALF_BITS) {
+                    // 0x6400 | n is the exact half 1024 + n, n in 0..15.
+                    // Subtracting the exact half 1032 produces n - 8,
+                    // including +0 at n=8, without an integer-to-half convert.
+                    // The MMA integer dots and ordered f32 fold are unchanged.
+                    weights[t].thread_elements()[0] = high_nibble
+                        ? (as_type<half>(ushort(0x6400u | (packed.x >> 4))) - half(1032.0f))
+                        : (as_type<half>(ushort(0x6400u | (packed.x & 0x0fu))) - half(1032.0f));
+                    weights[t].thread_elements()[1] = high_nibble
+                        ? (as_type<half>(ushort(0x6400u | (packed.y >> 4))) - half(1032.0f))
+                        : (as_type<half>(ushort(0x6400u | (packed.y & 0x0fu))) - half(1032.0f));
+                } else {
+                    weights[t].thread_elements()[0] = high_nibble
+                        ? half(int(packed.x >> 4) - 8)
+                        : half(int(packed.x & 0x0fu) - 8);
+                    weights[t].thread_elements()[1] = high_nibble
+                        ? half(int(packed.y >> 4) - 8)
+                        : half(int(packed.y & 0x0fu) - 8);
+                }
             }
             simdgroup_half8x8 activations[GROUPS];
 #pragma clang loop unroll(full)
@@ -4222,7 +4235,7 @@ inline void q4_0_q8_native_register_v2_blocks(
     }
 }
 
-template <uint TILES, uint UNROLL, uint GROUPS, bool FM>
+template <uint TILES, uint UNROLL, uint GROUPS, bool FM, bool HALF_BITS>
 inline void q4_0_q8_native_register_v2_body(
     device const float* input_scales,
     device const uchar* native_weight_bytes,
@@ -4249,12 +4262,12 @@ inline void q4_0_q8_native_register_v2_body(
     }
     uint block_index = 0u;
     for (; block_index + UNROLL <= blocks_per_row; block_index += UNROLL) {
-        q4_0_q8_native_register_v2_blocks<TILES, UNROLL, GROUPS, FM>(
+        q4_0_q8_native_register_v2_blocks<TILES, UNROLL, GROUPS, FM, HALF_BITS>(
             input_scales, native_weight_bytes, staged_quants, tile0, last_tile,
             blocks_per_row, columns, block_index, lane, accum);
     }
     for (; block_index < blocks_per_row; ++block_index) {
-        q4_0_q8_native_register_v2_blocks<TILES, 1u, GROUPS, FM>(
+        q4_0_q8_native_register_v2_blocks<TILES, 1u, GROUPS, FM, HALF_BITS>(
             input_scales, native_weight_bytes, staged_quants, tile0, last_tile,
             blocks_per_row, columns, block_index, lane, accum);
     }
@@ -4279,7 +4292,7 @@ inline void q4_0_q8_native_register_v2_body(
 
 // Named V2 entry points. A threadgroup may carry several simdgroups; each
 // simdgroup still owns its own TILES consecutive eight-row tiles.
-#define Q4_NATIVE_V2_KERNEL(NAME, TILES, UNROLL, GROUPS, FM)                 \
+#define Q4_NATIVE_V2_KERNEL(NAME, TILES, UNROLL, GROUPS, FM, HALF_BITS)                 \
 kernel void NAME(                                                            \
     device const float* input_scales [[buffer(0)]],                          \
     device const uchar* native_weight_bytes [[buffer(2)]],                   \
@@ -4293,22 +4306,24 @@ kernel void NAME(                                                            \
     uint sgs [[simdgroups_per_threadgroup]],                                 \
     uint lane [[thread_index_in_simdgroup]]                                  \
 ) {                                                                          \
-    q4_0_q8_native_register_v2_body<TILES, UNROLL, GROUPS, FM>(              \
+    q4_0_q8_native_register_v2_body<TILES, UNROLL, GROUPS, FM, HALF_BITS>(              \
         input_scales, native_weight_bytes, output, blocks_per_row, rows,     \
         columns, staged_quants, (tg * sgs + sg) * TILES, lane);              \
 }
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u2, 1u, 2u, 1u, false)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u4, 1u, 4u, 1u, false)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u1, 1u, 1u, 1u, true)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u4, 1u, 4u, 1u, true)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_t2_u2, 2u, 2u, 1u, true)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_t2_u4, 2u, 4u, 1u, true)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u2, 1u, 2u, 2u, false)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u4, 1u, 4u, 2u, false)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u1, 1u, 1u, 2u, true)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u4, 1u, 4u, 2u, true)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_t2_u2, 2u, 2u, 2u, true)
-Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_t2_u4, 2u, 4u, 2u, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u2, 1u, 2u, 1u, false, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u4, 1u, 4u, 1u, false, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u1, 1u, 1u, 1u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u4, 1u, 4u, 1u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_t2_u2, 2u, 2u, 1u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_t2_u4, 2u, 4u, 1u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u2, 1u, 2u, 2u, false, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u4, 1u, 4u, 2u, false, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u1, 1u, 1u, 2u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u4, 1u, 4u, 2u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_t2_u2, 2u, 2u, 2u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_t2_u4, 2u, 4u, 2u, true, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_bits_u4, 1u, 4u, 1u, true, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_bits_u4, 1u, 4u, 2u, true, true)
 #undef Q4_NATIVE_V2_KERNEL
 
 // Native-plane adaptation of the exact register-fed B kernel. Each lane loads
@@ -15255,6 +15270,7 @@ pub(crate) const GEMMA4_Q4_NATIVE_V2_VARIANTS: &[Gemma4Q4NativeV2Variant] = &[
     Gemma4Q4NativeV2Variant { name: "u4", tiles: 1, fragment_major: false },
     Gemma4Q4NativeV2Variant { name: "fm_u1", tiles: 1, fragment_major: true },
     Gemma4Q4NativeV2Variant { name: "fm_u4", tiles: 1, fragment_major: true },
+    Gemma4Q4NativeV2Variant { name: "fm_bits_u4", tiles: 1, fragment_major: true },
     Gemma4Q4NativeV2Variant { name: "fm_t2_u2", tiles: 2, fragment_major: true },
     Gemma4Q4NativeV2Variant { name: "fm_t2_u4", tiles: 2, fragment_major: true },
 ];
@@ -48043,7 +48059,8 @@ mod tests {
             -17.0,
             2_048.0,
         ];
-        let packed_patterns = [0x00u8, 0xff, 0x08, 0x80, 0x17, 0x71, 0x3c, 0xc3, 0x5a, 0xa5];
+        // Exercise every low/high nibble pair, including exact zero (8).
+        let packed_patterns: [u8; 256] = std::array::from_fn(|index| index as u8);
 
         for &(blocks_per_row, rows, label) in &[
             (1usize, 9usize, "edge-1-ragged"),
