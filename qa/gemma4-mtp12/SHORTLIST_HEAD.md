@@ -19,8 +19,9 @@ acceptance must be measured on the actual target workload before enabling it.
 The earlier single-assignment clustering experiment attained only 94.8%
 recall at top128. The existing overlapping top3 sidecar changes that tradeoff:
 on the saved 1,587 W8 draft queries, top128 recall is 98.74% and top192 is
-99.18%. These are offline draft recall figures, not a generation acceptance
-or throughput claim.
+99.18%. The production Metal centroid kernel reproduced these recall figures on all
+1,587 saved queries (top128: 20 misses; top192: 13; top256: 9). These are
+offline draft recall figures, not a generation acceptance or throughput claim.
 
 Local M4 synthetic Q4 head timing, 262,144 rows x 1,024 columns, nonzero
 18-byte matrix offset, actual sidecar and first saved query, 7 sequential
@@ -52,3 +53,14 @@ The GPU fixture checks tied centroid scores, top1/17/128/192/256/2048,
 masked-out logits, and both vocabulary argmax kernels. Parser tests cover
 identity, dimensions, nonfinite centroid values, cluster bounds/duplicates,
 invalid padding, truncation, and trailing bytes.
+
+Rebuild the sidecar with `generate_shortlist_sidecar.py model.safetensors
+output.c4sl` (NumPy required). It checks the actual source SHA before reading
+weights, writes explicit little-endian arrays, and atomically replaces the
+output only after all validation succeeds. Defaults remain 15 iterations,
+seed 12345, K=2048 and M=3. Stable grouping removes repeated boolean scans
+while preserving each original float32 sum's row order; a reduced training
+fixture compares the resulting centroid and assignment bits to the original
+generator. `test_generate_shortlist_sidecar.py` also checks hash refusal,
+header/endianness and destination preservation on invalid output. Full
+artifact regeneration was not performed during the kernel experiment.
