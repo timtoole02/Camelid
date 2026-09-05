@@ -12771,6 +12771,429 @@ kernel void gemma4_verify_head_norm_rope_scatter_f32(
         output[dim1] = x0 * s + x1 * c;
     }
 }
+
+// ---------------------------------------------------------------------------
+// C6 helpers: the inverse of `q4_0_q8_ordered_columns_mma_stage_fm`'s
+// (lane, k_tile, element) -> (column, position) mapping, so a quantizer can
+// write its block straight into the fragment-major K<=8 activation record.
+// The stage writes half(int(quant)) at staged[block*272 + rem] with
+// rem = lane*8 + k_tile*2 + element, column = fc.x + element and
+// position = k_tile*8 + fc.y for fc = q4_native_mma_fragment_coord(lane);
+// that map is a bijection between rem in [0,256) and (column in [0,8),
+// position in [0,32)), so the inverse below covers every panel half exactly
+// once. The f32 input scale lives at ((float*)staged)[block*136 + 128 + column].
+// ---------------------------------------------------------------------------
+inline uint gemma4_verify_stage_fm_slot(uint column, uint position) {
+    const uint k_tile = position >> 3;
+    const uint fy = position & 7u;
+    const uint lane = ((fy >> 2) << 4)
+        | (((column >> 2) & 1u) << 3)
+        | ((fy & 3u) << 1)
+        | ((column >> 1) & 1u);
+    return lane * 8u + k_tile * 2u + (column & 1u);
+}
+
+inline void gemma4_verify_stage_fm_scale(
+    device half* staged,
+    uint block,
+    uint column,
+    float stored
+) {
+    device float* scales = reinterpret_cast<device float*>(staged);
+    scales[block * 136u + 128u + column] = stored;
+}
+
+// Padding for a column >= columns, byte for byte what the stage kernel writes.
+inline void gemma4_verify_stage_fm_zero_block(
+    device half* staged,
+    uint block,
+    uint column
+) {
+    for (uint position = 0; position < 32u; ++position) {
+        staged[block * 272u + gemma4_verify_stage_fm_slot(column, position)] =
+            half(0.0f);
+    }
+    gemma4_verify_stage_fm_scale(staged, block, column, 0.0f);
+}
+
+// C6: quantize_q8_0_f32 straight into the fragment-major panel. The grid is
+// (blocks_per_row, 8) so every panel column is covered: column < columns
+// quantizes the same 32 inputs the flat `gid*32` block would (flat block index
+// = column*blocks_per_row + block), and column >= columns writes the stage
+// kernel's half(0)/0.0f padding.
+kernel void gemma4_verify_quantize_stage_fm_f32(
+    device const float* input [[buffer(0)]],
+    device half* staged [[buffer(1)]],
+    constant uint& blocks_per_row [[buffer(2)]],
+    constant uint& columns [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= blocks_per_row) return;
+    const uint block = gid.x;
+    const uint column = gid.y;
+    if (column >= columns) {
+        gemma4_verify_stage_fm_zero_block(staged, block, column);
+        return;
+    }
+    uint base = (column * blocks_per_row + block) * 32u;
+    float max_abs = 0.0;
+    for (uint i = 0; i < 32u; ++i) {
+        max_abs = max(max_abs, fabs(input[base + i]));
+    }
+    float unrounded = max_abs / 127.0;
+    float stored = float(half(unrounded));
+    float inv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+    gemma4_verify_stage_fm_scale(staged, block, column, stored);
+    for (uint i = 0; i < 32u; ++i) {
+        float scaled = input[base + i] * inv;
+        int q = int(round(scaled));
+        q = clamp(q, -127, 127);
+        staged[block * 272u + gemma4_verify_stage_fm_slot(column, i)] = half(q);
+    }
+}
+
+// C2 + C6: `gemma4_verify_rms_norm_quantize_batch_f32` writing the fragment-
+// major panel instead of the (scales, quants) pair. Same 256-thread group per
+// row, same strided sum, same reduction tree and the same per-block text; the
+// grid is the eight panel columns so a column >= columns writes the stage
+// kernel's padding.
+kernel void gemma4_verify_rms_norm_quantize_stage_fm_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device half* staged [[buffer(2)]],
+    constant uint& width [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    uint n_blocks = width / 32u;
+    if (row >= columns) {
+        for (uint b = tid; b < n_blocks; b += tgsize) {
+            gemma4_verify_stage_fm_zero_block(staged, b, row);
+        }
+        return;
+    }
+    device const float* in_row = input + row * width;
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = in_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    for (uint b = tid; b < n_blocks; b += tgsize) {
+        uint base = b * 32u;
+        float v[32];
+        float max_abs = 0.0;
+        for (uint i = 0; i < 32u; ++i) {
+            v[i] = in_row[base + i] * inv * weight[base + i];
+            max_abs = max(max_abs, fabs(v[i]));
+        }
+        float unrounded = max_abs / 127.0;
+        float stored = float(half(unrounded));
+        float qinv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+        gemma4_verify_stage_fm_scale(staged, b, row, stored);
+        for (uint i = 0; i < 32u; ++i) {
+            int q = int(round(v[i] * qinv));
+            q = clamp(q, -127, 127);
+            staged[b * 272u + gemma4_verify_stage_fm_slot(row, i)] = half(q);
+        }
+    }
+}
+
+// C3 + C6: `gemma4_verify_gelu_mul_quantize_f32` writing the fragment-major
+// panel. One thread per (block, panel column); the gate/up elements of a block
+// are the same ones the flat `gid*32` block reads.
+kernel void gemma4_verify_gelu_mul_quantize_stage_fm_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device half* staged [[buffer(2)]],
+    constant uint& blocks_per_row [[buffer(3)]],
+    constant uint& columns [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= blocks_per_row) return;
+    const uint block = gid.x;
+    const uint column = gid.y;
+    if (column >= columns) {
+        gemma4_verify_stage_fm_zero_block(staged, block, column);
+        return;
+    }
+    uint base = (column * blocks_per_row + block) * 32u;
+    float v[32];
+    float max_abs = 0.0;
+    for (uint i = 0; i < 32u; ++i) {
+        float x = gate[base + i];
+        float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+        float gelu = 0.5f * x * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+        v[i] = gelu * up[base + i];
+        max_abs = max(max_abs, fabs(v[i]));
+    }
+    float unrounded = max_abs / 127.0;
+    float stored = float(half(unrounded));
+    float inv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+    gemma4_verify_stage_fm_scale(staged, block, column, stored);
+    for (uint i = 0; i < 32u; ++i) {
+        int q = int(round(v[i] * inv));
+        q = clamp(q, -127, 127);
+        staged[block * 272u + gemma4_verify_stage_fm_slot(column, i)] = half(q);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C4: the residual add folded into the norm that follows it.
+//
+// Post-attention half: rms_norm_batch_f32(projection, post_attn_norm) ->
+// residual_add_f32(current, post) -> rms_norm_batch_f32(mid, ffn_norm) ->
+// quantize_q8_0_f32, as ONE 256-thread group per row. Every expression is the
+// text of the kernel it replaces and every reduction keeps the strided sum and
+// the halving tree of rms_norm_batch_f32.
+//
+// Contraction fences: the normed projection is STORED to `post` in device
+// memory and re-loaded behind `threadgroup_barrier(mem_flags::mem_device)`, so
+// `current + post` is the same fadd of two rounded f32 loads that
+// residual_add_f32 performs and cannot be contracted into
+// fma(proj*inv, weight, current). `mid` is likewise stored and re-loaded before
+// the second sum of squares, so that loop is byte-for-byte the sum loop of
+// rms_norm_batch_f32. There is an explicit threadgroup barrier after `inv` is
+// read out of partial[0] and before the second `partial[tid]` write, so a fast
+// lane cannot clobber partial[0] under a lagging reader.
+// ---------------------------------------------------------------------------
+kernel void gemma4_verify_post_attn_residual_norm_quantize_f32(
+    device const float* projection [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* post_attn_norm [[buffer(2)]],
+    device const float* ffn_norm [[buffer(3)]],
+    device float* post [[buffer(4)]],
+    device float* mid [[buffer(5)]],
+    device float* out_scales [[buffer(6)]],
+    device char* out_quants [[buffer(7)]],
+    constant uint& width [[buffer(8)]],
+    constant float& eps [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    device const float* proj_row = projection + row * width;
+    device const float* res_row = residual + row * width;
+    device float* post_row = post + row * width;
+    device float* mid_row = mid + row * width;
+    uint n_blocks = width / 32u;
+    device float* scales_row = out_scales + row * n_blocks;
+    device char* quants_row = out_quants + row * width;
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = proj_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < width; i += tgsize) {
+        post_row[i] = proj_row[i] * inv * post_attn_norm[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint i = tid; i < width; i += tgsize) {
+        mid_row[i] = res_row[i] + post_row[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = mid_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv2 = 1.0 / sqrt(partial[0] / float(width) + eps);
+    for (uint b = tid; b < n_blocks; b += tgsize) {
+        uint base = b * 32u;
+        float v[32];
+        float max_abs = 0.0;
+        for (uint i = 0; i < 32u; ++i) {
+            v[i] = mid_row[base + i] * inv2 * ffn_norm[base + i];
+            max_abs = max(max_abs, fabs(v[i]));
+        }
+        float unrounded = max_abs / 127.0;
+        float stored = float(half(unrounded));
+        float qinv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+        scales_row[b] = stored;
+        for (uint i = 0; i < 32u; ++i) {
+            int q = int(round(v[i] * qinv));
+            q = clamp(q, -127, 127);
+            quants_row[base + i] = char(q);
+        }
+    }
+}
+
+// C4 + C6: the post-attention kernel writing its Q8_0 blocks into the
+// fragment-major panel. Identical arithmetic and identical fences; the grid is
+// the eight panel columns so a column >= columns writes the stage padding and
+// touches nothing else (`mid` and `post` rows beyond `columns` stay as the
+// legacy encode leaves them: unwritten).
+kernel void gemma4_verify_post_attn_residual_norm_quantize_stage_fm_f32(
+    device const float* projection [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* post_attn_norm [[buffer(2)]],
+    device const float* ffn_norm [[buffer(3)]],
+    device float* post [[buffer(4)]],
+    device float* mid [[buffer(5)]],
+    device half* staged [[buffer(6)]],
+    constant uint& width [[buffer(8)]],
+    constant float& eps [[buffer(9)]],
+    constant uint& columns [[buffer(10)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    uint n_blocks = width / 32u;
+    if (row >= columns) {
+        for (uint b = tid; b < n_blocks; b += tgsize) {
+            gemma4_verify_stage_fm_zero_block(staged, b, row);
+        }
+        return;
+    }
+    device const float* proj_row = projection + row * width;
+    device const float* res_row = residual + row * width;
+    device float* post_row = post + row * width;
+    device float* mid_row = mid + row * width;
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = proj_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < width; i += tgsize) {
+        post_row[i] = proj_row[i] * inv * post_attn_norm[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint i = tid; i < width; i += tgsize) {
+        mid_row[i] = res_row[i] + post_row[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = mid_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv2 = 1.0 / sqrt(partial[0] / float(width) + eps);
+    for (uint b = tid; b < n_blocks; b += tgsize) {
+        uint base = b * 32u;
+        float v[32];
+        float max_abs = 0.0;
+        for (uint i = 0; i < 32u; ++i) {
+            v[i] = mid_row[base + i] * inv2 * ffn_norm[base + i];
+            max_abs = max(max_abs, fabs(v[i]));
+        }
+        float unrounded = max_abs / 127.0;
+        float stored = float(half(unrounded));
+        float qinv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+        gemma4_verify_stage_fm_scale(staged, b, row, stored);
+        for (uint i = 0; i < 32u; ++i) {
+            int q = int(round(v[i] * qinv));
+            q = clamp(q, -127, 127);
+            staged[b * 272u + gemma4_verify_stage_fm_slot(row, i)] = half(q);
+        }
+    }
+}
+
+// C4 (post-FFN half): rms_norm_batch_f32(down, post_ffw_norm) ->
+// residual_add_f32(mid, post) -> the plan's optional scale_f32, as one
+// 256-thread group per row. `post` is stored and re-loaded behind a
+// device-scope barrier exactly as above, and the layer scale is applied by
+// re-loading the stored sum, so the multiply is scale_f32's
+// `output[gid] = input[gid] * s` on the identical rounded f32. `apply_scale`
+// is zero when the layer scale's bits are exactly 1.0f, which is precisely
+// when the plan encodes no scale_f32 dispatch at all.
+kernel void gemma4_verify_post_ffw_residual_scale_f32(
+    device const float* down [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* post_ffw_norm [[buffer(2)]],
+    device float* post [[buffer(3)]],
+    device float* next [[buffer(4)]],
+    constant uint& width [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    constant float& layer_scale [[buffer(7)]],
+    constant uint& apply_scale [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    device const float* down_row = down + row * width;
+    device const float* res_row = residual + row * width;
+    device float* post_row = post + row * width;
+    device float* next_row = next + row * width;
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = down_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < width; i += tgsize) {
+        post_row[i] = down_row[i] * inv * post_ffw_norm[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint i = tid; i < width; i += tgsize) {
+        next_row[i] = res_row[i] + post_row[i];
+    }
+    if (apply_scale != 0u) {
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint i = tid; i < width; i += tgsize) {
+            next_row[i] = next_row[i] * layer_scale;
+        }
+    }
+}
 "#;
 
 // C7: segment-fused V2 grid appended to STRICT_Q8K_SHADER (same strict
@@ -12836,6 +13259,14 @@ pub(crate) struct Gemma4VerifyGluePipelines {
     gelu_mul_quantize: ComputePipelineState,
     head_norm: ComputePipelineState,
     head_norm_rope_scatter: ComputePipelineState,
+    /// C6: the same quantizers writing the fragment-major MMA panel directly.
+    quantize_stage_fm: ComputePipelineState,
+    rms_norm_quantize_stage_fm: ComputePipelineState,
+    gelu_mul_quantize_stage_fm: ComputePipelineState,
+    /// C4: the residual add folded into the norm that follows it.
+    post_attn_residual_norm_quantize: ComputePipelineState,
+    post_attn_residual_norm_quantize_stage_fm: ComputePipelineState,
+    post_ffw_residual_scale: ComputePipelineState,
 }
 
 /// The segment-fused MMA pipeline (C7), compiled lazily from the strict
@@ -12872,6 +13303,22 @@ impl MetalLinearKernel {
                     gelu_mul_quantize: make("gemma4_verify_gelu_mul_quantize_f32")?,
                     head_norm: make("gemma4_verify_head_norm_f32")?,
                     head_norm_rope_scatter: make("gemma4_verify_head_norm_rope_scatter_f32")?,
+                    quantize_stage_fm: make("gemma4_verify_quantize_stage_fm_f32")?,
+                    rms_norm_quantize_stage_fm: make(
+                        "gemma4_verify_rms_norm_quantize_stage_fm_f32",
+                    )?,
+                    gelu_mul_quantize_stage_fm: make(
+                        "gemma4_verify_gelu_mul_quantize_stage_fm_f32",
+                    )?,
+                    post_attn_residual_norm_quantize: make(
+                        "gemma4_verify_post_attn_residual_norm_quantize_f32",
+                    )?,
+                    post_attn_residual_norm_quantize_stage_fm: make(
+                        "gemma4_verify_post_attn_residual_norm_quantize_stage_fm_f32",
+                    )?,
+                    post_ffw_residual_scale: make(
+                        "gemma4_verify_post_ffw_residual_scale_f32",
+                    )?,
                 })
             })
             .as_ref()
@@ -15412,17 +15859,19 @@ pub(crate) const GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE: u32 = 1 << 1;
 /// bit2: gelu_mul + Q8_0 quantize in one dispatch.
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE: u32 = 1 << 2;
-/// bit3 (C4, residual add fused into the following norm) is reserved: refused.
+/// bit3: the residual add folded into the norm that FOLLOWS it, for both the
+/// post-attention block (post_attn norm + residual + ffn norm + quantize) and
+/// the post-FFN block (post_ffw norm + residual + the optional layer scale).
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
-pub(crate) const GEMMA4_FUSED_GLUE_C4_RESERVED: u32 = 1 << 3;
+pub(crate) const GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM: u32 = 1 << 3;
 /// bit4: per-head QK/V norm + split-half RoPE + KV scatter in one dispatch.
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER: u32 = 1 << 4;
-/// bit5 (C6, quantize straight into the MMA panel) is reserved: refused.
+/// bit5: the quantizers write their Q8_0 blocks straight into the
+/// fragment-major MMA activation record, so no stage dispatch follows them.
+/// Only admitted on the `fm_bits_u4` fragment-major V2 kernel at K <= 8.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
-pub(crate) const GEMMA4_FUSED_GLUE_C6_RESERVED: u32 = 1 << 5;
+pub(crate) const GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE: u32 = 1 << 5;
 /// bit6: segment-fused MMA grids (q|k|v and gate|up in one dispatch each).
 /// Implies bit0's single staging for the segments it fuses.
 #[cfg(target_os = "macos")]
@@ -15436,17 +15885,27 @@ pub(crate) const GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS: u32 = 1 << 7;
 pub(crate) const GEMMA4_FUSED_GLUE_IMPLEMENTED: u32 = GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
     | GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
     | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
+    | GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM
     | GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER
+    | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE
     | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA
     | GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS;
-/// The full cycle-1 mask (decimal 87): C1 | C2 | C3 | C5 | C7.
+/// The cycle-1 mask (decimal 87): C1 | C2 | C3 | C5 | C7 — the shipping
+/// candidate before the deferred C4/C6 fusions were implemented.
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
-pub(crate) const GEMMA4_FUSED_GLUE_ALL: u32 = GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
+pub(crate) const GEMMA4_FUSED_GLUE_CYCLE1: u32 = GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
     | GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
     | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
     | GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER
     | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA;
+/// Every fusion (decimal 127): C1 | C2 | C3 | C4 | C5 | C6 | C7. C5-lite
+/// (bit7) is the C5 fallback and is deliberately outside this mask.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) const GEMMA4_FUSED_GLUE_ALL: u32 = GEMMA4_FUSED_GLUE_CYCLE1
+    | GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM
+    | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE;
 /// The only V2 variant the fused encode admits: the segment kernels bind the
 /// `<1,4,1,true,true>` template body of this exact kernel.
 #[cfg(target_os = "macos")]
@@ -19155,7 +19614,9 @@ impl Gemma4ResidentModel {
         let glue_pipelines = if glue
             & (GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
                 | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
+                | GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM
                 | GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER
+                | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE
                 | GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS)
             != 0
         {
@@ -19185,11 +19646,23 @@ impl Gemma4ResidentModel {
         let glue_bit = |bit: u32| glue_pipelines.filter(|_| glue & bit != 0);
         let c2 = glue_bit(GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE);
         let c3 = glue_bit(GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE);
+        let c4 = glue_bit(GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM);
         let c5 = glue_bit(GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER);
         let c5_lite = glue_bit(GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS);
-        // C7 implies the single staging of C1 for the segments it fuses.
-        let stage_once = fused_v2.filter(|_| {
-            glue & (GEMMA4_FUSED_GLUE_C1_STAGE_ONCE | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA) != 0
+        // C6: the quantizers write the fragment-major MMA record themselves, so
+        // no stage dispatch follows them. It is only reachable through
+        // `fused_v2` (fragment-major `fm_bits_u4`, one tile, K <= 8, batched
+        // row ops, native-octet sidecars) — every other geometry keeps the
+        // legacy quantize + stage pair.
+        let c6 = glue_bit(GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE);
+        // C7 implies the single staging of C1 for the segments it fuses, and
+        // C6 forces the same split (its stage half is simply not encoded).
+        let stage_split = fused_v2.filter(|_| {
+            glue
+                & (GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
+                    | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE
+                    | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA)
+                != 0
         });
 
         let mut scratch_guard = self.dense12b_verifier.lock().ok()?;
@@ -19269,40 +19742,73 @@ impl Gemma4ResidentModel {
             let post_ffw_norm = &constants.post_ffw_norm;
 
             // Attention input norm and one shared Q8_0 activation panel.
-            if let Some(glue) = c2 {
-                encode_gemma4_verify_rms_norm_quantize_batch(
+            // With C6 the quantizer writes the fragment-major MMA record
+            // itself, so no stage dispatch follows it.
+            let attn_input_encoded = match (c2, c6) {
+                (Some(glue), Some(_)) => encode_gemma4_verify_rms_norm_quantize_stage_fm(
                     encoder,
                     glue,
                     current,
                     attn_norm,
-                    &scratch.input_scales,
-                    &scratch.input_quants,
-                    &keep[5],
+                    &scratch.q4_terms,
+                    HIDDEN,
+                    self.eps,
                     columns,
-                );
-            } else {
-                encode_rms_norm_batch(
-                    kernel,
-                    encoder,
-                    current,
-                    attn_norm,
-                    &scratch.norm,
-                    &keep[5],
-                    columns,
-                );
-                encode_quantize(
-                    encoder,
-                    kernel,
-                    &scratch.norm,
-                    &scratch.input_scales,
-                    &scratch.input_quants,
-                    &keep[0],
-                    columns * hidden_blocks,
-                );
+                ),
+                (Some(glue), None) => {
+                    encode_gemma4_verify_rms_norm_quantize_batch(
+                        encoder,
+                        glue,
+                        current,
+                        attn_norm,
+                        &scratch.input_scales,
+                        &scratch.input_quants,
+                        &keep[5],
+                        columns,
+                    );
+                    true
+                }
+                (None, quantize_to_panel) => {
+                    encode_rms_norm_batch(
+                        kernel,
+                        encoder,
+                        current,
+                        attn_norm,
+                        &scratch.norm,
+                        &keep[5],
+                        columns,
+                    );
+                    match quantize_to_panel {
+                        Some(glue) => encode_gemma4_verify_quantize_stage_fm(
+                            encoder,
+                            glue,
+                            &scratch.norm,
+                            &scratch.q4_terms,
+                            hidden_blocks,
+                            columns,
+                        ),
+                        None => {
+                            encode_quantize(
+                                encoder,
+                                kernel,
+                                &scratch.norm,
+                                &scratch.input_scales,
+                                &scratch.input_quants,
+                                &keep[0],
+                                columns * hidden_blocks,
+                            );
+                            true
+                        }
+                    }
+                }
+            };
+            if !attn_input_encoded {
+                encoder.end_encoding();
+                return None;
             }
-            if let Some(v2) = stage_once {
-                // C1/C7: the fragment-major record of the shared attention
-                // input is staged once; q, k and v read the identical bytes.
+            if let Some(v2) = stage_split {
+                // C1/C6/C7: the fragment-major record of the shared attention
+                // input is written once; q, k and v read the identical bytes.
                 let mut segments: Vec<Gemma4VerifyGlueSegment<'_>> = vec![
                     (&layer.q_w, 0, &scratch.q_raw, q_dim),
                     (&layer.k_w, 0, &scratch.k_raw, kv_dim),
@@ -19310,16 +19816,18 @@ impl Gemma4ResidentModel {
                 if let Some(value_weight) = layer.v_w.as_ref() {
                     segments.push((value_weight, 0, &scratch.v_raw, kv_dim));
                 }
-                let encoded = encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
-                    encoder,
-                    kernel,
-                    v2,
-                    &scratch.input_scales,
-                    &scratch.input_quants,
-                    &scratch.q4_terms,
-                    hidden_blocks,
-                    columns,
-                ) && if let Some(mma) = glue_mma {
+                let encoded = (c6.is_some()
+                    || encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+                        encoder,
+                        kernel,
+                        v2,
+                        &scratch.input_scales,
+                        &scratch.input_quants,
+                        &scratch.q4_terms,
+                        hidden_blocks,
+                        columns,
+                    ))
+                    && if let Some(mma) = glue_mma {
                     encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
                         encoder,
                         v2,
@@ -19759,102 +20267,205 @@ impl Gemma4ResidentModel {
                 }
             }
 
-            let context_block_count = u32_arg(columns * context_blocks);
-            encode_quantize(
-                encoder,
-                kernel,
-                &scratch.context,
-                &scratch.context_scales,
-                &scratch.context_quants,
-                &context_block_count,
-                columns * context_blocks,
-            );
-            if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
-                encoder,
-                kernel,
-                &scratch.context_scales,
-                &scratch.context_quants,
-                &layer.o_w,
-                0,
-                &scratch.projection,
-                Some(&scratch.q4_terms),
-                HIDDEN,
-                context_blocks,
-                columns,
-                layer.q4_layout,
-            ) {
+            // Context quantize + O projection. Under C6 the quantizer writes
+            // the fragment-major record and only the MMA half follows.
+            let context_encoded = match (c6, stage_split) {
+                (Some(glue), Some(v2)) => {
+                    encode_gemma4_verify_quantize_stage_fm(
+                        encoder,
+                        glue,
+                        &scratch.context,
+                        &scratch.q4_terms,
+                        context_blocks,
+                        columns,
+                    ) && encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                        encoder,
+                        v2,
+                        v2_simdgroups,
+                        &scratch.context_scales,
+                        &layer.o_w,
+                        0,
+                        &scratch.projection,
+                        &scratch.q4_terms,
+                        HIDDEN,
+                        context_blocks,
+                        columns,
+                    )
+                }
+                // Unreachable: bit5 is only ever set when `fused_v2` admitted
+                // the geometry, which is exactly what makes `stage_split` Some.
+                // Refuse rather than fall back to a legacy encode that would
+                // read the (never written) context quants.
+                (Some(_), None) => false,
+                _ => {
+                    let context_block_count = u32_arg(columns * context_blocks);
+                    encode_quantize(
+                        encoder,
+                        kernel,
+                        &scratch.context,
+                        &scratch.context_scales,
+                        &scratch.context_quants,
+                        &context_block_count,
+                        columns * context_blocks,
+                    );
+                    keep.push(context_block_count);
+                    encode_gemma4_q4_0_q8_ordered_columns_with_layout(
+                        encoder,
+                        kernel,
+                        &scratch.context_scales,
+                        &scratch.context_quants,
+                        &layer.o_w,
+                        0,
+                        &scratch.projection,
+                        Some(&scratch.q4_terms),
+                        HIDDEN,
+                        context_blocks,
+                        columns,
+                        layer.q4_layout,
+                    )
+                }
+            };
+            if !context_encoded {
                 encoder.end_encoding();
                 return None;
             }
-            encode_rms_norm_batch(
-                kernel,
-                encoder,
-                &scratch.projection,
-                post_attn_norm,
-                &scratch.post,
-                &keep[5],
-                columns,
-            );
-            encode_binary(
-                encoder,
-                &kernel.residual_add_pipeline,
-                current,
-                &scratch.post,
-                &scratch.mid,
-                &keep[2],
-                columns * HIDDEN,
-            );
-            keep.push(context_block_count);
 
+            // Post-attention sandwich norm, the residual add and the FFN input
+            // norm + quantize. C4 folds the residual into the norm that FOLLOWS
+            // it, which subsumes C2's FFN half: the fused kernel emits the
+            // quantized FFN input directly (into the MMA record under C6).
             // Dense FFN: norm -> Q4 gate/up -> GeGLU -> Q4 down -> sandwich
             // norm -> residual, all K rows in the same ordered-Q4 universe.
-            if let Some(glue) = c2 {
-                encode_gemma4_verify_rms_norm_quantize_batch(
-                    encoder,
-                    glue,
-                    &scratch.mid,
+            let ffn_input_encoded = if let Some(glue) = c4 {
+                let post_attn = Gemma4VerifyGluePostAttnArgs {
+                    projection: &scratch.projection,
+                    residual: current,
+                    post_attn_norm,
                     ffn_norm,
-                    &scratch.input_scales,
-                    &scratch.input_quants,
-                    &keep[5],
+                    post: &scratch.post,
+                    mid: &scratch.mid,
+                    width: HIDDEN,
+                    eps: self.eps,
                     columns,
-                );
+                };
+                match c6 {
+                    Some(_) => encode_gemma4_verify_post_attn_residual_norm_quantize_stage_fm(
+                        encoder,
+                        glue,
+                        post_attn,
+                        &scratch.q4_terms,
+                    ),
+                    None => {
+                        encode_gemma4_verify_post_attn_residual_norm_quantize(
+                            encoder,
+                            glue,
+                            post_attn,
+                            &scratch.input_scales,
+                            &scratch.input_quants,
+                        );
+                        true
+                    }
+                }
             } else {
                 encode_rms_norm_batch(
                     kernel,
                     encoder,
-                    &scratch.mid,
-                    ffn_norm,
-                    &scratch.norm,
+                    &scratch.projection,
+                    post_attn_norm,
+                    &scratch.post,
                     &keep[5],
                     columns,
                 );
-                encode_quantize(
+                encode_binary(
                     encoder,
-                    kernel,
-                    &scratch.norm,
-                    &scratch.input_scales,
-                    &scratch.input_quants,
-                    &keep[0],
-                    columns * hidden_blocks,
+                    &kernel.residual_add_pipeline,
+                    current,
+                    &scratch.post,
+                    &scratch.mid,
+                    &keep[2],
+                    columns * HIDDEN,
                 );
+                match (c2, c6) {
+                    (Some(glue), Some(_)) => encode_gemma4_verify_rms_norm_quantize_stage_fm(
+                        encoder,
+                        glue,
+                        &scratch.mid,
+                        ffn_norm,
+                        &scratch.q4_terms,
+                        HIDDEN,
+                        self.eps,
+                        columns,
+                    ),
+                    (Some(glue), None) => {
+                        encode_gemma4_verify_rms_norm_quantize_batch(
+                            encoder,
+                            glue,
+                            &scratch.mid,
+                            ffn_norm,
+                            &scratch.input_scales,
+                            &scratch.input_quants,
+                            &keep[5],
+                            columns,
+                        );
+                        true
+                    }
+                    (None, quantize_to_panel) => {
+                        encode_rms_norm_batch(
+                            kernel,
+                            encoder,
+                            &scratch.mid,
+                            ffn_norm,
+                            &scratch.norm,
+                            &keep[5],
+                            columns,
+                        );
+                        match quantize_to_panel {
+                            Some(glue) => encode_gemma4_verify_quantize_stage_fm(
+                                encoder,
+                                glue,
+                                &scratch.norm,
+                                &scratch.q4_terms,
+                                hidden_blocks,
+                                columns,
+                            ),
+                            None => {
+                                encode_quantize(
+                                    encoder,
+                                    kernel,
+                                    &scratch.norm,
+                                    &scratch.input_scales,
+                                    &scratch.input_quants,
+                                    &keep[0],
+                                    columns * hidden_blocks,
+                                );
+                                true
+                            }
+                        }
+                    }
+                }
+            };
+            if !ffn_input_encoded {
+                encoder.end_encoding();
+                return None;
             }
-            if let Some(v2) = stage_once {
-                // C1/C7: one staged record feeds both gate and up.
+            if let Some(v2) = stage_split {
+                // C1/C6/C7: one staged record feeds both gate and up.
                 let segments: [Gemma4VerifyGlueSegment<'_>; 2] = [
                     (&layer.gate_w, 0, &scratch.gate, FFN),
                     (&layer.up_w, 0, &scratch.up, FFN),
                 ];
-                let encoded = encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
-                    encoder,
-                    kernel,
-                    v2,
-                    &scratch.input_scales,
-                    &scratch.input_quants,
-                    &scratch.q4_terms,
-                    hidden_blocks,
-                    columns,
-                ) && if let Some(mma) = glue_mma {
+                let encoded = (c6.is_some()
+                    || encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+                        encoder,
+                        kernel,
+                        v2,
+                        &scratch.input_scales,
+                        &scratch.input_quants,
+                        &scratch.q4_terms,
+                        hidden_blocks,
+                        columns,
+                    ))
+                    && if let Some(mma) = glue_mma {
                     encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
                         encoder,
                         v2,
@@ -19917,81 +20528,149 @@ impl Gemma4ResidentModel {
                 encoder.end_encoding();
                 return None;
             }
-            if let Some(glue) = c3 {
-                encode_gemma4_verify_gelu_mul_quantize(
+            let activation_encoded = match (c3, c6) {
+                (Some(glue), Some(_)) => encode_gemma4_verify_gelu_mul_quantize_stage_fm(
                     encoder,
                     glue,
                     &scratch.gate,
                     &scratch.up,
-                    &scratch.activation_scales,
-                    &scratch.activation_quants,
-                    &keep[1],
-                    columns * activation_blocks,
-                );
-            } else {
-                encode_binary(
-                    encoder,
-                    &kernel.gelu_mul_pipeline,
-                    &scratch.gate,
-                    &scratch.up,
-                    &scratch.activation,
-                    &keep[3],
-                    columns * FFN,
-                );
-                encode_quantize(
-                    encoder,
-                    kernel,
-                    &scratch.activation,
-                    &scratch.activation_scales,
-                    &scratch.activation_quants,
-                    &keep[1],
-                    columns * activation_blocks,
-                );
-            }
-            if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
-                encoder,
-                kernel,
-                &scratch.activation_scales,
-                &scratch.activation_quants,
-                &layer.down_w,
-                0,
-                &scratch.down,
-                Some(&scratch.q4_terms),
-                HIDDEN,
-                activation_blocks,
-                columns,
-                layer.q4_layout,
-            ) {
+                    &scratch.q4_terms,
+                    activation_blocks,
+                    columns,
+                ),
+                (Some(glue), None) => {
+                    encode_gemma4_verify_gelu_mul_quantize(
+                        encoder,
+                        glue,
+                        &scratch.gate,
+                        &scratch.up,
+                        &scratch.activation_scales,
+                        &scratch.activation_quants,
+                        &keep[1],
+                        columns * activation_blocks,
+                    );
+                    true
+                }
+                (None, quantize_to_panel) => {
+                    encode_binary(
+                        encoder,
+                        &kernel.gelu_mul_pipeline,
+                        &scratch.gate,
+                        &scratch.up,
+                        &scratch.activation,
+                        &keep[3],
+                        columns * FFN,
+                    );
+                    match quantize_to_panel {
+                        Some(glue) => encode_gemma4_verify_quantize_stage_fm(
+                            encoder,
+                            glue,
+                            &scratch.activation,
+                            &scratch.q4_terms,
+                            activation_blocks,
+                            columns,
+                        ),
+                        None => {
+                            encode_quantize(
+                                encoder,
+                                kernel,
+                                &scratch.activation,
+                                &scratch.activation_scales,
+                                &scratch.activation_quants,
+                                &keep[1],
+                                columns * activation_blocks,
+                            );
+                            true
+                        }
+                    }
+                }
+            };
+            let down_encoded = activation_encoded
+                && match (c6, stage_split) {
+                    (Some(_), Some(v2)) => {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                            encoder,
+                            v2,
+                            v2_simdgroups,
+                            &scratch.activation_scales,
+                            &layer.down_w,
+                            0,
+                            &scratch.down,
+                            &scratch.q4_terms,
+                            HIDDEN,
+                            activation_blocks,
+                            columns,
+                        )
+                    }
+                    // Unreachable, refused rather than silently legacy-encoded
+                    // over activation quants the C6 writers never filled.
+                    (Some(_), None) => false,
+                    _ => encode_gemma4_q4_0_q8_ordered_columns_with_layout(
+                        encoder,
+                        kernel,
+                        &scratch.activation_scales,
+                        &scratch.activation_quants,
+                        &layer.down_w,
+                        0,
+                        &scratch.down,
+                        Some(&scratch.q4_terms),
+                        HIDDEN,
+                        activation_blocks,
+                        columns,
+                        layer.q4_layout,
+                    ),
+                };
+            if !down_encoded {
                 encoder.end_encoding();
                 return None;
             }
-            encode_rms_norm_batch(
-                kernel,
-                encoder,
-                &scratch.down,
-                post_ffw_norm,
-                &scratch.post,
-                &keep[5],
-                columns,
-            );
-            encode_binary(
-                encoder,
-                &kernel.residual_add_pipeline,
-                &scratch.mid,
-                &scratch.post,
-                next,
-                &keep[2],
-                columns * HIDDEN,
-            );
-            if self.layer_scales[layer_idx].to_bits() != 1.0f32.to_bits() {
-                let scale_args = shared(8);
-                unsafe {
-                    let args = scale_args.contents().cast::<u8>();
-                    *args.cast::<u32>() = (columns * HIDDEN) as u32;
-                    *args.add(4).cast::<f32>() = self.layer_scales[layer_idx];
+            // Post-FFN sandwich norm, the residual add and the plan's optional
+            // per-layer output scale. C4 folds all three into one dispatch and
+            // skips the multiply exactly when the scale's bits are 1.0f, which
+            // is when the legacy encode emits no `scale_f32` at all.
+            if let Some(glue) = c4 {
+                encode_gemma4_verify_post_ffw_residual_scale(
+                    encoder,
+                    glue,
+                    &scratch.down,
+                    &scratch.mid,
+                    post_ffw_norm,
+                    &scratch.post,
+                    next,
+                    HIDDEN,
+                    self.eps,
+                    self.layer_scales[layer_idx],
+                    columns,
+                );
+            } else {
+                encode_rms_norm_batch(
+                    kernel,
+                    encoder,
+                    &scratch.down,
+                    post_ffw_norm,
+                    &scratch.post,
+                    &keep[5],
+                    columns,
+                );
+                encode_binary(
+                    encoder,
+                    &kernel.residual_add_pipeline,
+                    &scratch.mid,
+                    &scratch.post,
+                    next,
+                    &keep[2],
+                    columns * HIDDEN,
+                );
+                if self.layer_scales[layer_idx].to_bits() != 1.0f32.to_bits() {
+                    let scale_args = shared(8);
+                    unsafe {
+                        let args = scale_args.contents().cast::<u8>();
+                        *args.cast::<u32>() = (columns * HIDDEN) as u32;
+                        *args.add(4).cast::<f32>() = self.layer_scales[layer_idx];
+                    }
+                    encode_scale_f32(encoder, kernel, next, next, &scale_args, columns * HIDDEN);
+                    keep.push(scale_args);
                 }
-                encode_scale_f32(encoder, kernel, next, next, &scale_args, columns * HIDDEN);
-                keep.push(scale_args);
             }
             from_a = !from_a;
         }
@@ -21886,6 +22565,303 @@ fn encode_gemma4_verify_head_norm_rope_scatter(
     e.set_buffer(8, Some(cos), 0);
     e.set_buffer(9, Some(sin), 0);
     gemma4_verify_glue_head_dispatch(e, args);
+}
+
+/// Panel columns of the fragment-major K<=8 activation record. Every fused
+/// C6 writer covers all eight so that columns >= K get the stage kernel's
+/// half(0)/0.0f padding, exactly as `q4_0_q8_ordered_columns_mma_stage_fm`
+/// writes it.
+#[cfg(target_os = "macos")]
+const GEMMA4_FUSED_GLUE_PANEL_COLUMNS: usize = 8;
+
+/// Shared C6 admission: the fused writers hard-code the 544-byte
+/// fragment-major record per Q4_0 block, so refuse before encoding anything
+/// unless the geometry is exactly the one that record describes and the
+/// staging buffer is long enough (mirrors the V2 stage encoder's check).
+#[cfg(target_os = "macos")]
+fn gemma4_verify_glue_stage_fm_admitted(
+    staged: &Buffer,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if blocks_per_row == 0
+        || blocks_per_row > (u32::MAX as usize) / 1088
+        || !matches!(columns, 1 | 2 | 4 | 8)
+    {
+        return false;
+    }
+    gemma4_q4_native_v2_stage_bytes(blocks_per_row, columns, true)
+        .is_some_and(|bytes| staged.length() >= bytes as u64)
+}
+
+/// Fused-glue C6: `quantize_q8_0_f32` writing the fragment-major MMA record
+/// directly. Replaces one `encode_quantize` plus the stage dispatch that used
+/// to re-read its output. The grid is `(blocks_per_row, 8)`; panel columns at
+/// or past `columns` write the stage kernel's padding.
+#[cfg(target_os = "macos")]
+fn encode_gemma4_verify_quantize_stage_fm(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    input: &Buffer,
+    staged: &Buffer,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if !gemma4_verify_glue_stage_fm_admitted(staged, blocks_per_row, columns)
+        || input.length() < (columns * blocks_per_row * 32 * std::mem::size_of::<f32>()) as u64
+    {
+        return false;
+    }
+    let blocks_u32 = blocks_per_row as u32;
+    let columns_u32 = columns as u32;
+    e.set_compute_pipeline_state(&glue.quantize_stage_fm);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(staged), 0);
+    e.set_bytes(2, 4, &blocks_u32 as *const u32 as *const _);
+    e.set_bytes(3, 4, &columns_u32 as *const u32 as *const _);
+    dispatch_2d_rows(
+        e,
+        &glue.quantize_stage_fm,
+        blocks_per_row,
+        GEMMA4_FUSED_GLUE_PANEL_COLUMNS,
+    );
+    true
+}
+
+/// Fused-glue C2 + C6: the batched rms_norm + quantize writing the
+/// fragment-major MMA record. One 256-thread group per panel column.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_rms_norm_quantize_stage_fm(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    input: &Buffer,
+    weight: &Buffer,
+    staged: &Buffer,
+    width: usize,
+    eps: f32,
+    columns: usize,
+) -> bool {
+    if width == 0 || !width.is_multiple_of(32) {
+        return false;
+    }
+    let blocks_per_row = width / 32;
+    if !gemma4_verify_glue_stage_fm_admitted(staged, blocks_per_row, columns)
+        || input.length() < (columns * width * std::mem::size_of::<f32>()) as u64
+        || weight.length() < (width * std::mem::size_of::<f32>()) as u64
+    {
+        return false;
+    }
+    let width_u32 = width as u32;
+    let columns_u32 = columns as u32;
+    e.set_compute_pipeline_state(&glue.rms_norm_quantize_stage_fm);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(staged), 0);
+    e.set_bytes(4, 4, &width_u32 as *const u32 as *const _);
+    e.set_bytes(5, 4, &eps as *const f32 as *const _);
+    e.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: GEMMA4_FUSED_GLUE_PANEL_COLUMNS as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    true
+}
+
+/// Fused-glue C3 + C6: gelu_mul + quantize writing the fragment-major record.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_gelu_mul_quantize_stage_fm(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    gate: &Buffer,
+    up: &Buffer,
+    staged: &Buffer,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    let Some(values) = columns
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(32))
+    else {
+        return false;
+    };
+    if !gemma4_verify_glue_stage_fm_admitted(staged, blocks_per_row, columns)
+        || gate.length() < (values * std::mem::size_of::<f32>()) as u64
+        || up.length() < (values * std::mem::size_of::<f32>()) as u64
+    {
+        return false;
+    }
+    let blocks_u32 = blocks_per_row as u32;
+    let columns_u32 = columns as u32;
+    e.set_compute_pipeline_state(&glue.gelu_mul_quantize_stage_fm);
+    e.set_buffer(0, Some(gate), 0);
+    e.set_buffer(1, Some(up), 0);
+    e.set_buffer(2, Some(staged), 0);
+    e.set_bytes(3, 4, &blocks_u32 as *const u32 as *const _);
+    e.set_bytes(4, 4, &columns_u32 as *const u32 as *const _);
+    dispatch_2d_rows(
+        e,
+        &glue.gelu_mul_quantize_stage_fm,
+        blocks_per_row,
+        GEMMA4_FUSED_GLUE_PANEL_COLUMNS,
+    );
+    true
+}
+
+/// Buffers and geometry of one fused-glue C4 post-attention dispatch: the
+/// projection and residual it folds, the two norm weights it applies and the
+/// `post`/`mid` device buffers that carry the opaque store/load fence.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct Gemma4VerifyGluePostAttnArgs<'a> {
+    projection: &'a Buffer,
+    residual: &'a Buffer,
+    post_attn_norm: &'a Buffer,
+    ffn_norm: &'a Buffer,
+    post: &'a Buffer,
+    mid: &'a Buffer,
+    width: usize,
+    eps: f32,
+    columns: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_verify_glue_post_attn_bind(
+    e: &metal::ComputeCommandEncoderRef,
+    args: Gemma4VerifyGluePostAttnArgs<'_>,
+) {
+    e.set_buffer(0, Some(args.projection), 0);
+    e.set_buffer(1, Some(args.residual), 0);
+    e.set_buffer(2, Some(args.post_attn_norm), 0);
+    e.set_buffer(3, Some(args.ffn_norm), 0);
+    e.set_buffer(4, Some(args.post), 0);
+    e.set_buffer(5, Some(args.mid), 0);
+}
+
+/// Fused-glue C4 (post-attention half): post_attn norm + residual add + ffn
+/// norm + Q8_0 quantize in one dispatch, one 256-thread group per row.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_post_attn_residual_norm_quantize(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    args: Gemma4VerifyGluePostAttnArgs<'_>,
+    scales: &Buffer,
+    quants: &Buffer,
+) {
+    let width_u32 = args.width as u32;
+    let eps = args.eps;
+    e.set_compute_pipeline_state(&glue.post_attn_residual_norm_quantize);
+    gemma4_verify_glue_post_attn_bind(e, args);
+    e.set_buffer(6, Some(scales), 0);
+    e.set_buffer(7, Some(quants), 0);
+    e.set_bytes(8, 4, &width_u32 as *const u32 as *const _);
+    e.set_bytes(9, 4, &eps as *const f32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: args.columns as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Fused-glue C4 + C6: the same kernel writing the fragment-major MMA record
+/// instead of the (scales, quants) pair, over all eight panel columns.
+#[cfg(target_os = "macos")]
+fn encode_gemma4_verify_post_attn_residual_norm_quantize_stage_fm(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    args: Gemma4VerifyGluePostAttnArgs<'_>,
+    staged: &Buffer,
+) -> bool {
+    if args.width == 0 || !args.width.is_multiple_of(32) {
+        return false;
+    }
+    if !gemma4_verify_glue_stage_fm_admitted(staged, args.width / 32, args.columns) {
+        return false;
+    }
+    let width_u32 = args.width as u32;
+    let eps = args.eps;
+    let columns_u32 = args.columns as u32;
+    e.set_compute_pipeline_state(&glue.post_attn_residual_norm_quantize_stage_fm);
+    gemma4_verify_glue_post_attn_bind(e, args);
+    e.set_buffer(6, Some(staged), 0);
+    e.set_bytes(8, 4, &width_u32 as *const u32 as *const _);
+    e.set_bytes(9, 4, &eps as *const f32 as *const _);
+    e.set_bytes(10, 4, &columns_u32 as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: GEMMA4_FUSED_GLUE_PANEL_COLUMNS as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    true
+}
+
+/// Fused-glue C4 (post-FFN half): post_ffw norm + residual add + the plan's
+/// optional `scale_f32` in one dispatch. `layer_scale` is applied only when
+/// its bits are not exactly 1.0f, which is precisely when the legacy encode
+/// emits a `scale_f32` dispatch at all.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_post_ffw_residual_scale(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    down: &Buffer,
+    residual: &Buffer,
+    post_ffw_norm: &Buffer,
+    post: &Buffer,
+    next: &Buffer,
+    width: usize,
+    eps: f32,
+    layer_scale: f32,
+    rows: usize,
+) {
+    let width_u32 = width as u32;
+    let apply_scale: u32 = u32::from(layer_scale.to_bits() != 1.0f32.to_bits());
+    e.set_compute_pipeline_state(&glue.post_ffw_residual_scale);
+    e.set_buffer(0, Some(down), 0);
+    e.set_buffer(1, Some(residual), 0);
+    e.set_buffer(2, Some(post_ffw_norm), 0);
+    e.set_buffer(3, Some(post), 0);
+    e.set_buffer(4, Some(next), 0);
+    e.set_bytes(5, 4, &width_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &eps as *const f32 as *const _);
+    e.set_bytes(7, 4, &layer_scale as *const f32 as *const _);
+    e.set_bytes(8, 4, &apply_scale as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 /// Opt-in: with CAMELID_METAL_F32Y also set, weights upload in the raw GGUF 34-byte
