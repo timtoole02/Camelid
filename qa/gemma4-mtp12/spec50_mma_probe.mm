@@ -27,14 +27,14 @@ int main(int argc,char**argv){@autoreleasepool{
  auto fields=[line componentsSeparatedByString:@" "];NSString* file=fields[0];int rb=[fields[1]intValue],sg=[fields[2]intValue];
  NSError* err=nil;NSString* source=[NSString stringWithContentsOfFile:file encoding:NSUTF8StringEncoding error:&err];
  MTLCompileOptions* opts=[MTLCompileOptions new];opts.fastMathEnabled=NO;
- auto lib=[dev newLibraryWithSource:source options:opts error:&err];if(!lib){fprintf(stderr,"COMPILE %s %s\n",file.UTF8String,err.localizedDescription.UTF8String);continue;}
+ auto lib=[dev newLibraryWithSource:source options:opts error:&err];if(!lib){failed=true;fprintf(stderr,"COMPILE %s %s\n",file.UTF8String,err.localizedDescription.UTF8String);continue;}
  auto expandfn=[lib newFunctionWithName:@"q6k_spec50_expand_f16"];
  if(!expandfn)expandfn=[lib newFunctionWithName:@"q6k_spec50_mma_expand_f16"];
  auto expand=[dev newComputePipelineStateWithFunction:expandfn error:&err];
  auto fn=[lib newFunctionWithName:[NSString stringWithFormat:@"q6k_spec50_batch_k%u",k]];
  if(!fn)fn=[lib newFunctionWithName:[NSString stringWithFormat:@"q6k_spec50_mma_k%u",k]];
  auto pipe=[dev newComputePipelineStateWithFunction:fn error:&err];
- if(!pipe){fprintf(stderr,"PIPE %s %s\n",file.UTF8String,err.localizedDescription.UTF8String);continue;}
+ if(!pipe){failed=true;fprintf(stderr,"PIPE %s %s\n",file.UTF8String,err.localizedDescription.UTF8String);continue;}
  std::vector<double> times;
  for(int rep=0;rep<9;rep++){
  auto cb=[queue commandBuffer];auto e=[cb computeCommandEncoder];

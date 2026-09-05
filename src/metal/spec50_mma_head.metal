@@ -20,11 +20,6 @@ kernel void q6k_spec50_mma_expand_f16(device const char* quants [[buffer(0)]],de
  out[gid]=half(quants[t*hidden+sb*256u+h*128u+s*16u+g*32u+l]);
 }
 inline uint2 head_coord(uint lane){return uint2(4u*((lane>>3u)&1u)+2u*(lane&1u),4u*(lane>>4u)+((lane&7u)>>1u));}
-inline half decode_weight(device const uchar* block,uint g,uint h,uint s,uint l){
- const uint j=s*16u+l,qla=block[h*64u+(g&1u)*32u+j],qhv=block[128u+h*32u+j];
- const uint low=g<2u?(qla&15u):(qla>>4u),high=((qhv>>(g*2u))&3u)<<4u;
- return half(int(low|high)-32);
-}
 template<uint KB>
 void mma_head(device const float* input_scales, device const half* input_perm,device const uchar* weight_blocks,device float* output,uint n_sb,uint rows,float softcap,uint tile,uint sgitg,uint lane,threadgroup float* partials){
  const uint row0=tile*8u,units=n_sb*4u;const uint2 fc=head_coord(lane);const uint row=min(row0+fc.y,rows-1u);
@@ -35,6 +30,17 @@ void mma_head(device const float* input_scales, device const half* input_perm,de
    const uint sb=u>>2u,quarter=u&3u,h=quarter>>1u,s=quarter&1u;
    device const uchar* block=weight_blocks+(ulong(row)*n_sb+sb)*210ul;
    device const char* ws=reinterpret_cast<device const char*>(block+192u);
+   // Load the packed Q6 bytes once. Both nibbles and all four high-bit
+   // pairs are reused below; packed loads also keep each two-byte fragment
+   // coalesced. This changes only decoding, before exact integer dot products.
+   uchar2 ql0[2],ql1[2],qh0[2];
+   #pragma unroll
+   for(uint kt=0;kt<2u;kt++) {
+    const uint j=s*16u+kt*8u+fc.x;
+    ql0[kt]=uchar2(*reinterpret_cast<device const packed_uchar2*>(block+h*64u+j));
+    ql1[kt]=uchar2(*reinterpret_cast<device const packed_uchar2*>(block+h*64u+32u+j));
+    qh0[kt]=uchar2(*reinterpret_cast<device const packed_uchar2*>(block+128u+h*32u+j));
+   }
    int isum[2]={0,0};
    #pragma unroll
    for(uint g=0;g<4u;g++){
@@ -42,8 +48,10 @@ void mma_head(device const float* input_scales, device const half* input_perm,de
     #pragma unroll
     for(uint kt=0;kt<2u;kt++){
      simdgroup_half8x8 weights,activations;
-     weights.thread_elements()[0]=decode_weight(block,g,h,s,kt*8u+fc.x);
-     weights.thread_elements()[1]=decode_weight(block,g,h,s,kt*8u+fc.x+1u);
+     const uint2 qlv=uint2((g&1u)?ql1[kt]:ql0[kt]),qhv=uint2(qh0[kt]);
+     const uint2 low=g<2u?(qlv&15u):(qlv>>4u),high=((qhv>>(g*2u))&3u)<<4u;
+     const half2 w=half2(int2(low|high)-32);
+     weights.thread_elements()[0]=w.x;weights.thread_elements()[1]=w.y;
      #pragma unroll
      for(uint cell=0;cell<2u;cell++){
       const uint t=fc.x+cell;
