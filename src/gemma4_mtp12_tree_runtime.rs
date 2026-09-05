@@ -157,6 +157,20 @@ impl Gemma4GpuRuntime {
         depths: &[u32],
         start_position: usize,
     ) -> Result<Gemma4DenseVerifierBatch> {
+        self.verify_tree_greedy_with_glue(candidate_tokens, parents, depths, start_position, None)
+    }
+
+    /// [`Self::verify_tree_greedy`] with an explicit verifier fused-glue mask
+    /// (`None` = `CAMELID_GEMMA4_VERIFY_FUSED_GLUE`; `Some(mask)` pins this
+    /// call so one process can A/B the fused and legacy decoder encodes).
+    pub(crate) fn verify_tree_greedy_with_glue(
+        &self,
+        candidate_tokens: &[u32],
+        parents: &[i32],
+        depths: &[u32],
+        start_position: usize,
+        fused_glue: Option<u32>,
+    ) -> Result<Gemma4DenseVerifierBatch> {
         if !mtp12_tree_policy::validate(candidate_tokens, parents, depths, self.vocab)
             || !self.head_on_cpu
             || start_position
@@ -196,7 +210,13 @@ impl Gemma4GpuRuntime {
         }
         let hidden_flat = self
             .model
-            .verify_tree_hidden_ordered_q4(&h0_rows, &inputs_by_row, start_position, &plan)
+            .verify_tree_hidden_ordered_q4_with_glue(
+                &h0_rows,
+                &inputs_by_row,
+                start_position,
+                &plan,
+                fused_glue,
+            )
             .ok_or_else(|| {
                 BackendError::UnsupportedModelArchitecture(
                     "ordered-Q4 tree decoder dispatch failed".into(),

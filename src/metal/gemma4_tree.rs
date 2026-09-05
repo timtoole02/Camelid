@@ -403,6 +403,7 @@ fn pipelines(kernel: &MetalLinearKernel) -> Option<&'static TreePipelines> {
 impl Gemma4ResidentModel {
     /// Physically writes eight node rows at base+i; the caller supplies each
     /// node's RoPE/window inputs at semantic position base+depth[i].
+    #[allow(dead_code)] // the runtime threads its fused-glue mask through `_with_glue`
     pub(crate) fn verify_tree_hidden_ordered_q4(
         &self,
         h0_rows: &[f32],
@@ -410,7 +411,31 @@ impl Gemma4ResidentModel {
         base_position: usize,
         plan: &Gemma4DenseTreePlan,
     ) -> Option<Vec<f32>> {
-        self.verify_hidden_ordered_q4_plan(h0_rows, inputs_by_row, base_position, Some(plan))
+        self.verify_tree_hidden_ordered_q4_with_glue(h0_rows, inputs_by_row, base_position, plan, None)
+    }
+
+    /// [`Self::verify_tree_hidden_ordered_q4`] with an explicit fused-glue
+    /// mask (`None` = `CAMELID_GEMMA4_VERIFY_FUSED_GLUE`, read once and
+    /// refusing on garbage; `Some(mask)` pins this call for in-process A/B).
+    pub(crate) fn verify_tree_hidden_ordered_q4_with_glue(
+        &self,
+        h0_rows: &[f32],
+        inputs_by_row: &[Vec<Gemma4TokenLayerInput>],
+        base_position: usize,
+        plan: &Gemma4DenseTreePlan,
+        fused_glue: Option<u32>,
+    ) -> Option<Vec<f32>> {
+        let fused_glue_mask = match fused_glue {
+            Some(mask) => mask,
+            None => super::gemma4_verify_fused_glue_mask()?,
+        };
+        self.verify_hidden_ordered_q4_plan(
+            h0_rows,
+            inputs_by_row,
+            base_position,
+            Some(plan),
+            fused_glue_mask,
+        )
     }
 
     /// Finish before advancing the runtime ticket/cursor. Prefix <base is never
