@@ -17898,11 +17898,77 @@ struct Gemma4PliResident {
     ple_dim: usize,
 }
 
+/// Immutable per-layer constants owned by the verifier scratch. They are
+/// uploaded once per model, after the dense 12B geometry has been admitted.
+/// Position/width-dependent RoPE tables and scatter arguments remain per-call.
+#[cfg(target_os = "macos")]
+struct Gemma4Dense12bLayerConstants {
+    attn_norm: Buffer,
+    q_norm: Buffer,
+    k_norm: Buffer,
+    post_attn_norm: Buffer,
+    ffn_norm: Buffer,
+    post_ffw_norm: Buffer,
+    weighted_head_args: Buffer,
+    unweighted_head_args: Buffer,
+    rope_q_args: Buffer,
+    rope_k_args: Buffer,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Dense12bLayerConstants {
+    fn new(device: &metal::DeviceRef, layer: &Gemma4ResidentLayer) -> Self {
+        let shared = |bytes: usize| {
+            device.new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let upload = |values: &[f32]| {
+            let buffer = shared(std::mem::size_of_val(values));
+            write_buffer_f32(&buffer, values);
+            buffer
+        };
+        let head_args = |use_weight: u32| {
+            let buffer = shared(12);
+            unsafe {
+                let args = buffer.contents().cast::<u8>();
+                *args.cast::<u32>() = layer.head_dim as u32;
+                *args.add(4).cast::<f32>() = layer.eps;
+                *args.add(8).cast::<u32>() = use_weight;
+            }
+            buffer
+        };
+        let rope_args = |heads: usize| {
+            let buffer = shared(16);
+            unsafe {
+                let args = buffer.contents().cast::<u32>();
+                *args = heads as u32;
+                *args.add(1) = layer.head_dim as u32;
+                *args.add(2) = (layer.head_dim / 2) as u32;
+                *args.add(3) = 1;
+            }
+            buffer
+        };
+        Self {
+            attn_norm: upload(&layer.attn_norm),
+            q_norm: upload(&layer.q_norm),
+            k_norm: upload(&layer.k_norm),
+            post_attn_norm: upload(&layer.post_attn_norm),
+            ffn_norm: upload(&layer.ffn_norm),
+            post_ffw_norm: upload(&layer.post_ffw_norm),
+            weighted_head_args: head_args(1),
+            unweighted_head_args: head_args(0),
+            rope_q_args: rope_args(layer.n_heads),
+            rope_k_args: rope_args(layer.n_kv_heads),
+        }
+    }
+}
+
 /// Reusable width-sixteen scratch for the dense Gemma 4 12B verifier.  The large
 /// Q4 term slab is private GPU memory; everything read back or populated by the
-/// host stays in coherent shared storage.  No model weights are duplicated.
+/// host stays in coherent shared storage. Only the small norm constants are
+/// copied; the projection weights retain their existing resident buffers.
 #[cfg(target_os = "macos")]
 struct Gemma4Dense12bVerifierScratch {
+    layer_constants: Vec<Gemma4Dense12bLayerConstants>,
     act_a: Buffer,
     act_b: Buffer,
     mid: Buffer,
@@ -17965,7 +18031,11 @@ impl Gemma4Dense12bVerifierScratch {
         Some(legacy_terms.max(gemma4_q4_mma_stage16_bytes(activation_blocks)?))
     }
 
-    fn new(kernel: &MetalLinearKernel, max_positions: usize) -> Option<Self> {
+    fn new(
+        kernel: &MetalLinearKernel,
+        max_positions: usize,
+        layers: &[Gemma4ResidentLayer],
+    ) -> Option<Self> {
         let shared = |elements: usize, element_bytes: usize| -> Option<Buffer> {
             Some(kernel.device.new_buffer(
                 elements.checked_mul(element_bytes)? as u64,
@@ -17982,6 +18052,10 @@ impl Gemma4Dense12bVerifierScratch {
             .device
             .new_buffer(term_bytes as u64, MTLResourceOptions::StorageModePrivate);
         Some(Self {
+            layer_constants: layers
+                .iter()
+                .map(|layer| Gemma4Dense12bLayerConstants::new(&kernel.device, layer))
+                .collect(),
             act_a: f32s(Self::row_elements(Self::HIDDEN)?)?,
             act_b: f32s(Self::row_elements(Self::HIDDEN)?)?,
             mid: f32s(Self::row_elements(Self::HIDDEN)?)?,
@@ -18377,6 +18451,7 @@ impl Gemma4ResidentModel {
             *scratch_guard = Some(Gemma4Dense12bVerifierScratch::new(
                 kernel,
                 self.max_positions,
+                &self.layers,
             )?);
         }
         let scratch = scratch_guard.as_ref()?;
@@ -18438,27 +18513,22 @@ impl Gemma4ResidentModel {
                 (&scratch.act_b, &scratch.act_a)
             };
 
-            let attn_norm = upload_f32(&layer.attn_norm);
-            let q_norm = upload_f32(&layer.q_norm);
-            let k_norm = upload_f32(&layer.k_norm);
-            let post_attn_norm = upload_f32(&layer.post_attn_norm);
-            let ffn_norm = upload_f32(&layer.ffn_norm);
-            let post_ffw_norm = upload_f32(&layer.post_ffw_norm);
-            keep.extend([
-                attn_norm.to_owned(),
-                q_norm.to_owned(),
-                k_norm.to_owned(),
-                post_attn_norm.to_owned(),
-                ffn_norm.to_owned(),
-                post_ffw_norm.to_owned(),
-            ]);
+            // Scratch owns these buffers through the command-buffer wait;
+            // no per-round upload or extra `keep` retention is necessary.
+            let constants = &scratch.layer_constants[layer_idx];
+            let attn_norm = &constants.attn_norm;
+            let q_norm = &constants.q_norm;
+            let k_norm = &constants.k_norm;
+            let post_attn_norm = &constants.post_attn_norm;
+            let ffn_norm = &constants.ffn_norm;
+            let post_ffw_norm = &constants.post_ffw_norm;
 
             // Attention input norm and one shared Q8_0 activation panel.
             encode_rms_norm_batch(
                 kernel,
                 encoder,
                 current,
-                &attn_norm,
+                attn_norm,
                 &scratch.norm,
                 &keep[5],
                 columns,
@@ -18522,32 +18592,11 @@ impl Gemma4ResidentModel {
                 }
             }
 
-            let q_head_args = shared(12);
-            let k_head_args = shared(12);
-            let v_head_args = shared(12);
-            for (buffer, use_weight) in [
-                (&q_head_args, 1u32),
-                (&k_head_args, 1u32),
-                (&v_head_args, 0u32),
-            ] {
-                unsafe {
-                    let args = buffer.contents().cast::<u8>();
-                    *args.cast::<u32>() = layer.head_dim as u32;
-                    *args.add(4).cast::<f32>() = layer.eps;
-                    *args.add(8).cast::<u32>() = use_weight;
-                }
-            }
-            let rope_q_args = shared(16);
-            let rope_k_args = shared(16);
-            for (buffer, heads) in [(&rope_q_args, HEADS), (&rope_k_args, layer.n_kv_heads)] {
-                unsafe {
-                    let args = buffer.contents().cast::<u32>();
-                    *args = heads as u32;
-                    *args.add(1) = layer.head_dim as u32;
-                    *args.add(2) = (layer.head_dim / 2) as u32;
-                    *args.add(3) = 1;
-                }
-            }
+            let q_head_args = &constants.weighted_head_args;
+            let k_head_args = &constants.weighted_head_args;
+            let v_head_args = &constants.unweighted_head_args;
+            let rope_q_args = &constants.rope_q_args;
+            let rope_k_args = &constants.rope_k_args;
             let mut cos_all = Vec::with_capacity(columns * layer.head_dim / 2);
             let mut sin_all = Vec::with_capacity(columns * layer.head_dim / 2);
             for inputs in inputs_by_row {
@@ -18556,24 +18605,16 @@ impl Gemma4ResidentModel {
             }
             let cos = upload_f32(&cos_all);
             let sin = upload_f32(&sin_all);
-            keep.extend([
-                q_head_args.to_owned(),
-                k_head_args.to_owned(),
-                v_head_args.to_owned(),
-                rope_q_args.to_owned(),
-                rope_k_args.to_owned(),
-                cos.to_owned(),
-                sin.to_owned(),
-            ]);
+            keep.extend([cos.to_owned(), sin.to_owned()]);
 
             if batch_row_ops {
                 encode_rms_norm_per_head(
                     encoder,
                     kernel,
                     &scratch.q_raw,
-                    &q_norm,
+                    q_norm,
                     &scratch.q_normed,
-                    &q_head_args,
+                    q_head_args,
                     columns * HEADS,
                     0,
                 );
@@ -18581,9 +18622,9 @@ impl Gemma4ResidentModel {
                     encoder,
                     kernel,
                     &scratch.k_raw,
-                    &k_norm,
+                    k_norm,
                     &scratch.k_normed,
-                    &k_head_args,
+                    k_head_args,
                     columns * layer.n_kv_heads,
                     0,
                 );
@@ -18594,15 +18635,15 @@ impl Gemma4ResidentModel {
                         .v_w
                         .as_ref()
                         .map_or(&scratch.k_raw, |_| &scratch.v_raw),
-                    &q_norm,
+                    q_norm,
                     &scratch.v_normed,
-                    &v_head_args,
+                    v_head_args,
                     columns * layer.n_kv_heads,
                     0,
                 );
                 for (data, args, heads) in [
-                    (&scratch.q_normed, &rope_q_args, HEADS),
-                    (&scratch.k_normed, &rope_k_args, layer.n_kv_heads),
+                    (&scratch.q_normed, rope_q_args, HEADS),
+                    (&scratch.k_normed, rope_k_args, layer.n_kv_heads),
                 ] {
                     encoder.set_compute_pipeline_state(&kernel.rope_rotate_batch_pipeline);
                     encoder.set_buffer(0, Some(data), 0);
@@ -18626,9 +18667,9 @@ impl Gemma4ResidentModel {
                         encoder,
                         kernel,
                         &scratch.q_raw,
-                        &q_norm,
+                        q_norm,
                         &scratch.q_normed,
-                        &q_head_args,
+                        q_head_args,
                         HEADS,
                         q_offset,
                     );
@@ -18636,9 +18677,9 @@ impl Gemma4ResidentModel {
                         encoder,
                         kernel,
                         &scratch.k_raw,
-                        &k_norm,
+                        k_norm,
                         &scratch.k_normed,
-                        &k_head_args,
+                        k_head_args,
                         layer.n_kv_heads,
                         kv_offset,
                     );
@@ -18649,9 +18690,9 @@ impl Gemma4ResidentModel {
                             .v_w
                             .as_ref()
                             .map_or(&scratch.k_raw, |_| &scratch.v_raw),
-                        &q_norm,
+                        q_norm,
                         &scratch.v_normed,
-                        &v_head_args,
+                        v_head_args,
                         layer.n_kv_heads,
                         kv_offset,
                     );
@@ -18662,7 +18703,7 @@ impl Gemma4ResidentModel {
                         &scratch.q_normed,
                         &cos,
                         &sin,
-                        &rope_q_args,
+                        rope_q_args,
                         HEADS,
                         layer.head_dim / 2,
                         q_offset,
@@ -18674,7 +18715,7 @@ impl Gemma4ResidentModel {
                         &scratch.k_normed,
                         &cos,
                         &sin,
-                        &rope_k_args,
+                        rope_k_args,
                         layer.n_kv_heads,
                         layer.head_dim / 2,
                         kv_offset,
@@ -18870,7 +18911,7 @@ impl Gemma4ResidentModel {
                 kernel,
                 encoder,
                 &scratch.projection,
-                &post_attn_norm,
+                post_attn_norm,
                 &scratch.post,
                 &keep[5],
                 columns,
@@ -18892,7 +18933,7 @@ impl Gemma4ResidentModel {
                 kernel,
                 encoder,
                 &scratch.mid,
-                &ffn_norm,
+                ffn_norm,
                 &scratch.norm,
                 &keep[5],
                 columns,
@@ -18975,7 +19016,7 @@ impl Gemma4ResidentModel {
                 kernel,
                 encoder,
                 &scratch.down,
-                &post_ffw_norm,
+                post_ffw_norm,
                 &scratch.post,
                 &keep[5],
                 columns,
@@ -40854,6 +40895,185 @@ mod tests {
         .expect("W16 global attention plan at verifier capacity");
         assert_eq!(attention_bytes, 516_608);
         assert!(Scratch::q4_work_bytes().unwrap() >= attention_bytes);
+    }
+
+    /// Resident constants keep the original bits after their CPU source is
+    /// dropped, and reusing them across widths/positions leaves RoPE dynamic.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_dense_verifier_constants_preserve_norm_and_dynamic_rope() {
+        use super::*;
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal pipelines");
+        let shared = |bytes: usize| {
+            kernel
+                .device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let upload = |values: &[f32]| {
+            let buffer = shared(std::mem::size_of_val(values));
+            write_buffer_f32(&buffer, values);
+            buffer
+        };
+        for (head_dim, kv_heads) in [(256usize, 8usize), (512, 1)] {
+            let norms: Vec<Vec<f32>> = (0..6)
+                .map(|which| {
+                    let len = if which == 1 || which == 2 {
+                        head_dim
+                    } else {
+                        3840
+                    };
+                    (0..len)
+                        .map(|i| 0.75 + (which * 17 + i % 31) as f32 * 0.003)
+                        .collect()
+                })
+                .collect();
+            let placeholder = shared(4);
+            let layer = Gemma4ResidentLayer {
+                attn_norm: norms[0].clone(),
+                q_norm: norms[1].clone(),
+                k_norm: norms[2].clone(),
+                post_attn_norm: norms[3].clone(),
+                ffn_norm: norms[4].clone(),
+                post_ffw_norm: norms[5].clone(),
+                q_w: placeholder.clone(),
+                k_w: placeholder.clone(),
+                v_w: None,
+                o_w: placeholder.clone(),
+                gate_w: placeholder.clone(),
+                up_w: placeholder.clone(),
+                down_w: placeholder,
+                fmt: GemmaWireFmt::Q4_0,
+                q4_layout: Gemma4Q4WeightLayout::WireRowMajor,
+                n_heads: 16,
+                n_kv_heads: kv_heads,
+                head_dim,
+                ffn_dim: 15360,
+                eps: 1.0e-6,
+                _owned_wire_pages: Vec::new(),
+            };
+            let cached = Gemma4Dense12bLayerConstants::new(&kernel.device, &layer);
+            drop(layer);
+            for (buffer, expected) in [
+                &cached.attn_norm,
+                &cached.q_norm,
+                &cached.k_norm,
+                &cached.post_attn_norm,
+                &cached.ffn_norm,
+                &cached.post_ffw_norm,
+            ]
+            .into_iter()
+            .zip(&norms)
+            {
+                let mut actual = vec![0.0; expected.len()];
+                read_buffer_f32(buffer, &mut actual);
+                assert!(actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()));
+            }
+            let words = |buffer: &Buffer, count: usize| unsafe {
+                std::slice::from_raw_parts(buffer.contents().cast::<u32>(), count).to_vec()
+            };
+            assert_eq!(
+                words(&cached.weighted_head_args, 3),
+                vec![head_dim as u32, 1.0e-6f32.to_bits(), 1]
+            );
+            assert_eq!(
+                words(&cached.unweighted_head_args, 3),
+                vec![head_dim as u32, 1.0e-6f32.to_bits(), 0]
+            );
+            assert_eq!(
+                words(&cached.rope_k_args, 4),
+                vec![kv_heads as u32, head_dim as u32, (head_dim / 2) as u32, 1]
+            );
+
+            let legacy_norm = upload(&norms[1]);
+            let legacy_head_args = shared(12);
+            let legacy_rope_args = shared(16);
+            unsafe {
+                let args = legacy_head_args.contents().cast::<u8>();
+                *args.cast::<u32>() = head_dim as u32;
+                *args.add(4).cast::<f32>() = 1.0e-6;
+                *args.add(8).cast::<u32>() = 1;
+                let args = legacy_rope_args.contents().cast::<u32>();
+                *args = 16;
+                *args.add(1) = head_dim as u32;
+                *args.add(2) = (head_dim / 2) as u32;
+                *args.add(3) = 1;
+            }
+            for (columns, position) in [(1usize, 0usize), (8, 19), (2, 63), (16, 127)] {
+                let count = columns * 16 * head_dim;
+                let values: Vec<f32> = (0..count)
+                    .map(|i| ((i % 113) as f32 - 56.0) * 0.017)
+                    .collect();
+                let input = upload(&values);
+                let outputs = [shared(count * 4), shared(count * 4)];
+                let half = head_dim / 2;
+                let angles: Vec<f32> = (0..columns * half)
+                    .map(|i| (position + i / half) as f32 * (i % half) as f32 * 0.001)
+                    .collect();
+                let cos = upload(&angles.iter().map(|x| x.cos()).collect::<Vec<_>>());
+                let sin = upload(&angles.iter().map(|x| x.sin()).collect::<Vec<_>>());
+                let cb = kernel.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                for (output, norm, head_args, rope_args) in [
+                    (
+                        &outputs[0],
+                        &legacy_norm,
+                        &legacy_head_args,
+                        &legacy_rope_args,
+                    ),
+                    (
+                        &outputs[1],
+                        &cached.q_norm,
+                        &cached.weighted_head_args,
+                        &cached.rope_q_args,
+                    ),
+                ] {
+                    encode_rms_norm_per_head(
+                        encoder,
+                        &kernel,
+                        &input,
+                        norm,
+                        output,
+                        head_args,
+                        columns * 16,
+                        0,
+                    );
+                    encoder.set_compute_pipeline_state(&kernel.rope_rotate_batch_pipeline);
+                    encoder.set_buffer(0, Some(output), 0);
+                    encoder.set_buffer(1, Some(&cos), 0);
+                    encoder.set_buffer(2, Some(&sin), 0);
+                    for index in 0..4u64 {
+                        encoder.set_buffer(3 + index, Some(rope_args), index * 4);
+                    }
+                    dispatch_2d_rows(
+                        encoder,
+                        &kernel.rope_rotate_batch_pipeline,
+                        16 * half,
+                        columns,
+                    );
+                }
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                let mut expected = vec![0.0; count];
+                let mut actual = vec![0.0; count];
+                read_buffer_f32(&outputs[0], &mut expected);
+                read_buffer_f32(&outputs[1], &mut actual);
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "head_dim={head_dim} columns={columns} position={position}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
