@@ -1047,6 +1047,77 @@ kernel void mtp12_q4_0_gemv_staged(
     }
 }
 
+// NOT BIT-IDENTICAL.  Each row is folded by `splits` simdgroups that each own
+// a DISJOINT contiguous range of the row's blocks; the per-simdgroup partials
+// are then summed in simdgroup order.  Every simdgroup runs the per-row
+// program of mtp12_q4_0_gemv verbatim over its own range (same lane->block
+// stride, same accumulation statement, same shuffle fold), but the row total
+// is (r0 + r1 [+ r2 + r3]) instead of one 32-lane fold over all blocks, so the
+// float addition order differs and the drafts it produces are NOT the
+// established drafts.  It exists only to measure whether the 1024-row shapes
+// are simdgroup-parallelism starved (CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4=4 for
+// two splits, =5 for four); it is excluded from the bit gates by construction
+// and must not ship without an acceptance re-measurement.
+kernel void mtp12_q4_0_gemv_split(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    constant uint& splits [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partials[4];
+    // `row` is threadgroup-uniform, so the whole group leaves together and no
+    // thread reaches the barrier alone.
+    if (row >= rows) return;
+    const uint blocks_per_row = cols / 32u;
+    device const uchar* row_bytes = q4_weights + weight_byte_offset
+        + ulong(row) * ulong(blocks_per_row) * 18ul;
+    const uint per_split = (blocks_per_row + splits - 1u) / splits;
+    const uint begin = sg * per_split;
+    const uint end = min(begin + per_split, blocks_per_row);
+    float partial = 0.0f;
+    for (uint block_index = begin + lane; block_index < end; block_index += 32u) {
+        device const uchar* block = row_bytes + ulong(block_index) * 18ul;
+        const float d = float(*reinterpret_cast<device const half*>(block));
+        device const packed_uchar4* q4 =
+            reinterpret_cast<device const packed_uchar4*>(block + 2);
+        const uint input_base = block_index * 32u;
+        #pragma unroll
+        for (uint k = 0u; k < 4u; ++k) {
+            const uchar4 packed = uchar4(q4[k]);
+            const uint offset = k * 4u;
+            partial += d * (
+                float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+              + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+              + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+              + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+              + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+              + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+              + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+              + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+        }
+    }
+    partial += simd_shuffle_down(partial, ushort(16));
+    partial += simd_shuffle_down(partial, ushort(8));
+    partial += simd_shuffle_down(partial, ushort(4));
+    const float pair01 =
+        simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+    const float pair23 =
+        simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+    if (lane == 0u) partials[sg] = pair01 + pair23;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane == 0u) {
+        float value = partials[0];
+        for (uint split = 1u; split < splits; ++split) value += partials[split];
+        output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+    }
+}
+
 // Gate row, up row and the GELU gate in one dispatch
 // (CAMELID_GEMMA4_MTP12_FUSE_GATEUP=1), x4 geometry.  The simdgroup computes
 // the gate row and then the up row with two independent copies of the
@@ -2544,7 +2615,11 @@ struct Mtp12FuseFlags {
     /// `mtp12_q4_0_gemv_x4` (four rows per 128-thread group), `2` =
     /// `mtp12_q4_0_gemv_staged` (register-staged inputs, `gemv_staged_rows`
     /// rows per simdgroup) for cols <= 1024 with the established kernel for
-    /// wider rows, `3` = staged for every shape.
+    /// wider rows, `3` = staged for every shape.  Levels `4` and `5` select
+    /// `mtp12_q4_0_gemv_split` with two and four simdgroups per row: those two
+    /// fold each row in a different order and are therefore NOT bit-identical
+    /// - they are a measurement lane only, and enabling them changes the
+    /// drafts and invalidates the acceptance rate.
     gemv_x4: u8,
     /// `CAMELID_GEMMA4_MTP12_GEMV_STAGED_ROWS` (1..=64, default 4): rows each
     /// simdgroup of `mtp12_q4_0_gemv_staged` walks.
@@ -2591,8 +2666,11 @@ const MTP12_FUSE_NORM_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_NORM";
 const MTP12_FUSE_QROPE_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_QROPE";
 const MTP12_FUSE_SOFTMAX_CTX_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX";
 const MTP12_FUSE_HEAD_PREFETCH_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH";
-/// Highest listed `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4` level.
-const MTP12_FUSE_GEMV_X4_MAX: u8 = 3;
+/// Highest listed `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4` level.  Levels 4 and 5
+/// select the deliberately NON-bit-identical split-block experiment.
+const MTP12_FUSE_GEMV_X4_MAX: u8 = 5;
+/// Lowest `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4` level that changes the drafts.
+const MTP12_FUSE_GEMV_X4_FIRST_INEXACT: u8 = 4;
 const MTP12_GEMV_STAGED_ROWS_DEFAULT: u32 = 4;
 const MTP12_GEMV_STAGED_ROWS_MAX: u32 = 64;
 
@@ -2646,8 +2724,16 @@ fn mtp12_fuse_flags_from_env() -> std::result::Result<Mtp12FuseFlags, String> {
     let flag = |name: &str| -> std::result::Result<bool, String> {
         mtp12_fuse_flag(name, read(name)?.as_deref())
     };
+    let gemv_x4 = level(MTP12_FUSE_GEMV_X4_ENV, MTP12_FUSE_GEMV_X4_MAX)?;
+    if gemv_x4 >= MTP12_FUSE_GEMV_X4_FIRST_INEXACT {
+        eprintln!(
+            "[gemma4-mtp12] WARNING: {MTP12_FUSE_GEMV_X4_ENV}={gemv_x4} selects the split-block \
+             GEMV experiment, which folds each row in a different order and does NOT produce the \
+             established drafts; acceptance must be re-measured."
+        );
+    }
     Ok(Mtp12FuseFlags {
-        gemv_x4: level(MTP12_FUSE_GEMV_X4_ENV, MTP12_FUSE_GEMV_X4_MAX)?,
+        gemv_x4,
         gemv_staged_rows: mtp12_gemv_staged_rows(read(MTP12_GEMV_STAGED_ROWS_ENV)?.as_deref())?,
         gate_up: flag(MTP12_FUSE_GATEUP_ENV)?,
         norm: flag(MTP12_FUSE_NORM_ENV)?,
@@ -2687,6 +2773,8 @@ struct Mtp12Pipelines {
     /// Draft-side fused / regeometried kernels (`CAMELID_GEMMA4_MTP12_FUSE_*`).
     q4_gemv_x4: ComputePipelineState,
     q4_gemv_staged: ComputePipelineState,
+    /// NOT bit-identical; bench/experiment only (`FUSE_GEMV_X4=4/5`).
+    q4_gemv_split: ComputePipelineState,
     q4_gemv_gate_up_gelu: ComputePipelineState,
     q4_gemv_shortlist_compact_prefetch: ComputePipelineState,
     q4_gemv_shortlist_compact_staged: ComputePipelineState,
@@ -2739,6 +2827,7 @@ impl Mtp12Pipelines {
             attention_context_v2: pipeline("mtp12_attention_context_v2")?,
             q4_gemv_x4: pipeline("mtp12_q4_0_gemv_x4")?,
             q4_gemv_staged: pipeline("mtp12_q4_0_gemv_staged")?,
+            q4_gemv_split: pipeline("mtp12_q4_0_gemv_split")?,
             q4_gemv_gate_up_gelu: pipeline("mtp12_q4_0_gemv_gate_up_gelu")?,
             q4_gemv_shortlist_compact_prefetch: pipeline(
                 "mtp12_q4_0_gemv_compact_local_prefetch",
@@ -4692,7 +4781,9 @@ impl Gemma4Mtp12AssistantMetal {
     /// `mtp12_q4_0_gemv_x4`, `2` = `mtp12_q4_0_gemv_staged` for rows of at
     /// most 1024 columns (one block per lane) and the established kernel for
     /// wider rows, `3` = staged for every shape, unset = the established
-    /// `mtp12_q4_0_gemv`; every route produces the same bits.
+    /// `mtp12_q4_0_gemv`; every one of those routes produces the same bits.
+    /// Levels `4`/`5` route to the NON-bit-identical `mtp12_q4_0_gemv_split`
+    /// (two/four simdgroups per row) and exist only for measurement.
     fn encode_dense_gemv_at_offset(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -4711,7 +4802,10 @@ impl Gemma4Mtp12AssistantMetal {
             3 => true,
             _ => false,
         };
-        if staged {
+        if let Some(splits) = mtp12_gemv_split_count(self.fuse.gemv_x4) {
+            encode_q4_gemv_split(encoder, &self.pipelines.q4_gemv_split, &self.packed_q4,
+                input, output, output_byte_offset, matrix, round_output_bf16, splits);
+        } else if staged {
             encode_q4_gemv_staged(encoder, &self.pipelines.q4_gemv_staged, &self.packed_q4,
                 input, output, output_byte_offset, matrix, round_output_bf16,
                 self.fuse.gemv_staged_rows);
@@ -5345,6 +5439,57 @@ fn encode_q4_gemv_staged(
         },
         MTLSize {
             width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Simdgroups per row for the split-block experiment, or `None` when the
+/// selector level is one of the bit-identical routes.
+fn mtp12_gemv_split_count(level: u8) -> Option<u32> {
+    match level {
+        4 => Some(2),
+        5 => Some(4),
+        _ => None,
+    }
+}
+
+/// `mtp12_q4_0_gemv_split`: `splits` simdgroups per row, each folding a
+/// disjoint contiguous block range, combined in simdgroup order.  NOT
+/// bit-identical to `mtp12_q4_0_gemv` - measurement lane only.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_gemv_split(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    output_byte_offset: u64,
+    matrix: Q4TensorRef,
+    round_output_bf16: bool,
+    splits: u32,
+) {
+    debug_assert!((2..=4).contains(&splits));
+    let round = u32::from(round_output_bf16);
+    let splits = splits.clamp(1, 4);
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(weights), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), output_byte_offset);
+    encoder.set_bytes(3, 4, &matrix.cols as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &matrix.rows as *const u32 as *const c_void);
+    encoder.set_bytes(5, 8, &matrix.byte_offset as *const u64 as *const c_void);
+    encoder.set_bytes(6, 4, &round as *const u32 as *const c_void);
+    encoder.set_bytes(7, 4, &splits as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: matrix.rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: (splits * 32) as u64,
             height: 1,
             depth: 1,
         },
@@ -7879,6 +8024,16 @@ mod tests {
                 assert!(mtp12_fuse_level("X", Some(&(max + 1).to_string()), max).is_err());
             }
         }
+        // Levels 0..=3 are the bit-identical dense-GEMV routes gated by
+        // gemv_x4_matches_gemv_bit_for_bit; 4 and 5 are the split-block
+        // experiment, which is deliberately excluded from that gate.
+        assert_eq!(MTP12_FUSE_GEMV_X4_MAX, 5);
+        assert_eq!(MTP12_FUSE_GEMV_X4_FIRST_INEXACT, 4);
+        for level in 0..MTP12_FUSE_GEMV_X4_FIRST_INEXACT {
+            assert!(mtp12_gemv_split_count(level).is_none(), "level {level} must be exact");
+        }
+        assert_eq!(mtp12_gemv_split_count(4), Some(2));
+        assert_eq!(mtp12_gemv_split_count(5), Some(4));
         assert_eq!(mtp12_gemv_staged_rows(None).unwrap(), MTP12_GEMV_STAGED_ROWS_DEFAULT);
         for rows in [1u32, 2, 4, 8, 16, MTP12_GEMV_STAGED_ROWS_MAX] {
             assert_eq!(mtp12_gemv_staged_rows(Some(&rows.to_string())).unwrap(), rows);
@@ -7988,6 +8143,8 @@ mod tests {
     /// inputs) at every `CAMELID_GEMMA4_MTP12_GEMV_STAGED_ROWS` value the gate
     /// lists.  Levels 2 and 3 differ only in which shapes they route to the
     /// staged kernel, so covering the kernel at all six shapes covers both.
+    /// Levels 4 and 5 (`mtp12_q4_0_gemv_split`) fold each row in a different
+    /// order and are deliberately NOT covered here; they are a bench-only lane.
     #[test]
     fn gemv_x4_matches_gemv_bit_for_bit() {
         let Some(device) = Device::system_default() else { return; };
@@ -8299,10 +8456,13 @@ mod tests {
         }
     }
 
-    /// GB/s per production GEMV shape, established one-row-per-group vs x4
-    /// (30 encodes per command buffer, hardware timestamps), plus the fused
-    /// gate/up/GELU vs three dispatches and a synthetic 262,144-row compact
-    /// head (random 384-of-2048 selection) with and without the row prefetch.
+    /// GB/s per production GEMV shape (30 encodes per command buffer, hardware
+    /// timestamps): the established one-row-per-group kernel, x4, the
+    /// register-staged kernel at five rows-per-simdgroup values and the
+    /// NON-bit-identical split-block experiment at two and four simdgroups per
+    /// row; plus the fused gate/up/GELU vs three dispatches and a synthetic
+    /// 262,144-row compact head (random 384-of-2048 selection) with the row
+    /// prefetch and the register-staged variants.
     #[test]
     #[ignore]
     fn assistant_gemv_bench_shapes() {
@@ -8343,15 +8503,38 @@ mod tests {
             let weights = random_q4_weights(&device, 0, matrix.byte_len as usize, 500 + index as u64);
             let input = f32_buffer(&device, &random_bf16_values(cols, 600 + index as u64, false)).unwrap();
             let output = shared_buffer(&device, rows * 4);
+            let report = |label: String, us: f64| {
+                eprintln!(
+                    "[mtp12-gemv-bench] {rows:>5}x{cols:<5} {label:<26} {us:8.1} us  {:6.1} GB/s",
+                    matrix.byte_len as f64 / us / 1.0e3
+                );
+            };
             for (label, x4) in [("gemv", false), ("gemv_x4", true)] {
                 let pipeline = if x4 { &pipelines.q4_gemv_x4 } else { &pipelines.q4_gemv };
                 let us = time(&|encoder| {
                     encode_q4_gemv_at_offset(encoder, pipeline, &weights, &input, &output, 0, matrix, true, x4);
                 });
-                eprintln!(
-                    "[mtp12-gemv-bench] {rows:>5}x{cols:<5} {label:<8} {us:8.1} us  {:6.1} GB/s",
-                    matrix.byte_len as f64 / us / 1.0e3
-                );
+                report(label.to_string(), us);
+            }
+            for rows_per_group in [1u32, 2, 4, 8, 16] {
+                let us = time(&|encoder| {
+                    encode_q4_gemv_staged(
+                        encoder, &pipelines.q4_gemv_staged, &weights, &input, &output, 0, matrix,
+                        true, rows_per_group,
+                    );
+                });
+                report(format!("gemv_staged rows={rows_per_group}"), us);
+            }
+            // NOT bit-identical (different fold order); reported so the
+            // simdgroup-parallelism ceiling of the 1024-row shapes is visible.
+            for splits in [2u32, 4] {
+                let us = time(&|encoder| {
+                    encode_q4_gemv_split(
+                        encoder, &pipelines.q4_gemv_split, &weights, &input, &output, 0, matrix,
+                        true, splits,
+                    );
+                });
+                report(format!("gemv_split x{splits} (INEXACT)"), us);
             }
         }
         {
@@ -8400,6 +8583,7 @@ mod tests {
             for (label, pipeline) in [
                 ("compact_local", &pipelines.q4_gemv_shortlist_compact),
                 ("compact_local_prefetch", &pipelines.q4_gemv_shortlist_compact_prefetch),
+                ("compact_local_staged", &pipelines.q4_gemv_shortlist_compact_staged),
             ] {
                 let us = time(&|encoder| {
                     encoder.set_buffer(7, Some(&clusters), 0);

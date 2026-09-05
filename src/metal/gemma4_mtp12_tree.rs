@@ -1017,6 +1017,15 @@ mod tests {
                 singles.push((format!("GEMV_X4={level} STAGED_ROWS={rows}"), staged(level, rows)));
             }
         }
+        // Levels 4/5 fold each row in a different order: they change the
+        // drafts, so they are measured but must never be reported as a
+        // shippable lane without an acceptance re-measurement.
+        for level in [4u8, 5] {
+            singles.push((
+                format!("GEMV_X4={level} (INEXACT split x{})", if level == 4 { 2 } else { 4 }),
+                Mtp12FuseFlags { gemv_x4: level, ..Default::default() },
+            ));
+        }
         singles.push(("GATEUP=1".to_string(), Mtp12FuseFlags { gate_up: true, ..Default::default() }));
         singles.push(("NORM=1".to_string(), Mtp12FuseFlags { norm: true, ..Default::default() }));
         singles.push(("QROPE=1".to_string(), Mtp12FuseFlags { qrope: true, ..Default::default() }));
@@ -1071,7 +1080,9 @@ mod tests {
                     .min_by(|a, b| a.2.total_cmp(&b.2))
                     .cloned()
             };
-            let best_gemv = best(&|f| f.gemv_x4 != 0);
+            // The all-on-best combination stays bit-identical: the split
+            // levels are measured above but never folded into it.
+            let best_gemv = best(&|f| f.gemv_x4 != 0 && f.gemv_x4 < MTP12_FUSE_GEMV_X4_FIRST_INEXACT);
             let best_softmax = best(&|f| f.softmax_ctx != 0);
             let best_head = best(&|f| f.head_prefetch != 0);
             let best_gateup = best(&|f| f.gate_up);
