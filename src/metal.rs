@@ -633,6 +633,45 @@ fn command_buffer_gpu_times_us(cb: &metal::CommandBuffer) -> (u128, u128) {
     }
 }
 
+/// `CAMELID_GEMMA4_METAL_HEAD_TIMING=1`, read once per process. Gates the
+/// hardware-timestamp queries and the `[gemma4-metal-head-batch]` trace lines
+/// of the speculative head; it never changes what the head computes.
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_metal_head_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// GPU busy window (µs) of the most recent ordered-Q4 K-wide verifier command
+/// buffer. Written only when `CAMELID_GEMMA4_VERIFY_TRACE` or
+/// `CAMELID_GEMMA4_METAL_HEAD_TIMING` is set, so the default path never
+/// queries the timestamps; stays zero otherwise. Read by the MTP12 round loop
+/// for the per-round (decoder GPU, head) split in its receipts.
+#[cfg(target_os = "macos")]
+pub(crate) static GEMMA4_LAST_VERIFY_GPU_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Timing of the most recent [`Gemma4Q6KHead::forward_argmax_spec50_batch`]
+/// call, summed over its ordered chunks (W16 = two K8 chunks). `gpu_us` /
+/// `kernel_us` are hardware timestamps and stay zero unless
+/// `CAMELID_GEMMA4_METAL_HEAD_TIMING=1`; the wall fields are always kept.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Gemma4Spec50HeadTiming {
+    pub columns: u32,
+    /// CPU output rms_norm + Q8_K quantize + scratch upload.
+    pub cpu_us: u64,
+    /// Command-buffer commit -> completed.
+    pub wait_us: u64,
+    pub gpu_us: u64,
+    pub kernel_us: u64,
+    /// Whole call, including the mutex and the id readback.
+    pub wall_us: u64,
+}
+
 /// IEEE 754 binary16 bits -> f32. Exact in every case (f32 covers the whole f16 range,
 /// subnormals included), so it is the exact inverse of [`f32_to_f16_bits`] on any value that
 /// round-trips. Used by the KV readback when the resident cache is in half mode.
@@ -17320,6 +17359,9 @@ struct Gemma4Q6KHeadInner {
     /// The dense Gemma lane pins the parity-preserving ordered kernel even when
     /// an unrelated Ghost-MoE benchmark has enabled its reassociated turbo path.
     allow_turbo: bool,
+    /// Timing of the last speculative (SPEC50) head call; see
+    /// [`Gemma4Q6KHead::last_spec50_timing`].
+    last_spec50_timing: Gemma4Spec50HeadTiming,
 }
 
 #[cfg(target_os = "macos")]
@@ -17485,6 +17527,7 @@ impl Gemma4Q6KHead {
                 vocab,
                 softcap,
                 allow_turbo,
+                last_spec50_timing: Gemma4Spec50HeadTiming::default(),
             }),
             _mmap: mmap,
         })
@@ -17644,12 +17687,18 @@ impl Gemma4Q6KHead {
     /// [`Self::forward`]: the established ordered full-logit path remains the
     /// default until whole-model token parity admits this lane.
     pub(crate) fn forward_argmax_spec50_batch(&self, hidden_rows: &[f32]) -> Option<Vec<u32>> {
+        let call_started = std::time::Instant::now();
+        let timing_enabled = gemma4_metal_head_timing_enabled();
         let mut state = self.inner.lock().ok()?;
         if state.hidden == 0 || !hidden_rows.len().is_multiple_of(state.hidden) {
             return None;
         }
         let columns = hidden_rows.len() / state.hidden;
         let chunks = Self::gemma4_spec50_head_chunk_ranges(columns)?;
+        let mut timing = Gemma4Spec50HeadTiming {
+            columns: columns as u32,
+            ..Gemma4Spec50HeadTiming::default()
+        };
         let n_superblocks = state.hidden / 256;
         let kernels = spec50_head::spec50_head_kernels()?;
         if state.batch.is_none() {
@@ -17671,6 +17720,7 @@ impl Gemma4Q6KHead {
         let batch = state.batch.as_ref()?;
         let mut ids = Vec::with_capacity(columns);
         for rows in chunks {
+            let cpu_started = std::time::Instant::now();
             let chunk_columns = rows.end.checked_sub(rows.start)?;
             let mut scales = Vec::with_capacity(chunk_columns * n_superblocks);
             let mut quants = Vec::with_capacity(chunk_columns * state.hidden);
@@ -17699,7 +17749,9 @@ impl Gemma4Q6KHead {
                     quants.len(),
                 );
             }
+            let cpu_us = cpu_started.elapsed().as_micros() as u64;
 
+            let encode_started = std::time::Instant::now();
             let command_buffer = kernels.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             if !spec50_head::encode_q6k_spec50_batch(
@@ -17730,12 +17782,22 @@ impl Gemma4Q6KHead {
                 chunk_columns,
             );
             encoder.end_encoding();
+            let encode_us = encode_started.elapsed().as_micros() as u64;
+            let wait_started = std::time::Instant::now();
             command_buffer.commit();
             command_buffer.wait_until_completed();
+            let wait_us = wait_started.elapsed().as_micros() as u64;
             if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
                 return None;
             }
+            let (gpu_us, kernel_us) = if timing_enabled {
+                let (gpu, kernel) = command_buffer_gpu_times_us(&command_buffer.to_owned());
+                (gpu as u64, kernel as u64)
+            } else {
+                (0, 0)
+            };
 
+            let readback_started = std::time::Instant::now();
             let old_len = ids.len();
             ids.resize(old_len + chunk_columns, 0);
             unsafe {
@@ -17745,8 +17807,37 @@ impl Gemma4Q6KHead {
                     chunk_columns,
                 );
             }
+            let readback_us = readback_started.elapsed().as_micros() as u64;
+            timing.cpu_us += cpu_us;
+            timing.wait_us += wait_us;
+            timing.gpu_us += gpu_us;
+            timing.kernel_us += kernel_us;
+            if timing_enabled {
+                eprintln!(
+                    "[gemma4-metal-head-batch] columns={columns} chunk={}..{} vocab={} cpu_norm_quant={cpu_us}us encode={encode_us}us wait={wait_us}us gpu={gpu_us}us kernel={kernel_us}us readback={readback_us}us",
+                    rows.start, rows.end, state.vocab,
+                );
+            }
         }
+        timing.wall_us = call_started.elapsed().as_micros() as u64;
+        if timing_enabled {
+            eprintln!(
+                "[gemma4-metal-head-batch] columns={columns} total cpu={}us wait={}us gpu={}us kernel={}us wall={}us",
+                timing.cpu_us, timing.wait_us, timing.gpu_us, timing.kernel_us, timing.wall_us,
+            );
+        }
+        state.last_spec50_timing = timing;
         Some(ids)
+    }
+
+    /// Timing of the most recent [`Self::forward_argmax_spec50_batch`] call
+    /// (all-zero before the first). Wall fields are always populated; the GPU
+    /// timestamps only under `CAMELID_GEMMA4_METAL_HEAD_TIMING=1`.
+    pub(crate) fn last_spec50_timing(&self) -> Gemma4Spec50HeadTiming {
+        self.inner
+            .lock()
+            .map(|state| state.last_spec50_timing)
+            .unwrap_or_default()
     }
 
     /// Borrow one vocab row of the file-backed Q6_K table without allocating or
@@ -18912,18 +19003,21 @@ impl Gemma4ResidentModel {
         if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
             return None;
         }
-        if std::env::var("CAMELID_GEMMA4_VERIFY_TRACE")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        {
+        let trace_enabled = std::env::var("CAMELID_GEMMA4_VERIFY_TRACE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        if trace_enabled || gemma4_metal_head_timing_enabled() {
             let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&command_buffer.to_owned());
-            eprintln!(
-                "[gemma4-12b-verify] base={} K={} wall={}us gpu={}us kernel={}us",
-                base_position,
-                columns,
-                started.elapsed().as_micros(),
-                gpu_us,
-                kernel_us,
-            );
+            GEMMA4_LAST_VERIFY_GPU_US.store(gpu_us as u64, std::sync::atomic::Ordering::Relaxed);
+            if trace_enabled {
+                eprintln!(
+                    "[gemma4-12b-verify] base={} K={} wall={}us gpu={}us kernel={}us",
+                    base_position,
+                    columns,
+                    started.elapsed().as_micros(),
+                    gpu_us,
+                    kernel_us,
+                );
+            }
         }
         let final_buffer = if from_a {
             &scratch.act_a

@@ -6993,6 +6993,11 @@ pub struct Gemma4DenseVerifierBatch {
     pub start_position: usize,
     pub greedy_ids: Vec<u32>,
     pub final_hidden: Vec<Vec<f32>>,
+    /// Timing of the SPEC50 head call that produced `greedy_ids`.
+    pub head_timing: crate::metal::Gemma4Spec50HeadTiming,
+    /// GPU busy µs of the decoder verify command buffer; zero unless
+    /// `CAMELID_GEMMA4_VERIFY_TRACE` or `CAMELID_GEMMA4_METAL_HEAD_TIMING` is set.
+    pub decoder_gpu_us: u64,
 }
 
 /// Ordered-Q4 prompt replay receipt. `first_greedy_id` is the first generated
@@ -7324,6 +7329,15 @@ pub struct Gemma4Mtp12MetalRoundReceipt {
     pub assistant_timing: Gemma4Mtp12MetalChainTimingReceipt,
     pub assistant_ledger: Gemma4Mtp12MetalChainLedgerReceipt,
     pub target_verify_us: u128,
+    /// SPEC50 head call wall inside `target_verify_us` (readback, CPU
+    /// rms_norm/Q8_K, head command buffer, argmax readback).
+    pub target_head_us: u128,
+    /// Hardware GPU busy µs of the head command buffer(s); zero unless
+    /// `CAMELID_GEMMA4_METAL_HEAD_TIMING=1`.
+    pub target_head_gpu_us: u128,
+    /// Hardware GPU busy µs of the decoder verify command buffer; zero unless
+    /// `CAMELID_GEMMA4_VERIFY_TRACE` or `CAMELID_GEMMA4_METAL_HEAD_TIMING` is set.
+    pub target_decoder_gpu_us: u128,
 }
 
 /// JSON-stable copy of the assistant chain timing (the Metal module keeps its
@@ -7447,6 +7461,13 @@ pub struct Gemma4Mtp12MetalStats {
     pub assistant_gpu_us: u128,
     pub assistant_kernel_us: u128,
     pub target_verify_us: u128,
+    /// Sum of the per-round SPEC50 head call walls (inside `target_verify_us`).
+    pub target_head_us: u128,
+    /// Sum of the head command-buffer GPU busy µs (needs HEAD_TIMING=1).
+    pub target_head_gpu_us: u128,
+    /// Sum of the decoder verify command-buffer GPU busy µs (needs
+    /// VERIFY_TRACE=1 or HEAD_TIMING=1).
+    pub target_decoder_gpu_us: u128,
     pub budget_tail_rounds: u64,
     pub terminal_stop_token: Option<u32>,
     pub trace: Vec<Gemma4Mtp12MetalRoundReceipt>,
@@ -8717,32 +8738,39 @@ impl Gemma4GpuRuntime {
         candidate_tokens: &[u32],
         start_position: usize,
     ) -> Result<Gemma4DenseVerifierBatch> {
-        let (ticket, (greedy_ids, final_hidden)) = self.with_consecutive_hidden_ordered_q4(
-            candidate_tokens,
-            start_position,
-            |head, hidden_flat| {
-                let greedy_ids = head.forward_argmax_spec50_batch(hidden_flat).ok_or_else(|| {
-                    BackendError::UnsupportedModelArchitecture(
-                        "SPEC50 K-wide Q6_K target head failed".into(),
-                    )
-                })?;
-                if greedy_ids.len() != candidate_tokens.len() {
-                    return Err(BackendError::RuntimeShapeMismatch(
-                        "verifier head returned an invalid row count".into(),
-                    ));
-                }
-                let final_hidden = hidden_flat
-                    .chunks_exact(self.hidden)
-                    .map(<[f32]>::to_vec)
-                    .collect();
-                Ok((greedy_ids, final_hidden))
-            },
-        )?;
+        let (ticket, (greedy_ids, final_hidden, head_timing)) = self
+            .with_consecutive_hidden_ordered_q4(
+                candidate_tokens,
+                start_position,
+                |head, hidden_flat| {
+                    let greedy_ids =
+                        head.forward_argmax_spec50_batch(hidden_flat).ok_or_else(|| {
+                            BackendError::UnsupportedModelArchitecture(
+                                "SPEC50 K-wide Q6_K target head failed".into(),
+                            )
+                        })?;
+                    let head_timing = head.last_spec50_timing();
+                    if greedy_ids.len() != candidate_tokens.len() {
+                        return Err(BackendError::RuntimeShapeMismatch(
+                            "verifier head returned an invalid row count".into(),
+                        ));
+                    }
+                    let final_hidden = hidden_flat
+                        .chunks_exact(self.hidden)
+                        .map(<[f32]>::to_vec)
+                        .collect();
+                    Ok((greedy_ids, final_hidden, head_timing))
+                },
+            )?;
+        let decoder_gpu_us = crate::metal::GEMMA4_LAST_VERIFY_GPU_US
+            .load(std::sync::atomic::Ordering::Relaxed);
         Ok(Gemma4DenseVerifierBatch {
             ticket,
             start_position,
             greedy_ids,
             final_hidden,
+            head_timing,
+            decoder_gpu_us,
         })
     }
 
@@ -9664,6 +9692,14 @@ impl Gemma4GpuRuntime {
                 .assistant_kernel_us
                 .saturating_add(draft_proposal.timing.kernel_us);
             stats.target_verify_us = stats.target_verify_us.saturating_add(target_verify_us);
+            let target_head_us = u128::from(target_batch.head_timing.wall_us);
+            let target_head_gpu_us = u128::from(target_batch.head_timing.gpu_us);
+            let target_decoder_gpu_us = u128::from(target_batch.decoder_gpu_us);
+            stats.target_head_us = stats.target_head_us.saturating_add(target_head_us);
+            stats.target_head_gpu_us = stats.target_head_gpu_us.saturating_add(target_head_gpu_us);
+            stats.target_decoder_gpu_us = stats
+                .target_decoder_gpu_us
+                .saturating_add(target_decoder_gpu_us);
             if round_plan.budget_truncated {
                 stats.budget_tail_rounds += 1;
             }
@@ -9707,6 +9743,9 @@ impl Gemma4GpuRuntime {
                 assistant_timing: draft_proposal.timing.into(),
                 assistant_ledger: draft_proposal.ledger.into(),
                 target_verify_us,
+                target_head_us,
+                target_head_gpu_us,
+                target_decoder_gpu_us,
             });
 
             if let Some(stop) = decision.stop_token {
