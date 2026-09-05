@@ -4262,10 +4262,14 @@ Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u2, 1u, 2u, 1
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u4, 1u, 4u, 1u, false)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u1, 1u, 1u, 1u, true)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u4, 1u, 4u, 1u, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_t2_u2, 2u, 2u, 1u, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_t2_u4, 2u, 4u, 1u, true)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u2, 1u, 2u, 2u, false)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u4, 1u, 4u, 2u, false)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u1, 1u, 1u, 2u, true)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u4, 1u, 4u, 2u, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_t2_u2, 2u, 2u, 2u, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_t2_u4, 2u, 4u, 2u, true)
 #undef Q4_NATIVE_V2_KERNEL
 
 // Native-plane adaptation of the exact register-fed B kernel. Each lane loads
@@ -15212,6 +15216,8 @@ pub(crate) const GEMMA4_Q4_NATIVE_V2_VARIANTS: &[Gemma4Q4NativeV2Variant] = &[
     Gemma4Q4NativeV2Variant { name: "u4", tiles: 1, fragment_major: false },
     Gemma4Q4NativeV2Variant { name: "fm_u1", tiles: 1, fragment_major: true },
     Gemma4Q4NativeV2Variant { name: "fm_u4", tiles: 1, fragment_major: true },
+    Gemma4Q4NativeV2Variant { name: "fm_t2_u2", tiles: 2, fragment_major: true },
+    Gemma4Q4NativeV2Variant { name: "fm_t2_u4", tiles: 2, fragment_major: true },
 ];
 
 /// Compiled pipelines of one V2 variant: the padded-eight K<=8 kernel, the
