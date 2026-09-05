@@ -1314,6 +1314,20 @@ fn mtp12_argmax_legacy_enabled() -> bool {
     })
 }
 
+/// `CAMELID_MTP12_DUMP_DRAFT_QUERIES=<path>`: append every resident-chain
+/// draft's head query (final normalized assistant hidden) and its full-head
+/// argmax token to `<path>`, for the offline head-shortlist recall experiment.
+/// Diagnostic only; unset in production.
+fn mtp12_dump_draft_queries_path() -> Option<&'static std::path::Path> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("CAMELID_MTP12_DUMP_DRAFT_QUERIES")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_deref()
+}
+
 struct Mtp12Pipelines {
     gather_q6k_embedding: ComputePipelineState,
     gather_q6k_embedding_and_recurrent: ComputePipelineState,
@@ -1411,6 +1425,9 @@ struct Mtp12Scratch {
     recurrent_hidden: Buffer,
     chain_initial_recurrent_hidden: Buffer,
     chain_recurrent_hidden: Buffer,
+    /// Per-draft copies of `final_normalized`, written only while
+    /// `CAMELID_MTP12_DUMP_DRAFT_QUERIES` is set.
+    chain_final_normalized: Buffer,
     logits: Buffer,
     output_token: Buffer,
     /// Stage-one (max, first index) partials of the chunked vocabulary argmax.
@@ -2082,6 +2099,7 @@ impl Mtp12Scratch {
             recurrent_hidden: f32s(TARGET_HIDDEN),
             chain_initial_recurrent_hidden: f32s(TARGET_HIDDEN),
             chain_recurrent_hidden: f32s(MTP12_CHAIN_RECURRENT_ELEMENTS),
+            chain_final_normalized: f32s(MTP12_CHAIN_MAX_DRAFTS * ASSISTANT_HIDDEN),
             logits: f32s(VOCAB),
             // Slot zero holds either the K=1 result or a chain anchor.  Chain
             // draft tokens occupy slots 1..=15 so each can feed the next step.
@@ -2123,6 +2141,7 @@ impl Mtp12Scratch {
             &self.recurrent_hidden,
             &self.chain_initial_recurrent_hidden,
             &self.chain_recurrent_hidden,
+            &self.chain_final_normalized,
             &self.logits,
             &self.output_token,
             &self.argmax_partial_values,
@@ -2821,6 +2840,7 @@ impl Gemma4Mtp12AssistantMetal {
             .ok_or_else(|| invalid("attention score byte size overflow"))?;
         let attention_scores = shared_buffer(&kernel.device, score_bytes);
         let cpu_prepare_us = prepare_started.elapsed().as_micros();
+        let dump_queries = mtp12_dump_draft_queries_path();
 
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -2911,6 +2931,18 @@ impl Gemma4Mtp12AssistantMetal {
                 ASSISTANT_HIDDEN,
                 1,
             );
+            if dump_queries.is_some() {
+                // Keep this step's head query (the vector the tied head is
+                // dotted with) for the offline shortlist-recall experiment.
+                encode_copy_f32_to_offset(
+                    encoder,
+                    &self.pipelines.copy_f32,
+                    &self.scratch.final_normalized,
+                    &self.scratch.chain_final_normalized,
+                    (step * ASSISTANT_HIDDEN * std::mem::size_of::<f32>()) as u64,
+                    ASSISTANT_HIDDEN,
+                );
+            }
             encode_q4_gemv(
                 encoder,
                 &self.pipelines.q4_gemv,
@@ -2963,6 +2995,36 @@ impl Gemma4Mtp12AssistantMetal {
                 return Err(invalid(format!(
                     "resident-chain argmax step {step} returned invalid token {token}"
                 )));
+            }
+        }
+        if let Some(path) = dump_queries {
+            // One 4,112-byte record per draft: u32 token, u32 step, u32
+            // absolute proposal position, u32 draft_k, then the 1,024 f32 head
+            // query. Append-only; a write failure only loses the diagnostic.
+            use std::io::Write;
+            let queries = unsafe {
+                std::slice::from_raw_parts(
+                    self.scratch.chain_final_normalized.contents().cast::<f32>(),
+                    draft_k * ASSISTANT_HIDDEN,
+                )
+            };
+            let mut record = Vec::with_capacity(draft_k * (16 + ASSISTANT_HIDDEN * 4));
+            for (step, token) in tokens.iter().copied().enumerate() {
+                record.extend_from_slice(&token.to_le_bytes());
+                record.extend_from_slice(&(step as u32).to_le_bytes());
+                record.extend_from_slice(&((proposal_position + step) as u32).to_le_bytes());
+                record.extend_from_slice(&(draft_k as u32).to_le_bytes());
+                for value in &queries[step * ASSISTANT_HIDDEN..(step + 1) * ASSISTANT_HIDDEN] {
+                    record.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            if let Err(error) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(&record))
+            {
+                eprintln!("[gemma4-mtp12] draft query dump to {} failed: {error}", path.display());
             }
         }
 
