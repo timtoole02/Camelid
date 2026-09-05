@@ -1951,6 +1951,7 @@ fn validate_device_chain_positions(
 /// The opt-in BF16 dense experiment owns a second buffer for the 22 dense
 /// matrices, retaining the Q4 tied head and the established activation rounding.
 pub struct Gemma4Mtp12AssistantMetal {
+    single_position: bool,
     shortlist: Option<Mtp12Shortlist>,
     dense_bf16: Option<dense_bf16::Bf16Dense>,
     packed_q4: Buffer,
@@ -2549,6 +2550,8 @@ impl Gemma4Mtp12AssistantMetal {
             .try_into()
             .map_err(|_| invalid("internal resident layer table is not four layers"))?;
         Ok(Self {
+            single_position: std::env::var("CAMELID_GEMMA4_MTP12_SINGLE_POSITION")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             shortlist,
             dense_bf16,
             packed_q4,
@@ -2999,7 +3002,10 @@ impl Gemma4Mtp12AssistantMetal {
     /// recurrent hidden directly from Metal, and writes the next token/recurrent
     /// row for the following step.  The fixed target layer-46/47 KV prefix is
     /// shared across all steps, matching repeated [`Self::propose_k1_device`].
-    /// `proposal_position` advances for RoPE while `target_kv_len` stays fixed;
+    /// By default `proposal_position` advances for RoPE. The opt-in
+    /// `CAMELID_GEMMA4_MTP12_SINGLE_POSITION=1` keeps every query at the round
+    /// anchor, as required by HF SinglePositionMultiTokenCandidateGenerator.
+    /// `target_kv_len` stays fixed in either mode;
     /// unverified physical cache rows at and beyond that prefix are never read.
     ///
     /// The production return crosses only `draft_k * sizeof(u32)` bytes back to
@@ -3111,7 +3117,7 @@ impl Gemma4Mtp12AssistantMetal {
         )?;
 
         let prepare_started = Instant::now();
-        write_chain_rope_tables(proposal_position, draft_k, &self.scratch)?;
+        write_chain_rope_tables(proposal_position, draft_k, self.single_position, &self.scratch)?;
         unsafe {
             *self.scratch.output_token.contents().cast::<u32>() = anchor_token;
         }
@@ -3182,7 +3188,8 @@ impl Gemma4Mtp12AssistantMetal {
                         (step * FULL_HEAD_DIM / 2 * std::mem::size_of::<f32>()) as u64,
                     )
                 };
-                let step_proposal_position = proposal_position + step;
+                let step_proposal_position =
+                    chain_query_position(proposal_position, step, self.single_position);
                 let compact_base = if is_sliding {
                     step_proposal_position
                         .saturating_sub(LOCAL_WINDOW + 1)
@@ -3277,8 +3284,9 @@ impl Gemma4Mtp12AssistantMetal {
         }
         if let Some(path) = dump_queries {
             // One 4,112-byte record per draft: u32 token, u32 step, u32
-            // absolute proposal position, u32 draft_k, then the 1,024 f32 head
-            // query. Append-only; a write failure only loses the diagnostic.
+            // absolute draft sequence position (not the frozen RoPE anchor),
+            // u32 draft_k, then the 1,024 f32 head query. Append-only; a write
+            // failure only loses the diagnostic.
             use std::io::Write;
             let queries = unsafe {
                 std::slice::from_raw_parts(
@@ -3308,7 +3316,7 @@ impl Gemma4Mtp12AssistantMetal {
 
         let mut total_target_kv_read_bytes = 0u64;
         for step in 0..draft_k {
-            let compact_base = (proposal_position + step)
+            let compact_base = chain_query_position(proposal_position, step, self.single_position)
                 .saturating_sub(LOCAL_WINDOW + 1)
                 .min(target_kv_len);
             total_target_kv_read_bytes = total_target_kv_read_bytes
@@ -4246,12 +4254,12 @@ fn write_rope_tables(position: usize, scratch: &Mtp12Scratch) -> Result<()> {
 fn write_chain_rope_tables(
     proposal_position: usize,
     draft_k: usize,
+    single_position: bool,
     scratch: &Mtp12Scratch,
 ) -> Result<()> {
     for step in 0..draft_k {
-        let position = proposal_position
-            .checked_add(step)
-            .ok_or_else(|| invalid("resident-chain RoPE position overflow"))?;
+        // The public chain validates anchor + K - 1 before entering here.
+        let position = chain_query_position(proposal_position, step, single_position);
         let (local_cos, local_sin) =
             rope_table_values(position, LOCAL_HEAD_DIM, 10_000.0, LOCAL_HEAD_DIM / 2);
         let (full_cos, full_sin) =
@@ -4264,6 +4272,17 @@ fn write_chain_rope_tables(
         write_buffer_f32_at(&scratch.full_sin, full_offset, &full_sin)?;
     }
     Ok(())
+}
+
+/// HF's shared-KV assistant advances the token and recurrent hidden, but its
+/// RoPE anchor remains fixed throughout the round. Keep the original advancing
+/// mode as an A/B control until the production acceptance gate is measured.
+fn chain_query_position(anchor: usize, step: usize, single_position: bool) -> usize {
+    if single_position {
+        anchor
+    } else {
+        anchor + step
+    }
 }
 
 #[cfg(test)]
@@ -4480,6 +4499,7 @@ mod tests {
             ..Gemma4Mtp12ResidentLedger::default()
         };
         Gemma4Mtp12AssistantMetal {
+            single_position: false,
             shortlist: None,
             dense_bf16: None,
             packed_q4,
@@ -4663,6 +4683,25 @@ mod tests {
         assert!(cos[64..].iter().all(|value| *value == 1.0));
         assert!(sin[64..].iter().all(|value| *value == 0.0));
         assert!(sin[..64].iter().any(|value| *value != 0.0));
+    }
+
+    #[test]
+    fn single_position_queries_keep_anchor_and_sliding_crop_fixed() {
+        for anchor in [2usize, 1_024, 1_025, 1_031] {
+            for step in 0..MTP12_CHAIN_MAX_DRAFTS {
+                assert_eq!(chain_query_position(anchor, step, true), anchor);
+                assert_eq!(chain_query_position(anchor, step, false), anchor + step);
+                let fixed_base = chain_query_position(anchor, step, true)
+                    .saturating_sub(LOCAL_WINDOW + 1);
+                assert_eq!(fixed_base, anchor.saturating_sub(LOCAL_WINDOW + 1));
+            }
+        }
+        let (_, fixed_sin) = rope_table_values(2, LOCAL_HEAD_DIM, 10_000.0, LOCAL_HEAD_DIM / 2);
+        let (_, advanced_sin) = rope_table_values(3, LOCAL_HEAD_DIM, 10_000.0, LOCAL_HEAD_DIM / 2);
+        assert_ne!(
+            fixed_sin, advanced_sin,
+            "the frozen and advancing RoPE controls must differ"
+        );
     }
 
     #[test]
@@ -5020,14 +5059,28 @@ mod tests {
 
     #[test]
     fn resident_chain_k1_through_k15_matches_repeated_device_k1_bit_for_bit() {
+        resident_chain_matches_repeated_device_k1(false, 2);
+    }
+
+    #[test]
+    fn resident_chain_single_position_k1_through_k15_matches_fixed_k1_bit_for_bit() {
+        resident_chain_matches_repeated_device_k1(true, 2);
+    }
+
+    #[test]
+    fn resident_chain_single_position_beyond_sliding_window_matches_fixed_k1_bit_for_bit() {
+        resident_chain_matches_repeated_device_k1(true, 1_031);
+    }
+
+    fn resident_chain_matches_repeated_device_k1(single_position: bool, logical_position: usize) {
         let Some(device) = Device::system_default() else {
             eprintln!("Metal is unavailable; skipping Gemma 4 12B resident-chain parity");
             return;
         };
         let mut assistant = synthetic_assistant(&device);
+        assistant.single_position = single_position;
         let anchor_token = 7u32;
-        let logical_position = 2usize;
-        let max_positions = 32usize;
+        let max_positions = logical_position + 30;
         let initial_hidden: Vec<f32> = (0..TARGET_HIDDEN)
             .map(|index| (index as i32 % 13 - 6) as f32 * 0.0078125)
             .collect();
@@ -5145,7 +5198,9 @@ mod tests {
                         sliding_device,
                         full_device,
                         logical_position,
-                        logical_position + oracle_tokens.len(),
+                        chain_query_position(
+                            logical_position, oracle_tokens.len(), single_position,
+                        ),
                     )
                     .expect("repeated device-fed K=1 oracle");
                 oracle_token = proposal.token;
@@ -5180,9 +5235,16 @@ mod tests {
             );
             assert_eq!(
                 chain.ledger.target_kv_read_bytes,
-                target_kv_read_bytes(logical_position, logical_position)
-                    .expect("fixture KV ledger")
-                    * draft_k as u64
+                (0..draft_k)
+                    .map(|step| {
+                        let compact_base =
+                            chain_query_position(logical_position, step, single_position)
+                                .saturating_sub(LOCAL_WINDOW + 1)
+                                .min(logical_position);
+                        target_kv_read_bytes(logical_position - compact_base, logical_position)
+                            .expect("fixture KV ledger")
+                    })
+                    .sum::<u64>()
             );
             assert_eq!(
                 chain.ledger.dynamic_attention_scratch_bytes,

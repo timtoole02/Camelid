@@ -104,6 +104,10 @@ token-only assistant seam. It is not wired to the CLI or target runtime.
 - `target_kv_len` is the immutable verified layer-46/47 prefix. In contrast,
   `proposal_position` advances as `P, P+1, ...` for per-step RoPE and sliding
   bounds. Physical KV slots at and beyond the prefix are never read.
+  This was a synthetic parity assumption, not the official HF chain contract.
+  The opt-in [single-position correction](SINGLE_POSITION.md) holds the initial
+  query position fixed across the chain, as the official candidate generator
+  requires; the advancing behavior remains available as the default control.
 - The timing result records CPU preparation, encoding, wait, GPU busy, kernel,
   and wall time. The ledger records the one command/wait, borrowed table/KV
   spans, assistant matrix and logical KV reads, dynamic score scratch, resident
