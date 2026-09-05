@@ -451,9 +451,15 @@ kernel void NAME( \
         values, scores, output, args, row_meta, denom_in, ancestors, tree_base, tg, lane); \
 }
 
-// Grid (n_kv_heads, ceil(group*rows / PAIRS), HD/32) x 32 lanes. At K=8: HD256 P4 =
-// 256 threadgroups, P8 = 128; HD512 P8 = 256, P16 = 128 (P16 is measurement-only).
+// Grid (n_kv_heads, ceil(group*rows / PAIRS), HD/32) x 32 lanes. At K=8: HD256 P2 =
+// 512 threadgroups, P4 = 256, P8 = 128; HD512 P2 = 1024, P4 = 512, P8 = 256, P16 = 128. Fewer
+// pairs per threadgroup means more V reads but more resident simdgroups; at K=8 the
+// kernel is occupancy-bound, so the small-PAIRS forms are the candidates and P16 is
+// measurement-only. The selection is made by the receipt, never by default.
+GEMMA4_TREE_CONTEXT_PIPELINED_KERNEL(gemma4_tree_context_hd256_p2x, 256u, 2u)
 GEMMA4_TREE_CONTEXT_PIPELINED_KERNEL(gemma4_tree_context_hd256_p4x, 256u, 4u)
 GEMMA4_TREE_CONTEXT_PIPELINED_KERNEL(gemma4_tree_context_hd256_p8x, 256u, 8u)
+GEMMA4_TREE_CONTEXT_PIPELINED_KERNEL(gemma4_tree_context_hd512_p2x, 512u, 2u)
+GEMMA4_TREE_CONTEXT_PIPELINED_KERNEL(gemma4_tree_context_hd512_p4x, 512u, 4u)
 GEMMA4_TREE_CONTEXT_PIPELINED_KERNEL(gemma4_tree_context_hd512_p8x, 512u, 8u)
 GEMMA4_TREE_CONTEXT_PIPELINED_KERNEL(gemma4_tree_context_hd512_p16x, 512u, 16u)
