@@ -78,13 +78,19 @@ kernel void gemma4_tree_context_nest(
     uint score_base = meta.z + head * position_count;
     float inv = 1.0 / denom_in[row * args.n_heads + head];
     uint stride = 32u * args.dim_blocks;
+    const uint prefix_count = meta.x < tree_base
+        ? min(position_count, tree_base - meta.x) : 0u;
+    const uint prefix_kv_base = kv_base + meta.x * position_stride;
 
     for (uint d = lane + tg.z * 32u; d < head_dim; d += stride) {
         float acc = 0.0;
-        for (uint p = 0; p < position_count; ++p) {
-            uint logical_position = meta.x + p;
-            uint physical_position = logical_position < tree_base ? logical_position
-                : tree_base + ancestors[row * 8u + logical_position - tree_base];
+        // Keep the long committed-prefix walk identical to the linear nest.
+        // The same accumulator and reciprocal continue through the suffix.
+        for (uint p = 0; p < prefix_count; ++p) {
+            acc += scores[score_base + p] * inv * values[prefix_kv_base + p * position_stride + d];
+        }
+        for (uint p = prefix_count; p < position_count; ++p) {
+            uint physical_position = tree_base + ancestors[row * 8u + meta.x + p - tree_base];
             acc += scores[score_base + p] * inv * values[kv_base + physical_position * position_stride + d];
         }
         output[q_base + d] = acc;
@@ -171,16 +177,27 @@ kernel void gemma4_tree_context_hd256_p2(
         values + args.kv_base_offset + kv_head * args.kv_head_stride + d0;
     const uint position_stride = args.position_stride;
 
-    for (uint p = args.union_start; p < args.union_end; ++p) {
-        const bool committed = p < tree_base;
-        const float prefix_v = committed ? vbase[p * position_stride] : 0.0f;
+    // The prefix is the original PAIRS2 loop: one shared V load, no tree
+    // address selection in the long walk. Every pair retains its same scalar
+    // accumulator and reciprocal across the following <=8 suffix positions.
+    const uint prefix_end = min(args.union_end, tree_base);
+    for (uint p = args.union_start; p < prefix_end; ++p) {
+        const float v = vbase[p * position_stride];
 #pragma clang loop unroll(full)
         for (uint j = 0u; j < PAIRS; ++j) {
             const uint rel = p - ws[j];
             if (p >= ws[j] && rel < cnt[j]) {
-                const uint physical = committed ? p
-                    : tree_base + ancestors[node[j] * 8u + p - tree_base];
-                const float v = committed ? prefix_v : vbase[physical * position_stride];
+                acc[j] += scores[sbase[j] + rel] * inv[j] * v;
+            }
+        }
+    }
+    for (uint p = max(args.union_start, tree_base); p < args.union_end; ++p) {
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < PAIRS; ++j) {
+            const uint rel = p - ws[j];
+            if (p >= ws[j] && rel < cnt[j]) {
+                const uint physical = tree_base + ancestors[node[j] * 8u + p - tree_base];
+                const float v = vbase[physical * position_stride];
                 acc[j] += scores[sbase[j] + rel] * inv[j] * v;
             }
         }
