@@ -15847,6 +15847,10 @@ fn gemma4_q4_row_ops_enabled() -> bool {
 // fragment-major `fm_bits_u4` V2 native kernel and native-octet sidecars for
 // every layer. Any other shape (K=16 prefill chunks, wire-layout sidecars, the
 // per-row path) runs the legacy encode unchanged instead of refusing.
+// Useful decimal masks: 87 = the cycle-1 candidate (C1|C2|C3|C5|C7), 95 = 87
+// plus the C4 residual-into-norm fusion, 119 = 87 plus the C6
+// quantize-into-panel fusion, 127 = every fusion. Bit 7 (C5-lite) is the C5
+// fallback and is ignored when bit 4 is set.
 // ---------------------------------------------------------------------------
 /// bit0: stage the fragment-major activation record once per shared input
 /// (q|k|v and gate|up) instead of once per matrix.
@@ -51289,6 +51293,349 @@ mod tests {
                             columns * rows_per_segment[segment],
                         );
                     }
+                }
+            }
+        }
+    }
+
+
+    /// Byte-for-byte comparison of two fragment-major activation records
+    /// (`blocks_per_row * 544` bytes: 512 bytes of panel halves then 32 bytes
+    /// of f32 input scales per Q4_0 block). Reported per block so a mismatch
+    /// names the plane it is in.
+    #[cfg(target_os = "macos")]
+    fn fused_glue_assert_panel(
+        label: &str,
+        expected: &Buffer,
+        actual: &Buffer,
+        blocks_per_row: usize,
+    ) {
+        let bytes = blocks_per_row * 544;
+        let mut a = vec![0i8; bytes];
+        let mut b = vec![0i8; bytes];
+        read_buffer_i8(expected, &mut a);
+        read_buffer_i8(actual, &mut b);
+        for (index, (x, y)) in a.iter().zip(&b).enumerate() {
+            let block = index / 544;
+            let offset = index % 544;
+            let plane = if offset < 512 {
+                format!("panel half {}", offset / 2)
+            } else {
+                format!("input scale column {}", (offset - 512) / 4)
+            };
+            assert_eq!(
+                x, y,
+                "{label}: staged block={block} byte={offset} ({plane}) expected={x} actual={y}"
+            );
+        }
+    }
+
+    /// C6: the three quantizers that write the fragment-major MMA activation
+    /// record directly, against the unfused chain they replace — the same
+    /// elementwise kernel followed by `quantize_q8_0_f32` (where applicable)
+    /// and then `q4_0_q8_ordered_columns_mma_stage_fm`. The whole record is
+    /// compared byte for byte, so the half(0)/0.0f padding of panel columns
+    /// past K is covered as well as the quantized columns. Widths are the
+    /// verifier's own: 3840 hidden, 15360 FFN activation and the 4096/8192
+    /// attention contexts of head_dim 256 and 512. K in {1,2,4,8}.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_verify_fused_glue_quantize_stage_fm_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let glue = kernel
+            .gemma4_verify_glue_pipelines()
+            .expect("fused-glue elementwise library must compile");
+        let v2 = kernel
+            .gemma4_q4_native_v2_named(GEMMA4_FUSED_GLUE_V2_VARIANT)
+            .expect("fm_bits_u4 V2 variant compiles under cfg(test)");
+        // 3840 = hidden, 15360 = FFN, 4096/8192 = the head_dim 256/512
+        // attention contexts the O projection quantizes.
+        for (width_index, width) in [3_840usize, 15_360, 4_096, 8_192]
+            .into_iter()
+            .enumerate()
+        {
+            let blocks = width / 32;
+            let panel_bytes = blocks * 544;
+            let weight = fused_glue_f32_buffer(
+                kernel,
+                &fused_glue_norm_weight(width, 0.88, 1_100 + width_index as u64),
+            );
+            for columns in [1usize, 2, 4, 8] {
+                let seed = 1_200 + width_index as u64 * 17 + columns as u64;
+                let input =
+                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * width, 3.0, seed));
+                let up =
+                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * width, 2.0, seed + 1));
+                let scales = fused_glue_shared(kernel, columns * blocks * 4);
+                let quants = fused_glue_shared(kernel, columns * width);
+                let normed = fused_glue_shared(kernel, columns * width * 4);
+                let activation = fused_glue_shared(kernel, columns * width * 4);
+                let nblocks = fused_glue_u32_buffer(kernel, &[(columns * blocks) as u32]);
+                let nvalues = fused_glue_u32_buffer(kernel, &[(columns * width) as u32]);
+                let scalar = fused_glue_shared(kernel, 8);
+                unsafe {
+                    let args = scalar.contents().cast::<u8>();
+                    *args.cast::<u32>() = width as u32;
+                    *args.add(4).cast::<f32>() = 1e-6;
+                }
+                // Poison both records so an unwritten byte cannot pass.
+                let poison = |seed: u8| -> Buffer {
+                    let buffer = fused_glue_shared(kernel, panel_bytes);
+                    write_buffer_u8(&buffer, &vec![seed; panel_bytes]);
+                    buffer
+                };
+
+                for arm in ["quantize", "rms_norm_quantize", "gelu_mul_quantize"] {
+                    let label = format!("{arm} stage_fm width={width} K={columns}");
+                    let reference = poison(0x5a);
+                    let fused = poison(0xa5);
+                    fused_glue_run(kernel, |e| {
+                        // Reference: the elementwise kernel, the standalone
+                        // quantizer and then the production stage kernel.
+                        match arm {
+                            "quantize" => encode_quantize(
+                                e, kernel, &input, &scales, &quants, &nblocks, columns * blocks,
+                            ),
+                            "rms_norm_quantize" => {
+                                encode_rms_norm_batch(
+                                    kernel, e, &input, &weight, &normed, &scalar, columns,
+                                );
+                                encode_quantize(
+                                    e, kernel, &normed, &scales, &quants, &nblocks, columns * blocks,
+                                );
+                            }
+                            _ => {
+                                encode_binary(
+                                    e,
+                                    &kernel.gelu_mul_pipeline,
+                                    &input,
+                                    &up,
+                                    &activation,
+                                    &nvalues,
+                                    columns * width,
+                                );
+                                encode_quantize(
+                                    e, kernel, &activation, &scales, &quants, &nblocks,
+                                    columns * blocks,
+                                );
+                            }
+                        }
+                        assert!(
+                            encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+                                e, kernel, v2, &scales, &quants, &reference, blocks, columns,
+                            ),
+                            "reference stage refused: {label}"
+                        );
+                        let encoded = match arm {
+                            "quantize" => encode_gemma4_verify_quantize_stage_fm(
+                                e, glue, &input, &fused, blocks, columns,
+                            ),
+                            "rms_norm_quantize" => encode_gemma4_verify_rms_norm_quantize_stage_fm(
+                                e, glue, &input, &weight, &fused, width, 1e-6, columns,
+                            ),
+                            _ => encode_gemma4_verify_gelu_mul_quantize_stage_fm(
+                                e, glue, &input, &up, &fused, blocks, columns,
+                            ),
+                        };
+                        assert!(encoded, "fused panel writer refused: {label}");
+                    });
+                    fused_glue_assert_panel(&label, &reference, &fused, blocks);
+                }
+            }
+        }
+    }
+
+    /// C4: the residual add folded into the norm that follows it, against the
+    /// dispatch chain it replaces — `rms_norm_batch_f32` + `residual_add_f32` +
+    /// `rms_norm_batch_f32` + `quantize_q8_0_f32` for the post-attention half
+    /// and `rms_norm_batch_f32` + `residual_add_f32` + the conditional
+    /// `scale_f32` for the post-FFN half. Compares the `post` and `mid`/`next`
+    /// f32 buffers plus the Q8_0 scales and quants (or, for the C4+C6 form, the
+    /// whole fragment-major record) bit for bit, on adversarial rows for
+    /// K in {1,2,4,8} and layer scales 1.0-bits / 0.05 / 0.88.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_verify_fused_glue_residual_norm_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let glue = kernel
+            .gemma4_verify_glue_pipelines()
+            .expect("fused-glue elementwise library must compile");
+        let v2 = kernel
+            .gemma4_q4_native_v2_named(GEMMA4_FUSED_GLUE_V2_VARIANT)
+            .expect("fm_bits_u4 V2 variant compiles under cfg(test)");
+        const WIDTH: usize = 3_840;
+        const BLOCKS: usize = WIDTH / 32;
+        const EPS: f32 = 1e-6;
+        let panel_bytes = BLOCKS * 544;
+        let scalar = fused_glue_shared(kernel, 8);
+        unsafe {
+            let args = scalar.contents().cast::<u8>();
+            *args.cast::<u32>() = WIDTH as u32;
+            *args.add(4).cast::<f32>() = EPS;
+        }
+        for (weight_index, weight_scale) in [0.0f32, 0.05, 0.88].into_iter().enumerate() {
+            let post_attn_norm =
+                fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(WIDTH, weight_scale, 1_300 + weight_index as u64));
+            let ffn_norm =
+                fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(WIDTH, weight_scale, 1_400 + weight_index as u64));
+            let post_ffw_norm =
+                fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(WIDTH, weight_scale, 1_500 + weight_index as u64));
+            for columns in [1usize, 2, 4, 8] {
+                let seed = 1_600 + weight_index as u64 * 23 + columns as u64;
+                let projection =
+                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * WIDTH, 3.0, seed));
+                let residual =
+                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * WIDTH, 1.5, seed + 1));
+                let poison_f32 = |len: usize| fused_glue_f32_buffer(kernel, &vec![f32::NAN; len]);
+                let poison_panel = |value: u8| -> Buffer {
+                    let buffer = fused_glue_shared(kernel, panel_bytes);
+                    write_buffer_u8(&buffer, &vec![value; panel_bytes]);
+                    buffer
+                };
+                let nblocks = fused_glue_u32_buffer(kernel, &[(columns * BLOCKS) as u32]);
+                let n = fused_glue_u32_buffer(kernel, &[(columns * WIDTH) as u32]);
+
+                // Post-attention half: reference chain, the fused kernel and
+                // the fused C4+C6 kernel that writes the MMA record.
+                let label = format!("post_attn weight_scale={weight_scale} K={columns}");
+                let post_ref = poison_f32(columns * WIDTH);
+                let mid_ref = poison_f32(columns * WIDTH);
+                let norm_ref = poison_f32(columns * WIDTH);
+                let scales_ref = poison_f32(columns * BLOCKS);
+                let quants_ref = fused_glue_shared(kernel, columns * WIDTH);
+                write_buffer_u8(&quants_ref, &vec![0x5au8; columns * WIDTH]);
+                let panel_ref = poison_panel(0x5a);
+                let post_fused = poison_f32(columns * WIDTH);
+                let mid_fused = poison_f32(columns * WIDTH);
+                let scales_fused = poison_f32(columns * BLOCKS);
+                let quants_fused = fused_glue_shared(kernel, columns * WIDTH);
+                write_buffer_u8(&quants_fused, &vec![0xa5u8; columns * WIDTH]);
+                let post_panel = poison_f32(columns * WIDTH);
+                let mid_panel = poison_f32(columns * WIDTH);
+                let panel_fused = poison_panel(0xa5);
+                fused_glue_run(kernel, |e| {
+                    encode_rms_norm_batch(
+                        kernel, e, &projection, &post_attn_norm, &post_ref, &scalar, columns,
+                    );
+                    encode_binary(
+                        e,
+                        &kernel.residual_add_pipeline,
+                        &residual,
+                        &post_ref,
+                        &mid_ref,
+                        &n,
+                        columns * WIDTH,
+                    );
+                    encode_rms_norm_batch(kernel, e, &mid_ref, &ffn_norm, &norm_ref, &scalar, columns);
+                    encode_quantize(
+                        e, kernel, &norm_ref, &scales_ref, &quants_ref, &nblocks, columns * BLOCKS,
+                    );
+                    assert!(
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+                            e, kernel, v2, &scales_ref, &quants_ref, &panel_ref, BLOCKS, columns,
+                        ),
+                        "reference stage refused: {label}"
+                    );
+                    encode_gemma4_verify_post_attn_residual_norm_quantize(
+                        e,
+                        glue,
+                        Gemma4VerifyGluePostAttnArgs {
+                            projection: &projection,
+                            residual: &residual,
+                            post_attn_norm: &post_attn_norm,
+                            ffn_norm: &ffn_norm,
+                            post: &post_fused,
+                            mid: &mid_fused,
+                            width: WIDTH,
+                            eps: EPS,
+                            columns,
+                        },
+                        &scales_fused,
+                        &quants_fused,
+                    );
+                    assert!(
+                        encode_gemma4_verify_post_attn_residual_norm_quantize_stage_fm(
+                            e,
+                            glue,
+                            Gemma4VerifyGluePostAttnArgs {
+                                projection: &projection,
+                                residual: &residual,
+                                post_attn_norm: &post_attn_norm,
+                                ffn_norm: &ffn_norm,
+                                post: &post_panel,
+                                mid: &mid_panel,
+                                width: WIDTH,
+                                eps: EPS,
+                                columns,
+                            },
+                            &panel_fused,
+                        ),
+                        "fused C4+C6 post-attention refused: {label}"
+                    );
+                });
+                fused_glue_assert_f32_bits(&format!("{label} post"), &post_ref, &post_fused, columns * WIDTH);
+                fused_glue_assert_f32_bits(&format!("{label} mid"), &mid_ref, &mid_fused, columns * WIDTH);
+                fused_glue_assert_f32_bits(&format!("{label} scales"), &scales_ref, &scales_fused, columns * BLOCKS);
+                fused_glue_assert_i8(&format!("{label} quants"), &quants_ref, &quants_fused, columns * WIDTH);
+                fused_glue_assert_f32_bits(&format!("{label} panel post"), &post_ref, &post_panel, columns * WIDTH);
+                fused_glue_assert_f32_bits(&format!("{label} panel mid"), &mid_ref, &mid_panel, columns * WIDTH);
+                fused_glue_assert_panel(&format!("{label} panel"), &panel_ref, &panel_fused, BLOCKS);
+
+                // Post-FFN half, including the exact-1.0-bits case in which the
+                // plan encodes no scale_f32 dispatch at all.
+                for layer_scale in [1.0f32, 0.05, 0.88] {
+                    let label =
+                        format!("post_ffw weight_scale={weight_scale} K={columns} scale={layer_scale}");
+                    let post_ref = poison_f32(columns * WIDTH);
+                    let next_ref = poison_f32(columns * WIDTH);
+                    let post_fused = poison_f32(columns * WIDTH);
+                    let next_fused = poison_f32(columns * WIDTH);
+                    let scale_args = fused_glue_shared(kernel, 8);
+                    unsafe {
+                        let args = scale_args.contents().cast::<u8>();
+                        *args.cast::<u32>() = (columns * WIDTH) as u32;
+                        *args.add(4).cast::<f32>() = layer_scale;
+                    }
+                    fused_glue_run(kernel, |e| {
+                        encode_rms_norm_batch(
+                            kernel, e, &projection, &post_ffw_norm, &post_ref, &scalar, columns,
+                        );
+                        encode_binary(
+                            e,
+                            &kernel.residual_add_pipeline,
+                            &residual,
+                            &post_ref,
+                            &next_ref,
+                            &n,
+                            columns * WIDTH,
+                        );
+                        if layer_scale.to_bits() != 1.0f32.to_bits() {
+                            encode_scale_f32(
+                                e, kernel, &next_ref, &next_ref, &scale_args, columns * WIDTH,
+                            );
+                        }
+                        encode_gemma4_verify_post_ffw_residual_scale(
+                            e,
+                            glue,
+                            &projection,
+                            &residual,
+                            &post_ffw_norm,
+                            &post_fused,
+                            &next_fused,
+                            WIDTH,
+                            EPS,
+                            layer_scale,
+                            columns,
+                        );
+                    });
+                    fused_glue_assert_f32_bits(&format!("{label} post"), &post_ref, &post_fused, columns * WIDTH);
+                    fused_glue_assert_f32_bits(&format!("{label} next"), &next_ref, &next_fused, columns * WIDTH);
                 }
             }
         }

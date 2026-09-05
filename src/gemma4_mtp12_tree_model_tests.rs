@@ -378,17 +378,21 @@ fn glue_observe(
 /// both of its lanes through the same `verify_hidden_ordered_q4_plan`, so a
 /// consistent last-ulp drift of a fused kernel would pass it; this is the
 /// old-vs-new oracle. For bases 529/1023/1024/1025, linear K=1 and K=8 and
-/// the five tree shapes, mask 0 is compared with the full cycle-1 mask, the
-/// C5-lite full mask and every single bit: identical final hidden bits,
-/// identical SPEC50 argmax ids, identical SPEC50 logits and identical
-/// 48-layer K/V bits of every written row. Runtime is a few minutes.
+/// the five tree shapes, mask 0 is compared with every shipping combination
+/// (127 = all seven fusions, 95 = cycle-1 + C4, 119 = cycle-1 + C6, 87 =
+/// cycle-1, the C5-lite variant) and every single bit including C4 (8) and
+/// C6 (32): identical final hidden bits, identical SPEC50 argmax ids,
+/// identical SPEC50 logits and identical 48-layer K/V bits of every written
+/// row. Runtime is a few minutes.
 #[test]
 #[ignore = "requires official 12B QAT target, native sidecar and frozen 529-token trace; run alone"]
 fn target_verify_fused_glue_masks_are_bit_exact_against_legacy() {
     use crate::metal::{
         GEMMA4_FUSED_GLUE_ALL, GEMMA4_FUSED_GLUE_C1_STAGE_ONCE, GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE,
-        GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE, GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER,
-        GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS, GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA,
+        GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE, GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM,
+        GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER, GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS,
+        GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE, GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA,
+        GEMMA4_FUSED_GLUE_CYCLE1,
     };
     let model_path =
         std::env::var("CAMELID_MTP12_TEST_MODEL").expect("explicit official target GGUF path");
@@ -420,21 +424,52 @@ fn target_verify_fused_glue_masks_are_bit_exact_against_legacy() {
 
     let masks: Vec<(&str, u32)> = vec![
         ("all", GEMMA4_FUSED_GLUE_ALL),
+        ("cycle1", GEMMA4_FUSED_GLUE_CYCLE1),
+        (
+            "cycle1+c4",
+            GEMMA4_FUSED_GLUE_CYCLE1 | GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM,
+        ),
+        (
+            "cycle1+c6",
+            GEMMA4_FUSED_GLUE_CYCLE1 | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE,
+        ),
         (
             "all-c5-lite",
             GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
                 | GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
                 | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
+                | GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM
+                | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE
                 | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA
                 | GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS,
         ),
         ("c1", GEMMA4_FUSED_GLUE_C1_STAGE_ONCE),
         ("c2", GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE),
         ("c3", GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE),
+        ("c4", GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM),
         ("c7", GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA),
         ("c5", GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER),
+        ("c6", GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE),
         ("c5-lite", GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS),
     ];
+    // The decimal masks the selector is documented with must be exactly the
+    // ones this gate compares, so a receipt naming a mask names a tested one.
+    assert_eq!(GEMMA4_FUSED_GLUE_CYCLE1, 87);
+    assert_eq!(GEMMA4_FUSED_GLUE_ALL, 127);
+    for &(label, expected) in &[
+        ("all", 127u32),
+        ("cycle1", 87),
+        ("cycle1+c4", 95),
+        ("cycle1+c6", 119),
+        ("c4", 8),
+        ("c6", 32),
+    ] {
+        let found = masks
+            .iter()
+            .find(|(name, _)| *name == label)
+            .map(|(_, mask)| *mask);
+        assert_eq!(found, Some(expected), "mask {label} must be {expected}");
+    }
     let mut cases: Vec<(String, GlueCase)> = vec![
         ("linear K=1".to_string(), GlueCase::Linear(1)),
         ("linear K=8".to_string(), GlueCase::Linear(8)),
