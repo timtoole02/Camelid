@@ -7956,7 +7956,7 @@ struct Gemma4AttnV2Args {
     uint dim_blocks;
 };
 
-template <uint HEAD_DIM, uint PAIRS>
+template <uint HEAD_DIM, uint PAIRS, uint SIMD_GROUPS = 1u>
 inline void gemma4_attn_rows_v2_scores_fused(
     device const float* query,
     device const float* keys,
@@ -7978,7 +7978,7 @@ inline void gemma4_attn_rows_v2_scores_fused(
     const uint row_stride = args.n_heads * HEAD_DIM;
 
     // Stage this chunk's queries: pair j -> (head = kv_head*group + j/rows, row = j%rows).
-    for (uint idx = lane; idx < pair_count * Q4; idx += 32u) {
+    for (uint idx = lane; idx < pair_count * Q4; idx += 32u * SIMD_GROUPS) {
         const uint j = idx / Q4;
         const uint c = idx - j * Q4;
         const uint pair = pair_begin + j;
@@ -7989,7 +7989,7 @@ inline void gemma4_attn_rows_v2_scores_fused(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint p = args.union_start + tg.y * 32u + lane;
+    const uint p = args.union_start + tg.y * 32u * SIMD_GROUPS + lane;
     if (p >= args.union_end) return;
     device const float4* k4 = (device const float4*)(
         keys + args.kv_base_offset + kv_head * args.kv_head_stride + p * args.position_stride);
@@ -8048,6 +8048,33 @@ kernel void NAME( \
 
 GEMMA4_ATTN_V2_SCORES_KERNEL(gemma4_attn_rows_v2_scores_hd256, 256u, 16u)
 GEMMA4_ATTN_V2_SCORES_KERNEL(gemma4_attn_rows_v2_scores_hd512, 512u, 8u)
+
+// Four SIMD groups share a query tile. Every lane still owns an independent,
+// sequential head_dim-deep score, exactly as above; only query staging and the
+// number of consecutive positions handled by one threadgroup change. PAIRS=8
+// uses 8/16 KiB at HD256/512; the smaller HD256 tile admits more threadgroups.
+#define GEMMA4_ATTN_V2_SCORES_SG4_KERNEL(NAME, HD) \
+kernel void NAME( \
+    device const float* query [[buffer(0)]], \
+    device const float* keys [[buffer(1)]], \
+    device float* scores [[buffer(3)]], \
+    constant Gemma4AttnV2Args& args [[buffer(5)]], \
+    constant uint4* row_meta [[buffer(6)]], \
+    uint3 tg [[threadgroup_position_in_grid]], \
+    uint tid [[thread_index_in_threadgroup]]) \
+{ \
+    threadgroup float4 q_tg[(HD / 4u) * 8u]; \
+    const uint pair_begin = tg.z * 8u; \
+    const uint live_pairs = min(8u, args.group * args.rows - pair_begin); \
+    for (uint idx = live_pairs * (HD / 4u) + tid; idx < (HD / 4u) * 8u; idx += 128u) { \
+        q_tg[idx] = float4(0.0f); \
+    } \
+    gemma4_attn_rows_v2_scores_fused<HD, 8u, 4u>( \
+        query, keys, scores, args, row_meta, q_tg, tg, tid); \
+}
+
+GEMMA4_ATTN_V2_SCORES_SG4_KERNEL(gemma4_attn_rows_v2_scores_hd256_p8_sg4, 256u)
+GEMMA4_ATTN_V2_SCORES_SG4_KERNEL(gemma4_attn_rows_v2_scores_hd512_p8_sg4, 512u)
 
 // Established score loop nest (attention_decode_scores_f32), widened over the row
 // metadata: grid (head, row, block).  Do not "simplify" this nest — see that kernel.
@@ -8216,6 +8243,9 @@ GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd256_p8, 256u, 8u)
 GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd256_p16, 256u, 16u)
 GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd512_p8, 512u, 8u)
 GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd512_p16, 512u, 16u)
+// Two pairs retain enough independent threadgroups to hide the sequential V-fold
+// latency on the 8-KV-head sliding geometry, while halving redundant V reads.
+GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd256_p2, 256u, 2u)
 
 // Established context loop nest (attention_decode_context_f32), widened over the row
 // metadata: grid (head, row, dim_block).  Reciprocal taken HERE from the denominator.
@@ -14995,6 +15025,13 @@ const GEMMA4_ATTN_V2_SCORES_HD256: &str = "gemma4_attn_rows_v2_scores_hd256";
 #[cfg(target_os = "macos")]
 const GEMMA4_ATTN_V2_SCORES_HD512: &str = "gemma4_attn_rows_v2_scores_hd512";
 #[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_SCORES_HD256_SG4: &str = "gemma4_attn_rows_v2_scores_hd256_p8_sg4";
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_SCORES_HD512_SG4: &str = "gemma4_attn_rows_v2_scores_hd512_p8_sg4";
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_CONTEXT_HD256_P2: &str = "gemma4_attn_rows_v2_context_hd256_p2";
+
+#[cfg(target_os = "macos")]
 const GEMMA4_ATTN_V2_CONTEXT_HD256: [&str; 2] = [
     "gemma4_attn_rows_v2_context_hd256_p8",
     "gemma4_attn_rows_v2_context_hd256_p16",
@@ -15022,6 +15059,9 @@ fn gemma4_attn_rows_v2_kernel_names() -> impl Iterator<Item = &'static str> {
             GEMMA4_ATTN_V2_SCORES_NEST,
             GEMMA4_ATTN_V2_SOFTMAX,
             GEMMA4_ATTN_V2_CONTEXT_NEST,
+            GEMMA4_ATTN_V2_SCORES_HD256_SG4,
+            GEMMA4_ATTN_V2_SCORES_HD512_SG4,
+            GEMMA4_ATTN_V2_CONTEXT_HD256_P2,
         ])
 }
 
@@ -15029,9 +15069,13 @@ fn gemma4_attn_rows_v2_kernel_names() -> impl Iterator<Item = &'static str> {
 /// bit-exact against the established `(head,row)` kernel on every production geometry
 /// by `metal_gemma4_dense_attention_rows_v2_variant_matrix`.
 /// `scores`: 0 = the fused `(kv_head, block, chunk)` kernel (sequential scalar chain,
-/// 16 pairs per threadgroup at head_dim 256 / 8 at 512), 1 = the established nest.
+/// 16 pairs per threadgroup at head_dim 256 / 8 at 512), 1 = the established nest,
+/// 2 = 8 pairs sharing a query tile across four SIMD groups (128 positions per TG).
 /// `context`: 0 = the established nest, 1 = the fused `(kv_head, chunk, dim_block)`
-/// kernel with 8 pairs per threadgroup, 2 = the same with 16 pairs.
+/// kernel with 8 pairs per threadgroup, 2 = the same with 16 pairs, 3 = 2 pairs
+/// for the sliding HD256 geometry and the established nest for global HD512.
+/// The depth candidate is explicitly selected with `V2_VARIANT=2,3`; DEFAULT
+/// remains unchanged until full model and request-level qualification.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Gemma4DenseAttentionRowsV2Variant {
@@ -15041,8 +15085,8 @@ struct Gemma4DenseAttentionRowsV2Variant {
 
 #[cfg(target_os = "macos")]
 impl Gemma4DenseAttentionRowsV2Variant {
-    const SCORES_FORMS: u8 = 2;
-    const CONTEXT_FORMS: u8 = 3;
+    const SCORES_FORMS: u8 = 3;
+    const CONTEXT_FORMS: u8 = 4;
     const NEST: Self = Self {
         scores: 1,
         context: 0,
@@ -15080,13 +15124,30 @@ impl Gemma4DenseAttentionRowsV2Variant {
             (1, _) => Some((GEMMA4_ATTN_V2_SCORES_NEST, 0)),
             (0, 256) => Some((GEMMA4_ATTN_V2_SCORES_HD256, 16)),
             (0, 512) => Some((GEMMA4_ATTN_V2_SCORES_HD512, 8)),
+            (2, 256) => Some((GEMMA4_ATTN_V2_SCORES_HD256_SG4, 8)),
+            (2, 512) => Some((GEMMA4_ATTN_V2_SCORES_HD512_SG4, 8)),
             _ => None,
+        }
+    }
+
+    fn scores_simdgroups(self) -> usize {
+        if self.scores == 2 {
+            4
+        } else {
+            1
         }
     }
 
     /// `(kernel name, pairs per threadgroup, output dims per threadgroup)`; pairs = 0
     /// marks the nest kernel.  Every context kernel runs 32 lanes over 32 dims.
     fn context_kernel(self, head_dim: usize) -> Option<(&'static str, usize, usize)> {
+        if self.context == 3 {
+            return match head_dim {
+                256 => Some((GEMMA4_ATTN_V2_CONTEXT_HD256_P2, 2, 32)),
+                512 => Some((GEMMA4_ATTN_V2_CONTEXT_NEST, 0, 32)),
+                _ => None,
+            };
+        }
         let (index, pairs) = match self.context {
             0 => return Some((GEMMA4_ATTN_V2_CONTEXT_NEST, 0, 32)),
             1 => (0, 8),
@@ -27775,6 +27836,7 @@ fn encode_gemma4_dense_attention_rows_v2_f32(
     e.set_buffer(1, Some(keys), 0);
     e.set_buffer(3, Some(score_scratch), 0);
     bind_args(e);
+    let scores_threads = 32 * variant.scores_simdgroups();
     let scores_grid = if scores_pairs == 0 {
         metal::MTLSize {
             width: n_heads as u64,
@@ -27784,11 +27846,18 @@ fn encode_gemma4_dense_attention_rows_v2_f32(
     } else {
         metal::MTLSize {
             width: n_kv_heads as u64,
-            height: ((union_end - union_start) as usize).div_ceil(32) as u64,
+            height: ((union_end - union_start) as usize).div_ceil(scores_threads) as u64,
             depth: total_pairs.div_ceil(scores_pairs) as u64,
         }
     };
-    e.dispatch_thread_groups(scores_grid, tg32);
+    e.dispatch_thread_groups(
+        scores_grid,
+        metal::MTLSize {
+            width: scores_threads as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
 
     e.set_compute_pipeline_state(softmax_pipeline);
     e.set_buffer(3, Some(score_scratch), 0);
@@ -52908,6 +52977,18 @@ mod tests {
             ("k8-sliding-full", 16, 8, 256, 2_048, 1_500, 8, Some(1_024)),
             ("k8-global-short", 16, 1, 512, 2_048, 60, 8, None),
             ("k8-global-1k", 16, 1, 512, 2_048, 1_030, 8, None),
+            ("k8-sliding-128", 16, 8, 256, 2_048, 128, 8, Some(1_024)),
+            ("k8-sliding-512", 16, 8, 256, 2_048, 512, 8, Some(1_024)),
+            ("k8-sliding-app-ragged", 16, 8, 256, 2_048, 529, 8, Some(1_024)),
+            ("k8-sliding-768", 16, 8, 256, 2_048, 768, 8, Some(1_024)),
+            ("k8-sliding-1023", 16, 8, 256, 2_048, 1_023, 8, Some(1_024)),
+            ("k8-sliding-1024", 16, 8, 256, 2_048, 1_024, 8, Some(1_024)),
+            ("k8-sliding-1025", 16, 8, 256, 2_048, 1_025, 8, Some(1_024)),
+            ("k8-global-128", 16, 1, 512, 2_048, 128, 8, None),
+            ("k8-global-512", 16, 1, 512, 2_048, 512, 8, None),
+            ("k8-global-app-ragged", 16, 1, 512, 2_048, 529, 8, None),
+            ("k8-global-768", 16, 1, 512, 2_048, 768, 8, None),
+            ("k8-global-1024", 16, 1, 512, 2_048, 1_024, 8, None),
             ("k16-sliding-edge", 16, 8, 256, 2_048, 1_017, 16, Some(1_024)),
             ("k16-global-1k", 16, 1, 512, 2_048, 1_000, 16, None),
             ("k4-sliding-full", 16, 8, 256, 2_048, 1_300, 4, Some(1_024)),
