@@ -44,6 +44,32 @@ impl Gemma4DenseTreePlan {
         &self.depths
     }
 
+    /// The linear W8 chain: parents `[-1, 0, 1, .., 6]`, depths `0..=7`, so
+    /// `ancestors[row][d] == d` (every mapped address equals its logical position)
+    /// and [`Self::row_plan`] equals `gemma4_dense_attention_row_plan` for 8 rows.
+    /// Used by the opt-in `CAMELID_GEMMA4_LINEAR_K8_VIA_TREE=1` route.
+    pub(crate) fn chain() -> &'static Self {
+        static CHAIN: OnceLock<Gemma4DenseTreePlan> = OnceLock::new();
+        CHAIN.get_or_init(|| {
+            Self::new(&[-1, 0, 1, 2, 3, 4, 5, 6], &[0, 1, 2, 3, 4, 5, 6, 7])
+                .expect("the static W8 chain plan is a valid tree")
+        })
+    }
+
+    /// True when every row's parent is the previous row at depth `row`: the whole
+    /// union is then linear-addressed and the encoder needs no suffix dispatch.
+    pub(crate) fn is_linear_chain(&self) -> bool {
+        self.parents
+            .iter()
+            .enumerate()
+            .all(|(row, &parent)| parent == row as i32 - 1)
+            && self
+                .depths
+                .iter()
+                .enumerate()
+                .all(|(row, &depth)| depth == row as u32)
+    }
+
     pub(crate) fn path_valid(&self, path: &[usize]) -> bool {
         !path.is_empty()
             && path.len() <= ROWS
@@ -88,7 +114,254 @@ struct TreePipelines {
     suffix_scores: ComputePipelineState,
     context: ComputePipelineState,
     context_p2: ComputePipelineState,
+    context_hd256_p2x: ComputePipelineState,
+    context_hd256_p4x: ComputePipelineState,
+    context_hd256_p8x: ComputePipelineState,
+    context_hd512_p2x: ComputePipelineState,
+    context_hd512_p4x: ComputePipelineState,
+    context_hd512_p8x: ComputePipelineState,
+    context_hd512_p16x: ComputePipelineState,
     compact: ComputePipelineState,
+}
+
+const TREE_CONTEXT_NEST: &str = "gemma4_tree_context_nest";
+const TREE_CONTEXT_HD256_P2: &str = "gemma4_tree_context_hd256_p2";
+const TREE_CONTEXT_HD256_P2X: &str = "gemma4_tree_context_hd256_p2x";
+const TREE_CONTEXT_HD256_P4X: &str = "gemma4_tree_context_hd256_p4x";
+const TREE_CONTEXT_HD256_P8X: &str = "gemma4_tree_context_hd256_p8x";
+const TREE_CONTEXT_HD512_P2X: &str = "gemma4_tree_context_hd512_p2x";
+const TREE_CONTEXT_HD512_P4X: &str = "gemma4_tree_context_hd512_p4x";
+const TREE_CONTEXT_HD512_P8X: &str = "gemma4_tree_context_hd512_p8x";
+const TREE_CONTEXT_HD512_P16X: &str = "gemma4_tree_context_hd512_p16x";
+
+impl TreePipelines {
+    fn context_pipeline(&self, name: &str) -> Option<&ComputePipelineState> {
+        Some(match name {
+            TREE_CONTEXT_NEST => &self.context,
+            TREE_CONTEXT_HD256_P2 => &self.context_p2,
+            TREE_CONTEXT_HD256_P2X => &self.context_hd256_p2x,
+            TREE_CONTEXT_HD256_P4X => &self.context_hd256_p4x,
+            TREE_CONTEXT_HD256_P8X => &self.context_hd256_p8x,
+            TREE_CONTEXT_HD512_P2X => &self.context_hd512_p2x,
+            TREE_CONTEXT_HD512_P4X => &self.context_hd512_p4x,
+            TREE_CONTEXT_HD512_P8X => &self.context_hd512_p8x,
+            TREE_CONTEXT_HD512_P16X => &self.context_hd512_p16x,
+            _ => return None,
+        })
+    }
+}
+
+/// One tree-library context kernel form. `P2` is today's dispatch (the qualified
+/// HD256 PAIRS2 kernel under V2 context form 3, else the nest / HD512 split); the
+/// others are the pipelined `gemma4_tree_context_pipelined<HD, PAIRS>` instantiations
+/// (`P2X` = pipelined PAIRS 2; P2X/P4/P8 exist at both head dims; P16 at HD512 only,
+/// measurement-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TreeContextForm {
+    P2,
+    P2X,
+    P4,
+    P8,
+    P16,
+}
+
+impl TreeContextForm {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "p2" => Self::P2,
+            "p2x" => Self::P2X,
+            "p4" | "p4x" => Self::P4,
+            "p8" | "p8x" => Self::P8,
+            "p16" | "p16x" => Self::P16,
+            _ => return None,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::P2 => "p2",
+            Self::P2X => "p2x",
+            Self::P4 => "p4",
+            Self::P8 => "p8",
+            Self::P16 => "p16",
+        }
+    }
+
+    /// Which instantiations exist per head dimension.
+    fn available(self, head_dim: usize) -> bool {
+        matches!(
+            (head_dim, self),
+            (256, Self::P2 | Self::P2X | Self::P4 | Self::P8)
+                | (512, Self::P2 | Self::P2X | Self::P4 | Self::P8 | Self::P16)
+        )
+    }
+}
+
+/// The tree-only context-kernel selection: one form for the sliding HD256 layers and
+/// one for the global HD512 layers (`CAMELID_GEMMA4_TREE_CONTEXT_FORM`, see
+/// [`context_selection`]). `TODAY` is byte-for-byte today's dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TreeContextSelection {
+    pub(super) sliding: TreeContextForm,
+    pub(super) global: TreeContextForm,
+}
+
+impl TreeContextSelection {
+    pub(super) const TODAY: Self = Self {
+        sliding: TreeContextForm::P2,
+        global: TreeContextForm::P2,
+    };
+
+    /// `p2|p2x|p4|p8|p16` applies one form to both head dims where it is instantiated
+    /// (P16 exists only at HD512; the other dim keeps `p2`);
+    /// `<sliding>,<global>` selects each explicitly and refuses a missing instantiation.
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if let Some((sliding, global)) = value.split_once(',') {
+            let sliding = TreeContextForm::parse(sliding)?;
+            let global = TreeContextForm::parse(global)?;
+            return (sliding.available(256) && global.available(512))
+                .then_some(Self { sliding, global });
+        }
+        let form = TreeContextForm::parse(value)?;
+        Some(Self {
+            sliding: if form.available(256) { form } else { TreeContextForm::P2 },
+            global: if form.available(512) { form } else { TreeContextForm::P2 },
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn label(self) -> String {
+        format!("{},{}", self.sliding.label(), self.global.label())
+    }
+
+    /// The tree-library kernel this selection binds for `head_dim` under the V2
+    /// `variant`: `(function name, pairs per threadgroup)`; pairs = 0 is the nest
+    /// grid `(head, row, dim_block)`, otherwise `(kv_head, pair_chunk, dim_block)`.
+    pub(super) fn kernel(
+        self,
+        head_dim: usize,
+        variant: Gemma4DenseAttentionRowsV2Variant,
+    ) -> Option<(&'static str, usize)> {
+        let form = match head_dim {
+            256 => self.sliding,
+            512 => self.global,
+            _ => return None,
+        };
+        Some(match (head_dim, form) {
+            (256, TreeContextForm::P2) if variant.context == 3 => (TREE_CONTEXT_HD256_P2, 2),
+            (_, TreeContextForm::P2) => (TREE_CONTEXT_NEST, 0),
+            (256, TreeContextForm::P2X) => (TREE_CONTEXT_HD256_P2X, 2),
+            (256, TreeContextForm::P4) => (TREE_CONTEXT_HD256_P4X, 4),
+            (256, TreeContextForm::P8) => (TREE_CONTEXT_HD256_P8X, 8),
+            (512, TreeContextForm::P2X) => (TREE_CONTEXT_HD512_P2X, 2),
+            (512, TreeContextForm::P4) => (TREE_CONTEXT_HD512_P4X, 4),
+            (512, TreeContextForm::P8) => (TREE_CONTEXT_HD512_P8X, 8),
+            (512, TreeContextForm::P16) => (TREE_CONTEXT_HD512_P16X, 16),
+            _ => return None,
+        })
+    }
+
+    /// Human-readable RESOLVED kernel name for receipts (the HD512 nest entry point
+    /// runs `gemma4_tree_context_hd512_split` internally).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn resolved_name(
+        self,
+        head_dim: usize,
+        variant: Gemma4DenseAttentionRowsV2Variant,
+    ) -> &'static str {
+        match self.kernel(head_dim, variant) {
+            Some((TREE_CONTEXT_NEST, _)) if head_dim == 512 => {
+                "gemma4_tree_context_nest(hd512_split)"
+            }
+            Some((name, _)) => name,
+            None => "<unavailable>",
+        }
+    }
+
+    /// Every selection the raw gate proves for one head dimension (the other dim's
+    /// form is irrelevant to that geometry and stays `p2`).
+    #[cfg(test)]
+    pub(super) fn gate_forms(head_dim: usize) -> Vec<Self> {
+        let forms = [
+            TreeContextForm::P2,
+            TreeContextForm::P2X,
+            TreeContextForm::P4,
+            TreeContextForm::P8,
+            TreeContextForm::P16,
+        ];
+        forms
+            .into_iter()
+            .filter(|form| form.available(head_dim))
+            .map(|form| match head_dim {
+                256 => Self {
+                    sliding: form,
+                    global: TreeContextForm::P2,
+                },
+                _ => Self {
+                    sliding: TreeContextForm::P2,
+                    global: form,
+                },
+            })
+            .collect()
+    }
+
+    /// Default measurement list for the tree receipt: today's forms, each new form in
+    /// isolation per head dimension, then the candidate combinations.
+    #[cfg(test)]
+    pub(super) fn receipt_forms() -> Vec<Self> {
+        [
+            "p2", "p2x,p2", "p4,p2", "p8,p2", "p2,p2x", "p2,p4", "p2,p8", "p2,p16", "p2x,p2x",
+            "p2x,p4", "p4,p4", "p4,p8", "p8,p8",
+        ]
+            .into_iter()
+            .map(|spec| Self::parse(spec).expect("static receipt form"))
+            .collect()
+    }
+}
+
+/// `CAMELID_GEMMA4_TREE_CONTEXT_FORM`, read once per process: tree-only context
+/// kernel selector (`p2` = today's kernels, `p2x`, `p4`, `p8`, `p16`, or
+/// `<sliding>,<global>` such as `p2x,p4`). Unset = today's dispatch byte-for-byte; an unparsable value
+/// keeps today's dispatch and says so once. The V2 variant matrix is not widened.
+pub(super) fn context_selection() -> TreeContextSelection {
+    static SELECTION: OnceLock<TreeContextSelection> = OnceLock::new();
+    *SELECTION.get_or_init(|| {
+        let Ok(value) = std::env::var("CAMELID_GEMMA4_TREE_CONTEXT_FORM") else {
+            return TreeContextSelection::TODAY;
+        };
+        match TreeContextSelection::parse(&value) {
+            Some(selection) => {
+                eprintln!(
+                    "[gemma4-tree] CAMELID_GEMMA4_TREE_CONTEXT_FORM={value:?} -> sliding HD256 {} / \
+                     global HD512 {}",
+                    selection.sliding.label(),
+                    selection.global.label()
+                );
+                selection
+            }
+            None => {
+                eprintln!(
+                    "[gemma4-tree] CAMELID_GEMMA4_TREE_CONTEXT_FORM={value:?} is not p2|p2x|p4|p8|p16 \
+                     or <sliding p2|p2x|p4|p8>,<global p2|p2x|p4|p8|p16>; keeping p2 (today's kernels)"
+                );
+                TreeContextSelection::TODAY
+            }
+        }
+    })
+}
+
+/// `CAMELID_GEMMA4_LINEAR_K8_VIA_TREE=1`, read once per process: route linear
+/// (non-branched) K=8 V2 verifies through [`encode_tree_attention`] with the static
+/// chain plan so they bind the tree-library context kernels. Unset = today's linear
+/// attention. Leave it UNSET for the full-model tree gate so its linear reference arm
+/// stays independent of the tree library.
+pub(super) fn linear_k8_via_tree_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_LINEAR_K8_VIA_TREE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 fn pipelines(kernel: &MetalLinearKernel) -> Option<&'static TreePipelines> {
@@ -111,8 +384,15 @@ fn pipelines(kernel: &MetalLinearKernel) -> Option<&'static TreePipelines> {
             Some(TreePipelines {
                 device_id: kernel.device.registry_id(),
                 suffix_scores: make("gemma4_tree_scores_suffix")?,
-                context: make("gemma4_tree_context_nest")?,
-                context_p2: make("gemma4_tree_context_hd256_p2")?,
+                context: make(TREE_CONTEXT_NEST)?,
+                context_p2: make(TREE_CONTEXT_HD256_P2)?,
+                context_hd256_p2x: make(TREE_CONTEXT_HD256_P2X)?,
+                context_hd256_p4x: make(TREE_CONTEXT_HD256_P4X)?,
+                context_hd256_p8x: make(TREE_CONTEXT_HD256_P8X)?,
+                context_hd512_p2x: make(TREE_CONTEXT_HD512_P2X)?,
+                context_hd512_p4x: make(TREE_CONTEXT_HD512_P4X)?,
+                context_hd512_p8x: make(TREE_CONTEXT_HD512_P8X)?,
+                context_hd512_p16x: make(TREE_CONTEXT_HD512_P16X)?,
                 compact: make("gemma4_tree_compact_kv")?,
             })
         })
@@ -260,6 +540,51 @@ pub(super) fn encode_tree_attention(
     plan: &Gemma4DenseTreePlan,
     variant: Gemma4DenseAttentionRowsV2Variant,
 ) -> bool {
+    encode_tree_attention_with_form(
+        encoder,
+        kernel,
+        query,
+        keys,
+        values,
+        scores,
+        denom,
+        output,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_positions,
+        base_position,
+        sliding_window,
+        scale,
+        plan,
+        variant,
+        context_selection(),
+    )
+}
+
+/// [`encode_tree_attention`] with an explicit context-kernel selection (tests and
+/// receipts); production reads the selection once from the environment.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_tree_attention_with_form(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    scores: &Buffer,
+    denom: &Buffer,
+    output: &Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_positions: usize,
+    base_position: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    plan: &Gemma4DenseTreePlan,
+    variant: Gemma4DenseAttentionRowsV2Variant,
+    form: TreeContextSelection,
+) -> bool {
     encode_tree_attention_inner(
         encoder,
         kernel,
@@ -278,6 +603,7 @@ pub(super) fn encode_tree_attention(
         scale,
         plan,
         variant,
+        form,
     )
     .is_some()
 }
@@ -301,10 +627,18 @@ fn encode_tree_attention_inner(
     scale: f32,
     plan: &Gemma4DenseTreePlan,
     variant: Gemma4DenseAttentionRowsV2Variant,
+    form: TreeContextSelection,
 ) -> Option<()> {
     let tree = pipelines(kernel)?;
     let (score_name, score_pairs) = variant.scores_kernel(head_dim)?;
     let prefix_pipeline = kernel.gemma4_attn_rows_v2_pipelines.get(score_name)?;
+    let (context_name, context_pairs) = form.kernel(head_dim, variant)?;
+    let context_pipeline = tree.context_pipeline(context_name)?;
+    // A linear chain (ancestors[row][d] == d) is entirely linear-addressed: the
+    // prefix scores dispatch then covers the WHOLE union with the linear encoder's
+    // grid (height from union_end - union_start, dispatched even when union_start ==
+    // base) and the mapped suffix dispatch is skipped: 3 dispatches per layer.
+    let chain = plan.is_linear_chain();
     let softmax_pipeline = kernel
         .gemma4_attn_rows_v2_pipelines
         .get(GEMMA4_ATTN_V2_SOFTMAX)?;
@@ -375,9 +709,10 @@ fn encode_tree_attention_inner(
     };
     // Unchanged fused arithmetic over already committed keys. The nest control
     // may also fill the suffix; mapped suffix scores overwrite it before softmax.
-    if union_start < base_u32 {
+    let prefix_end = if chain { union_end } else { base_u32 };
+    if union_start < prefix_end {
         let mut prefix_args = args;
-        prefix_args.union_end = base_u32;
+        prefix_args.union_end = prefix_end;
         encoder.set_compute_pipeline_state(prefix_pipeline);
         encoder.set_buffer(0, Some(query), 0);
         encoder.set_buffer(1, Some(keys), 0);
@@ -393,7 +728,7 @@ fn encode_tree_attention_inner(
         } else {
             metal::MTLSize {
                 width: n_kv_heads as u64,
-                height: (base_position - union_start as usize).div_ceil(threads) as u64,
+                height: ((prefix_end - union_start) as usize).div_ceil(threads) as u64,
                 depth: (group * ROWS).div_ceil(score_pairs) as u64,
             }
         };
@@ -406,19 +741,21 @@ fn encode_tree_attention_inner(
             },
         );
     }
-    encoder.set_compute_pipeline_state(&tree.suffix_scores);
-    encoder.set_buffer(0, Some(query), 0);
-    encoder.set_buffer(1, Some(keys), 0);
-    encoder.set_buffer(3, Some(scores), 0);
-    bind(encoder, &args);
-    encoder.dispatch_thread_groups(
-        metal::MTLSize {
-            width: n_heads as u64,
-            height: ROWS as u64,
-            depth: 1,
-        },
-        tg32,
-    );
+    if !chain {
+        encoder.set_compute_pipeline_state(&tree.suffix_scores);
+        encoder.set_buffer(0, Some(query), 0);
+        encoder.set_buffer(1, Some(keys), 0);
+        encoder.set_buffer(3, Some(scores), 0);
+        bind(encoder, &args);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_heads as u64,
+                height: ROWS as u64,
+                depth: 1,
+            },
+            tg32,
+        );
+    }
 
     encoder.set_compute_pipeline_state(softmax_pipeline);
     encoder.set_buffer(3, Some(scores), 0);
@@ -433,30 +770,47 @@ fn encode_tree_attention_inner(
         tg32,
     );
 
-    let paired_context = head_dim == 256 && variant.context == 3;
-    encoder.set_compute_pipeline_state(if paired_context {
-        &tree.context_p2
-    } else {
-        &tree.context
-    });
+    encoder.set_compute_pipeline_state(context_pipeline);
     encoder.set_buffer(2, Some(values), 0);
     encoder.set_buffer(3, Some(scores), 0);
     encoder.set_buffer(4, Some(output), 0);
     encoder.set_buffer(7, Some(denom), 0);
     bind(encoder, &args);
-    encoder.dispatch_thread_groups(
+    let context_grid = if context_pairs == 0 {
         metal::MTLSize {
-            width: if paired_context { n_kv_heads } else { n_heads } as u64,
-            height: if paired_context {
-                (group * ROWS).div_ceil(2)
-            } else {
-                ROWS
-            } as u64,
+            width: n_heads as u64,
+            height: ROWS as u64,
             depth: dim_blocks as u64,
-        },
-        tg32,
-    );
+        }
+    } else {
+        metal::MTLSize {
+            width: n_kv_heads as u64,
+            height: (group * ROWS).div_ceil(context_pairs) as u64,
+            depth: dim_blocks as u64,
+        }
+    };
+    encoder.dispatch_thread_groups(context_grid, tg32);
     Some(())
+}
+
+/// The 4+1+2 production topology forked at primary `step` (0..4): rows 0..4 are the
+/// primary chain, rows 5..7 continue from row `step`. Test/receipt shape only.
+#[cfg(test)]
+pub(super) fn fork_plan(step: usize) -> Gemma4DenseTreePlan {
+    Gemma4DenseTreePlan::new(
+        &[-1, 0, 1, 2, 3, step as i32, 5, 6],
+        &[
+            0,
+            1,
+            2,
+            3,
+            4,
+            step as u32 + 1,
+            step as u32 + 2,
+            step as u32 + 3,
+        ],
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -464,20 +818,131 @@ mod tests {
     use super::*;
 
     fn fork(step: usize) -> Gemma4DenseTreePlan {
-        Gemma4DenseTreePlan::new(
-            &[-1, 0, 1, 2, 3, step as i32, 5, 6],
-            &[
-                0,
-                1,
-                2,
-                3,
-                4,
-                step as u32 + 1,
-                step as u32 + 2,
-                step as u32 + 3,
-            ],
-        )
-        .unwrap()
+        fork_plan(step)
+    }
+
+    #[test]
+    fn gemma4_tree_chain_plan_matches_linear_row_plan_and_identity_ancestors() {
+        let chain = Gemma4DenseTreePlan::chain();
+        assert!(chain.is_linear_chain());
+        assert_eq!(chain.parents(), &[-1, 0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(chain.depths(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        for row in 0..ROWS {
+            for d in 0..=row {
+                assert_eq!(chain.ancestors[row][d] as usize, d, "row={row} d={d}");
+            }
+            let path: Vec<usize> = (0..=row).collect();
+            assert!(chain.path_valid(&path));
+        }
+        for step in 0..4 {
+            assert!(!fork(step).is_linear_chain());
+        }
+        assert!(
+            !Gemma4DenseTreePlan::new(&[-1, 0, 0, 1, 2, 3, 4, 5], &[0, 1, 1, 2, 2, 3, 3, 4])
+                .unwrap()
+                .is_linear_chain()
+        );
+        // The chain's row plan is the linear verifier's row plan for 8 rows: same
+        // visible_end / window_start / position_count / score_offset and scratch bytes,
+        // across the sliding-window edges and the capacity edge.
+        for window in [Some(1024), None] {
+            for base in [0, 1, 529, 640, 647, 1016, 1017, 1023, 1024, 1025, 1500, 2040] {
+                let (tree_rows, tree_bytes) = chain.row_plan(base, window, 2048, 16).unwrap();
+                let (linear_rows, linear_bytes) =
+                    gemma4_dense_attention_row_plan(base, ROWS, window, 2048, 16).unwrap();
+                assert_eq!(tree_rows, linear_rows, "window={window:?} base={base}");
+                assert_eq!(tree_bytes, linear_bytes, "window={window:?} base={base}");
+                for (row, meta) in tree_rows.iter().enumerate() {
+                    assert_eq!(meta.visible_end as usize, base + row + 1);
+                    assert_eq!(
+                        meta.window_start as usize,
+                        window.map_or(0, |w| (base + row + 1).saturating_sub(w))
+                    );
+                }
+            }
+            assert!(chain.row_plan(2041, window, 2048, 16).is_none());
+            assert!(gemma4_dense_attention_row_plan(2041, ROWS, window, 2048, 16).is_none());
+        }
+    }
+
+    #[test]
+    fn gemma4_tree_context_selection_parses_and_resolves_kernels() {
+        use TreeContextForm::{P16, P2, P2X, P4, P8};
+        let v23 = Gemma4DenseAttentionRowsV2Variant {
+            scores: 2,
+            context: 3,
+        };
+        let v00 = Gemma4DenseAttentionRowsV2Variant::DEFAULT;
+        let today = TreeContextSelection::TODAY;
+        assert_eq!(TreeContextSelection::parse("p2"), Some(today));
+        assert_eq!(today.kernel(256, v23), Some((TREE_CONTEXT_HD256_P2, 2)));
+        assert_eq!(today.kernel(256, v00), Some((TREE_CONTEXT_NEST, 0)));
+        assert_eq!(today.kernel(512, v23), Some((TREE_CONTEXT_NEST, 0)));
+        assert_eq!(today.kernel(128, v23), None);
+        assert_eq!(
+            today.resolved_name(512, v23),
+            "gemma4_tree_context_nest(hd512_split)"
+        );
+        assert_eq!(today.resolved_name(256, v23), TREE_CONTEXT_HD256_P2);
+        let p8 = TreeContextSelection::parse(" P8 ").unwrap();
+        assert_eq!(
+            p8,
+            TreeContextSelection {
+                sliding: P8,
+                global: P8
+            }
+        );
+        assert_eq!(p8.kernel(256, v00), Some((TREE_CONTEXT_HD256_P8X, 8)));
+        assert_eq!(p8.kernel(512, v23), Some((TREE_CONTEXT_HD512_P8X, 8)));
+        assert_eq!(p8.label(), "p8,p8");
+        // A single form keeps p2 where it is not instantiated.
+        assert_eq!(
+            TreeContextSelection::parse("p2x"),
+            Some(TreeContextSelection {
+                sliding: P2X,
+                global: P2X
+            })
+        );
+        assert_eq!(
+            TreeContextSelection::parse("p2x").unwrap().kernel(512, v00),
+            Some((TREE_CONTEXT_HD512_P2X, 2))
+        );
+        assert_eq!(
+            TreeContextSelection::parse("p4"),
+            Some(TreeContextSelection {
+                sliding: P4,
+                global: P4
+            })
+        );
+        let p2x4 = TreeContextSelection::parse("p2x,p4").unwrap();
+        assert_eq!(p2x4.kernel(256, v23), Some((TREE_CONTEXT_HD256_P2X, 2)));
+        assert_eq!(p2x4.kernel(256, v00), Some((TREE_CONTEXT_HD256_P2X, 2)));
+        assert_eq!(p2x4.kernel(512, v23), Some((TREE_CONTEXT_HD512_P4X, 4)));
+        assert_eq!(p2x4.label(), "p2x,p4");
+        assert_eq!(
+            TreeContextSelection::parse("p16x"),
+            Some(TreeContextSelection {
+                sliding: P2,
+                global: P16
+            })
+        );
+        let pair = TreeContextSelection::parse("p4,p16").unwrap();
+        assert_eq!(pair.kernel(256, v23), Some((TREE_CONTEXT_HD256_P4X, 4)));
+        assert_eq!(pair.kernel(512, v23), Some((TREE_CONTEXT_HD512_P16X, 16)));
+        assert_eq!(pair.label(), "p4,p16");
+        // Explicit pairs refuse a missing instantiation; garbage is refused.
+        assert_eq!(TreeContextSelection::parse("p16,p8"), None);
+        assert_eq!(TreeContextSelection::parse("p16,p2x"), None);
+        assert_eq!(TreeContextSelection::parse("p2x,p16x"), Some(TreeContextSelection {
+            sliding: P2X,
+            global: P16
+        }));
+        assert_eq!(TreeContextSelection::parse("p3"), None);
+        assert_eq!(TreeContextSelection::parse(""), None);
+        assert_eq!(TreeContextSelection::parse("p8,p8,p8"), None);
+        assert_eq!(TreeContextSelection::gate_forms(256).len(), 4);
+        assert_eq!(TreeContextSelection::gate_forms(512).len(), 5);
+        assert_eq!(TreeContextSelection::receipt_forms().len(), 13);
     }
 
     #[test]
@@ -585,26 +1050,45 @@ mod tests {
                     Gemma4DenseTreePlan::new(&[-1, 0, 0, 1, 2, 3, 4, 5], &[0, 1, 1, 2, 2, 3, 3, 4])
                         .unwrap(),
                 );
+                // The linear chain: whole-union prefix scores, no suffix dispatch.
+                plans.push(Gemma4DenseTreePlan::chain().clone());
                 for plan in plans {
                     let (tree_meta, tree_bytes) =
                         plan.row_plan(base, window, capacity, heads).unwrap();
                     let ts = buffer(tree_bytes / 4);
                     let td = buffer(ROWS * heads);
                     let to = buffer(query.len());
-                    for variant in [
+                    let variants = [
                         Gemma4DenseAttentionRowsV2Variant::DEFAULT,
                         Gemma4DenseAttentionRowsV2Variant::NEST,
                         Gemma4DenseAttentionRowsV2Variant {
                             scores: 2,
                             context: 3,
                         },
-                    ] {
+                    ];
+                    // Every tree-only context form for this head dimension (the
+                    // tree selector, not the V2 variant list) under every scores form.
+                    for (variant, form) in variants.into_iter().flat_map(|variant| {
+                        TreeContextSelection::gate_forms(hd)
+                            .into_iter()
+                            .map(move |form| (variant, form))
+                    }) {
+                        // Poison the packed score scratch so an element in [base, base+8)
+                        // left unwritten by a short prefix grid can never pass by
+                        // accident: the exp-score comparison would see the NaN bits.
+                        write_buffer_f32(&ts, &vec![f32::NAN; tree_bytes / 4]);
+                        write_buffer_f32(&to, &vec![f32::NAN; query.len()]);
                         let command = kernel.queue.new_command_buffer();
                         let encoder = command.new_compute_command_encoder();
-                        assert!(encode_tree_attention(
-                            encoder, kernel, &tq, &tk, &tv, &ts, &td, &to, heads, kv_heads, hd,
-                            capacity, base, window, 1.0, &plan, variant
-                        ));
+                        assert!(
+                            encode_tree_attention_with_form(
+                                encoder, kernel, &tq, &tk, &tv, &ts, &td, &to, heads, kv_heads,
+                                hd, capacity, base, window, 1.0, &plan, variant, form
+                            ),
+                            "hd={hd} base={base} parents={:?} variant={variant:?} form={} declined",
+                            plan.parents,
+                            form.label()
+                        );
                         encoder.end_encoding();
                         command.commit();
                         command.wait_until_completed();
@@ -662,8 +1146,9 @@ mod tests {
                             let denom = read(&rd, ROWS * heads);
                             let output = read(&ro, query.len());
                             let label = format!(
-                                "hd={hd} base={base} parents={:?} node={node} variant={variant:?}",
-                                plan.parents
+                                "hd={hd} base={base} parents={:?} node={node} variant={variant:?} form={}",
+                                plan.parents,
+                                form.label()
                             );
                             let tm = tree_meta[node];
                             let rm = reference_meta[depth];
@@ -747,7 +1232,12 @@ mod tests {
                 }
             }
         }
-        eprintln!("[gemma4-tree] exact attention: {cases} tree configurations, {} independent W8-padded paths", cases * ROWS);
+        eprintln!(
+            "[gemma4-tree] exact attention: {cases} tree configurations, {} independent W8-padded paths \
+             (plans: 4 forks + interleaved + linear chain; context forms p2/p2x/p4/p8 at HD256, \
+             p2/p2x/p4/p8/p16 at HD512; scores forms default/nest/sg4)",
+            cases * ROWS
+        );
     }
 
     #[test]
