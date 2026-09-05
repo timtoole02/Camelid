@@ -78,19 +78,13 @@ kernel void gemma4_tree_context_nest(
     uint score_base = meta.z + head * position_count;
     float inv = 1.0 / denom_in[row * args.n_heads + head];
     uint stride = 32u * args.dim_blocks;
-    const uint prefix_count = meta.x < tree_base
-        ? min(position_count, tree_base - meta.x) : 0u;
-    const uint prefix_kv_base = kv_base + meta.x * position_stride;
 
     for (uint d = lane + tg.z * 32u; d < head_dim; d += stride) {
         float acc = 0.0;
-        // Keep the long committed-prefix walk identical to the linear nest.
-        // The same accumulator and reciprocal continue through the suffix.
-        for (uint p = 0; p < prefix_count; ++p) {
-            acc += scores[score_base + p] * inv * values[prefix_kv_base + p * position_stride + d];
-        }
-        for (uint p = prefix_count; p < position_count; ++p) {
-            uint physical_position = tree_base + ancestors[row * 8u + meta.x + p - tree_base];
+        for (uint p = 0; p < position_count; ++p) {
+            uint logical_position = meta.x + p;
+            uint physical_position = logical_position < tree_base ? logical_position
+                : tree_base + ancestors[row * 8u + logical_position - tree_base];
             acc += scores[score_base + p] * inv * values[kv_base + physical_position * position_stride + d];
         }
         output[q_base + d] = acc;
