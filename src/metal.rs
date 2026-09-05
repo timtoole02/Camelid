@@ -12602,9 +12602,11 @@ kernel void gemma4_verify_head_norm_f32(
     constant uint& n_heads [[buffer(12)]],
     constant uint& n_kv_heads [[buffer(13)]],
     uint2 tgid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgsize [[threads_per_threadgroup]]
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 tgsize2 [[threads_per_threadgroup]]
 ) {
+    const uint tid = tid2.x;
+    const uint tgsize = tgsize2.x;
     threadgroup float partial[256];
     const uint row = tgid.y;
     uint head = tgid.x;
@@ -12688,9 +12690,11 @@ kernel void gemma4_verify_head_norm_rope_scatter_f32(
     constant uint& max_positions [[buffer(14)]],
     constant uint& base_position [[buffer(15)]],
     uint2 tgid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgsize [[threads_per_threadgroup]]
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 tgsize2 [[threads_per_threadgroup]]
 ) {
+    const uint tid = tid2.x;
+    const uint tgsize = tgsize2.x;
     threadgroup float partial[256];
     threadgroup float staged[512];
     const uint row = tgid.y;
