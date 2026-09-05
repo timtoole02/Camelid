@@ -1313,6 +1313,220 @@ fn spec50_mma_head_kernels() -> Option<&'static Spec50MmaHeadKernels> {
         .as_ref()
 }
 
+/// One dispatch form of the exact 12B/K8 MMA head, selected by
+/// `CAMELID_GEMMA4_SPEC50_HEAD_FORM`. Only the schedule changes: which
+/// simdgroup owns which `unit0` (`simdgroups`), whether the instruction-reduced
+/// decode sibling runs (`lean`), and whether both unit passes' device loads are
+/// hoisted above their arithmetic (`prefetch`). Every value folds the same
+/// per-cell integers in the same order and runs the same `simd_sum` and
+/// softcap, which is what `spec50_head_form_variants_are_bitwise_identical`
+/// gates. Unset selector = [`SPEC50_FORM_BASE`], which is the established
+/// `q6k_spec50_mma_k8` compiled from an unprefixed `spec50_mma_head.metal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Spec50HeadForm {
+    pub(crate) name: &'static str,
+    /// Simdgroups per threadgroup: `MMA_SG` for the established body, the `SG`
+    /// template argument for the lean sibling. A threadgroup still owns exactly
+    /// eight vocabulary rows, so this trades threadgroup count for the
+    /// simdgroups resident per byte of the 8 KB `partials` transpose.
+    pub(crate) simdgroups: usize,
+    /// 0 = `q6k_spec50_mma_k8`, 1 = `q6k_spec50_mma_lean_k8_sg*_pf*`.
+    pub(crate) lean: u32,
+    /// Lean only: 1 hoists both passes' loads (double-buffered unit fetch).
+    pub(crate) prefetch: u32,
+}
+
+/// The established form: today's kernel, four simdgroups, no prefetch.
+pub(crate) const SPEC50_FORM_BASE: Spec50HeadForm = Spec50HeadForm {
+    name: "base",
+    simdgroups: 4,
+    lean: 0,
+    prefetch: 0,
+};
+
+/// Forms selectable by name; the generic `sg<N>-lean<L>-pf<P>` form is accepted
+/// too, so a bench candidate can be driven in situ without a rebuild.
+const SPEC50_NAMED_FORMS: &[Spec50HeadForm] = &[
+    SPEC50_FORM_BASE,
+    Spec50HeadForm { name: "sg1", simdgroups: 1, lean: 0, prefetch: 0 },
+    Spec50HeadForm { name: "sg2", simdgroups: 2, lean: 0, prefetch: 0 },
+    Spec50HeadForm { name: "sg8", simdgroups: 8, lean: 0, prefetch: 0 },
+    Spec50HeadForm { name: "sg16", simdgroups: 16, lean: 0, prefetch: 0 },
+    Spec50HeadForm { name: "lean", simdgroups: 4, lean: 1, prefetch: 0 },
+    Spec50HeadForm { name: "lean-pf", simdgroups: 4, lean: 1, prefetch: 1 },
+    Spec50HeadForm { name: "lean-sg2", simdgroups: 2, lean: 1, prefetch: 0 },
+    Spec50HeadForm { name: "lean-sg8", simdgroups: 8, lean: 1, prefetch: 0 },
+    Spec50HeadForm { name: "lean-sg16", simdgroups: 16, lean: 1, prefetch: 0 },
+    Spec50HeadForm { name: "lean-pf-sg2", simdgroups: 2, lean: 1, prefetch: 1 },
+    Spec50HeadForm { name: "lean-pf-sg8", simdgroups: 8, lean: 1, prefetch: 1 },
+    Spec50HeadForm { name: "lean-pf-sg16", simdgroups: 16, lean: 1, prefetch: 1 },
+];
+
+impl Spec50HeadForm {
+    /// Threads per threadgroup (32-lane simdgroups).
+    pub(crate) fn threads_per_tg(&self) -> usize {
+        32 * self.simdgroups
+    }
+
+    /// Shapes the shader has entry points for: only the compiled `SG` values,
+    /// and `prefetch` exists on the lean sibling alone.
+    fn admitted(&self) -> bool {
+        matches!(self.simdgroups, 1 | 2 | 4 | 8 | 16)
+            && self.lean <= 1
+            && self.prefetch <= 1
+            && (self.lean == 1 || self.prefetch == 0)
+    }
+
+    /// Name of the K8 entry point this form dispatches.
+    fn batch_kernel(&self) -> String {
+        if self.lean == 1 {
+            format!(
+                "q6k_spec50_mma_lean_k8_sg{}_pf{}",
+                self.simdgroups, self.prefetch
+            )
+        } else {
+            "q6k_spec50_mma_k8".to_string()
+        }
+    }
+
+    /// The `#define` prologue prepended to `spec50_mma_head.metal`. The base
+    /// form at four simdgroups prepends nothing at all, so the default library
+    /// is compiled from the file byte-for-byte.
+    fn shader_defines(&self) -> String {
+        if self.lean == 0 && self.simdgroups != 4 {
+            format!("#define MMA_SG {}\n", self.simdgroups)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Parse a selector: a name from [`SPEC50_NAMED_FORMS`] or the generic
+    /// `sg<N>-lean<L>-pf<P>` form (every field required).
+    pub(crate) fn parse(spec: &str) -> Option<Self> {
+        let spec = spec.trim();
+        if let Some(named) = SPEC50_NAMED_FORMS
+            .iter()
+            .find(|form| form.name.eq_ignore_ascii_case(spec))
+        {
+            return Some(*named);
+        }
+        let mut form = Spec50HeadForm {
+            name: "custom",
+            simdgroups: 0,
+            lean: u32::MAX,
+            prefetch: u32::MAX,
+        };
+        for field in spec.split('-') {
+            let (prefix, digits) = field.split_at(field.find(|c: char| c.is_ascii_digit())?);
+            let value: usize = digits.parse().ok()?;
+            match prefix {
+                "sg" => form.simdgroups = value,
+                "lean" => form.lean = u32::try_from(value).ok()?,
+                "pf" => form.prefetch = u32::try_from(value).ok()?,
+                _ => return None,
+            }
+        }
+        (form.lean != u32::MAX && form.prefetch != u32::MAX && form.admitted()).then_some(form)
+    }
+}
+
+/// `CAMELID_GEMMA4_SPEC50_HEAD_FORM`, parsed once. Unset, empty or not admitted
+/// keeps [`SPEC50_FORM_BASE`], i.e. today's dispatch byte-for-byte.
+pub(crate) fn spec50_head_form() -> Spec50HeadForm {
+    static SELECTED: OnceLock<Spec50HeadForm> = OnceLock::new();
+    *SELECTED.get_or_init(|| {
+        let Some(spec) = std::env::var("CAMELID_GEMMA4_SPEC50_HEAD_FORM")
+            .ok()
+            .filter(|spec| !spec.trim().is_empty())
+        else {
+            return SPEC50_FORM_BASE;
+        };
+        match Spec50HeadForm::parse(&spec) {
+            Some(form) => {
+                eprintln!(
+                    "[metal] SPEC50 head form {:?}: sg{} lean{} pf{}",
+                    form.name, form.simdgroups, form.lean, form.prefetch
+                );
+                form
+            }
+            None => {
+                eprintln!(
+                    "[metal] CAMELID_GEMMA4_SPEC50_HEAD_FORM={spec:?} is not admitted; keeping the established head"
+                );
+                SPEC50_FORM_BASE
+            }
+        }
+    })
+}
+
+/// One compiled pipeline set per form, kept for the life of the process (a
+/// failed compile is remembered too, so the diagnostic prints once). The base
+/// form is delegated to [`spec50_mma_head_kernels`] so the established lane
+/// keeps its own single `OnceLock` and its unprefixed source.
+static SPEC50_MMA_FORM_KERNELS: OnceLock<
+    Mutex<Vec<(Spec50HeadForm, Option<&'static Spec50MmaHeadKernels>)>>,
+> = OnceLock::new();
+
+fn spec50_mma_head_kernels_for(form: Spec50HeadForm) -> Option<&'static Spec50MmaHeadKernels> {
+    if form == SPEC50_FORM_BASE {
+        return spec50_mma_head_kernels();
+    }
+    if !form.admitted() {
+        return None;
+    }
+    let cache = SPEC50_MMA_FORM_KERNELS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut cache = cache.lock().ok()?;
+    if let Some((_, kernels)) = cache.iter().find(|(cached, _)| *cached == form) {
+        return *kernels;
+    }
+    let kernels = compile_spec50_mma_head_kernels(form).map(|k| &*Box::leak(Box::new(k)));
+    cache.push((form, kernels));
+    kernels
+}
+
+fn compile_spec50_mma_head_kernels(form: Spec50HeadForm) -> Option<Spec50MmaHeadKernels> {
+    let device = Device::system_default()?;
+    let options = CompileOptions::new();
+    options.set_fast_math_enabled(false);
+    let source = format!(
+        "{}{}",
+        form.shader_defines(),
+        include_str!("spec50_mma_head.metal")
+    );
+    let library = device
+        .new_library_with_source(&source, &options)
+        .map_err(|err| {
+            eprintln!(
+                "[metal] SPEC50 MMA head form {:?} compile failed: {err}",
+                form.name
+            )
+        })
+        .ok()?;
+    let pipeline = |name: &str| {
+        let function = library
+            .get_function(name, None)
+            .map_err(|err| eprintln!("[metal] SPEC50 MMA head missing {name}: {err}"))
+            .ok()?;
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|err| eprintln!("[metal] SPEC50 MMA head pipeline {name}: {err}"))
+            .ok()
+    };
+    let expand = pipeline("q6k_spec50_mma_expand_f16")?;
+    let batch = pipeline(&form.batch_kernel())?;
+    if expand.max_total_threads_per_threadgroup() < 256
+        || batch.thread_execution_width() != 32
+        || batch.max_total_threads_per_threadgroup() < form.threads_per_tg() as u64
+    {
+        eprintln!(
+            "[metal] SPEC50 MMA head form {:?}: simd width or threadgroup size not admitted",
+            form.name
+        );
+        return None;
+    }
+    Some(Spec50MmaHeadKernels { expand, batch })
+}
+
 /// W16 may opt into one dual-group head instead of two ordered K8 calls.
 /// K8 and every other geometry retain their established path. A failed K16
 /// compilation keeps W16 on its original two-chunk fallback before encoding.
@@ -1431,8 +1645,9 @@ fn encode_q6k_spec50_mma16(
     true
 }
 
-/// Encode only after the exact 12B/K8 shape guard. Compiling failure encodes
-/// nothing, allowing the established head to remain the fallback.
+/// Encode only after the exact 12B/K8 shape guard, in the established form.
+/// Compiling failure encodes nothing, allowing the established head to remain
+/// the fallback.
 #[allow(clippy::too_many_arguments)]
 fn encode_q6k_spec50_mma8(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -1448,10 +1663,46 @@ fn encode_q6k_spec50_mma8(
     hidden: usize,
     softcap: f32,
 ) -> bool {
+    encode_q6k_spec50_mma8_form(
+        encoder,
+        input_scales,
+        input_quants,
+        activation_perm,
+        weight,
+        weight_offset,
+        output,
+        n_superblocks,
+        rows,
+        k_batch,
+        hidden,
+        softcap,
+        SPEC50_FORM_BASE,
+    )
+}
+
+/// The same encode in an explicit [`Spec50HeadForm`]. Only the K8 batch
+/// pipeline and its threads-per-threadgroup change; the grid still covers
+/// `rows / 8` eight-row tiles, and the expand repack is form-independent.
+#[allow(clippy::too_many_arguments)]
+fn encode_q6k_spec50_mma8_form(
+    encoder: &metal::ComputeCommandEncoderRef,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    activation_perm: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    n_superblocks: usize,
+    rows: usize,
+    k_batch: usize,
+    hidden: usize,
+    softcap: f32,
+    form: Spec50HeadForm,
+) -> bool {
     if rows == 0 || !spec50_mma_admitted(hidden, n_superblocks, k_batch) {
         return false;
     }
-    let Some(kernels) = spec50_mma_head_kernels() else {
+    let Some(kernels) = spec50_mma_head_kernels_for(form) else {
         return false;
     };
     let n_sb = n_superblocks as u32;
@@ -1489,7 +1740,7 @@ fn encode_q6k_spec50_mma8(
             depth: 1,
         },
         metal::MTLSize {
-            width: 128,
+            width: form.threads_per_tg() as u64,
             height: 1,
             depth: 1,
         },
@@ -1526,6 +1777,44 @@ pub(crate) fn encode_q6k_spec50_batch(
     hidden: usize,
     softcap: f32,
 ) -> bool {
+    encode_q6k_spec50_batch_with_form(
+        encoder,
+        kernels,
+        input_scales,
+        input_quants,
+        activation_perm,
+        weight,
+        weight_offset,
+        output,
+        n_superblocks,
+        rows,
+        k_batch,
+        hidden,
+        softcap,
+        spec50_head_form(),
+    )
+}
+
+/// [`encode_q6k_spec50_batch`] with the MMA form supplied explicitly instead of
+/// read from the environment, so one process can drive several forms (the
+/// GPU-vs-GPU equality test and the geometry bench both do).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q6k_spec50_batch_with_form(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernels: &Spec50HeadKernels,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    activation_perm: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    n_superblocks: usize,
+    rows: usize,
+    k_batch: usize,
+    hidden: usize,
+    softcap: f32,
+    form: Spec50HeadForm,
+) -> bool {
     if k_batch == 16 && spec50_mma16_available(hidden) {
         return encode_q6k_spec50_mma16(
             encoder, input_scales, input_quants, activation_perm, weight,
@@ -1536,9 +1825,9 @@ pub(crate) fn encode_q6k_spec50_batch(
     if k_batch == 0 || k_batch > 8 || rows == 0 || n_superblocks == 0 {
         return false;
     }
-    if spec50_mma_requested() && encode_q6k_spec50_mma8(
+    if spec50_mma_requested() && encode_q6k_spec50_mma8_form(
         encoder, input_scales, input_quants, activation_perm, weight,
-        weight_offset, output, n_superblocks, rows, k_batch, hidden, softcap,
+        weight_offset, output, n_superblocks, rows, k_batch, hidden, softcap, form,
     ) {
         return true;
     }
