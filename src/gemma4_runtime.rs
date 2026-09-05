@@ -9002,10 +9002,24 @@ impl Gemma4GpuRuntime {
         candidate_tokens: &[u32],
         start_position: usize,
     ) -> Result<Gemma4DenseVerifierBatch> {
+        self.verify_consecutive_greedy_with_glue(candidate_tokens, start_position, None)
+    }
+
+    /// [`Self::verify_consecutive_greedy`] with an explicit verifier
+    /// fused-glue mask (`None` = the process selector
+    /// `CAMELID_GEMMA4_VERIFY_FUSED_GLUE`; `Some(mask)` pins this call so a
+    /// test can A/B the fused and legacy decoder encodes in one process).
+    pub(crate) fn verify_consecutive_greedy_with_glue(
+        &self,
+        candidate_tokens: &[u32],
+        start_position: usize,
+        fused_glue: Option<u32>,
+    ) -> Result<Gemma4DenseVerifierBatch> {
         let (ticket, (greedy_ids, final_hidden, head_timing)) = self
-            .with_consecutive_hidden_ordered_q4(
+            .with_consecutive_hidden_ordered_q4_glue(
                 candidate_tokens,
                 start_position,
+                fused_glue,
                 |head, hidden_flat| {
                     let greedy_ids =
                         head.forward_argmax_spec50_batch(hidden_flat).ok_or_else(|| {
@@ -9047,6 +9061,18 @@ impl Gemma4GpuRuntime {
         start_position: usize,
         project: impl FnOnce(&crate::metal::Gemma4Q6KHead, &[f32]) -> Result<R>,
     ) -> Result<(u64, R)> {
+        self.with_consecutive_hidden_ordered_q4_glue(candidate_tokens, start_position, None, project)
+    }
+
+    /// [`Self::with_consecutive_hidden_ordered_q4`] with an explicit
+    /// fused-glue mask for the decoder command buffer (`None` = selector).
+    fn with_consecutive_hidden_ordered_q4_glue<R>(
+        &self,
+        candidate_tokens: &[u32],
+        start_position: usize,
+        fused_glue: Option<u32>,
+        project: impl FnOnce(&crate::metal::Gemma4Q6KHead, &[f32]) -> Result<R>,
+    ) -> Result<(u64, R)> {
         let width = candidate_tokens.len();
         if !gemma4_dense_verify_width_admitted(width) || !self.head_on_cpu {
             return Err(BackendError::UnsupportedModelArchitecture(
@@ -9085,7 +9111,12 @@ impl Gemma4GpuRuntime {
         }
         let hidden_flat = self
             .model
-            .verify_consecutive_hidden_ordered_q4(&h0_rows, &inputs_by_row, start_position)
+            .verify_consecutive_hidden_ordered_q4_with_glue(
+                &h0_rows,
+                &inputs_by_row,
+                start_position,
+                fused_glue,
+            )
             .ok_or_else(|| {
                 BackendError::UnsupportedModelArchitecture(
                     "ordered-Q4 K-wide target verifier refused the model or dispatch".into(),

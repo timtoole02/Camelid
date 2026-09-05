@@ -241,6 +241,12 @@ pub(crate) struct MetalLinearKernel {
     /// Empty unless `CAMELID_GEMMA4_Q4_NATIVE_REGISTER_V2` names a variant
     /// (every variant under `cfg(test)`), so the default lane is untouched.
     gemma4_q4_native_v2: Vec<Gemma4Q4NativeV2Pipelines>,
+    /// Lazily compiled fused-glue kernels of the dense Gemma 4 12B verifier
+    /// (`CAMELID_GEMMA4_VERIFY_FUSED_GLUE`). Never touched on the default
+    /// path, so an unset selector keeps process start and every other lane
+    /// byte-for-byte; a compile failure only refuses the fused request.
+    gemma4_verify_glue: OnceLock<Option<Gemma4VerifyGluePipelines>>,
+    gemma4_verify_glue_mma: OnceLock<Option<Gemma4VerifyGlueMmaPipelines>>,
     /// Fixed-geometry Gemma 4 26B routed-expert lane. These three strict
     /// pipelines consume caller-owned, persistent expert slot slabs: no weight
     /// buffer is allocated or copied on the token hot path.
@@ -12477,6 +12483,429 @@ kernel void bitnet_i2_s_linear_rows(
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// Fused glue kernels of the dense Gemma 4 12B verifier
+// (CAMELID_GEMMA4_VERIFY_FUSED_GLUE). Compiled lazily into their own library
+// with the SAME default CompileOptions as ELEMENTWISE_SHADER, so each kernel is
+// lowered exactly as the ELEMENTWISE kernel whose text it copies. Scalar lanes
+// only; every expression and reduction order is copied verbatim from the
+// kernel it replaces (named per kernel below); 256-thread groups wherever a
+// reduction tree depends on it.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+const GEMMA4_VERIFY_GLUE_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// C2: rms_norm_batch_f32 followed by quantize_q8_0_f32 over `row` (one
+// threadgroup per row), with the per-block text of rms_norm_quantize_f32:
+// v = input*inv*weight; sequential 32-max; stored = float(half(max_abs/127));
+// q = clamp(int(round(v*qinv)), -127, 127). Scales are row-major by block.
+kernel void gemma4_verify_rms_norm_quantize_batch_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out_scales [[buffer(2)]],
+    device char* out_quants [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    device const float* in_row = input + row * width;
+    uint n_blocks = width / 32u;
+    device float* scales_row = out_scales + row * n_blocks;
+    device char* quants_row = out_quants + row * width;
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = in_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    for (uint b = tid; b < n_blocks; b += tgsize) {
+        uint base = b * 32u;
+        float v[32];
+        float max_abs = 0.0;
+        for (uint i = 0; i < 32u; ++i) {
+            v[i] = in_row[base + i] * inv * weight[base + i];
+            max_abs = max(max_abs, fabs(v[i]));
+        }
+        float unrounded = max_abs / 127.0;
+        float stored = float(half(unrounded));
+        float qinv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+        scales_row[b] = stored;
+        for (uint i = 0; i < 32u; ++i) {
+            int q = int(round(v[i] * qinv));
+            q = clamp(q, -127, 127);
+            quants_row[base + i] = char(q);
+        }
+    }
+}
+
+// C3: gelu_mul_f32 followed by quantize_q8_0_f32, one thread per 32-value
+// block (silu_mul_quantize_f32 structure; gelu text from gelu_mul_f32).
+kernel void gemma4_verify_gelu_mul_quantize_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* out_scales [[buffer(2)]],
+    device char* out_quants [[buffer(3)]],
+    constant uint& n_blocks [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n_blocks) return;
+    uint base = gid * 32u;
+    float v[32];
+    float max_abs = 0.0;
+    for (uint i = 0; i < 32u; ++i) {
+        float x = gate[base + i];
+        float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+        float gelu = 0.5f * x * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+        v[i] = gelu * up[base + i];
+        max_abs = max(max_abs, fabs(v[i]));
+    }
+    float unrounded = max_abs / 127.0;
+    float stored = float(half(unrounded));
+    float inv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+    out_scales[gid] = stored;
+    for (uint i = 0; i < 32u; ++i) {
+        int q = int(round(v[i] * inv));
+        q = clamp(q, -127, 127);
+        out_quants[base + i] = char(q);
+    }
+}
+
+// C5-lite: the three per-head norms of one layer (q: weighted q_norm, k:
+// weighted k_norm, v: weightless norm of v_src) as one role-indexed grid of
+// (n_heads + 2*n_kv_heads) x rows threadgroups. Per threadgroup this is
+// rms_norm_per_head_f32 verbatim: same strided sum, same tree, and the
+// two-statement scaling `v = input*inv; v *= weight`.
+kernel void gemma4_verify_head_norm_f32(
+    device const float* q_raw [[buffer(0)]],
+    device const float* k_raw [[buffer(1)]],
+    device const float* v_src [[buffer(2)]],
+    device const float* q_norm [[buffer(3)]],
+    device const float* k_norm [[buffer(4)]],
+    device float* q_out [[buffer(5)]],
+    device float* k_out [[buffer(6)]],
+    device float* v_out [[buffer(7)]],
+    constant uint& head_dim [[buffer(10)]],
+    constant float& eps [[buffer(11)]],
+    constant uint& n_heads [[buffer(12)]],
+    constant uint& n_kv_heads [[buffer(13)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    const uint row = tgid.y;
+    uint head = tgid.x;
+    uint role = 0u;
+    if (head >= n_heads) {
+        head -= n_heads;
+        role = 1u;
+        if (head >= n_kv_heads) {
+            head -= n_kv_heads;
+            role = 2u;
+        }
+    }
+    device const float* input;
+    device const float* weight;
+    device float* output;
+    uint use_weight;
+    if (role == 0u) {
+        const uint base = (row * n_heads + head) * head_dim;
+        input = q_raw + base;
+        weight = q_norm;
+        output = q_out + base;
+        use_weight = 1u;
+    } else if (role == 1u) {
+        const uint base = (row * n_kv_heads + head) * head_dim;
+        input = k_raw + base;
+        weight = k_norm;
+        output = k_out + base;
+        use_weight = 1u;
+    } else {
+        const uint base = (row * n_kv_heads + head) * head_dim;
+        input = v_src + base;
+        weight = q_norm;
+        output = v_out + base;
+        use_weight = 0u;
+    }
+    float local = 0.0;
+    for (uint i = tid; i < head_dim; i += tgsize) {
+        float v = input[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(head_dim) + eps);
+    for (uint i = tid; i < head_dim; i += tgsize) {
+        float v = input[i] * inv;
+        if (use_weight != 0) {
+            v *= weight[i];
+        }
+        output[i] = v;
+    }
+}
+
+// C5: per-head norm (as above) + split-half RoPE + KV scatter in one
+// dispatch. q heads rotate into q_out; k heads rotate straight into cache_k;
+// v heads copy their weightless norm into cache_v (no RoPE). The normed head
+// is staged in threadgroup memory behind a barrier, so the norm's multiply
+// chain cannot merge into the rotation; the rotation is rope_rotate_batch_f32
+// text (pairing 1, half_rope = head_dim/2, per-row cos/sin tables); the cache
+// address is kv_scatter_batch_f32's (h*max_positions + base_position + t)*head_dim + d.
+kernel void gemma4_verify_head_norm_rope_scatter_f32(
+    device const float* q_raw [[buffer(0)]],
+    device const float* k_raw [[buffer(1)]],
+    device const float* v_src [[buffer(2)]],
+    device const float* q_norm [[buffer(3)]],
+    device const float* k_norm [[buffer(4)]],
+    device float* q_out [[buffer(5)]],
+    device float* cache_k [[buffer(6)]],
+    device float* cache_v [[buffer(7)]],
+    device const float* cos_table [[buffer(8)]],
+    device const float* sin_table [[buffer(9)]],
+    constant uint& head_dim [[buffer(10)]],
+    constant float& eps [[buffer(11)]],
+    constant uint& n_heads [[buffer(12)]],
+    constant uint& n_kv_heads [[buffer(13)]],
+    constant uint& max_positions [[buffer(14)]],
+    constant uint& base_position [[buffer(15)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    threadgroup float staged[512];
+    const uint row = tgid.y;
+    uint head = tgid.x;
+    uint role = 0u;
+    if (head >= n_heads) {
+        head -= n_heads;
+        role = 1u;
+        if (head >= n_kv_heads) {
+            head -= n_kv_heads;
+            role = 2u;
+        }
+    }
+    device const float* input;
+    device const float* weight;
+    device float* output;
+    uint use_weight;
+    if (role == 0u) {
+        const uint base = (row * n_heads + head) * head_dim;
+        input = q_raw + base;
+        weight = q_norm;
+        output = q_out + base;
+        use_weight = 1u;
+    } else if (role == 1u) {
+        input = k_raw + (row * n_kv_heads + head) * head_dim;
+        weight = k_norm;
+        output = cache_k + (head * max_positions + base_position + row) * head_dim;
+        use_weight = 1u;
+    } else {
+        input = v_src + (row * n_kv_heads + head) * head_dim;
+        weight = q_norm;
+        output = cache_v + (head * max_positions + base_position + row) * head_dim;
+        use_weight = 0u;
+    }
+    float local = 0.0;
+    for (uint i = tid; i < head_dim; i += tgsize) {
+        float v = input[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(head_dim) + eps);
+    for (uint i = tid; i < head_dim; i += tgsize) {
+        float v = input[i] * inv;
+        if (use_weight != 0) {
+            v *= weight[i];
+        }
+        staged[i] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (role == 2u) {
+        for (uint i = tid; i < head_dim; i += tgsize) {
+            output[i] = staged[i];
+        }
+        return;
+    }
+    const uint half_rope = head_dim / 2u;
+    device const float* ct = cos_table + row * half_rope;
+    device const float* st = sin_table + row * half_rope;
+    for (uint pair = tid; pair < half_rope; pair += tgsize) {
+        float c = ct[pair];
+        float s = st[pair];
+        uint dim0 = pair;
+        uint dim1 = pair + half_rope;
+        float x0 = staged[dim0];
+        float x1 = staged[dim1];
+        output[dim0] = x0 * c - x1 * s;
+        output[dim1] = x0 * s + x1 * c;
+    }
+}
+"#;
+
+// C7: segment-fused V2 grid appended to STRICT_Q8K_SHADER (same strict
+// options, same template definitions). One dispatch covers the q|k|v or
+// gate|up projections of one layer: the global simdgroup index selects the
+// matrix by cumulative eight-row tiles and the SAME
+// q4_0_q8_native_register_v2_body<1,4,1,true,true> instantiation of the
+// fm_bits_u4 kernel runs over the same sidecar bytes and the same staged panel
+// with the same increasing-block fold. Only the simdgroup -> (matrix, tile)
+// assignment differs. Two segments bind the second matrix twice with rows2 = 0
+// and never dispatch a third-segment tile.
+#[cfg(target_os = "macos")]
+const GEMMA4_VERIFY_GLUE_MMA_SHADER_TAIL: &str = r#"
+kernel void q4_0_q8_ordered_columns_mma_native_register_v2_fm_bits_u4_seg3(
+    device const float* input_scales [[buffer(0)]],
+    device const uchar* weight0 [[buffer(2)]],
+    device float* out0 [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows0 [[buffer(5)]],
+    constant uint& columns [[buffer(6)]],
+    device const half* staged_quants [[buffer(7)]],
+    constant uint& rows1 [[buffer(8)]],
+    constant uint& rows2 [[buffer(9)]],
+    device const uchar* weight1 [[buffer(10)]],
+    device float* out1 [[buffer(11)]],
+    device const uchar* weight2 [[buffer(12)]],
+    device float* out2 [[buffer(13)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sgs [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint tile = tg * sgs + sg;
+    const uint tiles0 = (rows0 + 7u) / 8u;
+    const uint tiles1 = (rows1 + 7u) / 8u;
+    device const uchar* weight = weight0;
+    device float* output = out0;
+    uint rows = rows0;
+    if (tile >= tiles0) {
+        tile -= tiles0;
+        if (tile < tiles1) {
+            weight = weight1;
+            output = out1;
+            rows = rows1;
+        } else {
+            tile -= tiles1;
+            weight = weight2;
+            output = out2;
+            rows = rows2;
+        }
+    }
+    q4_0_q8_native_register_v2_body<1u, 4u, 1u, true, true>(
+        input_scales, weight, output, blocks_per_row, rows, columns,
+        staged_quants, tile, lane);
+}
+"#;
+
+/// Elementwise fused-glue pipelines (C2, C3, C5-lite, C5), compiled lazily
+/// from [`GEMMA4_VERIFY_GLUE_SHADER`] with the ELEMENTWISE options.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4VerifyGluePipelines {
+    rms_norm_quantize_batch: ComputePipelineState,
+    gelu_mul_quantize: ComputePipelineState,
+    head_norm: ComputePipelineState,
+    head_norm_rope_scatter: ComputePipelineState,
+}
+
+/// The segment-fused MMA pipeline (C7), compiled lazily from the strict
+/// shader plus [`GEMMA4_VERIFY_GLUE_MMA_SHADER_TAIL`] with the strict options.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4VerifyGlueMmaPipelines {
+    seg3: ComputePipelineState,
+}
+
+#[cfg(target_os = "macos")]
+impl MetalLinearKernel {
+    /// Compiled on first request only; `None` (reported once) refuses the
+    /// fused request without touching any other lane.
+    pub(crate) fn gemma4_verify_glue_pipelines(&self) -> Option<&Gemma4VerifyGluePipelines> {
+        self.gemma4_verify_glue
+            .get_or_init(|| {
+                let options = CompileOptions::new();
+                let library = self
+                    .device
+                    .new_library_with_source(GEMMA4_VERIFY_GLUE_SHADER, &options)
+                    .map_err(|err| {
+                        eprintln!("[metal] GEMMA4_VERIFY_GLUE_SHADER compile failed: {err}")
+                    })
+                    .ok()?;
+                let make = |name: &str| {
+                    library.get_function(name, None).ok().and_then(|function| {
+                        self.device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                };
+                Some(Gemma4VerifyGluePipelines {
+                    rms_norm_quantize_batch: make("gemma4_verify_rms_norm_quantize_batch_f32")?,
+                    gelu_mul_quantize: make("gemma4_verify_gelu_mul_quantize_f32")?,
+                    head_norm: make("gemma4_verify_head_norm_f32")?,
+                    head_norm_rope_scatter: make("gemma4_verify_head_norm_rope_scatter_f32")?,
+                })
+            })
+            .as_ref()
+    }
+
+    /// Compiled on first request only (the strict shader is recompiled with
+    /// the segment entry appended, under the identical strict options).
+    pub(crate) fn gemma4_verify_glue_mma_pipelines(
+        &self,
+    ) -> Option<&Gemma4VerifyGlueMmaPipelines> {
+        self.gemma4_verify_glue_mma
+            .get_or_init(|| {
+                let options = CompileOptions::new();
+                options.set_fast_math_enabled(false);
+                let source = format!("{STRICT_Q8K_SHADER}\n{GEMMA4_VERIFY_GLUE_MMA_SHADER_TAIL}");
+                let library = self
+                    .device
+                    .new_library_with_source(&source, &options)
+                    .map_err(|err| {
+                        eprintln!("[metal] GEMMA4_VERIFY_GLUE_MMA_SHADER compile failed: {err}")
+                    })
+                    .ok()?;
+                let function = library
+                    .get_function(
+                        "q4_0_q8_ordered_columns_mma_native_register_v2_fm_bits_u4_seg3",
+                        None,
+                    )
+                    .ok()?;
+                let seg3 = self
+                    .device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()?;
+                Some(Gemma4VerifyGlueMmaPipelines { seg3 })
+            })
+            .as_ref()
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
     METAL_LINEAR_KERNEL
@@ -13537,6 +13966,8 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4_0_q8_ordered_columns_mma_stage16_pipeline,
                 q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline,
                 gemma4_q4_native_v2,
+                gemma4_verify_glue: OnceLock::new(),
+                gemma4_verify_glue_mma: OnceLock::new(),
                 gemma4_q4_expert_gate_up_geglu_pipeline,
                 gemma4_q4_expert_gate_up_geglu_simd_pipeline,
                 gemma4_q4_expert_gate_up_split_pipeline,
@@ -14953,6 +15384,101 @@ fn gemma4_q4_row_ops_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// `CAMELID_GEMMA4_VERIFY_FUSED_GLUE`: fused glue dispatches of the dense
+// Gemma 4 12B verifier command buffer (`verify_hidden_ordered_q4_plan`).
+// Unset/0 keeps today's encode byte-for-byte. Every fused kernel is scalar-lane
+// text copied from the dispatch chain it replaces, and the fused encode is only
+// taken on the exact geometry it was written for: K<=8, batched row ops, the
+// fragment-major `fm_bits_u4` V2 native kernel and native-octet sidecars for
+// every layer. Any other shape (K=16 prefill chunks, wire-layout sidecars, the
+// per-row path) runs the legacy encode unchanged instead of refusing.
+// ---------------------------------------------------------------------------
+/// bit0: stage the fragment-major activation record once per shared input
+/// (q|k|v and gate|up) instead of once per matrix.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_C1_STAGE_ONCE: u32 = 1 << 0;
+/// bit1: batched rms_norm + Q8_0 quantize in one dispatch (attention and FFN
+/// inputs).
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE: u32 = 1 << 1;
+/// bit2: gelu_mul + Q8_0 quantize in one dispatch.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE: u32 = 1 << 2;
+/// bit3 (C4, residual add fused into the following norm) is reserved: refused.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) const GEMMA4_FUSED_GLUE_C4_RESERVED: u32 = 1 << 3;
+/// bit4: per-head QK/V norm + split-half RoPE + KV scatter in one dispatch.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER: u32 = 1 << 4;
+/// bit5 (C6, quantize straight into the MMA panel) is reserved: refused.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) const GEMMA4_FUSED_GLUE_C6_RESERVED: u32 = 1 << 5;
+/// bit6: segment-fused MMA grids (q|k|v and gate|up in one dispatch each).
+/// Implies bit0's single staging for the segments it fuses.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA: u32 = 1 << 6;
+/// bit7: C5-lite fallback — the three per-head norms merged into one
+/// role-indexed dispatch, RoPE and scatter untouched. Ignored when bit4 is set.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS: u32 = 1 << 7;
+/// Bits this build implements; any other bit refuses the verifier loudly.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_IMPLEMENTED: u32 = GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
+    | GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
+    | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
+    | GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER
+    | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA
+    | GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS;
+/// The full cycle-1 mask (decimal 87): C1 | C2 | C3 | C5 | C7.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) const GEMMA4_FUSED_GLUE_ALL: u32 = GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
+    | GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
+    | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
+    | GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER
+    | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA;
+/// The only V2 variant the fused encode admits: the segment kernels bind the
+/// `<1,4,1,true,true>` template body of this exact kernel.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_FUSED_GLUE_V2_VARIANT: &str = "fm_bits_u4";
+
+/// The process-wide fused-glue mask, read once. Unset or empty is `Some(0)`
+/// (legacy encode). A value that is not a plain decimal bitmask within
+/// [`GEMMA4_FUSED_GLUE_IMPLEMENTED`] is `None`: the verifier then refuses
+/// loudly instead of silently measuring the legacy encode under a fused label.
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_verify_fused_glue_mask() -> Option<u32> {
+    static MASK: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let Ok(raw) = std::env::var("CAMELID_GEMMA4_VERIFY_FUSED_GLUE") else {
+            return Some(0);
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Some(0);
+        }
+        let parsed = if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            raw.parse::<u32>().ok()
+        } else {
+            None
+        };
+        match parsed {
+            Some(mask) if mask & !GEMMA4_FUSED_GLUE_IMPLEMENTED == 0 => Some(mask),
+            _ => {
+                eprintln!(
+                    "[gemma4-12b-verify] CAMELID_GEMMA4_VERIFY_FUSED_GLUE={raw:?} is not an \
+                     admitted decimal bitmask (implemented bits {GEMMA4_FUSED_GLUE_IMPLEMENTED}); \
+                     the ordered-Q4 verifier refuses until it is fixed or unset"
+                );
+                None
+            }
+        }
     })
 }
 
@@ -18423,21 +18949,56 @@ impl Gemma4ResidentModel {
     ///
     /// This path is fail-closed to the exact 48-layer dense QAT geometry.  It is
     /// additive and is never selected by [`Self::forward_token_hidden`].
+    #[allow(dead_code)] // the runtime threads its fused-glue mask through `_with_glue`
     pub(crate) fn verify_consecutive_hidden_ordered_q4(
         &self,
         h0_rows: &[f32],
         inputs_by_row: &[Vec<Gemma4TokenLayerInput>],
         base_position: usize,
     ) -> Option<Vec<f32>> {
-        self.verify_hidden_ordered_q4_plan(h0_rows, inputs_by_row, base_position, None)
+        self.verify_consecutive_hidden_ordered_q4_with_glue(
+            h0_rows,
+            inputs_by_row,
+            base_position,
+            None,
+        )
     }
 
+    /// [`Self::verify_consecutive_hidden_ordered_q4`] with an explicit
+    /// fused-glue mask: `None` reads `CAMELID_GEMMA4_VERIFY_FUSED_GLUE` (once
+    /// per process, refusing on garbage), `Some(mask)` pins the mask for this
+    /// call so one process can A/B the fused and legacy encodes bit for bit.
+    pub(crate) fn verify_consecutive_hidden_ordered_q4_with_glue(
+        &self,
+        h0_rows: &[f32],
+        inputs_by_row: &[Vec<Gemma4TokenLayerInput>],
+        base_position: usize,
+        fused_glue: Option<u32>,
+    ) -> Option<Vec<f32>> {
+        let fused_glue_mask = match fused_glue {
+            Some(mask) => mask,
+            None => gemma4_verify_fused_glue_mask()?,
+        };
+        self.verify_hidden_ordered_q4_plan(
+            h0_rows,
+            inputs_by_row,
+            base_position,
+            None,
+            fused_glue_mask,
+        )
+    }
+
+    /// `fused_glue_mask`: `CAMELID_GEMMA4_VERIFY_FUSED_GLUE` bits (see the
+    /// `GEMMA4_FUSED_GLUE_*` constants). Zero is today's encode byte-for-byte;
+    /// reserved bits refuse; admitted bits only change the encode on the exact
+    /// fused geometry and otherwise fall back to the legacy dispatch chain.
     fn verify_hidden_ordered_q4_plan(
         &self,
         h0_rows: &[f32],
         inputs_by_row: &[Vec<Gemma4TokenLayerInput>],
         base_position: usize,
         tree_plan: Option<&Gemma4DenseTreePlan>,
+        fused_glue_mask: u32,
     ) -> Option<Vec<f32>> {
         const LAYERS: usize = 48;
         const HIDDEN: usize = 3_840;
@@ -18550,6 +19111,83 @@ impl Gemma4ResidentModel {
         }
 
         let kernel = metal_linear_kernel()?;
+
+        // Fused-glue admission. Reserved/unknown bits refuse loudly; admitted
+        // bits are honoured only on the geometry the fused kernels were written
+        // for (K<=8, batched row ops, the fragment-major `fm_bits_u4` V2 kernel,
+        // native-octet sidecars everywhere). Anything else keeps the legacy
+        // encode below byte-for-byte, so K=16 prefill chunks, wire sidecars and
+        // the per-row path keep working without the fused kernels.
+        if fused_glue_mask & !GEMMA4_FUSED_GLUE_IMPLEMENTED != 0 {
+            eprintln!(
+                "[gemma4-12b-verify] fused-glue mask {fused_glue_mask} names reserved or \
+                 unknown bits (implemented {GEMMA4_FUSED_GLUE_IMPLEMENTED}); refusing"
+            );
+            return None;
+        }
+        let batch_row_ops = gemma4_q4_row_ops_enabled();
+        let v2_simdgroups = gemma4_q4_native_register_v2_simdgroups();
+        let fused_v2 = if fused_glue_mask != 0
+            && columns <= 8
+            && batch_row_ops
+            && self
+                .layers
+                .iter()
+                .all(|layer| layer.q4_layout == Gemma4Q4WeightLayout::NativeOctets)
+        {
+            kernel.gemma4_q4_native_v2_selected().filter(|v2| {
+                v2.variant.fragment_major
+                    && v2.variant.tiles == 1
+                    && v2.variant.name == GEMMA4_FUSED_GLUE_V2_VARIANT
+            })
+        } else {
+            None
+        };
+        let glue = if fused_v2.is_some() {
+            fused_glue_mask
+        } else {
+            0
+        };
+        let glue_pipelines = if glue
+            & (GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
+                | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
+                | GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER
+                | GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS)
+            != 0
+        {
+            let Some(pipelines) = kernel.gemma4_verify_glue_pipelines() else {
+                eprintln!(
+                    "[gemma4-12b-verify] fused-glue mask {glue} requested but the fused \
+                     elementwise kernels did not compile; refusing"
+                );
+                return None;
+            };
+            Some(pipelines)
+        } else {
+            None
+        };
+        let glue_mma = if glue & GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA != 0 {
+            let Some(pipelines) = kernel.gemma4_verify_glue_mma_pipelines() else {
+                eprintln!(
+                    "[gemma4-12b-verify] fused-glue mask {glue} requested but the segment \
+                     MMA kernel did not compile; refusing"
+                );
+                return None;
+            };
+            Some(pipelines)
+        } else {
+            None
+        };
+        let glue_bit = |bit: u32| glue_pipelines.filter(|_| glue & bit != 0);
+        let c2 = glue_bit(GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE);
+        let c3 = glue_bit(GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE);
+        let c5 = glue_bit(GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER);
+        let c5_lite = glue_bit(GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS);
+        // C7 implies the single staging of C1 for the segments it fuses.
+        let stage_once = fused_v2.filter(|_| {
+            glue & (GEMMA4_FUSED_GLUE_C1_STAGE_ONCE | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA) != 0
+        });
+
         let mut scratch_guard = self.dense12b_verifier.lock().ok()?;
         if scratch_guard.is_none() {
             *scratch_guard = Some(Gemma4Dense12bVerifierScratch::new(
@@ -18604,7 +19242,6 @@ impl Gemma4ResidentModel {
             rms_scalar,
         ];
         let mut from_a = true;
-        let batch_row_ops = gemma4_q4_row_ops_enabled();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let sliding = layer_idx % 6 != 5;
@@ -18628,63 +19265,111 @@ impl Gemma4ResidentModel {
             let post_ffw_norm = &constants.post_ffw_norm;
 
             // Attention input norm and one shared Q8_0 activation panel.
-            encode_rms_norm_batch(
-                kernel,
-                encoder,
-                current,
-                attn_norm,
-                &scratch.norm,
-                &keep[5],
-                columns,
-            );
-            encode_quantize(
-                encoder,
-                kernel,
-                &scratch.norm,
-                &scratch.input_scales,
-                &scratch.input_quants,
-                &keep[0],
-                columns * hidden_blocks,
-            );
-            if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
-                encoder,
-                kernel,
-                &scratch.input_scales,
-                &scratch.input_quants,
-                &layer.q_w,
-                0,
-                &scratch.q_raw,
-                Some(&scratch.q4_terms),
-                q_dim,
-                hidden_blocks,
-                columns,
-                layer.q4_layout,
-            ) || !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
-                encoder,
-                kernel,
-                &scratch.input_scales,
-                &scratch.input_quants,
-                &layer.k_w,
-                0,
-                &scratch.k_raw,
-                Some(&scratch.q4_terms),
-                kv_dim,
-                hidden_blocks,
-                columns,
-                layer.q4_layout,
-            ) {
-                encoder.end_encoding();
-                return None;
+            if let Some(glue) = c2 {
+                encode_gemma4_verify_rms_norm_quantize_batch(
+                    encoder,
+                    glue,
+                    current,
+                    attn_norm,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    &keep[5],
+                    columns,
+                );
+            } else {
+                encode_rms_norm_batch(
+                    kernel,
+                    encoder,
+                    current,
+                    attn_norm,
+                    &scratch.norm,
+                    &keep[5],
+                    columns,
+                );
+                encode_quantize(
+                    encoder,
+                    kernel,
+                    &scratch.norm,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    &keep[0],
+                    columns * hidden_blocks,
+                );
             }
-            if let Some(value_weight) = layer.v_w.as_ref() {
+            if let Some(v2) = stage_once {
+                // C1/C7: the fragment-major record of the shared attention
+                // input is staged once; q, k and v read the identical bytes.
+                let mut segments: Vec<Gemma4VerifyGlueSegment<'_>> = vec![
+                    (&layer.q_w, 0, &scratch.q_raw, q_dim),
+                    (&layer.k_w, 0, &scratch.k_raw, kv_dim),
+                ];
+                if let Some(value_weight) = layer.v_w.as_ref() {
+                    segments.push((value_weight, 0, &scratch.v_raw, kv_dim));
+                }
+                let encoded = encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+                    encoder,
+                    kernel,
+                    v2,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    &scratch.q4_terms,
+                    hidden_blocks,
+                    columns,
+                ) && if let Some(mma) = glue_mma {
+                    encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
+                        encoder,
+                        v2,
+                        mma,
+                        v2_simdgroups,
+                        &scratch.input_scales,
+                        &scratch.q4_terms,
+                        &segments,
+                        hidden_blocks,
+                        columns,
+                    )
+                } else {
+                    segments.iter().all(|&(weight, offset, output, rows)| {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                            encoder,
+                            v2,
+                            v2_simdgroups,
+                            &scratch.input_scales,
+                            weight,
+                            offset,
+                            output,
+                            &scratch.q4_terms,
+                            rows,
+                            hidden_blocks,
+                            columns,
+                        )
+                    })
+                };
+                if !encoded {
+                    encoder.end_encoding();
+                    return None;
+                }
+            } else {
                 if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
                     encoder,
                     kernel,
                     &scratch.input_scales,
                     &scratch.input_quants,
-                    value_weight,
+                    &layer.q_w,
                     0,
-                    &scratch.v_raw,
+                    &scratch.q_raw,
+                    Some(&scratch.q4_terms),
+                    q_dim,
+                    hidden_blocks,
+                    columns,
+                    layer.q4_layout,
+                ) || !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
+                    encoder,
+                    kernel,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    &layer.k_w,
+                    0,
+                    &scratch.k_raw,
                     Some(&scratch.q4_terms),
                     kv_dim,
                     hidden_blocks,
@@ -18693,6 +19378,25 @@ impl Gemma4ResidentModel {
                 ) {
                     encoder.end_encoding();
                     return None;
+                }
+                if let Some(value_weight) = layer.v_w.as_ref() {
+                    if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
+                        encoder,
+                        kernel,
+                        &scratch.input_scales,
+                        &scratch.input_quants,
+                        value_weight,
+                        0,
+                        &scratch.v_raw,
+                        Some(&scratch.q4_terms),
+                        kv_dim,
+                        hidden_blocks,
+                        columns,
+                        layer.q4_layout,
+                    ) {
+                        encoder.end_encoding();
+                        return None;
+                    }
                 }
             }
 
@@ -18711,40 +19415,85 @@ impl Gemma4ResidentModel {
             let sin = upload_f32(&sin_all);
             keep.extend([cos.to_owned(), sin.to_owned()]);
 
-            if batch_row_ops {
-                encode_rms_norm_per_head(
+            let (cache_k, cache_v) = self.caches[layer_idx].as_ref()?;
+            let value_source = layer
+                .v_w
+                .as_ref()
+                .map_or(&scratch.k_raw, |_| &scratch.v_raw);
+            let head_args = Gemma4VerifyGlueHeadArgs {
+                head_dim: layer.head_dim,
+                eps: layer.eps,
+                n_heads: HEADS,
+                n_kv_heads: layer.n_kv_heads,
+                max_positions: self.max_positions,
+                base_position,
+                rows: columns,
+            };
+            if let Some(glue) = c5 {
+                // C5: per-head norms, RoPE and the KV scatter in one dispatch.
+                encode_gemma4_verify_head_norm_rope_scatter(
                     encoder,
-                    kernel,
+                    glue,
                     &scratch.q_raw,
-                    q_norm,
-                    &scratch.q_normed,
-                    q_head_args,
-                    columns * HEADS,
-                    0,
-                );
-                encode_rms_norm_per_head(
-                    encoder,
-                    kernel,
                     &scratch.k_raw,
-                    k_norm,
-                    &scratch.k_normed,
-                    k_head_args,
-                    columns * layer.n_kv_heads,
-                    0,
-                );
-                encode_rms_norm_per_head(
-                    encoder,
-                    kernel,
-                    layer
-                        .v_w
-                        .as_ref()
-                        .map_or(&scratch.k_raw, |_| &scratch.v_raw),
+                    value_source,
                     q_norm,
-                    &scratch.v_normed,
-                    v_head_args,
-                    columns * layer.n_kv_heads,
-                    0,
+                    k_norm,
+                    &scratch.q_normed,
+                    cache_k,
+                    cache_v,
+                    &cos,
+                    &sin,
+                    head_args,
                 );
+            } else if batch_row_ops {
+                if let Some(glue) = c5_lite {
+                    // C5-lite: the three per-head norms as one role-indexed grid.
+                    encode_gemma4_verify_head_norm(
+                        encoder,
+                        glue,
+                        &scratch.q_raw,
+                        &scratch.k_raw,
+                        value_source,
+                        q_norm,
+                        k_norm,
+                        &scratch.q_normed,
+                        &scratch.k_normed,
+                        &scratch.v_normed,
+                        head_args,
+                    );
+                } else {
+                    encode_rms_norm_per_head(
+                        encoder,
+                        kernel,
+                        &scratch.q_raw,
+                        q_norm,
+                        &scratch.q_normed,
+                        q_head_args,
+                        columns * HEADS,
+                        0,
+                    );
+                    encode_rms_norm_per_head(
+                        encoder,
+                        kernel,
+                        &scratch.k_raw,
+                        k_norm,
+                        &scratch.k_normed,
+                        k_head_args,
+                        columns * layer.n_kv_heads,
+                        0,
+                    );
+                    encode_rms_norm_per_head(
+                        encoder,
+                        kernel,
+                        value_source,
+                        q_norm,
+                        &scratch.v_normed,
+                        v_head_args,
+                        columns * layer.n_kv_heads,
+                        0,
+                    );
+                }
                 for (data, args, heads) in [
                     (&scratch.q_normed, rope_q_args, HEADS),
                     (&scratch.k_normed, rope_k_args, layer.n_kv_heads),
@@ -18828,8 +19577,9 @@ impl Gemma4ResidentModel {
                 }
             }
 
-            let (cache_k, cache_v) = self.caches[layer_idx].as_ref()?;
-            if batch_row_ops {
+            if c5.is_some() {
+                // C5 already scattered k and v into the caches.
+            } else if batch_row_ops {
                 let scatter_args = shared(16);
                 unsafe {
                     let args = scatter_args.contents().cast::<u32>();
@@ -19041,25 +19791,86 @@ impl Gemma4ResidentModel {
 
             // Dense FFN: norm -> Q4 gate/up -> GeGLU -> Q4 down -> sandwich
             // norm -> residual, all K rows in the same ordered-Q4 universe.
-            encode_rms_norm_batch(
-                kernel,
-                encoder,
-                &scratch.mid,
-                ffn_norm,
-                &scratch.norm,
-                &keep[5],
-                columns,
-            );
-            encode_quantize(
-                encoder,
-                kernel,
-                &scratch.norm,
-                &scratch.input_scales,
-                &scratch.input_quants,
-                &keep[0],
-                columns * hidden_blocks,
-            );
-            if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
+            if let Some(glue) = c2 {
+                encode_gemma4_verify_rms_norm_quantize_batch(
+                    encoder,
+                    glue,
+                    &scratch.mid,
+                    ffn_norm,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    &keep[5],
+                    columns,
+                );
+            } else {
+                encode_rms_norm_batch(
+                    kernel,
+                    encoder,
+                    &scratch.mid,
+                    ffn_norm,
+                    &scratch.norm,
+                    &keep[5],
+                    columns,
+                );
+                encode_quantize(
+                    encoder,
+                    kernel,
+                    &scratch.norm,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    &keep[0],
+                    columns * hidden_blocks,
+                );
+            }
+            if let Some(v2) = stage_once {
+                // C1/C7: one staged record feeds both gate and up.
+                let segments: [Gemma4VerifyGlueSegment<'_>; 2] = [
+                    (&layer.gate_w, 0, &scratch.gate, FFN),
+                    (&layer.up_w, 0, &scratch.up, FFN),
+                ];
+                let encoded = encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+                    encoder,
+                    kernel,
+                    v2,
+                    &scratch.input_scales,
+                    &scratch.input_quants,
+                    &scratch.q4_terms,
+                    hidden_blocks,
+                    columns,
+                ) && if let Some(mma) = glue_mma {
+                    encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
+                        encoder,
+                        v2,
+                        mma,
+                        v2_simdgroups,
+                        &scratch.input_scales,
+                        &scratch.q4_terms,
+                        &segments,
+                        hidden_blocks,
+                        columns,
+                    )
+                } else {
+                    segments.iter().all(|&(weight, offset, output, rows)| {
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                            encoder,
+                            v2,
+                            v2_simdgroups,
+                            &scratch.input_scales,
+                            weight,
+                            offset,
+                            output,
+                            &scratch.q4_terms,
+                            rows,
+                            hidden_blocks,
+                            columns,
+                        )
+                    })
+                };
+                if !encoded {
+                    encoder.end_encoding();
+                    return None;
+                }
+            } else if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
                 encoder,
                 kernel,
                 &scratch.input_scales,
@@ -19089,24 +19900,37 @@ impl Gemma4ResidentModel {
                 encoder.end_encoding();
                 return None;
             }
-            encode_binary(
-                encoder,
-                &kernel.gelu_mul_pipeline,
-                &scratch.gate,
-                &scratch.up,
-                &scratch.activation,
-                &keep[3],
-                columns * FFN,
-            );
-            encode_quantize(
-                encoder,
-                kernel,
-                &scratch.activation,
-                &scratch.activation_scales,
-                &scratch.activation_quants,
-                &keep[1],
-                columns * activation_blocks,
-            );
+            if let Some(glue) = c3 {
+                encode_gemma4_verify_gelu_mul_quantize(
+                    encoder,
+                    glue,
+                    &scratch.gate,
+                    &scratch.up,
+                    &scratch.activation_scales,
+                    &scratch.activation_quants,
+                    &keep[1],
+                    columns * activation_blocks,
+                );
+            } else {
+                encode_binary(
+                    encoder,
+                    &kernel.gelu_mul_pipeline,
+                    &scratch.gate,
+                    &scratch.up,
+                    &scratch.activation,
+                    &keep[3],
+                    columns * FFN,
+                );
+                encode_quantize(
+                    encoder,
+                    kernel,
+                    &scratch.activation,
+                    &scratch.activation_scales,
+                    &scratch.activation_quants,
+                    &keep[1],
+                    columns * activation_blocks,
+                );
+            }
             if !encode_gemma4_q4_0_q8_ordered_columns_with_layout(
                 encoder,
                 kernel,
@@ -20874,6 +21698,178 @@ fn encode_rms_norm_batch(
             depth: 1,
         },
     );
+}
+
+/// Fused-glue C2: `rms_norm_batch_f32` + `quantize_q8_0_f32` over `rows`
+/// rows in one dispatch (one 256-thread group per row, as the batched norm).
+/// `scalar` carries `width` at 0 and `eps` at 4, exactly as
+/// `encode_rms_norm_batch` binds it.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_rms_norm_quantize_batch(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    input: &Buffer,
+    weight: &Buffer,
+    scales: &Buffer,
+    quants: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    e.set_compute_pipeline_state(&glue.rms_norm_quantize_batch);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(scales), 0);
+    e.set_buffer(3, Some(quants), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Fused-glue C3: `gelu_mul_f32` + `quantize_q8_0_f32`, one thread per
+/// 32-value block (`nblocks_buf` holds `n_blocks` as a u32).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_gelu_mul_quantize(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    gate: &Buffer,
+    up: &Buffer,
+    scales: &Buffer,
+    quants: &Buffer,
+    nblocks_buf: &Buffer,
+    n_blocks: usize,
+) {
+    e.set_compute_pipeline_state(&glue.gelu_mul_quantize);
+    e.set_buffer(0, Some(gate), 0);
+    e.set_buffer(1, Some(up), 0);
+    e.set_buffer(2, Some(scales), 0);
+    e.set_buffer(3, Some(quants), 0);
+    e.set_buffer(4, Some(nblocks_buf), 0);
+    dispatch_1d(e, &glue.gelu_mul_quantize, n_blocks);
+}
+
+/// Shape of one fused-glue head dispatch (C5 / C5-lite): the layer's head
+/// geometry plus the verifier's physical row placement.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct Gemma4VerifyGlueHeadArgs {
+    head_dim: usize,
+    eps: f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_positions: usize,
+    base_position: usize,
+    rows: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_verify_glue_head_dispatch(
+    e: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    args: Gemma4VerifyGlueHeadArgs,
+) {
+    let head_dim = args.head_dim as u32;
+    let eps = args.eps;
+    let n_heads = args.n_heads as u32;
+    let n_kv_heads = args.n_kv_heads as u32;
+    let max_positions = args.max_positions as u32;
+    let base_position = args.base_position as u32;
+    e.set_bytes(10, 4, &head_dim as *const u32 as *const _);
+    e.set_bytes(11, 4, &eps as *const f32 as *const _);
+    e.set_bytes(12, 4, &n_heads as *const u32 as *const _);
+    e.set_bytes(13, 4, &n_kv_heads as *const u32 as *const _);
+    e.set_bytes(14, 4, &max_positions as *const u32 as *const _);
+    e.set_bytes(15, 4, &base_position as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (args.n_heads + 2 * args.n_kv_heads) as u64,
+            height: args.rows as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Fused-glue C5-lite: the three batched per-head norms (q, k, v) of one
+/// layer in one role-indexed dispatch. Outputs go to the same `*_normed`
+/// buffers the separate `rms_norm_per_head_f32` dispatches fill, so the
+/// untouched RoPE and scatter dispatches follow exactly as before.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_head_norm(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    q_raw: &Buffer,
+    k_raw: &Buffer,
+    v_src: &Buffer,
+    q_norm: &Buffer,
+    k_norm: &Buffer,
+    q_out: &Buffer,
+    k_out: &Buffer,
+    v_out: &Buffer,
+    args: Gemma4VerifyGlueHeadArgs,
+) {
+    e.set_compute_pipeline_state(&glue.head_norm);
+    e.set_buffer(0, Some(q_raw), 0);
+    e.set_buffer(1, Some(k_raw), 0);
+    e.set_buffer(2, Some(v_src), 0);
+    e.set_buffer(3, Some(q_norm), 0);
+    e.set_buffer(4, Some(k_norm), 0);
+    e.set_buffer(5, Some(q_out), 0);
+    e.set_buffer(6, Some(k_out), 0);
+    e.set_buffer(7, Some(v_out), 0);
+    gemma4_verify_glue_head_dispatch(e, &glue.head_norm, args);
+}
+
+/// Fused-glue C5: per-head norm + split-half RoPE + KV scatter of one layer
+/// in one dispatch. `cos`/`sin` are the per-row tables the plan uploads
+/// (`rows x head_dim/2`, row-major); q rotates into `q_out`, k rotates into
+/// `cache_k` at physical `base_position + row`, v copies into `cache_v`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_verify_head_norm_rope_scatter(
+    e: &metal::ComputeCommandEncoderRef,
+    glue: &Gemma4VerifyGluePipelines,
+    q_raw: &Buffer,
+    k_raw: &Buffer,
+    v_src: &Buffer,
+    q_norm: &Buffer,
+    k_norm: &Buffer,
+    q_out: &Buffer,
+    cache_k: &Buffer,
+    cache_v: &Buffer,
+    cos: &Buffer,
+    sin: &Buffer,
+    args: Gemma4VerifyGlueHeadArgs,
+) {
+    e.set_compute_pipeline_state(&glue.head_norm_rope_scatter);
+    e.set_buffer(0, Some(q_raw), 0);
+    e.set_buffer(1, Some(k_raw), 0);
+    e.set_buffer(2, Some(v_src), 0);
+    e.set_buffer(3, Some(q_norm), 0);
+    e.set_buffer(4, Some(k_norm), 0);
+    e.set_buffer(5, Some(q_out), 0);
+    e.set_buffer(6, Some(cache_k), 0);
+    e.set_buffer(7, Some(cache_v), 0);
+    e.set_buffer(8, Some(cos), 0);
+    e.set_buffer(9, Some(sin), 0);
+    gemma4_verify_glue_head_dispatch(e, &glue.head_norm_rope_scatter, args);
 }
 
 /// Opt-in: with CAMELID_METAL_F32Y also set, weights upload in the raw GGUF 34-byte
@@ -22727,6 +23723,313 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2(
         },
     );
     record_gemma4_q4_column_dispatch(columns);
+    true
+}
+
+/// Fused-glue C1 (stage half): write the V2 activation record for
+/// (`input_quants`, `input_scales`, `blocks_per_row`, `columns`) into
+/// `staged_quants` once. It is a pure function of those inputs, so every MMA
+/// half that follows reads exactly the bytes the combined encoder would have
+/// re-staged for it. Refuses before encoding on any shape or length defect.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    v2: &Gemma4Q4NativeV2Pipelines,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    staged_quants: &Buffer,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if blocks_per_row == 0
+        || blocks_per_row > (u32::MAX as usize) / 1088
+        || !matches!(columns, 1 | 2 | 4 | 8 | 16)
+    {
+        return false;
+    }
+    let fragment_major = v2.variant.fragment_major;
+    let panel_columns = if columns == 16 { 16 } else { 8 };
+    let input_width = blocks_per_row * 32;
+    let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
+        return false;
+    };
+    let Some(scale_bytes) = input_blocks.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(quant_bytes) = input_blocks.checked_mul(32) else {
+        return false;
+    };
+    let Some(stage_bytes) =
+        gemma4_q4_native_v2_stage_bytes(blocks_per_row, columns, fragment_major)
+    else {
+        return false;
+    };
+    if input_scales.length() < scale_bytes as u64
+        || input_quants.length() < quant_bytes as u64
+        || staged_quants.length() < stage_bytes as u64
+    {
+        return false;
+    }
+    let stage_pipeline = match (fragment_major, columns == 16) {
+        (true, false) => v2.stage_fm.as_ref(),
+        (true, true) => v2.stage16_fm.as_ref(),
+        (false, false) => kernel.q4_0_q8_ordered_columns_mma_stage_pipeline.as_ref(),
+        (false, true) => kernel.q4_0_q8_ordered_columns_mma_stage16_pipeline.as_ref(),
+    };
+    let Some(stage_pipeline) = stage_pipeline else {
+        return false;
+    };
+    let stage_threads = if fragment_major {
+        blocks_per_row * (panel_columns * 32 + panel_columns)
+    } else {
+        input_width * panel_columns
+    };
+    let blocks_u32 = blocks_per_row as u32;
+    let columns_u32 = columns as u32;
+    encoder.set_compute_pipeline_state(stage_pipeline);
+    encoder.set_buffer(0, Some(input_quants), 0);
+    encoder.set_buffer(1, Some(staged_quants), 0);
+    if fragment_major {
+        encoder.set_buffer(2, Some(input_scales), 0);
+    }
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    dispatch_1d(encoder, stage_pipeline, stage_threads);
+    true
+}
+
+/// Byte-length admission shared by the fused-glue MMA halves: the sidecar
+/// tiles, the f32 output and the staged record must all fit before anything
+/// is encoded (mirrors the combined V2 encoder's checks).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_q4_native_v2_mma_admitted(
+    v2: &Gemma4Q4NativeV2Pipelines,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if rows == 0
+        || blocks_per_row == 0
+        || rows > u32::MAX as usize
+        || blocks_per_row > (u32::MAX as usize) / 1088
+        || !matches!(columns, 1 | 2 | 4 | 8 | 16)
+    {
+        return false;
+    }
+    let Some(weight_bytes) = rows
+        .div_ceil(8)
+        .checked_mul(blocks_per_row)
+        .and_then(|records| records.checked_mul(144))
+    else {
+        return false;
+    };
+    let Some(weight_end) = weight_offset.checked_add(weight_bytes as u64) else {
+        return false;
+    };
+    let Some(output_bytes) = rows
+        .checked_mul(columns)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(stage_bytes) =
+        gemma4_q4_native_v2_stage_bytes(blocks_per_row, columns, v2.variant.fragment_major)
+    else {
+        return false;
+    };
+    weight.length() >= weight_end
+        && output.length() >= output_bytes as u64
+        && staged_quants.length() >= stage_bytes as u64
+}
+
+/// Fused-glue C1 (MMA half): the V2 MMA dispatch over an already-staged
+/// record. Identical pipeline, bindings, grid and dispatch counter to the
+/// combined encoder; only the stage dispatch is absent.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+    encoder: &metal::ComputeCommandEncoderRef,
+    v2: &Gemma4Q4NativeV2Pipelines,
+    simdgroups_per_threadgroup: usize,
+    input_scales: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if !matches!(simdgroups_per_threadgroup, 1 | 2 | 4 | 8)
+        || !gemma4_q4_native_v2_mma_admitted(
+            v2,
+            weight,
+            weight_offset,
+            output,
+            staged_quants,
+            rows,
+            blocks_per_row,
+            columns,
+        )
+    {
+        return false;
+    }
+    let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
+        return false;
+    };
+    if input_scales.length() < (input_blocks * std::mem::size_of::<f32>()) as u64 {
+        return false;
+    }
+    let mma_pipeline = if columns == 16 { &v2.k16 } else { &v2.k8 };
+    let threads_per_threadgroup = 32 * simdgroups_per_threadgroup;
+    if mma_pipeline.thread_execution_width() != 32
+        || (mma_pipeline.max_total_threads_per_threadgroup() as usize) < threads_per_threadgroup
+    {
+        return false;
+    }
+    let tiles = rows.div_ceil(8);
+    let threadgroups = tiles
+        .div_ceil(v2.variant.tiles)
+        .div_ceil(simdgroups_per_threadgroup);
+    let blocks_u32 = blocks_per_row as u32;
+    let rows_u32 = rows as u32;
+    let columns_u32 = columns as u32;
+    encoder.set_compute_pipeline_state(mma_pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    encoder.set_buffer(7, Some(staged_quants), 0);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: threadgroups as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: threads_per_threadgroup as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    record_gemma4_q4_column_dispatch(columns);
+    true
+}
+
+/// One projection segment of a fused-glue C7 grid: `(weight, weight_offset,
+/// output, rows)` over the shared staged record.
+#[cfg(target_os = "macos")]
+pub(crate) type Gemma4VerifyGlueSegment<'a> = (&'a Buffer, u64, &'a Buffer, usize);
+
+/// Fused-glue C7: two or three projections that share one staged K<=8 record
+/// in ONE dispatch of the `fm_bits_u4` segment kernel. Every simdgroup runs
+/// the identical template body over identical bytes; only the simdgroup ->
+/// (matrix, tile) assignment changes. The dispatch counter is recorded once
+/// per segment so the per-width bookkeeping matches the single-matrix
+/// encoders. Refuses before encoding on any defect of any segment.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
+    encoder: &metal::ComputeCommandEncoderRef,
+    v2: &Gemma4Q4NativeV2Pipelines,
+    glue: &Gemma4VerifyGlueMmaPipelines,
+    simdgroups_per_threadgroup: usize,
+    input_scales: &Buffer,
+    staged_quants: &Buffer,
+    segments: &[Gemma4VerifyGlueSegment<'_>],
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if v2.variant.name != GEMMA4_FUSED_GLUE_V2_VARIANT
+        || !v2.variant.fragment_major
+        || v2.variant.tiles != 1
+        || !matches!(segments.len(), 2 | 3)
+        || !matches!(columns, 1 | 2 | 4 | 8)
+        || !matches!(simdgroups_per_threadgroup, 1 | 2 | 4 | 8)
+    {
+        return false;
+    }
+    let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
+        return false;
+    };
+    if input_scales.length() < (input_blocks * std::mem::size_of::<f32>()) as u64 {
+        return false;
+    }
+    let mut total_tiles = 0usize;
+    for &(weight, weight_offset, output, rows) in segments {
+        if !gemma4_q4_native_v2_mma_admitted(
+            v2,
+            weight,
+            weight_offset,
+            output,
+            staged_quants,
+            rows,
+            blocks_per_row,
+            columns,
+        ) {
+            return false;
+        }
+        total_tiles += rows.div_ceil(8);
+    }
+    let threads_per_threadgroup = 32 * simdgroups_per_threadgroup;
+    let pipeline = &glue.seg3;
+    if pipeline.thread_execution_width() != 32
+        || (pipeline.max_total_threads_per_threadgroup() as usize) < threads_per_threadgroup
+    {
+        return false;
+    }
+    let threadgroups = total_tiles.div_ceil(simdgroups_per_threadgroup);
+    let blocks_u32 = blocks_per_row as u32;
+    let columns_u32 = columns as u32;
+    let (weight0, offset0, out0, rows0) = segments[0];
+    let (weight1, offset1, out1, rows1) = segments[1];
+    // A two-segment grid binds the second matrix again with zero rows; the
+    // kernel never reaches a third-segment tile because none is dispatched.
+    let (weight2, offset2, out2, rows2) = segments
+        .get(2)
+        .copied()
+        .unwrap_or((weight1, offset1, out1, 0));
+    let rows0_u32 = rows0 as u32;
+    let rows1_u32 = rows1 as u32;
+    let rows2_u32 = rows2 as u32;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(2, Some(weight0), offset0);
+    encoder.set_buffer(3, Some(out0), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(5, 4, &rows0_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    encoder.set_buffer(7, Some(staged_quants), 0);
+    encoder.set_bytes(8, 4, &rows1_u32 as *const u32 as *const _);
+    encoder.set_bytes(9, 4, &rows2_u32 as *const u32 as *const _);
+    encoder.set_buffer(10, Some(weight1), offset1);
+    encoder.set_buffer(11, Some(out1), 0);
+    encoder.set_buffer(12, Some(weight2), offset2);
+    encoder.set_buffer(13, Some(out2), 0);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: threadgroups as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: threads_per_threadgroup as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    for _ in segments {
+        record_gemma4_q4_column_dispatch(columns);
+    }
     true
 }
 
