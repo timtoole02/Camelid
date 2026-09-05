@@ -23,6 +23,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{wire_mmap::GgufWireMmap, BackendError, Result};
 
+#[path = "gemma4_mtp12_shortlist.rs"]
+mod shortlist;
+
 pub const GEMMA4_12B_MTP_ASSISTANT_SHA256: &str =
     "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6";
 const OFFICIAL_CONFIG_SHA256: &str =
@@ -835,6 +838,98 @@ kernel void mtp12_q4_0_gemv(
     }
 }
 
+// Draft-only shortlist: score all 2048 raw-mean centroids and select the
+// largest T scores with stable first-index tie breaking. The target verifier
+// remains authoritative; these kernels only change proposed draft tokens.
+kernel void mtp12_shortlist_scores(
+    device const float* centroids [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    float sum = 0.0f;
+    for (uint col = lane; col < 1024u; col += 32u)
+        sum += centroids[row * 1024u + col] * input[col];
+    const float value = simd_sum(sum);
+    if (lane == 0u) scores[row] = value;
+}
+
+kernel void mtp12_shortlist_select(
+    device const float* scores [[buffer(0)]],
+    device uint* selected [[buffer(1)]],
+    constant uint& top [[buffer(2)]],
+    uint row [[thread_position_in_grid]]) {
+    if (row >= 2048u) return;
+    // A nonfinite score conservatively admits its cluster. Finite queries
+    // produce exactly T selected clusters, including exact score ties.
+    const float score = scores[row];
+    if (!isfinite(score)) { selected[row] = 1u; return; }
+    uint rank = 0u;
+    for (uint other = 0u; other < 2048u && rank < top; ++other) {
+        const float candidate = scores[other];
+        rank += uint(candidate > score || (candidate == score && other < row));
+    }
+    selected[row] = uint(rank < top);
+}
+
+kernel void mtp12_q4_0_gemv_shortlist(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    device const ushort4* token_clusters [[buffer(7)]],
+    device const uint* selected_clusters [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (row >= rows) return;
+    const ushort4 clusters = token_clusters[row];
+    if (selected_clusters[clusters.x] == 0u &&
+        selected_clusters[clusters.y] == 0u &&
+        selected_clusters[clusters.z] == 0u) {
+        if (lane == 0u) output[row] = -INFINITY;
+        return;
+    }
+    const uint blocks_per_row = cols / 32u;
+    device const uchar* row_bytes = q4_weights + weight_byte_offset
+        + ulong(row) * ulong(blocks_per_row) * 18ul;
+    float partial = 0.0f;
+    for (uint block_index = lane; block_index < blocks_per_row; block_index += 32u) {
+        device const uchar* block = row_bytes + ulong(block_index) * 18ul;
+        const float d = float(*reinterpret_cast<device const half*>(block));
+        device const packed_uchar4* q4 =
+            reinterpret_cast<device const packed_uchar4*>(block + 2);
+        const uint input_base = block_index * 32u;
+        #pragma unroll
+        for (uint k = 0u; k < 4u; ++k) {
+            const uchar4 packed = uchar4(q4[k]);
+            const uint offset = k * 4u;
+            partial += d * (
+                float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+              + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+              + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+              + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+              + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+              + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+              + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+              + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+        }
+    }
+    partial += simd_shuffle_down(partial, ushort(16));
+    partial += simd_shuffle_down(partial, ushort(8));
+    partial += simd_shuffle_down(partial, ushort(4));
+    const float pair01 =
+        simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+    const float pair23 =
+        simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+    const float value = pair01 + pair23;
+    if (lane == 0u) {
+        output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+    }
+}
+
 // Pinned ATen-style contiguous f32 RMS geometry for all production widths
 // (256/512/1024). One threadgroup owns a row/head.
 kernel void mtp12_rms_norm(
@@ -1317,6 +1412,8 @@ fn mtp12_argmax_legacy_enabled() -> bool {
 /// `CAMELID_MTP12_DUMP_DRAFT_QUERIES=<path>`: append every resident-chain
 /// draft's head query (final normalized assistant hidden) and its full-head
 /// argmax token to `<path>`, for the offline head-shortlist recall experiment.
+/// Collect reference labels with the shortlist disabled: with it enabled the
+/// token is the shortlisted proposal, not necessarily the full-head argmax.
 /// Diagnostic only; unset in production.
 fn mtp12_dump_draft_queries_path() -> Option<&'static std::path::Path> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
@@ -1333,6 +1430,9 @@ struct Mtp12Pipelines {
     gather_q6k_embedding_and_recurrent: ComputePipelineState,
     copy_f32: ComputePipelineState,
     q4_gemv: ComputePipelineState,
+    q4_gemv_shortlist: ComputePipelineState,
+    shortlist_scores: ComputePipelineState,
+    shortlist_select: ComputePipelineState,
     rms_norm: ComputePipelineState,
     rope: ComputePipelineState,
     attention_scores: ComputePipelineState,
@@ -1370,6 +1470,9 @@ impl Mtp12Pipelines {
             )?,
             copy_f32: pipeline("mtp12_copy_f32")?,
             q4_gemv: pipeline("mtp12_q4_0_gemv")?,
+            q4_gemv_shortlist: pipeline("mtp12_q4_0_gemv_shortlist")?,
+            shortlist_scores: pipeline("mtp12_shortlist_scores")?,
+            shortlist_select: pipeline("mtp12_shortlist_select")?,
             rms_norm: pipeline("mtp12_rms_norm")?,
             rope: pipeline("mtp12_rope_split")?,
             attention_scores: pipeline("mtp12_attention_scores")?,
@@ -1754,6 +1857,7 @@ fn validate_device_chain_positions(
 /// Fully packed 12B assistant.  No target model, pager, MoE state, or verifier
 /// is retained here; all 23 matrices live in one bounded Q4_0 Metal buffer.
 pub struct Gemma4Mtp12AssistantMetal {
+    shortlist: Option<Mtp12Shortlist>,
     packed_q4: Buffer,
     layout: Q4Layout,
     pipelines: Mtp12Pipelines,
@@ -2077,6 +2181,58 @@ fn pack_all_q4_0(
     Ok((buffer, started.elapsed().as_micros()))
 }
 
+const MTP12_SHORTLIST_CLUSTERS: usize = 2048;
+
+struct Mtp12Shortlist {
+    centroids: Buffer,
+    token_clusters: Buffer,
+    scores: Buffer,
+    selected: Buffer,
+    top: u32,
+}
+
+fn mtp12_shortlist_top(value: Option<&str>) -> Result<u32> {
+    match value {
+        None => Ok(192),
+        Some(text) => text.parse::<u32>()
+            .ok().filter(|top| (1..=MTP12_SHORTLIST_CLUSTERS as u32).contains(top))
+            .ok_or_else(|| invalid("CAMELID_GEMMA4_MTP12_SHORTLIST_TOP must be in 1..=2048")),
+    }
+}
+
+impl Mtp12Shortlist {
+    fn from_env(device: &Device) -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os("CAMELID_GEMMA4_MTP12_SHORTLIST") else {
+            return Ok(None);
+        };
+        let data = shortlist::read_sidecar(Path::new(&path))?;
+        let top_text = std::env::var("CAMELID_GEMMA4_MTP12_SHORTLIST_TOP")
+            .map(Some).or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                _ => Err(invalid("CAMELID_GEMMA4_MTP12_SHORTLIST_TOP is not Unicode")),
+            })?;
+        let top = mtp12_shortlist_top(top_text.as_deref())?;
+        let token_clusters = shared_buffer(device, data.token_clusters.len() * 2);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.token_clusters.as_ptr(),
+                token_clusters.contents().cast::<u16>(), data.token_clusters.len());
+        }
+        eprintln!("[gemma4-mtp12] draft head shortlist top={top}/2048 path={}", Path::new(&path).display());
+        Ok(Some(Self {
+            centroids: f32_buffer(device, &data.centroids)?,
+            token_clusters,
+            scores: shared_buffer(device, MTP12_SHORTLIST_CLUSTERS * 4),
+            selected: shared_buffer(device, MTP12_SHORTLIST_CLUSTERS * 4),
+            top,
+        }))
+    }
+
+    fn byte_len(&self) -> u64 {
+        self.centroids.length() + self.token_clusters.length()
+            + self.scores.length() + self.selected.length()
+    }
+}
+
 impl Mtp12Scratch {
     fn new(device: &Device) -> Self {
         let f32s = |count: usize| shared_buffer(device, count * std::mem::size_of::<f32>());
@@ -2261,13 +2417,15 @@ impl Gemma4Mtp12AssistantMetal {
         let pipelines = Mtp12Pipelines::new(device)?;
         let pipeline_compile_us = pipeline_started.elapsed().as_micros();
         let scratch = Mtp12Scratch::new(device);
+        let shortlist = Mtp12Shortlist::from_env(device)?;
+        let shortlist_bytes = shortlist.as_ref().map_or(0, Mtp12Shortlist::byte_len);
         let resident_ledger = Gemma4Mtp12ResidentLedger {
             source_file_bytes: EXPECTED_FILE_BYTES,
             source_sha256_verified: true,
             source_mapping_retained: false,
             packed_q4_matrix_bytes: packed_q4.length(),
             decoded_norm_bytes,
-            fixed_scratch_bytes: scratch.byte_len(),
+            fixed_scratch_bytes: scratch.byte_len() + shortlist_bytes,
             quantize_us,
             hash_us,
             pipeline_compile_us,
@@ -2277,6 +2435,7 @@ impl Gemma4Mtp12AssistantMetal {
             .try_into()
             .map_err(|_| invalid("internal resident layer table is not four layers"))?;
         Ok(Self {
+            shortlist,
             packed_q4,
             layout,
             pipelines,
@@ -2772,6 +2931,22 @@ impl Gemma4Mtp12AssistantMetal {
         }
     }
 
+    /// Only the resident draft chain uses the optional shortlist. The K=1
+    /// full-logit APIs remain full-head parity oracles.
+    fn encode_draft_head(&self, encoder: &metal::ComputeCommandEncoderRef) {
+        let pipeline = if let Some(shortlist) = &self.shortlist {
+            encode_shortlist(encoder, &self.pipelines, shortlist, &self.scratch.final_normalized);
+            encoder.set_buffer(7, Some(&shortlist.token_clusters), 0);
+            encoder.set_buffer(8, Some(&shortlist.selected), 0);
+            &self.pipelines.q4_gemv_shortlist
+        } else {
+            &self.pipelines.q4_gemv
+        };
+        encode_q4_gemv(encoder, pipeline, &self.packed_q4,
+            &self.scratch.final_normalized, &self.scratch.logits,
+            self.layout.embedding, false);
+    }
+
     pub fn propose_chain_device_resident(
         &mut self,
         anchor_token: u32,
@@ -2960,15 +3135,7 @@ impl Gemma4Mtp12AssistantMetal {
                 (step * TARGET_HIDDEN * std::mem::size_of::<f32>()) as u64,
                 TARGET_HIDDEN,
             );
-            encode_q4_gemv(
-                encoder,
-                &self.pipelines.q4_gemv,
-                &self.packed_q4,
-                &self.scratch.final_normalized,
-                &self.scratch.logits,
-                self.layout.embedding,
-                false,
-            );
+            self.encode_draft_head(encoder);
             self.encode_vocab_argmax(
                 encoder,
                 ((step + 1) * std::mem::size_of::<u32>()) as u64,
@@ -3459,6 +3626,27 @@ fn encode_copy_f32_to_offset(
     encoder.set_buffer(1, Some(destination), destination_byte_offset);
     encoder.set_bytes(2, 4, &count_u32 as *const u32 as *const c_void);
     dispatch_1d(encoder, pipeline, count);
+}
+
+fn encode_shortlist(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipelines: &Mtp12Pipelines,
+    shortlist: &Mtp12Shortlist,
+    query: &Buffer,
+) {
+    encoder.set_compute_pipeline_state(&pipelines.shortlist_scores);
+    encoder.set_buffer(0, Some(&shortlist.centroids), 0);
+    encoder.set_buffer(1, Some(query), 0);
+    encoder.set_buffer(2, Some(&shortlist.scores), 0);
+    encoder.dispatch_thread_groups(
+        MTLSize { width: MTP12_SHORTLIST_CLUSTERS as u64, height: 1, depth: 1 },
+        MTLSize { width: 32, height: 1, depth: 1 },
+    );
+    encoder.set_compute_pipeline_state(&pipelines.shortlist_select);
+    encoder.set_buffer(0, Some(&shortlist.scores), 0);
+    encoder.set_buffer(1, Some(&shortlist.selected), 0);
+    encoder.set_bytes(2, 4, &shortlist.top as *const u32 as *const c_void);
+    dispatch_1d(encoder, &pipelines.shortlist_select, MTP12_SHORTLIST_CLUSTERS);
 }
 
 fn encode_q4_gemv(
@@ -4143,6 +4331,7 @@ mod tests {
             ..Gemma4Mtp12ResidentLedger::default()
         };
         Gemma4Mtp12AssistantMetal {
+            shortlist: None,
             packed_q4,
             layout,
             pipelines,
@@ -5546,6 +5735,106 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn assistant_shortlist_top_rejects_invalid_settings() {
+        assert_eq!(mtp12_shortlist_top(None).unwrap(), 192);
+        for top in [1, 128, 192, 256, 2048] {
+            assert_eq!(mtp12_shortlist_top(Some(&top.to_string())).unwrap(), top);
+        }
+        for bad in ["", "0", "2049", "-1", "true", "128 "] {
+            assert!(mtp12_shortlist_top(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn assistant_shortlist_matches_masked_full_head_and_stable_top_clusters() {
+        let Some(device) = Device::system_default() else { return; };
+        let pipelines = Mtp12Pipelines::new(&device).expect("shortlist pipelines");
+        let queue = device.new_command_queue();
+        const ROWS: usize = 8193;
+        const OFFSET: usize = 18;
+        let matrix = Q4TensorRef {
+            byte_offset: OFFSET as u64,
+            byte_len: (ROWS * ASSISTANT_HIDDEN / 32 * 18) as u64,
+            rows: ROWS as u32, cols: ASSISTANT_HIDDEN as u32,
+        };
+        let weights = shared_buffer(&device, OFFSET + matrix.byte_len as usize);
+        let bytes = unsafe { std::slice::from_raw_parts_mut(
+            weights.contents().cast::<u8>(), weights.length() as usize) };
+        let mut random = 0x9876_4321_abcdu64;
+        for block in bytes[OFFSET..].chunks_exact_mut(18) {
+            random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+            let scale = (random as i16) as f32 / 32768.0;
+            block[..2].copy_from_slice(&crate::tensor::f32_to_f16_bits(scale).to_le_bytes());
+            for byte in &mut block[2..] {
+                random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+                *byte = random as u8;
+            }
+        }
+        let query: Vec<f32> = (0..ASSISTANT_HIDDEN)
+            .map(|i| if i == 0 { 1.0 } else { ((i * 13 % 71) as f32 - 35.0) / 16.0 }).collect();
+        let query_buffer = f32_buffer(&device, &query).unwrap();
+        // Only dimension zero contributes; repeated scores exercise stable
+        // top-T ties. Remaining query dimensions exercise the real Q4 dot.
+        let expected_scores: Vec<f32> = (0..MTP12_SHORTLIST_CLUSTERS)
+            .map(|i| (i * 37 % 53) as f32 - 26.0).collect();
+        let mut centroids = vec![0.0; MTP12_SHORTLIST_CLUSTERS * ASSISTANT_HIDDEN];
+        for (i, score) in expected_scores.iter().enumerate() {
+            centroids[i * ASSISTANT_HIDDEN] = *score;
+        }
+        let clusters: Vec<u16> = (0..ROWS).flat_map(|row| {
+            [(row % 2048) as u16, ((row + 71) % 2048) as u16,
+             ((row + 193) % 2048) as u16, 0]
+        }).collect();
+        let cluster_buffer = shared_buffer(&device, clusters.len() * 2);
+        unsafe { std::ptr::copy_nonoverlapping(clusters.as_ptr(),
+            cluster_buffer.contents().cast::<u16>(), clusters.len()); }
+        let mut shortlist = Mtp12Shortlist {
+            centroids: f32_buffer(&device, &centroids).unwrap(),
+            token_clusters: cluster_buffer,
+            scores: shared_buffer(&device, MTP12_SHORTLIST_CLUSTERS * 4),
+            selected: shared_buffer(&device, MTP12_SHORTLIST_CLUSTERS * 4), top: 192,
+        };
+        let full_logits = shared_buffer(&device, ROWS * 4);
+        let masked_logits = shared_buffer(&device, ROWS * 4);
+        let mut order: Vec<usize> = (0..MTP12_SHORTLIST_CLUSTERS).collect();
+        order.sort_by(|&a, &b| expected_scores[b].total_cmp(&expected_scores[a]).then(a.cmp(&b)));
+        for top in [1, 17, 128, 192, 256, 2048] {
+            shortlist.top = top;
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &query_buffer,
+                &full_logits, matrix, false);
+            encode_shortlist(encoder, &pipelines, &shortlist, &query_buffer);
+            encoder.set_buffer(7, Some(&shortlist.token_clusters), 0);
+            encoder.set_buffer(8, Some(&shortlist.selected), 0);
+            encode_q4_gemv(encoder, &pipelines.q4_gemv_shortlist, &weights, &query_buffer,
+                &masked_logits, matrix, false);
+            encoder.end_encoding(); cb.commit(); cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            let selected = unsafe { std::slice::from_raw_parts(
+                shortlist.selected.contents().cast::<u32>(), MTP12_SHORTLIST_CLUSTERS) };
+            let scores = unsafe { std::slice::from_raw_parts(
+                shortlist.scores.contents().cast::<f32>(), MTP12_SHORTLIST_CLUSTERS) };
+            assert_eq!(scores, expected_scores, "centroid scores at top={top}");
+            let mut expected_selected = vec![0u32; MTP12_SHORTLIST_CLUSTERS];
+            for &index in &order[..top as usize] { expected_selected[index] = 1; }
+            assert_eq!(selected, expected_selected, "top={top}");
+            let full = unsafe { std::slice::from_raw_parts(full_logits.contents().cast::<f32>(), ROWS) };
+            let actual = unsafe { std::slice::from_raw_parts(masked_logits.contents().cast::<f32>(), ROWS) };
+            for row in 0..ROWS {
+                let admitted = clusters[row * 4..row * 4 + 3].iter()
+                    .any(|&c| expected_selected[c as usize] != 0);
+                let expected = if admitted { full[row] } else { f32::NEG_INFINITY };
+                assert_eq!(actual[row].to_bits(), expected.to_bits(), "top={top} row={row}");
+            }
+            let expected_token = reference_first_index_argmax(actual);
+            let (legacy, chunked) = run_argmax_pair(&device, &queue, &pipelines, actual);
+            assert_eq!(legacy, expected_token);
+            assert_eq!(chunked, expected_token);
+        }
+    }
 
     #[test]
     fn production_mtp12_shader_compiles() {
