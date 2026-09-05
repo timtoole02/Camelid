@@ -8695,6 +8695,10 @@ impl Gemma4GpuRuntime {
         })?;
         let sliding_window = self.g.sliding_window as usize;
         let mut inputs = Vec::with_capacity(self.n_layers);
+        // Layers sharing a rotary configuration use identical tables at this
+        // position. Compute the original expressions once for each configuration
+        // instead of repeating powf/sin_cos across all 48 layers.
+        let mut rotary_tables: Vec<(usize, u32, bool, Vec<f32>, Vec<f32>)> = Vec::new();
         for layer in 0..self.n_layers {
             let head_dim = self.g.head_dim_at(layer) as usize;
             let theta = self.g.rope_freq_base_at(layer);
@@ -8704,16 +8708,26 @@ impl Gemma4GpuRuntime {
             } else {
                 self.rope_factors.as_deref()
             };
-            let (mut cos_t, mut sin_t) = (vec![0.0f32; half], vec![0.0f32; half]);
-            for pair in 0..half {
-                let mut frequency = theta.powf(-(2.0 * pair as f32) / head_dim as f32);
-                if let Some(factors) = factors {
-                    frequency /= factors[pair];
+            let key = (head_dim, theta.to_bits(), factors.is_some());
+            let (cos_t, sin_t) = if let Some((_, _, _, cos_t, sin_t)) = rotary_tables
+                .iter()
+                .find(|entry| (entry.0, entry.1, entry.2) == key)
+            {
+                (cos_t.clone(), sin_t.clone())
+            } else {
+                let (mut cos_t, mut sin_t) = (vec![0.0f32; half], vec![0.0f32; half]);
+                for pair in 0..half {
+                    let mut frequency = theta.powf(-(2.0 * pair as f32) / head_dim as f32);
+                    if let Some(factors) = factors {
+                        frequency /= factors[pair];
+                    }
+                    let (sin, cos) = (position as f32 * frequency).sin_cos();
+                    cos_t[pair] = cos;
+                    sin_t[pair] = sin;
                 }
-                let (sin, cos) = (position as f32 * frequency).sin_cos();
-                cos_t[pair] = cos;
-                sin_t[pair] = sin;
-            }
+                rotary_tables.push((key.0, key.1, key.2, cos_t.clone(), sin_t.clone()));
+                (cos_t, sin_t)
+            };
             inputs.push(crate::metal::Gemma4TokenLayerInput {
                 cos_t,
                 sin_t,
