@@ -10253,6 +10253,9 @@ mod gemma4_template_tests {
                 accepted_drafts: 4,
                 emitted_tokens: 6,
                 decode_us: 100_000,
+                tree_proposal_rounds: 2,
+                tree_branch_rounds: 1,
+                tree_compaction_us: 750,
                 ..Default::default()
             },
         };
@@ -10264,6 +10267,9 @@ mod gemma4_template_tests {
         assert_eq!(diagnostics["mtp12"]["accepted_drafts"], 4);
         assert_eq!(diagnostics["mtp12"]["drafted"], 8);
         assert_eq!(diagnostics["mtp12"]["alpha"], 2.0);
+        assert_eq!(diagnostics["mtp12"]["tree_proposal_rounds"], 2);
+        assert_eq!(diagnostics["mtp12"]["tree_branch_rounds"], 1);
+        assert_eq!(diagnostics["mtp12"]["tree_compaction_us"], 750);
         let qualification = &diagnostics["mtp12"]["native_receipt_qualification"];
         assert_eq!(
             qualification["workload"],
@@ -11368,6 +11374,9 @@ fn gemma4_mtp12_diagnostics(
             "target_verify_us": stats.target_verify_us,
             "rounds": stats.rounds,
             "target_verify_rows": stats.target_verify_rows,
+            "tree_proposal_rounds": stats.tree_proposal_rounds,
+            "tree_branch_rounds": stats.tree_branch_rounds,
+            "tree_compaction_us": stats.tree_compaction_us,
             "decode_output_tokens": decode_output_tokens,
             "decode_tokens_per_second": stats.decode_tokens_per_second(),
             "configured_verify_width": stats.configured_verify_width,
