@@ -275,10 +275,20 @@ fn tree_snapshot_primary_and_fork_bits() {
             token = answer.token;
             hidden = answer.recurrent_hidden;
         }
-        let selected = margins
-            .iter()
-            .position(|v| v.is_finite() && (0.0..=2.0).contains(v));
+        // The replay knows two proposal rules: today's earliest-eligible fork
+        // and the menu's linear shape. Running it under `fixed:lin7` is what
+        // re-proves that recording a top-2 on the continuation forwards leaves
+        // the seven drafted tokens and their recurrent bits unchanged.
+        let selected = match std::env::var(crate::gemma4_mtp12_tree_menu::POLICY_ENV).ok().as_deref()
+        {
+            None | Some("legacy") => margins
+                .iter()
+                .position(|v| v.is_finite() && (0.0..=2.0).contains(v)),
+            Some("fixed:lin7") => None,
+            Some(other) => panic!("tree oracle replays legacy and fixed:lin7 only; got {other:?}"),
+        };
         assert_eq!(tree.branch_primary_step, selected);
+        assert_eq!(tree.assistant_steps, if selected.is_some() { 6 } else { 7 });
         if let Some(step) = selected {
             token = alternatives[step];
             hidden = parents[step].clone();
@@ -341,6 +351,7 @@ fn tree_snapshot_primary_and_fork_bits() {
         }
         records.push(serde_json::json!({"round":ri,"position":p,"tokens":tree.tokens,"parents":tree.parents,
             "depths":tree.depths,"branch_primary_step":tree.branch_primary_step,"primary_margins":tree.primary_margins,
+            "policy":tree.policy,"shape":tree.shape,"forward_margins":tree.forward_margins,
             "assistant_steps":tree.assistant_steps,"gpu_us":tree.timing.gpu_us,"wall_us":tree.timing.wall_us}));
         eprintln!(
             "tree oracle: {} rounds passed; shortlist={shortlist} single={single}",
