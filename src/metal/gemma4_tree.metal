@@ -51,6 +51,53 @@ kernel void gemma4_tree_scores_suffix(
     }
 }
 
+// Global-only candidate: preserve the qualified per-term FMA while keeping
+// the long committed walk free of tree address selection. The HD256 control
+// nest below remains unchanged; the selected HD256 path uses its own PAIRS2.
+inline void gemma4_tree_context_hd512_split(
+    device const float* values,
+    device const float* scores,
+    device float* output,
+    constant Gemma4AttnV2Args& args,
+    constant uint4* row_meta,
+    device const float* denom_in,
+    constant uint* ancestors,
+    constant uint& tree_base,
+    uint3 tg,
+    uint lane)
+{
+    uint head = tg.x;
+    uint row = tg.y;
+    if (head >= args.n_heads || row >= args.rows) return;
+    uint4 meta = row_meta[row];
+    uint position_count = meta.y;
+    constexpr uint head_dim = 512u;
+    uint kv_head = head / args.group;
+    uint q_base = row * args.n_heads * head_dim + head * head_dim;
+    uint position_stride = args.position_stride;
+    uint kv_base = args.kv_base_offset + kv_head * args.kv_head_stride;
+    uint score_base = meta.z + head * position_count;
+    float inv = 1.0 / denom_in[row * args.n_heads + head];
+    uint stride = 32u * args.dim_blocks;
+    const uint prefix_count = meta.x < tree_base
+        ? min(position_count, tree_base - meta.x) : 0u;
+    const uint prefix_kv_base = kv_base + meta.x * position_stride;
+
+    for (uint d = lane + tg.z * 32u; d < head_dim; d += stride) {
+        float acc = 0.0;
+        for (uint p = 0; p < prefix_count; ++p) {
+            const float v = values[prefix_kv_base + p * position_stride + d];
+            acc = metal::fma(scores[score_base + p] * v, inv, acc);
+        }
+        for (uint p = prefix_count; p < position_count; ++p) {
+            uint physical_position = tree_base + ancestors[row * 8u + meta.x + p - tree_base];
+            const float v = values[kv_base + physical_position * position_stride + d];
+            acc = metal::fma(scores[score_base + p] * v, inv, acc);
+        }
+        output[q_base + d] = acc;
+    }
+}
+
 // The logical score positions, denominator, reciprocal location and ascending
 // scalar fold are unchanged. Only each logical suffix V address is mapped.
 kernel void gemma4_tree_context_nest(
@@ -65,6 +112,11 @@ kernel void gemma4_tree_context_nest(
     uint3 tg [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]])
 {
+    if (args.head_dim == 512u) {
+        gemma4_tree_context_hd512_split(values, scores, output, args, row_meta,
+            denom_in, ancestors, tree_base, tg, lane);
+        return;
+    }
     uint head = tg.x;
     uint row = tg.y;
     if (head >= args.n_heads || row >= args.rows) return;
