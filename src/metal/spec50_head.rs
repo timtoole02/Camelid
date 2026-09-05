@@ -1013,23 +1013,34 @@ pub(crate) const SPEC50_GEOMETRY_DEFAULT: Spec50Geometry = Spec50Geometry {
     yfmt: 2,
 };
 
+/// Winner of `spec50_sweep_geometry_12b` on the 12B head (hidden 3840 = 60
+/// units per row, 15 superblocks): two rows per flat step share one activation
+/// fetch. K=8 19.1 ms vs 21.5 ms for `26b` on the 826 MB table (mini2);
+/// bit-exact against the reference on the full table at K=1,2,4,8.
+pub(crate) const SPEC50_GEOMETRY_12B: Spec50Geometry = Spec50Geometry {
+    name: "12b",
+    rows_per_sg: 8,
+    rows_per_step: 2,
+    sg_per_tg: 4,
+    flat: 1,
+    yfmt: 2,
+};
+
 /// Geometries selectable by name through `CAMELID_GEMMA4_SPEC50_GEOMETRY`.
-/// `12b` is the winner of `spec50_sweep_geometry_12b` on the 12B head
-/// (hidden 3840 = 60 units per row, 15 superblocks). The generic form
-/// `rb<R>-rg<G>-sg<S>-flat<F>-y<Y>` (for example `rb8-rg2-sg4-flat1-y2`) is
-/// accepted as well, so a sweep candidate can be driven in situ without a
-/// rebuild.
-const SPEC50_NAMED_GEOMETRIES: &[Spec50Geometry] = &[
-    SPEC50_GEOMETRY_DEFAULT,
-    Spec50Geometry {
-        name: "12b",
-        rows_per_sg: 8,
-        rows_per_step: 2,
-        sg_per_tg: 4,
-        flat: 1,
-        yfmt: 2,
-    },
-];
+/// The generic form `rb<R>-rg<G>-sg<S>-flat<F>-y<Y>` (for example
+/// `rb8-rg2-sg4-flat1-y2`) is accepted as well, so a sweep candidate can be
+/// driven in situ without a rebuild.
+const SPEC50_NAMED_GEOMETRIES: &[Spec50Geometry] = &[SPEC50_GEOMETRY_DEFAULT, SPEC50_GEOMETRY_12B];
+
+/// The geometry the default path uses for a head of `hidden` width: `12b` for
+/// the 3,840-wide Gemma 4 12B head, the established `26b` for everything else.
+pub(crate) fn spec50_default_geometry_for(hidden: usize) -> Spec50Geometry {
+    if hidden == 3840 {
+        SPEC50_GEOMETRY_12B
+    } else {
+        SPEC50_GEOMETRY_DEFAULT
+    }
+}
 
 impl Spec50Geometry {
     /// Vocab rows one threadgroup covers.
@@ -1109,40 +1120,29 @@ impl Spec50Geometry {
     }
 }
 
-/// The geometry the process compiles the SPEC50 head with: the default unless
-/// `CAMELID_GEMMA4_SPEC50_GEOMETRY` names an admitted one. Read once; the
-/// pipelines are compiled once, so a later change of the variable is ignored.
-pub(crate) fn spec50_selected_geometry() -> Spec50Geometry {
-    static SELECTED: OnceLock<Spec50Geometry> = OnceLock::new();
+/// `CAMELID_GEMMA4_SPEC50_GEOMETRY`, parsed once: `Some` when it names an
+/// admitted geometry, which then overrides the width-keyed default everywhere
+/// (`26b` restores the pre-sweep geometry on the 12B head for an A/B).
+fn spec50_env_geometry() -> Option<Spec50Geometry> {
+    static SELECTED: OnceLock<Option<Spec50Geometry>> = OnceLock::new();
     *SELECTED.get_or_init(|| {
-        let Some(spec) = std::env::var("CAMELID_GEMMA4_SPEC50_GEOMETRY")
+        let spec = std::env::var("CAMELID_GEMMA4_SPEC50_GEOMETRY")
             .ok()
-            .filter(|spec| !spec.trim().is_empty())
-        else {
-            return SPEC50_GEOMETRY_DEFAULT;
-        };
-        match Spec50Geometry::parse(&spec) {
-            Some(geometry) => {
-                eprintln!(
-                    "[metal] spec50 head geometry {:?}: rb{} rg{} sg{} flat{} y{}",
-                    geometry.name,
-                    geometry.rows_per_sg,
-                    geometry.rows_per_step,
-                    geometry.sg_per_tg,
-                    geometry.flat,
-                    geometry.yfmt,
-                );
-                geometry
-            }
-            None => {
-                eprintln!(
-                    "[metal] CAMELID_GEMMA4_SPEC50_GEOMETRY={spec:?} is not admitted; keeping {:?}",
-                    SPEC50_GEOMETRY_DEFAULT.name
-                );
-                SPEC50_GEOMETRY_DEFAULT
-            }
+            .filter(|spec| !spec.trim().is_empty())?;
+        let parsed = Spec50Geometry::parse(&spec);
+        if parsed.is_none() {
+            eprintln!(
+                "[metal] CAMELID_GEMMA4_SPEC50_GEOMETRY={spec:?} is not admitted; keeping the width default"
+            );
         }
+        parsed
     })
+}
+
+/// The geometry a head of `hidden` width runs with: the environment override
+/// when set, else [`spec50_default_geometry_for`].
+pub(crate) fn spec50_selected_geometry_for(hidden: usize) -> Spec50Geometry {
+    spec50_env_geometry().unwrap_or_else(|| spec50_default_geometry_for(hidden))
 }
 
 /// Compiled pipelines for the speculative Q6_K tied head.
@@ -1157,67 +1157,99 @@ pub(crate) struct Spec50HeadKernels {
     argmax: ComputePipelineState,
 }
 
-static SPEC50_HEAD_KERNELS: OnceLock<Option<Spec50HeadKernels>> = OnceLock::new();
+/// One compiled pipeline set per geometry, kept for the life of the process
+/// (a failed compile is remembered too, so the diagnostic prints once).
+static SPEC50_HEAD_KERNELS: OnceLock<Mutex<Vec<(Spec50Geometry, Option<&'static Spec50HeadKernels>)>>> =
+    OnceLock::new();
 
-/// Compile (once) the speculative Q6_K head library. Returns `None` and prints
-/// the compiler diagnostic on failure so the caller can keep the existing lane.
+/// The pipelines for a head of `hidden` width (see
+/// [`spec50_selected_geometry_for`]). This is the production accessor.
+pub(crate) fn spec50_head_kernels_for(hidden: usize) -> Option<&'static Spec50HeadKernels> {
+    spec50_head_kernels_with(spec50_selected_geometry_for(hidden))
+}
+
+/// The pipelines of the established `26b` geometry (or the environment
+/// override): the accessor for callers that do not know their head width.
 pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
-    SPEC50_HEAD_KERNELS
-        .get_or_init(|| {
-            let device = Device::system_default()?;
-            let geometry = spec50_selected_geometry();
-            // Same options as STRICT_Q8K_SHADER, which owns the kernels this
-            // replaces: fast math off, so the surviving float expressions and
-            // the softcap `tanh` compile identically.
-            let options = CompileOptions::new();
-            options.set_fast_math_enabled(false);
-            let source = format!("{}{SPEC50_HEAD_SHADER}", geometry.shader_defines());
-            let library = device
-                .new_library_with_source(&source, &options)
-                .map_err(|err| eprintln!("[metal] SPEC50_HEAD_SHADER compile failed: {err}"))
-                .ok()?;
-            let pipeline = |name: &str| -> Option<ComputePipelineState> {
-                let function = library
-                    .get_function(name, None)
-                    .map_err(|err| eprintln!("[metal] spec50 missing {name}: {err}"))
-                    .ok()?;
-                device
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(|err| eprintln!("[metal] spec50 pipeline {name}: {err}"))
-                    .ok()
-            };
-            let mut batch = Vec::with_capacity(8);
-            for k in 1..=8 {
-                batch.push(pipeline(&format!("q6k_spec50_batch_k{k}"))?);
-            }
-            let batch: [ComputePipelineState; 8] = batch.try_into().ok()?;
-            // The lane -> unit partition this kernel inherits is only correct on
-            // a 32-wide simdgroup, exactly like `admitted_32_lane_pipeline`.
-            if batch.iter().any(|p| p.thread_execution_width() != 32)
-                || batch.iter().any(|p| {
-                    p.max_total_threads_per_threadgroup() < geometry.threads_per_tg() as u64
-                })
-            {
-                eprintln!("[metal] spec50 head: simd width or threadgroup size not admitted");
-                return None;
-            }
-            let expand = pipeline(geometry.expand_kernel())?;
-            let argmax = pipeline("q6k_spec50_argmax_rows")?;
-            if argmax.max_total_threads_per_threadgroup() < 1024 {
-                eprintln!("[metal] spec50 head: argmax threadgroup < 1024");
-                return None;
-            }
-            let queue = device.new_command_queue();
-            Some(Spec50HeadKernels {
-                device,
-                queue,
-                geometry,
-                batch,
-                expand,
-                argmax,
-            })
-        })
-        .as_ref()
+    spec50_head_kernels_with(spec50_env_geometry().unwrap_or(SPEC50_GEOMETRY_DEFAULT))
+}
+
+/// Compile (once per geometry) the speculative Q6_K head library. Returns
+/// `None` and prints the compiler diagnostic on failure so the caller can keep
+/// the existing lane.
+pub(crate) fn spec50_head_kernels_with(geometry: Spec50Geometry) -> Option<&'static Spec50HeadKernels> {
+    let cache = SPEC50_HEAD_KERNELS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut cache = cache.lock().ok()?;
+    if let Some((_, kernels)) = cache.iter().find(|(cached, _)| *cached == geometry) {
+        return *kernels;
+    }
+    let kernels = compile_spec50_head_kernels(geometry)
+        .map(|kernels| &*Box::leak(Box::new(kernels)));
+    cache.push((geometry, kernels));
+    kernels
+}
+
+fn compile_spec50_head_kernels(geometry: Spec50Geometry) -> Option<Spec50HeadKernels> {
+    let device = Device::system_default()?;
+    eprintln!(
+        "[metal] spec50 head geometry {:?}: rb{} rg{} sg{} flat{} y{}",
+        geometry.name,
+        geometry.rows_per_sg,
+        geometry.rows_per_step,
+        geometry.sg_per_tg,
+        geometry.flat,
+        geometry.yfmt,
+    );
+    // Same options as STRICT_Q8K_SHADER, which owns the kernels this
+    // replaces: fast math off, so the surviving float expressions and
+    // the softcap `tanh` compile identically.
+    let options = CompileOptions::new();
+    options.set_fast_math_enabled(false);
+    let source = format!("{}{SPEC50_HEAD_SHADER}", geometry.shader_defines());
+    let library = device
+        .new_library_with_source(&source, &options)
+        .map_err(|err| eprintln!("[metal] SPEC50_HEAD_SHADER compile failed: {err}"))
+        .ok()?;
+    let pipeline = |name: &str| -> Option<ComputePipelineState> {
+        let function = library
+            .get_function(name, None)
+            .map_err(|err| eprintln!("[metal] spec50 missing {name}: {err}"))
+            .ok()?;
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|err| eprintln!("[metal] spec50 pipeline {name}: {err}"))
+            .ok()
+    };
+    let mut batch = Vec::with_capacity(8);
+    for k in 1..=8 {
+        batch.push(pipeline(&format!("q6k_spec50_batch_k{k}"))?);
+    }
+    let batch: [ComputePipelineState; 8] = batch.try_into().ok()?;
+    // The lane -> unit partition this kernel inherits is only correct on
+    // a 32-wide simdgroup, exactly like `admitted_32_lane_pipeline`.
+    if batch.iter().any(|p| p.thread_execution_width() != 32)
+        || batch
+            .iter()
+            .any(|p| p.max_total_threads_per_threadgroup() < geometry.threads_per_tg() as u64)
+    {
+        eprintln!("[metal] spec50 head: simd width or threadgroup size not admitted");
+        return None;
+    }
+    let expand = pipeline(geometry.expand_kernel())?;
+    let argmax = pipeline("q6k_spec50_argmax_rows")?;
+    if argmax.max_total_threads_per_threadgroup() < 1024 {
+        eprintln!("[metal] spec50 head: argmax threadgroup < 1024");
+        return None;
+    }
+    let queue = device.new_command_queue();
+    Some(Spec50HeadKernels {
+        device,
+        queue,
+        geometry,
+        batch,
+        expand,
+        argmax,
+    })
 }
 
 /// Bytes the integrator must allocate for the one new buffer, `activation_perm`:
@@ -1742,7 +1774,9 @@ mod tests {
         const ROWS: usize = 2051;
 
         let refs = reference_kernels();
-        let kernels = spec50_head_kernels().expect("spec50 pipelines");
+        // The production accessor: the 12B width default (or the env override).
+        let kernels = spec50_head_kernels_for(HIDDEN_12B).expect("spec50 pipelines");
+        eprintln!("[spec50] 12B geometry under test: {:?}", kernels.geometry.name);
         let mut rng = Rng(0x12b0_3840_2621_4400);
         let weights = build_weights_for(&mut rng, ROWS, N_SB_12B);
         let (scales, quants) = build_activations_for(&mut rng, 8, HIDDEN_12B, N_SB_12B);
@@ -2339,7 +2373,7 @@ mod tests {
         const ROWS: usize = 262_144;
         const REPS: usize = 20;
         let refs = reference_kernels();
-        let kernels = spec50_head_kernels().expect("spec50 pipelines");
+        let kernels = spec50_head_kernels_for(HIDDEN_12B).expect("spec50 pipelines");
         let bytes = ROWS * N_SB_12B * Q6K_WIRE;
         let wbuf = shared(&refs.device, bytes);
         {
@@ -2446,7 +2480,11 @@ mod tests {
         assert_eq!(Spec50Geometry::parse(" 26B "), Some(SPEC50_GEOMETRY_DEFAULT));
         let twelve = Spec50Geometry::parse("12b").expect("12b is named");
         assert!(twelve.admitted());
-        assert_eq!(twelve.name, "12b");
+        assert_eq!(twelve, SPEC50_GEOMETRY_12B);
+        // Width-keyed defaults: only the 3,840-wide 12B head moves to `12b`.
+        assert_eq!(spec50_default_geometry_for(3840), SPEC50_GEOMETRY_12B);
+        assert_eq!(spec50_default_geometry_for(2816), SPEC50_GEOMETRY_DEFAULT);
+        assert_eq!(spec50_default_geometry_for(0), SPEC50_GEOMETRY_DEFAULT);
         let custom = Spec50Geometry::parse("rb8-rg2-sg4-flat1-y2").expect("generic form");
         assert_eq!(
             custom,

@@ -17700,7 +17700,7 @@ impl Gemma4Q6KHead {
             ..Gemma4Spec50HeadTiming::default()
         };
         let n_superblocks = state.hidden / 256;
-        let kernels = spec50_head::spec50_head_kernels()?;
+        let kernels = spec50_head::spec50_head_kernels_for(state.hidden)?;
         if state.batch.is_none() {
             let shared = |bytes: usize| {
                 kernels.device.new_buffer(
