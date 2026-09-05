@@ -5405,6 +5405,7 @@ async fn main() -> anyhow::Result<()> {
                         "CAMELID_GEMMA4_MTP_W16_WARMUP8": std::env::var("CAMELID_GEMMA4_MTP_W16_WARMUP8").ok(),
                         "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16": std::env::var("CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16").ok(),
                         "CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL": std::env::var("CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL").ok(),
+                        "CAMELID_GEMMA4_MTP12_DENSE_BF16": std::env::var("CAMELID_GEMMA4_MTP12_DENSE_BF16").ok(),
                         "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
                         "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
                         "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),

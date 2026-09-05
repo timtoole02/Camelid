@@ -6,6 +6,8 @@
 //! CPU/device parity oracles beside a scoped one-command K<=15 device
 //! chain.  Target verification, acceptance, and rollback remain outside this
 //! module, so none of these assistant paths changes target-authoritative output.
+//! `CAMELID_GEMMA4_MTP12_DENSE_BF16=1` additionally retains the original BF16
+//! dense matrices and uses them for assistant projections; its tied head stays Q4.
 
 use std::{
     collections::BTreeMap,
@@ -25,6 +27,8 @@ use crate::{wire_mmap::GgufWireMmap, BackendError, Result};
 
 #[path = "gemma4_mtp12_shortlist.rs"]
 mod shortlist;
+#[path = "gemma4_mtp12_bf16.rs"]
+mod dense_bf16;
 
 pub const GEMMA4_12B_MTP_ASSISTANT_SHA256: &str =
     "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6";
@@ -1633,6 +1637,9 @@ pub struct Gemma4Mtp12ResidentLedger {
     pub source_sha256_verified: bool,
     pub source_mapping_retained: bool,
     pub packed_q4_matrix_bytes: u64,
+    pub dense_bf16_enabled: bool,
+    pub dense_bf16_matrix_bytes: u64,
+    pub dense_bf16_upload_us: u128,
     pub decoded_norm_bytes: u64,
     pub fixed_scratch_bytes: u64,
     pub quantize_us: u128,
@@ -1941,8 +1948,11 @@ fn validate_device_chain_positions(
 
 /// Fully packed 12B assistant.  No target model, pager, MoE state, or verifier
 /// is retained here; all 23 matrices live in one bounded Q4_0 Metal buffer.
+/// The opt-in BF16 dense experiment owns a second buffer for the 22 dense
+/// matrices, retaining the Q4 tied head and the established activation rounding.
 pub struct Gemma4Mtp12AssistantMetal {
     shortlist: Option<Mtp12Shortlist>,
+    dense_bf16: Option<dense_bf16::Bf16Dense>,
     packed_q4: Buffer,
     layout: Q4Layout,
     pipelines: Mtp12Pipelines,
@@ -2419,6 +2429,7 @@ impl Gemma4Mtp12AssistantMetal {
     /// before any matrix reaches the resident Q4_0 pack.
     pub fn load(path: &Path) -> Result<Self> {
         let load_started = Instant::now();
+        let dense_bf16_enabled = dense_bf16::enabled()?;
         validate_official_config(path)?;
         let mapping = GgufWireMmap::map(path)?;
         mapping.advise_sequential();
@@ -2503,13 +2514,19 @@ impl Gemma4Mtp12AssistantMetal {
             pre_projection,
             post_projection,
         )?;
+        let dense_bf16 = dense_bf16_enabled.then(|| dense_bf16::Bf16Dense::load(
+            device, &mapping,
+            layout.pairs(embedding, &source_layers, pre_projection, post_projection),
+            layout.embedding,
+        )).transpose()?;
         // Every runtime matrix and norm now owns independent Metal storage.
         // Releasing the source is part of the 16 GB admission contract.
         drop(mapping);
 
         let pipeline_started = Instant::now();
         let pipelines = Mtp12Pipelines::new(device)?;
-        let pipeline_compile_us = pipeline_started.elapsed().as_micros();
+        let pipeline_compile_us = pipeline_started.elapsed().as_micros()
+            + dense_bf16.as_ref().map_or(0, |dense| dense.pipeline_compile_us);
         let scratch = Mtp12Scratch::new(device);
         let shortlist = Mtp12Shortlist::from_env(device)?;
         let shortlist_bytes = shortlist.as_ref().map_or(0, Mtp12Shortlist::byte_len);
@@ -2518,6 +2535,9 @@ impl Gemma4Mtp12AssistantMetal {
             source_sha256_verified: true,
             source_mapping_retained: false,
             packed_q4_matrix_bytes: packed_q4.length(),
+            dense_bf16_enabled,
+            dense_bf16_matrix_bytes: dense_bf16.as_ref().map_or(0, |dense| dense.byte_len()),
+            dense_bf16_upload_us: dense_bf16.as_ref().map_or(0, |dense| dense.upload_us),
             decoded_norm_bytes,
             fixed_scratch_bytes: scratch.byte_len() + shortlist_bytes,
             quantize_us,
@@ -2530,6 +2550,7 @@ impl Gemma4Mtp12AssistantMetal {
             .map_err(|_| invalid("internal resident layer table is not four layers"))?;
         Ok(Self {
             shortlist,
+            dense_bf16,
             packed_q4,
             layout,
             pipelines,
@@ -2624,10 +2645,8 @@ impl Gemma4Mtp12AssistantMetal {
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         let encode_started = Instant::now();
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.pre_input,
             &self.scratch.hidden,
             self.layout.pre_projection,
@@ -2684,10 +2703,8 @@ impl Gemma4Mtp12AssistantMetal {
             ASSISTANT_HIDDEN,
             1,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.final_normalized,
             &self.scratch.recurrent_hidden,
             self.layout.post_projection,
@@ -2860,10 +2877,8 @@ impl Gemma4Mtp12AssistantMetal {
             target_q6k_embedding,
             &self.scratch.pre_input,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.pre_input,
             &self.scratch.hidden,
             self.layout.pre_projection,
@@ -2924,10 +2939,8 @@ impl Gemma4Mtp12AssistantMetal {
             ASSISTANT_HIDDEN,
             1,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.final_normalized,
             &self.scratch.recurrent_hidden,
             self.layout.post_projection,
@@ -3141,10 +3154,8 @@ impl Gemma4Mtp12AssistantMetal {
                 recurrent_byte_offset,
                 &self.scratch.pre_input,
             );
-            encode_q4_gemv(
+            self.encode_dense_gemv(
                 encoder,
-                &self.pipelines.q4_gemv,
-                &self.packed_q4,
                 &self.scratch.pre_input,
                 &self.scratch.hidden,
                 self.layout.pre_projection,
@@ -3220,10 +3231,8 @@ impl Gemma4Mtp12AssistantMetal {
                     ASSISTANT_HIDDEN,
                 );
             }
-            encode_q4_gemv(
+            self.encode_dense_gemv(
                 encoder,
-                &self.pipelines.q4_gemv,
-                &self.packed_q4,
                 &self.scratch.final_normalized,
                 &self.scratch.recurrent_hidden,
                 self.layout.post_projection,
@@ -3323,7 +3332,8 @@ impl Gemma4Mtp12AssistantMetal {
             command_buffer_waits: 1,
             target_q6k_table_alias_bytes: target_q6k_embedding.wire.byte_len,
             target_kv_alias_bytes,
-            assistant_matrix_read_bytes: FULL_Q4_MATRIX_BYTES
+            assistant_matrix_read_bytes: self.dense_bf16.as_ref()
+                .map_or(FULL_Q4_MATRIX_BYTES, |dense| self.layout.embedding.byte_len + dense.byte_len())
                 .checked_mul(draft_k_u64)
                 .ok_or_else(|| invalid("resident-chain assistant matrix ledger overflow"))?,
             target_kv_read_bytes: total_target_kv_read_bytes,
@@ -3446,6 +3456,22 @@ impl Gemma4Mtp12AssistantMetal {
         Ok(proposal)
     }
 
+    fn encode_dense_gemv(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input: &Buffer,
+        output: &Buffer,
+        matrix: Q4TensorRef,
+        round_output_bf16: bool,
+    ) {
+        if let Some(dense) = &self.dense_bf16 {
+            dense.encode(encoder, input, output, matrix, round_output_bf16);
+        } else {
+            encode_q4_gemv(encoder, &self.pipelines.q4_gemv, &self.packed_q4,
+                input, output, matrix, round_output_bf16);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_layer_k1(
         &self,
@@ -3513,10 +3539,8 @@ impl Gemma4Mtp12AssistantMetal {
             ASSISTANT_HIDDEN,
             1,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.normed,
             &self.scratch.query,
             matrices.q,
@@ -3557,10 +3581,8 @@ impl Gemma4Mtp12AssistantMetal {
             compact_base,
             position_count,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.context,
             &self.scratch.attention_projection,
             matrices.o,
@@ -3592,19 +3614,15 @@ impl Gemma4Mtp12AssistantMetal {
             ASSISTANT_HIDDEN,
             1,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.normed,
             &self.scratch.gate,
             matrices.gate,
             true,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.normed,
             &self.scratch.up,
             matrices.up,
@@ -3618,10 +3636,8 @@ impl Gemma4Mtp12AssistantMetal {
             &self.scratch.gated,
             FFN_HIDDEN,
         );
-        encode_q4_gemv(
+        self.encode_dense_gemv(
             encoder,
-            &self.pipelines.q4_gemv,
-            &self.packed_q4,
             &self.scratch.gated,
             &self.scratch.down,
             matrices.down,
@@ -4465,6 +4481,7 @@ mod tests {
         };
         Gemma4Mtp12AssistantMetal {
             shortlist: None,
+            dense_bf16: None,
             packed_q4,
             layout,
             pipelines,

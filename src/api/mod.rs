@@ -11376,6 +11376,8 @@ fn gemma4_mtp12_diagnostics(
             "alpha": stats.alpha(),
             "target_model_sha256": generation.target_model_sha256,
             "assistant_model_sha256": generation.assistant_model_sha256,
+            "assistant_dense_bf16": generation.assistant_resident_ledger.dense_bf16_enabled,
+            "assistant_dense_bf16_matrix_bytes": generation.assistant_resident_ledger.dense_bf16_matrix_bytes,
             "selector": stats.width_schedule.selector,
             "width_schedule": &stats.width_schedule,
         }
