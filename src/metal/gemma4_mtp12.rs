@@ -930,6 +930,194 @@ kernel void mtp12_q4_0_gemv_x4(
     }
 }
 
+// One 32-thread simdgroup per threadgroup walking `rows_per_group`
+// consecutive rows (CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4=2 for cols <= 1024,
+// =3 for every shape).  The lane->block map of mtp12_q4_0_gemv is
+// row-independent, so lane l's 32 input floats for block l are loaded ONCE
+// into registers and reused for every row the simdgroup folds; the
+// established kernel re-reads the whole input vector from device memory for
+// every row (32 input loads per 18-byte weight block).  Blocks beyond the
+// first 32 (cols > 1024) read their inputs in place exactly as before, and
+// the next row's first block is prefetched into registers while the current
+// row is folded.  The per-row program - block order, the accumulation
+// statement, the shuffle fold and the lane-0 rounding - is verbatim, so the
+// output bits match mtp12_q4_0_gemv.
+kernel void mtp12_q4_0_gemv_staged(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    constant uint& rows_per_group [[buffer(7)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint first_row = tg * rows_per_group;
+    if (first_row >= rows) return;
+    const uint last_row = min(first_row + rows_per_group, rows);
+    const uint blocks_per_row = cols / 32u;
+    const bool owns_block = lane < blocks_per_row;
+    float x[32];
+    #pragma unroll
+    for (uint i = 0u; i < 32u; ++i) x[i] = 0.0f;
+    if (owns_block) {
+        const uint input_base = lane * 32u;
+        #pragma unroll
+        for (uint i = 0u; i < 32u; ++i) x[i] = input[input_base + i];
+    }
+    half next_d = half(0.0f);
+    uchar4 next_q0 = uchar4(0), next_q1 = uchar4(0), next_q2 = uchar4(0), next_q3 = uchar4(0);
+    if (owns_block) {
+        device const uchar* first = q4_weights + weight_byte_offset
+            + ulong(first_row) * ulong(blocks_per_row) * 18ul + ulong(lane) * 18ul;
+        next_d = *reinterpret_cast<device const half*>(first);
+        device const packed_uchar4* first_q4 =
+            reinterpret_cast<device const packed_uchar4*>(first + 2);
+        next_q0 = uchar4(first_q4[0]);
+        next_q1 = uchar4(first_q4[1]);
+        next_q2 = uchar4(first_q4[2]);
+        next_q3 = uchar4(first_q4[3]);
+    }
+    for (uint row = first_row; row < last_row; ++row) {
+        device const uchar* row_bytes = q4_weights + weight_byte_offset
+            + ulong(row) * ulong(blocks_per_row) * 18ul;
+        const float first_d = float(next_d);
+        const uchar4 first_q[4] = {next_q0, next_q1, next_q2, next_q3};
+        if (row + 1u < last_row && owns_block) {
+            device const uchar* next = row_bytes + ulong(blocks_per_row) * 18ul + ulong(lane) * 18ul;
+            next_d = *reinterpret_cast<device const half*>(next);
+            device const packed_uchar4* next_q4 =
+                reinterpret_cast<device const packed_uchar4*>(next + 2);
+            next_q0 = uchar4(next_q4[0]);
+            next_q1 = uchar4(next_q4[1]);
+            next_q2 = uchar4(next_q4[2]);
+            next_q3 = uchar4(next_q4[3]);
+        }
+        float partial = 0.0f;
+        if (owns_block) {
+            const float d = first_d;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = first_q[k];
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * x[offset]
+                  + float(int(packed.x >> 4) - 8) * x[16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * x[offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * x[17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * x[offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * x[18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * x[offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * x[19u + offset]);
+            }
+        }
+        for (uint block_index = lane + 32u; block_index < blocks_per_row; block_index += 32u) {
+            device const uchar* block = row_bytes + ulong(block_index) * 18ul;
+            const float d = float(*reinterpret_cast<device const half*>(block));
+            device const packed_uchar4* q4 =
+                reinterpret_cast<device const packed_uchar4*>(block + 2);
+            const uint input_base = block_index * 32u;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = uchar4(q4[k]);
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+                  + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+            }
+        }
+        partial += simd_shuffle_down(partial, ushort(16));
+        partial += simd_shuffle_down(partial, ushort(8));
+        partial += simd_shuffle_down(partial, ushort(4));
+        const float pair01 =
+            simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+        const float pair23 =
+            simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+        const float value = pair01 + pair23;
+        if (lane == 0u) {
+            output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+        }
+    }
+}
+
+// NOT BIT-IDENTICAL.  Each row is folded by `splits` simdgroups that each own
+// a DISJOINT contiguous range of the row's blocks; the per-simdgroup partials
+// are then summed in simdgroup order.  Every simdgroup runs the per-row
+// program of mtp12_q4_0_gemv verbatim over its own range (same lane->block
+// stride, same accumulation statement, same shuffle fold), but the row total
+// is (r0 + r1 [+ r2 + r3]) instead of one 32-lane fold over all blocks, so the
+// float addition order differs and the drafts it produces are NOT the
+// established drafts.  It exists only to measure whether the 1024-row shapes
+// are simdgroup-parallelism starved (CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4=4 for
+// two splits, =5 for four); it is excluded from the bit gates by construction
+// and must not ship without an acceptance re-measurement.
+kernel void mtp12_q4_0_gemv_split(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    constant uint& splits [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partials[4];
+    // `row` is threadgroup-uniform, so the whole group leaves together and no
+    // thread reaches the barrier alone.
+    if (row >= rows) return;
+    const uint blocks_per_row = cols / 32u;
+    device const uchar* row_bytes = q4_weights + weight_byte_offset
+        + ulong(row) * ulong(blocks_per_row) * 18ul;
+    const uint per_split = (blocks_per_row + splits - 1u) / splits;
+    const uint begin = sg * per_split;
+    const uint end = min(begin + per_split, blocks_per_row);
+    float partial = 0.0f;
+    for (uint block_index = begin + lane; block_index < end; block_index += 32u) {
+        device const uchar* block = row_bytes + ulong(block_index) * 18ul;
+        const float d = float(*reinterpret_cast<device const half*>(block));
+        device const packed_uchar4* q4 =
+            reinterpret_cast<device const packed_uchar4*>(block + 2);
+        const uint input_base = block_index * 32u;
+        #pragma unroll
+        for (uint k = 0u; k < 4u; ++k) {
+            const uchar4 packed = uchar4(q4[k]);
+            const uint offset = k * 4u;
+            partial += d * (
+                float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+              + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+              + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+              + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+              + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+              + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+              + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+              + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+        }
+    }
+    partial += simd_shuffle_down(partial, ushort(16));
+    partial += simd_shuffle_down(partial, ushort(8));
+    partial += simd_shuffle_down(partial, ushort(4));
+    const float pair01 =
+        simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+    const float pair23 =
+        simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+    if (lane == 0u) partials[sg] = pair01 + pair23;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane == 0u) {
+        float value = partials[0];
+        for (uint split = 1u; split < splits; ++split) value += partials[split];
+        output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+    }
+}
+
 // Gate row, up row and the GELU gate in one dispatch
 // (CAMELID_GEMMA4_MTP12_FUSE_GATEUP=1), x4 geometry.  The simdgroup computes
 // the gate row and then the up row with two independent copies of the
@@ -1349,6 +1537,144 @@ kernel void mtp12_q4_0_gemv_compact_local_prefetch(
             #pragma unroll
             for (uint k = 0u; k < 4u; ++k) {
                 const uchar4 packed = q[k];
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+                  + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+            }
+        }
+        partial += simd_shuffle_down(partial, ushort(16));
+        partial += simd_shuffle_down(partial, ushort(8));
+        partial += simd_shuffle_down(partial, ushort(4));
+        const float pair01 =
+            simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+        const float pair23 =
+            simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+        const float value = pair01 + pair23;
+        if (lane == 0u) {
+            output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+        }
+    }
+}
+
+// mtp12_q4_0_gemv_compact_local_prefetch with the lane's 32 input floats
+// for its first block staged in registers across the serial retained-row
+// loop (CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH=2).  The compaction, the row
+// prefetch, the lane->block map, the accumulation statement and the fold are
+// verbatim; only the input loads of block `lane` move out of the row loop
+// (blocks beyond the first, cols > 1024, still read their inputs in place).
+kernel void mtp12_q4_0_gemv_compact_local_staged(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    device const ushort4* token_clusters [[buffer(7)]],
+    device const uint* selected_clusters [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint ids[256];
+    threadgroup uint counts[8];
+    threadgroup uint offsets[8];
+    threadgroup uint total;
+    const uint candidate = group * 256u + tid;
+    uint keep = 0u;
+    if (candidate < rows) {
+        const ushort4 c = token_clusters[candidate];
+        keep = uint(selected_clusters[c.x] || selected_clusters[c.y] || selected_clusters[c.z]);
+        output[candidate] = -INFINITY;
+    }
+    const uint within_sg = simd_prefix_exclusive_sum(keep);
+    const uint sg_count = simd_sum(keep);
+    if (lane == 0u) counts[sg] = sg_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        const uint n = lane < 8u ? counts[lane] : 0u;
+        const uint preceding = simd_prefix_exclusive_sum(n);
+        const uint sum = simd_sum(n);
+        if (lane < 8u) offsets[lane] = preceding;
+        if (lane == 0u) total = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (keep != 0u) ids[offsets[sg] + within_sg] = candidate;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    const uint blocks_per_row = cols / 32u;
+    const bool owns_block = lane < blocks_per_row;
+    float x[32];
+    #pragma unroll
+    for (uint i = 0u; i < 32u; ++i) x[i] = 0.0f;
+    if (owns_block && sg < total) {
+        const uint input_base = lane * 32u;
+        #pragma unroll
+        for (uint i = 0u; i < 32u; ++i) x[i] = input[input_base + i];
+    }
+    half next_d = half(0.0f);
+    uchar4 next_q0 = uchar4(0), next_q1 = uchar4(0), next_q2 = uchar4(0), next_q3 = uchar4(0);
+    if (sg < total && owns_block) {
+        device const uchar* first = q4_weights + weight_byte_offset
+            + ulong(ids[sg]) * ulong(blocks_per_row) * 18ul + ulong(lane) * 18ul;
+        next_d = *reinterpret_cast<device const half*>(first);
+        device const packed_uchar4* first_q4 =
+            reinterpret_cast<device const packed_uchar4*>(first + 2);
+        next_q0 = uchar4(first_q4[0]);
+        next_q1 = uchar4(first_q4[1]);
+        next_q2 = uchar4(first_q4[2]);
+        next_q3 = uchar4(first_q4[3]);
+    }
+    for (uint index = sg; index < total; index += 8u) {
+        const uint row = ids[index];
+        device const uchar* row_bytes = q4_weights + weight_byte_offset
+            + ulong(row) * ulong(blocks_per_row) * 18ul;
+        const float first_d = float(next_d);
+        const uchar4 first_q[4] = {next_q0, next_q1, next_q2, next_q3};
+        if (index + 8u < total && owns_block) {
+            device const uchar* next = q4_weights + weight_byte_offset
+                + ulong(ids[index + 8u]) * ulong(blocks_per_row) * 18ul + ulong(lane) * 18ul;
+            next_d = *reinterpret_cast<device const half*>(next);
+            device const packed_uchar4* next_q4 =
+                reinterpret_cast<device const packed_uchar4*>(next + 2);
+            next_q0 = uchar4(next_q4[0]);
+            next_q1 = uchar4(next_q4[1]);
+            next_q2 = uchar4(next_q4[2]);
+            next_q3 = uchar4(next_q4[3]);
+        }
+        float partial = 0.0f;
+        if (owns_block) {
+            const float d = first_d;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = first_q[k];
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * x[offset]
+                  + float(int(packed.x >> 4) - 8) * x[16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * x[offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * x[17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * x[offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * x[18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * x[offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * x[19u + offset]);
+            }
+        }
+        for (uint block_index = lane + 32u; block_index < blocks_per_row; block_index += 32u) {
+            device const uchar* block = row_bytes + ulong(block_index) * 18ul;
+            const float d = float(*reinterpret_cast<device const half*>(block));
+            device const packed_uchar4* q4 =
+                reinterpret_cast<device const packed_uchar4*>(block + 2);
+            const uint input_base = block_index * 32u;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = uchar4(q4[k]);
                 const uint offset = k * 4u;
                 partial += d * (
                     float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
@@ -1943,6 +2269,172 @@ kernel void mtp12_attention_softmax_context_v2(
     output[output_base + d + 3u] = mtp12_round_bf16(folded.w);
 }
 
+// Per-head softmax statistics (CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX=2/3):
+// the mtp12_attention_softmax max and exp-sum passes verbatim (lane-strided
+// order, simd_max / simd_sum) computed ONCE per head by a 32-lane group and
+// written as stats[head * 2] = max, stats[head * 2 + 1] = denominator.  The
+// scores stay raw; the stats-fed context kernels below turn them into the
+// softmax kernel's probabilities with round(exp(s - max) / denominator), so
+// the (heads x dim-blocks) context threadgroups no longer redo the two passes
+// that mtp12_attention_softmax_context_v2 repeats in every threadgroup.
+kernel void mtp12_attention_softmax_stats(
+    device const float* scores [[buffer(0)]],
+    constant uint& n_heads [[buffer(1)]],
+    constant uint& position_count [[buffer(2)]],
+    device float* stats [[buffer(3)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= n_heads) return;
+    const uint base = head * position_count;
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32u) {
+        local_max = max(local_max, scores[base + p]);
+    }
+    const float max_score = simd_max(local_max);
+    float local_sum = 0.0f;
+    for (uint p = lane; p < position_count; p += 32u) {
+        const float value = exp(scores[base + p] - max_score);
+        local_sum += value;
+    }
+    const float denominator = simd_sum(local_sum);
+    if (lane == 0u) {
+        stats[head * 2u] = max_score;
+        stats[head * 2u + 1u] = denominator;
+    }
+}
+
+// The context phase of mtp12_attention_softmax_context_v2 with (max,
+// denominator) read from the stats buffer instead of recomputed per
+// threadgroup.  Probabilities are produced once per 32-position chunk (lane l
+// computes position p+l with the softmax kernel's expression) and broadcast
+// with simd_shuffle; DEPTH positions of loads are issued ahead of their
+// accumulation (16 as in the fused kernel, 4 as in mtp12_attention_context_v2)
+// and the per-parity partials accumulate in position order, so the output
+// bits match softmax + context_v2 at either depth.
+template <uint DEPTH>
+inline void mtp12_context_v2_from_stats(
+    device const float* values,
+    device const float* scores,
+    device float* output,
+    uint n_heads,
+    uint head_dim,
+    uint position_count,
+    uint group,
+    uint position_stride,
+    uint kv_head_stride,
+    uint kv_base_offset,
+    uint compact_base,
+    uint physical_logical_k,
+    device const float* stats,
+    uint2 tg,
+    uint lane) {
+    const uint head = tg.x;
+    if (head >= n_heads || compact_base + position_count != physical_logical_k) return;
+    const uint score_base = head * position_count;
+    const float max_score = stats[head * 2u];
+    const float denominator = stats[head * 2u + 1u];
+    // Lanes past the head stay resident (they take part in every shuffle)
+    // but read dim 0 and never write.
+    const uint lane_dim = tg.y * 128u + lane * 4u;
+    const bool active = lane_dim + 4u <= head_dim;
+    const uint d = active ? lane_dim : 0u;
+    const uint kv_head = head / group;
+    const uint output_base = head * head_dim;
+    const uint kv_base = kv_base_offset + kv_head * kv_head_stride + d;
+    const uint vector_end = physical_logical_k & ~3u;
+    float4 p0 = 0.0f;
+    float4 p1 = 0.0f;
+    float4 p2 = 0.0f;
+    float4 p3 = 0.0f;
+    uint p = 0u;
+    for (; p + 32u <= position_count; p += 32u) {
+        const float value = exp(scores[score_base + p + lane] - max_score);
+        const float e = mtp12_round_bf16(value / denominator);
+        #pragma unroll
+        for (uint c = 0u; c < 32u; c += DEPTH) {
+            float pr[DEPTH];
+            float4 v[DEPTH];
+            #pragma unroll
+            for (uint j = 0u; j < DEPTH; ++j) {
+                pr[j] = mtp12_round_bf16(simd_shuffle(e, ushort(c + j)));
+                v[j] = mtp12_load_bf16x4(values, kv_base + (p + c + j) * position_stride);
+            }
+            #pragma unroll
+            for (uint j = 0u; j < DEPTH; ++j) {
+                const float4 product = pr[j] * v[j];
+                mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + c + j, vector_end, product);
+            }
+        }
+    }
+    if (p < position_count) {
+        const uint remaining = position_count - p;
+        float e = 0.0f;
+        if (lane < remaining) {
+            const float value = exp(scores[score_base + p + lane] - max_score);
+            e = mtp12_round_bf16(value / denominator);
+        }
+        for (uint j = 0u; j < remaining; ++j) {
+            const float pr = mtp12_round_bf16(simd_shuffle(e, ushort(j)));
+            const float4 v = mtp12_load_bf16x4(values, kv_base + (p + j) * position_stride);
+            const float4 product = pr * v;
+            mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + j, vector_end, product);
+        }
+    }
+    if (!active) return;
+    const float4 folded = ((p0 + p1) + p2) + p3;
+    output[output_base + d] = mtp12_round_bf16(folded.x);
+    output[output_base + d + 1u] = mtp12_round_bf16(folded.y);
+    output[output_base + d + 2u] = mtp12_round_bf16(folded.z);
+    output[output_base + d + 3u] = mtp12_round_bf16(folded.w);
+}
+
+// CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX=2: stats pre-pass + 16-deep context.
+kernel void mtp12_attention_context_v2_stats16(
+    device const float* values [[buffer(0)]],
+    device const float* scores [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    constant uint& compact_base [[buffer(10)]],
+    constant uint& physical_logical_k [[buffer(11)]],
+    device const float* stats [[buffer(12)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    mtp12_context_v2_from_stats<16u>(
+        values, scores, output, n_heads, head_dim, position_count, group,
+        position_stride, kv_head_stride, kv_base_offset, compact_base,
+        physical_logical_k, stats, tg, lane);
+}
+
+// CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX=3: stats pre-pass + 4-deep context
+// (the mtp12_attention_context_v2 load depth).
+kernel void mtp12_attention_context_v2_stats4(
+    device const float* values [[buffer(0)]],
+    device const float* scores [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    constant uint& compact_base [[buffer(10)]],
+    constant uint& physical_logical_k [[buffer(11)]],
+    device const float* stats [[buffer(12)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    mtp12_context_v2_from_stats<4u>(
+        values, scores, output, n_heads, head_dim, position_count, group,
+        position_stride, kv_head_stride, kv_base_offset, compact_base,
+        physical_logical_k, stats, tg, lane);
+}
+
 kernel void mtp12_argmax(
     device const float* logits [[buffer(0)]],
     device uint* output_id [[buffer(1)]],
@@ -2110,16 +2602,28 @@ fn mtp12_dump_draft_queries_path() -> Option<&'static std::path::Path> {
 /// Independent draft-side fusion selectors for the W8 tree lane's assistant
 /// steps.  Each is read once per process and parsed strictly like
 /// `CAMELID_GEMMA4_MTP12_TREE_W8`: unset or `0` keeps the established kernel
-/// sequence byte-for-byte, `1` selects the fused / regeometried kernel, and
-/// anything else fails the assistant load.  Every fused kernel is
-/// order-preserving (see the shader notes), so the drafts do not change; the
-/// selectors exist so a bit mismatch can be bisected without a rebuild.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// sequence byte-for-byte, a listed nonzero level selects a fused /
+/// regeometried kernel, and anything else fails the assistant load.  Every
+/// fused kernel is order-preserving (see the shader notes), so the drafts do
+/// not change; the selectors exist so a bit mismatch can be bisected without
+/// a rebuild and so the tree-step bench can attribute time per kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Mtp12FuseFlags {
-    /// `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4`: `mtp12_q4_0_gemv_x4` for every dense
-    /// GEMV routed through [`Gemma4Mtp12AssistantMetal::encode_dense_gemv`]
-    /// (tree, resident chain and K=1 paths alike; never the BF16 dense route).
-    gemv_x4: bool,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4` for every dense GEMV routed through
+    /// [`Gemma4Mtp12AssistantMetal::encode_dense_gemv`] (tree, resident chain
+    /// and K=1 paths alike; never the BF16 dense route): `1` =
+    /// `mtp12_q4_0_gemv_x4` (four rows per 128-thread group), `2` =
+    /// `mtp12_q4_0_gemv_staged` (register-staged inputs, `gemv_staged_rows`
+    /// rows per simdgroup) for cols <= 1024 with the established kernel for
+    /// wider rows, `3` = staged for every shape.  Levels `4` and `5` select
+    /// `mtp12_q4_0_gemv_split` with two and four simdgroups per row: those two
+    /// fold each row in a different order and are therefore NOT bit-identical
+    /// - they are a measurement lane only, and enabling them changes the
+    /// drafts and invalidates the acceptance rate.
+    gemv_x4: u8,
+    /// `CAMELID_GEMMA4_MTP12_GEMV_STAGED_ROWS` (1..=64, default 4): rows each
+    /// simdgroup of `mtp12_q4_0_gemv_staged` walks.
+    gemv_staged_rows: u32,
     /// `CAMELID_GEMMA4_MTP12_FUSE_GATEUP`: gate + up + GELU in one dispatch on
     /// the tree path (skipped while the BF16 dense route is active).
     gate_up: bool,
@@ -2129,42 +2633,113 @@ struct Mtp12FuseFlags {
     /// `CAMELID_GEMMA4_MTP12_FUSE_QROPE`: per-head query norm + RoPE in one
     /// dispatch on the tree path.
     qrope: bool,
-    /// `CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX`: softmax folded into the V2
-    /// context kernel on the tree path.
-    softmax_ctx: bool,
-    /// `CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH`: row prefetch in the compact
-    /// shortlist head GEMV (tree and resident-chain draft heads).
-    head_prefetch: bool,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX` on the tree path: `1` = softmax
+    /// folded into the V2 context kernel (`mtp12_attention_softmax_context_v2`,
+    /// every context threadgroup recomputes max/denominator), `2` =
+    /// `mtp12_attention_softmax_stats` pre-pass + 16-deep stats-fed context,
+    /// `3` = the same pre-pass + 4-deep stats-fed context.
+    softmax_ctx: u8,
+    /// `CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH` for the compact shortlist head
+    /// GEMV (tree and resident-chain draft heads): `1` = row prefetch, `2` =
+    /// row prefetch + register-staged inputs.
+    head_prefetch: u8,
+}
+
+impl Default for Mtp12FuseFlags {
+    fn default() -> Self {
+        Self {
+            gemv_x4: 0,
+            gemv_staged_rows: MTP12_GEMV_STAGED_ROWS_DEFAULT,
+            gate_up: false,
+            norm: false,
+            qrope: false,
+            softmax_ctx: 0,
+            head_prefetch: 0,
+        }
+    }
 }
 
 const MTP12_FUSE_GEMV_X4_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4";
+const MTP12_GEMV_STAGED_ROWS_ENV: &str = "CAMELID_GEMMA4_MTP12_GEMV_STAGED_ROWS";
 const MTP12_FUSE_GATEUP_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_GATEUP";
 const MTP12_FUSE_NORM_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_NORM";
 const MTP12_FUSE_QROPE_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_QROPE";
 const MTP12_FUSE_SOFTMAX_CTX_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX";
 const MTP12_FUSE_HEAD_PREFETCH_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH";
+/// Highest listed `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4` level.  Levels 4 and 5
+/// select the deliberately NON-bit-identical split-block experiment.
+const MTP12_FUSE_GEMV_X4_MAX: u8 = 5;
+/// Lowest `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4` level that changes the drafts.
+const MTP12_FUSE_GEMV_X4_FIRST_INEXACT: u8 = 4;
+const MTP12_GEMV_STAGED_ROWS_DEFAULT: u32 = 4;
+const MTP12_GEMV_STAGED_ROWS_MAX: u32 = 64;
 
 fn mtp12_fuse_flag(name: &str, value: Option<&str>) -> std::result::Result<bool, String> {
+    Ok(mtp12_fuse_level(name, value, 1)? != 0)
+}
+
+/// Strict level selector: unset or `0` off, `1..=max` a listed variant (no
+/// whitespace, no leading zeros, no aliases).
+fn mtp12_fuse_level(name: &str, value: Option<&str>, max: u8) -> std::result::Result<u8, String> {
     match value {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => Err(format!("{name} must be exactly 0 or 1; got {other:?}")),
+        None => Ok(0),
+        Some(text) => {
+            let level = match text.as_bytes() {
+                [digit @ b'0'..=b'9'] => digit - b'0',
+                _ => 255,
+            };
+            if level <= max {
+                Ok(level)
+            } else {
+                Err(format!("{name} must be exactly 0..={max}; got {text:?}"))
+            }
+        }
+    }
+}
+
+fn mtp12_gemv_staged_rows(value: Option<&str>) -> std::result::Result<u32, String> {
+    match value {
+        None => Ok(MTP12_GEMV_STAGED_ROWS_DEFAULT),
+        Some(text) => text
+            .parse::<u32>()
+            .ok()
+            .filter(|rows| (1..=MTP12_GEMV_STAGED_ROWS_MAX).contains(rows) && rows.to_string() == text)
+            .ok_or_else(|| {
+                format!("{MTP12_GEMV_STAGED_ROWS_ENV} must be an integer in 1..={MTP12_GEMV_STAGED_ROWS_MAX}; got {text:?}")
+            }),
     }
 }
 
 fn mtp12_fuse_flags_from_env() -> std::result::Result<Mtp12FuseFlags, String> {
-    let read = |name: &str| match std::env::var(name) {
-        Ok(value) => mtp12_fuse_flag(name, Some(&value)),
-        Err(std::env::VarError::NotPresent) => mtp12_fuse_flag(name, None),
-        Err(error) => Err(format!("{name}: {error}")),
+    let read = |name: &str| -> std::result::Result<Option<String>, String> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(format!("{name}: {error}")),
+        }
     };
+    let level = |name: &str, max: u8| -> std::result::Result<u8, String> {
+        mtp12_fuse_level(name, read(name)?.as_deref(), max)
+    };
+    let flag = |name: &str| -> std::result::Result<bool, String> {
+        mtp12_fuse_flag(name, read(name)?.as_deref())
+    };
+    let gemv_x4 = level(MTP12_FUSE_GEMV_X4_ENV, MTP12_FUSE_GEMV_X4_MAX)?;
+    if gemv_x4 >= MTP12_FUSE_GEMV_X4_FIRST_INEXACT {
+        eprintln!(
+            "[gemma4-mtp12] WARNING: {MTP12_FUSE_GEMV_X4_ENV}={gemv_x4} selects the split-block \
+             GEMV experiment, which folds each row in a different order and does NOT produce the \
+             established drafts; acceptance must be re-measured."
+        );
+    }
     Ok(Mtp12FuseFlags {
-        gemv_x4: read(MTP12_FUSE_GEMV_X4_ENV)?,
-        gate_up: read(MTP12_FUSE_GATEUP_ENV)?,
-        norm: read(MTP12_FUSE_NORM_ENV)?,
-        qrope: read(MTP12_FUSE_QROPE_ENV)?,
-        softmax_ctx: read(MTP12_FUSE_SOFTMAX_CTX_ENV)?,
-        head_prefetch: read(MTP12_FUSE_HEAD_PREFETCH_ENV)?,
+        gemv_x4,
+        gemv_staged_rows: mtp12_gemv_staged_rows(read(MTP12_GEMV_STAGED_ROWS_ENV)?.as_deref())?,
+        gate_up: flag(MTP12_FUSE_GATEUP_ENV)?,
+        norm: flag(MTP12_FUSE_NORM_ENV)?,
+        qrope: flag(MTP12_FUSE_QROPE_ENV)?,
+        softmax_ctx: level(MTP12_FUSE_SOFTMAX_CTX_ENV, 3)?,
+        head_prefetch: level(MTP12_FUSE_HEAD_PREFETCH_ENV, 2)?,
     })
 }
 
@@ -2197,11 +2772,18 @@ struct Mtp12Pipelines {
     attention_context_v2: ComputePipelineState,
     /// Draft-side fused / regeometried kernels (`CAMELID_GEMMA4_MTP12_FUSE_*`).
     q4_gemv_x4: ComputePipelineState,
+    q4_gemv_staged: ComputePipelineState,
+    /// NOT bit-identical; bench/experiment only (`FUSE_GEMV_X4=4/5`).
+    q4_gemv_split: ComputePipelineState,
     q4_gemv_gate_up_gelu: ComputePipelineState,
     q4_gemv_shortlist_compact_prefetch: ComputePipelineState,
+    q4_gemv_shortlist_compact_staged: ComputePipelineState,
     norm_add_norm: ComputePipelineState,
     qnorm_rope: ComputePipelineState,
     attention_softmax_context_v2: ComputePipelineState,
+    attention_softmax_stats: ComputePipelineState,
+    attention_context_v2_stats16: ComputePipelineState,
+    attention_context_v2_stats4: ComputePipelineState,
     add: ComputePipelineState,
     add_scale: ComputePipelineState,
     gelu_mul: ComputePipelineState,
@@ -2244,13 +2826,21 @@ impl Mtp12Pipelines {
             attention_scores_v2: pipeline("mtp12_attention_scores_v2")?,
             attention_context_v2: pipeline("mtp12_attention_context_v2")?,
             q4_gemv_x4: pipeline("mtp12_q4_0_gemv_x4")?,
+            q4_gemv_staged: pipeline("mtp12_q4_0_gemv_staged")?,
+            q4_gemv_split: pipeline("mtp12_q4_0_gemv_split")?,
             q4_gemv_gate_up_gelu: pipeline("mtp12_q4_0_gemv_gate_up_gelu")?,
             q4_gemv_shortlist_compact_prefetch: pipeline(
                 "mtp12_q4_0_gemv_compact_local_prefetch",
             )?,
+            q4_gemv_shortlist_compact_staged: pipeline(
+                "mtp12_q4_0_gemv_compact_local_staged",
+            )?,
             norm_add_norm: pipeline("mtp12_norm_add_norm")?,
             qnorm_rope: pipeline("mtp12_qnorm_rope")?,
             attention_softmax_context_v2: pipeline("mtp12_attention_softmax_context_v2")?,
+            attention_softmax_stats: pipeline("mtp12_attention_softmax_stats")?,
+            attention_context_v2_stats16: pipeline("mtp12_attention_context_v2_stats16")?,
+            attention_context_v2_stats4: pipeline("mtp12_attention_context_v2_stats4")?,
             add: pipeline("mtp12_add_bf16")?,
             add_scale: pipeline("mtp12_add_scale_bf16")?,
             gelu_mul: pipeline("mtp12_gelu_mul")?,
@@ -2311,6 +2901,9 @@ struct Mtp12Scratch {
     local_sin: Buffer,
     full_cos: Buffer,
     full_sin: Buffer,
+    /// Per-head (max, denominator) of `mtp12_attention_softmax_stats`
+    /// (`CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX=2/3`).
+    attention_stats: Buffer,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -3063,6 +3656,7 @@ impl Mtp12Scratch {
             local_sin: f32s(MTP12_CHAIN_LOCAL_ROPE_ELEMENTS),
             full_cos: f32s(MTP12_CHAIN_FULL_ROPE_ELEMENTS),
             full_sin: f32s(MTP12_CHAIN_FULL_ROPE_ELEMENTS),
+            attention_stats: f32s(N_HEADS * 2),
         }
     }
 
@@ -3095,6 +3689,7 @@ impl Mtp12Scratch {
             &self.local_sin,
             &self.full_cos,
             &self.full_sin,
+            &self.attention_stats,
         ]
         .iter()
         .map(|buffer| buffer.length())
@@ -3738,10 +4333,10 @@ impl Gemma4Mtp12AssistantMetal {
             encoder.set_buffer(7, Some(&shortlist.token_clusters), 0);
             encoder.set_buffer(8, Some(&shortlist.selected), 0);
             if mtp12_shortlist_compact_enabled() {
-                let compact = if self.fuse.head_prefetch {
-                    &self.pipelines.q4_gemv_shortlist_compact_prefetch
-                } else {
-                    &self.pipelines.q4_gemv_shortlist_compact
+                let compact = match self.fuse.head_prefetch {
+                    0 => &self.pipelines.q4_gemv_shortlist_compact,
+                    1 => &self.pipelines.q4_gemv_shortlist_compact_prefetch,
+                    _ => &self.pipelines.q4_gemv_shortlist_compact_staged,
                 };
                 encode_q4_gemv_shortlist_compact(
                     encoder, compact,
@@ -4182,9 +4777,13 @@ impl Gemma4Mtp12AssistantMetal {
 
     /// One dense GEMV whose row vector lands at `output_byte_offset` inside
     /// `output`.  Routes to the BF16 dense experiment when it is active,
-    /// otherwise to `mtp12_q4_0_gemv_x4` under
-    /// `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4=1` and to the established
-    /// `mtp12_q4_0_gemv` by default; all three produce the same bits.
+    /// otherwise per `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4`: `1` =
+    /// `mtp12_q4_0_gemv_x4`, `2` = `mtp12_q4_0_gemv_staged` for rows of at
+    /// most 1024 columns (one block per lane) and the established kernel for
+    /// wider rows, `3` = staged for every shape, unset = the established
+    /// `mtp12_q4_0_gemv`; every one of those routes produces the same bits.
+    /// Levels `4`/`5` route to the NON-bit-identical `mtp12_q4_0_gemv_split`
+    /// (two/four simdgroups per row) and exist only for measurement.
     fn encode_dense_gemv_at_offset(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -4196,7 +4795,21 @@ impl Gemma4Mtp12AssistantMetal {
     ) {
         if let Some(dense) = &self.dense_bf16 {
             dense.encode(encoder, input, output, output_byte_offset, matrix, round_output_bf16);
-        } else if self.fuse.gemv_x4 {
+            return;
+        }
+        let staged = match self.fuse.gemv_x4 {
+            2 => matrix.cols <= 1024,
+            3 => true,
+            _ => false,
+        };
+        if let Some(splits) = mtp12_gemv_split_count(self.fuse.gemv_x4) {
+            encode_q4_gemv_split(encoder, &self.pipelines.q4_gemv_split, &self.packed_q4,
+                input, output, output_byte_offset, matrix, round_output_bf16, splits);
+        } else if staged {
+            encode_q4_gemv_staged(encoder, &self.pipelines.q4_gemv_staged, &self.packed_q4,
+                input, output, output_byte_offset, matrix, round_output_bf16,
+                self.fuse.gemv_staged_rows);
+        } else if self.fuse.gemv_x4 == 1 {
             encode_q4_gemv_at_offset(encoder, &self.pipelines.q4_gemv_x4, &self.packed_q4,
                 input, output, output_byte_offset, matrix, round_output_bf16, true);
         } else {
@@ -4502,7 +5115,8 @@ impl Gemma4Mtp12AssistantMetal {
             compact_base,
             position_count,
             mtp12_attention_v2_enabled() && covers,
-            fuse.softmax_ctx && covers,
+            if covers { fuse.softmax_ctx } else { 0 },
+            Some(&self.scratch.attention_stats),
         );
         self.encode_dense_gemv(
             encoder,
@@ -4790,6 +5404,98 @@ fn encode_q4_gemv_at_offset(
     );
 }
 
+/// `mtp12_q4_0_gemv_staged`: one 32-thread simdgroup per threadgroup folding
+/// `rows_per_group` consecutive rows with its input slice register-staged
+/// (`pipeline` must be that kernel); bit-identical to `mtp12_q4_0_gemv`.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_gemv_staged(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    output_byte_offset: u64,
+    matrix: Q4TensorRef,
+    round_output_bf16: bool,
+    rows_per_group: u32,
+) {
+    debug_assert!((1..=MTP12_GEMV_STAGED_ROWS_MAX).contains(&rows_per_group));
+    let round = u32::from(round_output_bf16);
+    let rows_per_group = rows_per_group.clamp(1, MTP12_GEMV_STAGED_ROWS_MAX);
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(weights), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), output_byte_offset);
+    encoder.set_bytes(3, 4, &matrix.cols as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &matrix.rows as *const u32 as *const c_void);
+    encoder.set_bytes(5, 8, &matrix.byte_offset as *const u64 as *const c_void);
+    encoder.set_bytes(6, 4, &round as *const u32 as *const c_void);
+    encoder.set_bytes(7, 4, &rows_per_group as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: (matrix.rows as u64).div_ceil(rows_per_group as u64),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Simdgroups per row for the split-block experiment, or `None` when the
+/// selector level is one of the bit-identical routes.
+fn mtp12_gemv_split_count(level: u8) -> Option<u32> {
+    match level {
+        4 => Some(2),
+        5 => Some(4),
+        _ => None,
+    }
+}
+
+/// `mtp12_q4_0_gemv_split`: `splits` simdgroups per row, each folding a
+/// disjoint contiguous block range, combined in simdgroup order.  NOT
+/// bit-identical to `mtp12_q4_0_gemv` - measurement lane only.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_gemv_split(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    output_byte_offset: u64,
+    matrix: Q4TensorRef,
+    round_output_bf16: bool,
+    splits: u32,
+) {
+    debug_assert!((2..=4).contains(&splits));
+    let round = u32::from(round_output_bf16);
+    let splits = splits.clamp(1, 4);
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(weights), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), output_byte_offset);
+    encoder.set_bytes(3, 4, &matrix.cols as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &matrix.rows as *const u32 as *const c_void);
+    encoder.set_bytes(5, 8, &matrix.byte_offset as *const u64 as *const c_void);
+    encoder.set_bytes(6, 4, &round as *const u32 as *const c_void);
+    encoder.set_bytes(7, 4, &splits as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: matrix.rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: (splits * 32) as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Fused gate/up GEMV + GELU gate (`mtp12_q4_0_gemv_gate_up_gelu`): `gate` and
 /// `up` share `input`, and `output[row]` receives what
 /// `mtp12_gelu_mul(gate_row, up_row)` would after both rows were BF16-rounded.
@@ -5004,15 +5710,21 @@ fn encode_attention_impl(
         compact_base,
         position_count,
         v2,
-        false,
+        0,
+        None,
     );
 }
 
-/// `fused_softmax_ctx` replaces the softmax + context pair with
-/// `mtp12_attention_softmax_context_v2` (V2 grid; requires
-/// [`mtp12_attention_v2_covers`]), leaving the scores buffer holding raw
-/// scores.  Bit-identical to the pair (pinned by
-/// `mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit`).
+/// `softmax_ctx` replaces the softmax + context pair (all levels require
+/// [`mtp12_attention_v2_covers`], all leave the scores buffer holding raw
+/// scores, and all are bit-identical to the pair - pinned by
+/// `mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit`):
+/// `0` = the established pair, `1` = `mtp12_attention_softmax_context_v2`
+/// (every context threadgroup recomputes max/denominator), `2` =
+/// `mtp12_attention_softmax_stats` + `mtp12_attention_context_v2_stats16`,
+/// `3` = `mtp12_attention_softmax_stats` + `mtp12_attention_context_v2_stats4`.
+/// `stats` is the `N_HEADS * 2` scratch the pre-pass writes; levels 2 and 3
+/// require it.
 #[allow(clippy::too_many_arguments)]
 fn encode_attention_impl_ex(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -5031,10 +5743,13 @@ fn encode_attention_impl_ex(
     compact_base: usize,
     position_count: usize,
     v2: bool,
-    fused_softmax_ctx: bool,
+    softmax_ctx: u8,
+    stats: Option<&Buffer>,
 ) {
     debug_assert!(position_count > 0);
-    debug_assert!(!fused_softmax_ctx || mtp12_attention_v2_covers(head_dim));
+    debug_assert!(softmax_ctx <= 3);
+    debug_assert!(softmax_ctx == 0 || mtp12_attention_v2_covers(head_dim));
+    debug_assert!(softmax_ctx < 2 || stats.is_some());
     debug_assert_eq!(compact_base + position_count, logical_len);
     let n_heads = N_HEADS as u32;
     let head_dim = head_dim as u32;
@@ -5079,27 +5794,47 @@ fn encode_attention_impl_ex(
         tg32,
     );
 
-    if !fused_softmax_ctx {
-        encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
-        encoder.set_buffer(0, Some(scores), 0);
-        encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
-        encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: N_HEADS as u64,
-                height: 1,
-                depth: 1,
-            },
-            tg32,
-        );
+    match softmax_ctx {
+        0 => {
+            encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
+            encoder.set_buffer(0, Some(scores), 0);
+            encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+            encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: N_HEADS as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                tg32,
+            );
+        }
+        // Levels 2 and 3 hoist the two softmax passes out of the
+        // (heads x dim-blocks) context grid into one per-head pre-pass.
+        2 | 3 => {
+            encoder.set_compute_pipeline_state(&pipelines.attention_softmax_stats);
+            encoder.set_buffer(0, Some(scores), 0);
+            encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+            encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+            encoder.set_buffer(3, stats.map(|v| &**v), 0);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: N_HEADS as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                tg32,
+            );
+        }
+        _ => {}
     }
 
-    encoder.set_compute_pipeline_state(if fused_softmax_ctx {
-        &pipelines.attention_softmax_context_v2
-    } else if v2 {
-        &pipelines.attention_context_v2
-    } else {
-        &pipelines.attention_context
+    encoder.set_compute_pipeline_state(match softmax_ctx {
+        1 => &pipelines.attention_softmax_context_v2,
+        2 => &pipelines.attention_context_v2_stats16,
+        3 => &pipelines.attention_context_v2_stats4,
+        _ if v2 => &pipelines.attention_context_v2,
+        _ => &pipelines.attention_context,
     });
     encoder.set_buffer(0, Some(value), value_byte_offset);
     encoder.set_buffer(1, Some(scores), 0);
@@ -5113,10 +5848,13 @@ fn encode_attention_impl_ex(
     encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
     encoder.set_bytes(10, 4, &compact_base_u32 as *const u32 as *const c_void);
     encoder.set_bytes(11, 4, &logical_len_u32 as *const u32 as *const c_void);
+    if softmax_ctx >= 2 {
+        encoder.set_buffer(12, stats.map(|v| &**v), 0);
+    }
     encoder.dispatch_thread_groups(
         MTLSize {
             width: N_HEADS as u64,
-            height: if v2 || fused_softmax_ctx {
+            height: if v2 || softmax_ctx != 0 {
                 (head_dim as usize / 128) as u64
             } else {
                 1
@@ -5522,7 +6260,7 @@ mod tests {
         serde_json::to_vec(&serde_json::Value::Object(object)).expect("synthetic header")
     }
 
-    fn synthetic_q6k_embedding_row() -> Vec<u8> {
+    pub(super) fn synthetic_q6k_embedding_row() -> Vec<u8> {
         let mut row = vec![0u8; GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES as usize];
         let half_scales = [0.5f32, -0.125, 0.03125, -0.0078125, 0.001953125];
         for (block_index, block) in row.chunks_exact_mut(Q6_K_BLOCK_BYTES).enumerate() {
@@ -5606,7 +6344,7 @@ mod tests {
         }
     }
 
-    fn synthetic_assistant(device: &Device) -> Gemma4Mtp12AssistantMetal {
+    pub(super) fn synthetic_assistant(device: &Device) -> Gemma4Mtp12AssistantMetal {
         let (embedding, source_layers, pre, post) = source_geometry();
         let layout =
             Q4Layout::build(embedding, &source_layers, pre, post).expect("synthetic exact layout");
@@ -5673,7 +6411,7 @@ mod tests {
         }
     }
 
-    fn synthetic_kv(
+    pub(super) fn synthetic_kv(
         kv_heads: usize,
         head_dim: usize,
         logical_len: usize,
@@ -5702,7 +6440,7 @@ mod tests {
         (compact_key, compact_value, physical_key, physical_value)
     }
 
-    fn f32_view<'a>(
+    pub(super) fn f32_view<'a>(
         buffer: &'a Buffer,
         byte_offset: u64,
         elements: usize,
@@ -6677,19 +7415,20 @@ mod tests {
         position_count: usize,
     ) -> Vec<f32> {
         mtp12_attention_run_ex(
-            device, pipelines, v2, false, query, keys, values, kv_heads, head_dim, capacity,
+            device, pipelines, v2, 0, query, keys, values, kv_heads, head_dim, capacity,
             compact_base, position_count,
         )
     }
 
-    /// As [`mtp12_attention_run`], with `fused` selecting
-    /// `mtp12_attention_softmax_context_v2` in place of softmax + context.
+    /// As [`mtp12_attention_run`], with `softmax_ctx` selecting one of the
+    /// `CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX` levels in place of the softmax +
+    /// context pair (1 = fused, 2 = stats + 16-deep, 3 = stats + 4-deep).
     #[allow(clippy::too_many_arguments)]
-    fn mtp12_attention_run_ex(
+    pub(super) fn mtp12_attention_run_ex(
         device: &Device,
         pipelines: &Mtp12Pipelines,
         v2: bool,
-        fused: bool,
+        softmax_ctx: u8,
         query: &[f32],
         keys: &[f32],
         values: &[f32],
@@ -6706,6 +7445,7 @@ mod tests {
         let values_buf = f32_buffer(device, values).expect("values buffer");
         let scores = shared_buffer(device, N_HEADS * logical_len * 4);
         let output = shared_buffer(device, N_HEADS * head_dim * 4);
+        let stats = shared_buffer(device, N_HEADS * 2 * 4);
         write_buffer_f32(&output, &vec![f32::NAN; N_HEADS * head_dim]).expect("poison");
         let queue = device.new_command_queue();
         let command = queue.new_command_buffer();
@@ -6727,7 +7467,8 @@ mod tests {
             compact_base,
             position_count,
             v2,
-            fused,
+            softmax_ctx,
+            Some(&stats),
         );
         encoder.end_encoding();
         command.commit();
@@ -7267,9 +8008,47 @@ mod tests {
         for bad in ["", " 1", "1 ", "true", "false", "on", "2", "01"] {
             assert!(mtp12_fuse_flag("X", Some(bad)).is_err(), "{bad:?}");
         }
+        // Leveled selectors admit exactly 0..=max, one ASCII digit.
+        for max in [1u8, 2, 3, 5] {
+            for level in 0..=max {
+                assert_eq!(
+                    mtp12_fuse_level("X", Some(&level.to_string()), max).unwrap(),
+                    level
+                );
+            }
+            assert_eq!(mtp12_fuse_level("X", None, max).unwrap(), 0);
+            for bad in ["", " 1", "1 ", "true", "01", "-1", "10"] {
+                assert!(mtp12_fuse_level("X", Some(bad), max).is_err(), "{bad:?} max={max}");
+            }
+            if max < 9 {
+                assert!(mtp12_fuse_level("X", Some(&(max + 1).to_string()), max).is_err());
+            }
+        }
+        // Levels 0..=3 are the bit-identical dense-GEMV routes gated by
+        // gemv_x4_matches_gemv_bit_for_bit; 4 and 5 are the split-block
+        // experiment, which is deliberately excluded from that gate.
+        assert_eq!(MTP12_FUSE_GEMV_X4_MAX, 5);
+        assert_eq!(MTP12_FUSE_GEMV_X4_FIRST_INEXACT, 4);
+        for level in 0..MTP12_FUSE_GEMV_X4_FIRST_INEXACT {
+            assert!(mtp12_gemv_split_count(level).is_none(), "level {level} must be exact");
+        }
+        assert_eq!(mtp12_gemv_split_count(4), Some(2));
+        assert_eq!(mtp12_gemv_split_count(5), Some(4));
+        assert_eq!(mtp12_gemv_staged_rows(None).unwrap(), MTP12_GEMV_STAGED_ROWS_DEFAULT);
+        for rows in [1u32, 2, 4, 8, 16, MTP12_GEMV_STAGED_ROWS_MAX] {
+            assert_eq!(mtp12_gemv_staged_rows(Some(&rows.to_string())).unwrap(), rows);
+        }
+        for bad in ["", "0", "65", "-1", " 4", "4 ", "04", "true", "4.0"] {
+            assert!(mtp12_gemv_staged_rows(Some(bad)).is_err(), "{bad:?}");
+        }
         assert_eq!(Mtp12FuseFlags::default(), Mtp12FuseFlags {
-            gemv_x4: false, gate_up: false, norm: false, qrope: false,
-            softmax_ctx: false, head_prefetch: false,
+            gemv_x4: 0,
+            gemv_staged_rows: MTP12_GEMV_STAGED_ROWS_DEFAULT,
+            gate_up: false,
+            norm: false,
+            qrope: false,
+            softmax_ctx: 0,
+            head_prefetch: 0,
         });
     }
 
@@ -7291,7 +8070,7 @@ mod tests {
 
     /// BF16-valued activations in roughly [-4, 4] with zeros, negative zeros,
     /// BF16 denormals and tiny normals sprinkled in when `specials` is set.
-    fn random_bf16_values(count: usize, seed: u64, specials: bool) -> Vec<f32> {
+    pub(super) fn random_bf16_values(count: usize, seed: u64, specials: bool) -> Vec<f32> {
         let mut state = 0x2545_F491_4F6C_DD1Du64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (0..count)
             .map(|i| {
@@ -7314,7 +8093,7 @@ mod tests {
 
     /// Random Q4_0 blocks (f16 scale in about [-1, 1), random nibbles) at
     /// `byte_offset` inside a fresh buffer.
-    fn random_q4_weights(device: &Device, byte_offset: usize, byte_len: usize, seed: u64) -> Buffer {
+    pub(super) fn random_q4_weights(device: &Device, byte_offset: usize, byte_len: usize, seed: u64) -> Buffer {
         let weights = shared_buffer(device, byte_offset + byte_len);
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(weights.contents().cast::<u8>(), weights.length() as usize)
@@ -7350,10 +8129,22 @@ mod tests {
     const FUSE_GEMV_SHAPES: [(usize, usize); 6] =
         [(1_024, 3_840), (4_096, 1_024), (8_192, 1_024), (1_024, 4_096), (1_024, 8_192), (3_840, 1_024)];
 
-    /// `mtp12_q4_0_gemv_x4` (four rows per 128-thread group, guarded prefetch)
-    /// must reproduce `mtp12_q4_0_gemv` bit-for-bit at the six production
-    /// shapes, both rounding modes, a nonzero weight offset, a nonzero output
-    /// offset, and BF16 inputs including zeros and denormals.
+    /// Rows-per-simdgroup values covered by the staged-GEMV bit gate: divisors
+    /// and non-divisors of every production row count (3 and 6 leave a partial
+    /// last group), the default, and the clamp maximum.
+    const FUSE_GEMV_STAGED_ROWS: [u32; 8] = [1, 2, 3, 4, 6, 8, 16, MTP12_GEMV_STAGED_ROWS_MAX];
+
+    /// Every order-preserving dense-GEMV variant must reproduce
+    /// `mtp12_q4_0_gemv` bit-for-bit at the six production shapes, both
+    /// rounding modes, a nonzero weight offset, a nonzero output offset, and
+    /// BF16 inputs including zeros and denormals:
+    /// `mtp12_q4_0_gemv_x4` (`FUSE_GEMV_X4=1`, four rows per 128-thread group)
+    /// and `mtp12_q4_0_gemv_staged` (`FUSE_GEMV_X4=2/3`, register-staged
+    /// inputs) at every `CAMELID_GEMMA4_MTP12_GEMV_STAGED_ROWS` value the gate
+    /// lists.  Levels 2 and 3 differ only in which shapes they route to the
+    /// staged kernel, so covering the kernel at all six shapes covers both.
+    /// Levels 4 and 5 (`mtp12_q4_0_gemv_split`) fold each row in a different
+    /// order and are deliberately NOT covered here; they are a bench-only lane.
     #[test]
     fn gemv_x4_matches_gemv_bit_for_bit() {
         let Some(device) = Device::system_default() else { return; };
@@ -7372,23 +8163,42 @@ mod tests {
             let input = f32_buffer(&device, &random_bf16_values(cols, 100 + index as u64, true)).unwrap();
             for round in [false, true] {
                 let established = f32_buffer(&device, &vec![f32::NAN; rows]).unwrap();
-                let candidate = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
+                let mut variants: Vec<(String, Buffer)> = Vec::new();
                 let cb = queue.new_command_buffer();
                 let encoder = cb.new_compute_command_encoder();
                 encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &established, matrix, round);
+                let x4 = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
                 encode_q4_gemv_at_offset(
-                    encoder, &pipelines.q4_gemv_x4, &weights, &input, &candidate,
+                    encoder, &pipelines.q4_gemv_x4, &weights, &input, &x4,
                     OUTPUT_OFFSET as u64, matrix, round, true,
                 );
+                variants.push(("gemv_x4".to_string(), x4));
+                for rows_per_group in FUSE_GEMV_STAGED_ROWS {
+                    let staged = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
+                    encode_q4_gemv_staged(
+                        encoder, &pipelines.q4_gemv_staged, &weights, &input, &staged,
+                        OUTPUT_OFFSET as u64, matrix, round, rows_per_group,
+                    );
+                    variants.push((format!("gemv_staged rows_per_group={rows_per_group}"), staged));
+                }
                 encoder.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();
                 assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
                 let expected = read_f32s(&established, rows);
                 assert!(expected.iter().all(|v| v.is_finite()), "{rows}x{cols}: fixture not finite");
-                let actual = read_f32s(&candidate, rows + OUTPUT_OFFSET / 4);
-                assert!(actual[..OUTPUT_OFFSET / 4].iter().all(|v| v.is_nan()), "offset prefix clobbered");
-                assert_bits_equal(&format!("gemv_x4 {rows}x{cols} round={round}"), &expected, &actual[OUTPUT_OFFSET / 4..]);
+                for (label, buffer) in &variants {
+                    let actual = read_f32s(buffer, rows + OUTPUT_OFFSET / 4);
+                    assert!(
+                        actual[..OUTPUT_OFFSET / 4].iter().all(|v| v.is_nan()),
+                        "{label} {rows}x{cols}: offset prefix clobbered"
+                    );
+                    assert_bits_equal(
+                        &format!("{label} {rows}x{cols} round={round}"),
+                        &expected,
+                        &actual[OUTPUT_OFFSET / 4..],
+                    );
+                }
             }
         }
     }
@@ -7514,9 +8324,10 @@ mod tests {
         }
     }
 
-    /// `mtp12_attention_softmax_context_v2` must reproduce softmax + context_v2
-    /// (and the established pair) bit-for-bit on both head shapes at position
-    /// counts around the 32-lane chunk boundaries and at production depth.
+    /// Every `FUSE_SOFTMAX_CTX` level (1 = fused, 2 = stats + 16-deep context,
+    /// 3 = stats + 4-deep context) must reproduce softmax + context_v2 (and the
+    /// established pair) bit-for-bit on both head shapes at position counts
+    /// around the 32-lane chunk boundaries and at production depth.
     #[test]
     fn mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit() {
         let Some(device) = Device::system_default() else { return; };
@@ -7529,19 +8340,23 @@ mod tests {
                 mtp12_attention_fixture(kv_heads, head_dim, CAPACITY, 40 + shape_index as u64);
             for &position_count in &[1usize, 31, 32, 33, 127, 128, 129, 620, 1_024] {
                 for compact_base in [0usize, 3] {
-                    let run = |v2: bool, fused: bool| {
+                    let run = |v2: bool, softmax_ctx: u8| {
                         mtp12_attention_run_ex(
-                            &device, &pipelines, v2, fused, &query, &keys, &values,
+                            &device, &pipelines, v2, softmax_ctx, &query, &keys, &values,
                             kv_heads, head_dim, CAPACITY, compact_base, position_count,
                         )
                     };
-                    let established = run(false, false);
-                    let pair_v2 = run(true, false);
-                    let fused = run(true, true);
+                    let established = run(false, 0);
+                    let pair_v2 = run(true, 0);
                     assert!(established.iter().all(|v| v.is_finite()));
-                    let label = format!("softmax_ctx kv {kv_heads}x{head_dim} base {compact_base} count {position_count}");
-                    assert_bits_equal(&format!("{label} (v2 pair)"), &pair_v2, &fused);
-                    assert_bits_equal(&format!("{label} (established)"), &established, &fused);
+                    for level in 1u8..=3 {
+                        let fused = run(true, level);
+                        let label = format!(
+                            "softmax_ctx={level} kv {kv_heads}x{head_dim} base {compact_base} count {position_count}"
+                        );
+                        assert_bits_equal(&format!("{label} (v2 pair)"), &pair_v2, &fused);
+                        assert_bits_equal(&format!("{label} (established)"), &established, &fused);
+                    }
                 }
             }
         }
@@ -7550,7 +8365,7 @@ mod tests {
     /// Synthetic compact-head fixture: `rows` tokens with three random clusters
     /// each and a random `top`-of-2048 selection (about the production retained
     /// fraction).  Returns (token_clusters, selected).
-    fn synthetic_head_selection(device: &Device, rows: usize, top: usize, seed: u64) -> (Buffer, Buffer) {
+    pub(super) fn synthetic_head_selection(device: &Device, rows: usize, top: usize, seed: u64) -> (Buffer, Buffer) {
         let mut state = 0x5eed_5eedu64 ^ seed;
         let clusters: Vec<u16> = (0..rows)
             .flat_map(|_| {
@@ -7580,8 +8395,11 @@ mod tests {
         (cluster_buffer, selected_buffer)
     }
 
-    /// `mtp12_q4_0_gemv_compact_local_prefetch` == `mtp12_q4_0_gemv_compact_local`
-    /// at cols 1024 (one block per lane) and 2048 (a second in-place block).
+    /// Both compact-head variants must equal `mtp12_q4_0_gemv_compact_local`
+    /// bit-for-bit at cols 1024 (one block per lane) and 2048 (a second
+    /// in-place block): `_prefetch` (`FUSE_HEAD_PREFETCH=1`, row prefetch) and
+    /// `_staged` (`FUSE_HEAD_PREFETCH=2`, row prefetch + register-staged
+    /// inputs).  `top` spans an empty, a production-sized and a full shortlist.
     #[test]
     fn head_prefetch_matches_compact_local_bit_for_bit() {
         let Some(device) = Device::system_default() else { return; };
@@ -7600,7 +8418,6 @@ mod tests {
             for top in [1usize, 384, 2_048] {
                 let (clusters, selected) = synthetic_head_selection(&device, ROWS, top, top as u64);
                 let established = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
-                let candidate = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
                 let cb = queue.new_command_buffer();
                 let encoder = cb.new_compute_command_encoder();
                 encoder.set_buffer(7, Some(&clusters), 0);
@@ -7608,11 +8425,19 @@ mod tests {
                 encode_q4_gemv_shortlist_compact(
                     encoder, &pipelines.q4_gemv_shortlist_compact, &weights, &input, &established, matrix,
                 );
-                encoder.set_buffer(7, Some(&clusters), 0);
-                encoder.set_buffer(8, Some(&selected), 0);
-                encode_q4_gemv_shortlist_compact(
-                    encoder, &pipelines.q4_gemv_shortlist_compact_prefetch, &weights, &input, &candidate, matrix,
-                );
+                let candidates: Vec<(&str, Buffer)> = [
+                    ("head_prefetch=1", &pipelines.q4_gemv_shortlist_compact_prefetch),
+                    ("head_prefetch=2", &pipelines.q4_gemv_shortlist_compact_staged),
+                ]
+                .into_iter()
+                .map(|(label, pipeline)| {
+                    let output = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
+                    encoder.set_buffer(7, Some(&clusters), 0);
+                    encoder.set_buffer(8, Some(&selected), 0);
+                    encode_q4_gemv_shortlist_compact(encoder, pipeline, &weights, &input, &output, matrix);
+                    (label, output)
+                })
+                .collect();
                 encoder.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();
@@ -7620,15 +8445,24 @@ mod tests {
                 let expected = read_f32s(&established, ROWS);
                 assert!(expected.iter().any(|v| v.is_finite()) || top == 1, "fixture retained nothing");
                 assert!(expected.iter().all(|v| !v.is_nan()));
-                assert_bits_equal(&format!("head_prefetch cols={cols} top={top}"), &expected, &read_f32s(&candidate, ROWS));
+                for (label, output) in &candidates {
+                    assert_bits_equal(
+                        &format!("{label} cols={cols} top={top}"),
+                        &expected,
+                        &read_f32s(output, ROWS),
+                    );
+                }
             }
         }
     }
 
-    /// GB/s per production GEMV shape, established one-row-per-group vs x4
-    /// (30 encodes per command buffer, hardware timestamps), plus the fused
-    /// gate/up/GELU vs three dispatches and a synthetic 262,144-row compact
-    /// head (random 384-of-2048 selection) with and without the row prefetch.
+    /// GB/s per production GEMV shape (30 encodes per command buffer, hardware
+    /// timestamps): the established one-row-per-group kernel, x4, the
+    /// register-staged kernel at five rows-per-simdgroup values and the
+    /// NON-bit-identical split-block experiment at two and four simdgroups per
+    /// row; plus the fused gate/up/GELU vs three dispatches and a synthetic
+    /// 262,144-row compact head (random 384-of-2048 selection) with the row
+    /// prefetch and the register-staged variants.
     #[test]
     #[ignore]
     fn assistant_gemv_bench_shapes() {
@@ -7669,15 +8503,38 @@ mod tests {
             let weights = random_q4_weights(&device, 0, matrix.byte_len as usize, 500 + index as u64);
             let input = f32_buffer(&device, &random_bf16_values(cols, 600 + index as u64, false)).unwrap();
             let output = shared_buffer(&device, rows * 4);
+            let report = |label: String, us: f64| {
+                eprintln!(
+                    "[mtp12-gemv-bench] {rows:>5}x{cols:<5} {label:<26} {us:8.1} us  {:6.1} GB/s",
+                    matrix.byte_len as f64 / us / 1.0e3
+                );
+            };
             for (label, x4) in [("gemv", false), ("gemv_x4", true)] {
                 let pipeline = if x4 { &pipelines.q4_gemv_x4 } else { &pipelines.q4_gemv };
                 let us = time(&|encoder| {
                     encode_q4_gemv_at_offset(encoder, pipeline, &weights, &input, &output, 0, matrix, true, x4);
                 });
-                eprintln!(
-                    "[mtp12-gemv-bench] {rows:>5}x{cols:<5} {label:<8} {us:8.1} us  {:6.1} GB/s",
-                    matrix.byte_len as f64 / us / 1.0e3
-                );
+                report(label.to_string(), us);
+            }
+            for rows_per_group in [1u32, 2, 4, 8, 16] {
+                let us = time(&|encoder| {
+                    encode_q4_gemv_staged(
+                        encoder, &pipelines.q4_gemv_staged, &weights, &input, &output, 0, matrix,
+                        true, rows_per_group,
+                    );
+                });
+                report(format!("gemv_staged rows={rows_per_group}"), us);
+            }
+            // NOT bit-identical (different fold order); reported so the
+            // simdgroup-parallelism ceiling of the 1024-row shapes is visible.
+            for splits in [2u32, 4] {
+                let us = time(&|encoder| {
+                    encode_q4_gemv_split(
+                        encoder, &pipelines.q4_gemv_split, &weights, &input, &output, 0, matrix,
+                        true, splits,
+                    );
+                });
+                report(format!("gemv_split x{splits} (INEXACT)"), us);
             }
         }
         {
@@ -7726,6 +8583,7 @@ mod tests {
             for (label, pipeline) in [
                 ("compact_local", &pipelines.q4_gemv_shortlist_compact),
                 ("compact_local_prefetch", &pipelines.q4_gemv_shortlist_compact_prefetch),
+                ("compact_local_staged", &pipelines.q4_gemv_shortlist_compact_staged),
             ] {
                 let us = time(&|encoder| {
                     encoder.set_buffer(7, Some(&clusters), 0);
@@ -7736,6 +8594,247 @@ mod tests {
                     "[mtp12-gemv-bench] head {label:<22} {us:8.1} us  retained {retained} rows ({:.1}%)  {:6.1} GB/s over retained bytes",
                     retained as f64 * 100.0 / VOCAB as f64,
                     (retained * ASSISTANT_HIDDEN / 32 * 18) as f64 / us / 1.0e3
+                );
+            }
+        }
+    }
+
+
+    /// One attention dispatch, bound exactly as `encode_attention_impl_ex`
+    /// binds it.  The bench needs the phases separately, so the bindings are
+    /// mirrored here; any binding change must be mirrored back.
+    #[derive(Clone, Copy, Debug)]
+    enum AttentionPhase {
+        Scores { v2: bool },
+        Softmax,
+        SoftmaxStats,
+        /// `mtp12_attention_context_v2`, `_softmax_context_v2`,
+        /// `_context_v2_stats16` or `_context_v2_stats4`.
+        Context { softmax_ctx: u8 },
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bench_encode_attention_phase(
+        encoder: &metal::ComputeCommandEncoderRef,
+        pipelines: &Mtp12Pipelines,
+        phase: AttentionPhase,
+        query: &Buffer,
+        key: &Buffer,
+        value: &Buffer,
+        scores: &Buffer,
+        output: &Buffer,
+        stats: &Buffer,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        position_count: usize,
+    ) {
+        let n_heads = N_HEADS as u32;
+        let head_dim_u32 = head_dim as u32;
+        let position_count_u32 = position_count as u32;
+        let group = (N_HEADS / kv_heads) as u32;
+        let position_stride = head_dim_u32;
+        let kv_head_stride = (capacity * head_dim) as u32;
+        let kv_base_offset = 0u32;
+        let compact_base = 0u32;
+        let logical_len = position_count_u32;
+        let tg32 = MTLSize { width: 32, height: 1, depth: 1 };
+        match phase {
+            AttentionPhase::Scores { v2 } => {
+                encoder.set_compute_pipeline_state(if v2 {
+                    &pipelines.attention_scores_v2
+                } else {
+                    &pipelines.attention_scores
+                });
+                encoder.set_buffer(0, Some(query), 0);
+                encoder.set_buffer(1, Some(key), 0);
+                encoder.set_buffer(2, Some(scores), 0);
+                encoder.set_bytes(3, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(4, 4, &head_dim_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(5, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(6, 4, &group as *const u32 as *const c_void);
+                encoder.set_bytes(7, 4, &position_stride as *const u32 as *const c_void);
+                encoder.set_bytes(8, 4, &kv_head_stride as *const u32 as *const c_void);
+                encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
+                encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: N_HEADS as u64,
+                        height: if v2 { position_count.div_ceil(32) as u64 } else { 1 },
+                        depth: 1,
+                    },
+                    tg32,
+                );
+            }
+            AttentionPhase::Softmax => {
+                encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
+                encoder.set_buffer(0, Some(scores), 0);
+                encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.dispatch_thread_groups(
+                    MTLSize { width: N_HEADS as u64, height: 1, depth: 1 },
+                    tg32,
+                );
+            }
+            AttentionPhase::SoftmaxStats => {
+                encoder.set_compute_pipeline_state(&pipelines.attention_softmax_stats);
+                encoder.set_buffer(0, Some(scores), 0);
+                encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_buffer(3, Some(stats), 0);
+                encoder.dispatch_thread_groups(
+                    MTLSize { width: N_HEADS as u64, height: 1, depth: 1 },
+                    tg32,
+                );
+            }
+            AttentionPhase::Context { softmax_ctx } => {
+                encoder.set_compute_pipeline_state(match softmax_ctx {
+                    1 => &pipelines.attention_softmax_context_v2,
+                    2 => &pipelines.attention_context_v2_stats16,
+                    3 => &pipelines.attention_context_v2_stats4,
+                    _ => &pipelines.attention_context_v2,
+                });
+                encoder.set_buffer(0, Some(value), 0);
+                encoder.set_buffer(1, Some(scores), 0);
+                encoder.set_buffer(2, Some(output), 0);
+                encoder.set_bytes(3, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(4, 4, &head_dim_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(5, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(6, 4, &group as *const u32 as *const c_void);
+                encoder.set_bytes(7, 4, &position_stride as *const u32 as *const c_void);
+                encoder.set_bytes(8, 4, &kv_head_stride as *const u32 as *const c_void);
+                encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
+                encoder.set_bytes(10, 4, &compact_base as *const u32 as *const c_void);
+                encoder.set_bytes(11, 4, &logical_len as *const u32 as *const c_void);
+                if softmax_ctx >= 2 {
+                    encoder.set_buffer(12, Some(stats), 0);
+                }
+                encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: N_HEADS as u64,
+                        height: (head_dim / 128) as u64,
+                        depth: 1,
+                    },
+                    tg32,
+                );
+            }
+        }
+    }
+
+    /// Per-kernel GPU cost of the assistant's attention phases on both 12B head
+    /// shapes at the tree lane's production prefixes: the established
+    /// softmax + `context_v2` pair against the fused `softmax_context_v2` and
+    /// against the stats pre-pass + stats-fed context at both load depths.
+    /// Prefix lengths come from `CAMELID_MTP12_BENCH_PREFIX` (default
+    /// "620,1500"); every prefix is measured with `compact_base` 0, so
+    /// `position_count` is the prefix itself.
+    ///
+    /// Invoke (release, on the rig):
+    ///   cargo test --release --lib assistant_attention_kernel_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn assistant_attention_kernel_bench() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping assistant attention bench");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("pipelines");
+        let queue = device.new_command_queue();
+        const REPS: usize = 20;
+        const BUFFERS: usize = 5;
+        let median = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
+            let mut samples = Vec::with_capacity(BUFFERS);
+            for pass in 0..=BUFFERS {
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                for _ in 0..REPS {
+                    encode(encoder);
+                }
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                if pass > 0 {
+                    let (us, _) = super::super::command_buffer_gpu_times_us(&cb.to_owned());
+                    samples.push(us as f64 / REPS as f64);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+        let prefixes: Vec<usize> = std::env::var("CAMELID_MTP12_BENCH_PREFIX")
+            .unwrap_or_else(|_| "620,1500".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.parse::<usize>().expect("prefix must be an integer"))
+            .collect();
+        eprintln!(
+            "[mtp12-attn-bench] {REPS} encodes/buffer, median of {BUFFERS} buffers, compact_base 0"
+        );
+        for (index, &(kv_heads, head_dim)) in
+            [(LOCAL_KV_HEADS, LOCAL_HEAD_DIM), (FULL_KV_HEADS, FULL_HEAD_DIM)].iter().enumerate()
+        {
+            for &position_count in &prefixes {
+                let capacity = position_count;
+                let (query, keys, values) =
+                    mtp12_attention_fixture(kv_heads, head_dim, capacity, 900 + index as u64);
+                let query = f32_buffer(&device, &query).unwrap();
+                let keys = f32_buffer(&device, &keys).unwrap();
+                let values = f32_buffer(&device, &values).unwrap();
+                let scores = shared_buffer(&device, N_HEADS * position_count * 4);
+                let output = shared_buffer(&device, N_HEADS * head_dim * 4);
+                let stats = shared_buffer(&device, N_HEADS * 2 * 4);
+                let run = |phases: &[AttentionPhase]| -> f64 {
+                    median(&|encoder| {
+                        for &phase in phases {
+                            bench_encode_attention_phase(
+                                encoder, &pipelines, phase, &query, &keys, &values, &scores,
+                                &output, &stats, kv_heads, head_dim, capacity, position_count,
+                            );
+                        }
+                    })
+                };
+                let group = N_HEADS / kv_heads;
+                eprintln!(
+                    "[mtp12-attn-bench] ---- HD{head_dim} ({kv_heads} KV heads, group {group}), \
+                     prefix {position_count} ----"
+                );
+                let scores_v2 = run(&[AttentionPhase::Scores { v2: true }]);
+                let softmax = run(&[AttentionPhase::Softmax]);
+                let stats_pass = run(&[AttentionPhase::SoftmaxStats]);
+                let context_v2 = run(&[AttentionPhase::Context { softmax_ctx: 0 }]);
+                let fused = run(&[AttentionPhase::Context { softmax_ctx: 1 }]);
+                let ctx16 = run(&[AttentionPhase::Context { softmax_ctx: 2 }]);
+                let ctx4 = run(&[AttentionPhase::Context { softmax_ctx: 3 }]);
+                for (label, us) in [
+                    ("scores_v2", scores_v2),
+                    ("softmax", softmax),
+                    ("softmax_stats", stats_pass),
+                    ("context_v2", context_v2),
+                    ("softmax_context_v2 (fused)", fused),
+                    ("context_v2_stats16", ctx16),
+                    ("context_v2_stats4", ctx4),
+                ] {
+                    eprintln!("[mtp12-attn-bench]   kernel {label:<28} {us:8.1} us");
+                }
+                let pair = softmax + context_v2;
+                for (label, us) in [
+                    ("softmax + context_v2 (level 0)", pair),
+                    ("softmax_context_v2 (level 1)", fused),
+                    ("stats + context_v2_stats16 (level 2)", stats_pass + ctx16),
+                    ("stats + context_v2_stats4 (level 3)", stats_pass + ctx4),
+                ] {
+                    eprintln!(
+                        "[mtp12-attn-bench]   phase  {label:<38} {us:8.1} us  {:+6.1}% vs pair",
+                        (us - pair) * 100.0 / pair
+                    );
+                }
+                eprintln!(
+                    "[mtp12-attn-bench]   whole  {:<38} {:8.1} us",
+                    "scores_v2 + best phase",
+                    scores_v2 + [pair, fused, stats_pass + ctx16, stats_pass + ctx4]
+                        .into_iter()
+                        .fold(f64::INFINITY, f64::min)
                 );
             }
         }
