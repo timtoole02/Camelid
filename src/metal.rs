@@ -3962,6 +3962,72 @@ inline uint2 q4_native_mma_fragment_coord(uint lane) {
 // Every staged value is the identical exact integer / f32 the position-major
 // panel and the strided input_scales reads deliver; only addressing differs.
 // ---------------------------------------------------------------------------
+kernel void q4_0_q8_ordered_columns_mma_stage_fm(
+    device const char* input_quants [[buffer(0)]],
+    device half* staged [[buffer(1)]],
+    device const float* input_scales [[buffer(2)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& columns [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint width = blocks_per_row * 32u;
+    const uint panel_total = blocks_per_row * 256u;
+    if (gid < panel_total) {
+        const uint block = gid >> 8;
+        const uint rem = gid & 255u;
+        const uint lane = rem >> 3;
+        const uint k_tile = (rem >> 1) & 3u;
+        const uint element = rem & 1u;
+        const uint2 fc = q4_native_mma_fragment_coord(lane);
+        const uint column = fc.x + element;
+        const uint position = block * 32u + k_tile * 8u + fc.y;
+        staged[block * 272u + rem] = column < columns
+            ? half(int(input_quants[ulong(column) * width + position]))
+            : half(0.0f);
+        return;
+    }
+    const uint index = gid - panel_total;
+    if (index >= blocks_per_row * 8u) return;
+    const uint block = index >> 3;
+    const uint column = index & 7u;
+    device float* scales = reinterpret_cast<device float*>(staged);
+    scales[block * 136u + 128u + column] = column < columns
+        ? input_scales[ulong(column) * blocks_per_row + block]
+        : 0.0f;
+}
+
+kernel void q4_0_q8_ordered_columns_mma_stage16_fm(
+    device const char* input_quants [[buffer(0)]],
+    device half* staged [[buffer(1)]],
+    device const float* input_scales [[buffer(2)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint width = blocks_per_row * 32u;
+    const uint panel_total = blocks_per_row * 512u;
+    if (gid < panel_total) {
+        const uint block = gid >> 9;
+        const uint rem = gid & 511u;
+        const uint group = rem >> 8;
+        const uint lane = (rem >> 3) & 31u;
+        const uint k_tile = (rem >> 1) & 3u;
+        const uint element = rem & 1u;
+        const uint2 fc = q4_native_mma_fragment_coord(lane);
+        const uint column = group * 8u + fc.x + element;
+        const uint position = block * 32u + k_tile * 8u + fc.y;
+        staged[block * 544u + rem] =
+            half(int(input_quants[ulong(column) * width + position]));
+        return;
+    }
+    const uint index = gid - panel_total;
+    if (index >= blocks_per_row * 16u) return;
+    const uint block = index >> 4;
+    const uint column = index & 15u;
+    device float* scales = reinterpret_cast<device float*>(staged);
+    scales[block * 272u + 256u + column] =
+        input_scales[ulong(column) * blocks_per_row + block];
+}
+
 // One V2 batch: N consecutive blocks for TILES eight-row tiles and GROUPS
 // eight-column groups. All loads of the batch are issued before its MMAs;
 // the fold then visits the N blocks in increasing order per cell.
@@ -4194,8 +4260,12 @@ kernel void NAME(                                                            \
 }
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u2, 1u, 2u, 1u, false)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u4, 1u, 4u, 1u, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u1, 1u, 1u, 1u, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_fm_u4, 1u, 4u, 1u, true)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u2, 1u, 2u, 2u, false)
 Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u4, 1u, 4u, 2u, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u1, 1u, 1u, 2u, true)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_fm_u4, 1u, 4u, 2u, true)
 #undef Q4_NATIVE_V2_KERNEL
 
 // Native-plane adaptation of the exact register-fed B kernel. Each lane loads
@@ -15140,6 +15210,8 @@ pub(crate) struct Gemma4Q4NativeV2Variant {
 pub(crate) const GEMMA4_Q4_NATIVE_V2_VARIANTS: &[Gemma4Q4NativeV2Variant] = &[
     Gemma4Q4NativeV2Variant { name: "u2", tiles: 1, fragment_major: false },
     Gemma4Q4NativeV2Variant { name: "u4", tiles: 1, fragment_major: false },
+    Gemma4Q4NativeV2Variant { name: "fm_u1", tiles: 1, fragment_major: true },
+    Gemma4Q4NativeV2Variant { name: "fm_u4", tiles: 1, fragment_major: true },
 ];
 
 /// Compiled pipelines of one V2 variant: the padded-eight K<=8 kernel, the
