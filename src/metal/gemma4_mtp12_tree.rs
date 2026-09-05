@@ -6,7 +6,27 @@ use super::*;
 mod oracle;
 
 const PRIMARY: usize = 4;
-const GAP_LIMIT: f32 = 2.0;
+const DEFAULT_MAX_MARGIN: f32 = 2.0;
+const MAX_MARGIN_ENV: &str = "CAMELID_GEMMA4_MTP12_TREE_MAX_MARGIN";
+
+fn parse_max_margin(value: Option<&str>) -> Result<f32> {
+    let Some(text) = value else { return Ok(DEFAULT_MAX_MARGIN); };
+    let margin = text.parse::<f32>().map_err(|_| {
+        invalid(format!("{MAX_MARGIN_ENV} must be a finite nonnegative number; got {text:?}"))
+    })?;
+    if !margin.is_finite() || margin.is_sign_negative() {
+        return Err(invalid(format!("{MAX_MARGIN_ENV} must be a finite nonnegative number; got {text:?}")));
+    }
+    Ok(margin)
+}
+
+fn max_margin_from_env() -> Result<f32> {
+    match std::env::var(MAX_MARGIN_ENV) {
+        Ok(value) => parse_max_margin(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_max_margin(None),
+        Err(error) => Err(invalid(format!("{MAX_MARGIN_ENV}: {error}"))),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Gemma4Mtp12TreeProposal {
@@ -107,6 +127,9 @@ kernel void mtp12_tree_top2_merge(
 "#;
 
 pub(super) struct TreeState {
+    // Read once on this assistant's first tree proposal. Ordinary linear
+    // drafting never reads the experimental selector or allocates this state.
+    max_margin: f32,
     partial: ComputePipelineState,
     merge: ComputePipelineState,
     partials: Buffer,
@@ -115,6 +138,7 @@ pub(super) struct TreeState {
 
 impl TreeState {
     fn new(device: &Device) -> Result<Self> {
+        let max_margin = max_margin_from_env()?;
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         let library = device
@@ -127,6 +151,7 @@ impl TreeState {
                 .map_err(invalid)
         };
         Ok(Self {
+            max_margin,
             partial: pipeline("mtp12_tree_top2_partial")?,
             merge: pipeline("mtp12_tree_top2_merge")?,
             partials: shared_buffer(device, MTP12_ARGMAX_MAX_PARTIALS * 16),
@@ -186,14 +211,14 @@ impl TreeState {
     }
 }
 
-fn select_branch(top: &[TopTwo; PRIMARY]) -> Option<usize> {
+fn select_branch(top: &[TopTwo; PRIMARY], max_margin: f32) -> Option<usize> {
     top.iter().position(|pair| {
         let gap = pair.values[0] - pair.values[1];
         pair.ids[0] < VOCAB as u32
             && pair.ids[1] < VOCAB as u32
             && pair.ids[0] != pair.ids[1]
             && gap.is_finite()
-            && (0.0..=GAP_LIMIT).contains(&gap)
+            && (0.0..=max_margin).contains(&gap)
     })
 }
 
@@ -342,6 +367,8 @@ impl Gemma4Mtp12AssistantMetal {
 
     /// Explicit W8 tree entry point. Caller must use ordinary linear drafting
     /// for shorter output-budget tails and must keep target verification authoritative.
+    /// `CAMELID_GEMMA4_MTP12_TREE_MAX_MARGIN` is read once on this assistant's
+    /// first tree call (default 2); a new assistant is required to change it.
     #[allow(clippy::too_many_arguments)]
     pub fn propose_tree_w8_from_cpu_hidden(
         &mut self,
@@ -456,7 +483,7 @@ impl Gemma4Mtp12AssistantMetal {
         }
         .try_into()
         .unwrap();
-        let branch = select_branch(&top);
+        let branch = select_branch(&top, self.tree_state.as_ref().unwrap().max_margin);
         let margins = std::array::from_fn(|i| top[i].values[0] - top[i].values[1]);
         let prepare = Instant::now();
         if let Some(step) = branch {
@@ -597,19 +624,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tree_max_margin_parse_is_explicit_and_defaults_to_two() {
+        assert_eq!(parse_max_margin(None).unwrap().to_bits(), 2.0f32.to_bits());
+        for (text, expected) in [("0", 0.0f32), ("0.5", 0.5), ("2", 2.0), ("2.5", 2.5), ("3e0", 3.0)] {
+            assert_eq!(parse_max_margin(Some(text)).unwrap().to_bits(), expected.to_bits());
+        }
+        for text in ["", " ", " 2", "2 ", "two", "2,5", "-1", "-0.5", "-0", "-1e-100", "NaN", "inf", "+inf", "-inf", "1e100"] {
+            assert!(parse_max_margin(Some(text)).is_err(), "must reject {text:?}");
+        }
+    }
+
+    #[test]
+    fn tree_max_margin_boundaries_preserve_first_eligible_and_linear_fallback() {
+        let wide = TopTwo { values: [4.0, 0.0], ids: [8, 9] };
+        let mut pairs = [wide; PRIMARY];
+        pairs[0].values[0] = f32::from_bits(2.5f32.to_bits() + 1);
+        pairs[1].values[0] = 2.5;
+        assert_eq!(select_branch(&pairs, 2.5), Some(1));
+        assert_eq!(select_branch(&pairs, 3.0), Some(0));
+        assert_eq!(select_branch(&pairs, DEFAULT_MAX_MARGIN), None);
+        assert_eq!(select_branch(&pairs, parse_max_margin(None).unwrap()), None);
+        let (parents, depths, primary) = topology(select_branch(&pairs, DEFAULT_MAX_MARGIN));
+        assert_eq!(parents, [-1, 0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(depths, (0..8).collect::<Vec<_>>());
+        assert_eq!(primary, (0..8).collect::<Vec<_>>());
+        pairs[0].values = [1.0, 1.0];
+        assert_eq!(select_branch(&pairs, 0.0), Some(0));
+        pairs[0].ids = [8, 8];
+        assert_eq!(select_branch(&pairs, 0.0), None);
+    }
+
+    #[test]
     fn tree_policy_keeps_first_threshold_crossing_and_valid_topology() {
         let wide = TopTwo {
             values: [3.0, 0.0],
             ids: [8, 9],
         };
         let mut pairs = [wide; PRIMARY];
-        assert_eq!(select_branch(&pairs), None);
+        assert_eq!(select_branch(&pairs, DEFAULT_MAX_MARGIN), None);
         pairs[2].values = [2.0, 0.0];
-        assert_eq!(select_branch(&pairs), Some(2));
+        assert_eq!(select_branch(&pairs, DEFAULT_MAX_MARGIN), Some(2));
         pairs[1].values = [1.0, 0.0];
-        assert_eq!(select_branch(&pairs), Some(1));
+        assert_eq!(select_branch(&pairs, DEFAULT_MAX_MARGIN), Some(1));
         pairs[0].values = [f32::INFINITY, f32::INFINITY];
-        assert_eq!(select_branch(&pairs), Some(1));
+        assert_eq!(select_branch(&pairs, DEFAULT_MAX_MARGIN), Some(1));
         for branch in [None, Some(0), Some(1), Some(2), Some(3)] {
             let (parents, depths, primary) = topology(branch);
             assert_eq!((parents[0], depths[0]), (-1, 0));

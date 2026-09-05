@@ -40,6 +40,10 @@ fn snapshot_view<'a>(
 #[test]
 #[ignore = "explicit local model, snapshot and captured oracle paths required"]
 fn tree_snapshot_primary_and_fork_bits() {
+    // These frozen captures and alternate-selection assertions qualify only
+    // the original threshold. An explicit experiment must use a new oracle.
+    assert_eq!(max_margin_from_env().unwrap().to_bits(), DEFAULT_MAX_MARGIN.to_bits(),
+        "captured tree replay requires the default max margin 2");
     let config: serde_json::Value = serde_json::from_slice(
         &std::fs::read(std::env::var("CAMELID_MTP12_TREE_ORACLE_CONFIG").unwrap()).unwrap(),
     )
