@@ -1,6 +1,7 @@
 //! Opt-in draft-only W8 tree. The ordinary resident-chain entry points do not
 //! call this module, allocate its scratch, or change their command sequence.
 use super::*;
+use crate::gemma4_mtp12_tree_menu as menu;
 #[cfg(test)]
 #[path = "gemma4_mtp12_tree_oracle.rs"]
 mod oracle;
@@ -18,6 +19,17 @@ fn parse_max_margin(value: Option<&str>) -> Result<f32> {
         return Err(invalid(format!("{MAX_MARGIN_ENV} must be a finite nonnegative number; got {text:?}")));
     }
     Ok(margin)
+}
+
+/// Read one selector once and parse it strictly, exactly like the margin
+/// selector: absent is the documented default, anything unparseable is an
+/// error rather than a silent fallback.
+fn env_once<T>(name: &str, parse: fn(Option<&str>) -> std::result::Result<T, String>) -> Result<T> {
+    match std::env::var(name) {
+        Ok(value) => parse(Some(&value)).map_err(invalid),
+        Err(std::env::VarError::NotPresent) => parse(None).map_err(invalid),
+        Err(error) => Err(invalid(format!("{name}: {error}"))),
+    }
 }
 
 fn max_margin_from_env() -> Result<f32> {
@@ -38,10 +50,28 @@ pub struct Gemma4Mtp12TreeProposal {
     pub depths: Vec<u32>,
     /// Physical rows of the ordinary primary chain, including the anchor.
     pub primary_rows: Vec<usize>,
-    /// Zero-based primary query where the rank-two fork was selected.
+    /// Zero-based primary query where the rank-two fork was selected. Under
+    /// every policy this stays the EARLIEST kept fork among the first four
+    /// forwards, or `None` on a linear tree, so existing receipt readers keep
+    /// their meaning; `fork_forwards` carries the rest.
     pub branch_primary_step: Option<usize>,
+    /// Every primary forward whose rank-two child this tree kept, ascending.
+    pub fork_forwards: Vec<usize>,
     pub primary_margins: [f32; PRIMARY],
-    /// Six forwards for a tree; seven for the no-eligible-branch linear fallback.
+    /// Top-1 minus top-2 logit of EVERY forward this round ran, in forward
+    /// order. Legacy records only its four primaries; the menu policies record
+    /// all of them, which is the out-of-sample data a recalibration needs.
+    pub forward_margins: Vec<f32>,
+    /// Rank-two id of every forward in `forward_margins`, same order.
+    pub runner_up_ids: Vec<u32>,
+    /// Modeled probability that each physical row is committed, row order.
+    /// Empty on the legacy path, whose continuations record no top-2.
+    pub node_p: Vec<f32>,
+    /// Selector value that produced this round: `legacy`, `dyn`, `fixed:<shape>`.
+    pub policy: String,
+    /// Named topology this round emitted, e.g. `4+1+2`, `5+1+1`, `lin7`.
+    pub shape: String,
+    /// Four to seven forwards, decided by the chosen shape.
     pub assistant_steps: usize,
     pub timing: Gemma4Mtp12ChainTiming,
     pub ledger: Gemma4Mtp12ChainLedger,
@@ -128,8 +158,11 @@ kernel void mtp12_tree_top2_merge(
 
 pub(super) struct TreeState {
     // Read once on this assistant's first tree proposal. Ordinary linear
-    // drafting never reads the experimental selector or allocates this state.
+    // drafting never reads the experimental selectors or allocates this state.
     max_margin: f32,
+    policy: menu::Policy,
+    lambda: f32,
+    calib: menu::Calibration,
     partial: ComputePipelineState,
     merge: ComputePipelineState,
     partials: Buffer,
@@ -139,6 +172,9 @@ pub(super) struct TreeState {
 impl TreeState {
     fn new(device: &Device) -> Result<Self> {
         let max_margin = max_margin_from_env()?;
+        let policy = env_once(menu::POLICY_ENV, menu::parse_policy)?;
+        let lambda = env_once(menu::LAMBDA_ENV, menu::parse_lambda)?;
+        let calib = env_once(menu::CALIB_ENV, menu::parse_calibration)?;
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         let library = device
@@ -152,10 +188,15 @@ impl TreeState {
         };
         Ok(Self {
             max_margin,
+            policy,
+            lambda,
+            calib,
             partial: pipeline("mtp12_tree_top2_partial")?,
             merge: pipeline("mtp12_tree_top2_merge")?,
             partials: shared_buffer(device, MTP12_ARGMAX_MAX_PARTIALS * 16),
-            results: shared_buffer(device, PRIMARY * 16),
+            // One TopTwo per forward, not per primary: the menu policies read
+            // the top-2 of the continuation forwards as well.
+            results: shared_buffer(device, MTP12_CHAIN_MAX_DRAFTS * 16),
         })
     }
 
@@ -443,6 +484,10 @@ impl Gemma4Mtp12AssistantMetal {
             self.resident_ledger.fixed_scratch_bytes += tree.byte_len();
             self.tree_state = Some(tree);
         }
+        let (policy, lambda, calib, max_margin) = {
+            let tree = self.tree_state.as_ref().expect("tree state just installed");
+            (tree.policy, tree.lambda, tree.calib, tree.max_margin)
+        };
         write_buffer_f32(&self.scratch.chain_initial_recurrent_hidden, initial_hidden)?;
         write_chain_rope_tables(proposal_position, 7, self.single_position, &self.scratch)?;
         unsafe {
@@ -513,30 +558,184 @@ impl Gemma4Mtp12AssistantMetal {
         }
         .try_into()
         .unwrap();
-        let branch = select_branch(&top, self.tree_state.as_ref().unwrap().max_margin);
-        let margins = std::array::from_fn(|i| top[i].values[0] - top[i].values[1]);
+        let margins: [f32; PRIMARY] =
+            std::array::from_fn(|i| top[i].values[0] - top[i].values[1]);
+        if policy == menu::Policy::Legacy {
+            // Byte-for-byte the qualified V3 proposal: the same earliest
+            // eligible fork rule, the same two argmax continuations off the
+            // rank-two slot, the same linear fallback and the same ledger.
+            let branch = select_branch(&top, max_margin);
+            let prepare = Instant::now();
+            if let Some(step) = branch {
+                unsafe {
+                    *self.scratch.output_token.contents().cast::<u32>().add(5) = top[step].ids[1];
+                }
+            }
+            timing.cpu_prepare_us += prepare.elapsed().as_micros();
+            let second = self.queue.new_command_buffer();
+            let encoder = second.new_compute_command_encoder();
+            let encoded = Instant::now();
+            let mut query_steps: Vec<usize> = (0..PRIMARY).collect();
+            if let Some(step) = branch {
+                for continuation in 0..2 {
+                    // Continuation A resumes from the forked primary's slot;
+                    // continuation B from A's own slot (history step 4).
+                    let history_slot = if continuation == 0 { step } else { 4 };
+                    let (recurrent, offset): (&BufferRef, u64) = (
+                        &self.scratch.chain_recurrent_hidden,
+                        (history_slot * TARGET_HIDDEN * 4) as u64,
+                    );
+                    let query = step + 1 + continuation;
+                    query_steps.push(query);
+                    self.encode_tree_step(
+                        encoder,
+                        table,
+                        sliding,
+                        full,
+                        target_kv_len,
+                        proposal_position,
+                        query,
+                        5 + continuation,
+                        6 + continuation,
+                        recurrent,
+                        offset,
+                        4 + continuation,
+                        &scores,
+                        false,
+                    );
+                }
+            } else {
+                for step in 4..7 {
+                    query_steps.push(step);
+                    self.encode_tree_step(
+                        encoder,
+                        table,
+                        sliding,
+                        full,
+                        target_kv_len,
+                        proposal_position,
+                        step,
+                        step,
+                        step + 1,
+                        &self.scratch.chain_recurrent_hidden,
+                        ((step - 1) * TARGET_HIDDEN * 4) as u64,
+                        step,
+                        &scores,
+                        false,
+                    );
+                }
+            }
+            encoder.end_encoding();
+            timing.encode_us += encoded.elapsed().as_micros();
+            second.commit();
+            let waited = Instant::now();
+            second.wait_until_completed();
+            timing.wait_us += waited.elapsed().as_micros();
+            if second.status() != MTLCommandBufferStatus::Completed {
+                return Err(invalid("tree continuation command failed"));
+            }
+            let (gpu, kernel) = super::super::command_buffer_gpu_times_us(&second.to_owned());
+            timing.gpu_us += gpu;
+            timing.kernel_us += kernel;
+            let tokens = unsafe {
+                std::slice::from_raw_parts(self.scratch.output_token.contents().cast::<u32>(), 8)
+            }
+            .to_vec();
+            if tokens.iter().any(|t| *t as usize >= VOCAB) {
+                return Err(invalid("tree returned invalid token"));
+            }
+            let (parents, depths, primary_rows) = topology(branch);
+            let mut kv_reads = 0u64;
+            for &step in &query_steps {
+                let compact = chain_query_position(proposal_position, step, self.single_position)
+                    .saturating_sub(LOCAL_WINDOW + 1)
+                    .min(target_kv_len);
+                kv_reads = kv_reads
+                    .checked_add(target_kv_read_bytes(
+                        target_kv_len - compact,
+                        target_kv_len,
+                    )?)
+                    .ok_or_else(|| invalid("tree KV read ledger overflow"))?;
+            }
+            let steps = query_steps.len();
+            let ledger = Gemma4Mtp12ChainLedger {
+                draft_k: 7,
+                command_buffers: 2,
+                command_buffer_waits: 2,
+                target_q6k_table_alias_bytes: table.wire.byte_len,
+                target_kv_alias_bytes: sliding.key.byte_len
+                    + sliding.value.byte_len
+                    + full.key.byte_len
+                    + full.value.byte_len,
+                assistant_matrix_read_bytes: self
+                    .dense_bf16
+                    .as_ref()
+                    .map_or(FULL_Q4_MATRIX_BYTES, |dense| {
+                        self.layout.embedding.byte_len + dense.byte_len()
+                    })
+                    * steps as u64,
+                target_kv_read_bytes: kv_reads,
+                dynamic_attention_scratch_bytes: scores.length(),
+                resident_chain_state_bytes: self.scratch.chain_initial_recurrent_hidden.length()
+                    + self.scratch.chain_recurrent_hidden.length()
+                    + self.scratch.output_token.length()
+                    + self.tree_state.as_ref().unwrap().byte_len(),
+                initial_hidden_upload_bytes: (TARGET_HIDDEN * 4) as u64,
+                readback_bytes: (PRIMARY * 16 + 8 * 4) as u64,
+            };
+            timing.wall_us = started.elapsed().as_micros();
+            return Ok(Gemma4Mtp12TreeProposal {
+                tokens,
+                parents,
+                depths,
+                primary_rows,
+                branch_primary_step: branch,
+                fork_forwards: branch.into_iter().collect(),
+                primary_margins: margins,
+                forward_margins: margins.to_vec(),
+                runner_up_ids: top.iter().map(|pair| pair.ids[1]).collect(),
+                // The legacy continuations use the argmax kernel, so they have
+                // no recorded rank-two answer and no modeled node probability.
+                node_p: Vec::new(),
+                policy: policy.name(),
+                shape: if branch.is_some() { "4+1+2" } else { "lin7" }.to_string(),
+                assistant_steps: steps,
+                timing,
+                ledger,
+            });
+        }
+        // Menu policies choose the shape from the four primary margins, run
+        // only the forwards that shape needs, and assemble the eight rows from
+        // the recorded top-2 of every forward.  The node set is fixed by the
+        // shape, never re-ranked, so the runtime can only emit topologies that
+        // `menu::gate_topologies` enumerates and the model gate covers.
+        let primary_top: [menu::ForwardTop; menu::PRIMARY] =
+            std::array::from_fn(|i| menu::ForwardTop::from_pair(top[i].values, top[i].ids, VOCAB));
+        let choices = menu::Menu::new(&primary_top, calib);
+        let shape = menu::choose(policy, &choices, lambda);
+        let alt_steps = choices
+            .alt_steps(shape)
+            .ok_or_else(|| invalid("tree policy chose a shape this round cannot build"))?;
+        let plan = menu::layout(shape, &alt_steps)
+            .ok_or_else(|| invalid("tree policy produced an unbuildable layout"))?;
         let prepare = Instant::now();
-        if let Some(step) = branch {
+        if let Some((slot, step)) = plan.runner_up_write {
+            // The expanded rank-two token is the only forward input the GPU
+            // does not write; slots 8.. never collide with the GPU's 1..=7.
             unsafe {
-                *self.scratch.output_token.contents().cast::<u32>().add(5) = top[step].ids[1];
+                *self.scratch.output_token.contents().cast::<u32>().add(slot) = top[step].ids[1];
             }
         }
         timing.cpu_prepare_us += prepare.elapsed().as_micros();
-        let second = self.queue.new_command_buffer();
-        let encoder = second.new_compute_command_encoder();
-        let encoded = Instant::now();
         let mut query_steps: Vec<usize> = (0..PRIMARY).collect();
-        if let Some(step) = branch {
-            for continuation in 0..2 {
-                // Continuation A resumes from the forked primary's slot;
-                // continuation B from A's own slot (history step 4).
-                let history_slot = if continuation == 0 { step } else { 4 };
-                let (recurrent, offset): (&BufferRef, u64) = (
-                    &self.scratch.chain_recurrent_hidden,
-                    (history_slot * TARGET_HIDDEN * 4) as u64,
-                );
-                let query = step + 1 + continuation;
-                query_steps.push(query);
+        let mut command_buffers = 1u32;
+        if !plan.cb2.is_empty() {
+            command_buffers = 2;
+            let second = self.queue.new_command_buffer();
+            let encoder = second.new_compute_command_encoder();
+            let encoded = Instant::now();
+            for spec in &plan.cb2 {
+                query_steps.push(spec.query_step);
                 self.encode_tree_step(
                     encoder,
                     table,
@@ -544,57 +743,59 @@ impl Gemma4Mtp12AssistantMetal {
                     full,
                     target_kv_len,
                     proposal_position,
-                    query,
-                    5 + continuation,
-                    6 + continuation,
-                    recurrent,
-                    offset,
-                    4 + continuation,
-                    &scores,
-                    false,
-                );
-            }
-        } else {
-            for step in 4..7 {
-                query_steps.push(step);
-                self.encode_tree_step(
-                    encoder,
-                    table,
-                    sliding,
-                    full,
-                    target_kv_len,
-                    proposal_position,
-                    step,
-                    step,
-                    step + 1,
+                    spec.query_step,
+                    spec.input_slot,
+                    spec.history_step + 1,
+                    // Always the explicit history slot of the forward that
+                    // produced this node's parent.  The live recurrent buffer
+                    // is never reused: CB2 interleaves parents (5+1+1 runs
+                    // chain node 5 and then a sibling from an earlier step).
                     &self.scratch.chain_recurrent_hidden,
-                    ((step - 1) * TARGET_HIDDEN * 4) as u64,
-                    step,
+                    (spec.recurrent_slot * TARGET_HIDDEN * 4) as u64,
+                    spec.history_step,
                     &scores,
-                    false,
+                    true,
                 );
             }
+            encoder.end_encoding();
+            timing.encode_us += encoded.elapsed().as_micros();
+            second.commit();
+            let waited = Instant::now();
+            second.wait_until_completed();
+            timing.wait_us += waited.elapsed().as_micros();
+            if second.status() != MTLCommandBufferStatus::Completed {
+                return Err(invalid("tree continuation command failed"));
+            }
+            let (gpu, kernel) = super::super::command_buffer_gpu_times_us(&second.to_owned());
+            timing.gpu_us += gpu;
+            timing.kernel_us += kernel;
         }
-        encoder.end_encoding();
-        timing.encode_us += encoded.elapsed().as_micros();
-        second.commit();
-        let waited = Instant::now();
-        second.wait_until_completed();
-        timing.wait_us += waited.elapsed().as_micros();
-        if second.status() != MTLCommandBufferStatus::Completed {
-            return Err(invalid("tree continuation command failed"));
-        }
-        let (gpu, kernel) = super::super::command_buffer_gpu_times_us(&second.to_owned());
-        timing.gpu_us += gpu;
-        timing.kernel_us += kernel;
-        let tokens = unsafe {
+        let steps = shape.forwards();
+        let gpu_tokens = unsafe {
             std::slice::from_raw_parts(self.scratch.output_token.contents().cast::<u32>(), 8)
         }
         .to_vec();
-        if tokens.iter().any(|t| *t as usize >= VOCAB) {
+        // Every forward records its own top-2 now, so the receipt carries the
+        // out-of-sample margins a later calibration needs.
+        let forward_top: Vec<menu::ForwardTop> = unsafe {
+            std::slice::from_raw_parts(
+                self.tree_state
+                    .as_ref()
+                    .unwrap()
+                    .results
+                    .contents()
+                    .cast::<TopTwo>(),
+                steps,
+            )
+        }
+        .iter()
+        .map(|pair| menu::ForwardTop::from_pair(pair.values, pair.ids, VOCAB))
+        .collect();
+        let finalized =
+            menu::finalize(&plan, &forward_top, &gpu_tokens, anchor_token, calib).map_err(invalid)?;
+        if finalized.tokens.iter().any(|t| *t as usize >= VOCAB) {
             return Err(invalid("tree returned invalid token"));
         }
-        let (parents, depths, primary_rows) = topology(branch);
         let mut kv_reads = 0u64;
         for &step in &query_steps {
             let compact = chain_query_position(proposal_position, step, self.single_position)
@@ -607,11 +808,11 @@ impl Gemma4Mtp12AssistantMetal {
                 )?)
                 .ok_or_else(|| invalid("tree KV read ledger overflow"))?;
         }
-        let steps = query_steps.len();
+        debug_assert_eq!(query_steps.len(), steps);
         let ledger = Gemma4Mtp12ChainLedger {
             draft_k: 7,
-            command_buffers: 2,
-            command_buffer_waits: 2,
+            command_buffers,
+            command_buffer_waits: command_buffers,
             target_q6k_table_alias_bytes: table.wire.byte_len,
             target_kv_alias_bytes: sliding.key.byte_len
                 + sliding.value.byte_len
@@ -631,16 +832,22 @@ impl Gemma4Mtp12AssistantMetal {
                 + self.scratch.output_token.length()
                 + self.tree_state.as_ref().unwrap().byte_len(),
             initial_hidden_upload_bytes: (TARGET_HIDDEN * 4) as u64,
-            readback_bytes: (PRIMARY * 16 + 8 * 4) as u64,
+            readback_bytes: (steps * 16 + (steps + 1) * 4) as u64,
         };
         timing.wall_us = started.elapsed().as_micros();
         Ok(Gemma4Mtp12TreeProposal {
-            tokens,
-            parents,
-            depths,
-            primary_rows,
-            branch_primary_step: branch,
+            tokens: finalized.tokens,
+            parents: finalized.parents,
+            depths: finalized.depths,
+            primary_rows: finalized.primary_rows,
+            branch_primary_step: finalized.branch_primary_step,
+            fork_forwards: finalized.fork_forwards,
             primary_margins: margins,
+            forward_margins: forward_top.iter().map(|pair| pair.margin).collect(),
+            runner_up_ids: forward_top.iter().map(|pair| pair.runner_up_id).collect(),
+            node_p: finalized.node_p,
+            policy: policy.name(),
+            shape: shape.name().to_string(),
             assistant_steps: steps,
             timing,
             ledger,
