@@ -6115,7 +6115,7 @@ mod tests {
         serde_json::to_vec(&serde_json::Value::Object(object)).expect("synthetic header")
     }
 
-    fn synthetic_q6k_embedding_row() -> Vec<u8> {
+    pub(super) fn synthetic_q6k_embedding_row() -> Vec<u8> {
         let mut row = vec![0u8; GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES as usize];
         let half_scales = [0.5f32, -0.125, 0.03125, -0.0078125, 0.001953125];
         for (block_index, block) in row.chunks_exact_mut(Q6_K_BLOCK_BYTES).enumerate() {
@@ -6199,7 +6199,7 @@ mod tests {
         }
     }
 
-    fn synthetic_assistant(device: &Device) -> Gemma4Mtp12AssistantMetal {
+    pub(super) fn synthetic_assistant(device: &Device) -> Gemma4Mtp12AssistantMetal {
         let (embedding, source_layers, pre, post) = source_geometry();
         let layout =
             Q4Layout::build(embedding, &source_layers, pre, post).expect("synthetic exact layout");
@@ -6266,7 +6266,7 @@ mod tests {
         }
     }
 
-    fn synthetic_kv(
+    pub(super) fn synthetic_kv(
         kv_heads: usize,
         head_dim: usize,
         logical_len: usize,
@@ -6295,7 +6295,7 @@ mod tests {
         (compact_key, compact_value, physical_key, physical_value)
     }
 
-    fn f32_view<'a>(
+    pub(super) fn f32_view<'a>(
         buffer: &'a Buffer,
         byte_offset: u64,
         elements: usize,
@@ -7915,7 +7915,7 @@ mod tests {
 
     /// BF16-valued activations in roughly [-4, 4] with zeros, negative zeros,
     /// BF16 denormals and tiny normals sprinkled in when `specials` is set.
-    fn random_bf16_values(count: usize, seed: u64, specials: bool) -> Vec<f32> {
+    pub(super) fn random_bf16_values(count: usize, seed: u64, specials: bool) -> Vec<f32> {
         let mut state = 0x2545_F491_4F6C_DD1Du64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (0..count)
             .map(|i| {
@@ -7938,7 +7938,7 @@ mod tests {
 
     /// Random Q4_0 blocks (f16 scale in about [-1, 1), random nibbles) at
     /// `byte_offset` inside a fresh buffer.
-    fn random_q4_weights(device: &Device, byte_offset: usize, byte_len: usize, seed: u64) -> Buffer {
+    pub(super) fn random_q4_weights(device: &Device, byte_offset: usize, byte_len: usize, seed: u64) -> Buffer {
         let weights = shared_buffer(device, byte_offset + byte_len);
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(weights.contents().cast::<u8>(), weights.length() as usize)
@@ -8208,7 +8208,7 @@ mod tests {
     /// Synthetic compact-head fixture: `rows` tokens with three random clusters
     /// each and a random `top`-of-2048 selection (about the production retained
     /// fraction).  Returns (token_clusters, selected).
-    fn synthetic_head_selection(device: &Device, rows: usize, top: usize, seed: u64) -> (Buffer, Buffer) {
+    pub(super) fn synthetic_head_selection(device: &Device, rows: usize, top: usize, seed: u64) -> (Buffer, Buffer) {
         let mut state = 0x5eed_5eedu64 ^ seed;
         let clusters: Vec<u16> = (0..rows)
             .flat_map(|_| {

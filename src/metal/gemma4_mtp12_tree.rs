@@ -787,4 +787,383 @@ mod tests {
             }
         }
     }
+
+    // ---- Ignored per-step benches for the W8 tree assistant -----------------
+    //
+    // Invoke (release, on the rig):
+    //   cargo test --release --lib gemma4_mtp12::tree::tests::assistant_tree_step_bench \
+    //     -- --ignored --nocapture
+    // Optional environment:
+    //   CAMELID_MTP12_BENCH_PREFIX=620,1500        prefix lengths (default)
+    //   CAMELID_GEMMA4_MTP12_ASSISTANT=1|<path>    real weights (default synthetic)
+    //   CAMELID_GEMMA4_MTP12_SHORTLIST=<sidecar>   real shortlist (real weights only)
+    //   CAMELID_GEMMA4_MTP12_SHORTLIST_COMPACT=1   the production compact head
+    // The fuse selectors are NOT read from the environment here: every
+    // configuration is written straight onto the assistant's `fuse` field, so
+    // one process measures them all.
+
+    const BENCH_REPS: usize = 20;
+    const BENCH_BUFFERS: usize = 5;
+
+    /// Prefix lengths from `CAMELID_MTP12_BENCH_PREFIX` (comma separated).
+    fn bench_prefixes() -> Vec<usize> {
+        let raw = std::env::var("CAMELID_MTP12_BENCH_PREFIX")
+            .unwrap_or_else(|_| "620,1500".to_string());
+        let prefixes: Vec<usize> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                text.parse::<usize>()
+                    .unwrap_or_else(|_| panic!("CAMELID_MTP12_BENCH_PREFIX entry {text:?} is not an integer"))
+            })
+            .collect();
+        assert!(!prefixes.is_empty(), "CAMELID_MTP12_BENCH_PREFIX listed no prefixes");
+        assert!(prefixes.iter().all(|p| *p > 0), "prefixes must be positive");
+        prefixes
+    }
+
+    /// Median over `BENCH_BUFFERS` command buffers of (hardware GPU time of one
+    /// buffer holding `BENCH_REPS` encodes) / `BENCH_REPS`, after one discarded
+    /// warm-up buffer.
+    fn bench_median_us(
+        queue: &metal::CommandQueue,
+        encode: &dyn Fn(&metal::ComputeCommandEncoderRef),
+    ) -> f64 {
+        let mut samples = Vec::with_capacity(BENCH_BUFFERS);
+        for pass in 0..=BENCH_BUFFERS {
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            for _ in 0..BENCH_REPS {
+                encode(encoder);
+            }
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+            if pass > 0 {
+                let (us, _) = crate::metal::command_buffer_gpu_times_us(&cb.to_owned());
+                samples.push(us as f64 / BENCH_REPS as f64);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    }
+
+    /// The four-layer body of [`Gemma4Mtp12AssistantMetal::encode_tree_step`]
+    /// at `query_step` 0, mirrored here so the bench can time it on its own.
+    /// Any change to the step's layer loop must be mirrored back.
+    fn bench_encode_layers(
+        assistant: &Gemma4Mtp12AssistantMetal,
+        encoder: &metal::ComputeCommandEncoderRef,
+        sliding: Gemma4Mtp12DeviceKv<'_>,
+        full: Gemma4Mtp12DeviceKv<'_>,
+        prefix: usize,
+        position: usize,
+        scores: &Buffer,
+    ) {
+        for layer in 0..N_LAYERS {
+            let local = layer < 3;
+            let (kv, heads, dim, cos, sin) = if local {
+                (sliding, LOCAL_KV_HEADS, LOCAL_HEAD_DIM,
+                 &assistant.scratch.local_cos, &assistant.scratch.local_sin)
+            } else {
+                (full, FULL_KV_HEADS, FULL_HEAD_DIM,
+                 &assistant.scratch.full_cos, &assistant.scratch.full_sin)
+            };
+            let compact = if local {
+                chain_query_position(position, 0, assistant.single_position)
+                    .saturating_sub(LOCAL_WINDOW + 1)
+                    .min(prefix)
+            } else {
+                0
+            };
+            let (next_norm, next_normed) = if layer + 1 < N_LAYERS {
+                (&assistant.layers[layer + 1].input_norm, &assistant.scratch.normed)
+            } else {
+                (&assistant.final_norm, &assistant.scratch.final_normalized)
+            };
+            assistant.encode_layer_k1_fused(
+                encoder, layer, kv.key.buffer, kv.value.buffer,
+                kv.key.byte_offset, kv.value.byte_offset, kv.max_positions,
+                heads, dim, prefix, compact, prefix - compact, cos, sin, 0,
+                scores, next_norm, next_normed,
+            );
+        }
+    }
+
+    /// One production assistant tree step (gather, pre GEMV, four layers, final
+    /// norm, post GEMV, draft head, top-2) at every prefix in
+    /// `CAMELID_MTP12_BENCH_PREFIX`, for the all-off baseline, each fusion
+    /// selector on its own, the leveled staged-GEMV variants, two hand-picked
+    /// combinations and the per-selector best combination; plus a single-stage
+    /// breakdown of the all-off step so the round cost can be attributed.
+    #[test]
+    #[ignore]
+    fn assistant_tree_step_bench() {
+        let Some(default_device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping assistant tree-step bench");
+            return;
+        };
+        let requested = std::env::var("CAMELID_GEMMA4_MTP12_ASSISTANT").ok();
+        let mut assistant = match requested.as_deref() {
+            None => {
+                eprintln!("[mtp12-tree-bench] weights SYNTHETIC (sparse unit weights in a full-size \
+                           Q4_0 pack: bandwidth-representative, numerically trivial). Set \
+                           CAMELID_GEMMA4_MTP12_ASSISTANT=1 for the staged official assistant.");
+                super::super::tests::synthetic_assistant(&default_device)
+            }
+            Some("1") | Some("true") => {
+                eprintln!("[mtp12-tree-bench] weights REAL (staged official assistant)");
+                Gemma4Mtp12AssistantMetal::load_staged_official().expect("staged official assistant")
+            }
+            Some(path) => {
+                eprintln!("[mtp12-tree-bench] weights REAL ({path})");
+                Gemma4Mtp12AssistantMetal::load(std::path::Path::new(path)).expect("assistant")
+            }
+        };
+        let device = assistant.packed_q4.device().to_owned();
+        let queue = device.new_command_queue();
+
+        if assistant.shortlist.is_none() {
+            // Zero centroids score every cluster 0, so the stable top-T keeps
+            // clusters 0..top-1; against a uniformly random three-cluster
+            // assignment that retains 1 - (1 - 384/2048)^3 = 46.4% of the
+            // vocabulary, the production shortlist's retained fraction.
+            let (token_clusters, selected) =
+                super::super::tests::synthetic_head_selection(&device, VOCAB, 384, 0xb0a7);
+            assistant.shortlist = Some(Mtp12Shortlist {
+                centroids: f32_buffer(&device, &vec![0.0f32; MTP12_SHORTLIST_CLUSTERS * ASSISTANT_HIDDEN])
+                    .expect("bench centroids"),
+                token_clusters,
+                scores: shared_buffer(&device, MTP12_SHORTLIST_CLUSTERS * 4),
+                selected,
+                top: 384,
+            });
+            eprintln!("[mtp12-tree-bench] shortlist SYNTHETIC top=384/2048 (~46.4% of vocab retained)");
+        } else {
+            eprintln!("[mtp12-tree-bench] shortlist REAL (CAMELID_GEMMA4_MTP12_SHORTLIST)");
+        }
+        eprintln!(
+            "[mtp12-tree-bench] compact head {} (CAMELID_GEMMA4_MTP12_SHORTLIST_COMPACT), attn_v2 {}, \
+             {BENCH_REPS} encodes/buffer, median of {BENCH_BUFFERS} buffers",
+            if mtp12_shortlist_compact_enabled() { "ON" } else { "OFF - masked full head" },
+            if mtp12_attention_v2_enabled() { "ON" } else { "OFF" },
+        );
+        assistant.tree_state = Some(TreeState::new(&device).expect("tree state"));
+
+        let prefixes = bench_prefixes();
+        let capacity = prefixes.iter().copied().max().expect("prefixes") + 32;
+        let table_offset = 32u64;
+        let table_buffer = shared_buffer(
+            &device,
+            (table_offset + GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES + 32) as usize,
+        );
+        let q6_row = super::super::tests::synthetic_q6k_embedding_row();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                q6_row.as_ptr(),
+                table_buffer.contents().cast::<u8>().add(table_offset as usize),
+                q6_row.len(),
+            );
+        }
+        let table = Gemma4Mtp12Q6KEmbeddingTable {
+            wire: Gemma4Mtp12MetalBufferView {
+                buffer: &table_buffer,
+                byte_offset: table_offset,
+                byte_len: GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES,
+            },
+            hidden: TARGET_HIDDEN,
+            vocab: VOCAB,
+            target_model_sha256: GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
+        };
+
+        let (_, _, sliding_key, sliding_value) =
+            super::super::tests::synthetic_kv(LOCAL_KV_HEADS, LOCAL_HEAD_DIM, capacity - 32, capacity, 3);
+        let (_, _, full_key, full_value) =
+            super::super::tests::synthetic_kv(FULL_KV_HEADS, FULL_HEAD_DIM, capacity - 32, capacity, 19);
+        let kv_buffer = |values: &[f32]| f32_buffer(&device, values).expect("bench KV buffer");
+        let sliding_key_buffer = kv_buffer(&sliding_key);
+        let sliding_value_buffer = kv_buffer(&sliding_value);
+        let full_key_buffer = kv_buffer(&full_key);
+        let full_value_buffer = kv_buffer(&full_value);
+        let sliding = Gemma4Mtp12DeviceKv {
+            key: super::super::tests::f32_view(&sliding_key_buffer, 0, sliding_key.len()),
+            value: super::super::tests::f32_view(&sliding_value_buffer, 0, sliding_value.len()),
+            source_layer: GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
+            kv_heads: LOCAL_KV_HEADS,
+            head_dim: LOCAL_HEAD_DIM,
+            max_positions: capacity,
+        };
+        let full = Gemma4Mtp12DeviceKv {
+            key: super::super::tests::f32_view(&full_key_buffer, 0, full_key.len()),
+            value: super::super::tests::f32_view(&full_value_buffer, 0, full_value.len()),
+            source_layer: GEMMA4_12B_MTP_FULL_HOST_LAYER,
+            kv_heads: FULL_KV_HEADS,
+            head_dim: FULL_HEAD_DIM,
+            max_positions: capacity,
+        };
+
+        let staged = |level: u8, rows: u32| Mtp12FuseFlags {
+            gemv_x4: level,
+            gemv_staged_rows: rows,
+            ..Mtp12FuseFlags::default()
+        };
+        let mut singles: Vec<(String, Mtp12FuseFlags)> = vec![
+            ("GEMV_X4=1".to_string(), Mtp12FuseFlags { gemv_x4: 1, ..Default::default() }),
+        ];
+        for level in [2u8, 3] {
+            for rows in [2u32, 4, 8] {
+                singles.push((format!("GEMV_X4={level} STAGED_ROWS={rows}"), staged(level, rows)));
+            }
+        }
+        singles.push(("GATEUP=1".to_string(), Mtp12FuseFlags { gate_up: true, ..Default::default() }));
+        singles.push(("NORM=1".to_string(), Mtp12FuseFlags { norm: true, ..Default::default() }));
+        singles.push(("QROPE=1".to_string(), Mtp12FuseFlags { qrope: true, ..Default::default() }));
+        for level in 1u8..=3 {
+            singles.push((format!("SOFTMAX_CTX={level}"), Mtp12FuseFlags { softmax_ctx: level, ..Default::default() }));
+        }
+        for level in 1u8..=2 {
+            singles.push((format!("HEAD_PREFETCH={level}"), Mtp12FuseFlags { head_prefetch: level, ..Default::default() }));
+        }
+
+        for &prefix in &prefixes {
+            let position = prefix;
+            write_chain_rope_tables(position, 7, assistant.single_position, &assistant.scratch)
+                .expect("bench rope tables");
+            let scores = shared_buffer(&device, N_HEADS * prefix * 4);
+            let local_window = chain_query_position(position, 0, assistant.single_position)
+                .saturating_sub(LOCAL_WINDOW + 1)
+                .min(prefix);
+            eprintln!(
+                "\n[mtp12-tree-bench] ==== prefix {prefix} (query position {position}; sliding \
+                 attends {} of {prefix}, full attends {prefix}) ====",
+                prefix - local_window
+            );
+
+            let step = |assistant: &Gemma4Mtp12AssistantMetal, encoder: &metal::ComputeCommandEncoderRef| {
+                assistant.encode_tree_step(
+                    encoder, table, sliding, full, prefix, position, 0, 0, 1,
+                    &assistant.scratch.chain_initial_recurrent_hidden, 0, 0, &scores, true,
+                );
+            };
+
+            assistant.fuse = Mtp12FuseFlags::default();
+            let baseline = bench_median_us(&queue, &|encoder| step(&assistant, encoder));
+            eprintln!("[mtp12-tree-bench] {:<34} {baseline:9.1} us/step", "all-off (baseline)");
+
+            let mut measured: Vec<(String, Mtp12FuseFlags, f64)> = Vec::new();
+            for (label, flags) in &singles {
+                assistant.fuse = *flags;
+                let us = bench_median_us(&queue, &|encoder| step(&assistant, encoder));
+                eprintln!(
+                    "[mtp12-tree-bench] {label:<34} {us:9.1} us/step  {:+6.1}%",
+                    (us - baseline) * 100.0 / baseline
+                );
+                measured.push((label.clone(), *flags, us));
+            }
+
+            // Per-selector best (never worse than off), then the combinations.
+            let best = |pick: &dyn Fn(&Mtp12FuseFlags) -> bool| -> Option<(String, Mtp12FuseFlags, f64)> {
+                measured
+                    .iter()
+                    .filter(|(_, flags, us)| pick(flags) && *us < baseline)
+                    .min_by(|a, b| a.2.total_cmp(&b.2))
+                    .cloned()
+            };
+            let best_gemv = best(&|f| f.gemv_x4 != 0);
+            let best_softmax = best(&|f| f.softmax_ctx != 0);
+            let best_head = best(&|f| f.head_prefetch != 0);
+            let best_gateup = best(&|f| f.gate_up);
+            let best_norm = best(&|f| f.norm);
+            let best_qrope = best(&|f| f.qrope);
+            let mut all_on = Mtp12FuseFlags::default();
+            if let Some((_, f, _)) = &best_gemv {
+                all_on.gemv_x4 = f.gemv_x4;
+                all_on.gemv_staged_rows = f.gemv_staged_rows;
+            }
+            if let Some((_, f, _)) = &best_softmax { all_on.softmax_ctx = f.softmax_ctx; }
+            if let Some((_, f, _)) = &best_head { all_on.head_prefetch = f.head_prefetch; }
+            all_on.gate_up = best_gateup.is_some();
+            all_on.norm = best_norm.is_some();
+            all_on.qrope = best_qrope.is_some();
+
+            let mut norm_qrope = Mtp12FuseFlags { norm: true, qrope: true, ..Default::default() };
+            let mut combos = vec![("NORM=1 QROPE=1".to_string(), norm_qrope)];
+            norm_qrope.head_prefetch = best_head.as_ref().map_or(2, |(_, f, _)| f.head_prefetch);
+            combos.push((
+                format!("NORM=1 QROPE=1 HEAD_PREFETCH={}", norm_qrope.head_prefetch),
+                norm_qrope,
+            ));
+            combos.push((format!("all-on-best {all_on:?}"), all_on));
+            for (label, flags) in combos {
+                assistant.fuse = flags;
+                let us = bench_median_us(&queue, &|encoder| step(&assistant, encoder));
+                eprintln!(
+                    "[mtp12-tree-bench] {label:<34} {us:9.1} us/step  {:+6.1}%",
+                    (us - baseline) * 100.0 / baseline
+                );
+            }
+
+            // Single-stage breakdown of the all-off step.  The stages are
+            // encoded independently, so they do not overlap and their sum
+            // exceeds the fused step by the per-dispatch launch cost.
+            assistant.fuse = Mtp12FuseFlags::default();
+            let gather_pre = bench_median_us(&queue, &|encoder| {
+                encode_q6k_embedding_and_recurrent_gather(
+                    encoder, &assistant.pipelines.gather_q6k_embedding_and_recurrent,
+                    &assistant.scratch.output_token, 0, table,
+                    &assistant.scratch.chain_initial_recurrent_hidden, 0,
+                    &assistant.scratch.pre_input,
+                );
+                assistant.encode_dense_gemv(
+                    encoder, &assistant.scratch.pre_input, &assistant.scratch.hidden,
+                    assistant.layout.pre_projection, true,
+                );
+            });
+            let layers = bench_median_us(&queue, &|encoder| {
+                bench_encode_layers(&assistant, encoder, sliding, full, prefix, position, &scores);
+            });
+            let post_final = bench_median_us(&queue, &|encoder| {
+                encode_rms_norm(
+                    encoder, &assistant.pipelines.rms_norm, &assistant.scratch.hidden,
+                    &assistant.final_norm, &assistant.scratch.final_normalized, ASSISTANT_HIDDEN, 1,
+                );
+                // The step's test-only draft-query dump, kept here so the
+                // stages account for every dispatch the measured step issues.
+                encode_copy_f32_to_offset(
+                    encoder, &assistant.pipelines.copy_f32, &assistant.scratch.final_normalized,
+                    &assistant.scratch.chain_final_normalized, 0, ASSISTANT_HIDDEN,
+                );
+                assistant.encode_dense_gemv_at_offset(
+                    encoder, &assistant.scratch.final_normalized,
+                    &assistant.scratch.chain_recurrent_hidden, 0,
+                    assistant.layout.post_projection, true,
+                );
+            });
+            let head = bench_median_us(&queue, &|encoder| assistant.encode_draft_head(encoder));
+            let top2 = bench_median_us(&queue, &|encoder| {
+                assistant.tree_state.as_ref().unwrap().encode(
+                    encoder, &assistant.scratch.logits, &assistant.scratch.output_token, 0, VOCAB,
+                );
+            });
+            let sum = gather_pre + layers + post_final + head + top2;
+            for (label, us) in [
+                ("gather + pre GEMV", gather_pre),
+                ("4 layers", layers),
+                ("final norm + post GEMV", post_final),
+                ("compact draft head", head),
+                ("tree top2", top2),
+            ] {
+                eprintln!(
+                    "[mtp12-tree-bench]   stage {label:<26} {us:9.1} us  {:5.1}% of stage sum",
+                    us * 100.0 / sum
+                );
+            }
+            eprintln!(
+                "[mtp12-tree-bench]   stage {:<26} {sum:9.1} us  (fused step {baseline:.1} us)",
+                "sum"
+            );
+        }
+    }
 }
