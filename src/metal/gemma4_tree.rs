@@ -415,7 +415,7 @@ fn encode_tree_attention_inner(
         metal::MTLSize {
             width: n_heads as u64,
             height: ROWS as u64,
-            depth: score_blocks as u64,
+            depth: 1,
         },
         tg32,
     );

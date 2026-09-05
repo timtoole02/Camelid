@@ -32,13 +32,15 @@ kernel void gemma4_tree_scores_suffix(
     uint position_stride = args.position_stride;
     uint kv_base = args.kv_base_offset + kv_head * args.kv_head_stride;
     uint score_base = meta.z + head * position_count;
-    uint stride = 32u * args.score_blocks;
     float scale = args.scale;
-
-    for (uint p = lane + tg.z * 32u; p < position_count; p += stride) {
-        uint logical_position = meta.x + p;
-        if (logical_position < tree_base) continue;
-        uint physical_position = tree_base + ancestors[row * 8u + logical_position - tree_base];
+    // One group handles this node's <=8 suffix positions. Committed-prefix
+    // score groups already ran; no context-sized grid of empty work is needed.
+    const uint suffix_count = meta.w - tree_base;
+    for (uint suffix = lane; suffix < suffix_count; suffix += 32u) {
+        uint logical_position = tree_base + suffix;
+        if (logical_position < meta.x) continue;
+        uint p = logical_position - meta.x;
+        uint physical_position = tree_base + ancestors[row * 8u + suffix];
         uint k_base = kv_base + physical_position * position_stride;
         float s = 0.0;
         for (uint d = 0; d < head_dim; ++d) {
