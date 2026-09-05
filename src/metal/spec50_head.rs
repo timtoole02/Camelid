@@ -1524,6 +1524,20 @@ fn compile_spec50_mma_head_kernels(form: Spec50HeadForm) -> Option<Spec50MmaHead
         );
         return None;
     }
+    eprintln!(
+        "[metal] SPEC50 MMA head form {:?}: K8, 3840-wide, {} simdgroups, {}, exact unit fold",
+        form.name,
+        form.simdgroups,
+        if form.lean == 1 {
+            if form.prefetch == 1 {
+                "lean decode + hoisted unit loads"
+            } else {
+                "lean decode"
+            }
+        } else {
+            "established decode"
+        }
+    );
     Some(Spec50MmaHeadKernels { expand, batch })
 }
 
@@ -3243,6 +3257,619 @@ mod tests {
             run(old_label, false, false);
             run("NEW q6k_spec50_batch", true, false);
             run("NEW spec50 + argmax", true, true);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // SPEC50 head form: GPU-vs-GPU bit equality and the geometry/form bench.
+    // ---------------------------------------------------------------------
+
+    /// Every form the selector admits. `base` is deliberately first so the
+    /// comparisons below always have their oracle in hand.
+    fn spec50_bench_forms() -> Vec<Spec50HeadForm> {
+        SPEC50_NAMED_FORMS.to_vec()
+    }
+
+    /// Adversarial Q8_K activation sets for the K8 head. All are exactly
+    /// representable and none produces a NaN, so a `to_bits` comparison is
+    /// total.
+    ///
+    /// 0 random; 1 all-zero quants (every logit collapses onto the softcap's
+    /// fixed point, so the whole vocabulary ties and the argmax tie rule alone
+    /// decides); 2 f32-subnormal scales; 3 huge scales with saturating quants
+    /// (the softcap pins the result); 4 signed zeros (+0 and -0 logits, which
+    /// the total-order argmax key distinguishes); 5 alternating extreme quants.
+    fn build_adversarial_activations(
+        rng: &mut Rng,
+        k: usize,
+        hidden: usize,
+        n_superblocks: usize,
+        kind: usize,
+    ) -> (Vec<f32>, Vec<i8>) {
+        let n = k * n_superblocks;
+        match kind {
+            1 => (vec![0.0; n], vec![0i8; k * hidden]),
+            2 => (
+                (0..n).map(|i| f32::from_bits(1 + (i as u32 % 64))).collect(),
+                (0..k * hidden).map(|_| rng.byte() as i8).collect(),
+            ),
+            3 => (
+                (0..n)
+                    .map(|i| if i % 2 == 0 { 3.0e30 } else { -3.0e30 })
+                    .collect(),
+                (0..k * hidden)
+                    .map(|i| if i % 2 == 0 { 127i8 } else { -128i8 })
+                    .collect(),
+            ),
+            4 => (
+                (0..n).map(|i| if i % 3 == 0 { -0.0 } else { 0.0 }).collect(),
+                (0..k * hidden).map(|_| rng.byte() as i8).collect(),
+            ),
+            5 => (
+                (0..n).map(|i| 1.0 / (1 + i as u32 % 7) as f32).collect(),
+                (0..k * hidden)
+                    .map(|i| match i % 4 {
+                        0 => 127i8,
+                        1 => -128i8,
+                        2 => 0i8,
+                        _ => -1i8,
+                    })
+                    .collect(),
+            ),
+            _ => build_activations_for(rng, k, hidden, n_superblocks),
+        }
+    }
+
+    /// A Q6_K table whose rows contain deliberate duplicates: two runs of
+    /// sixteen byte-identical rows, so those rows produce exactly equal logits
+    /// and the argmax tie rule (highest id wins an exact tie) is exercised on
+    /// every activation set, not only the degenerate ones.
+    fn build_weights_with_ties(rng: &mut Rng, rows: usize, n_superblocks: usize) -> Vec<u8> {
+        let row_bytes = n_superblocks * Q6K_WIRE;
+        let mut w = build_weights_for(rng, rows, n_superblocks);
+        for (first, len) in [(101usize, 16usize), (rows.saturating_sub(20), 16)] {
+            if first + len > rows {
+                continue;
+            }
+            let source: Vec<u8> = w[first * row_bytes..(first + 1) * row_bytes].to_vec();
+            for row in first + 1..first + len {
+                w[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(&source);
+            }
+        }
+        w
+    }
+
+    /// Run one K8 head form over the whole table and return (logit bits, ids).
+    #[allow(clippy::too_many_arguments)]
+    fn run_mma8_form(
+        refs: &RefKernels,
+        kernels: &Spec50HeadKernels,
+        sbuf: &Buffer,
+        qbuf: &Buffer,
+        fbuf: &Buffer,
+        wbuf: &Buffer,
+        n_superblocks: usize,
+        rows: usize,
+        hidden: usize,
+        softcap: f32,
+        form: Spec50HeadForm,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let out = shared(&refs.device, 8 * rows * 4);
+        let ids = shared(&refs.device, 8 * 4);
+        let vals = shared(&refs.device, 8 * 4);
+        let cb = refs.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        assert!(
+            encode_q6k_spec50_mma8_form(
+                e,
+                sbuf,
+                qbuf,
+                fbuf,
+                wbuf,
+                0,
+                &out,
+                n_superblocks,
+                rows,
+                8,
+                hidden,
+                softcap,
+                form,
+            ),
+            "form {:?} refused a K8 12B encode",
+            form.name
+        );
+        encode_q6k_spec50_argmax(e, kernels, &out, &ids, &vals, rows, 8);
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+        let mut logits = vec![0.0f32; 8 * rows];
+        read_buffer_f32(&out, &mut logits);
+        let mut id_values = vec![0u32; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ids.contents().cast::<u32>(),
+                id_values.as_mut_ptr(),
+                8,
+            );
+        }
+        (
+            logits.iter().map(|value| value.to_bits()).collect(),
+            id_values,
+        )
+    }
+
+    /// GPU vs GPU: every admitted `CAMELID_GEMMA4_SPEC50_HEAD_FORM` value must
+    /// reproduce the established `q6k_spec50_mma_k8` logits BIT for BIT and the
+    /// same greedy ids, on random and adversarial activations, with and without
+    /// the softcap, on a table that contains exact vocabulary ties and a ragged
+    /// final eight-row tile.
+    ///
+    /// K=1/2/4 are covered too: the MMA path is admitted at K=8 only, so the
+    /// test asserts every form refuses those widths (the selector cannot leak
+    /// into them) and that the geometry path they fall back to is unchanged.
+    #[test]
+    fn spec50_head_form_variants_are_bitwise_identical() {
+        const HIDDEN_12B: usize = 3840;
+        const N_SB_12B: usize = HIDDEN_12B / 256;
+        const ROWS: usize = 2051;
+        if Device::system_default().is_none() {
+            return;
+        }
+        let refs = reference_kernels();
+        let kernels = spec50_head_kernels_for(HIDDEN_12B).expect("spec50 pipelines");
+        let mut rng = Rng(0xf0e1_d2c3_b4a5_9687);
+        let weights = build_weights_with_ties(&mut rng, ROWS, N_SB_12B);
+        let wbuf = shared(&refs.device, weights.len());
+        write_buffer_u8(&wbuf, &weights);
+        let fbuf = shared(&refs.device, spec50_activation_scratch_bytes(8, HIDDEN_12B));
+        let forms = spec50_bench_forms();
+        assert_eq!(forms[0], SPEC50_FORM_BASE);
+
+        let mut ties_seen = 0usize;
+        for kind in 0..6usize {
+            let (scales, quants) =
+                build_adversarial_activations(&mut rng, 8, HIDDEN_12B, N_SB_12B, kind);
+            let sbuf = shared(&refs.device, scales.len() * 4);
+            write_buffer_f32(&sbuf, &scales);
+            let qbuf = shared(&refs.device, quants.len());
+            write_buffer_i8(&qbuf, &quants);
+            for softcap in [0.0f32, SOFTCAP] {
+                let (base_logits, base_ids) = run_mma8_form(
+                    &refs, kernels, &sbuf, &qbuf, &fbuf, &wbuf, N_SB_12B, ROWS, HIDDEN_12B,
+                    softcap, SPEC50_FORM_BASE,
+                );
+                // The duplicated rows must actually collide, or the tie rule
+                // was never reached on this input.
+                for t in 0..8 {
+                    let row = &base_logits[t * ROWS..(t + 1) * ROWS];
+                    if row[101] == row[102] {
+                        ties_seen += 1;
+                    }
+                }
+                for form in forms.iter().skip(1) {
+                    let (logits, ids) = run_mma8_form(
+                        &refs, kernels, &sbuf, &qbuf, &fbuf, &wbuf, N_SB_12B, ROWS, HIDDEN_12B,
+                        softcap, *form,
+                    );
+                    let bad = (0..8 * ROWS)
+                        .filter(|&i| logits[i] != base_logits[i])
+                        .count();
+                    assert_eq!(
+                        bad, 0,
+                        "form {:?} kind={kind} cap={softcap}: {bad} of {} logits differ from the established K8 head",
+                        form.name,
+                        8 * ROWS
+                    );
+                    assert_eq!(
+                        ids, base_ids,
+                        "form {:?} kind={kind} cap={softcap}: greedy ids differ",
+                        form.name
+                    );
+                }
+            }
+        }
+        assert!(
+            ties_seen > 0,
+            "the duplicated vocabulary rows never produced an exact tie"
+        );
+
+        // K < 8: the MMA path is admitted at K=8 only, so no form may encode
+        // it, and the geometry fallback must be form-independent.
+        let mut rng = Rng(0x0102_0304_0506_0708);
+        let (scales, quants) = build_activations_for(&mut rng, 8, HIDDEN_12B, N_SB_12B);
+        let sbuf = shared(&refs.device, scales.len() * 4);
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        for k in [1usize, 2, 4] {
+            let mut expected: Option<Vec<u32>> = None;
+            for form in &forms {
+                let out = shared(&refs.device, k * ROWS * 4);
+                {
+                    let cb = refs.queue.new_command_buffer();
+                    let e = cb.new_compute_command_encoder();
+                    let encoded = encode_q6k_spec50_mma8_form(
+                        e, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k, HIDDEN_12B,
+                        SOFTCAP, *form,
+                    );
+                    e.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    assert!(
+                        !encoded,
+                        "form {:?} encoded the MMA head at K={k}, which it is not qualified for",
+                        form.name
+                    );
+                }
+                let cb = refs.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                assert!(encode_q6k_spec50_batch_with_form(
+                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k,
+                    HIDDEN_12B, SOFTCAP, *form,
+                ));
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                let mut logits = vec![0.0f32; k * ROWS];
+                read_buffer_f32(&out, &mut logits);
+                let bits: Vec<u32> = logits.iter().map(|value| value.to_bits()).collect();
+                match &expected {
+                    None => expected = Some(bits),
+                    Some(expected) => assert_eq!(
+                        &bits, expected,
+                        "form {:?} changed the K={k} geometry fallback",
+                        form.name
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The form selector parser: names, the generic form, and refusals.
+    #[test]
+    fn spec50_head_form_selector_parses_names_and_generic_form() {
+        assert_eq!(Spec50HeadForm::parse("base"), Some(SPEC50_FORM_BASE));
+        assert_eq!(Spec50HeadForm::parse(" BASE "), Some(SPEC50_FORM_BASE));
+        assert_eq!(
+            Spec50HeadForm::parse("sg8-lean0-pf0"),
+            Some(Spec50HeadForm { name: "custom", simdgroups: 8, lean: 0, prefetch: 0 })
+        );
+        assert_eq!(
+            Spec50HeadForm::parse("lean-pf-sg8").map(|form| (form.simdgroups, form.lean, form.prefetch)),
+            Some((8, 1, 1))
+        );
+        assert_eq!(
+            Spec50HeadForm::parse("sg2-lean1-pf1").map(|form| form.threads_per_tg()),
+            Some(64)
+        );
+        // Refusals: an unknown field, a missing field, an unsupported simdgroup
+        // count, and prefetch on the established body (which has no such entry).
+        assert_eq!(Spec50HeadForm::parse("sg8-rb4-lean0-pf0"), None);
+        assert_eq!(Spec50HeadForm::parse("sg8-lean1"), None);
+        assert_eq!(Spec50HeadForm::parse("sg3-lean0-pf0"), None);
+        assert_eq!(Spec50HeadForm::parse("sg4-lean0-pf1"), None);
+        assert_eq!(Spec50HeadForm::parse(""), None);
+        for form in SPEC50_NAMED_FORMS {
+            assert!(form.admitted(), "named form {:?} is not admitted", form.name);
+        }
+    }
+
+    /// Fill `dst` with the real 262,144 x 3,840 Q6_K tied head from the GGUF at
+    /// `CAMELID_MTP12_TEST_MODEL`, if that variable is set and the file holds a
+    /// Q6_K tensor of exactly that shape. Returns the tensor name it used.
+    fn load_real_q6k_head(dst: &mut [u8], rows: usize, hidden: usize) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = std::env::var("CAMELID_MTP12_TEST_MODEL").ok()?;
+        let gguf = match crate::gguf::read_metadata(&path) {
+            Ok(gguf) => gguf,
+            Err(err) => {
+                eprintln!("[spec50-head-bench] CAMELID_MTP12_TEST_MODEL={path:?}: {err}");
+                return None;
+            }
+        };
+        let wanted = [hidden as u64, rows as u64];
+        let tensor = ["output.weight", "token_embd.weight"]
+            .iter()
+            .find_map(|name| {
+                gguf.tensors.iter().find(|tensor| {
+                    tensor.name == *name
+                        && tensor.tensor_type == crate::gguf::GgufTensorType::Q6K
+                        && tensor.dimensions.as_slice() == wanted
+                        && tensor.n_bytes as usize == dst.len()
+                })
+            })?;
+        let mut file = std::fs::File::open(&gguf.path).ok()?;
+        file.seek(SeekFrom::Start(tensor.absolute_offset)).ok()?;
+        file.read_exact(dst).ok()?;
+        Some(tensor.name.clone())
+    }
+
+    /// Admitted geometries the bench sweeps. `core` (the default) is the grid
+    /// that separates the knobs; `CAMELID_SPEC50_BENCH_GRID=full` walks the
+    /// whole product the selector can express, which is ~360 shader compiles.
+    fn spec50_bench_geometries(full: bool) -> Vec<Spec50Geometry> {
+        let mut out: Vec<Spec50Geometry> = Vec::new();
+        let mut push = |rb: usize, rg: usize, sg: usize, flat: u32, yfmt: u32| {
+            let geometry = Spec50Geometry {
+                name: "sweep",
+                rows_per_sg: rb,
+                rows_per_step: rg,
+                sg_per_tg: sg,
+                flat,
+                yfmt,
+            };
+            if geometry.admitted() && !out.iter().any(|seen: &Spec50Geometry| {
+                (seen.rows_per_sg, seen.rows_per_step, seen.sg_per_tg, seen.flat, seen.yfmt)
+                    == (rb, rg, sg, flat, yfmt)
+            }) {
+                out.push(geometry);
+            }
+        };
+        let (rbs, rgs, sgs, yfmts): (&[usize], &[usize], &[usize], &[u32]) = if full {
+            (&[1, 2, 4, 8, 16, 32], &[1, 2, 4, 8], &[1, 2, 4, 8, 16], &[0, 1, 2])
+        } else {
+            (&[4, 8, 16], &[1, 2, 4], &[2, 4, 8], &[2])
+        };
+        for &rb in rbs {
+            for &rg in rgs {
+                if !rb.is_multiple_of(rg) {
+                    continue;
+                }
+                for &sg in sgs {
+                    for &yfmt in yfmts {
+                        push(rb, rg, sg, 1, yfmt);
+                        // The blocked mapping ignores rows_per_step entirely.
+                        if rg == 1 {
+                            push(rb, rg, sg, 0, yfmt);
+                        }
+                    }
+                }
+            }
+        }
+        if !full {
+            // Keep one activation-format cut in the default grid.
+            for yfmt in [0u32, 1] {
+                for rg in [1usize, 2] {
+                    push(8, rg, 4, 1, yfmt);
+                }
+            }
+        }
+        out
+    }
+
+    /// GPU-timestamped geometry/form bench for the Gemma 4 12B Q6_K SPEC50
+    /// head: the full 262,144 x 3,840 table (825,753,600 bytes), K = 1, 2, 4, 8,
+    /// 20 encodes per measurement, reporting GPU microseconds and the effective
+    /// GB/s over the table bytes.
+    ///
+    /// Rows are printed for
+    ///   * every `CAMELID_GEMMA4_SPEC50_HEAD_FORM` value (K=8 only: the MMA
+    ///     head is admitted at the eight-column tile alone), the first of which
+    ///     is the shipped `base` kernel; and
+    ///   * the selected geometry plus the sweep of the rb/rg/sg/flat/y knobs
+    ///     `Spec50Geometry` can express, which is what K=1/2/4 actually run.
+    ///
+    /// Each row also carries its dispatch shape (threadgroups, threads per
+    /// threadgroup, total simdgroups, and the Q6_K bytes one simdgroup streams)
+    /// so the timing can be read against the geometry that produced it.
+    ///
+    /// Uses the real Q6_K table when `CAMELID_MTP12_TEST_MODEL` points at the
+    /// 12B GGUF; otherwise it synthesizes a table of exactly the same shape and
+    /// says so on the first line (timings do not depend on the values, only the
+    /// bytes).
+    ///
+    /// `cargo test --release spec50_head_geometry_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn spec50_head_geometry_bench() {
+        const HIDDEN_12B: usize = 3840;
+        const N_SB_12B: usize = HIDDEN_12B / 256;
+        const ROWS: usize = 262_144;
+        const REPS: usize = 20;
+        if Device::system_default().is_none() {
+            return;
+        }
+        let refs = reference_kernels();
+        let bytes = ROWS * N_SB_12B * Q6K_WIRE;
+        let wbuf = shared(&refs.device, bytes);
+        let source = {
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), bytes) };
+            match load_real_q6k_head(dst, ROWS, HIDDEN_12B) {
+                Some(name) => format!("real GGUF tensor {name}"),
+                None => {
+                    let mut rng = Rng(0x2718_2818_2845_9045);
+                    for block in dst.chunks_exact_mut(Q6K_WIRE) {
+                        fill_q6k_block(&mut rng, block);
+                    }
+                    "SYNTHETIC (CAMELID_MTP12_TEST_MODEL unset or not a matching Q6_K head)"
+                        .to_string()
+                }
+            }
+        };
+        let mut rng = Rng(0x3141_5926_5358_9793);
+        let (scales, quants) = build_activations_for(&mut rng, 8, HIDDEN_12B, N_SB_12B);
+        let sbuf = shared(&refs.device, scales.len() * 4);
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let fbuf = shared(&refs.device, spec50_activation_scratch_bytes(8, HIDDEN_12B));
+        let out = shared(&refs.device, 8 * ROWS * 4);
+        let gb = bytes as f64 / 1.0e9;
+
+        eprintln!(
+            "[spec50-head-bench] table {ROWS} x {HIDDEN_12B} Q6_K = {bytes} bytes ({:.1} MB), source: {source}, {REPS} encodes per measurement",
+            bytes as f64 / 1.0e6
+        );
+
+        // One timed run of an already-built encode closure: a single-encode
+        // warm-up command buffer, then REPS encodes in one command buffer whose
+        // hardware GPU window is the measurement.
+        let time = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
+            let mut per_encode_us = 0.0;
+            for pass in 0..2 {
+                let cb = refs.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                let n = if pass == 0 { 1 } else { REPS };
+                for _ in 0..n {
+                    encode(e);
+                }
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                if pass == 1 {
+                    let (gpu_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                    per_encode_us = gpu_us as f64 / REPS as f64;
+                }
+            }
+            per_encode_us
+        };
+
+        // --- MMA head forms (K=8 only; the MMA path is admitted there alone).
+        for form in spec50_bench_forms() {
+            if spec50_mma_head_kernels_for(form).is_none() {
+                eprintln!("[spec50-head-bench] form {:<13} unavailable", form.name);
+                continue;
+            }
+            let encode = |e: &metal::ComputeCommandEncoderRef| {
+                assert!(encode_q6k_spec50_mma8_form(
+                    e, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, 8, HIDDEN_12B,
+                    SOFTCAP, form,
+                ));
+            };
+            let us = time(&encode);
+            let threadgroups = ROWS.div_ceil(8);
+            let simdgroups = threadgroups * form.simdgroups;
+            // A threadgroup owns eight rows and its simdgroups split the 60
+            // units of each row between them.
+            let bytes_per_sg = 8 * N_SB_12B * Q6K_WIRE / form.simdgroups;
+            eprintln!(
+                "[spec50-head-bench] form {:<13} K=8 {:9.1} us {:6.1} GB/s  tg={threadgroups} x {:4} thr  sg={simdgroups}  {bytes_per_sg} B/sg",
+                form.name,
+                us,
+                gb / (us / 1.0e6),
+                form.threads_per_tg(),
+            );
+        }
+
+        // --- Geometry kernels: the production path at K=1/2/4 (and at K=8
+        // whenever CAMELID_GEMMA4_SPEC50_MMA is off).
+        let full = std::env::var("CAMELID_SPEC50_BENCH_GRID")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("full"));
+        let mut geometries = vec![spec50_selected_geometry_for(HIDDEN_12B)];
+        for geometry in spec50_bench_geometries(full) {
+            if !geometries.iter().any(|seen: &Spec50Geometry| {
+                (seen.rows_per_sg, seen.rows_per_step, seen.sg_per_tg, seen.flat, seen.yfmt)
+                    == (
+                        geometry.rows_per_sg,
+                        geometry.rows_per_step,
+                        geometry.sg_per_tg,
+                        geometry.flat,
+                        geometry.yfmt,
+                    )
+            }) {
+                geometries.push(geometry);
+            }
+        }
+        eprintln!(
+            "[spec50-head-bench] sweeping {} geometries ({} grid); the first is the selected one",
+            geometries.len(),
+            if full { "full" } else { "core" }
+        );
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
+        for geometry in geometries {
+            let src = format!("{}{SPEC50_HEAD_SHADER}", geometry.shader_defines());
+            let library = match refs.device.new_library_with_source(&src, &options) {
+                Ok(library) => library,
+                Err(err) => {
+                    eprintln!(
+                        "[spec50-head-bench] geom rb{} rg{} sg{} flat{} y{}: compile failed: {err}",
+                        geometry.rows_per_sg, geometry.rows_per_step, geometry.sg_per_tg,
+                        geometry.flat, geometry.yfmt
+                    );
+                    continue;
+                }
+            };
+            let pipeline = |name: &str| -> Option<ComputePipelineState> {
+                let function = library.get_function(name, None).ok()?;
+                refs.device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()
+            };
+            let Some(expand) = pipeline(geometry.expand_kernel()) else {
+                eprintln!(
+                    "[spec50-head-bench] geom rb{} rg{} sg{} flat{} y{}: no expand pipeline",
+                    geometry.rows_per_sg, geometry.rows_per_step, geometry.sg_per_tg,
+                    geometry.flat, geometry.yfmt
+                );
+                continue;
+            };
+            for k in [1usize, 2, 4, 8] {
+                let Some(batch) = pipeline(&format!("q6k_spec50_batch_k{k}")) else {
+                    continue;
+                };
+                if batch.max_total_threads_per_threadgroup() < geometry.threads_per_tg() as u64 {
+                    eprintln!(
+                        "[spec50-head-bench] geom rb{} rg{} sg{} flat{} y{} K={k}: threadgroup too wide",
+                        geometry.rows_per_sg, geometry.rows_per_step, geometry.sg_per_tg,
+                        geometry.flat, geometry.yfmt
+                    );
+                    continue;
+                }
+                let encode = |e: &metal::ComputeCommandEncoderRef| {
+                    let n_sb = N_SB_12B as u32;
+                    let k_u32 = k as u32;
+                    let rows_u32 = ROWS as u32;
+                    let cap = SOFTCAP;
+                    e.set_compute_pipeline_state(&expand);
+                    e.set_buffer(0, Some(&qbuf), 0);
+                    e.set_buffer(1, Some(&fbuf), 0);
+                    e.set_bytes(2, 4, &n_sb as *const u32 as *const _);
+                    e.set_bytes(3, 4, &k_u32 as *const u32 as *const _);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: ((k * HIDDEN_12B) as u64).div_ceil(256),
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize { width: 256, height: 1, depth: 1 },
+                    );
+                    e.set_compute_pipeline_state(&batch);
+                    e.set_buffer(0, Some(&sbuf), 0);
+                    e.set_buffer(1, Some(&fbuf), 0);
+                    e.set_buffer(2, Some(&wbuf), 0);
+                    e.set_buffer(3, Some(&out), 0);
+                    e.set_bytes(4, 4, &n_sb as *const u32 as *const _);
+                    e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+                    e.set_bytes(6, 4, &cap as *const f32 as *const _);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: ROWS.div_ceil(geometry.rows_per_tg()) as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: geometry.threads_per_tg() as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                };
+                let us = time(&encode);
+                let threadgroups = ROWS.div_ceil(geometry.rows_per_tg());
+                let simdgroups = threadgroups * geometry.sg_per_tg;
+                let bytes_per_sg = geometry.rows_per_sg * N_SB_12B * Q6K_WIRE;
+                eprintln!(
+                    "[spec50-head-bench] geom rb{:<2} rg{:<2} sg{:<2} flat{} y{} K={k} {:9.1} us {:6.1} GB/s  tg={threadgroups} x {:4} thr  sg={simdgroups}  {bytes_per_sg} B/sg",
+                    geometry.rows_per_sg, geometry.rows_per_step, geometry.sg_per_tg,
+                    geometry.flat, geometry.yfmt, us, gb / (us / 1.0e6),
+                    geometry.threads_per_tg(),
+                );
+            }
         }
     }
 }
