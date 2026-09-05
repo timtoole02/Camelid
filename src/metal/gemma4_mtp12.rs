@@ -29,6 +29,9 @@ use crate::{wire_mmap::GgufWireMmap, BackendError, Result};
 mod shortlist;
 #[path = "gemma4_mtp12_bf16.rs"]
 mod dense_bf16;
+#[path = "gemma4_mtp12_tree.rs"]
+mod tree;
+pub use tree::Gemma4Mtp12TreeProposal;
 
 pub const GEMMA4_12B_MTP_ASSISTANT_SHA256: &str =
     "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6";
@@ -1954,6 +1957,7 @@ pub struct Gemma4Mtp12AssistantMetal {
     single_position: bool,
     shortlist: Option<Mtp12Shortlist>,
     dense_bf16: Option<dense_bf16::Bf16Dense>,
+    tree_state: Option<tree::TreeState>,
     packed_q4: Buffer,
     layout: Q4Layout,
     pipelines: Mtp12Pipelines,
@@ -2554,6 +2558,7 @@ impl Gemma4Mtp12AssistantMetal {
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             shortlist,
             dense_bf16,
+            tree_state: None,
             packed_q4,
             layout,
             pipelines,
@@ -4516,6 +4521,7 @@ mod tests {
             single_position: false,
             shortlist: None,
             dense_bf16: None,
+            tree_state: None,
             packed_q4,
             layout,
             pipelines,
