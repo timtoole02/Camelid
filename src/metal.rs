@@ -21777,7 +21777,6 @@ struct Gemma4VerifyGlueHeadArgs {
 #[cfg(target_os = "macos")]
 fn gemma4_verify_glue_head_dispatch(
     e: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
     args: Gemma4VerifyGlueHeadArgs,
 ) {
     let head_dim = args.head_dim as u32;
@@ -21834,7 +21833,7 @@ fn encode_gemma4_verify_head_norm(
     e.set_buffer(5, Some(q_out), 0);
     e.set_buffer(6, Some(k_out), 0);
     e.set_buffer(7, Some(v_out), 0);
-    gemma4_verify_glue_head_dispatch(e, &glue.head_norm, args);
+    gemma4_verify_glue_head_dispatch(e, args);
 }
 
 /// Fused-glue C5: per-head norm + split-half RoPE + KV scatter of one layer
@@ -21869,7 +21868,7 @@ fn encode_gemma4_verify_head_norm_rope_scatter(
     e.set_buffer(7, Some(cache_v), 0);
     e.set_buffer(8, Some(cos), 0);
     e.set_buffer(9, Some(sin), 0);
-    gemma4_verify_glue_head_dispatch(e, &glue.head_norm_rope_scatter, args);
+    gemma4_verify_glue_head_dispatch(e, args);
 }
 
 /// Opt-in: with CAMELID_METAL_F32Y also set, weights upload in the raw GGUF 34-byte
@@ -49729,6 +49728,650 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused-glue byte tests (CAMELID_GEMMA4_VERIFY_FUSED_GLUE). Every fused
+    // kernel is compared GPU-vs-GPU, bit for bit, against the unfused dispatch
+    // chain it replaces, on adversarial rows: real-scale values, exact zeros
+    // and -0.0, denormals, half-rounding boundary magnitudes and whole
+    // all-zero blocks (the `unrounded == 0` path of the quantizer).
+    // -----------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    fn fused_glue_adversarial_rows(count: usize, scale: f32, seed: u64) -> Vec<f32> {
+        let mut state = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0x2545_F491_4F6C_DD1D)
+            | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..count)
+            .map(|index| {
+                let r = next();
+                if (index / 32) % 13 == 5 {
+                    // Whole all-zero blocks.
+                    return 0.0;
+                }
+                let unit = (r >> 40) as f32 / (1u64 << 24) as f32;
+                let sign = if r & 1 == 0 { 1.0f32 } else { -1.0 };
+                match (r >> 8) % 61 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => sign * f32::from_bits(1 + ((r >> 20) as u32 % 0x007f_ffff)),
+                    3 => sign * scale * 127.0 * (1.0 + 1.0 / 2048.0),
+                    4 => sign * scale * (1.0 + 1.0 / 1024.0 + 1.0 / 2048.0),
+                    5 => sign * scale * 8.0 * unit,
+                    6 => sign * scale * f32::from_bits(0x3f80_0001),
+                    _ => sign * scale * (2.0 * unit - 1.0),
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fused_glue_norm_weight(width: usize, scale: f32, seed: u64) -> Vec<f32> {
+        if scale == 0.0 {
+            return vec![1.0; width];
+        }
+        fused_glue_adversarial_rows(width, scale, seed)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fused_glue_shared(kernel: &MetalLinearKernel, bytes: usize) -> Buffer {
+        kernel.device.new_buffer(
+            bytes.max(4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fused_glue_f32_buffer(kernel: &MetalLinearKernel, values: &[f32]) -> Buffer {
+        let buffer = fused_glue_shared(kernel, std::mem::size_of_val(values));
+        write_buffer_f32(&buffer, values);
+        buffer
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fused_glue_u32_buffer(kernel: &MetalLinearKernel, values: &[u32]) -> Buffer {
+        let buffer = fused_glue_shared(kernel, std::mem::size_of_val(values));
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                buffer.contents().cast::<u8>(),
+                std::mem::size_of_val(values),
+            );
+        }
+        buffer
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fused_glue_assert_f32_bits(label: &str, expected: &Buffer, actual: &Buffer, count: usize) {
+        let mut a = vec![0.0f32; count];
+        let mut b = vec![0.0f32; count];
+        read_buffer_f32(expected, &mut a);
+        read_buffer_f32(actual, &mut b);
+        for (index, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{label}: index={index} expected={x:?}/{:08x} actual={y:?}/{:08x}",
+                x.to_bits(),
+                y.to_bits()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fused_glue_assert_i8(label: &str, expected: &Buffer, actual: &Buffer, count: usize) {
+        let mut a = vec![0i8; count];
+        let mut b = vec![0i8; count];
+        read_buffer_i8(expected, &mut a);
+        read_buffer_i8(actual, &mut b);
+        for (index, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x, y, "{label}: quant index={index}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fused_glue_run(kernel: &MetalLinearKernel, encode: impl FnOnce(&metal::ComputeCommandEncoderRef)) -> u128 {
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        encode(encoder);
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        assert_eq!(
+            cb.status(),
+            metal::MTLCommandBufferStatus::Completed,
+            "fused-glue command buffer failed"
+        );
+        command_buffer_gpu_times_us(&cb.to_owned()).0
+    }
+
+    /// C2: `gemma4_verify_rms_norm_quantize_batch_f32` against
+    /// `rms_norm_batch_f32` + `quantize_q8_0_f32` on K in {1,2,4,8} rows of
+    /// the 3840-wide verifier input, three norm-weight scales (exact 1.0 bits,
+    /// 0.05, 0.88), scales and quants bit for bit.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_verify_fused_glue_rms_norm_quantize_batch_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let glue = kernel
+            .gemma4_verify_glue_pipelines()
+            .expect("fused-glue elementwise library must compile");
+        const WIDTH: usize = 3_840;
+        const BLOCKS: usize = WIDTH / 32;
+        let scalar = fused_glue_shared(kernel, 8);
+        unsafe {
+            let args = scalar.contents().cast::<u8>();
+            *args.cast::<u32>() = WIDTH as u32;
+            *args.add(4).cast::<f32>() = 1e-6;
+        }
+        for (weight_index, weight_scale) in [0.0f32, 0.05, 0.88].into_iter().enumerate() {
+            let weight = fused_glue_norm_weight(WIDTH, weight_scale, 11 + weight_index as u64);
+            let weight_buf = fused_glue_f32_buffer(kernel, &weight);
+            for columns in [1usize, 2, 4, 8] {
+                let label = format!("rms_norm_quantize_batch weight_scale={weight_scale} K={columns}");
+                let input = fused_glue_adversarial_rows(
+                    columns * WIDTH,
+                    3.0,
+                    100 + columns as u64 + weight_index as u64 * 7,
+                );
+                let input_buf = fused_glue_f32_buffer(kernel, &input);
+                let norm_buf = fused_glue_shared(kernel, columns * WIDTH * 4);
+                let ref_scales = fused_glue_shared(kernel, columns * BLOCKS * 4);
+                let ref_quants = fused_glue_shared(kernel, columns * WIDTH);
+                let fused_scales = fused_glue_f32_buffer(kernel, &vec![f32::NAN; columns * BLOCKS]);
+                let fused_quants = fused_glue_shared(kernel, columns * WIDTH);
+                write_buffer_u8(&fused_quants, &vec![0xa5u8; columns * WIDTH]);
+                let nblocks = fused_glue_u32_buffer(kernel, &[(columns * BLOCKS) as u32]);
+                fused_glue_run(kernel, |e| {
+                    encode_rms_norm_batch(kernel, e, &input_buf, &weight_buf, &norm_buf, &scalar, columns);
+                    encode_quantize(e, kernel, &norm_buf, &ref_scales, &ref_quants, &nblocks, columns * BLOCKS);
+                    encode_gemma4_verify_rms_norm_quantize_batch(
+                        e,
+                        glue,
+                        &input_buf,
+                        &weight_buf,
+                        &fused_scales,
+                        &fused_quants,
+                        &scalar,
+                        columns,
+                    );
+                });
+                fused_glue_assert_f32_bits(&format!("{label} scales"), &ref_scales, &fused_scales, columns * BLOCKS);
+                fused_glue_assert_i8(&format!("{label} quants"), &ref_quants, &fused_quants, columns * WIDTH);
+            }
+        }
+    }
+
+    /// C3: `gemma4_verify_gelu_mul_quantize_f32` against `gelu_mul_f32` +
+    /// `quantize_q8_0_f32` on K in {1,2,4,8} rows of the 15360-wide FFN
+    /// activation, including saturating gate magnitudes (the tanh clamp).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_verify_fused_glue_gelu_mul_quantize_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let glue = kernel
+            .gemma4_verify_glue_pipelines()
+            .expect("fused-glue elementwise library must compile");
+        const FFN: usize = 15_360;
+        const BLOCKS: usize = FFN / 32;
+        for (scale_index, scale) in [1.0f32, 0.05, 6.0].into_iter().enumerate() {
+            for columns in [1usize, 2, 4, 8] {
+                let label = format!("gelu_mul_quantize scale={scale} K={columns}");
+                let gate = fused_glue_adversarial_rows(columns * FFN, scale, 300 + columns as u64 + scale_index as u64 * 5);
+                let up = fused_glue_adversarial_rows(columns * FFN, 2.0, 400 + columns as u64 + scale_index as u64 * 5);
+                let gate_buf = fused_glue_f32_buffer(kernel, &gate);
+                let up_buf = fused_glue_f32_buffer(kernel, &up);
+                let activation = fused_glue_shared(kernel, columns * FFN * 4);
+                let ref_scales = fused_glue_shared(kernel, columns * BLOCKS * 4);
+                let ref_quants = fused_glue_shared(kernel, columns * FFN);
+                let fused_scales = fused_glue_f32_buffer(kernel, &vec![f32::NAN; columns * BLOCKS]);
+                let fused_quants = fused_glue_shared(kernel, columns * FFN);
+                write_buffer_u8(&fused_quants, &vec![0xa5u8; columns * FFN]);
+                let n = fused_glue_u32_buffer(kernel, &[(columns * FFN) as u32]);
+                let nblocks = fused_glue_u32_buffer(kernel, &[(columns * BLOCKS) as u32]);
+                fused_glue_run(kernel, |e| {
+                    encode_binary(e, &kernel.gelu_mul_pipeline, &gate_buf, &up_buf, &activation, &n, columns * FFN);
+                    encode_quantize(e, kernel, &activation, &ref_scales, &ref_quants, &nblocks, columns * BLOCKS);
+                    encode_gemma4_verify_gelu_mul_quantize(
+                        e,
+                        glue,
+                        &gate_buf,
+                        &up_buf,
+                        &fused_scales,
+                        &fused_quants,
+                        &nblocks,
+                        columns * BLOCKS,
+                    );
+                });
+                fused_glue_assert_f32_bits(&format!("{label} scales"), &ref_scales, &fused_scales, columns * BLOCKS);
+                fused_glue_assert_i8(&format!("{label} quants"), &ref_quants, &fused_quants, columns * FFN);
+            }
+        }
+    }
+
+    /// C5 and C5-lite: the fused per-head norm (+ RoPE + KV scatter) against
+    /// the plan's batched chain of three `rms_norm_per_head_f32` dispatches,
+    /// two `rope_rotate_batch_f32` dispatches and one `kv_scatter_batch_f32`,
+    /// for head_dim 256 (8 KV heads) and 512 (1 KV head), with and without a
+    /// V projection (the V-less global layers norm k_raw), K in {1,2,4,8}.
+    /// Compares q_normed, k/v_normed (lite) and the whole K/V caches (C5).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_verify_fused_glue_head_norm_rope_scatter_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let glue = kernel
+            .gemma4_verify_glue_pipelines()
+            .expect("fused-glue elementwise library must compile");
+        const HEADS: usize = 16;
+        const MAX_POSITIONS: usize = 40;
+        const BASE: usize = 7;
+        const EPS: f32 = 1e-6;
+        let kv16_write = fused_glue_u32_buffer(kernel, &[0]);
+        for (shape, (head_dim, n_kv, has_v)) in [
+            (256usize, 8usize, true),
+            (512, 1, false),
+            (256, 8, false),
+            (512, 1, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let half = head_dim / 2;
+            let q_dim = HEADS * head_dim;
+            let kv_dim = n_kv * head_dim;
+            let cache_len = n_kv * MAX_POSITIONS * head_dim;
+            let weighted = fused_glue_shared(kernel, 12);
+            let unweighted = fused_glue_shared(kernel, 12);
+            for (buffer, use_weight) in [(&weighted, 1u32), (&unweighted, 0u32)] {
+                unsafe {
+                    let args = buffer.contents().cast::<u8>();
+                    *args.cast::<u32>() = head_dim as u32;
+                    *args.add(4).cast::<f32>() = EPS;
+                    *args.add(8).cast::<u32>() = use_weight;
+                }
+            }
+            let rope_q = fused_glue_u32_buffer(kernel, &[HEADS as u32, head_dim as u32, half as u32, 1]);
+            let rope_k = fused_glue_u32_buffer(kernel, &[n_kv as u32, head_dim as u32, half as u32, 1]);
+            let scatter = fused_glue_u32_buffer(
+                kernel,
+                &[head_dim as u32, MAX_POSITIONS as u32, BASE as u32, kv_dim as u32],
+            );
+            let q_norm = fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(head_dim, 0.88, 500 + shape as u64));
+            let k_norm = fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(head_dim, 0.05, 600 + shape as u64));
+            for columns in [1usize, 2, 4, 8] {
+                let label = format!("head_norm head_dim={head_dim} n_kv={n_kv} has_v={has_v} K={columns}");
+                let seed = 700 + shape as u64 * 31 + columns as u64;
+                let q_raw = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * q_dim, 2.0, seed));
+                let k_raw = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * kv_dim, 2.0, seed + 1));
+                let v_raw = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * kv_dim, 2.0, seed + 2));
+                let v_src = if has_v { &v_raw } else { &k_raw };
+                let mut cos = Vec::with_capacity(columns * half);
+                let mut sin = Vec::with_capacity(columns * half);
+                for index in 0..columns * half {
+                    let theta = ((index as f32) * 0.37 + seed as f32).sin() * 3.0;
+                    cos.push(theta.cos());
+                    sin.push(theta.sin());
+                }
+                let cos_buf = fused_glue_f32_buffer(kernel, &cos);
+                let sin_buf = fused_glue_f32_buffer(kernel, &sin);
+                let poison = |len: usize| fused_glue_f32_buffer(kernel, &vec![f32::NAN; len]);
+                let cache_poison: Vec<f32> = (0..cache_len)
+                    .map(|index| f32::from_bits(0x7fc1_0000 | (index as u32 & 0xffff)))
+                    .collect();
+                let q_normed_ref = poison(columns * q_dim);
+                let k_normed_ref = poison(columns * kv_dim);
+                let v_normed_ref = poison(columns * kv_dim);
+                let q_normed_lite = poison(columns * q_dim);
+                let k_normed_lite = poison(columns * kv_dim);
+                let v_normed_lite = poison(columns * kv_dim);
+                let q_normed_fused = poison(columns * q_dim);
+                let cache_k_ref = fused_glue_f32_buffer(kernel, &cache_poison);
+                let cache_v_ref = fused_glue_f32_buffer(kernel, &cache_poison);
+                let cache_k_fused = fused_glue_f32_buffer(kernel, &cache_poison);
+                let cache_v_fused = fused_glue_f32_buffer(kernel, &cache_poison);
+                let head_args = Gemma4VerifyGlueHeadArgs {
+                    head_dim,
+                    eps: EPS,
+                    n_heads: HEADS,
+                    n_kv_heads: n_kv,
+                    max_positions: MAX_POSITIONS,
+                    base_position: BASE,
+                    rows: columns,
+                };
+
+                // Phase 1: the three batched per-head norms vs C5-lite.
+                fused_glue_run(kernel, |e| {
+                    encode_rms_norm_per_head(e, kernel, &q_raw, &q_norm, &q_normed_ref, &weighted, columns * HEADS, 0);
+                    encode_rms_norm_per_head(e, kernel, &k_raw, &k_norm, &k_normed_ref, &weighted, columns * n_kv, 0);
+                    encode_rms_norm_per_head(e, kernel, v_src, &q_norm, &v_normed_ref, &unweighted, columns * n_kv, 0);
+                    encode_gemma4_verify_head_norm(
+                        e,
+                        glue,
+                        &q_raw,
+                        &k_raw,
+                        v_src,
+                        &q_norm,
+                        &k_norm,
+                        &q_normed_lite,
+                        &k_normed_lite,
+                        &v_normed_lite,
+                        head_args,
+                    );
+                });
+                fused_glue_assert_f32_bits(&format!("{label} lite q_normed"), &q_normed_ref, &q_normed_lite, columns * q_dim);
+                fused_glue_assert_f32_bits(&format!("{label} lite k_normed"), &k_normed_ref, &k_normed_lite, columns * kv_dim);
+                fused_glue_assert_f32_bits(&format!("{label} lite v_normed"), &v_normed_ref, &v_normed_lite, columns * kv_dim);
+
+                // Phase 2: RoPE (in place, as the plan encodes it) + scatter vs C5.
+                fused_glue_run(kernel, |e| {
+                    for (data, args, heads) in [(&q_normed_ref, &rope_q, HEADS), (&k_normed_ref, &rope_k, n_kv)] {
+                        e.set_compute_pipeline_state(&kernel.rope_rotate_batch_pipeline);
+                        e.set_buffer(0, Some(data), 0);
+                        e.set_buffer(1, Some(&cos_buf), 0);
+                        e.set_buffer(2, Some(&sin_buf), 0);
+                        for index in 0..4u64 {
+                            e.set_buffer(3 + index, Some(args), index * 4);
+                        }
+                        dispatch_2d_rows(e, &kernel.rope_rotate_batch_pipeline, heads * half, columns);
+                    }
+                    e.set_compute_pipeline_state(&kernel.kv_scatter_batch_pipeline);
+                    e.set_buffer(0, Some(&k_normed_ref), 0);
+                    e.set_buffer(1, Some(&v_normed_ref), 0);
+                    e.set_buffer(2, Some(&cache_k_ref), 0);
+                    e.set_buffer(3, Some(&cache_v_ref), 0);
+                    e.set_buffer(4, Some(&scatter), 0);
+                    e.set_buffer(5, Some(&scatter), 4);
+                    e.set_buffer(6, Some(&scatter), 8);
+                    e.set_buffer(7, Some(&scatter), 12);
+                    e.set_buffer(8, Some(&scatter), 0);
+                    e.set_buffer(9, Some(&scatter), 0);
+                    e.set_buffer(10, Some(&kv16_write), 0);
+                    dispatch_2d_rows(e, &kernel.kv_scatter_batch_pipeline, kv_dim, columns);
+                    encode_gemma4_verify_head_norm_rope_scatter(
+                        e,
+                        glue,
+                        &q_raw,
+                        &k_raw,
+                        v_src,
+                        &q_norm,
+                        &k_norm,
+                        &q_normed_fused,
+                        &cache_k_fused,
+                        &cache_v_fused,
+                        &cos_buf,
+                        &sin_buf,
+                        head_args,
+                    );
+                });
+                fused_glue_assert_f32_bits(&format!("{label} C5 q_normed"), &q_normed_ref, &q_normed_fused, columns * q_dim);
+                fused_glue_assert_f32_bits(&format!("{label} C5 cache_k"), &cache_k_ref, &cache_k_fused, cache_len);
+                fused_glue_assert_f32_bits(&format!("{label} C5 cache_v"), &cache_v_ref, &cache_v_fused, cache_len);
+            }
+        }
+    }
+
+    /// C1 + C7: one staged record plus one segment-fused `fm_bits_u4` grid
+    /// (three or two matrices) against the same matrices as single
+    /// stage+MMA dispatches, on random Q4 sidecars and random Q8 inputs, K in
+    /// {1,2,4,8}, one and four simdgroups per threadgroup, with the per-width
+    /// dispatch counter advancing once per segment.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_verify_fused_glue_segment_mma_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::tensor::Q8_0Block;
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let v2 = kernel
+            .gemma4_q4_native_v2_named(GEMMA4_FUSED_GLUE_V2_VARIANT)
+            .expect("fm_bits_u4 V2 variant compiles under cfg(test)");
+        let glue = kernel
+            .gemma4_verify_glue_mma_pipelines()
+            .expect("fused-glue segment MMA library must compile");
+        const BLOCKS: usize = 120;
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (label, rows_per_segment) in [
+            ("sliding-qkv", vec![4_096usize, 2_048, 2_048]),
+            ("global-qk", vec![4_096, 512]),
+            ("ragged", vec![520, 136, 8]),
+            ("gate-up", vec![1_536, 1_536]),
+        ] {
+            let inputs: Vec<Vec<Q8_0Block>> = (0..8)
+                .map(|_| {
+                    (0..BLOCKS)
+                        .map(|_| Q8_0Block {
+                            scale: 0.000_7 * (1 + (next() % 37) as usize) as f32,
+                            quants: std::array::from_fn(|_| ((next() % 255) as i16 - 127) as i8),
+                        })
+                        .collect()
+                })
+                .collect();
+            let wires: Vec<Vec<u8>> = rows_per_segment
+                .iter()
+                .map(|&rows| {
+                    let mut wire = Vec::with_capacity(rows * BLOCKS * 18);
+                    for _ in 0..rows * BLOCKS {
+                        let scale = 0.000_11 * (1 + (next() % 101) as usize) as f32;
+                        wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                        for _ in 0..16 {
+                            wire.push((next() % 256) as u8);
+                        }
+                    }
+                    wire
+                })
+                .collect();
+            for columns in [1usize, 2, 4, 8] {
+                let refs: Vec<&[Q8_0Block]> = inputs[..columns].iter().map(Vec::as_slice).collect();
+                let fixtures: Vec<NativeV2Fixture> = rows_per_segment
+                    .iter()
+                    .zip(&wires)
+                    .map(|(&rows, wire)| native_v2_fixture(kernel, &refs, wire, rows, BLOCKS))
+                    .collect();
+                let outputs = |poison: bool| -> Vec<Buffer> {
+                    rows_per_segment
+                        .iter()
+                        .map(|&rows| {
+                            let buffer = fused_glue_shared(kernel, columns * rows * 4);
+                            if poison {
+                                write_buffer_f32(&buffer, &vec![f32::NAN; columns * rows]);
+                            }
+                            buffer
+                        })
+                        .collect()
+                };
+                let reference = outputs(false);
+                fused_glue_run(kernel, |e| {
+                    for (fixture, output) in fixtures.iter().zip(&reference) {
+                        assert!(
+                            encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2(
+                                e,
+                                kernel,
+                                v2,
+                                1,
+                                &fixture.scales_buf,
+                                &fixture.quants_buf,
+                                &fixture.weight_buf,
+                                0,
+                                output,
+                                &fixture.stage_buf,
+                                fixture.rows,
+                                BLOCKS,
+                                columns,
+                            ),
+                            "reference V2 dispatch refused: {label} K={columns}"
+                        );
+                    }
+                });
+                for simdgroups in [1usize, 4] {
+                    let fused = outputs(true);
+                    let segments: Vec<Gemma4VerifyGlueSegment<'_>> = fixtures
+                        .iter()
+                        .zip(&fused)
+                        .map(|(fixture, output)| (&fixture.weight_buf, 0u64, output, fixture.rows))
+                        .collect();
+                    let before = gemma4_q4_column_dispatch_counts();
+                    fused_glue_run(kernel, |e| {
+                        assert!(
+                            encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
+                                e,
+                                kernel,
+                                v2,
+                                &fixtures[0].scales_buf,
+                                &fixtures[0].quants_buf,
+                                &fixtures[0].stage_buf,
+                                BLOCKS,
+                                columns,
+                            ),
+                            "stage refused: {label} K={columns}"
+                        );
+                        assert!(
+                            encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
+                                e,
+                                v2,
+                                glue,
+                                simdgroups,
+                                &fixtures[0].scales_buf,
+                                &fixtures[0].stage_buf,
+                                &segments,
+                                BLOCKS,
+                                columns,
+                            ),
+                            "segment grid refused: {label} K={columns} simdgroups={simdgroups}"
+                        );
+                    });
+                    let after = gemma4_q4_column_dispatch_counts();
+                    let deltas = [
+                        after.k1 - before.k1,
+                        after.k2 - before.k2,
+                        after.k4 - before.k4,
+                        after.k8 - before.k8,
+                        after.k16 - before.k16,
+                    ];
+                    let selected = match columns {
+                        1 => 0,
+                        2 => 1,
+                        4 => 2,
+                        8 => 3,
+                        _ => unreachable!(),
+                    };
+                    for (index, delta) in deltas.into_iter().enumerate() {
+                        let expected = if index == selected { segments.len() as u64 } else { 0 };
+                        assert_eq!(
+                            delta, expected,
+                            "{label} K={columns} simdgroups={simdgroups}: the counter advances once per segment at the selected width"
+                        );
+                    }
+                    for (segment, (expected, actual)) in reference.iter().zip(&fused).enumerate() {
+                        fused_glue_assert_f32_bits(
+                            &format!("{label} K={columns} simdgroups={simdgroups} segment={segment} rows={}", rows_per_segment[segment]),
+                            expected,
+                            actual,
+                            columns * rows_per_segment[segment],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// GPU cost of a dependent tiny dispatch, measured directly: 2,000
+    /// ping-pong `rms_norm_batch_f32` dispatches (8 threadgroups each) in one
+    /// command buffer, the same for `residual_add_f32`, and 1,000 dependent
+    /// norm+quantize pairs against 1,000 fused C2 dispatches. Prints the GPU
+    /// microseconds per dispatch for the glue-design calibration (Step 0).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "GPU timing probe for the fused-glue calibration; prints us/dispatch"]
+    fn metal_dependent_dispatch_cost_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let glue = kernel
+            .gemma4_verify_glue_pipelines()
+            .expect("fused-glue elementwise library must compile");
+        const ROWS: usize = 8;
+        const WIDTH: usize = 3_840;
+        const BLOCKS: usize = WIDTH / 32;
+        const DISPATCHES: usize = 2_000;
+        let a = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(ROWS * WIDTH, 1.0, 900));
+        let b = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(ROWS * WIDTH, 1.0, 901));
+        let c = fused_glue_f32_buffer(kernel, &vec![0.0; ROWS * WIDTH]);
+        let weight = fused_glue_f32_buffer(kernel, &vec![1.0; WIDTH]);
+        let scalar = fused_glue_shared(kernel, 8);
+        unsafe {
+            let args = scalar.contents().cast::<u8>();
+            *args.cast::<u32>() = WIDTH as u32;
+            *args.add(4).cast::<f32>() = 1e-6;
+        }
+        let n = fused_glue_u32_buffer(kernel, &[(ROWS * WIDTH) as u32]);
+        let nblocks = fused_glue_u32_buffer(kernel, &[(ROWS * BLOCKS) as u32]);
+        let scales = fused_glue_shared(kernel, ROWS * BLOCKS * 4);
+        let quants = fused_glue_shared(kernel, ROWS * WIDTH);
+        for _ in 0..2 {
+            let norm_us = fused_glue_run(kernel, |e| {
+                for index in 0..DISPATCHES {
+                    let (src, dst) = if index % 2 == 0 { (&a, &b) } else { (&b, &a) };
+                    encode_rms_norm_batch(kernel, e, src, &weight, dst, &scalar, ROWS);
+                }
+            });
+            let add_us = fused_glue_run(kernel, |e| {
+                for index in 0..DISPATCHES {
+                    let (x, out) = if index % 2 == 0 { (&a, &c) } else { (&c, &a) };
+                    encode_binary(e, &kernel.residual_add_pipeline, x, &b, out, &n, ROWS * WIDTH);
+                }
+            });
+            let pair_us = fused_glue_run(kernel, |e| {
+                for _ in 0..DISPATCHES / 2 {
+                    encode_rms_norm_batch(kernel, e, &a, &weight, &b, &scalar, ROWS);
+                    encode_quantize(e, kernel, &b, &scales, &quants, &nblocks, ROWS * BLOCKS);
+                }
+            });
+            let fused_us = fused_glue_run(kernel, |e| {
+                for _ in 0..DISPATCHES / 2 {
+                    encode_gemma4_verify_rms_norm_quantize_batch(
+                        e, glue, &a, &weight, &scales, &quants, &scalar, ROWS,
+                    );
+                }
+            });
+            eprintln!(
+                "[dispatch-probe] rms_norm_batch x{DISPATCHES} dependent: {norm_us} us ({:.2} us/dispatch); \
+                 residual_add x{DISPATCHES}: {add_us} us ({:.2} us/dispatch); \
+                 norm+quantize pairs x{}: {pair_us} us ({:.2} us/pair) vs fused C2 x{}: {fused_us} us ({:.2} us/dispatch)",
+                norm_us as f64 / DISPATCHES as f64,
+                add_us as f64 / DISPATCHES as f64,
+                DISPATCHES / 2,
+                pair_us as f64 / (DISPATCHES / 2) as f64,
+                DISPATCHES / 2,
+                fused_us as f64 / (DISPATCHES / 2) as f64,
+            );
         }
     }
 

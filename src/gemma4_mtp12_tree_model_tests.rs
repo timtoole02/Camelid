@@ -334,3 +334,164 @@ fn target_tree_w8_model_paths_logits_kv_and_compaction_are_bit_exact() {
     }
     eprintln!("[tree-model] qualified {node_checks} node comparisons, 4 compacted K1 continuations in {:?}", started.elapsed());
 }
+
+/// One verify call shape for the fused-glue A/B: a linear K-row batch or one
+/// of the W8 tree topologies the gate above exercises.
+enum GlueCase {
+    Linear(usize),
+    Tree { parents: Vec<i32>, depths: Vec<u32> },
+}
+
+/// Everything the target side is contracted on: final hidden bits, SPEC50
+/// argmax ids, every SPEC50 logit and the 48-layer K/V bits of the rows the
+/// call wrote. The batch is rolled back so every run starts from the same
+/// committed prefix.
+fn glue_observe(
+    runtime: &Gemma4GpuRuntime,
+    tokens: &[u32],
+    base: usize,
+    case: &GlueCase,
+    mask: u32,
+) -> (Vec<Vec<f32>>, Vec<u32>, Vec<f32>, Vec<Vec<u32>>) {
+    poison_tentative_rows(runtime, base);
+    let (batch, width) = match case {
+        GlueCase::Linear(width) => (
+            runtime
+                .verify_consecutive_greedy_with_glue(&tokens[..*width], base, Some(mask))
+                .unwrap(),
+            *width,
+        ),
+        GlueCase::Tree { parents, depths } => (
+            runtime
+                .verify_tree_greedy_with_glue(tokens, parents, depths, base, Some(mask))
+                .unwrap(),
+            8,
+        ),
+    };
+    let logits = logits(runtime, width);
+    let kv = kv_rows(runtime, &(base..base + width).collect::<Vec<_>>());
+    assert_eq!(runtime.rollback_verifier_batch(batch.ticket).unwrap(), base);
+    (batch.final_hidden, batch.greedy_ids, logits, kv)
+}
+
+/// Fused-glue A/B against the legacy encode. The tree/linear gate above runs
+/// both of its lanes through the same `verify_hidden_ordered_q4_plan`, so a
+/// consistent last-ulp drift of a fused kernel would pass it; this is the
+/// old-vs-new oracle. For bases 529/1023/1024/1025, linear K=1 and K=8 and
+/// the five tree shapes, mask 0 is compared with the full cycle-1 mask, the
+/// C5-lite full mask and every single bit: identical final hidden bits,
+/// identical SPEC50 argmax ids, identical SPEC50 logits and identical
+/// 48-layer K/V bits of every written row. Runtime is a few minutes.
+#[test]
+#[ignore = "requires official 12B QAT target, native sidecar and frozen 529-token trace; run alone"]
+fn target_verify_fused_glue_masks_are_bit_exact_against_legacy() {
+    use crate::metal::{
+        GEMMA4_FUSED_GLUE_ALL, GEMMA4_FUSED_GLUE_C1_STAGE_ONCE, GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE,
+        GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE, GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER,
+        GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS, GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA,
+    };
+    let model_path =
+        std::env::var("CAMELID_MTP12_TEST_MODEL").expect("explicit official target GGUF path");
+    let trace_path = std::env::var("CAMELID_TREE_TEST_TRACE")
+        .expect("explicit full-trace JSON with rendered 529-token prompt");
+    let trace: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(trace_path).unwrap()).unwrap();
+    assert_eq!(trace["prompt_tokens"], 529);
+    let prompt = trace["rendered_prompt"].as_str().unwrap();
+    let prompt_ids: Vec<u32> =
+        serde_json::from_value(trace["rendered_prompt_token_ids"].clone()).unwrap();
+    assert_eq!(prompt_ids.len(), 529);
+    let runtime = Gemma4GpuRuntime::load(Path::new(&model_path), 2048).unwrap();
+    runtime.admit_mtp12_target_identity().unwrap();
+    assert!(
+        runtime.q6k_gpu_head.is_some(),
+        "SPEC50 head must be enabled"
+    );
+    let mut tokens = Vec::new();
+    for &token in &prompt_ids {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+        if tokens.len() == 8 {
+            break;
+        }
+    }
+    assert_eq!(tokens.len(), 8);
+
+    let masks: Vec<(&str, u32)> = vec![
+        ("all", GEMMA4_FUSED_GLUE_ALL),
+        (
+            "all-c5-lite",
+            GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
+                | GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE
+                | GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE
+                | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA
+                | GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS,
+        ),
+        ("c1", GEMMA4_FUSED_GLUE_C1_STAGE_ONCE),
+        ("c2", GEMMA4_FUSED_GLUE_C2_NORM_QUANTIZE),
+        ("c3", GEMMA4_FUSED_GLUE_C3_GELU_QUANTIZE),
+        ("c7", GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA),
+        ("c5", GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER),
+        ("c5-lite", GEMMA4_FUSED_GLUE_C5_LITE_HEAD_NORMS),
+    ];
+    let mut cases: Vec<(String, GlueCase)> = vec![
+        ("linear K=1".to_string(), GlueCase::Linear(1)),
+        ("linear K=8".to_string(), GlueCase::Linear(8)),
+    ];
+    for step in 0..4u32 {
+        cases.push((
+            format!("tree shape={step}"),
+            GlueCase::Tree {
+                parents: vec![-1, 0, 1, 2, 3, step as i32, 5, 6],
+                depths: vec![0, 1, 2, 3, 4, step + 1, step + 2, step + 3],
+            },
+        ));
+    }
+    cases.push((
+        "tree shape=4".to_string(),
+        GlueCase::Tree {
+            parents: vec![-1, 0, 0, 1, 2, 3, 4, 5],
+            depths: vec![0, 1, 1, 2, 2, 3, 3, 4],
+        },
+    ));
+
+    let started = std::time::Instant::now();
+    let mut comparisons = 0;
+    for base in [529, 1023, 1024, 1025] {
+        prepare_prefix(&runtime, prompt, &prompt_ids, base);
+        let guard_positions = [0, base.saturating_sub(1024), base - 1];
+        let guard = kv_rows(&runtime, &guard_positions);
+        for (case_label, case) in &cases {
+            let (hidden, ids, logits_ref, kv) = glue_observe(&runtime, &tokens, base, case, 0);
+            for &(mask_label, mask) in &masks {
+                let (hidden_m, ids_m, logits_m, kv_m) =
+                    glue_observe(&runtime, &tokens, base, case, mask);
+                let label = format!("base={base} {case_label} mask={mask_label}({mask})");
+                assert_eq!(hidden.len(), hidden_m.len(), "{label}: row count");
+                for (row, (expected, actual)) in hidden.iter().zip(&hidden_m).enumerate() {
+                    exact(&format!("final hidden {label} row={row}"), expected, actual);
+                }
+                assert_eq!(ids, ids_m, "SPEC50 argmax ids {label}");
+                exact(&format!("all SPEC50 logits {label}"), &logits_ref, &logits_m);
+                assert_eq!(kv, kv_m, "48-layer K/V bits {label}");
+                comparisons += 1;
+            }
+            assert_eq!(
+                kv_rows(&runtime, &guard_positions),
+                guard,
+                "committed prefix guards base={base} {case_label}"
+            );
+        }
+        eprintln!(
+            "[fused-glue-ab] base={base}: {} cases x {} masks EXACT against mask=0 ({:?} elapsed)",
+            cases.len(),
+            masks.len(),
+            started.elapsed()
+        );
+    }
+    eprintln!(
+        "[fused-glue-ab] {comparisons} mask comparisons bit-exact against the legacy encode in {:?}",
+        started.elapsed()
+    );
+}
