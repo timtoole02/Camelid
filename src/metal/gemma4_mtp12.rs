@@ -2591,6 +2591,8 @@ const MTP12_FUSE_NORM_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_NORM";
 const MTP12_FUSE_QROPE_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_QROPE";
 const MTP12_FUSE_SOFTMAX_CTX_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX";
 const MTP12_FUSE_HEAD_PREFETCH_ENV: &str = "CAMELID_GEMMA4_MTP12_FUSE_HEAD_PREFETCH";
+/// Highest listed `CAMELID_GEMMA4_MTP12_FUSE_GEMV_X4` level.
+const MTP12_FUSE_GEMV_X4_MAX: u8 = 3;
 const MTP12_GEMV_STAGED_ROWS_DEFAULT: u32 = 4;
 const MTP12_GEMV_STAGED_ROWS_MAX: u32 = 64;
 
@@ -2641,12 +2643,15 @@ fn mtp12_fuse_flags_from_env() -> std::result::Result<Mtp12FuseFlags, String> {
     let level = |name: &str, max: u8| -> std::result::Result<u8, String> {
         mtp12_fuse_level(name, read(name)?.as_deref(), max)
     };
+    let flag = |name: &str| -> std::result::Result<bool, String> {
+        mtp12_fuse_flag(name, read(name)?.as_deref())
+    };
     Ok(Mtp12FuseFlags {
-        gemv_x4: level(MTP12_FUSE_GEMV_X4_ENV, 3)?,
+        gemv_x4: level(MTP12_FUSE_GEMV_X4_ENV, MTP12_FUSE_GEMV_X4_MAX)?,
         gemv_staged_rows: mtp12_gemv_staged_rows(read(MTP12_GEMV_STAGED_ROWS_ENV)?.as_deref())?,
-        gate_up: level(MTP12_FUSE_GATEUP_ENV, 1)? != 0,
-        norm: level(MTP12_FUSE_NORM_ENV, 1)? != 0,
-        qrope: level(MTP12_FUSE_QROPE_ENV, 1)? != 0,
+        gate_up: flag(MTP12_FUSE_GATEUP_ENV)?,
+        norm: flag(MTP12_FUSE_NORM_ENV)?,
+        qrope: flag(MTP12_FUSE_QROPE_ENV)?,
         softmax_ctx: level(MTP12_FUSE_SOFTMAX_CTX_ENV, 3)?,
         head_prefetch: level(MTP12_FUSE_HEAD_PREFETCH_ENV, 2)?,
     })
@@ -5016,7 +5021,8 @@ impl Gemma4Mtp12AssistantMetal {
             compact_base,
             position_count,
             mtp12_attention_v2_enabled() && covers,
-            fuse.softmax_ctx && covers,
+            if covers { fuse.softmax_ctx } else { 0 },
+            Some(&self.scratch.attention_stats),
         );
         self.encode_dense_gemv(
             encoder,
@@ -5559,15 +5565,21 @@ fn encode_attention_impl(
         compact_base,
         position_count,
         v2,
-        false,
+        0,
+        None,
     );
 }
 
-/// `fused_softmax_ctx` replaces the softmax + context pair with
-/// `mtp12_attention_softmax_context_v2` (V2 grid; requires
-/// [`mtp12_attention_v2_covers`]), leaving the scores buffer holding raw
-/// scores.  Bit-identical to the pair (pinned by
-/// `mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit`).
+/// `softmax_ctx` replaces the softmax + context pair (all levels require
+/// [`mtp12_attention_v2_covers`], all leave the scores buffer holding raw
+/// scores, and all are bit-identical to the pair - pinned by
+/// `mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit`):
+/// `0` = the established pair, `1` = `mtp12_attention_softmax_context_v2`
+/// (every context threadgroup recomputes max/denominator), `2` =
+/// `mtp12_attention_softmax_stats` + `mtp12_attention_context_v2_stats16`,
+/// `3` = `mtp12_attention_softmax_stats` + `mtp12_attention_context_v2_stats4`.
+/// `stats` is the `N_HEADS * 2` scratch the pre-pass writes; levels 2 and 3
+/// require it.
 #[allow(clippy::too_many_arguments)]
 fn encode_attention_impl_ex(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -5586,10 +5598,13 @@ fn encode_attention_impl_ex(
     compact_base: usize,
     position_count: usize,
     v2: bool,
-    fused_softmax_ctx: bool,
+    softmax_ctx: u8,
+    stats: Option<&Buffer>,
 ) {
     debug_assert!(position_count > 0);
-    debug_assert!(!fused_softmax_ctx || mtp12_attention_v2_covers(head_dim));
+    debug_assert!(softmax_ctx <= 3);
+    debug_assert!(softmax_ctx == 0 || mtp12_attention_v2_covers(head_dim));
+    debug_assert!(softmax_ctx < 2 || stats.is_some());
     debug_assert_eq!(compact_base + position_count, logical_len);
     let n_heads = N_HEADS as u32;
     let head_dim = head_dim as u32;
@@ -5634,27 +5649,47 @@ fn encode_attention_impl_ex(
         tg32,
     );
 
-    if !fused_softmax_ctx {
-        encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
-        encoder.set_buffer(0, Some(scores), 0);
-        encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
-        encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: N_HEADS as u64,
-                height: 1,
-                depth: 1,
-            },
-            tg32,
-        );
+    match softmax_ctx {
+        0 => {
+            encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
+            encoder.set_buffer(0, Some(scores), 0);
+            encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+            encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: N_HEADS as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                tg32,
+            );
+        }
+        // Levels 2 and 3 hoist the two softmax passes out of the
+        // (heads x dim-blocks) context grid into one per-head pre-pass.
+        2 | 3 => {
+            encoder.set_compute_pipeline_state(&pipelines.attention_softmax_stats);
+            encoder.set_buffer(0, Some(scores), 0);
+            encoder.set_bytes(1, 4, &n_heads as *const u32 as *const c_void);
+            encoder.set_bytes(2, 4, &position_count_u32 as *const u32 as *const c_void);
+            encoder.set_buffer(3, stats.map(|v| &**v), 0);
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: N_HEADS as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                tg32,
+            );
+        }
+        _ => {}
     }
 
-    encoder.set_compute_pipeline_state(if fused_softmax_ctx {
-        &pipelines.attention_softmax_context_v2
-    } else if v2 {
-        &pipelines.attention_context_v2
-    } else {
-        &pipelines.attention_context
+    encoder.set_compute_pipeline_state(match softmax_ctx {
+        1 => &pipelines.attention_softmax_context_v2,
+        2 => &pipelines.attention_context_v2_stats16,
+        3 => &pipelines.attention_context_v2_stats4,
+        _ if v2 => &pipelines.attention_context_v2,
+        _ => &pipelines.attention_context,
     });
     encoder.set_buffer(0, Some(value), value_byte_offset);
     encoder.set_buffer(1, Some(scores), 0);
@@ -5668,10 +5703,13 @@ fn encode_attention_impl_ex(
     encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
     encoder.set_bytes(10, 4, &compact_base_u32 as *const u32 as *const c_void);
     encoder.set_bytes(11, 4, &logical_len_u32 as *const u32 as *const c_void);
+    if softmax_ctx >= 2 {
+        encoder.set_buffer(12, stats.map(|v| &**v), 0);
+    }
     encoder.dispatch_thread_groups(
         MTLSize {
             width: N_HEADS as u64,
-            height: if v2 || fused_softmax_ctx {
+            height: if v2 || softmax_ctx != 0 {
                 (head_dim as usize / 128) as u64
             } else {
                 1
@@ -7232,19 +7270,20 @@ mod tests {
         position_count: usize,
     ) -> Vec<f32> {
         mtp12_attention_run_ex(
-            device, pipelines, v2, false, query, keys, values, kv_heads, head_dim, capacity,
+            device, pipelines, v2, 0, query, keys, values, kv_heads, head_dim, capacity,
             compact_base, position_count,
         )
     }
 
-    /// As [`mtp12_attention_run`], with `fused` selecting
-    /// `mtp12_attention_softmax_context_v2` in place of softmax + context.
+    /// As [`mtp12_attention_run`], with `softmax_ctx` selecting one of the
+    /// `CAMELID_GEMMA4_MTP12_FUSE_SOFTMAX_CTX` levels in place of the softmax +
+    /// context pair (1 = fused, 2 = stats + 16-deep, 3 = stats + 4-deep).
     #[allow(clippy::too_many_arguments)]
-    fn mtp12_attention_run_ex(
+    pub(super) fn mtp12_attention_run_ex(
         device: &Device,
         pipelines: &Mtp12Pipelines,
         v2: bool,
-        fused: bool,
+        softmax_ctx: u8,
         query: &[f32],
         keys: &[f32],
         values: &[f32],
@@ -7261,6 +7300,7 @@ mod tests {
         let values_buf = f32_buffer(device, values).expect("values buffer");
         let scores = shared_buffer(device, N_HEADS * logical_len * 4);
         let output = shared_buffer(device, N_HEADS * head_dim * 4);
+        let stats = shared_buffer(device, N_HEADS * 2 * 4);
         write_buffer_f32(&output, &vec![f32::NAN; N_HEADS * head_dim]).expect("poison");
         let queue = device.new_command_queue();
         let command = queue.new_command_buffer();
@@ -7282,7 +7322,8 @@ mod tests {
             compact_base,
             position_count,
             v2,
-            fused,
+            softmax_ctx,
+            Some(&stats),
         );
         encoder.end_encoding();
         command.commit();
@@ -7822,9 +7863,37 @@ mod tests {
         for bad in ["", " 1", "1 ", "true", "false", "on", "2", "01"] {
             assert!(mtp12_fuse_flag("X", Some(bad)).is_err(), "{bad:?}");
         }
+        // Leveled selectors admit exactly 0..=max, one ASCII digit.
+        for max in [1u8, 2, 3, 5] {
+            for level in 0..=max {
+                assert_eq!(
+                    mtp12_fuse_level("X", Some(&level.to_string()), max).unwrap(),
+                    level
+                );
+            }
+            assert_eq!(mtp12_fuse_level("X", None, max).unwrap(), 0);
+            for bad in ["", " 1", "1 ", "true", "01", "-1", "10"] {
+                assert!(mtp12_fuse_level("X", Some(bad), max).is_err(), "{bad:?} max={max}");
+            }
+            if max < 9 {
+                assert!(mtp12_fuse_level("X", Some(&(max + 1).to_string()), max).is_err());
+            }
+        }
+        assert_eq!(mtp12_gemv_staged_rows(None).unwrap(), MTP12_GEMV_STAGED_ROWS_DEFAULT);
+        for rows in [1u32, 2, 4, 8, 16, MTP12_GEMV_STAGED_ROWS_MAX] {
+            assert_eq!(mtp12_gemv_staged_rows(Some(&rows.to_string())).unwrap(), rows);
+        }
+        for bad in ["", "0", "65", "-1", " 4", "4 ", "04", "true", "4.0"] {
+            assert!(mtp12_gemv_staged_rows(Some(bad)).is_err(), "{bad:?}");
+        }
         assert_eq!(Mtp12FuseFlags::default(), Mtp12FuseFlags {
-            gemv_x4: false, gate_up: false, norm: false, qrope: false,
-            softmax_ctx: false, head_prefetch: false,
+            gemv_x4: 0,
+            gemv_staged_rows: MTP12_GEMV_STAGED_ROWS_DEFAULT,
+            gate_up: false,
+            norm: false,
+            qrope: false,
+            softmax_ctx: 0,
+            head_prefetch: 0,
         });
     }
 
@@ -7905,10 +7974,20 @@ mod tests {
     const FUSE_GEMV_SHAPES: [(usize, usize); 6] =
         [(1_024, 3_840), (4_096, 1_024), (8_192, 1_024), (1_024, 4_096), (1_024, 8_192), (3_840, 1_024)];
 
-    /// `mtp12_q4_0_gemv_x4` (four rows per 128-thread group, guarded prefetch)
-    /// must reproduce `mtp12_q4_0_gemv` bit-for-bit at the six production
-    /// shapes, both rounding modes, a nonzero weight offset, a nonzero output
-    /// offset, and BF16 inputs including zeros and denormals.
+    /// Rows-per-simdgroup values covered by the staged-GEMV bit gate: divisors
+    /// and non-divisors of every production row count (3 and 6 leave a partial
+    /// last group), the default, and the clamp maximum.
+    const FUSE_GEMV_STAGED_ROWS: [u32; 8] = [1, 2, 3, 4, 6, 8, 16, MTP12_GEMV_STAGED_ROWS_MAX];
+
+    /// Every order-preserving dense-GEMV variant must reproduce
+    /// `mtp12_q4_0_gemv` bit-for-bit at the six production shapes, both
+    /// rounding modes, a nonzero weight offset, a nonzero output offset, and
+    /// BF16 inputs including zeros and denormals:
+    /// `mtp12_q4_0_gemv_x4` (`FUSE_GEMV_X4=1`, four rows per 128-thread group)
+    /// and `mtp12_q4_0_gemv_staged` (`FUSE_GEMV_X4=2/3`, register-staged
+    /// inputs) at every `CAMELID_GEMMA4_MTP12_GEMV_STAGED_ROWS` value the gate
+    /// lists.  Levels 2 and 3 differ only in which shapes they route to the
+    /// staged kernel, so covering the kernel at all six shapes covers both.
     #[test]
     fn gemv_x4_matches_gemv_bit_for_bit() {
         let Some(device) = Device::system_default() else { return; };
@@ -7927,23 +8006,42 @@ mod tests {
             let input = f32_buffer(&device, &random_bf16_values(cols, 100 + index as u64, true)).unwrap();
             for round in [false, true] {
                 let established = f32_buffer(&device, &vec![f32::NAN; rows]).unwrap();
-                let candidate = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
+                let mut variants: Vec<(String, Buffer)> = Vec::new();
                 let cb = queue.new_command_buffer();
                 let encoder = cb.new_compute_command_encoder();
                 encode_q4_gemv(encoder, &pipelines.q4_gemv, &weights, &input, &established, matrix, round);
+                let x4 = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
                 encode_q4_gemv_at_offset(
-                    encoder, &pipelines.q4_gemv_x4, &weights, &input, &candidate,
+                    encoder, &pipelines.q4_gemv_x4, &weights, &input, &x4,
                     OUTPUT_OFFSET as u64, matrix, round, true,
                 );
+                variants.push(("gemv_x4".to_string(), x4));
+                for rows_per_group in FUSE_GEMV_STAGED_ROWS {
+                    let staged = f32_buffer(&device, &vec![f32::NAN; rows + OUTPUT_OFFSET / 4]).unwrap();
+                    encode_q4_gemv_staged(
+                        encoder, &pipelines.q4_gemv_staged, &weights, &input, &staged,
+                        OUTPUT_OFFSET as u64, matrix, round, rows_per_group,
+                    );
+                    variants.push((format!("gemv_staged rows_per_group={rows_per_group}"), staged));
+                }
                 encoder.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();
                 assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
                 let expected = read_f32s(&established, rows);
                 assert!(expected.iter().all(|v| v.is_finite()), "{rows}x{cols}: fixture not finite");
-                let actual = read_f32s(&candidate, rows + OUTPUT_OFFSET / 4);
-                assert!(actual[..OUTPUT_OFFSET / 4].iter().all(|v| v.is_nan()), "offset prefix clobbered");
-                assert_bits_equal(&format!("gemv_x4 {rows}x{cols} round={round}"), &expected, &actual[OUTPUT_OFFSET / 4..]);
+                for (label, buffer) in &variants {
+                    let actual = read_f32s(buffer, rows + OUTPUT_OFFSET / 4);
+                    assert!(
+                        actual[..OUTPUT_OFFSET / 4].iter().all(|v| v.is_nan()),
+                        "{label} {rows}x{cols}: offset prefix clobbered"
+                    );
+                    assert_bits_equal(
+                        &format!("{label} {rows}x{cols} round={round}"),
+                        &expected,
+                        &actual[OUTPUT_OFFSET / 4..],
+                    );
+                }
             }
         }
     }
@@ -8069,9 +8167,10 @@ mod tests {
         }
     }
 
-    /// `mtp12_attention_softmax_context_v2` must reproduce softmax + context_v2
-    /// (and the established pair) bit-for-bit on both head shapes at position
-    /// counts around the 32-lane chunk boundaries and at production depth.
+    /// Every `FUSE_SOFTMAX_CTX` level (1 = fused, 2 = stats + 16-deep context,
+    /// 3 = stats + 4-deep context) must reproduce softmax + context_v2 (and the
+    /// established pair) bit-for-bit on both head shapes at position counts
+    /// around the 32-lane chunk boundaries and at production depth.
     #[test]
     fn mtp12_attention_softmax_context_fused_matches_pair_bit_for_bit() {
         let Some(device) = Device::system_default() else { return; };
@@ -8084,19 +8183,23 @@ mod tests {
                 mtp12_attention_fixture(kv_heads, head_dim, CAPACITY, 40 + shape_index as u64);
             for &position_count in &[1usize, 31, 32, 33, 127, 128, 129, 620, 1_024] {
                 for compact_base in [0usize, 3] {
-                    let run = |v2: bool, fused: bool| {
+                    let run = |v2: bool, softmax_ctx: u8| {
                         mtp12_attention_run_ex(
-                            &device, &pipelines, v2, fused, &query, &keys, &values,
+                            &device, &pipelines, v2, softmax_ctx, &query, &keys, &values,
                             kv_heads, head_dim, CAPACITY, compact_base, position_count,
                         )
                     };
-                    let established = run(false, false);
-                    let pair_v2 = run(true, false);
-                    let fused = run(true, true);
+                    let established = run(false, 0);
+                    let pair_v2 = run(true, 0);
                     assert!(established.iter().all(|v| v.is_finite()));
-                    let label = format!("softmax_ctx kv {kv_heads}x{head_dim} base {compact_base} count {position_count}");
-                    assert_bits_equal(&format!("{label} (v2 pair)"), &pair_v2, &fused);
-                    assert_bits_equal(&format!("{label} (established)"), &established, &fused);
+                    for level in 1u8..=3 {
+                        let fused = run(true, level);
+                        let label = format!(
+                            "softmax_ctx={level} kv {kv_heads}x{head_dim} base {compact_base} count {position_count}"
+                        );
+                        assert_bits_equal(&format!("{label} (v2 pair)"), &pair_v2, &fused);
+                        assert_bits_equal(&format!("{label} (established)"), &established, &fused);
+                    }
                 }
             }
         }
@@ -8135,8 +8238,11 @@ mod tests {
         (cluster_buffer, selected_buffer)
     }
 
-    /// `mtp12_q4_0_gemv_compact_local_prefetch` == `mtp12_q4_0_gemv_compact_local`
-    /// at cols 1024 (one block per lane) and 2048 (a second in-place block).
+    /// Both compact-head variants must equal `mtp12_q4_0_gemv_compact_local`
+    /// bit-for-bit at cols 1024 (one block per lane) and 2048 (a second
+    /// in-place block): `_prefetch` (`FUSE_HEAD_PREFETCH=1`, row prefetch) and
+    /// `_staged` (`FUSE_HEAD_PREFETCH=2`, row prefetch + register-staged
+    /// inputs).  `top` spans an empty, a production-sized and a full shortlist.
     #[test]
     fn head_prefetch_matches_compact_local_bit_for_bit() {
         let Some(device) = Device::system_default() else { return; };
@@ -8155,7 +8261,6 @@ mod tests {
             for top in [1usize, 384, 2_048] {
                 let (clusters, selected) = synthetic_head_selection(&device, ROWS, top, top as u64);
                 let established = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
-                let candidate = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
                 let cb = queue.new_command_buffer();
                 let encoder = cb.new_compute_command_encoder();
                 encoder.set_buffer(7, Some(&clusters), 0);
@@ -8163,11 +8268,19 @@ mod tests {
                 encode_q4_gemv_shortlist_compact(
                     encoder, &pipelines.q4_gemv_shortlist_compact, &weights, &input, &established, matrix,
                 );
-                encoder.set_buffer(7, Some(&clusters), 0);
-                encoder.set_buffer(8, Some(&selected), 0);
-                encode_q4_gemv_shortlist_compact(
-                    encoder, &pipelines.q4_gemv_shortlist_compact_prefetch, &weights, &input, &candidate, matrix,
-                );
+                let candidates: Vec<(&str, Buffer)> = [
+                    ("head_prefetch=1", &pipelines.q4_gemv_shortlist_compact_prefetch),
+                    ("head_prefetch=2", &pipelines.q4_gemv_shortlist_compact_staged),
+                ]
+                .into_iter()
+                .map(|(label, pipeline)| {
+                    let output = f32_buffer(&device, &vec![f32::NAN; ROWS]).unwrap();
+                    encoder.set_buffer(7, Some(&clusters), 0);
+                    encoder.set_buffer(8, Some(&selected), 0);
+                    encode_q4_gemv_shortlist_compact(encoder, pipeline, &weights, &input, &output, matrix);
+                    (label, output)
+                })
+                .collect();
                 encoder.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();
@@ -8175,7 +8288,13 @@ mod tests {
                 let expected = read_f32s(&established, ROWS);
                 assert!(expected.iter().any(|v| v.is_finite()) || top == 1, "fixture retained nothing");
                 assert!(expected.iter().all(|v| !v.is_nan()));
-                assert_bits_equal(&format!("head_prefetch cols={cols} top={top}"), &expected, &read_f32s(&candidate, ROWS));
+                for (label, output) in &candidates {
+                    assert_bits_equal(
+                        &format!("{label} cols={cols} top={top}"),
+                        &expected,
+                        &read_f32s(output, ROWS),
+                    );
+                }
             }
         }
     }
