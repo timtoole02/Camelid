@@ -3137,6 +3137,20 @@ impl Gemma4Mtp12AssistantMetal {
         let attention_scores = shared_buffer(&kernel.device, score_bytes);
         let cpu_prepare_us = prepare_started.elapsed().as_micros();
         let dump_queries = mtp12_dump_draft_queries_path();
+        if let Some(path) = dump_queries {
+            if crate::gemma4_runtime::mtp12_snapshot::enabled_path().is_some() {
+                let seed = unsafe {
+                    std::slice::from_raw_parts(
+                        initial_recurrent_hidden.values.buffer.contents().cast::<u8>()
+                            .add(initial_recurrent_hidden.values.byte_offset as usize).cast::<f32>(),
+                        TARGET_HIDDEN,
+                    )
+                };
+                crate::gemma4_runtime::mtp12_snapshot::record_initial_seed(
+                    path, anchor_token, proposal_position, target_kv_len, draft_k, seed,
+                )?;
+            }
+        }
 
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();

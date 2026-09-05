@@ -31,6 +31,10 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
+#[path = "gemma4_mtp12_snapshot.rs"]
+pub(crate) mod mtp12_snapshot;
+
 /// Q8_0 wire-block geometry (GGUF on-disk format): 32 quantized values per block,
 /// stored as a 2-byte little-endian f16 scale followed by 32 i8 quants = 34 bytes.
 const Q8_VALUES_PER_BLOCK: usize = 32;
@@ -10024,6 +10028,7 @@ impl Gemma4GpuRuntime {
         }
         stats.decode_us = decode_started.elapsed().as_micros();
         stats.emitted_tokens = generated.len() as u64;
+        self.maybe_dump_mtp12_final_kv(prompt, &generated, position, &stats)?;
         let text = if on_delta.is_some() {
             let final_text = self.tokenizer.decode(&generated, true)?;
             if final_text != text_stream.emitted_text {
