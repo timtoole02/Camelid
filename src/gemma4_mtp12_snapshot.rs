@@ -98,7 +98,10 @@ impl Gemma4GpuRuntime {
             }
             Ok(())
         }).ok_or_else(|| diagnostic_error("source KV views unavailable"))??;
-        let environment = std::env::vars().filter(|(k, _)| k.starts_with("CAMELID_"))
+        let environment = std::env::vars().filter(|(k, _)| {
+            k.starts_with("CAMELID_GEMMA4_") || k.starts_with("CAMELID_MTP12_")
+                || matches!(k.as_str(), "CAMELID_SKIP_FIT_CHECK" | "CAMELID_CONTEXT_PAGING")
+        })
             .collect::<std::collections::BTreeMap<_, _>>();
         let metadata = serde_json::json!({"format":"camelid-mtp12-final-kv-v1","diagnostic_only":true,
             "target_sha256":crate::metal::GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
