@@ -680,6 +680,62 @@ mod tests {
                                 &denom[depth * heads..(depth + 1) * heads],
                                 &tree_denom[node * heads..(node + 1) * heads],
                             );
+                            if std::env::var_os("CAMELID_TREE_DEBUG_ROUNDING").is_some() {
+                                let expected = &output[depth * qdim..(depth + 1) * qdim];
+                                let actual = &tree_output[node * qdim..(node + 1) * qdim];
+                                if let Some(index) = expected.iter().zip(actual)
+                                    .position(|(a, b)| a.to_bits() != b.to_bits()) {
+                                    let head = index / hd;
+                                    let dim = index % hd;
+                                    let kv_head = head / (heads / kv_heads);
+                                    let denominator = tree_denom[node * heads + head];
+                                    let mut terms = Vec::new();
+                                    for p in 0..tm.position_count as usize {
+                                        let logical = tm.window_start as usize + p;
+                                        let physical = if logical < base { logical } else {
+                                            base + plan.ancestors[node][logical - base] as usize
+                                        };
+                                        let score = tree_scores[tm.score_offset as usize + head * tm.position_count as usize + p];
+                                        let value = values[(kv_head * capacity + physical) * hd + dim];
+                                        terms.push((score, value));
+                                    }
+                                    eprintln!("[tree-rounding] {label} index={index} head={head} dim={dim} denom={:08x} expected={:08x} actual={:08x}",
+                                        denominator.to_bits(), expected[index].to_bits(), actual[index].to_bits());
+                                    if terms.len() <= 8 {
+                                        for (p, &(score, value)) in terms.iter().enumerate() {
+                                            eprintln!("[tree-rounding] p={p} exp={:08x} value={:08x}", score.to_bits(), value.to_bits());
+                                        }
+                                    }
+                                    // Rust f32 mul_add provides an explicit one-rounding FMA.
+                                    // Screen rounded divide and its adjacent representations;
+                                    // GPU inverse/contraction still needs direct evidence.
+                                    let inverse = 1.0f32 / denominator;
+                                    for inverse_bits in [inverse.to_bits() - 1, inverse.to_bits(), inverse.to_bits() + 1] {
+                                        let inv = f32::from_bits(inverse_bits);
+                                        let mut svi_fma = 0.0f32;
+                                        let mut siv_fma = 0.0f32;
+                                        let mut vis_fma = 0.0f32;
+                                        let mut unfused = 0.0f32;
+                                        let mut dot_fma = 0.0f32;
+                                        let mut dot_unfused = 0.0f32;
+                                        for &(score, value) in &terms {
+                                            svi_fma = (score * value).mul_add(inv, svi_fma);
+                                            siv_fma = (score * inv).mul_add(value, siv_fma);
+                                            vis_fma = (value * inv).mul_add(score, vis_fma);
+                                            unfused = unfused + ((score * inv) * value);
+                                            dot_fma = score.mul_add(value, dot_fma);
+                                            dot_unfused = dot_unfused + score * value;
+                                        }
+                                        for (name, value) in [("fma(score*value,inv,acc)", svi_fma),
+                                            ("fma(score*inv,value,acc)", siv_fma), ("fma(value*inv,score,acc)", vis_fma),
+                                            ("add(mul(mul(score,inv),value))", unfused), ("fma_dot_then_inv", dot_fma * inv),
+                                            ("unfused_dot_then_inv", dot_unfused * inv)] {
+                                            eprintln!("[tree-rounding] inv={inverse_bits:08x} form={name} value={:08x} expected_match={} actual_match={}",
+                                                value.to_bits(), value.to_bits() == expected[index].to_bits(), value.to_bits() == actual[index].to_bits());
+                                        }
+                                    }
+                                }
+                            }
                             bits_equal(
                                 &format!("context {label}"),
                                 &output[depth * qdim..(depth + 1) * qdim],
