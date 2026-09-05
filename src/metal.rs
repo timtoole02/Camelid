@@ -18889,8 +18889,21 @@ impl Gemma4ResidentModel {
             let attention_rows_v2_requested = gemma4_dense_attention_rows_v2_enabled();
             let attention_rows_requested =
                 tree_plan.is_some() || gemma4_dense_attention_rows_enabled() || attention_rows_v2_requested;
+            // Opt-in `CAMELID_GEMMA4_LINEAR_K8_VIA_TREE=1`: a linear (non-branched) K=8 V2
+            // verify takes the tree encoder with the static chain plan (its row plan and
+            // addressing equal the linear path's; prefix scores cover the whole union and
+            // no suffix dispatch is made) so it binds the tree-library context kernels
+            // selected by CAMELID_GEMMA4_TREE_CONTEXT_FORM. Columns 1/2/4/16, and unset,
+            // keep today's linear attention. Like the tree path it is fail-closed: a
+            // tree-library compile failure declines the round instead of running.
+            let linear_k8_via_tree = tree_plan.is_none()
+                && columns == 8
+                && attention_rows_v2_requested
+                && gemma4_tree::linear_k8_via_tree_enabled();
+            let attention_plan: Option<&Gemma4DenseTreePlan> =
+                tree_plan.or_else(|| linear_k8_via_tree.then(Gemma4DenseTreePlan::chain));
             let attention_rows_encoded = attention_rows_requested
-                && if let Some(plan) = tree_plan {
+                && if let Some(plan) = attention_plan {
                     gemma4_tree::encode_tree_attention(
                         encoder, kernel, &scratch.q_normed, cache_k, cache_v,
                         &scratch.q4_terms, &scratch.rows_denom, &scratch.context,
@@ -53137,6 +53150,10 @@ mod tests {
     /// `(head,row)` kernel and the requested V2 forms
     /// (`CAMELID_ATTN_V2_RECEIPT_VARIANTS="s,c;s,c;..."`, default: default + nest).
     /// Prints median GPU microseconds per round and the per-position slope.
+    /// `CAMELID_ATTN_V2_RECEIPT_TREE=1` adds the tree-library path (chain plan, or a fork
+    /// via `..._TREE_FORK=<0..3>`) for every tree context form
+    /// (`..._TREE_FORMS="p2;p8,p8;..."`, see `gemma4_tree::TreeContextSelection`) and
+    /// prints the resolved kernels; the linear V2 form is then the reference timing.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
@@ -53187,36 +53204,132 @@ mod tests {
         let scores = cache(16 * HEADS * MAX_POSITIONS);
         let denom = cache(16 * HEADS);
 
-        let variants: Vec<Option<Gemma4DenseAttentionRowsV2Variant>> = {
-            let mut list = vec![None];
-            match std::env::var("CAMELID_ATTN_V2_RECEIPT_VARIANTS") {
+        /// One timed configuration of the receipt.
+        #[derive(Clone, Copy)]
+        enum ReceiptConfig {
+            RowsV1,
+            V2(Gemma4DenseAttentionRowsV2Variant),
+            Tree(Gemma4DenseAttentionRowsV2Variant, gemma4_tree::TreeContextSelection),
+        }
+        // Tree mode (`CAMELID_ATTN_V2_RECEIPT_TREE=1`): the same 48-layer round is encoded
+        // through `gemma4_tree::encode_tree_attention_with_form` with the static W8 chain
+        // plan (or the 4+1+2 fork at `CAMELID_ATTN_V2_RECEIPT_TREE_FORK=<0..3>`) for every
+        // tree context form (`CAMELID_ATTN_V2_RECEIPT_TREE_FORMS="p2;p4,p2;p8,p8;..."`,
+        // default: today's forms, each new form alone, then p8,p8 and p4,p8), printing the
+        // RESOLVED context kernel per head dimension. Requesting tree forms without the
+        // tree flag is refused so the linear encoder is never labeled as a tree form.
+        let tree_mode = std::env::var("CAMELID_ATTN_V2_RECEIPT_TREE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let tree_forms: Vec<gemma4_tree::TreeContextSelection> =
+            match std::env::var("CAMELID_ATTN_V2_RECEIPT_TREE_FORMS") {
                 Ok(spec) => {
-                    for item in spec.split(';') {
-                        list.push(Some(
-                            Gemma4DenseAttentionRowsV2Variant::parse(item)
-                                .unwrap_or_else(|| panic!("bad variant {item:?}")),
-                        ));
-                    }
+                    assert!(
+                        tree_mode,
+                        "[attn-v2-receipt] REFUSED: CAMELID_ATTN_V2_RECEIPT_TREE_FORMS={spec:?} \
+                         requests tree context forms but CAMELID_ATTN_V2_RECEIPT_TREE=1 is not \
+                         set; the linear encoder cannot bind them and must not be reported as them"
+                    );
+                    spec.split(';')
+                        .map(|item| {
+                            gemma4_tree::TreeContextSelection::parse(item)
+                                .unwrap_or_else(|| panic!("bad tree context form {item:?}"))
+                        })
+                        .collect()
                 }
-                Err(_) => {
-                    list.push(Some(Gemma4DenseAttentionRowsV2Variant::DEFAULT));
-                    if Gemma4DenseAttentionRowsV2Variant::DEFAULT
-                        != Gemma4DenseAttentionRowsV2Variant::NEST
-                    {
-                        list.push(Some(Gemma4DenseAttentionRowsV2Variant::NEST));
-                    }
-                }
-            }
-            list
-        };
+                Err(_) if tree_mode => gemma4_tree::TreeContextSelection::receipt_forms(),
+                Err(_) => Vec::new(),
+            };
         let rows: usize = std::env::var("CAMELID_ATTN_V2_RECEIPT_ROWS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(8);
+        let tree_plan: Option<Gemma4DenseTreePlan> = tree_mode.then(|| {
+            assert_eq!(
+                rows, 8,
+                "[attn-v2-receipt] REFUSED: the tree receipt is W8 only (CAMELID_ATTN_V2_RECEIPT_ROWS)"
+            );
+            match std::env::var("CAMELID_ATTN_V2_RECEIPT_TREE_FORK") {
+                Ok(step) => {
+                    let step: usize = step
+                        .parse()
+                        .ok()
+                        .filter(|step| *step < 4)
+                        .unwrap_or_else(|| panic!("CAMELID_ATTN_V2_RECEIPT_TREE_FORK={step:?} is not 0..=3"));
+                    gemma4_tree::fork_plan(step)
+                }
+                Err(_) => Gemma4DenseTreePlan::chain().clone(),
+            }
+        });
+        let plan_label = tree_plan.as_ref().map_or_else(String::new, |plan| {
+            if plan.is_linear_chain() {
+                "chain".to_string()
+            } else {
+                format!("fork{:?}", plan.parents())
+            }
+        });
+        let variants: Vec<Gemma4DenseAttentionRowsV2Variant> = match std::env::var(
+            "CAMELID_ATTN_V2_RECEIPT_VARIANTS",
+        ) {
+            Ok(spec) => spec
+                .split(';')
+                .map(|item| {
+                    Gemma4DenseAttentionRowsV2Variant::parse(item)
+                        .unwrap_or_else(|| panic!("bad variant {item:?}"))
+                })
+                .collect(),
+            Err(_) if tree_mode => vec![Gemma4DenseAttentionRowsV2Variant {
+                scores: 2,
+                context: 3,
+            }],
+            Err(_) => {
+                let mut list = vec![Gemma4DenseAttentionRowsV2Variant::DEFAULT];
+                if Gemma4DenseAttentionRowsV2Variant::DEFAULT
+                    != Gemma4DenseAttentionRowsV2Variant::NEST
+                {
+                    list.push(Gemma4DenseAttentionRowsV2Variant::NEST);
+                }
+                list
+            }
+        };
+        let mut configs = Vec::new();
+        if !tree_mode {
+            configs.push(ReceiptConfig::RowsV1);
+        }
+        for variant in &variants {
+            configs.push(ReceiptConfig::V2(*variant));
+            for form in &tree_forms {
+                configs.push(ReceiptConfig::Tree(*variant, *form));
+            }
+        }
         let depths = [128usize, 512, 1_024, 1_536, 2_040 - rows];
 
-        for variant in &variants {
-            let label = variant.map_or_else(|| "rows-v1".to_string(), |v| format!("v2-{}", v.label()));
+        for config in &configs {
+            // Label and the RESOLVED context kernels (sliding HD256 / global HD512), so a
+            // receipt line can never be mistaken for a form it did not run.
+            let (label, resolved) = match config {
+                ReceiptConfig::RowsV1 => (
+                    "rows-v1".to_string(),
+                    "sliding=gemma4_dense_attention_rows(head,row) global=gemma4_dense_attention_rows(head,row)"
+                        .to_string(),
+                ),
+                ReceiptConfig::V2(variant) => (
+                    format!("v2-{}", variant.label()),
+                    format!(
+                        "sliding={} global={}",
+                        variant.context_kernel(256).map_or("<none>", |k| k.0),
+                        variant.context_kernel(512).map_or("<none>", |k| k.0)
+                    ),
+                ),
+                ReceiptConfig::Tree(variant, form) => (
+                    format!("tree-{}-{}-{plan_label}", variant.label(), form.label()),
+                    format!(
+                        "sliding={} global={}",
+                        form.resolved_name(256, *variant),
+                        form.resolved_name(512, *variant)
+                    ),
+                ),
+            };
+            println!("[attn-v2-receipt] {label} rows={rows} {resolved}");
             let mut per_depth = Vec::new();
             for &base in &depths {
                 let mut samples = Vec::new();
@@ -53233,8 +53346,8 @@ mod tests {
                             let (k, v) = &global_caches[(layer / 6) % GLOBAL_SETS];
                             (k, v, 1, 512, None)
                         };
-                        let encoded = match variant {
-                            None => encode_gemma4_dense_attention_rows_f32(
+                        let encoded = match config {
+                            ReceiptConfig::RowsV1 => encode_gemma4_dense_attention_rows_f32(
                                 encoder,
                                 kernel,
                                 &mut keep,
@@ -53252,7 +53365,7 @@ mod tests {
                                 window,
                                 1.0,
                             ),
-                            Some(variant) => encode_gemma4_dense_attention_rows_v2_f32(
+                            ReceiptConfig::V2(variant) => encode_gemma4_dense_attention_rows_v2_f32(
                                 encoder,
                                 kernel,
                                 &query,
@@ -53271,6 +53384,28 @@ mod tests {
                                 1.0,
                                 *variant,
                             ),
+                            ReceiptConfig::Tree(variant, form) => {
+                                gemma4_tree::encode_tree_attention_with_form(
+                                    encoder,
+                                    kernel,
+                                    &query,
+                                    k,
+                                    v,
+                                    &scores,
+                                    &denom,
+                                    &out,
+                                    HEADS,
+                                    n_kv_heads,
+                                    head_dim,
+                                    MAX_POSITIONS,
+                                    base,
+                                    window,
+                                    1.0,
+                                    tree_plan.as_ref().expect("tree receipt plan"),
+                                    *variant,
+                                    *form,
+                                )
+                            }
                         };
                         assert!(encoded, "{label}: layer {layer} declined at base {base}");
                     }
@@ -53285,7 +53420,7 @@ mod tests {
                 samples.sort_unstable();
                 let median = samples[samples.len() / 2];
                 println!(
-                    "[attn-v2-receipt] {label} rows={rows} base={base} gpu_us median={median} min={} max={}",
+                    "[attn-v2-receipt] {label} rows={rows} base={base} {resolved} gpu_us median={median} min={} max={}",
                     samples[0],
                     samples[samples.len() - 1]
                 );
