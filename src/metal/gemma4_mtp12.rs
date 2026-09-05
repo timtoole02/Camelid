@@ -1031,6 +1031,141 @@ kernel void mtp12_attention_context(
     }
 }
 
+// ---- Assistant attention V2 (opt-in, default off) --------------------------------
+// Same per-element arithmetic as mtp12_attention_scores / mtp12_attention_context.
+// This library is compiled without fast-math, so the textual operation order IS the
+// bit order; only the work distribution changes:
+//   * scores: grid (head, position block).  The BF16-rounded query is staged once in
+//     threadgroup memory and each lane owns ONE position, keeping the eight float4
+//     accumulators and the final fold verbatim;
+//   * context: grid (head, 128-dim block).  Each lane owns four dims, the four
+//     position-parity partials are kept per component, and the probability/value loads
+//     are hoisted four positions ahead so memory latency overlaps the serial adds.
+kernel void mtp12_attention_scores_v2(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float4 q_tg[128];
+    const uint head = tg.x;
+    if (head >= n_heads || (head_dim & 31u) != 0u || head_dim > 512u) return;
+    const uint q_base = head * head_dim;
+    for (uint c = lane; c < head_dim / 4u; c += 32u) {
+        q_tg[c] = mtp12_load_bf16x4(query, q_base + c * 4u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint p = tg.y * 32u + lane;
+    if (p >= position_count) return;
+    const uint kv_head = head / group;
+    const uint k_base = kv_base_offset + kv_head * kv_head_stride + p * position_stride;
+    float4 acc0 = 0.0f;
+    float4 acc1 = 0.0f;
+    float4 acc2 = 0.0f;
+    float4 acc3 = 0.0f;
+    float4 acc4 = 0.0f;
+    float4 acc5 = 0.0f;
+    float4 acc6 = 0.0f;
+    float4 acc7 = 0.0f;
+    for (uint d = 0u; d < head_dim; d += 32u) {
+        const uint c = d / 4u;
+        acc0 += q_tg[c] * mtp12_load_bf16x4(keys, k_base + d);
+        acc1 += q_tg[c + 1u] * mtp12_load_bf16x4(keys, k_base + d + 4u);
+        acc2 += q_tg[c + 2u] * mtp12_load_bf16x4(keys, k_base + d + 8u);
+        acc3 += q_tg[c + 3u] * mtp12_load_bf16x4(keys, k_base + d + 12u);
+        acc4 += q_tg[c + 4u] * mtp12_load_bf16x4(keys, k_base + d + 16u);
+        acc5 += q_tg[c + 5u] * mtp12_load_bf16x4(keys, k_base + d + 20u);
+        acc6 += q_tg[c + 6u] * mtp12_load_bf16x4(keys, k_base + d + 24u);
+        acc7 += q_tg[c + 7u] * mtp12_load_bf16x4(keys, k_base + d + 28u);
+    }
+    acc0 += acc4; acc1 += acc5; acc2 += acc6; acc3 += acc7;
+    acc0 += acc2; acc1 += acc3; acc0 += acc1;
+    scores[head * position_count + p] =
+        mtp12_round_bf16((acc0.x + acc0.y) + (acc0.z + acc0.w));
+}
+
+inline void mtp12_context_v2_accumulate(
+    thread float4& p0,
+    thread float4& p1,
+    thread float4& p2,
+    thread float4& p3,
+    uint absolute_position,
+    uint vector_end,
+    float4 product) {
+    if (absolute_position >= vector_end) p0 += product;
+    else if ((absolute_position & 3u) == 0u) p0 += product;
+    else if ((absolute_position & 3u) == 1u) p1 += product;
+    else if ((absolute_position & 3u) == 2u) p2 += product;
+    else p3 += product;
+}
+
+kernel void mtp12_attention_context_v2(
+    device const float* values [[buffer(0)]],
+    device const float* probabilities [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& position_count [[buffer(5)]],
+    constant uint& group [[buffer(6)]],
+    constant uint& position_stride [[buffer(7)]],
+    constant uint& kv_head_stride [[buffer(8)]],
+    constant uint& kv_base_offset [[buffer(9)]],
+    constant uint& compact_base [[buffer(10)]],
+    constant uint& physical_logical_k [[buffer(11)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint head = tg.x;
+    if (head >= n_heads || compact_base + position_count != physical_logical_k) return;
+    const uint d = tg.y * 128u + lane * 4u;
+    if (d + 4u > head_dim) return;
+    const uint kv_head = head / group;
+    const uint output_base = head * head_dim;
+    const uint kv_base = kv_base_offset + kv_head * kv_head_stride + d;
+    const uint score_base = head * position_count;
+    const uint vector_end = physical_logical_k & ~3u;
+    float4 p0 = 0.0f;
+    float4 p1 = 0.0f;
+    float4 p2 = 0.0f;
+    float4 p3 = 0.0f;
+    uint p = 0u;
+    for (; p + 4u <= position_count; p += 4u) {
+        const float pr0 = mtp12_round_bf16(probabilities[score_base + p]);
+        const float pr1 = mtp12_round_bf16(probabilities[score_base + p + 1u]);
+        const float pr2 = mtp12_round_bf16(probabilities[score_base + p + 2u]);
+        const float pr3 = mtp12_round_bf16(probabilities[score_base + p + 3u]);
+        const float4 v0 = mtp12_load_bf16x4(values, kv_base + p * position_stride);
+        const float4 v1 = mtp12_load_bf16x4(values, kv_base + (p + 1u) * position_stride);
+        const float4 v2 = mtp12_load_bf16x4(values, kv_base + (p + 2u) * position_stride);
+        const float4 v3 = mtp12_load_bf16x4(values, kv_base + (p + 3u) * position_stride);
+        const float4 product0 = pr0 * v0;
+        const float4 product1 = pr1 * v1;
+        const float4 product2 = pr2 * v2;
+        const float4 product3 = pr3 * v3;
+        mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p, vector_end, product0);
+        mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + 1u, vector_end, product1);
+        mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + 2u, vector_end, product2);
+        mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p + 3u, vector_end, product3);
+    }
+    for (; p < position_count; ++p) {
+        const float pr = mtp12_round_bf16(probabilities[score_base + p]);
+        const float4 v = mtp12_load_bf16x4(values, kv_base + p * position_stride);
+        const float4 product = pr * v;
+        mtp12_context_v2_accumulate(p0, p1, p2, p3, compact_base + p, vector_end, product);
+    }
+    const float4 folded = ((p0 + p1) + p2) + p3;
+    output[output_base + d] = mtp12_round_bf16(folded.x);
+    output[output_base + d + 1u] = mtp12_round_bf16(folded.y);
+    output[output_base + d + 2u] = mtp12_round_bf16(folded.z);
+    output[output_base + d + 3u] = mtp12_round_bf16(folded.w);
+}
+
 kernel void mtp12_argmax(
     device const float* logits [[buffer(0)]],
     device uint* output_id [[buffer(1)]],
@@ -1081,6 +1216,8 @@ struct Mtp12Pipelines {
     attention_scores: ComputePipelineState,
     attention_softmax: ComputePipelineState,
     attention_context: ComputePipelineState,
+    attention_scores_v2: ComputePipelineState,
+    attention_context_v2: ComputePipelineState,
     add: ComputePipelineState,
     add_scale: ComputePipelineState,
     gelu_mul: ComputePipelineState,
@@ -1114,6 +1251,8 @@ impl Mtp12Pipelines {
             attention_scores: pipeline("mtp12_attention_scores")?,
             attention_softmax: pipeline("mtp12_attention_softmax")?,
             attention_context: pipeline("mtp12_attention_context")?,
+            attention_scores_v2: pipeline("mtp12_attention_scores_v2")?,
+            attention_context_v2: pipeline("mtp12_attention_context_v2")?,
             add: pipeline("mtp12_add_bf16")?,
             add_scale: pipeline("mtp12_add_scale_bf16")?,
             gelu_mul: pipeline("mtp12_gelu_mul")?,
@@ -3206,6 +3345,24 @@ fn encode_rope_at_offset(
     dispatch_1d(encoder, pipeline, count);
 }
 
+/// Opt-in latency-hiding V2 of the assistant's attention over the target KV
+/// (`CAMELID_GEMMA4_MTP12_ATTN_V2=1`).  Same per-element arithmetic as the established
+/// kernels (see the shader note on `mtp12_attention_scores_v2`); only the dispatch grids
+/// change, so the proposals are bit-identical and acceptance is unchanged.
+fn mtp12_attention_v2_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_MTP12_ATTN_V2")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Geometry the V2 kernels cover: the staged query fits threadgroup memory and the
+/// context grid's 128-dim blocks tile the head exactly (both 12B head shapes qualify).
+fn mtp12_attention_v2_covers(head_dim: usize) -> bool {
+    head_dim % 128 == 0 && head_dim <= 512
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_attention(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -3224,6 +3381,49 @@ fn encode_attention(
     compact_base: usize,
     position_count: usize,
 ) {
+    encode_attention_impl(
+        encoder,
+        pipelines,
+        query,
+        key,
+        value,
+        key_byte_offset,
+        value_byte_offset,
+        kv_capacity,
+        scores,
+        output,
+        kv_heads,
+        head_dim,
+        logical_len,
+        compact_base,
+        position_count,
+        mtp12_attention_v2_enabled() && mtp12_attention_v2_covers(head_dim),
+    );
+}
+
+/// `v2` selects the latency-hiding grids (`mtp12_attention_scores_v2` /
+/// `mtp12_attention_context_v2`); the softmax dispatch is shared.  Both routes bind the
+/// same arguments and produce bit-identical output (pinned by
+/// `mtp12_attention_v2_matches_established_kernels_bit_for_bit`).
+#[allow(clippy::too_many_arguments)]
+fn encode_attention_impl(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipelines: &Mtp12Pipelines,
+    query: &Buffer,
+    key: &BufferRef,
+    value: &BufferRef,
+    key_byte_offset: u64,
+    value_byte_offset: u64,
+    kv_capacity: usize,
+    scores: &Buffer,
+    output: &Buffer,
+    kv_heads: usize,
+    head_dim: usize,
+    logical_len: usize,
+    compact_base: usize,
+    position_count: usize,
+    v2: bool,
+) {
     debug_assert!(position_count > 0);
     debug_assert_eq!(compact_base + position_count, logical_len);
     let n_heads = N_HEADS as u32;
@@ -3235,8 +3435,17 @@ fn encode_attention(
     let kv_base_offset = (compact_base * head_dim as usize) as u32;
     let compact_base_u32 = compact_base as u32;
     let logical_len_u32 = logical_len as u32;
+    let tg32 = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
 
-    encoder.set_compute_pipeline_state(&pipelines.attention_scores);
+    encoder.set_compute_pipeline_state(if v2 {
+        &pipelines.attention_scores_v2
+    } else {
+        &pipelines.attention_scores
+    });
     encoder.set_buffer(0, Some(query), 0);
     encoder.set_buffer(1, Some(key), key_byte_offset);
     encoder.set_buffer(2, Some(scores), 0);
@@ -3250,14 +3459,14 @@ fn encode_attention(
     encoder.dispatch_thread_groups(
         MTLSize {
             width: N_HEADS as u64,
-            height: 1,
+            height: if v2 {
+                position_count.div_ceil(32) as u64
+            } else {
+                1
+            },
             depth: 1,
         },
-        MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
+        tg32,
     );
 
     encoder.set_compute_pipeline_state(&pipelines.attention_softmax);
@@ -3270,14 +3479,14 @@ fn encode_attention(
             height: 1,
             depth: 1,
         },
-        MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
+        tg32,
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.attention_context);
+    encoder.set_compute_pipeline_state(if v2 {
+        &pipelines.attention_context_v2
+    } else {
+        &pipelines.attention_context
+    });
     encoder.set_buffer(0, Some(value), value_byte_offset);
     encoder.set_buffer(1, Some(scores), 0);
     encoder.set_buffer(2, Some(output), 0);
@@ -3293,14 +3502,14 @@ fn encode_attention(
     encoder.dispatch_thread_groups(
         MTLSize {
             width: N_HEADS as u64,
-            height: 1,
+            height: if v2 {
+                (head_dim as usize / 128) as u64
+            } else {
+                1
+            },
             depth: 1,
         },
-        MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
+        tg32,
     );
 }
 
@@ -4595,6 +4804,279 @@ mod tests {
         command_buffer.wait_until_completed();
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(unsafe { *output.contents().cast::<u32>() }, 3);
+    }
+
+
+    /// Adversarial assistant-attention fixture over a target-shaped KV view: queries in
+    /// three magnitude bands, LCG-noised K/V with a per-position marker so any dropped or
+    /// duplicated position changes the output.
+    fn mtp12_attention_fixture(
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        seed: u64,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ seed;
+        let mut noise = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (((state >> 40) & 0xFFFF) as f32 / 65_535.0 - 0.5) * 2.0
+        };
+        let query: Vec<f32> = (0..N_HEADS * head_dim)
+            .map(|index| {
+                let band = match (index / head_dim) % 3 {
+                    0 => 0.25,
+                    1 => 1.0,
+                    _ => 3.0,
+                };
+                (((index * 17) % 61) as f32 - 30.0) * 0.03125 * band + noise() * 0.125
+            })
+            .collect();
+        let mut keys = vec![0.0f32; kv_heads * capacity * head_dim];
+        let mut values = vec![0.0f32; keys.len()];
+        for kv_head in 0..kv_heads {
+            for position in 0..capacity {
+                let marker = (position % 97) as f32 * 0.01;
+                for dim in 0..head_dim {
+                    let index = (kv_head * capacity + position) * head_dim + dim;
+                    keys[index] =
+                        (((index * 13) % 47) as f32 - 23.0) * 0.015625 + noise() * 0.0625 + marker;
+                    values[index] =
+                        (((index * 19) % 53) as f32 - 26.0) * 0.015625 + noise() * 0.0625 - marker;
+                }
+            }
+        }
+        (query, keys, values)
+    }
+
+    /// Encodes one assistant attention (established or V2 grids) over the fixture and
+    /// returns the context output.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp12_attention_run(
+        device: &Device,
+        pipelines: &Mtp12Pipelines,
+        v2: bool,
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        compact_base: usize,
+        position_count: usize,
+    ) -> Vec<f32> {
+        let logical_len = compact_base + position_count;
+        assert!(logical_len <= capacity);
+        let query_buf = f32_buffer(device, query).expect("query buffer");
+        let keys_buf = f32_buffer(device, keys).expect("keys buffer");
+        let values_buf = f32_buffer(device, values).expect("values buffer");
+        let scores = shared_buffer(device, N_HEADS * logical_len * 4);
+        let output = shared_buffer(device, N_HEADS * head_dim * 4);
+        write_buffer_f32(&output, &vec![f32::NAN; N_HEADS * head_dim]).expect("poison");
+        let queue = device.new_command_queue();
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encode_attention_impl(
+            encoder,
+            pipelines,
+            &query_buf,
+            &keys_buf,
+            &values_buf,
+            0,
+            0,
+            capacity,
+            &scores,
+            &output,
+            kv_heads,
+            head_dim,
+            logical_len,
+            compact_base,
+            position_count,
+            v2,
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        let mut out = vec![0.0f32; N_HEADS * head_dim];
+        read_buffer_f32(&output, &mut out).expect("read output");
+        out
+    }
+
+    /// The V2 grids must reproduce the established assistant attention BIT-FOR-BIT on
+    /// both 12B head shapes, at depths past the 32-lane stride, at a compacted sliding
+    /// base, and with a ragged (non-multiple-of-four) position count.
+    #[test]
+    fn mtp12_attention_v2_matches_established_kernels_bit_for_bit() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping Gemma 4 12B MTP attention V2 parity");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("Gemma 4 12B MTP pipelines");
+        // (kv_heads, head_dim, capacity, compact_base, position_count)
+        let cases = [
+            (LOCAL_KV_HEADS, LOCAL_HEAD_DIM, 1_100, 0, 64),
+            (LOCAL_KV_HEADS, LOCAL_HEAD_DIM, 1_100, 70, 1_025),
+            (LOCAL_KV_HEADS, LOCAL_HEAD_DIM, 1_100, 3, 517),
+            (LOCAL_KV_HEADS, LOCAL_HEAD_DIM, 1_100, 0, 1),
+            (LOCAL_KV_HEADS, LOCAL_HEAD_DIM, 1_100, 1, 2),
+            (FULL_KV_HEADS, FULL_HEAD_DIM, 1_100, 0, 1_031),
+            (FULL_KV_HEADS, FULL_HEAD_DIM, 1_100, 0, 130),
+            (FULL_KV_HEADS, FULL_HEAD_DIM, 1_100, 0, 5),
+        ];
+        for (index, &(kv_heads, head_dim, capacity, compact_base, position_count)) in
+            cases.iter().enumerate()
+        {
+            let (query, keys, values) =
+                mtp12_attention_fixture(kv_heads, head_dim, capacity, index as u64);
+            let established = mtp12_attention_run(
+                &device,
+                &pipelines,
+                false,
+                &query,
+                &keys,
+                &values,
+                kv_heads,
+                head_dim,
+                capacity,
+                compact_base,
+                position_count,
+            );
+            let candidate = mtp12_attention_run(
+                &device,
+                &pipelines,
+                true,
+                &query,
+                &keys,
+                &values,
+                kv_heads,
+                head_dim,
+                capacity,
+                compact_base,
+                position_count,
+            );
+            assert!(
+                established.iter().all(|value| value.is_finite()),
+                "case {index}: established output is not finite"
+            );
+            for (element, (expected, actual)) in established.iter().zip(&candidate).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "case {index} (kv {kv_heads} x {head_dim}, base {compact_base}, count {position_count}) element {element}: v2={actual} ({:#010x}) != established={expected} ({:#010x})",
+                    actual.to_bits(),
+                    expected.to_bits(),
+                );
+            }
+        }
+    }
+
+    /// Production-shape timing receipt for the assistant chain's attention: seven
+    /// drafts x (three sliding-layer + one full-layer attentions) over the target KV at
+    /// several depths, established grids vs V2.  Prints median GPU microseconds per
+    /// round and the per-position slope.
+    #[test]
+    #[ignore]
+    fn mtp12_attention_v2_production_receipt() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping Gemma 4 12B MTP attention V2 receipt");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("Gemma 4 12B MTP pipelines");
+        const CAPACITY: usize = 2_048;
+        const DRAFTS: usize = 7;
+        let (query_local, keys_local, values_local) =
+            mtp12_attention_fixture(LOCAL_KV_HEADS, LOCAL_HEAD_DIM, CAPACITY, 11);
+        let (query_full, keys_full, values_full) =
+            mtp12_attention_fixture(FULL_KV_HEADS, FULL_HEAD_DIM, CAPACITY, 12);
+        let query_local = f32_buffer(&device, &query_local).expect("query");
+        let keys_local = f32_buffer(&device, &keys_local).expect("keys");
+        let values_local = f32_buffer(&device, &values_local).expect("values");
+        let query_full = f32_buffer(&device, &query_full).expect("query");
+        let keys_full = f32_buffer(&device, &keys_full).expect("keys");
+        let values_full = f32_buffer(&device, &values_full).expect("values");
+        let scores = shared_buffer(&device, N_HEADS * CAPACITY * 4);
+        let output = shared_buffer(&device, N_HEADS * FULL_HEAD_DIM * 4);
+        let queue = device.new_command_queue();
+        let depths = [128usize, 512, 1_024, 2_000];
+        for v2 in [false, true] {
+            let label = if v2 { "v2" } else { "established" };
+            let mut per_depth = Vec::new();
+            for &depth in &depths {
+                let mut samples = Vec::new();
+                for _ in 0..5 {
+                    let command = queue.new_command_buffer();
+                    let encoder = command.new_compute_command_encoder();
+                    for _draft in 0..DRAFTS {
+                        for layer in 0..N_LAYERS {
+                            let sliding = layer < 3;
+                            let compact_base = if sliding {
+                                depth.saturating_sub(LOCAL_WINDOW + 1)
+                            } else {
+                                0
+                            };
+                            let position_count = depth - compact_base;
+                            let (query, keys, values, kv_heads, head_dim) = if sliding {
+                                (
+                                    &query_local,
+                                    &keys_local,
+                                    &values_local,
+                                    LOCAL_KV_HEADS,
+                                    LOCAL_HEAD_DIM,
+                                )
+                            } else {
+                                (
+                                    &query_full,
+                                    &keys_full,
+                                    &values_full,
+                                    FULL_KV_HEADS,
+                                    FULL_HEAD_DIM,
+                                )
+                            };
+                            encode_attention_impl(
+                                encoder,
+                                &pipelines,
+                                query,
+                                keys,
+                                values,
+                                0,
+                                0,
+                                CAPACITY,
+                                &scores,
+                                &output,
+                                kv_heads,
+                                head_dim,
+                                depth,
+                                compact_base,
+                                position_count,
+                                v2,
+                            );
+                        }
+                    }
+                    encoder.end_encoding();
+                    command.commit();
+                    command.wait_until_completed();
+                    assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+                    let (gpu_us, _) = super::super::command_buffer_gpu_times_us(&command.to_owned());
+                    samples.push(gpu_us);
+                }
+                samples.sort_unstable();
+                let median = samples[samples.len() / 2];
+                println!(
+                    "[mtp12-attn-v2-receipt] {label} depth={depth} drafts={DRAFTS} gpu_us median={median} min={} max={}",
+                    samples[0],
+                    samples[samples.len() - 1]
+                );
+                per_depth.push((depth, median));
+            }
+            let (d0, t0) = per_depth[0];
+            let (d1, t1) = per_depth[2];
+            println!(
+                "[mtp12-attn-v2-receipt] {label} slope({d0}->{d1}) = {:.4} ms/position per {DRAFTS}-draft round",
+                (t1 as f64 - t0 as f64) / 1_000.0 / (d1 - d0) as f64
+            );
+        }
     }
 
     #[test]
