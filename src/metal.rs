@@ -655,7 +655,7 @@ pub(crate) static GEMMA4_LAST_VERIFY_GPU_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Timing of the most recent [`Gemma4Q6KHead::forward_argmax_spec50_batch`]
-/// call, summed over its ordered chunks (W16 = two K8 chunks). `gpu_us` /
+/// call, summed over its ordered chunks (W16 defaults to two K8 chunks). `gpu_us` /
 /// `kernel_us` are hardware timestamps and stay zero unless
 /// `CAMELID_GEMMA4_METAL_HEAD_TIMING=1`; the wall fields are always kept.
 #[cfg(target_os = "macos")]
@@ -17698,8 +17698,10 @@ impl Gemma4Q6KHead {
 
     /// Project K final-hidden rows and return only their greedy ids.  K=1 and
     /// K>1 bind the same strict SPEC50 kernel family, so the normal step and the
-    /// verifier live in one arithmetic universe. W16 concatenates two exact K8
-    /// calls in row order. This API is deliberately separate from
+    /// verifier live in one arithmetic universe. W16 defaults to two exact K8
+    /// calls in row order. With `CAMELID_GEMMA4_SPEC50_MMA_K16=1`, the 12B head
+    /// may instead share its Q6 fragments across two exact eight-column groups.
+    /// This API is deliberately separate from
     /// [`Self::forward`]: the established ordered full-logit path remains the
     /// default until whole-model token parity admits this lane.
     pub(crate) fn forward_argmax_spec50_batch(&self, hidden_rows: &[f32]) -> Option<Vec<u32>> {
@@ -17710,7 +17712,12 @@ impl Gemma4Q6KHead {
             return None;
         }
         let columns = hidden_rows.len() / state.hidden;
-        let chunks = Self::gemma4_spec50_head_chunk_ranges(columns)?;
+        let dual_k16 = spec50_head::spec50_mma16_available(state.hidden);
+        let chunks = if columns == 16 && dual_k16 {
+            vec![0..16]
+        } else {
+            Self::gemma4_spec50_head_chunk_ranges(columns)?
+        };
         let mut timing = Gemma4Spec50HeadTiming {
             columns: columns as u32,
             ..Gemma4Spec50HeadTiming::default()
@@ -17724,13 +17731,14 @@ impl Gemma4Q6KHead {
                     MTLResourceOptions::StorageModeShared,
                 )
             };
+            let max_k = if dual_k16 { 16 } else { 8 };
             state.batch = Some(Gemma4Q6KBatchScratch {
-                scales: shared(8 * n_superblocks * std::mem::size_of::<f32>()),
-                quants: shared(8 * state.hidden),
-                permuted: shared(spec50_head::spec50_activation_scratch_bytes(8, state.hidden)),
-                logits: shared(8 * state.vocab * std::mem::size_of::<f32>()),
-                argmax_ids: shared(8 * std::mem::size_of::<u32>()),
-                argmax_vals: shared(8 * std::mem::size_of::<f32>()),
+                scales: shared(max_k * n_superblocks * std::mem::size_of::<f32>()),
+                quants: shared(max_k * state.hidden),
+                permuted: shared(spec50_head::spec50_activation_scratch_bytes(max_k, state.hidden)),
+                logits: shared(max_k * state.vocab * std::mem::size_of::<f32>()),
+                argmax_ids: shared(max_k * std::mem::size_of::<u32>()),
+                argmax_vals: shared(max_k * std::mem::size_of::<f32>()),
             });
         }
         let batch = state.batch.as_ref()?;

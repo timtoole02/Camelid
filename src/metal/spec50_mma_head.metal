@@ -84,3 +84,96 @@ void mma_head(device const float* input_scales, device const half* input_perm,de
 #define ENTRY(K) \
 kernel void q6k_spec50_mma_k##K(device const float* scales [[buffer(0)]],device const half* perm [[buffer(1)]],device const uchar* weights [[buffer(2)]],device float* output [[buffer(3)]],constant uint& n_sb [[buffer(4)]],constant uint& rows [[buffer(5)]],constant float& cap [[buffer(6)]],uint tile [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {threadgroup float partials[2048];mma_head<K>(scales,perm,weights,output,n_sb,rows,cap,tile,sg,lane,partials);}
 ENTRY(8)
+
+kernel void q6k_spec50_mma_expand16_f16(device const char* quants [[buffer(0)]],device half* out [[buffer(1)]],constant uint& n_sb [[buffer(2)]],constant uint& k_batch [[buffer(3)]],uint gid [[thread_position_in_grid]]) {
+ const uint units=n_sb*4u,hidden=n_sb*256u;if(gid>=k_batch*hidden)return;
+ const uint group=gid/(units*512u),local=gid%(units*512u);
+ const uint cell=local&1u,lane=(local>>1u)&31u,kt=(local>>6u)&1u,g=(local>>7u)&3u,u=local>>9u;
+ const uint t=group*8u+4u*((lane>>3u)&1u)+2u*(lane&1u)+cell,l=kt*8u+4u*(lane>>4u)+((lane&7u)>>1u);
+ const uint sb=u>>2u,quarter=u&3u,h=quarter>>1u,s=quarter&1u;
+ out[gid]=half(quants[t*hidden+sb*256u+h*128u+s*16u+g*32u+l]);
+}
+template<uint SG>
+void mma_head16(device const float* input_scales, device const half* input_perm,device const uchar* weight_blocks,device float* output,uint n_sb,uint rows,float softcap,uint tile,uint sgitg,uint lane,threadgroup float* partials){
+ const uint row0=tile*8u,units=n_sb*4u;const uint2 fc=head_coord(lane);const uint row=min(row0+fc.y,rows-1u);
+ for(uint unit0=sgitg;unit0<32u;unit0+=SG){
+  float accum[2][2]={{0.0f,0.0f},{0.0f,0.0f}};
+  for(uint pass=0;pass<2u;pass++){
+   const uint u=unit0+pass*32u;if(u>=units)continue;
+   const uint sb=u>>2u,quarter=u&3u,h=quarter>>1u,s=quarter&1u;
+   device const uchar* block=weight_blocks+(ulong(row)*n_sb+sb)*210ul;
+   device const char* ws=reinterpret_cast<device const char*>(block+192u);
+   // Load the packed Q6 bytes once. Both nibbles and all four high-bit
+   // pairs are reused below; packed loads also keep each two-byte fragment
+   // coalesced. This changes only decoding, before exact integer dot products.
+   uchar2 ql0[2],ql1[2],qh0[2];
+   #pragma unroll
+   for(uint kt=0;kt<2u;kt++) {
+    const uint j=s*16u+kt*8u+fc.x;
+    ql0[kt]=uchar2(*reinterpret_cast<device const packed_uchar2*>(block+h*64u+j));
+    ql1[kt]=uchar2(*reinterpret_cast<device const packed_uchar2*>(block+h*64u+32u+j));
+    qh0[kt]=uchar2(*reinterpret_cast<device const packed_uchar2*>(block+128u+h*32u+j));
+   }
+   int isum[2][2]={{0,0},{0,0}};
+   #pragma unroll
+   for(uint g=0;g<4u;g++){
+    simdgroup_float8x8 dots[2];
+    #pragma unroll
+    for(uint bg=0;bg<2u;bg++) dots[bg]=make_filled_simdgroup_matrix<float,8,8>(0.0f);
+    #pragma unroll
+    for(uint kt=0;kt<2u;kt++){
+     simdgroup_half8x8 weights;
+     const uint2 qlv=uint2((g&1u)?ql1[kt]:ql0[kt]),qhv=uint2(qh0[kt]);
+     const uint2 low=g<2u?(qlv&15u):(qlv>>4u),high=((qhv>>(g*2u))&3u)<<4u;
+     const half2 w=half2(int2(low|high)-32);
+     weights.thread_elements()[0]=w.x;weights.thread_elements()[1]=w.y;
+     #pragma unroll
+     for(uint bg=0;bg<2u;bg++) {
+      simdgroup_half8x8 activations;
+      #pragma unroll
+      for(uint cell=0;cell<2u;cell++) {
+       activations.thread_elements()[cell]=input_perm[(((bg*units+u)*4u+g)*2u+kt)*64u+lane*2u+cell];
+      }
+      simdgroup_multiply_accumulate(dots[bg],weights,activations,dots[bg]);
+     }
+    }
+    const float subscale=float(ws[8u*h+s+2u*g]);
+    #pragma unroll
+    for(uint bg=0;bg<2u;bg++) {
+     isum[bg][0]+=int(subscale*dots[bg].thread_elements()[0]);
+     isum[bg][1]+=int(subscale*dots[bg].thread_elements()[1]);
+    }
+   }
+   const float weight_scale=float(*reinterpret_cast<device const half*>(block+208u));
+   #pragma unroll
+   for(uint bg=0;bg<2u;bg++) {
+    #pragma unroll
+    for(uint cell=0;cell<2u;cell++) {
+     const uint t=bg*8u+fc.x+cell;
+     const float in_scale=input_scales[t*n_sb+sb];
+     accum[bg][cell]=accum[bg][cell]+(weight_scale*in_scale)*float(isum[bg][cell]);
+    }
+   }
+  }
+  #pragma unroll
+  for(uint bg=0;bg<2u;bg++) {
+   #pragma unroll
+   for(uint cell=0;cell<2u;cell++)partials[unit0*128u+fc.y*16u+bg*8u+fc.x+cell]=accum[bg][cell];
+  }
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ for(uint outcell=sgitg;outcell<128u;outcell+=SG){
+  const uint r=outcell/16u,t=outcell%16u;
+  const float partial=partials[lane*128u+r*16u+t];
+  float value=simd_sum(partial);
+  if(lane==0u&&row0+r<rows){if(softcap>0.0f)value=tanh(value/softcap)*softcap;output[ulong(t)*rows+row0+r]=value;}
+ }
+}
+// K16 owns two independent eight-column groups and shares only integer
+// Q6 fragment decoding. Each group's two-pass unit fold and final simd_sum
+// remain the K8 oracle. The established K8 entry above is unchanged.
+#define ENTRY16(SG) \
+kernel void q6k_spec50_mma_k16_sg##SG(device const float* scales [[buffer(0)]],device const half* perm [[buffer(1)]],device const uchar* weights [[buffer(2)]],device float* output [[buffer(3)]],constant uint& n_sb [[buffer(4)]],constant uint& rows [[buffer(5)]],constant float& cap [[buffer(6)]],uint tile [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {threadgroup float partials[4096];mma_head16<SG>(scales,perm,weights,output,n_sb,rows,cap,tile,sg,lane,partials);}
+ENTRY16(4)
+ENTRY16(8)
+#undef ENTRY16

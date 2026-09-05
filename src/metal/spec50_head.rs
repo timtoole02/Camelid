@@ -1313,6 +1313,124 @@ fn spec50_mma_head_kernels() -> Option<&'static Spec50MmaHeadKernels> {
         .as_ref()
 }
 
+/// W16 may opt into one dual-group head instead of two ordered K8 calls.
+/// K8 and every other geometry retain their established path. A failed K16
+/// compilation keeps W16 on its original two-chunk fallback before encoding.
+struct Spec50Mma16HeadKernels {
+    expand: ComputePipelineState,
+    batch4: ComputePipelineState,
+    batch8: ComputePipelineState,
+}
+
+fn spec50_mma16_simdgroups() -> usize {
+    static SG: OnceLock<usize> = OnceLock::new();
+    *SG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_SPEC50_MMA_K16_SIMDGROUPS")
+            .ok().and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| matches!(value, 4 | 8)).unwrap_or(8)
+    })
+}
+
+pub(crate) fn spec50_mma16_available(hidden: usize) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    hidden == 3840 && *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_SPEC50_MMA_K16").is_ok_and(|value| value == "1")
+    }) && spec50_mma16_head_kernels().is_some()
+}
+
+fn spec50_mma16_head_kernels() -> Option<&'static Spec50Mma16HeadKernels> {
+    static KERNELS: OnceLock<Option<Spec50Mma16HeadKernels>> = OnceLock::new();
+    KERNELS.get_or_init(|| {
+        let device = Device::system_default()?;
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
+        let library = device.new_library_with_source(include_str!("spec50_mma_head.metal"), &options)
+            .map_err(|err| eprintln!("[metal] SPEC50 K16 MMA head compile failed: {err}")).ok()?;
+        let pipeline = |name: &str| {
+            let function = library.get_function(name, None).ok()?;
+            device.new_compute_pipeline_state_with_function(&function).ok()
+        };
+        let expand = pipeline("q6k_spec50_mma_expand16_f16")?;
+        let batch4 = pipeline("q6k_spec50_mma_k16_sg4")?;
+        let batch8 = pipeline("q6k_spec50_mma_k16_sg8")?;
+        if expand.max_total_threads_per_threadgroup() < 256
+            || batch4.thread_execution_width() != 32 || batch8.thread_execution_width() != 32
+            || batch4.max_total_threads_per_threadgroup() < 128
+            || batch8.max_total_threads_per_threadgroup() < 256 {
+            return None;
+        }
+        eprintln!("[metal] SPEC50 K16 MMA head: 3840-wide, {} simdgroups, exact dual-group fold", spec50_mma16_simdgroups());
+        Some(Spec50Mma16HeadKernels { expand, batch4, batch8 })
+    }).as_ref()
+}
+
+/// Encode only after the exact 12B/K16 shape guard. Compiling failure encodes
+/// nothing, allowing the established head to remain the fallback.
+#[allow(clippy::too_many_arguments)]
+fn encode_q6k_spec50_mma16(
+    encoder: &metal::ComputeCommandEncoderRef,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    activation_perm: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    n_superblocks: usize,
+    rows: usize,
+    k_batch: usize,
+    hidden: usize,
+    softcap: f32,
+    simdgroups: usize,
+) -> bool {
+    if !matches!(simdgroups, 4 | 8) || rows == 0 || !(hidden == 3840 && n_superblocks == 15 && k_batch == 16) {
+        return false;
+    }
+    let Some(kernels) = spec50_mma16_head_kernels() else {
+        return false;
+    };
+    let n_sb = n_superblocks as u32;
+    let k = k_batch as u32;
+    let rows_u32 = rows as u32;
+    encoder.set_compute_pipeline_state(&kernels.expand);
+    encoder.set_buffer(0, Some(input_quants), 0);
+    encoder.set_buffer(1, Some(activation_perm), 0);
+    encoder.set_bytes(2, 4, &n_sb as *const u32 as *const _);
+    encoder.set_bytes(3, 4, &k as *const u32 as *const _);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (k_batch * hidden).div_ceil(256) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.set_compute_pipeline_state(if simdgroups == 4 { &kernels.batch4 } else { &kernels.batch8 });
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(1, Some(activation_perm), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_bytes(4, 4, &n_sb as *const u32 as *const _);
+    encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &softcap as *const f32 as *const _);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(8) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: (32 * simdgroups) as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    true
+}
+
 /// Encode only after the exact 12B/K8 shape guard. Compiling failure encodes
 /// nothing, allowing the established head to remain the fallback.
 #[allow(clippy::too_many_arguments)]
@@ -1379,7 +1497,8 @@ fn encode_q6k_spec50_mma8(
     true
 }
 
-/// Encode the K<=8 speculative Q6_K tied-head projection.
+/// Encode the K<=8 speculative Q6_K tied-head projection, or the independently
+/// enabled exact 12B K16 MMA sibling.
 ///
 /// Buffer order on `q6k_spec50_batch_k{K}`:
 ///   0 `input_scales`     `K * n_superblocks` f32 (candidate-major)
@@ -1389,7 +1508,8 @@ fn encode_q6k_spec50_mma8(
 ///   4 `n_sb` u32, 5 `rows` u32, 6 `softcap` f32
 ///
 /// Returns `false` (encoding nothing) when the pipelines are unavailable or
-/// `k_batch` is outside `1..=8`; the caller then keeps `encode_q6k_ordered_batch`.
+/// `k_batch` is outside `1..=8` and the opt-in 12B K16 sibling is unavailable;
+/// the caller retains its established fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q6k_spec50_batch(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -1406,6 +1526,13 @@ pub(crate) fn encode_q6k_spec50_batch(
     hidden: usize,
     softcap: f32,
 ) -> bool {
+    if k_batch == 16 && spec50_mma16_available(hidden) {
+        return encode_q6k_spec50_mma16(
+            encoder, input_scales, input_quants, activation_perm, weight,
+            weight_offset, output, n_superblocks, rows, k_batch, hidden, softcap,
+            spec50_mma16_simdgroups(),
+        );
+    }
     if k_batch == 0 || k_batch > 8 || rows == 0 || n_superblocks == 0 {
         return false;
     }
@@ -2025,6 +2152,59 @@ mod tests {
                     expected.to_bits(),
                     "12B Q6_K head K={k} output index {index} diverged"
                 );
+            }
+        }
+    }
+
+    /// K16 reproduces two K8 calls, including cap ties and a ragged tile.
+    #[test]
+    fn spec50_mma16_is_bitwise_identical_to_two_mma8_calls() {
+        const HIDDEN: usize = 3840;
+        const N_SB: usize = 15;
+        const ROWS: usize = 2051;
+        let refs = reference_kernels();
+        let mut rng = Rng(0x1616_3840_2051_7788);
+        let weights = build_weights_for(&mut rng, ROWS, N_SB);
+        let (scales, quants) = build_activations_for(&mut rng, 16, HIDDEN, N_SB);
+        let wbuf = shared(&refs.device, weights.len());
+        write_buffer_u8(&wbuf, &weights);
+        let sbuf = shared(&refs.device, scales.len() * 4);
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let perm = shared(&refs.device, spec50_activation_scratch_bytes(16, HIDDEN));
+        let out = shared(&refs.device, 16 * ROWS * 4);
+        for softcap in [0.0, SOFTCAP] {
+            let mut expected = Vec::with_capacity(16 * ROWS);
+            for group in 0..2 {
+                let s8 = shared(&refs.device, 8 * N_SB * 4);
+                write_buffer_f32(&s8, &scales[group * 8 * N_SB..(group + 1) * 8 * N_SB]);
+                let q8 = shared(&refs.device, 8 * HIDDEN);
+                write_buffer_i8(&q8, &quants[group * 8 * HIDDEN..(group + 1) * 8 * HIDDEN]);
+                let out8 = shared(&refs.device, 8 * ROWS * 4);
+                let cb = refs.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                assert!(encode_q6k_spec50_mma8(encoder, &s8, &q8, &perm, &wbuf, 0,
+                    &out8, N_SB, ROWS, 8, HIDDEN, softcap));
+                encoder.end_encoding(); cb.commit(); cb.wait_until_completed();
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                let mut values = vec![0.0; 8 * ROWS];
+                read_buffer_f32(&out8, &mut values);
+                expected.extend(values);
+            }
+            for simdgroups in [4, 8] {
+                let cb = refs.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                assert!(encode_q6k_spec50_mma16(encoder, &sbuf, &qbuf, &perm, &wbuf, 0,
+                    &out, N_SB, ROWS, 16, HIDDEN, softcap, simdgroups));
+                encoder.end_encoding(); cb.commit(); cb.wait_until_completed();
+                assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+                let mut actual = vec![0.0; 16 * ROWS];
+                read_buffer_f32(&out, &mut actual);
+                for (index, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+                    assert_eq!(actual.to_bits(), expected.to_bits(),
+                        "K16 sg={simdgroups} cap={softcap} output={index}");
+                }
             }
         }
     }
