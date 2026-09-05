@@ -1,6 +1,11 @@
 //! Direct-runtime TREE=0 versus TREE=1 qualification with padded-tail=1 on both.
 //! Public generation performs a fresh reset/prefill on every call; this helper
 //! also checks the public logical cursor before and after every generation.
+//! At a budget boundary, one mode can commit the last output while the other
+//! leaves it as the free bonus. Their raw cursors may then differ by one; each
+//! cursor must still equal prompt length plus its own committed trace. Public
+//! termination is length at the cap, otherwise stop; extra EOS lookahead at the
+//! cap is diagnostic metadata, not a different user-visible termination.
 //!
 //! Invoke separate processes with the chosen assistant position/shortlist env:
 //! - MODEL ASSISTANT PROMPT 32 4,5,6,7,8,9,16,24 0 1
@@ -217,10 +222,17 @@ fn check_generation(
     assert!(free_bonus <= 1);
     if free_bonus == 1 {
         assert!(stats.terminal_stop_token.is_none());
-        assert_eq!(
-            trace.last().and_then(|r| r.next_anchor_token),
-            generation.token_ids.last().copied()
-        );
+        if let Some(last) = trace.last() {
+            assert_eq!(last.next_anchor_token, generation.token_ids.last().copied());
+        } else {
+            // Budget one returns the already-proved prefill token without a
+            // decode round or any generated-token KV commit.
+            assert_eq!(budget, 1);
+            assert_eq!(generation.token_ids.len(), 1);
+            assert_eq!(stats.rounds, 0);
+            assert_eq!(stats.committed_input_rows, 0);
+            assert_eq!(cursor, prompt_tokens);
+        }
     }
     if stats.terminal_stop_token.is_none() {
         assert_eq!(
@@ -330,35 +342,69 @@ fn main() -> Result<(), Box<dyn Error>> {
             candidate.text, control.text,
             "TREE0/1 text parity at budget {budget}"
         );
+        let control_termination = if control.token_ids.len() == budget {
+            "length"
+        } else {
+            "stop"
+        };
+        let candidate_termination = if candidate.token_ids.len() == budget {
+            "length"
+        } else {
+            "stop"
+        };
         assert_eq!(
-            candidate.stats.terminal_stop_token, control.stats.terminal_stop_token,
-            "TREE0/1 stop parity at budget {budget}"
+            candidate_termination, control_termination,
+            "TREE0/1 public termination at budget {budget}"
         );
+        if candidate.token_ids.len() < budget {
+            assert!(candidate.stats.terminal_stop_token.is_some());
+            assert!(control.stats.terminal_stop_token.is_some());
+            assert_eq!(
+                candidate.stats.terminal_stop_token, control.stats.terminal_stop_token,
+                "TREE0/1 natural stop token at budget {budget}"
+            );
+        }
+        let control_free_bonus =
+            control.token_ids.len() - control.stats.committed_input_rows as usize;
+        let candidate_free_bonus =
+            candidate.token_ids.len() - candidate.stats.committed_input_rows as usize;
+        assert!(control_free_bonus <= 1 && candidate_free_bonus <= 1);
+        assert!(candidate_cursor.abs_diff(control_cursor) <= 1);
         assert_eq!(
-            candidate_cursor, control_cursor,
-            "TREE0/1 committed cursor parity at budget {budget}"
+            candidate_cursor + candidate_free_bonus,
+            control_cursor + control_free_bonus,
+            "TREE0/1 cursor difference must be exactly the unforwarded final bonus"
         );
-        assert_eq!(
-            candidate.stats.committed_input_rows,
-            control.stats.committed_input_rows
-        );
-        saw_stop |= candidate.stats.terminal_stop_token.is_some();
+        if candidate_cursor != control_cursor {
+            assert_ne!(candidate_free_bonus, control_free_bonus);
+            assert_eq!(candidate_termination, "length");
+        }
+        let raw_cursor_equal = candidate_cursor == control_cursor;
+        let stop_metadata_equal =
+            candidate.stats.terminal_stop_token == control.stats.terminal_stop_token;
+        saw_stop |= candidate_termination == "stop";
         if candidate.stats.tree_branch_rounds > 0 {
             assert!(budget >= 9);
             branch_budgets.push(budget);
         }
         eprintln!("TREE tail pair passed: budget={budget} available={available} tokens={} stop={:?} branches={} cursor={candidate_cursor}",
             candidate.token_ids.len(), candidate.stats.terminal_stop_token, candidate.stats.tree_branch_rounds);
-        receipts.push(serde_json::json!({"budget":budget,"tree_off_on_ids_exact":true,"text_exact":true,"stop_exact":true,
-            "cursor_exact":true,"control_cursor":control_cursor,"candidate_cursor":candidate_cursor,
-            "control":control,"candidate":candidate}));
+        receipts.push(
+            serde_json::json!({"budget":budget,"tree_off_on_ids_exact":true,"text_exact":true,
+            "termination_semantics_exact":true,"cursor_accounting_valid":true,
+            "control_termination":control_termination,"candidate_termination":candidate_termination,
+            "raw_cursor_equal":raw_cursor_equal,"stop_metadata_equal":stop_metadata_equal,
+            "control_cursor":control_cursor,"candidate_cursor":candidate_cursor,
+            "control_free_bonus":control_free_bonus,"candidate_free_bonus":candidate_free_bonus,
+            "control":control,"candidate":candidate}),
+        );
     }
     let coverage_ok =
         (!require_stop || saw_stop) && (!require_branch || !branch_budgets.is_empty());
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema":"camelid.w8_tree_tail_direct_validation.v1","prompt":prompt,"prompt_tokens":prompt_tokens,
+            "schema":"camelid.w8_tree_tail_direct_validation.v2","prompt":prompt,"prompt_tokens":prompt_tokens,
             "available_positions":available,"max_positions":capacity,"selectors_before_pairs":selectors,
             "controls":{"tree_off":0,"tree_on":1,"padded_tail_both":1,"fresh_reset_and_prefill_each":true},
             "require_stop":require_stop,"require_branch":require_branch,"saw_stop":saw_stop,"branch_budgets":branch_budgets,
