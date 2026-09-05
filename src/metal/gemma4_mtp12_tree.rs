@@ -94,7 +94,12 @@ kernel void mtp12_tree_top2_merge(
     }
     if (tid == 0u) {
         uint2 answer = ids[0];
-        if (answer.x == 0xffffffffu) answer.x = 0u;
+        // Existing argmax starts at (-inf, id=0), so its degenerate
+        // all-NaN/-inf answer remains zero even when logit[0] is NaN.
+        if (values[0].x == -INFINITY) {
+            if (answer.x != 0u) answer.y = answer.x;
+            answer.x = 0u;
+        }
         result[0].values = values[0]; result[0].ids = answer;
         output_token[0] = answer.x;
     }
@@ -634,7 +639,7 @@ mod tests {
         let tree = TreeState::new(&device).unwrap();
         let queue = device.new_command_queue();
         for count in [1, 31, 1023, 1024, 1025, VOCAB] {
-            for variant in 0..4 {
+            for variant in 0..5 {
                 let mut logits: Vec<f32> = (0..count)
                     .map(|i| ((i * 17 % 31) as f32 - 15.0) / 8.0)
                     .collect();
@@ -653,10 +658,18 @@ mod tests {
                         logits[count - 2] = f32::INFINITY;
                     }
                 }
+                if variant == 4 {
+                    logits.fill(f32::NEG_INFINITY);
+                    logits[0] = f32::NAN;
+                }
                 let mut expected: Vec<usize> =
                     (0..count).filter(|i| !logits[*i].is_nan()).collect();
                 expected
                     .sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap().then(a.cmp(b)));
+                if expected.first().is_none_or(|i| logits[*i] == f32::NEG_INFINITY) {
+                    expected.retain(|i| *i != 0);
+                    expected.insert(0, 0);
+                }
                 let wanted = [
                     expected.first().copied().unwrap_or(0) as u32,
                     expected
@@ -681,7 +694,8 @@ mod tests {
                     wanted[0]
                 );
                 for (j, id) in expected.iter().take(2).enumerate() {
-                    assert_eq!(actual.values[j].to_bits(), logits[*id].to_bits());
+                    let value = if logits[*id].is_nan() { f32::NEG_INFINITY } else { logits[*id] };
+                    assert_eq!(actual.values[j].to_bits(), value.to_bits());
                 }
             }
         }

@@ -35,6 +35,16 @@ use std::sync::Arc;
 #[path = "gemma4_mtp12_snapshot.rs"]
 pub(crate) mod mtp12_snapshot;
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "gemma4_mtp12_tree_policy.rs"]
+mod mtp12_tree_policy;
+#[cfg(target_os = "macos")]
+#[path = "gemma4_mtp12_tree_runtime.rs"]
+mod mtp12_tree_runtime;
+#[cfg(all(target_os = "macos", test))]
+#[path = "gemma4_mtp12_tree_model_tests.rs"]
+mod mtp12_tree_model_tests;
+
 /// Q8_0 wire-block geometry (GGUF on-disk format): 32 quantized values per block,
 /// stored as a 2-byte little-endian f16 scale followed by 32 i8 quants = 34 bytes.
 const Q8_VALUES_PER_BLOCK: usize = 32;
@@ -6739,6 +6749,9 @@ struct Gemma4PendingVerifierBatch {
     ticket: u64,
     start_position: usize,
     width: usize,
+    // Bind the completed topology to its ticket. A tree may only be committed
+    // through path compaction; the ordinary prefix API permits abort only.
+    tree_parents: Option<[i32; 8]>,
 }
 
 #[cfg(target_os = "macos")]
@@ -6867,6 +6880,7 @@ impl Gemma4DenseVerifierState {
             ticket,
             start_position,
             width,
+            tree_parents: None,
         });
         Some(ticket)
     }
@@ -7360,6 +7374,9 @@ pub struct Gemma4Mtp12MetalRoundReceipt {
     /// Backward-compatible alias of `physical_verify_width`.
     pub verifier_width: usize,
     pub padding_candidate_ids: Vec<u32>,
+    /// Tree metadata is absent on the unchanged linear path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree: Option<Gemma4Mtp12TreeRoundReceipt>,
     pub budget_truncated: bool,
     pub schedule_state_before: Gemma4Mtp12WidthScheduleState,
     pub schedule_state_after: Gemma4Mtp12WidthScheduleState,
@@ -7393,6 +7410,21 @@ pub struct Gemma4Mtp12MetalRoundReceipt {
     /// Hardware GPU busy µs of the decoder verify command buffer; zero unless
     /// `CAMELID_GEMMA4_VERIFY_TRACE` or `CAMELID_GEMMA4_METAL_HEAD_TIMING` is set.
     pub target_decoder_gpu_us: u128,
+}
+
+/// Physical tree nodes and the target-authoritative path actually committed.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Gemma4Mtp12TreeRoundReceipt {
+    pub parents: Vec<i32>,
+    pub depths: Vec<u32>,
+    pub primary_rows: Vec<usize>,
+    pub branch_primary_step: Option<usize>,
+    pub primary_margins: [f32; 4],
+    pub assistant_steps: usize,
+    pub committed_path: Vec<usize>,
+    pub mismatch_parent: Option<usize>,
+    pub compaction_us: u128,
 }
 
 /// JSON-stable copy of the assistant chain timing (the Metal module keeps its
@@ -7530,6 +7562,9 @@ pub struct Gemma4Mtp12MetalStats {
     /// VERIFY_TRACE=1 or HEAD_TIMING=1).
     pub target_decoder_gpu_us: u128,
     pub budget_tail_rounds: u64,
+    pub tree_proposal_rounds: u64,
+    pub tree_branch_rounds: u64,
+    pub tree_compaction_us: u128,
     pub terminal_stop_token: Option<u32>,
     pub trace: Vec<Gemma4Mtp12MetalRoundReceipt>,
 }
@@ -9089,7 +9124,7 @@ impl Gemma4GpuRuntime {
         let pending = state.pending.ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("no pending verifier batch".into())
         })?;
-        if pending.ticket != ticket || consumed_input_rows > pending.width {
+        if !pending.permits_linear_commit(ticket, consumed_input_rows) {
             return Err(BackendError::UnsupportedModelArchitecture(format!(
                 "verifier commit mismatch: ticket={ticket}, consumed_inputs={consumed_input_rows}, pending={pending:?}",
             )));
@@ -9730,6 +9765,28 @@ impl Gemma4GpuRuntime {
             )));
         }
 
+        let tree_value = std::env::var(mtp12_tree_policy::TREE_W8_ENV)
+            .map(Some).or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                other => Err(BackendError::RuntimeShapeMismatch(format!(
+                    "{}: {other}", mtp12_tree_policy::TREE_W8_ENV,
+                ))),
+            })?;
+        let tree_enabled = mtp12_tree_policy::enabled(tree_value.as_deref())
+            .map_err(BackendError::RuntimeShapeMismatch)?;
+        if tree_enabled && std::env::var_os("CAMELID_MTP12_DUMP_DRAFT_QUERIES")
+            .is_some_and(|path| !path.is_empty())
+        {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "linear draft-query dumps do not represent tree proposals; disable CAMELID_MTP12_DUMP_DRAFT_QUERIES for tree runs".into(),
+            ));
+        }
+        if tree_enabled && verify_width != 8 {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "bounded tree speculation requires configured verifier width 8".into(),
+            ));
+        }
+
         let adaptive_selector_value = std::env::var_os(GEMMA4_MTP12_W16_WARMUP8_ENV)
             .map(|value| {
                 value.into_string().map_err(|value| {
@@ -9868,70 +9925,106 @@ impl Gemma4GpuRuntime {
             let physical_width = round_plan.physical_verify_width;
             let draft_k = logical_width - 1;
             let assistant_started = std::time::Instant::now();
-            let draft_proposal = self.propose_mtp12_chain_ordered_q4(
-                assistant,
-                anchor_token,
-                &pending_target_raw_hidden,
-                position,
-                draft_k,
-            )?;
+            // Only full W8 rounds use the tree. Existing padded/short/capacity
+            // tails retain the already-qualified linear proposal and verifier.
+            let tree_proposal = if tree_enabled && mtp12_tree_policy::round_eligible(
+                logical_width, physical_width, position, self.model.max_positions(),
+            ) {
+                Some(self.propose_mtp12_tree_ordered_q4(
+                    assistant, anchor_token, &pending_target_raw_hidden, position,
+                )?)
+            } else { None };
+            let draft_proposal = if let Some(tree) = tree_proposal.as_ref() {
+                let linear_topology = tree.parents.iter().enumerate()
+                    .all(|(row, &parent)| parent == row as i32 - 1);
+                if tree.tokens.first() != Some(&anchor_token)
+                    || !mtp12_tree_policy::validate(&tree.tokens, &tree.parents, &tree.depths, self.vocab)
+                    || (linear_topology == tree.branch_primary_step.is_some())
+                {
+                    return Err(BackendError::RuntimeShapeMismatch("assistant returned an invalid tree proposal".into()));
+                }
+                crate::metal::Gemma4Mtp12ChainProposal {
+                    tokens: tree.tokens[1..].to_vec(), timing: tree.timing, ledger: tree.ledger,
+                }
+            } else {
+                self.propose_mtp12_chain_ordered_q4(
+                    assistant, anchor_token, &pending_target_raw_hidden, position, draft_k,
+                )?
+            };
             let assistant_call_us = assistant_started.elapsed().as_micros();
             if draft_proposal.tokens.len() != draft_k {
                 return Err(BackendError::RuntimeShapeMismatch(format!(
-                    "MTP assistant returned {} drafts for requested K={draft_k}",
-                    draft_proposal.tokens.len()
+                    "MTP assistant returned {} drafts for requested K={draft_k}", draft_proposal.tokens.len(),
                 )));
             }
-
-            let (candidates, padding_candidate_ids) =
-                gemma4_mtp12_materialize_candidate_rows(
-                    round_plan,
-                    anchor_token,
-                    &draft_proposal.tokens,
-                )
-                .ok_or_else(|| {
-                    BackendError::RuntimeShapeMismatch(format!(
-                        "MTP candidate materialization refused logical W{logical_width} / physical W{physical_width} / drafts {draft_k}"
-                    ))
-                })?;
+            let (candidates, padding_candidate_ids) = gemma4_mtp12_materialize_candidate_rows(
+                round_plan, anchor_token, &draft_proposal.tokens,
+            ).ok_or_else(|| BackendError::RuntimeShapeMismatch(
+                "MTP candidate materialization refused verifier widths or draft count".into(),
+            ))?;
+            let branched = tree_proposal.as_ref().is_some_and(|tree| tree.branch_primary_step.is_some());
             let verify_started = std::time::Instant::now();
-            let target_batch = self.verify_consecutive_greedy(&candidates, position)?;
+            let target_batch = if branched {
+                let tree = tree_proposal.as_ref().expect("branched proposal");
+                self.verify_tree_greedy(&candidates, &tree.parents, &tree.depths, position)?
+            } else { self.verify_consecutive_greedy(&candidates, position)? };
             let target_verify_us = verify_started.elapsed().as_micros();
-            let logical_target_greedy_ids = (target_batch.greedy_ids.len() == physical_width)
-                .then(|| target_batch.greedy_ids[..logical_width].to_vec());
-            let decision = logical_target_greedy_ids.as_deref().and_then(|target_ids| {
-                gemma4_mtp12_acceptance_decision(
-                    &draft_proposal.tokens,
-                    target_ids,
-                    &stop_ids,
-                )
-            })
-            .ok_or_else(|| {
-                // The verifier contract guarantees K predictions, but leave no
-                // pending ticket behind if a future implementation violates it.
-                let _ = self.rollback_verifier_batch(target_batch.ticket);
-                BackendError::RuntimeShapeMismatch(format!(
-                    "MTP target returned {} predictions for logical W{logical_width} / physical W{physical_width} / {} drafts",
-                    target_batch.greedy_ids.len(),
-                    draft_proposal.tokens.len()
-                ))
-            })?;
-            let hidden_index = decision.committed_input_rows - 1;
+            let tree_decision = tree_proposal.as_ref().map(|tree| {
+                mtp12_tree_policy::accept(
+                    &candidates, &tree.parents, &tree.depths, &target_batch.greedy_ids, &stop_ids, self.vocab,
+                ).ok_or_else(|| {
+                    let _ = self.rollback_verifier_batch(target_batch.ticket);
+                    BackendError::RuntimeShapeMismatch("target tree acceptance contract failed".into())
+                })
+            }).transpose()?;
+            let decision = if branched {
+                let tree = tree_decision.as_ref().expect("branched target decision");
+                Gemma4Mtp12AcceptanceDecision {
+                    accepted_drafts: tree.path.len() - 1,
+                    committed_input_rows: tree.path.len(),
+                    // Linear draft-index mismatch has no meaning on a branch.
+                    mismatch_draft_index: None,
+                    stop_token: tree.stop_token, next_anchor_token: tree.next_anchor_token,
+                }
+            } else {
+                (target_batch.greedy_ids.len() == physical_width)
+                    .then(|| &target_batch.greedy_ids[..logical_width])
+                    .and_then(|target_ids| gemma4_mtp12_acceptance_decision(
+                        &draft_proposal.tokens, target_ids, &stop_ids,
+                    ))
+                    .ok_or_else(|| {
+                        let _ = self.rollback_verifier_batch(target_batch.ticket);
+                        BackendError::RuntimeShapeMismatch("MTP linear acceptance contract failed".into())
+                    })?
+            };
+            let path = tree_decision.as_ref().map(|tree| tree.path.clone())
+                .unwrap_or_else(|| (0..decision.committed_input_rows).collect());
+            let hidden_index = *path.last().expect("anchor always committed");
             let next_raw_hidden = target_batch.final_hidden.get(hidden_index).cloned();
-            let committed_position = self.commit_verifier_prefix(
-                target_batch.ticket,
-                decision.committed_input_rows,
-            )?;
-
-            let mut emitted_token_ids = Vec::with_capacity(1 + decision.accepted_drafts);
-            emitted_token_ids.push(anchor_token);
-            emitted_token_ids
-                .extend_from_slice(&draft_proposal.tokens[..decision.accepted_drafts]);
-            if generated.len() + emitted_token_ids.len() > max_new {
+            let emitted_token_ids = path.iter().map(|&row| candidates[row]).collect::<Vec<_>>();
+            if next_raw_hidden.is_none() || generated.len() + emitted_token_ids.len() > max_new {
+                let _ = self.rollback_verifier_batch(target_batch.ticket);
                 return Err(BackendError::RuntimeShapeMismatch(
-                    "MTP adaptive verifier emitted past the requested output budget".into(),
+                    "MTP verifier omitted committed hidden or exceeded output budget".into(),
                 ));
             }
+            let compaction_started = std::time::Instant::now();
+            let committed_position = if branched {
+                self.commit_verifier_tree_path(target_batch.ticket, &path)?
+            } else {
+                self.commit_verifier_prefix(target_batch.ticket, decision.committed_input_rows)?
+            };
+            let compaction_us = if branched { compaction_started.elapsed().as_micros() } else { 0 };
+            let tree_receipt = tree_proposal.as_ref().map(|tree| Gemma4Mtp12TreeRoundReceipt {
+                parents: tree.parents.clone(), depths: tree.depths.clone(),
+                primary_rows: tree.primary_rows.clone(), branch_primary_step: tree.branch_primary_step,
+                primary_margins: tree.primary_margins, assistant_steps: tree.assistant_steps as usize,
+                committed_path: path, mismatch_parent: tree_decision.as_ref().and_then(|d| d.mismatch_parent),
+                compaction_us,
+            });
+            if tree_proposal.is_some() { stats.tree_proposal_rounds += 1; }
+            if branched { stats.tree_branch_rounds += 1; }
+            stats.tree_compaction_us = stats.tree_compaction_us.saturating_add(compaction_us);
             generated.extend_from_slice(&emitted_token_ids);
             if let Some(on_delta) = on_delta.as_mut() {
                 text_stream.push_verified(
@@ -9989,6 +10082,7 @@ impl Gemma4GpuRuntime {
                 physical_verify_width: physical_width,
                 verifier_width: physical_width,
                 padding_candidate_ids,
+                tree: tree_receipt,
                 budget_truncated: round_plan.budget_truncated,
                 schedule_state_before: round_plan.state_before,
                 schedule_state_after,
@@ -10010,6 +10104,9 @@ impl Gemma4GpuRuntime {
                 target_decoder_gpu_us,
             });
 
+            // The receipt above retains the round start; final snapshots must
+            // see the new cursor even when this round confirmed a stop.
+            position = committed_position;
             if let Some(stop) = decision.stop_token {
                 stats.terminal_stop_token = Some(stop);
                 break;
@@ -10024,7 +10121,6 @@ impl Gemma4GpuRuntime {
                     "MTP target omitted the raw hidden row for the committed prefix".into(),
                 )
             })?;
-            position = committed_position;
         }
         stats.decode_us = decode_started.elapsed().as_micros();
         stats.emitted_tokens = generated.len() as u64;

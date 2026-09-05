@@ -15,6 +15,7 @@ mod gemma4_mtp12;
 pub use gemma4_mtp12::{
     validate_gemma4_12b_shared_kv_schedule, Gemma4Mtp12AssistantMetal,
     Gemma4Mtp12ChainLedger, Gemma4Mtp12ChainProposal, Gemma4Mtp12ChainTiming,
+    Gemma4Mtp12TreeProposal,
     Gemma4Mtp12CpuKv, Gemma4Mtp12DeviceKv, Gemma4Mtp12DeviceRecurrentHidden,
     Gemma4Mtp12MetalBufferView, Gemma4Mtp12Proposal, Gemma4Mtp12ProposalTiming,
     Gemma4Mtp12Q6KEmbeddingRow, Gemma4Mtp12Q6KEmbeddingTable,
@@ -785,6 +786,10 @@ static METAL_LINEAR_CACHE: OnceLock<Mutex<MetalLinearCache>> = OnceLock::new();
 mod spec50_head;
 #[cfg(target_os = "macos")]
 pub(crate) use spec50_head::*;
+#[cfg(target_os = "macos")]
+mod gemma4_tree;
+#[cfg(target_os = "macos")]
+pub(crate) use gemma4_tree::Gemma4DenseTreePlan;
 
 #[cfg(target_os = "macos")]
 const LINEAR_ROW_SHADER: &str = r#"
@@ -18424,6 +18429,16 @@ impl Gemma4ResidentModel {
         inputs_by_row: &[Vec<Gemma4TokenLayerInput>],
         base_position: usize,
     ) -> Option<Vec<f32>> {
+        self.verify_hidden_ordered_q4_plan(h0_rows, inputs_by_row, base_position, None)
+    }
+
+    fn verify_hidden_ordered_q4_plan(
+        &self,
+        h0_rows: &[f32],
+        inputs_by_row: &[Vec<Gemma4TokenLayerInput>],
+        base_position: usize,
+        tree_plan: Option<&Gemma4DenseTreePlan>,
+    ) -> Option<Vec<f32>> {
         const LAYERS: usize = 48;
         const HIDDEN: usize = 3_840;
         const FFN: usize = 15_360;
@@ -18452,6 +18467,10 @@ impl Gemma4ResidentModel {
             || !self.scale.is_finite()
             || self.scale.to_bits() != 1.0f32.to_bits()
         {
+            return None;
+        }
+
+        if tree_plan.is_some_and(|plan| columns != plan.depths().len()) {
             return None;
         }
 
@@ -18501,7 +18520,7 @@ impl Gemma4ResidentModel {
             if inputs.len() != LAYERS {
                 return None;
             }
-            let position = base_position + row;
+            let position = base_position + tree_plan.map_or(row, |plan| plan.depths()[row] as usize);
             let filled = position + 1;
             for (layer_idx, input) in inputs.iter().enumerate() {
                 let sliding = layer_idx % 6 != 5;
@@ -18869,9 +18888,17 @@ impl Gemma4ResidentModel {
             // may retain the immutable per-row scalar blocks and 3*K dispatches.
             let attention_rows_v2_requested = gemma4_dense_attention_rows_v2_enabled();
             let attention_rows_requested =
-                gemma4_dense_attention_rows_enabled() || attention_rows_v2_requested;
+                tree_plan.is_some() || gemma4_dense_attention_rows_enabled() || attention_rows_v2_requested;
             let attention_rows_encoded = attention_rows_requested
-                && if attention_rows_v2_requested {
+                && if let Some(plan) = tree_plan {
+                    gemma4_tree::encode_tree_attention(
+                        encoder, kernel, &scratch.q_normed, cache_k, cache_v,
+                        &scratch.q4_terms, &scratch.rows_denom, &scratch.context,
+                        HEADS, layer.n_kv_heads, layer.head_dim, self.max_positions,
+                        base_position, sliding.then_some(SLIDING_WINDOW), 1.0,
+                        plan, gemma4_dense_attention_rows_v2_variant(),
+                    )
+                } else if attention_rows_v2_requested {
                     encode_gemma4_dense_attention_rows_v2_f32(
                         encoder,
                         kernel,
