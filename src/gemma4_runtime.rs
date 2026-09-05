@@ -37,7 +37,7 @@ pub(crate) mod mtp12_snapshot;
 
 #[cfg(any(target_os = "macos", test))]
 #[path = "gemma4_mtp12_tree_policy.rs"]
-mod mtp12_tree_policy;
+pub(crate) mod mtp12_tree_policy;
 #[cfg(target_os = "macos")]
 #[path = "gemma4_mtp12_tree_runtime.rs"]
 mod mtp12_tree_runtime;
