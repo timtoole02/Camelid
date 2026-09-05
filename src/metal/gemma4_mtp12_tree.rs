@@ -273,6 +273,23 @@ impl Gemma4Mtp12AssistantMetal {
             self.layout.pre_projection,
             true,
         );
+        // Under FUSE_NORM each layer's tail computes the NEXT layer's input
+        // norm (or the final norm), so only layer 0's input norm stands alone
+        // and no separate final rms_norm may follow (rms_norm is not
+        // idempotent).  Unset, encode_layer_k1_fused encodes exactly the
+        // established per-layer list and the final norm is encoded here.
+        let fuse_norm = self.fuse.norm;
+        if fuse_norm {
+            encode_rms_norm(
+                encoder,
+                &self.pipelines.rms_norm,
+                &self.scratch.hidden,
+                &self.layers[0].input_norm,
+                &self.scratch.normed,
+                ASSISTANT_HIDDEN,
+                1,
+            );
+        }
         for layer in 0..N_LAYERS {
             let local = layer < 3;
             let (kv, heads, dim, cos, sin) = if local {
@@ -299,7 +316,12 @@ impl Gemma4Mtp12AssistantMetal {
             } else {
                 0
             };
-            self.encode_layer_k1_from_views(
+            let (next_norm, next_normed) = if layer + 1 < N_LAYERS {
+                (&self.layers[layer + 1].input_norm, &self.scratch.normed)
+            } else {
+                (&self.final_norm, &self.scratch.final_normalized)
+            };
+            self.encode_layer_k1_fused(
                 encoder,
                 layer,
                 kv.key.buffer,
@@ -316,17 +338,21 @@ impl Gemma4Mtp12AssistantMetal {
                 sin,
                 (query_step * dim / 2 * 4) as u64,
                 scores,
+                next_norm,
+                next_normed,
             );
         }
-        encode_rms_norm(
-            encoder,
-            &self.pipelines.rms_norm,
-            &self.scratch.hidden,
-            &self.final_norm,
-            &self.scratch.final_normalized,
-            ASSISTANT_HIDDEN,
-            1,
-        );
+        if !fuse_norm {
+            encode_rms_norm(
+                encoder,
+                &self.pipelines.rms_norm,
+                &self.scratch.hidden,
+                &self.final_norm,
+                &self.scratch.final_normalized,
+                ASSISTANT_HIDDEN,
+                1,
+            );
+        }
         #[cfg(test)]
         encode_copy_f32_to_offset(
             encoder,
@@ -336,20 +362,21 @@ impl Gemma4Mtp12AssistantMetal {
             (history_step * ASSISTANT_HIDDEN * 4) as u64,
             ASSISTANT_HIDDEN,
         );
-        self.encode_dense_gemv(
+        // The post projection lands directly in this step's history slot;
+        // the next step's gather reads it back from there (no copy dispatch).
+        let recurrent_byte_offset = (history_step * TARGET_HIDDEN * 4) as u64;
+        debug_assert!(
+            recurrent_byte_offset + (TARGET_HIDDEN * 4) as u64
+                <= self.scratch.chain_recurrent_hidden.length(),
+            "tree history slot {history_step} exceeds chain_recurrent_hidden"
+        );
+        self.encode_dense_gemv_at_offset(
             encoder,
             &self.scratch.final_normalized,
-            &self.scratch.recurrent_hidden,
+            &self.scratch.chain_recurrent_hidden,
+            recurrent_byte_offset,
             self.layout.post_projection,
             true,
-        );
-        encode_copy_f32_to_offset(
-            encoder,
-            &self.pipelines.copy_f32,
-            &self.scratch.recurrent_hidden,
-            &self.scratch.chain_recurrent_hidden,
-            (history_step * TARGET_HIDDEN * 4) as u64,
-            TARGET_HIDDEN,
         );
         self.encode_draft_head(encoder);
         if top2 {
@@ -436,10 +463,13 @@ impl Gemma4Mtp12AssistantMetal {
         let encoder = first.new_compute_command_encoder();
         let encoded = Instant::now();
         for step in 0..PRIMARY {
-            let recurrent = if step == 0 {
-                &self.scratch.chain_initial_recurrent_hidden
+            let (recurrent, offset): (&BufferRef, u64) = if step == 0 {
+                (&self.scratch.chain_initial_recurrent_hidden, 0)
             } else {
-                &self.scratch.recurrent_hidden
+                (
+                    &self.scratch.chain_recurrent_hidden,
+                    ((step - 1) * TARGET_HIDDEN * 4) as u64,
+                )
             };
             self.encode_tree_step(
                 encoder,
@@ -452,7 +482,7 @@ impl Gemma4Mtp12AssistantMetal {
                 step,
                 step + 1,
                 recurrent,
-                0,
+                offset,
                 step,
                 &scores,
                 true,
@@ -498,14 +528,13 @@ impl Gemma4Mtp12AssistantMetal {
         let mut query_steps: Vec<usize> = (0..PRIMARY).collect();
         if let Some(step) = branch {
             for continuation in 0..2 {
-                let (recurrent, offset): (&BufferRef, u64) = if continuation == 0 {
-                    (
-                        &self.scratch.chain_recurrent_hidden,
-                        (step * TARGET_HIDDEN * 4) as u64,
-                    )
-                } else {
-                    (&self.scratch.recurrent_hidden, 0)
-                };
+                // Continuation A resumes from the forked primary's slot;
+                // continuation B from A's own slot (history step 4).
+                let history_slot = if continuation == 0 { step } else { 4 };
+                let (recurrent, offset): (&BufferRef, u64) = (
+                    &self.scratch.chain_recurrent_hidden,
+                    (history_slot * TARGET_HIDDEN * 4) as u64,
+                );
                 let query = step + 1 + continuation;
                 query_steps.push(query);
                 self.encode_tree_step(
@@ -538,8 +567,8 @@ impl Gemma4Mtp12AssistantMetal {
                     step,
                     step,
                     step + 1,
-                    &self.scratch.recurrent_hidden,
-                    0,
+                    &self.scratch.chain_recurrent_hidden,
+                    ((step - 1) * TARGET_HIDDEN * 4) as u64,
                     step,
                     &scores,
                     false,
