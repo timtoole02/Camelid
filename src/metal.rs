@@ -15872,8 +15872,11 @@ pub(crate) const GEMMA4_FUSED_GLUE_C4_RESIDUAL_NORM: u32 = 1 << 3;
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_FUSED_GLUE_C5_HEAD_ROPE_SCATTER: u32 = 1 << 4;
 /// bit5: the quantizers write their Q8_0 blocks straight into the
-/// fragment-major MMA activation record, so no stage dispatch follows them.
-/// Only admitted on the `fm_bits_u4` fragment-major V2 kernel at K <= 8.
+/// fragment-major MMA activation record, so no stage dispatch follows them
+/// (the attention input, the context, the FFN input and the GeGLU
+/// activation). Only admitted on the `fm_bits_u4` fragment-major V2 kernel at
+/// K <= 8, and it subsumes bit0: the record for a shared input is written
+/// once and every matrix that consumes it reads the identical bytes.
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE: u32 = 1 << 5;
 /// bit6: segment-fused MMA grids (q|k|v and gate|up in one dispatch each).
