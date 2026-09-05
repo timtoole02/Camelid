@@ -64,3 +64,33 @@ fixture compares the resulting centroid and assignment bits to the original
 generator. `test_generate_shortlist_sidecar.py` also checks hash refusal,
 header/endianness and destination preservation on invalid output. Full
 artifact regeneration was not performed during the kernel experiment.
+
+## Optional local compaction
+
+`CAMELID_GEMMA4_MTP12_SHORTLIST_COMPACT=1` selects a second bit-exact masked
+head kernel. Each 256-row threadgroup builds a local list of retained row
+IDs, then its eight SIMDgroups evaluate only those rows. It initializes all
+vocabulary logits to -infinity before writing retained results, so the
+ordinary stable argmax is unchanged. There are no extra resident buffers,
+global prefix passes or indirect-dispatch dependencies. Each group uses
+1,092 bytes of threadgroup storage for its compact IDs, counts and offsets.
+The selector defaults off and has no effect without a shortlist.
+
+Local M4 measurements with three saved queries (indices 0, 512 and 1200),
+synthetic full-size Q4 weights and the actual sidecar, 70 heads per command,
+median of five warmed commands; scoring and selection included:
+
+| Top clusters | Masked head, mean of medians | Local compaction | Saving per W8 chain of 7 drafts |
+|---|---:|---:|---:|
+| 128 | 596 us | 455 us | 0.99 ms |
+| 192 | 628 us | 531 us | 0.68 ms |
+| 256 | 671 us | 624 us | 0.33 ms |
+
+A separate global prefix-scan/scatter plus indirect-dispatch prototype was
+slower than local compaction and was not integrated. These small isolated
+savings require an in-situ mini2 gate before any default change.
+The GPU fixture compares every retained and omitted logit bit for
+TOP1/17/128/192/256/2048, including an 8,193-row partial final block and
+all-empty blocks. It also explicitly clears the complete selected mask and
+checks all -infinity logits and first-index-zero argmax after a prior full
+head, ruling out stale output in empty work.

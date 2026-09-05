@@ -930,6 +930,89 @@ kernel void mtp12_q4_0_gemv_shortlist(
     }
 }
 
+// Per-256-row local compaction removes empty GEMV work without a global
+// scan, indirect dispatch, or extra scratch. The retained row dot below is
+// identical to mtp12_q4_0_gemv_shortlist.
+kernel void mtp12_q4_0_gemv_compact_local(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
+    device const ushort4* token_clusters [[buffer(7)]],
+    device const uint* selected_clusters [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint ids[256];
+    threadgroup uint counts[8];
+    threadgroup uint offsets[8];
+    threadgroup uint total;
+    const uint candidate = group * 256u + tid;
+    uint keep = 0u;
+    if (candidate < rows) {
+        const ushort4 c = token_clusters[candidate];
+        keep = uint(selected_clusters[c.x] || selected_clusters[c.y] || selected_clusters[c.z]);
+        output[candidate] = -INFINITY;
+    }
+    const uint within_sg = simd_prefix_exclusive_sum(keep);
+    const uint sg_count = simd_sum(keep);
+    if (lane == 0u) counts[sg] = sg_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        const uint n = lane < 8u ? counts[lane] : 0u;
+        const uint preceding = simd_prefix_exclusive_sum(n);
+        const uint sum = simd_sum(n);
+        if (lane < 8u) offsets[lane] = preceding;
+        if (lane == 0u) total = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (keep != 0u) ids[offsets[sg] + within_sg] = candidate;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    for (uint index = sg; index < total; index += 8u) {
+        const uint row = ids[index];
+        const uint blocks_per_row = cols / 32u;
+        device const uchar* row_bytes = q4_weights + weight_byte_offset
+            + ulong(row) * ulong(blocks_per_row) * 18ul;
+        float partial = 0.0f;
+        for (uint block_index = lane; block_index < blocks_per_row; block_index += 32u) {
+            device const uchar* block = row_bytes + ulong(block_index) * 18ul;
+            const float d = float(*reinterpret_cast<device const half*>(block));
+            device const packed_uchar4* q4 =
+                reinterpret_cast<device const packed_uchar4*>(block + 2);
+            const uint input_base = block_index * 32u;
+            #pragma unroll
+            for (uint k = 0u; k < 4u; ++k) {
+                const uchar4 packed = uchar4(q4[k]);
+                const uint offset = k * 4u;
+                partial += d * (
+                    float(int(packed.x & 0x0f) - 8) * input[input_base + offset]
+                  + float(int(packed.x >> 4) - 8) * input[input_base + 16u + offset]
+                  + float(int(packed.y & 0x0f) - 8) * input[input_base + offset + 1u]
+                  + float(int(packed.y >> 4) - 8) * input[input_base + 17u + offset]
+                  + float(int(packed.z & 0x0f) - 8) * input[input_base + offset + 2u]
+                  + float(int(packed.z >> 4) - 8) * input[input_base + 18u + offset]
+                  + float(int(packed.w & 0x0f) - 8) * input[input_base + offset + 3u]
+                  + float(int(packed.w >> 4) - 8) * input[input_base + 19u + offset]);
+            }
+        }
+        partial += simd_shuffle_down(partial, ushort(16));
+        partial += simd_shuffle_down(partial, ushort(8));
+        partial += simd_shuffle_down(partial, ushort(4));
+        const float pair01 =
+            simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+        const float pair23 =
+            simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+        const float value = pair01 + pair23;
+        if (lane == 0u) {
+            output[row] = round_output_bf16 != 0u ? mtp12_round_bf16(value) : value;
+        }
+    }
+}
+
 // Pinned ATen-style contiguous f32 RMS geometry for all production widths
 // (256/512/1024). One threadgroup owns a row/head.
 kernel void mtp12_rms_norm(
@@ -1431,6 +1514,7 @@ struct Mtp12Pipelines {
     copy_f32: ComputePipelineState,
     q4_gemv: ComputePipelineState,
     q4_gemv_shortlist: ComputePipelineState,
+    q4_gemv_shortlist_compact: ComputePipelineState,
     shortlist_scores: ComputePipelineState,
     shortlist_select: ComputePipelineState,
     rms_norm: ComputePipelineState,
@@ -1471,6 +1555,7 @@ impl Mtp12Pipelines {
             copy_f32: pipeline("mtp12_copy_f32")?,
             q4_gemv: pipeline("mtp12_q4_0_gemv")?,
             q4_gemv_shortlist: pipeline("mtp12_q4_0_gemv_shortlist")?,
+            q4_gemv_shortlist_compact: pipeline("mtp12_q4_0_gemv_compact_local")?,
             shortlist_scores: pipeline("mtp12_shortlist_scores")?,
             shortlist_select: pipeline("mtp12_shortlist_select")?,
             rms_norm: pipeline("mtp12_rms_norm")?,
@@ -2189,6 +2274,15 @@ struct Mtp12Shortlist {
     scores: Buffer,
     selected: Buffer,
     top: u32,
+}
+
+/// A/B selector for the bit-exact retained-row local compaction kernel.
+fn mtp12_shortlist_compact_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_MTP12_SHORTLIST_COMPACT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 fn mtp12_shortlist_top(value: Option<&str>) -> Result<u32> {
@@ -2938,6 +3032,14 @@ impl Gemma4Mtp12AssistantMetal {
             encode_shortlist(encoder, &self.pipelines, shortlist, &self.scratch.final_normalized);
             encoder.set_buffer(7, Some(&shortlist.token_clusters), 0);
             encoder.set_buffer(8, Some(&shortlist.selected), 0);
+            if mtp12_shortlist_compact_enabled() {
+                encode_q4_gemv_shortlist_compact(
+                    encoder, &self.pipelines.q4_gemv_shortlist_compact,
+                    &self.packed_q4, &self.scratch.final_normalized,
+                    &self.scratch.logits, self.layout.embedding,
+                );
+                return;
+            }
             &self.pipelines.q4_gemv_shortlist
         } else {
             &self.pipelines.q4_gemv
@@ -3675,6 +3777,37 @@ fn encode_q4_gemv(
         },
         MTLSize {
             width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_q4_gemv_shortlist_compact(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    matrix: Q4TensorRef,
+) {
+    let round = 0u32;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(weights), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), 0);
+    encoder.set_bytes(3, 4, &matrix.cols as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &matrix.rows as *const u32 as *const c_void);
+    encoder.set_bytes(5, 8, &matrix.byte_offset as *const u64 as *const c_void);
+    encoder.set_bytes(6, 4, &round as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: (matrix.rows as u64).div_ceil(256),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
             height: 1,
             depth: 1,
         },
@@ -5798,6 +5931,7 @@ mod tests {
         };
         let full_logits = shared_buffer(&device, ROWS * 4);
         let masked_logits = shared_buffer(&device, ROWS * 4);
+        let compact_logits = shared_buffer(&device, ROWS * 4);
         let mut order: Vec<usize> = (0..MTP12_SHORTLIST_CLUSTERS).collect();
         order.sort_by(|&a, &b| expected_scores[b].total_cmp(&expected_scores[a]).then(a.cmp(&b)));
         for top in [1, 17, 128, 192, 256, 2048] {
@@ -5811,6 +5945,8 @@ mod tests {
             encoder.set_buffer(8, Some(&shortlist.selected), 0);
             encode_q4_gemv(encoder, &pipelines.q4_gemv_shortlist, &weights, &query_buffer,
                 &masked_logits, matrix, false);
+            encode_q4_gemv_shortlist_compact(encoder, &pipelines.q4_gemv_shortlist_compact,
+                &weights, &query_buffer, &compact_logits, matrix);
             encoder.end_encoding(); cb.commit(); cb.wait_until_completed();
             assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
             let selected = unsafe { std::slice::from_raw_parts(
@@ -5823,17 +5959,39 @@ mod tests {
             assert_eq!(selected, expected_selected, "top={top}");
             let full = unsafe { std::slice::from_raw_parts(full_logits.contents().cast::<f32>(), ROWS) };
             let actual = unsafe { std::slice::from_raw_parts(masked_logits.contents().cast::<f32>(), ROWS) };
+            let compacted = unsafe { std::slice::from_raw_parts(compact_logits.contents().cast::<f32>(), ROWS) };
+            let mut empty_blocks = 0;
+            for block in clusters.chunks(256 * 4) {
+                empty_blocks += usize::from(block.chunks_exact(4)
+                    .all(|ids| ids[..3].iter().all(|&c| expected_selected[c as usize] == 0)));
+            }
+            if top == 1 { assert!(empty_blocks > 0, "fixture must include all-empty blocks"); }
+            if top == 2048 { assert_eq!(empty_blocks, 0); }
             for row in 0..ROWS {
                 let admitted = clusters[row * 4..row * 4 + 3].iter()
                     .any(|&c| expected_selected[c as usize] != 0);
                 let expected = if admitted { full[row] } else { f32::NEG_INFINITY };
                 assert_eq!(actual[row].to_bits(), expected.to_bits(), "top={top} row={row}");
+                assert_eq!(compacted[row].to_bits(), expected.to_bits(), "compact top={top} row={row}");
             }
             let expected_token = reference_first_index_argmax(actual);
-            let (legacy, chunked) = run_argmax_pair(&device, &queue, &pipelines, actual);
+            let (legacy, chunked) = run_argmax_pair(&device, &queue, &pipelines, compacted);
             assert_eq!(legacy, expected_token);
             assert_eq!(chunked, expected_token);
         }
+        unsafe { std::ptr::write_bytes(shortlist.selected.contents().cast::<u8>(), 0,
+            MTP12_SHORTLIST_CLUSTERS * 4); }
+        let cb = queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        encoder.set_buffer(7, Some(&shortlist.token_clusters), 0);
+        encoder.set_buffer(8, Some(&shortlist.selected), 0);
+        encode_q4_gemv_shortlist_compact(encoder, &pipelines.q4_gemv_shortlist_compact,
+            &weights, &query_buffer, &compact_logits, matrix);
+        encoder.end_encoding(); cb.commit(); cb.wait_until_completed();
+        assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+        let empty = unsafe { std::slice::from_raw_parts(compact_logits.contents().cast::<f32>(), ROWS) };
+        assert!(empty.iter().all(|&value| value == f32::NEG_INFINITY));
+        assert_eq!(run_argmax_pair(&device, &queue, &pipelines, empty), (0, 0));
     }
 
     #[test]
