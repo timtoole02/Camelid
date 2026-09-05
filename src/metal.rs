@@ -236,6 +236,10 @@ pub(crate) struct MetalLinearKernel {
     /// one decoded Q4 fragment across two independent 8-column accumulators.
     q4_0_q8_ordered_columns_mma_stage16_pipeline: Option<ComputePipelineState>,
     q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline: Option<ComputePipelineState>,
+    /// Opt-in register-exact V2 native family (`GEMMA4_Q4_NATIVE_V2_VARIANTS`).
+    /// Empty unless `CAMELID_GEMMA4_Q4_NATIVE_REGISTER_V2` names a variant
+    /// (every variant under `cfg(test)`), so the default lane is untouched.
+    gemma4_q4_native_v2: Vec<Gemma4Q4NativeV2Pipelines>,
     /// Fixed-geometry Gemma 4 26B routed-expert lane. These three strict
     /// pipelines consume caller-owned, persistent expert slot slabs: no weight
     /// buffer is allocated or copied on the token hot path.
@@ -3933,6 +3937,266 @@ inline uint2 q4_native_mma_fragment_coord(uint lane) {
         4u * ((lane >> 3) & 1u) + 2u * (lane & 1u);
     return uint2(fragment_column, fragment_row);
 }
+
+// ---------------------------------------------------------------------------
+// Opt-in register-exact V2 natives (CAMELID_GEMMA4_Q4_NATIVE_REGISTER_V2).
+// Same sidecar bytes, the same exact MMA integer block dots, and the same
+// per-cell fold as the qualified native register kernels: increasing block
+// order with the two explicit multiplies (float(isum) * weight_scale) *
+// input_scale into an f32 accumulator. Only the memory traffic in flight per
+// simdgroup changes:
+//   * UNROLL consecutive blocks have every weight, scale, and activation load
+//     issued before the first MMA of the batch (UNROLL x 144 sidecar bytes in
+//     flight per tile instead of 144);
+//   * TILES eight-row tiles per simdgroup share each staged B fragment;
+//   * FM (fragment-major) panels let a lane fetch its eight B halves for one
+//     block with a single uint4 load and its two input scales with one
+//     float2 load, instead of eight scalar half loads and two strided floats.
+//
+// Fragment-major record per Q4_0 block (written by the *_fm stage kernels):
+//   K<=8 : 32 lanes x uint4 (the lane's B halves, k-tile-major,
+//          element-minor) = 512 bytes, then eight f32 input scales for
+//          columns 0..7 (zero for a padded column) = 32 bytes; 544 bytes.
+//   K=16 : two 512-byte lane panels (columns 0..7, then 8..15), then sixteen
+//          f32 input scales; 1088 bytes.
+// Every staged value is the identical exact integer / f32 the position-major
+// panel and the strided input_scales reads deliver; only addressing differs.
+// ---------------------------------------------------------------------------
+// One V2 batch: N consecutive blocks for TILES eight-row tiles and GROUPS
+// eight-column groups. All loads of the batch are issued before its MMAs;
+// the fold then visits the N blocks in increasing order per cell.
+template <uint TILES, uint N, uint GROUPS, bool FM>
+inline void q4_0_q8_native_register_v2_blocks(
+    device const float* input_scales,
+    device const uchar* native_weight_bytes,
+    device const half* staged_quants,
+    uint tile0,
+    uint last_tile,
+    uint blocks_per_row,
+    uint columns,
+    uint block_index,
+    uint lane,
+    thread float (&accum)[TILES][GROUPS][2]
+) {
+    const uint2 fc = q4_native_mma_fragment_coord(lane);
+    const uint fragment_column0 = fc.x;
+    const uint fragment_row = fc.y;
+    const ulong tile_span = ulong(blocks_per_row) * 144ul;
+    const ulong quant_plane = ulong(blocks_per_row) * 16ul;
+    const ulong first_offset = ulong(fragment_column0 >> 2) * 32ul
+        + ulong(fragment_row) * 4ul + ulong(fragment_column0 & 3u);
+    const ulong second_offset = first_offset + 64ul;
+    const uint panel_width = GROUPS * 8u;
+    const uint record_u4 = GROUPS == 1u ? 34u : 68u;
+    const uint record_f2 = GROUPS == 1u ? 68u : 136u;
+    const uint scale_f2 = GROUPS == 1u ? 64u : 128u;
+    device const uint4* panel4 =
+        reinterpret_cast<device const uint4*>(staged_quants);
+    device const float2* scales2 =
+        reinterpret_cast<device const float2*>(staged_quants);
+
+    half weight_scale[N][TILES];
+    uchar2 packed_first[N][TILES];
+    uchar2 packed_second[N][TILES];
+    uint4 panel[N][GROUPS];
+    half2 panel_pm[N][GROUPS][4];
+    float2 input_scale[N][GROUPS];
+
+#pragma clang loop unroll(full)
+    for (uint u = 0; u < N; ++u) {
+        const uint block = block_index + u;
+#pragma clang loop unroll(full)
+        for (uint t = 0; t < TILES; ++t) {
+            device const uchar* tile_base = native_weight_bytes
+                + ulong(min(tile0 + t, last_tile)) * tile_span;
+            weight_scale[u][t] = reinterpret_cast<device const half*>(
+                tile_base)[block * 8u + fragment_row];
+            device const uchar* quant_block =
+                tile_base + quant_plane + ulong(block) * 128ul;
+            packed_first[u][t] = uchar2(
+                *reinterpret_cast<device const packed_uchar2*>(
+                    quant_block + first_offset));
+            packed_second[u][t] = uchar2(
+                *reinterpret_cast<device const packed_uchar2*>(
+                    quant_block + second_offset));
+        }
+#pragma clang loop unroll(full)
+        for (uint g = 0; g < GROUPS; ++g) {
+            const uint column0 = g * 8u + fragment_column0;
+            if (FM) {
+                panel[u][g] = panel4[block * record_u4 + g * 32u + lane];
+                input_scale[u][g] =
+                    scales2[block * record_f2 + scale_f2 + (column0 >> 1)];
+            } else {
+#pragma clang loop unroll(full)
+                for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+                    const ulong activation_row =
+                        (ulong(block) * 32ul + k_tile * 8ul + fragment_row)
+                        * panel_width;
+                    panel_pm[u][g][k_tile] =
+                        *reinterpret_cast<device const half2*>(
+                            staged_quants + activation_row + column0);
+                }
+                input_scale[u][g] = float2(
+                    column0 < columns
+                        ? input_scales[ulong(column0) * blocks_per_row + block]
+                        : 0.0f,
+                    column0 + 1u < columns
+                        ? input_scales[ulong(column0 + 1u) * blocks_per_row + block]
+                        : 0.0f);
+            }
+        }
+    }
+
+    simdgroup_float8x8 dots[N][TILES][GROUPS];
+#pragma clang loop unroll(full)
+    for (uint u = 0; u < N; ++u) {
+#pragma clang loop unroll(full)
+        for (uint t = 0; t < TILES; ++t) {
+#pragma clang loop unroll(full)
+            for (uint g = 0; g < GROUPS; ++g) {
+                dots[u][t][g] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+        }
+    }
+#pragma clang loop unroll(full)
+    for (uint u = 0; u < N; ++u) {
+#pragma clang loop unroll(full)
+        for (uint k_tile = 0; k_tile < 4u; ++k_tile) {
+            const bool high_nibble = k_tile >= 2u;
+            simdgroup_half8x8 weights[TILES];
+#pragma clang loop unroll(full)
+            for (uint t = 0; t < TILES; ++t) {
+                const uchar2 packed = (k_tile & 1u) == 0u
+                    ? packed_first[u][t]
+                    : packed_second[u][t];
+                weights[t].thread_elements()[0] = high_nibble
+                    ? half(int(packed.x >> 4) - 8)
+                    : half(int(packed.x & 0x0fu) - 8);
+                weights[t].thread_elements()[1] = high_nibble
+                    ? half(int(packed.y >> 4) - 8)
+                    : half(int(packed.y & 0x0fu) - 8);
+            }
+            simdgroup_half8x8 activations[GROUPS];
+#pragma clang loop unroll(full)
+            for (uint g = 0; g < GROUPS; ++g) {
+                const half2 pair = FM
+                    ? as_type<half2>(panel[u][g][k_tile])
+                    : panel_pm[u][g][k_tile];
+                activations[g].thread_elements()[0] = pair.x;
+                activations[g].thread_elements()[1] = pair.y;
+            }
+#pragma clang loop unroll(full)
+            for (uint t = 0; t < TILES; ++t) {
+#pragma clang loop unroll(full)
+                for (uint g = 0; g < GROUPS; ++g) {
+                    simdgroup_multiply_accumulate(
+                        dots[u][t][g], weights[t], activations[g], dots[u][t][g]);
+                }
+            }
+        }
+    }
+#pragma clang loop unroll(full)
+    for (uint u = 0; u < N; ++u) {
+#pragma clang loop unroll(full)
+        for (uint t = 0; t < TILES; ++t) {
+            const float weight_scale_f = float(weight_scale[u][t]);
+#pragma clang loop unroll(full)
+            for (uint g = 0; g < GROUPS; ++g) {
+#pragma clang loop unroll(full)
+                for (uint cell = 0; cell < 2u; ++cell) {
+                    const float isum = dots[u][t][g].thread_elements()[cell];
+                    float term = isum * weight_scale_f;
+                    term = term * (cell == 0u
+                        ? input_scale[u][g].x
+                        : input_scale[u][g].y);
+                    accum[t][g][cell] = accum[t][g][cell] + term;
+                }
+            }
+        }
+    }
+}
+
+template <uint TILES, uint UNROLL, uint GROUPS, bool FM>
+inline void q4_0_q8_native_register_v2_body(
+    device const float* input_scales,
+    device const uchar* native_weight_bytes,
+    device float* output,
+    uint blocks_per_row,
+    uint rows,
+    uint columns,
+    device const half* staged_quants,
+    uint tile0,
+    uint lane
+) {
+    if (tile0 * 8u >= rows) return;
+    if (GROUPS == 2u && columns != 16u) return;
+    const uint last_tile = (rows - 1u) / 8u;
+    const uint2 fc = q4_native_mma_fragment_coord(lane);
+    float accum[TILES][GROUPS][2];
+#pragma clang loop unroll(full)
+    for (uint t = 0; t < TILES; ++t) {
+#pragma clang loop unroll(full)
+        for (uint g = 0; g < GROUPS; ++g) {
+            accum[t][g][0] = 0.0f;
+            accum[t][g][1] = 0.0f;
+        }
+    }
+    uint block_index = 0u;
+    for (; block_index + UNROLL <= blocks_per_row; block_index += UNROLL) {
+        q4_0_q8_native_register_v2_blocks<TILES, UNROLL, GROUPS, FM>(
+            input_scales, native_weight_bytes, staged_quants, tile0, last_tile,
+            blocks_per_row, columns, block_index, lane, accum);
+    }
+    for (; block_index < blocks_per_row; ++block_index) {
+        q4_0_q8_native_register_v2_blocks<TILES, 1u, GROUPS, FM>(
+            input_scales, native_weight_bytes, staged_quants, tile0, last_tile,
+            blocks_per_row, columns, block_index, lane, accum);
+    }
+#pragma clang loop unroll(full)
+    for (uint t = 0; t < TILES; ++t) {
+        const uint output_row = (tile0 + t) * 8u + fc.y;
+        if (output_row < rows) {
+#pragma clang loop unroll(full)
+            for (uint g = 0; g < GROUPS; ++g) {
+#pragma clang loop unroll(full)
+                for (uint cell = 0; cell < 2u; ++cell) {
+                    const uint column = g * 8u + fc.x + cell;
+                    if (column < columns) {
+                        output[ulong(column) * rows + output_row] =
+                            accum[t][g][cell];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Named V2 entry points. A threadgroup may carry several simdgroups; each
+// simdgroup still owns its own TILES consecutive eight-row tiles.
+#define Q4_NATIVE_V2_KERNEL(NAME, TILES, UNROLL, GROUPS, FM)                 \
+kernel void NAME(                                                            \
+    device const float* input_scales [[buffer(0)]],                          \
+    device const uchar* native_weight_bytes [[buffer(2)]],                   \
+    device float* output [[buffer(3)]],                                      \
+    constant uint& blocks_per_row [[buffer(4)]],                             \
+    constant uint& rows [[buffer(5)]],                                       \
+    constant uint& columns [[buffer(6)]],                                    \
+    device const half* staged_quants [[buffer(7)]],                          \
+    uint tg [[threadgroup_position_in_grid]],                                \
+    uint sg [[simdgroup_index_in_threadgroup]],                              \
+    uint sgs [[simdgroups_per_threadgroup]],                                 \
+    uint lane [[thread_index_in_simdgroup]]                                  \
+) {                                                                          \
+    q4_0_q8_native_register_v2_body<TILES, UNROLL, GROUPS, FM>(              \
+        input_scales, native_weight_bytes, output, blocks_per_row, rows,     \
+        columns, staged_quants, (tg * sgs + sg) * TILES, lane);              \
+}
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u2, 1u, 2u, 1u, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_v2_u4, 1u, 4u, 1u, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u2, 1u, 2u, 2u, false)
+Q4_NATIVE_V2_KERNEL(q4_0_q8_ordered_columns_mma_native_register_k16_v2_u4, 1u, 4u, 2u, false)
+#undef Q4_NATIVE_V2_KERNEL
 
 // Native-plane adaptation of the exact register-fed B kernel. Each lane loads
 // the two Q4 bytes backing each of its two fragment cells directly from the
@@ -12890,6 +13154,16 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                             .new_compute_pipeline_state_with_function(&function)
                             .ok()
                     });
+            let gemma4_q4_native_v2 = {
+                let selected = gemma4_q4_native_register_v2_variant();
+                GEMMA4_Q4_NATIVE_V2_VARIANTS
+                    .iter()
+                    .filter(|variant| cfg!(test) || selected == Some(variant.name))
+                    .filter_map(|variant| {
+                        gemma4_q4_native_v2_build(&strict_q8k_library, &device, *variant)
+                    })
+                    .collect::<Vec<_>>()
+            };
             let gemma4_q4_expert_gate_up_geglu_function = strict_q8k_library
                 .get_function("gemma4_q4_expert_gate_up_geglu", None)
                 .ok()?;
@@ -13099,6 +13373,7 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4_0_q8_ordered_columns_mma_register_fragment_pipeline,
                 q4_0_q8_ordered_columns_mma_stage16_pipeline,
                 q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline,
+                gemma4_q4_native_v2,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
                 gemma4_q4_expert_gate_up_geglu_simd_pipeline,
                 gemma4_q4_expert_gate_up_split_pipeline,
@@ -14815,6 +15090,140 @@ fn gemma4_q4_native_register_fragment_enabled() -> bool {
         std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
+}
+
+/// Opt-in register-exact V2 native selector:
+/// `CAMELID_GEMMA4_Q4_NATIVE_REGISTER_V2=<variant>` names one entry of
+/// [`GEMMA4_Q4_NATIVE_V2_VARIANTS`]. Unset (or `0`) keeps the qualified native
+/// kernels byte-for-byte; a set-but-unknown or uncompiled variant is admitted
+/// fail-closed and never silently falls back to the baseline kernels.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_native_register_v2_variant() -> Option<&'static str> {
+    static SELECTED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SELECTED
+        .get_or_init(|| {
+            std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_V2")
+                .ok()
+                .filter(|value| !value.is_empty() && value != "0")
+        })
+        .as_deref()
+}
+
+/// Simdgroups per threadgroup for the V2 kernels; every simdgroup still owns
+/// its own tiles. `CAMELID_GEMMA4_Q4_NATIVE_REGISTER_V2_SIMDGROUPS` in
+/// {1,2,4,8}; the default 1 is the established one-simdgroup geometry.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_native_register_v2_simdgroups() -> usize {
+    static SIMDGROUPS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIMDGROUPS.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_V2_SIMDGROUPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| matches!(*value, 1 | 2 | 4 | 8))
+            .unwrap_or(1)
+    })
+}
+
+/// One V2 family member: `tiles` eight-row tiles per simdgroup and whether it
+/// consumes the fragment-major activation record instead of the position-major
+/// panel. The kernel names are `..._native_register_v2_<name>` (K<=8) and
+/// `..._native_register_k16_v2_<name>` (K=16).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Gemma4Q4NativeV2Variant {
+    pub(crate) name: &'static str,
+    pub(crate) tiles: usize,
+    pub(crate) fragment_major: bool,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_Q4_NATIVE_V2_VARIANTS: &[Gemma4Q4NativeV2Variant] = &[
+    Gemma4Q4NativeV2Variant { name: "u2", tiles: 1, fragment_major: false },
+    Gemma4Q4NativeV2Variant { name: "u4", tiles: 1, fragment_major: false },
+];
+
+/// Compiled pipelines of one V2 variant: the padded-eight K<=8 kernel, the
+/// fixed K=16 kernel, and (fragment-major variants only) their stage kernels.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q4NativeV2Pipelines {
+    pub(crate) variant: Gemma4Q4NativeV2Variant,
+    stage_fm: Option<ComputePipelineState>,
+    stage16_fm: Option<ComputePipelineState>,
+    k8: ComputePipelineState,
+    k16: ComputePipelineState,
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_q4_native_v2_build(
+    library: &metal::LibraryRef,
+    device: &metal::DeviceRef,
+    variant: Gemma4Q4NativeV2Variant,
+) -> Option<Gemma4Q4NativeV2Pipelines> {
+    let make = |name: &str| {
+        library.get_function(name, None).ok().and_then(|function| {
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .ok()
+        })
+    };
+    let k8 = make(&format!(
+        "q4_0_q8_ordered_columns_mma_native_register_v2_{}",
+        variant.name
+    ))?;
+    let k16 = make(&format!(
+        "q4_0_q8_ordered_columns_mma_native_register_k16_v2_{}",
+        variant.name
+    ))?;
+    let (stage_fm, stage16_fm) = if variant.fragment_major {
+        (
+            Some(make("q4_0_q8_ordered_columns_mma_stage_fm")?),
+            Some(make("q4_0_q8_ordered_columns_mma_stage16_fm")?),
+        )
+    } else {
+        (None, None)
+    };
+    Some(Gemma4Q4NativeV2Pipelines {
+        variant,
+        stage_fm,
+        stage16_fm,
+        k8,
+        k16,
+    })
+}
+
+/// Scratch bytes one V2 projection needs: the established position-major
+/// panels for non-fragment-major variants, or 544 (K<=8) / 1088 (K=16) bytes
+/// per block for the fragment-major record (lane panel plus its scale plane).
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_q4_native_v2_stage_bytes(
+    blocks_per_row: usize,
+    columns: usize,
+    fragment_major: bool,
+) -> Option<usize> {
+    match (fragment_major, columns == 16) {
+        (false, false) => gemma4_q4_mma_stage_bytes(blocks_per_row),
+        (false, true) => gemma4_q4_mma_stage16_bytes(blocks_per_row),
+        (true, false) => blocks_per_row.checked_mul(544),
+        (true, true) => blocks_per_row.checked_mul(1088),
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MetalLinearKernel {
+    /// The V2 pipelines named by the selector, if that variant compiled.
+    pub(crate) fn gemma4_q4_native_v2_selected(&self) -> Option<&Gemma4Q4NativeV2Pipelines> {
+        let name = gemma4_q4_native_register_v2_variant()?;
+        self.gemma4_q4_native_v2_named(name)
+    }
+
+    pub(crate) fn gemma4_q4_native_v2_named(
+        &self,
+        name: &str,
+    ) -> Option<&Gemma4Q4NativeV2Pipelines> {
+        self.gemma4_q4_native_v2
+            .iter()
+            .find(|pipelines| pipelines.variant.name == name)
+    }
 }
 
 /// Fixed-width native K=16 selector. This is independent of the qualified
@@ -21492,6 +21901,8 @@ pub(crate) fn gemma4_native_q4_kernel_family_admitted() -> bool {
                             .as_ref(),
                     )
                     .is_some()))
+            && (gemma4_q4_native_register_v2_variant().is_none()
+                || kernel.gemma4_q4_native_v2_selected().is_some())
     })
 }
 
@@ -21853,6 +22264,140 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register(
         columns,
         Gemma4Q4MmaLayout::NativeRegister,
     )
+}
+
+/// Encode one opt-in register-exact V2 native projection: K=1..8 on the
+/// padded-eight panel or fixed K=16. The stage dispatch writes the variant's
+/// activation record and the MMA dispatch consumes exact sidecar octet tiles.
+/// Every refusal happens before either dispatch is encoded.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    v2: &Gemma4Q4NativeV2Pipelines,
+    simdgroups_per_threadgroup: usize,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    staged_quants: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    columns: usize,
+) -> bool {
+    if rows == 0
+        || blocks_per_row == 0
+        || rows > u32::MAX as usize
+        || blocks_per_row > (u32::MAX as usize) / 1088
+        || !matches!(columns, 1 | 2 | 4 | 8 | 16)
+        || !matches!(simdgroups_per_threadgroup, 1 | 2 | 4 | 8)
+    {
+        return false;
+    }
+    let fragment_major = v2.variant.fragment_major;
+    let panel_columns = if columns == 16 { 16 } else { 8 };
+    let input_width = blocks_per_row * 32;
+    let Some(input_blocks) = columns.checked_mul(blocks_per_row) else {
+        return false;
+    };
+    let Some(scale_bytes) = input_blocks.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(quant_bytes) = input_blocks.checked_mul(32) else {
+        return false;
+    };
+    let Some(weight_bytes) = rows
+        .div_ceil(8)
+        .checked_mul(blocks_per_row)
+        .and_then(|records| records.checked_mul(144))
+    else {
+        return false;
+    };
+    let Some(weight_end) = weight_offset.checked_add(weight_bytes as u64) else {
+        return false;
+    };
+    let Some(output_bytes) = rows
+        .checked_mul(columns)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(stage_bytes) =
+        gemma4_q4_native_v2_stage_bytes(blocks_per_row, columns, fragment_major)
+    else {
+        return false;
+    };
+    if input_scales.length() < scale_bytes as u64
+        || input_quants.length() < quant_bytes as u64
+        || weight.length() < weight_end
+        || output.length() < output_bytes as u64
+        || staged_quants.length() < stage_bytes as u64
+    {
+        return false;
+    }
+    let stage_pipeline = match (fragment_major, columns == 16) {
+        (true, false) => v2.stage_fm.as_ref(),
+        (true, true) => v2.stage16_fm.as_ref(),
+        (false, false) => kernel.q4_0_q8_ordered_columns_mma_stage_pipeline.as_ref(),
+        (false, true) => kernel.q4_0_q8_ordered_columns_mma_stage16_pipeline.as_ref(),
+    };
+    let Some(stage_pipeline) = stage_pipeline else {
+        return false;
+    };
+    let mma_pipeline = if columns == 16 { &v2.k16 } else { &v2.k8 };
+    let threads_per_threadgroup = 32 * simdgroups_per_threadgroup;
+    if mma_pipeline.thread_execution_width() != 32
+        || (mma_pipeline.max_total_threads_per_threadgroup() as usize) < threads_per_threadgroup
+    {
+        return false;
+    }
+    let stage_threads = if fragment_major {
+        blocks_per_row * (panel_columns * 32 + panel_columns)
+    } else {
+        input_width * panel_columns
+    };
+    let tiles = rows.div_ceil(8);
+    let threadgroups = tiles
+        .div_ceil(v2.variant.tiles)
+        .div_ceil(simdgroups_per_threadgroup);
+    let blocks_u32 = blocks_per_row as u32;
+    let rows_u32 = rows as u32;
+    let columns_u32 = columns as u32;
+
+    encoder.set_compute_pipeline_state(stage_pipeline);
+    encoder.set_buffer(0, Some(input_quants), 0);
+    encoder.set_buffer(1, Some(staged_quants), 0);
+    if fragment_major {
+        encoder.set_buffer(2, Some(input_scales), 0);
+    }
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    dispatch_1d(encoder, stage_pipeline, stage_threads);
+
+    encoder.set_compute_pipeline_state(mma_pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+    encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+    encoder.set_bytes(6, 4, &columns_u32 as *const u32 as *const _);
+    encoder.set_buffer(7, Some(staged_quants), 0);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: threadgroups as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: threads_per_threadgroup as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    record_gemma4_q4_column_dispatch(columns);
+    true
 }
 
 /// Encode the native-planar K=16 dual-register-fragment sibling. Native bytes
@@ -22534,6 +23079,34 @@ fn encode_gemma4_q4_0_q8_ordered_columns_with_layout(
         || output.length() < output_bytes as u64
     {
         return false;
+    }
+
+    // Opt-in register-exact V2 natives: one selector covers every admitted
+    // width, K=1 through K=16, over the same sidecar bytes with the same
+    // per-cell fold. A selected variant that is missing or refuses fails
+    // closed instead of falling back to the qualified kernels.
+    if weight_layout == Gemma4Q4WeightLayout::NativeOctets
+        && gemma4_q4_native_register_v2_variant().is_some()
+    {
+        return kernel.gemma4_q4_native_v2_selected().is_some_and(|v2| {
+            terms.is_some_and(|staged| {
+                encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2(
+                    encoder,
+                    kernel,
+                    v2,
+                    gemma4_q4_native_register_v2_simdgroups(),
+                    input_scales,
+                    input_quants,
+                    weight,
+                    weight_offset,
+                    output,
+                    staged,
+                    rows,
+                    blocks_per_row,
+                    columns,
+                )
+            })
+        });
     }
 
     // Native K=16 is admitted only for exact sidecar bytes and its independent
@@ -46881,6 +47454,460 @@ mod tests {
                  samples=9 exact_bits=true",
                 two_k8_us[4], k16_us[4],
             );
+        }
+    }
+
+    /// Shared fixture for the opt-in V2 native family: K-wide Q8 inputs
+    /// flattened to the column-major scale/quant buffers the production lane
+    /// binds, the exact native repack of one wire matrix, and one scratch
+    /// buffer large enough for every panel format.
+    #[cfg(target_os = "macos")]
+    struct NativeV2Fixture {
+        rows: usize,
+        blocks_per_row: usize,
+        columns: usize,
+        scales_buf: Buffer,
+        quants_buf: Buffer,
+        weight_buf: Buffer,
+        stage_buf: Buffer,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_fixture(
+        kernel: &MetalLinearKernel,
+        inputs: &[&[crate::tensor::Q8_0Block]],
+        wire: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+    ) -> NativeV2Fixture {
+        let columns = inputs.len();
+        let width = blocks_per_row * 32;
+        let mut scales = vec![0.0f32; columns * blocks_per_row];
+        let mut quants = vec![0u8; columns * width];
+        for (column, input) in inputs.iter().enumerate() {
+            assert_eq!(input.len(), blocks_per_row);
+            for (block, q8) in input.iter().enumerate() {
+                scales[column * blocks_per_row + block] = q8.scale;
+                for (j, &value) in q8.quants.iter().enumerate() {
+                    quants[column * width + block * 32 + j] = value as u8;
+                }
+            }
+        }
+        let native = crate::gemma4_q4_sidecar::pack_native_q4_octets(wire, rows, blocks_per_row)
+            .expect("wire matrix must repack to native octets");
+        let stage_bytes = gemma4_q4_native_v2_stage_bytes(blocks_per_row, columns, true)
+            .unwrap()
+            .max(gemma4_q4_native_v2_stage_bytes(blocks_per_row, columns, false).unwrap());
+        let scales_buf = kernel.device.new_buffer(
+            std::mem::size_of_val(scales.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let quants_buf = kernel
+            .device
+            .new_buffer(quants.len() as u64, MTLResourceOptions::StorageModeShared);
+        let weight_buf = kernel
+            .device
+            .new_buffer(native.len() as u64, MTLResourceOptions::StorageModeShared);
+        let stage_buf = kernel
+            .device
+            .new_buffer(stage_bytes as u64, MTLResourceOptions::StorageModePrivate);
+        write_buffer_f32(&scales_buf, &scales);
+        write_buffer_u8(&quants_buf, &quants);
+        write_buffer_u8(&weight_buf, &native);
+        NativeV2Fixture {
+            rows,
+            blocks_per_row,
+            columns,
+            scales_buf,
+            quants_buf,
+            weight_buf,
+            stage_buf,
+        }
+    }
+
+    /// Encode one arm (`None` = the qualified native register kernel of the
+    /// fixture's width, `Some` = a V2 variant with its simdgroups per
+    /// threadgroup), run it, and return the command buffer's GPU microseconds.
+    #[cfg(target_os = "macos")]
+    fn native_v2_run(
+        kernel: &MetalLinearKernel,
+        fixture: &NativeV2Fixture,
+        arm: Option<(&Gemma4Q4NativeV2Pipelines, usize)>,
+        output: &Buffer,
+    ) -> u128 {
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        let encoded = match arm {
+            Some((v2, simdgroups)) => {
+                encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2(
+                    encoder,
+                    kernel,
+                    v2,
+                    simdgroups,
+                    &fixture.scales_buf,
+                    &fixture.quants_buf,
+                    &fixture.weight_buf,
+                    0,
+                    output,
+                    &fixture.stage_buf,
+                    fixture.rows,
+                    fixture.blocks_per_row,
+                    fixture.columns,
+                )
+            }
+            None if fixture.columns == 16 => {
+                encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_k16(
+                    encoder,
+                    kernel,
+                    &fixture.scales_buf,
+                    &fixture.quants_buf,
+                    &fixture.weight_buf,
+                    0,
+                    output,
+                    &fixture.stage_buf,
+                    fixture.rows,
+                    fixture.blocks_per_row,
+                    fixture.columns,
+                )
+            }
+            None => encode_gemma4_q4_0_q8_ordered_columns_mma_native_register(
+                encoder,
+                kernel,
+                &fixture.scales_buf,
+                &fixture.quants_buf,
+                &fixture.weight_buf,
+                0,
+                output,
+                &fixture.stage_buf,
+                fixture.rows,
+                fixture.blocks_per_row,
+                fixture.columns,
+            ),
+        };
+        encoder.end_encoding();
+        assert!(
+            encoded,
+            "native V2 arm {:?} rejected rows={} blocks_per_row={} K={}",
+            arm.map(|(v2, simdgroups)| (v2.variant.name, simdgroups)),
+            fixture.rows,
+            fixture.blocks_per_row,
+            fixture.columns
+        );
+        cb.commit();
+        cb.wait_until_completed();
+        command_buffer_gpu_times_us(&cb.to_owned()).0
+    }
+
+    /// Every opt-in V2 native variant, at one and four simdgroups per
+    /// threadgroup, must reproduce the qualified native register kernels bit
+    /// for bit at every admitted width on adversarial values, ragged and odd
+    /// tile counts, and both Gemma 4 12B input widths. The qualified kernels
+    /// are checked against the established K=1 comparator in the same pass so
+    /// the V2 family is pinned to the same universe.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q4_0_q8_native_register_v2_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::tensor::Q8_0Block;
+
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        assert_eq!(
+            kernel.gemma4_q4_native_v2.len(),
+            GEMMA4_Q4_NATIVE_V2_VARIANTS.len(),
+            "every V2 variant must compile under cfg(test)"
+        );
+        for v2 in &kernel.gemma4_q4_native_v2 {
+            assert_eq!(v2.k8.thread_execution_width(), 32, "{}", v2.variant.name);
+            assert_eq!(v2.k16.thread_execution_width(), 32, "{}", v2.variant.name);
+            assert!(
+                v2.k8.max_total_threads_per_threadgroup() >= 128
+                    && v2.k16.max_total_threads_per_threadgroup() >= 128,
+                "{}",
+                v2.variant.name
+            );
+        }
+        assert_eq!(gemma4_q4_native_v2_stage_bytes(120, 8, true), Some(65_280));
+        assert_eq!(gemma4_q4_native_v2_stage_bytes(480, 16, true), Some(522_240));
+        assert_eq!(gemma4_q4_native_v2_stage_bytes(120, 8, false), Some(61_440));
+        assert_eq!(gemma4_q4_native_v2_stage_bytes(480, 16, false), Some(491_520));
+
+        let half_scales = [
+            0x0000u16, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3555, 0x3c00, 0xbc00, 0x7bff, 0xfbff,
+        ];
+        let input_scales = [
+            0.0f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            0.000_000_119_209_29,
+            -0.03125,
+            0.333_333_34,
+            -17.0,
+            2_048.0,
+        ];
+        let packed_patterns = [0x00u8, 0xff, 0x08, 0x80, 0x17, 0x71, 0x3c, 0xc3, 0x5a, 0xa5];
+
+        for &(blocks_per_row, rows, label) in &[
+            (1usize, 9usize, "edge-1-ragged"),
+            (2, 17, "edge-2-odd-tiles"),
+            (31, 9, "edge-31-ragged"),
+            (33, 35, "edge-33-ragged"),
+            (120, 11, "gemma4-12b-hidden-3840-ragged"),
+            (120, 16, "gemma4-12b-hidden-3840-even-tiles"),
+            (480, 7, "gemma4-12b-ffn-15360-one-tile"),
+        ] {
+            let inputs: Vec<Vec<Q8_0Block>> = (0..16)
+                .map(|column| {
+                    (0..blocks_per_row)
+                        .map(|block| Q8_0Block {
+                            scale: input_scales[(column * 5 + block * 3) % input_scales.len()],
+                            quants: std::array::from_fn(|j| match (column + block + j) % 10 {
+                                0 => -128,
+                                1 => 127,
+                                2 => -127,
+                                3 => 126,
+                                4 => -1,
+                                5 => 0,
+                                6 => 1,
+                                _ => {
+                                    (((column * 67 + block * 29 + j * 13) % 255) as i16 - 127)
+                                        as i8
+                                }
+                            }),
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = half_scales[(row * 7 + block * 3) % half_scales.len()];
+                    wire.extend_from_slice(&scale.to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(
+                            packed_patterns
+                                [(row * 11 + block * 7 + j * 3) % packed_patterns.len()],
+                        );
+                    }
+                }
+            }
+
+            for columns in [1usize, 2, 4, 8, 16] {
+                let refs: Vec<&[Q8_0Block]> =
+                    inputs[..columns].iter().map(Vec::as_slice).collect();
+                let fixture = native_v2_fixture(&kernel, &refs, &wire, rows, blocks_per_row);
+                let output_bytes = (columns * rows * std::mem::size_of::<f32>()) as u64;
+                let control_buf = kernel
+                    .device
+                    .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+                native_v2_run(&kernel, &fixture, None, &control_buf);
+                let mut control = vec![0.0f32; columns * rows];
+                read_buffer_f32(&control_buf, &mut control);
+                for (column, input) in refs.iter().enumerate() {
+                    let expected = try_gemma4_q4_0_matmul_q8_batch(&[*input], &wire, rows)
+                        .unwrap_or_else(|| panic!("K=1 comparator: {label} column={column}"));
+                    for row in 0..rows {
+                        assert_eq!(
+                            control[column * rows + row].to_bits(),
+                            expected[0][row].to_bits(),
+                            "qualified-native-vs-K1 shape={label} K={columns} column={column} row={row}"
+                        );
+                    }
+                }
+
+                let output_buf = kernel
+                    .device
+                    .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+                let poison = vec![f32::NAN; columns * rows];
+                let mut got = vec![0.0f32; columns * rows];
+                for v2 in &kernel.gemma4_q4_native_v2 {
+                    for simdgroups in [1usize, 4] {
+                        write_buffer_f32(&output_buf, &poison);
+                        let before = gemma4_q4_column_dispatch_counts();
+                        native_v2_run(&kernel, &fixture, Some((v2, simdgroups)), &output_buf);
+                        let after = gemma4_q4_column_dispatch_counts();
+                        let deltas = [
+                            after.k1 - before.k1,
+                            after.k2 - before.k2,
+                            after.k4 - before.k4,
+                            after.k8 - before.k8,
+                            after.k16 - before.k16,
+                        ];
+                        let selected = match columns {
+                            1 => 0,
+                            2 => 1,
+                            4 => 2,
+                            8 => 3,
+                            16 => 4,
+                            _ => unreachable!(),
+                        };
+                        for (index, delta) in deltas.into_iter().enumerate() {
+                            assert_eq!(
+                                delta,
+                                u64::from(index == selected),
+                                "shape={label} K={columns} variant={}: exactly one selected-width dispatch required",
+                                v2.variant.name
+                            );
+                        }
+                        read_buffer_f32(&output_buf, &mut got);
+                        for column in 0..columns {
+                            for row in 0..rows {
+                                assert_eq!(
+                                    got[column * rows + row].to_bits(),
+                                    control[column * rows + row].to_bits(),
+                                    "v2-vs-qualified shape={label} K={columns} variant={} simdgroups={simdgroups} column={column} row={row}",
+                                    v2.variant.name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Production-shape receipt for the V2 family: every variant at one
+    /// simdgroup per threadgroup (plus the unrolled fragment-major kernels at
+    /// four) against the qualified native register kernel at K=8 and K=16,
+    /// bit-exact first, then alternating GPU medians for the seven Gemma 4 12B
+    /// contractions with the effective sidecar bandwidth of each arm.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "full Gemma 4 12B native V2 register-exact production receipt"]
+    fn metal_gemma4_q4_0_q8_native_register_v2_production_receipt() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::tensor::Q8_0Block;
+
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        let arms: Vec<(&Gemma4Q4NativeV2Pipelines, usize)> = kernel
+            .gemma4_q4_native_v2
+            .iter()
+            .map(|v2| (v2, 1usize))
+            .chain(
+                kernel
+                    .gemma4_q4_native_v2
+                    .iter()
+                    .filter(|v2| v2.variant.fragment_major && v2.variant.name != "fm_u1")
+                    .map(|v2| (v2, 4usize)),
+            )
+            .collect();
+        assert!(!arms.is_empty(), "V2 variants must compile under cfg(test)");
+        const SAMPLES: usize = 7;
+
+        for &(blocks_per_row, rows, label) in &[
+            (120usize, 4_096usize, "3840-to-4096"),
+            (120, 8_192, "3840-to-8192"),
+            (120, 2_048, "3840-to-2048"),
+            (120, 512, "3840-to-512"),
+            (120, 15_360, "3840-to-15360-gate-up"),
+            (480, 3_840, "15360-to-3840-down"),
+            (128, 3_840, "4096-attention-to-3840"),
+        ] {
+            let width = blocks_per_row * 32;
+            let inputs: Vec<Vec<Q8_0Block>> = (0..16)
+                .map(|column| {
+                    (0..blocks_per_row)
+                        .map(|block| {
+                            let scale_index = column * blocks_per_row + block;
+                            Q8_0Block {
+                                scale: 0.000_7 * (1 + scale_index % 37) as f32,
+                                quants: std::array::from_fn(|j| {
+                                    let index = column * width + block * 32 + j;
+                                    (((index * 29 + index / 31) % 255) as i16 - 127) as i8
+                                }),
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = 0.000_11 * (1 + (row * 7 + block * 13) % 101) as f32;
+                    wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(((row * 43 + block * 19 + j * 11 + 5) % 256) as u8);
+                    }
+                }
+            }
+
+            for columns in [8usize, 16] {
+                let refs: Vec<&[Q8_0Block]> =
+                    inputs[..columns].iter().map(Vec::as_slice).collect();
+                let fixture = native_v2_fixture(&kernel, &refs, &wire, rows, blocks_per_row);
+                let output_bytes = (columns * rows * std::mem::size_of::<f32>()) as u64;
+                let control_buf = kernel
+                    .device
+                    .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+                let output_buf = kernel
+                    .device
+                    .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+                for _ in 0..2 {
+                    native_v2_run(&kernel, &fixture, None, &control_buf);
+                }
+                let mut control = vec![0.0f32; columns * rows];
+                read_buffer_f32(&control_buf, &mut control);
+                let poison = vec![f32::NAN; columns * rows];
+                let mut got = vec![0.0f32; columns * rows];
+                for &(v2, simdgroups) in &arms {
+                    write_buffer_f32(&output_buf, &poison);
+                    native_v2_run(&kernel, &fixture, Some((v2, simdgroups)), &output_buf);
+                    read_buffer_f32(&output_buf, &mut got);
+                    for (index, (&value, &expected)) in got.iter().zip(&control).enumerate() {
+                        assert_eq!(
+                            value.to_bits(),
+                            expected.to_bits(),
+                            "shape={label} K={columns} variant={} simdgroups={simdgroups} flat-output={index}",
+                            v2.variant.name
+                        );
+                    }
+                }
+
+                let order = arms.len() + 1;
+                let mut control_us = Vec::with_capacity(SAMPLES);
+                let mut arm_us: Vec<Vec<u128>> = vec![Vec::with_capacity(SAMPLES); arms.len()];
+                for repeat in 0..SAMPLES {
+                    for step in 0..order {
+                        let slot = (step + repeat) % order;
+                        if slot == 0 {
+                            control_us.push(native_v2_run(&kernel, &fixture, None, &control_buf));
+                        } else {
+                            let (v2, simdgroups) = arms[slot - 1];
+                            arm_us[slot - 1].push(native_v2_run(
+                                &kernel,
+                                &fixture,
+                                Some((v2, simdgroups)),
+                                &output_buf,
+                            ));
+                        }
+                    }
+                }
+                control_us.sort_unstable();
+                let control_median = control_us[SAMPLES / 2];
+                let sidecar_bytes = rows.div_ceil(8) * blocks_per_row * 144;
+                eprintln!(
+                    "gemma4-q4-native-v2 shape={label} K={columns} rows={rows} \
+                     blocks_per_row={blocks_per_row} sidecar_bytes={sidecar_bytes} \
+                     established_gpu_us={control_median} established_gb_s={:.1} \
+                     samples={SAMPLES}",
+                    sidecar_bytes as f64 / control_median as f64 / 1e3,
+                );
+                for (index, &(v2, simdgroups)) in arms.iter().enumerate() {
+                    arm_us[index].sort_unstable();
+                    let median = arm_us[index][SAMPLES / 2];
+                    eprintln!(
+                        "gemma4-q4-native-v2 shape={label} K={columns} \
+                         variant={}/sg{simdgroups} gpu_us={median} gb_s={:.1} \
+                         vs_established={:.4}x exact_bits=true",
+                        v2.variant.name,
+                        sidecar_bytes as f64 / median as f64 / 1e3,
+                        control_median as f64 / median as f64,
+                    );
+                }
+            }
         }
     }
 
