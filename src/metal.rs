@@ -313,6 +313,7 @@ pub(crate) struct MetalLinearKernel {
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
     attention_decode_f32_rows_pipeline: Option<ComputePipelineState>,
+    gemma4_attn_rows_v2_pipelines: std::collections::HashMap<&'static str, ComputePipelineState>,
     attention_decode_scores_pipeline: ComputePipelineState,
     attention_decode_softmax_pipeline: ComputePipelineState,
     attention_decode_context_pipeline: ComputePipelineState,
@@ -7514,6 +7515,352 @@ kernel void attention_decode_context_f32(
     }
 }
 
+// ---- Dense Gemma verifier row-aware attention, V2 (opt-in, default off) ----------
+//
+// Latency-hiding redistribution of attention_decode_f32_rows that keeps the SAME
+// floating-point universe: every (row, head, position) score is still ONE lane's
+// sequential head_dim-deep dot product, the softmax keeps the original lane->position
+// striding and simd_max / exp / simd_sum / reciprocal, and every context element is
+// still ONE lane's ascending-position accumulation of `(prob * inv) * v`.  Only the
+// work distribution changes:
+//   * scores: a (kv_head, position_block, pair_chunk) grid.  Each lane owns one
+//     position, loads its K row once as float4 and dots it against up to PAIRS
+//     (head,row) queries staged in threadgroup memory, so PAIRS independent
+//     accumulators are in flight per lane and K is read once per chunk;
+//   * softmax: one 32-lane simdgroup per (head,row), textually the split-three
+//     kernel, publishing the DENOMINATOR (phase 3 takes the reciprocal itself; see the
+//     note on attention_decode_softmax_f32);
+//   * context: a (kv_head, pair_chunk, dim_block) grid.  Each lane owns ONE output
+//     dim of PAIRS pairs and walks the union window once, so V is read once per chunk
+//     and PAIRS accumulators are in flight.
+// The elementwise library compiles with fast-math, so the TEXTUAL form of the
+// per-element arithmetic decides whether the codegen reproduces the established kernel
+// bit-for-bit.  Measured on the variant matrix
+// (metal_gemma4_dense_attention_rows_v2_variant_matrix): a score is exact only as the
+// sequential scalar chain `s += q.x*k.x; s += q.y*k.y; ...` (float4 partials folded in
+// any order move the last ulp), and a context element is exact only with a SCALAR lane
+// accumulating the established statement `acc += scores[p] * inv * values[p]` verbatim,
+// `inv = 1.0 / denom` taken in the kernel with one textual use -- every float4-lane
+// form (`acc4 += t * v4`, explicit fma, or `scores * inv * v4`) differs in the last
+// ulp.  Only exact forms are kept.  The `_nest` kernels keep the established loop
+// nests verbatim (only widened over the row metadata, exactly like
+// attention_decode_scores_f32 / _context_f32) and are the always-available fallback;
+// on the production shape the nest context is also the FASTEST exact context (its
+// redundant V reads are served from cache and it runs 16x the threadgroups), so the
+// qualified default pairs the fused scores with the nest context.
+
+struct Gemma4AttnV2Args {
+    uint n_heads;
+    uint head_dim;
+    uint rows;
+    uint group;
+    float scale;
+    uint position_stride;
+    uint kv_head_stride;
+    uint kv_base_offset;
+    uint union_start;
+    uint union_end;
+    uint score_blocks;
+    uint dim_blocks;
+};
+
+template <uint HEAD_DIM, uint PAIRS>
+inline void gemma4_attn_rows_v2_scores_fused(
+    device const float* query,
+    device const float* keys,
+    device float* scores,
+    constant Gemma4AttnV2Args& args,
+    constant uint4* row_meta,
+    threadgroup float4* q_tg,
+    uint3 tg,
+    uint lane)
+{
+    constexpr uint Q4 = HEAD_DIM / 4u;
+    const uint kv_head = tg.x;
+    const uint rows = args.rows;
+    const uint group = args.group;
+    const uint total_pairs = group * rows;
+    const uint pair_begin = tg.z * PAIRS;
+    if (pair_begin >= total_pairs) return;
+    const uint pair_count = min(PAIRS, total_pairs - pair_begin);
+    const uint row_stride = args.n_heads * HEAD_DIM;
+
+    // Stage this chunk's queries: pair j -> (head = kv_head*group + j/rows, row = j%rows).
+    for (uint idx = lane; idx < pair_count * Q4; idx += 32u) {
+        const uint j = idx / Q4;
+        const uint c = idx - j * Q4;
+        const uint pair = pair_begin + j;
+        const uint head_local = pair / rows;
+        const uint row = pair - head_local * rows;
+        const uint head = kv_head * group + head_local;
+        q_tg[idx] = ((device const float4*)(query + row * row_stride + head * HEAD_DIM))[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint p = args.union_start + tg.y * 32u + lane;
+    if (p >= args.union_end) return;
+    device const float4* k4 = (device const float4*)(
+        keys + args.kv_base_offset + kv_head * args.kv_head_stride + p * args.position_stride);
+
+    float s[PAIRS];
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        s[j] = 0.0f;
+    }
+
+#pragma clang loop unroll(disable)
+    for (uint c = 0u; c < Q4; ++c) {
+        const float4 k = k4[c];
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < PAIRS; ++j) {
+            const float4 q = q_tg[j * Q4 + c];
+            // The established kernel's `s += query[d] * keys[d]`, one lane, in order.
+            s[j] += q.x * k.x;
+            s[j] += q.y * k.y;
+            s[j] += q.z * k.z;
+            s[j] += q.w * k.w;
+        }
+    }
+
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        if (j < pair_count) {
+            float v = s[j];
+            const uint pair = pair_begin + j;
+            const uint head_local = pair / rows;
+            const uint row = pair - head_local * rows;
+            const uint4 meta = row_meta[row];
+            const uint rel = p - meta.x;
+            if (p >= meta.x && rel < meta.y) {
+                v *= args.scale;
+                scores[meta.z + (kv_head * group + head_local) * meta.y + rel] = v;
+            }
+        }
+    }
+}
+
+#define GEMMA4_ATTN_V2_SCORES_KERNEL(NAME, HD, PAIRS) \
+kernel void NAME( \
+    device const float* query [[buffer(0)]], \
+    device const float* keys [[buffer(1)]], \
+    device float* scores [[buffer(3)]], \
+    constant Gemma4AttnV2Args& args [[buffer(5)]], \
+    constant uint4* row_meta [[buffer(6)]], \
+    uint3 tg [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]]) \
+{ \
+    threadgroup float4 q_tg[1024]; \
+    gemma4_attn_rows_v2_scores_fused<HD, PAIRS>( \
+        query, keys, scores, args, row_meta, q_tg, tg, lane); \
+}
+
+GEMMA4_ATTN_V2_SCORES_KERNEL(gemma4_attn_rows_v2_scores_hd256, 256u, 16u)
+GEMMA4_ATTN_V2_SCORES_KERNEL(gemma4_attn_rows_v2_scores_hd512, 512u, 8u)
+
+// Established score loop nest (attention_decode_scores_f32), widened over the row
+// metadata: grid (head, row, block).  Do not "simplify" this nest — see that kernel.
+kernel void gemma4_attn_rows_v2_scores_nest(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(3)]],
+    constant Gemma4AttnV2Args& args [[buffer(5)]],
+    constant uint4* row_meta [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    uint head = tg.x;
+    uint row = tg.y;
+    if (head >= args.n_heads || row >= args.rows) return;
+    uint4 meta = row_meta[row];
+    uint position_count = meta.y;
+    uint head_dim = args.head_dim;
+    uint kv_head = head / args.group;
+    uint q_base = row * args.n_heads * head_dim + head * head_dim;
+    uint position_stride = args.position_stride;
+    uint kv_base = args.kv_base_offset + kv_head * args.kv_head_stride +
+                   meta.x * position_stride;
+    uint score_base = meta.z + head * position_count;
+    uint stride = 32u * args.score_blocks;
+    float scale = args.scale;
+
+    for (uint p = lane + tg.z * 32u; p < position_count; p += stride) {
+        uint k_base = kv_base + p * position_stride;
+        float s = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * keys[k_base + d];
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+    }
+}
+
+// Row max, exp in place, denominator: one 32-lane simdgroup per (head,row) with the
+// SAME lane->position striding as attention_decode_f32_rows phase 2.
+kernel void gemma4_attn_rows_v2_softmax(
+    device float* scores [[buffer(3)]],
+    constant Gemma4AttnV2Args& args [[buffer(5)]],
+    constant uint4* row_meta [[buffer(6)]],
+    device float* denom_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    uint head = tg.x;
+    uint row = tg.y;
+    if (head >= args.n_heads || row >= args.rows) return;
+    uint4 meta = row_meta[row];
+    uint position_count = meta.y;
+    uint score_base = meta.z + head * position_count;
+
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32) {
+        local_max = max(local_max, scores[score_base + p]);
+    }
+    float max_score = simd_max(local_max);
+
+    float local_sum = 0.0;
+    for (uint p = lane; p < position_count; p += 32) {
+        float e = exp(scores[score_base + p] - max_score);
+        scores[score_base + p] = e;
+        local_sum += e;
+    }
+    float denom = simd_sum(local_sum);
+    if (lane == 0) {
+        denom_out[row * args.n_heads + head] = denom;
+    }
+}
+
+// Fused context: PAIRS pairs per threadgroup share one V walk over the union window;
+// each lane owns ONE output dim (grid (kv_head, pair_chunk, 32-dim block)).  The
+// per-element statement is the established nest's VERBATIM -- `acc += scores[p] * inv
+// * values[p]` with `inv = 1.0 / denom` taken here and consumed in exactly ONE textual
+// place -- so the compiler makes the same contraction and reciprocal choices.  Pairs
+// past pair_count alias pair 0 (same addressing, same reciprocal, never stored) so no
+// select ever touches `inv`.  Bit-exact on every production geometry; slower than the
+// nest on the production shape (fewer threadgroups), kept as the exact starting point
+// for a latency-hiding revision.
+template <uint HEAD_DIM, uint PAIRS>
+inline void gemma4_attn_rows_v2_context_fused(
+    device const float* values,
+    device const float* scores,
+    device float* output,
+    constant Gemma4AttnV2Args& args,
+    constant uint4* row_meta,
+    device const float* denom_in,
+    uint3 tg,
+    uint lane)
+{
+    const uint kv_head = tg.x;
+    const uint rows = args.rows;
+    const uint group = args.group;
+    const uint total_pairs = group * rows;
+    const uint pair_begin = tg.y * PAIRS;
+    if (pair_begin >= total_pairs) return;
+    const uint pair_count = min(PAIRS, total_pairs - pair_begin);
+    const uint d0 = tg.z * 32u + lane;
+    if (d0 >= HEAD_DIM) return;
+    const uint row_stride = args.n_heads * HEAD_DIM;
+
+    uint ws[PAIRS];
+    uint cnt[PAIRS];
+    uint sbase[PAIRS];
+    float inv[PAIRS];
+    float acc[PAIRS];
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        acc[j] = 0.0f;
+        const uint pair = pair_begin + (j < pair_count ? j : 0u);
+        const uint head_local = pair / rows;
+        const uint row = pair - head_local * rows;
+        const uint head = kv_head * group + head_local;
+        const uint4 meta = row_meta[row];
+        ws[j] = meta.x;
+        cnt[j] = meta.y;
+        sbase[j] = meta.z + head * meta.y;
+        inv[j] = 1.0 / denom_in[row * args.n_heads + head];
+    }
+    device const float* vbase =
+        values + args.kv_base_offset + kv_head * args.kv_head_stride + d0;
+    const uint position_stride = args.position_stride;
+
+    for (uint p = args.union_start; p < args.union_end; ++p) {
+        const float v = vbase[p * position_stride];
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < PAIRS; ++j) {
+            const uint rel = p - ws[j];
+            if (p >= ws[j] && rel < cnt[j]) {
+                acc[j] += scores[sbase[j] + rel] * inv[j] * v;
+            }
+        }
+    }
+
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        if (j < pair_count) {
+            const uint pair = pair_begin + j;
+            const uint head_local = pair / rows;
+            const uint row = pair - head_local * rows;
+            const uint head = kv_head * group + head_local;
+            output[row * row_stride + head * HEAD_DIM + d0] = acc[j];
+        }
+    }
+}
+
+#define GEMMA4_ATTN_V2_CONTEXT_KERNEL(NAME, HD, PAIRS) \
+kernel void NAME( \
+    device const float* values [[buffer(2)]], \
+    device const float* scores [[buffer(3)]], \
+    device float* output [[buffer(4)]], \
+    constant Gemma4AttnV2Args& args [[buffer(5)]], \
+    constant uint4* row_meta [[buffer(6)]], \
+    device const float* denom_in [[buffer(7)]], \
+    uint3 tg [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]]) \
+{ \
+    gemma4_attn_rows_v2_context_fused<HD, PAIRS>( \
+        values, scores, output, args, row_meta, denom_in, tg, lane); \
+}
+
+GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd256_p8, 256u, 8u)
+GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd256_p16, 256u, 16u)
+GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd512_p8, 512u, 8u)
+GEMMA4_ATTN_V2_CONTEXT_KERNEL(gemma4_attn_rows_v2_context_hd512_p16, 512u, 16u)
+
+// Established context loop nest (attention_decode_context_f32), widened over the row
+// metadata: grid (head, row, dim_block).  Reciprocal taken HERE from the denominator.
+kernel void gemma4_attn_rows_v2_context_nest(
+    device const float* values [[buffer(2)]],
+    device const float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant Gemma4AttnV2Args& args [[buffer(5)]],
+    constant uint4* row_meta [[buffer(6)]],
+    device const float* denom_in [[buffer(7)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    uint head = tg.x;
+    uint row = tg.y;
+    if (head >= args.n_heads || row >= args.rows) return;
+    uint4 meta = row_meta[row];
+    uint position_count = meta.y;
+    uint head_dim = args.head_dim;
+    uint kv_head = head / args.group;
+    uint q_base = row * args.n_heads * head_dim + head * head_dim;
+    uint position_stride = args.position_stride;
+    uint kv_base = args.kv_base_offset + kv_head * args.kv_head_stride +
+                   meta.x * position_stride;
+    uint score_base = meta.z + head * position_count;
+    float inv = 1.0 / denom_in[row * args.n_heads + head];
+    uint stride = 32u * args.dim_blocks;
+
+    for (uint d = lane + tg.z * 32u; d < head_dim; d += stride) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            acc += scores[score_base + p] * inv * values[kv_base + p * position_stride + d];
+        }
+        output[q_base + d] = acc;
+    }
+}
+
 // f16-KV variant of attention_decode_f32: identical math, K/V read as half and converted
 // per element (the scores/output stay f32).
 kernel void attention_decode_kv16(
@@ -11889,6 +12236,22 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
+            let mut gemma4_attn_rows_v2_pipelines = std::collections::HashMap::new();
+            for name in gemma4_attn_rows_v2_kernel_names() {
+                match elementwise_library
+                    .get_function(name, None)
+                    .ok()
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    }) {
+                    Some(pipeline) => {
+                        gemma4_attn_rows_v2_pipelines.insert(name, pipeline);
+                    }
+                    None => eprintln!("[metal] gemma4 attention V2 kernel {name} unavailable"),
+                }
+            }
             let attention_decode_scores_function = elementwise_library
                 .get_function("attention_decode_scores_f32", None)
                 .ok()?;
@@ -12798,6 +13161,7 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
                 attention_decode_f32_rows_pipeline,
+                gemma4_attn_rows_v2_pipelines,
                 attention_decode_scores_pipeline,
                 attention_decode_softmax_pipeline,
                 attention_decode_context_pipeline,
@@ -14179,6 +14543,178 @@ fn gemma4_dense_attention_rows_policy(requested: bool, encoded: bool) -> Option<
         (true, true) => Some(true),
         (true, false) => None,
     }
+}
+
+
+/// Opt-in latency-hiding V2 of the dense Gemma verifier's row-aware attention
+/// (`CAMELID_GEMMA4_DENSE_ATTN_ROWS_V2=1`).  Same floating-point universe as the
+/// `(head,row)` kernel (see the shader note on `gemma4_attn_rows_v2_scores_fused`);
+/// only the dispatch grids and the memory traffic change.  Like the parent selector
+/// it is receipt-bearing and therefore fail-closed once requested.
+#[cfg(target_os = "macos")]
+fn gemma4_dense_attention_rows_v2_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS_V2")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Kernel-form override for the V2 attention (`CAMELID_GEMMA4_DENSE_ATTN_ROWS_V2_VARIANT=
+/// <scores>,<context>`, see [`Gemma4DenseAttentionRowsV2Variant`]).  An unparsable value
+/// keeps the qualified default and says so once.
+#[cfg(target_os = "macos")]
+fn gemma4_dense_attention_rows_v2_variant() -> Gemma4DenseAttentionRowsV2Variant {
+    static VARIANT: std::sync::OnceLock<Gemma4DenseAttentionRowsV2Variant> =
+        std::sync::OnceLock::new();
+    *VARIANT.get_or_init(|| {
+        let Ok(value) = std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS_V2_VARIANT") else {
+            return Gemma4DenseAttentionRowsV2Variant::DEFAULT;
+        };
+        match Gemma4DenseAttentionRowsV2Variant::parse(&value) {
+            Some(variant) => variant,
+            None => {
+                eprintln!(
+                    "[metal] CAMELID_GEMMA4_DENSE_ATTN_ROWS_V2_VARIANT={value:?} is not \
+                     <scores 0..={}>,<context 0..={}>; keeping the default {}",
+                    Gemma4DenseAttentionRowsV2Variant::SCORES_FORMS - 1,
+                    Gemma4DenseAttentionRowsV2Variant::CONTEXT_FORMS - 1,
+                    Gemma4DenseAttentionRowsV2Variant::DEFAULT.label(),
+                );
+                Gemma4DenseAttentionRowsV2Variant::DEFAULT
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_SCORES_HD256: &str = "gemma4_attn_rows_v2_scores_hd256";
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_SCORES_HD512: &str = "gemma4_attn_rows_v2_scores_hd512";
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_CONTEXT_HD256: [&str; 2] = [
+    "gemma4_attn_rows_v2_context_hd256_p8",
+    "gemma4_attn_rows_v2_context_hd256_p16",
+];
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_CONTEXT_HD512: [&str; 2] = [
+    "gemma4_attn_rows_v2_context_hd512_p8",
+    "gemma4_attn_rows_v2_context_hd512_p16",
+];
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_SCORES_NEST: &str = "gemma4_attn_rows_v2_scores_nest";
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_SOFTMAX: &str = "gemma4_attn_rows_v2_softmax";
+#[cfg(target_os = "macos")]
+const GEMMA4_ATTN_V2_CONTEXT_NEST: &str = "gemma4_attn_rows_v2_context_nest";
+
+/// Every V2 attention kernel the elementwise library is expected to provide.
+#[cfg(target_os = "macos")]
+fn gemma4_attn_rows_v2_kernel_names() -> impl Iterator<Item = &'static str> {
+    [GEMMA4_ATTN_V2_SCORES_HD256, GEMMA4_ATTN_V2_SCORES_HD512]
+        .into_iter()
+        .chain(GEMMA4_ATTN_V2_CONTEXT_HD256)
+        .chain(GEMMA4_ATTN_V2_CONTEXT_HD512)
+        .chain([
+            GEMMA4_ATTN_V2_SCORES_NEST,
+            GEMMA4_ATTN_V2_SOFTMAX,
+            GEMMA4_ATTN_V2_CONTEXT_NEST,
+        ])
+}
+
+/// Which kernel forms the V2 attention binds.  Every selectable form is proven
+/// bit-exact against the established `(head,row)` kernel on every production geometry
+/// by `metal_gemma4_dense_attention_rows_v2_variant_matrix`.
+/// `scores`: 0 = the fused `(kv_head, block, chunk)` kernel (sequential scalar chain,
+/// 16 pairs per threadgroup at head_dim 256 / 8 at 512), 1 = the established nest.
+/// `context`: 0 = the established nest, 1 = the fused `(kv_head, chunk, dim_block)`
+/// kernel with 8 pairs per threadgroup, 2 = the same with 16 pairs.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Gemma4DenseAttentionRowsV2Variant {
+    scores: u8,
+    context: u8,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4DenseAttentionRowsV2Variant {
+    const SCORES_FORMS: u8 = 2;
+    const CONTEXT_FORMS: u8 = 3;
+    const NEST: Self = Self {
+        scores: 1,
+        context: 0,
+    };
+    /// The form production binds when only `CAMELID_GEMMA4_DENSE_ATTN_ROWS_V2=1` is set:
+    /// fused scores + nest context, the fastest exact form on the production-shape
+    /// receipt (0.033 ms/position at K=8 vs 0.137 for the established kernel).
+    /// Must be proven by `metal_gemma4_dense_attention_rows_v2_is_bit_exact_and_causal`.
+    const DEFAULT: Self = Self {
+        scores: 0,
+        context: 0,
+    };
+
+    fn all() -> impl Iterator<Item = Self> {
+        (0..Self::SCORES_FORMS).flat_map(|scores| {
+            (0..Self::CONTEXT_FORMS).map(move |context| Self { scores, context })
+        })
+    }
+
+    fn label(self) -> String {
+        format!("s{}c{}", self.scores, self.context)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let (scores, context) = value.trim().split_once(',')?;
+        let scores = scores.trim().parse::<u8>().ok()?;
+        let context = context.trim().parse::<u8>().ok()?;
+        (scores < Self::SCORES_FORMS && context < Self::CONTEXT_FORMS)
+            .then_some(Self { scores, context })
+    }
+
+    /// `(kernel name, pairs per threadgroup)`; pairs = 0 marks the nest kernel.
+    fn scores_kernel(self, head_dim: usize) -> Option<(&'static str, usize)> {
+        match (self.scores, head_dim) {
+            (1, _) => Some((GEMMA4_ATTN_V2_SCORES_NEST, 0)),
+            (0, 256) => Some((GEMMA4_ATTN_V2_SCORES_HD256, 16)),
+            (0, 512) => Some((GEMMA4_ATTN_V2_SCORES_HD512, 8)),
+            _ => None,
+        }
+    }
+
+    /// `(kernel name, pairs per threadgroup, output dims per threadgroup)`; pairs = 0
+    /// marks the nest kernel.  Every context kernel runs 32 lanes over 32 dims.
+    fn context_kernel(self, head_dim: usize) -> Option<(&'static str, usize, usize)> {
+        let (index, pairs) = match self.context {
+            0 => return Some((GEMMA4_ATTN_V2_CONTEXT_NEST, 0, 32)),
+            1 => (0, 8),
+            2 => (1, 16),
+            _ => return None,
+        };
+        match head_dim {
+            256 => Some((GEMMA4_ATTN_V2_CONTEXT_HD256[index], pairs, 32)),
+            512 => Some((GEMMA4_ATTN_V2_CONTEXT_HD512[index], pairs, 32)),
+            _ => None,
+        }
+    }
+}
+
+/// Host mirror of the shader's `Gemma4AttnV2Args` (bound with `set_bytes`).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Gemma4AttnV2Args {
+    n_heads: u32,
+    head_dim: u32,
+    rows: u32,
+    group: u32,
+    scale: f32,
+    position_stride: u32,
+    kv_head_stride: u32,
+    kv_base_offset: u32,
+    union_start: u32,
+    union_end: u32,
+    score_blocks: u32,
+    dim_blocks: u32,
 }
 
 /// One row's explicit visibility contract for dense speculative attention.
@@ -16815,6 +17351,7 @@ struct Gemma4Dense12bVerifierScratch {
     q4_terms: Buffer,
     scores: Buffer,
     denom: Buffer,
+    rows_denom: Buffer,
 }
 
 #[cfg(target_os = "macos")]
@@ -16893,6 +17430,7 @@ impl Gemma4Dense12bVerifierScratch {
             q4_terms,
             scores: f32s(16usize.checked_mul(max_positions)?)?,
             denom: f32s(16)?,
+            rows_denom: f32s(256)?,
         })
     }
 }
@@ -17620,26 +18158,50 @@ impl Gemma4ResidentModel {
             // checks the exact byte requirement before binding it. An explicit selector
             // is receipt-bearing and therefore fail-closed; only the default-off route
             // may retain the immutable per-row scalar blocks and 3*K dispatches.
-            let attention_rows_requested = gemma4_dense_attention_rows_enabled();
+            let attention_rows_v2_requested = gemma4_dense_attention_rows_v2_enabled();
+            let attention_rows_requested =
+                gemma4_dense_attention_rows_enabled() || attention_rows_v2_requested;
             let attention_rows_encoded = attention_rows_requested
-                && encode_gemma4_dense_attention_rows_f32(
-                    encoder,
-                    kernel,
-                    &mut keep,
-                    &scratch.q_normed,
-                    cache_k,
-                    cache_v,
-                    &scratch.q4_terms,
-                    &scratch.context,
-                    HEADS,
-                    layer.n_kv_heads,
-                    layer.head_dim,
-                    self.max_positions,
-                    base_position,
-                    columns,
-                    sliding.then_some(SLIDING_WINDOW),
-                    1.0,
-                );
+                && if attention_rows_v2_requested {
+                    encode_gemma4_dense_attention_rows_v2_f32(
+                        encoder,
+                        kernel,
+                        &scratch.q_normed,
+                        cache_k,
+                        cache_v,
+                        &scratch.q4_terms,
+                        &scratch.rows_denom,
+                        &scratch.context,
+                        HEADS,
+                        layer.n_kv_heads,
+                        layer.head_dim,
+                        self.max_positions,
+                        base_position,
+                        columns,
+                        sliding.then_some(SLIDING_WINDOW),
+                        1.0,
+                        gemma4_dense_attention_rows_v2_variant(),
+                    )
+                } else {
+                    encode_gemma4_dense_attention_rows_f32(
+                        encoder,
+                        kernel,
+                        &mut keep,
+                        &scratch.q_normed,
+                        cache_k,
+                        cache_v,
+                        &scratch.q4_terms,
+                        &scratch.context,
+                        HEADS,
+                        layer.n_kv_heads,
+                        layer.head_dim,
+                        self.max_positions,
+                        base_position,
+                        columns,
+                        sliding.then_some(SLIDING_WINDOW),
+                        1.0,
+                    )
+                };
             let Some(batched_attention) = gemma4_dense_attention_rows_policy(
                 attention_rows_requested,
                 attention_rows_encoded,
@@ -18767,6 +19329,186 @@ fn try_gemma4_dense_attention_rows_for_test(
     read_buffer_f32(&fused_output, &mut fused);
     drop(keep);
     Some((rowwise, fused))
+}
+
+/// Test-only exactness comparator for the V2 dense row-aware attention: the oracle is
+/// the established `(head,row)` kernel (`encode_gemma4_dense_attention_rows_f32`, itself
+/// pinned bit-for-bit to the per-row split-three path), the candidate is the V2
+/// three-dispatch encode with the requested kernel forms.  Both read the same cache in
+/// one command buffer and return `(oracle, candidate)`.
+#[cfg(all(target_os = "macos", test))]
+#[allow(clippy::too_many_arguments)]
+fn try_gemma4_dense_attention_rows_v2_for_test(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_positions: usize,
+    base_position: usize,
+    rows: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    variant: Gemma4DenseAttentionRowsV2Variant,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let q_dim = n_heads.checked_mul(head_dim)?;
+    let cache_elements = n_kv_heads
+        .checked_mul(max_positions)?
+        .checked_mul(head_dim)?;
+    let (_, score_bytes) = gemma4_dense_attention_row_plan(
+        base_position,
+        rows,
+        sliding_window,
+        max_positions,
+        n_heads,
+    )?;
+    if n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+        || query.len() != rows.checked_mul(q_dim)?
+        || keys.len() != cache_elements
+        || values.len() != cache_elements
+    {
+        return None;
+    }
+
+    let kernel = metal_linear_kernel()?;
+    let opts = MTLResourceOptions::StorageModeShared;
+    let buffer = |bytes: usize| kernel.device.new_buffer(bytes.max(4) as u64, opts);
+    let query_buf = buffer(std::mem::size_of_val(query));
+    let keys_buf = buffer(std::mem::size_of_val(keys));
+    let values_buf = buffer(std::mem::size_of_val(values));
+    let oracle_scores = buffer(score_bytes);
+    let candidate_scores = buffer(score_bytes);
+    let candidate_denom = buffer(rows * n_heads * std::mem::size_of::<f32>());
+    let output_bytes = query.len().checked_mul(std::mem::size_of::<f32>())?;
+    let oracle_output = buffer(output_bytes);
+    let candidate_output = buffer(output_bytes);
+    write_buffer_f32(&query_buf, query);
+    write_buffer_f32(&keys_buf, keys);
+    write_buffer_f32(&values_buf, values);
+    let poison = vec![f32::NAN; query.len()];
+    write_buffer_f32(&oracle_output, &poison);
+    write_buffer_f32(&candidate_output, &poison);
+    write_buffer_f32(&candidate_denom, &vec![f32::NAN; rows * n_heads]);
+
+    let command = kernel.queue.new_command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    let mut keep = Vec::with_capacity(2);
+    if !encode_gemma4_dense_attention_rows_f32(
+        encoder,
+        kernel,
+        &mut keep,
+        &query_buf,
+        &keys_buf,
+        &values_buf,
+        &oracle_scores,
+        &oracle_output,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_positions,
+        base_position,
+        rows,
+        sliding_window,
+        scale,
+    ) {
+        encoder.end_encoding();
+        return None;
+    }
+    if !encode_gemma4_dense_attention_rows_v2_f32(
+        encoder,
+        kernel,
+        &query_buf,
+        &keys_buf,
+        &values_buf,
+        &candidate_scores,
+        &candidate_denom,
+        &candidate_output,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_positions,
+        base_position,
+        rows,
+        sliding_window,
+        scale,
+        variant,
+    ) {
+        encoder.end_encoding();
+        return None;
+    }
+    encoder.end_encoding();
+    command.commit();
+    command.wait_until_completed();
+    if command.status() != metal::MTLCommandBufferStatus::Completed {
+        return None;
+    }
+    let mut oracle = vec![0.0f32; query.len()];
+    let mut candidate = vec![0.0f32; query.len()];
+    read_buffer_f32(&oracle_output, &mut oracle);
+    read_buffer_f32(&candidate_output, &mut candidate);
+    drop(keep);
+    Some((oracle, candidate))
+}
+
+/// Adversarial dense-verifier attention fixture: queries with three magnitude bands
+/// (so the row max, the exp tail, and the denominator all see a wide dynamic range),
+/// LCG-noised K/V, a poison marker on every position at or past the candidate end,
+/// and a per-candidate marker so any causal leak between rows changes the output.
+#[cfg(all(target_os = "macos", test))]
+fn gemma4_dense_attention_v2_fixture(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_positions: usize,
+    base_position: usize,
+    rows: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let q_dim = n_heads * head_dim;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ ((base_position as u64) << 20) ^ (rows as u64);
+    let mut noise = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (((state >> 40) & 0xFFFF) as f32 / 65_535.0 - 0.5) * 2.0
+    };
+    let query: Vec<f32> = (0..rows * q_dim)
+        .map(|index| {
+            let row = index / q_dim;
+            let band = match row % 3 {
+                0 => 0.25,
+                1 => 1.0,
+                _ => 4.0,
+            };
+            (((index * 17) % 61) as f32 - 30.0) * 0.03125 * band + noise() * 0.125
+        })
+        .collect();
+    let candidate_end = base_position + rows;
+    let mut keys = vec![0.0f32; n_kv_heads * max_positions * head_dim];
+    let mut values = vec![0.0f32; keys.len()];
+    for kv_head in 0..n_kv_heads {
+        for position in 0..max_positions {
+            let tail_poison = if position >= candidate_end { 128.0 } else { 0.0 };
+            let candidate_marker = if position > base_position {
+                (position - base_position) as f32 * 0.5
+            } else {
+                0.0
+            };
+            for dim in 0..head_dim {
+                let index = (kv_head * max_positions + position) * head_dim + dim;
+                keys[index] = (((index * 13) % 47) as f32 - 23.0) * 0.015625
+                    + noise() * 0.0625
+                    + tail_poison
+                    + candidate_marker;
+                values[index] = (((index * 19) % 53) as f32 - 26.0) * 0.015625
+                    + noise() * 0.0625
+                    - tail_poison
+                    - candidate_marker;
+            }
+        }
+    }
+    (query, keys, values)
 }
 
 #[cfg(target_os = "macos")]
@@ -26064,6 +26806,208 @@ fn encode_gemma4_dense_attention_rows_f32(
         },
     );
     keep.extend([scalars, row_meta]);
+    true
+}
+
+/// Encode all dense Gemma verifier rows through the V2 three-dispatch attention
+/// (scores / softmax / context; see the shader note on `gemma4_attn_rows_v2_scores_fused`).
+/// Same causal row metadata and packed score slab as [`encode_gemma4_dense_attention_rows_f32`],
+/// plus a `rows * n_heads` f32 denominator scratch; every scalar argument is bound with
+/// `set_bytes`, so the encode allocates nothing.  Any geometry, pipeline, or capacity
+/// refusal declines before dispatch for the caller's fail-closed policy.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_dense_attention_rows_v2_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    score_scratch: &Buffer,
+    denom_scratch: &Buffer,
+    out: &Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_positions: usize,
+    base_position: usize,
+    rows: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    variant: Gemma4DenseAttentionRowsV2Variant,
+) -> bool {
+    let Some((scores_name, scores_pairs)) = variant.scores_kernel(head_dim) else {
+        return false;
+    };
+    let Some((context_name, context_pairs, context_span)) = variant.context_kernel(head_dim)
+    else {
+        return false;
+    };
+    let (Some(scores_pipeline), Some(softmax_pipeline), Some(context_pipeline)) = (
+        k.gemma4_attn_rows_v2_pipelines.get(scores_name),
+        k.gemma4_attn_rows_v2_pipelines.get(GEMMA4_ATTN_V2_SOFTMAX),
+        k.gemma4_attn_rows_v2_pipelines.get(context_name),
+    ) else {
+        return false;
+    };
+    let Some(group) = n_heads.checked_div(n_kv_heads) else {
+        return false;
+    };
+    let Some((row_plan, score_bytes)) = gemma4_dense_attention_row_plan(
+        base_position,
+        rows,
+        sliding_window,
+        max_positions,
+        n_heads,
+    ) else {
+        return false;
+    };
+    let Some(q_dim) = n_heads.checked_mul(head_dim) else {
+        return false;
+    };
+    let Some(query_elements) = rows.checked_mul(q_dim) else {
+        return false;
+    };
+    let Some(query_bytes) = query_elements.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(kv_head_stride) = max_positions.checked_mul(head_dim) else {
+        return false;
+    };
+    let Some(cache_elements) = n_kv_heads.checked_mul(kv_head_stride) else {
+        return false;
+    };
+    let Some(cache_bytes) = cache_elements.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(denom_bytes) = rows
+        .checked_mul(n_heads)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(total_pairs) = group.checked_mul(rows) else {
+        return false;
+    };
+    let union_start = row_plan.iter().map(|meta| meta.window_start).min().unwrap_or(0);
+    let union_end = row_plan.iter().map(|meta| meta.visible_end).max().unwrap_or(0);
+    let max_count = row_plan
+        .iter()
+        .map(|meta| meta.position_count as usize)
+        .max()
+        .unwrap_or(0);
+    if n_kv_heads == 0
+        || group == 0
+        || n_heads % n_kv_heads != 0
+        || head_dim == 0
+        || head_dim % 4 != 0
+        || (context_pairs != 0 && head_dim % context_span != 0)
+        || union_end <= union_start
+        || max_count == 0
+        || !scale.is_finite()
+        || query.length() < query_bytes as u64
+        || out.length() < query_bytes as u64
+        || keys.length() < cache_bytes as u64
+        || values.length() < cache_bytes as u64
+        || score_scratch.length() < score_bytes as u64
+        || denom_scratch.length() < denom_bytes as u64
+        || u32::try_from(n_heads).is_err()
+        || u32::try_from(head_dim).is_err()
+        || u32::try_from(rows).is_err()
+        || u32::try_from(group).is_err()
+        || u32::try_from(kv_head_stride).is_err()
+        || u32::try_from(query_elements).is_err()
+        || u32::try_from(cache_elements).is_err()
+    {
+        return false;
+    }
+    let score_blocks = max_count.div_ceil(32).max(1);
+    let dim_blocks = head_dim.div_ceil(32).max(1);
+    let args = Gemma4AttnV2Args {
+        n_heads: n_heads as u32,
+        head_dim: head_dim as u32,
+        rows: rows as u32,
+        group: group as u32,
+        scale,
+        position_stride: head_dim as u32,
+        kv_head_stride: kv_head_stride as u32,
+        kv_base_offset: 0,
+        union_start,
+        union_end,
+        score_blocks: score_blocks as u32,
+        dim_blocks: dim_blocks as u32,
+    };
+    let tg32 = metal::MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    let bind_args = |e: &metal::ComputeCommandEncoderRef| {
+        e.set_bytes(
+            5,
+            std::mem::size_of::<Gemma4AttnV2Args>() as u64,
+            (&args as *const Gemma4AttnV2Args).cast::<std::ffi::c_void>(),
+        );
+        e.set_bytes(
+            6,
+            (row_plan.len() * std::mem::size_of::<Gemma4DenseAttentionRowMeta>()) as u64,
+            row_plan.as_ptr().cast::<std::ffi::c_void>(),
+        );
+    };
+
+    e.set_compute_pipeline_state(scores_pipeline);
+    e.set_buffer(0, Some(query), 0);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(3, Some(score_scratch), 0);
+    bind_args(e);
+    let scores_grid = if scores_pairs == 0 {
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: rows as u64,
+            depth: score_blocks as u64,
+        }
+    } else {
+        metal::MTLSize {
+            width: n_kv_heads as u64,
+            height: ((union_end - union_start) as usize).div_ceil(32) as u64,
+            depth: total_pairs.div_ceil(scores_pairs) as u64,
+        }
+    };
+    e.dispatch_thread_groups(scores_grid, tg32);
+
+    e.set_compute_pipeline_state(softmax_pipeline);
+    e.set_buffer(3, Some(score_scratch), 0);
+    bind_args(e);
+    e.set_buffer(7, Some(denom_scratch), 0);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: rows as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+
+    e.set_compute_pipeline_state(context_pipeline);
+    e.set_buffer(2, Some(values), 0);
+    e.set_buffer(3, Some(score_scratch), 0);
+    e.set_buffer(4, Some(out), 0);
+    bind_args(e);
+    e.set_buffer(7, Some(denom_scratch), 0);
+    let context_grid = if context_pairs == 0 {
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: rows as u64,
+            depth: dim_blocks as u64,
+        }
+    } else {
+        metal::MTLSize {
+            width: n_kv_heads as u64,
+            height: total_pairs.div_ceil(context_pairs) as u64,
+            depth: (head_dim / context_span) as u64,
+        }
+    };
+    e.dispatch_thread_groups(context_grid, tg32);
     true
 }
 
@@ -50490,6 +51434,313 @@ mod tests {
                     expected.to_bits(),
                 );
             }
+        }
+    }
+
+
+    /// Production 12B geometries for the V2 dense attention comparators:
+    /// (label, heads, kv_heads, head_dim, max_positions, base_position, rows, window).
+    /// Sliding cases straddle the window edge (base 1020) and sit fully inside it
+    /// (base 1500); global cases grow past 1k so every lane stride is exercised.
+    #[cfg(target_os = "macos")]
+    fn gemma4_dense_attention_v2_cases() -> Vec<(
+        &'static str,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        Option<usize>,
+    )> {
+        vec![
+            ("k8-sliding-short", 16, 8, 256, 2_048, 60, 8, Some(1_024)),
+            ("k8-sliding-edge", 16, 8, 256, 2_048, 1_020, 8, Some(1_024)),
+            ("k8-sliding-full", 16, 8, 256, 2_048, 1_500, 8, Some(1_024)),
+            ("k8-global-short", 16, 1, 512, 2_048, 60, 8, None),
+            ("k8-global-1k", 16, 1, 512, 2_048, 1_030, 8, None),
+            ("k16-sliding-edge", 16, 8, 256, 2_048, 1_017, 16, Some(1_024)),
+            ("k16-global-1k", 16, 1, 512, 2_048, 1_000, 16, None),
+            ("k4-sliding-full", 16, 8, 256, 2_048, 1_300, 4, Some(1_024)),
+            ("k2-global-short", 16, 1, 512, 2_048, 33, 2, None),
+            ("k1-sliding-edge", 16, 8, 256, 2_048, 1_023, 1, Some(1_024)),
+            ("k1-global-1k", 16, 1, 512, 2_048, 1_100, 1, None),
+        ]
+    }
+
+    /// Runs one V2 variant against the established `(head,row)` kernel on every
+    /// production case; returns the first mismatch description, if any.
+    #[cfg(target_os = "macos")]
+    fn gemma4_dense_attention_v2_mismatch(
+        variant: Gemma4DenseAttentionRowsV2Variant,
+    ) -> Option<String> {
+        for (label, n_heads, n_kv_heads, head_dim, max_positions, base, rows, window) in
+            gemma4_dense_attention_v2_cases()
+        {
+            let (query, keys, values) = gemma4_dense_attention_v2_fixture(
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_positions,
+                base,
+                rows,
+            );
+            let Some((oracle, candidate)) = try_gemma4_dense_attention_rows_v2_for_test(
+                &query,
+                &keys,
+                &values,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_positions,
+                base,
+                rows,
+                window,
+                1.0,
+                variant,
+            ) else {
+                return Some(format!("{label}: comparator declined"));
+            };
+            if candidate.len() != oracle.len() {
+                return Some(format!("{label}: length {} != {}", candidate.len(), oracle.len()));
+            }
+            let mismatches = oracle
+                .iter()
+                .zip(&candidate)
+                .filter(|(expected, actual)| expected.to_bits() != actual.to_bits())
+                .count();
+            if mismatches != 0 {
+                let (index, (expected, actual)) = oracle
+                    .iter()
+                    .zip(&candidate)
+                    .enumerate()
+                    .find(|(_, (expected, actual))| expected.to_bits() != actual.to_bits())
+                    .expect("a mismatch exists");
+                return Some(format!(
+                    "{label}: {mismatches}/{} elements differ; first at {index}: v2={actual} ({:#010x}) != rows={expected} ({:#010x})",
+                    oracle.len(),
+                    actual.to_bits(),
+                    expected.to_bits(),
+                ));
+            }
+        }
+        None
+    }
+
+    /// The V2 forms production may bind (the default and the always-available nest)
+    /// must reproduce the established `(head,row)` kernel BIT-FOR-BIT on every
+    /// production geometry, including the causal edges.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_dense_attention_rows_v2_is_bit_exact_and_causal() {
+        if !detect_metal_device().available {
+            return;
+        }
+        for variant in [
+            Gemma4DenseAttentionRowsV2Variant::DEFAULT,
+            Gemma4DenseAttentionRowsV2Variant::NEST,
+        ] {
+            if let Some(mismatch) = gemma4_dense_attention_v2_mismatch(variant) {
+                panic!("V2 variant {}: {mismatch}", variant.label());
+            }
+        }
+    }
+
+    /// Every selectable (scores, context) form must reproduce the established kernel's
+    /// codegen bit-for-bit.  The elementwise library compiles with fast-math, so this
+    /// is a property of each kernel's textual form and is re-proven on every build;
+    /// prints one line per form.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_dense_attention_rows_v2_variant_matrix() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let mut exact = Vec::new();
+        let mut failed = Vec::new();
+        for variant in Gemma4DenseAttentionRowsV2Variant::all() {
+            match gemma4_dense_attention_v2_mismatch(variant) {
+                None => {
+                    println!("[attn-v2-matrix] {} EXACT", variant.label());
+                    exact.push(variant.label());
+                }
+                Some(mismatch) => {
+                    println!("[attn-v2-matrix] {} MISMATCH {mismatch}", variant.label());
+                    failed.push(format!("{}: {mismatch}", variant.label()));
+                }
+            }
+        }
+        println!("[attn-v2-matrix] exact forms: {}", exact.join(" "));
+        assert!(failed.is_empty(), "non-exact V2 forms: {}", failed.join("; "));
+    }
+
+    /// Production-shape timing receipt: one verifier round of attention (40 sliding
+    /// layers over 8 KV heads x 256 dims with a 1024 window plus 8 global layers over
+    /// 1 KV head x 512 dims) at K=8 across context depths, for the established
+    /// `(head,row)` kernel and the requested V2 forms
+    /// (`CAMELID_ATTN_V2_RECEIPT_VARIANTS="s,c;s,c;..."`, default: default + nest).
+    /// Prints median GPU microseconds per round and the per-position slope.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn metal_gemma4_dense_attention_rows_v2_production_receipt() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal kernel library");
+        const HEADS: usize = 16;
+        const MAX_POSITIONS: usize = 2_048;
+        const SLIDING_SETS: usize = 8;
+        const GLOBAL_SETS: usize = 2;
+        let opts = MTLResourceOptions::StorageModeShared;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut fill = |buffer: &Buffer| {
+            let elements = buffer.length() as usize / 4;
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), elements) };
+            for value in slice.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *value = ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.5;
+            }
+        };
+        let cache = |elements: usize| kernel.device.new_buffer((elements * 4) as u64, opts);
+        let sliding_caches: Vec<(Buffer, Buffer)> = (0..SLIDING_SETS)
+            .map(|_| {
+                let k = cache(8 * MAX_POSITIONS * 256);
+                let v = cache(8 * MAX_POSITIONS * 256);
+                fill(&k);
+                fill(&v);
+                (k, v)
+            })
+            .collect();
+        let global_caches: Vec<(Buffer, Buffer)> = (0..GLOBAL_SETS)
+            .map(|_| {
+                let k = cache(MAX_POSITIONS * 512);
+                let v = cache(MAX_POSITIONS * 512);
+                fill(&k);
+                fill(&v);
+                (k, v)
+            })
+            .collect();
+        let query = cache(16 * HEADS * 512);
+        fill(&query);
+        let out = cache(16 * HEADS * 512);
+        let scores = cache(16 * HEADS * MAX_POSITIONS);
+        let denom = cache(16 * HEADS);
+
+        let variants: Vec<Option<Gemma4DenseAttentionRowsV2Variant>> = {
+            let mut list = vec![None];
+            match std::env::var("CAMELID_ATTN_V2_RECEIPT_VARIANTS") {
+                Ok(spec) => {
+                    for item in spec.split(';') {
+                        list.push(Some(
+                            Gemma4DenseAttentionRowsV2Variant::parse(item)
+                                .unwrap_or_else(|| panic!("bad variant {item:?}")),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    list.push(Some(Gemma4DenseAttentionRowsV2Variant::DEFAULT));
+                    if Gemma4DenseAttentionRowsV2Variant::DEFAULT
+                        != Gemma4DenseAttentionRowsV2Variant::NEST
+                    {
+                        list.push(Some(Gemma4DenseAttentionRowsV2Variant::NEST));
+                    }
+                }
+            }
+            list
+        };
+        let rows: usize = std::env::var("CAMELID_ATTN_V2_RECEIPT_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let depths = [128usize, 512, 1_024, 1_536, 2_040 - rows];
+
+        for variant in &variants {
+            let label = variant.map_or_else(|| "rows-v1".to_string(), |v| format!("v2-{}", v.label()));
+            let mut per_depth = Vec::new();
+            for &base in &depths {
+                let mut samples = Vec::new();
+                for _ in 0..5 {
+                    let command = kernel.queue.new_command_buffer();
+                    let encoder = command.new_compute_command_encoder();
+                    let mut keep = Vec::new();
+                    for layer in 0..48usize {
+                        let sliding = layer % 6 != 5;
+                        let (k, v, n_kv_heads, head_dim, window) = if sliding {
+                            let (k, v) = &sliding_caches[layer % SLIDING_SETS];
+                            (k, v, 8, 256, Some(1_024))
+                        } else {
+                            let (k, v) = &global_caches[(layer / 6) % GLOBAL_SETS];
+                            (k, v, 1, 512, None)
+                        };
+                        let encoded = match variant {
+                            None => encode_gemma4_dense_attention_rows_f32(
+                                encoder,
+                                kernel,
+                                &mut keep,
+                                &query,
+                                k,
+                                v,
+                                &scores,
+                                &out,
+                                HEADS,
+                                n_kv_heads,
+                                head_dim,
+                                MAX_POSITIONS,
+                                base,
+                                rows,
+                                window,
+                                1.0,
+                            ),
+                            Some(variant) => encode_gemma4_dense_attention_rows_v2_f32(
+                                encoder,
+                                kernel,
+                                &query,
+                                k,
+                                v,
+                                &scores,
+                                &denom,
+                                &out,
+                                HEADS,
+                                n_kv_heads,
+                                head_dim,
+                                MAX_POSITIONS,
+                                base,
+                                rows,
+                                window,
+                                1.0,
+                                *variant,
+                            ),
+                        };
+                        assert!(encoded, "{label}: layer {layer} declined at base {base}");
+                    }
+                    encoder.end_encoding();
+                    command.commit();
+                    command.wait_until_completed();
+                    assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+                    let (gpu_us, _) = command_buffer_gpu_times_us(&command.to_owned());
+                    samples.push(gpu_us);
+                    drop(keep);
+                }
+                samples.sort_unstable();
+                let median = samples[samples.len() / 2];
+                println!(
+                    "[attn-v2-receipt] {label} rows={rows} base={base} gpu_us median={median} min={} max={}",
+                    samples[0],
+                    samples[samples.len() - 1]
+                );
+                per_depth.push((base, median));
+            }
+            let (b0, t0) = per_depth[0];
+            let (b1, t1) = per_depth[2];
+            println!(
+                "[attn-v2-receipt] {label} rows={rows} slope({b0}->{b1}) = {:.4} ms/position, intercept ~{:.2} ms",
+                (t1 as f64 - t0 as f64) / 1_000.0 / (b1 - b0) as f64,
+                (t0 as f64 - (t1 as f64 - t0 as f64) * b0 as f64 / (b1 - b0) as f64) / 1_000.0
+            );
         }
     }
 
