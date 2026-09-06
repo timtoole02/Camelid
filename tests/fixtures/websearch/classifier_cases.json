@@ -166,5 +166,23 @@
     "needed": true,
     "has_query": true,
     "url_count": 0
+  },
+  {
+    "prompt": "What is the weather in Tokyo?",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Give me the weather forecast for the weekend.",
+    "needed": true,
+    "has_query": true,
+    "url_count": 0
+  },
+  {
+    "prompt": "Summarize the revenue forecast for next year from this spreadsheet.",
+    "needed": false,
+    "has_query": false,
+    "url_count": 0
   }
 ]

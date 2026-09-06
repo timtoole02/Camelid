@@ -1178,7 +1178,48 @@ enum AgentAction {
         shell_timeout: u64,
         #[arg(long)]
         models_dir: Option<PathBuf>,
+        /// Write a secret-safe, versioned benchmark trace after the agent loop
+        /// reaches a typed terminal state. The path must not already exist.
+        #[arg(long)]
+        benchmark_events: Option<PathBuf>,
     },
+}
+
+#[cfg(test)]
+mod agent_command_tests {
+    use super::*;
+
+    #[test]
+    fn agent_exec_parses_a_benchmark_event_destination() {
+        std::thread::Builder::new()
+            .name("agent-cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "camelid",
+                    "agent",
+                    "exec",
+                    "fix the boundary",
+                    "--model",
+                    "model.gguf",
+                    "--benchmark-events",
+                    "trace.json",
+                ])
+                .unwrap();
+                match cli.command {
+                    Some(Command::Agent {
+                        action:
+                            AgentAction::Exec {
+                                benchmark_events, ..
+                            },
+                    }) => assert_eq!(benchmark_events, Some(PathBuf::from("trace.json"))),
+                    other => panic!("expected agent exec, got {other:?}"),
+                }
+            })
+            .expect("spawn agent CLI parse test")
+            .join()
+            .expect("agent CLI parse test panicked");
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2165,7 +2206,11 @@ enum Command {
         #[arg(long = "gpu", value_enum, default_value_t = GpuMode::Auto, env = "CAMELID_GPU")]
         gpu: GpuMode,
         /// KV cache quantization format: "f16" (default, unquantized), "q8_0"
-        /// (50% memory savings), or "q4_0" (75% memory savings).
+        /// (50% memory savings), "q4_0" (75% memory savings), or "fp8_e4m3" /
+        /// "fp8_e5m2" (same 50% savings as q8_0, trading uniform accuracy for
+        /// outlier headroom — see docs/kv-cache-fp8.md). CPU lanes only: the
+        /// resident CUDA decoder honours f16 and q8_0, and runs every other
+        /// format's KV as f16 on the GPU.
         #[arg(long, env = "CAMELID_KV_QUANT", default_value_t = KvCacheQuantization::F16)]
         kv_quant: KvCacheQuantization,
         #[command(flatten)]
@@ -3298,6 +3343,17 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
+    /// Quantize a GGUF model file to Q8_0, Q4_0, or Q4_K_M.
+    Quantize {
+        /// Source input GGUF model file.
+        input: PathBuf,
+        /// Target output GGUF model file.
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+        /// Target quantization format: q8_0, q4_0, or q4_k_m (default: q4_k_m).
+        #[arg(long = "type", default_value = "q4_k_m")]
+        quant_type: String,
+    },
 }
 
 /// Counts reported by the CUDA Gemma 4 development benchmark.
@@ -3999,6 +4055,7 @@ async fn main() -> anyhow::Result<()> {
                 plain,
                 models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
                 exec_goal: None,
+                benchmark_events: None,
                 agent,
                 workdir,
                 max_steps,
@@ -6351,6 +6408,7 @@ async fn main() -> anyhow::Result<()> {
                 shell_sandbox,
                 shell_timeout,
                 models_dir,
+                benchmark_events,
             } => {
                 // The goal may come from stdin so a caller can pipe a long or
                 // generated prompt in without shell quoting.
@@ -6392,6 +6450,7 @@ async fn main() -> anyhow::Result<()> {
                     audit_webhook: None,
                     shell_sandbox,
                     exec_goal: Some(goal),
+                    benchmark_events,
                 })?;
                 std::process::exit(code);
             }
@@ -6596,6 +6655,44 @@ async fn main() -> anyhow::Result<()> {
                 "sealed receipt_id={} -> {}",
                 receipt.receipt_id,
                 out_path.display()
+            );
+        }
+        Command::Quantize {
+            input,
+            output,
+            quant_type,
+        } => {
+            let target = match quant_type.to_lowercase().as_str() {
+                "q8_0" | "q8" => camelid::quantize::TargetQuant::Q8_0,
+                "q4_0" | "q4" => camelid::quantize::TargetQuant::Q4_0,
+                "q4_k_m" | "q4_k" | "q4km" => camelid::quantize::TargetQuant::Q4_K_M,
+                other => anyhow::bail!(
+                    "Unsupported quantization type '{other}'. Supported: q8_0, q4_0, q4_k_m"
+                ),
+            };
+
+            println!(
+                "Quantizing {} -> {} ({:?})...",
+                input.display(),
+                output.display(),
+                target
+            );
+            let receipt = camelid::quantize::quantize_model(&input, &output, target)?;
+            println!("Quantization complete!");
+            println!("  SHA256:            {}", receipt.sha256);
+            println!("  Input bytes:       {}", receipt.input_bytes);
+            println!("  Output bytes:      {}", receipt.output_bytes);
+            println!(
+                "  Compression ratio: {:.2}x",
+                if receipt.compression_ratio > 0.0 {
+                    1.0 / receipt.compression_ratio
+                } else {
+                    1.0
+                }
+            );
+            println!(
+                "  Tensors:           {} quantized / {} total",
+                receipt.quantized_tensors, receipt.tensor_count
             );
         }
     }

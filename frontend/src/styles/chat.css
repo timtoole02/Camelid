@@ -94,8 +94,14 @@
 /* ---- Turns ---- */
 .cxturn { display: flex; gap: var(--space-3); animation: camelidFadeInUp var(--dur-base) var(--ease-standard); }
 .cxturn--user { justify-content: flex-end; }
-.cxturn__user-chip {
+.cxturn__user-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
   max-width: 80%;
+}
+.cxturn__user-chip {
+  max-width: 100%;
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
   background: var(--color-user-chip);
@@ -178,6 +184,7 @@
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
   color: var(--color-text-faint);
+  margin-right: 2px;
 }
 .cxturn__action {
   display: inline-flex;
@@ -188,8 +195,37 @@
   color: var(--color-text-muted);
   font-size: var(--text-xs);
   font-weight: 500;
+  border: none;
+  background: transparent;
+  cursor: pointer;
 }
 .cxturn__action:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.cxturn__action--icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  transition: background var(--dur-fast) var(--ease-standard),
+              color var(--dur-fast) var(--ease-standard),
+              transform var(--dur-fast) var(--ease-standard);
+}
+.cxturn__action--icon:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+.cxturn__action--icon:active {
+  transform: scale(0.92);
+}
+.cxturn__action--icon.is-copied {
+  color: var(--color-accent-text);
+}
 
 /* ---- Assistant markdown content ---- */
 .cxturn__body .message-markdown { color: var(--color-text); font-size: var(--text-md); line-height: var(--leading-relaxed); }
@@ -492,7 +528,7 @@
 
 @media (max-width: 860px) {
   .cxchat__suggestions { grid-template-columns: 1fr; }
-  .cxturn__user-chip { max-width: 90%; }
+  .cxturn__user-wrapper { max-width: 90%; }
 }
 
 /* Narrow composer: the labeled toolbar buttons collapse to icon-only (their
@@ -594,9 +630,20 @@
 
 /* ---- User-row edit & resend (Phase 2) ---- */
 .cxturn--user { position: relative; }
-.cxturn__actions--user { justify-content: flex-end; opacity: 0; transition: opacity var(--dur-fast) var(--ease-standard); }
+.cxturn__actions--user {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 4px;
+  justify-content: flex-end;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-standard);
+}
 .cxturn--user:hover .cxturn__actions--user,
 .cxturn--user:focus-within .cxturn__actions--user { opacity: 1; }
+@media (hover: none) {
+  .cxturn__actions--user { opacity: 0.85; }
+}
 .cxturn__edit { display: flex; flex-direction: column; gap: var(--space-2); min-width: min(480px, 70vw); }
 .cxturn__edit-input {
   width: 100%;
@@ -870,3 +917,442 @@
   .cxfirstrun__primary,
   .cxfirstrun__secondary { text-align: center; }
 }
+
+/* --- Context meter -------------------------------------------------------
+   Sits in the composer status line. The reservation is drawn as its own
+   hatched band rather than folded into "used": it is room held for the reply,
+   not tokens already spent. The verified-bound marker sits ON the track with
+   the space past it still styled as usable, because the tested envelope is
+   evidence, not a ceiling. */
+
+.ctxmeter { position: relative; display: inline-flex; }
+
+.ctxmeter__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-subtle);
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  line-height: 1.6;
+  cursor: pointer;
+}
+
+.ctxmeter__chip:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.ctxmeter__chip:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.ctxmeter__chip.is-notice { border-color: var(--color-warning); }
+.ctxmeter__chip.is-error { border-color: var(--color-danger, var(--color-warning)); color: var(--color-text); }
+
+.ctxmeter__track {
+  position: relative;
+  width: 44px;
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border-soft);
+  overflow: hidden;
+}
+
+.ctxmeter__fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: var(--color-accent);
+  border-radius: var(--radius-pill);
+}
+
+.ctxmeter__fill--reserved {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--color-accent-soft) 0 3px,
+    transparent 3px 6px
+  );
+  box-shadow: inset 0 0 0 1px var(--color-accent-soft);
+}
+
+.ctxmeter__chip-value { font-variant-numeric: tabular-nums; }
+
+.ctxmeter__panel {
+  position: absolute;
+  bottom: calc(100% + var(--space-2));
+  /* Anchored to the chip's right edge so the panel grows inward. Anchoring left
+     put its edge exactly on the viewport boundary at 1024px. */
+  right: 0;
+  z-index: 30;
+  width: min(400px, calc(100vw - var(--space-6)));
+  padding: var(--space-4);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-elevated);
+  box-shadow: var(--shadow-3);
+}
+
+.ctxmeter__panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.ctxmeter__panel-title { font-size: var(--text-sm); font-weight: 600; color: var(--color-text); }
+.ctxmeter__panel-total { font-size: var(--text-sm); color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
+
+.ctxmeter__panel-count {
+  margin: 2px 0 var(--space-3);
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ctxmeter__bar {
+  position: relative;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border-soft);
+  overflow: hidden;
+}
+
+.ctxmeter__bar-fill { position: absolute; top: 0; bottom: 0; left: 0; background: var(--color-accent); }
+
+.ctxmeter__bar-fill--reserved {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--color-accent-soft) 0 4px,
+    transparent 4px 8px
+  );
+  box-shadow: inset 0 0 0 1px var(--color-accent-soft);
+}
+
+/* Marker, not a wall: 2px rule with a gap either side so the usable context
+   past the tested envelope still reads as available. */
+.ctxmeter__marker {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--color-text);
+  opacity: 0.55;
+}
+
+.ctxmeter__verified {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__legend { list-style: none; margin: var(--space-3) 0 0; padding: 0; }
+
+.ctxmeter__legend-row {
+  display: grid;
+  grid-template-columns: 10px 1fr auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__swatch { width: 8px; height: 8px; border-radius: 2px; background: var(--color-accent); }
+.ctxmeter__legend-row.is-messages .ctxmeter__swatch { opacity: 0.75; }
+.ctxmeter__legend-row.is-images .ctxmeter__swatch { opacity: 0.5; }
+.ctxmeter__legend-row.is-reserved .ctxmeter__swatch { background: var(--color-accent-soft); box-shadow: inset 0 0 0 1px var(--color-accent); }
+.ctxmeter__legend-row.is-free .ctxmeter__swatch { background: var(--color-border-soft); }
+.ctxmeter__legend-label { color: var(--color-text); }
+.ctxmeter__legend-tokens,
+.ctxmeter__legend-percent { font-variant-numeric: tabular-nums; }
+.ctxmeter__legend-percent { min-width: 34px; text-align: right; }
+
+.ctxmeter__foot {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-micro);
+  line-height: 1.5;
+  color: var(--color-text-faint);
+}
+
+.ctxmeter__foot code { font-family: var(--font-mono); font-size: var(--text-micro); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .ctxmeter__fill,
+  .ctxmeter__bar-fill { transition: width 160ms ease, left 160ms ease; }
+}
+/* Compaction controls inside the meter panel. `is-near` is the 80% state that
+   automatic compaction keys off, so the chip warns with the same threshold the
+   trim uses rather than a second hand-tuned number. */
+
+.ctxmeter__chip.is-near { border-color: var(--color-warning); color: var(--color-text); }
+
+/* Stacked, not side by side: the action and the automatic toggle each need a
+   full line at this width, and letting them share one wrapped the label into a
+   three-line column beside a pinned checkbox. Each child claims the full row so
+   no inherited justification can reintroduce that gap. */
+.ctxmeter__compact {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.ctxmeter__compact > * { align-self: flex-start; }
+
+.ctxmeter__compact-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+
+.ctxmeter__compact-action:hover { background: var(--color-surface-hover); }
+.ctxmeter__compact-action:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+
+.ctxmeter__compact-auto {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--space-2);
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  /* 25 characters at this size cannot overflow a 400px panel, and forbidding
+     the wrap is what stops a stale or competing rule stacking it again. */
+  white-space: nowrap;
+}
+
+/* A global reset makes inputs `display: block`, and a blockified checkbox fills
+   its flex line -- which pushed the label 146px to the right. Size it
+   explicitly rather than relying on the intrinsic width it no longer has. */
+.ctxmeter__compact-auto input {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.ctxmeter__compacted {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-accent-soft);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__compact-undo {
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-accent-text);
+  font-size: var(--text-2xs);
+  text-decoration: underline;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ctxmeter__compact-undo:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+/* Receipt-style breakdown: numbers stack in one right-aligned column and sum to
+   a ruled total. A conversation's context spend reads the way this project asks
+   people to read everything else it produces. */
+
+.ctxmeter__headline {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__headline strong {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.ctxmeter__receipt { list-style: none; margin: var(--space-3) 0 0; padding: 0; }
+
+.ctxmeter__receipt-row {
+  display: grid;
+  grid-template-columns: 10px minmax(64px, auto) 1fr;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 3px 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+}
+
+.ctxmeter__receipt-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
+
+.ctxmeter__receipt-label { color: var(--color-text-muted); }
+
+.ctxmeter__receipt-row--total {
+  margin-top: 3px;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.ctxmeter__receipt-row--total .ctxmeter__receipt-num { font-weight: 600; }
+.ctxmeter__swatch--blank { background: none; }
+
+.ctxmeter__compact-action[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ctxmeter__compact-hint {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-micro);
+  line-height: 1.5;
+  color: var(--color-text-faint);
+}
+
+/* The bar carries the whole story at a glance, so give it room to be read. */
+.ctxmeter__bar { height: 10px; }
+
+/* Document Drag-and-Drop RAG & Inline Citation Pills */
+.cxcomposer__docs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 var(--space-2) var(--space-2);
+}
+.cxcomposer__doc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 4px 10px;
+  background: var(--color-surface-raised, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-pill, 9999px);
+  font-size: var(--text-xs);
+  color: var(--color-text);
+  max-width: 260px;
+}
+.cxcomposer__doc-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.cxcomposer__doc-chunks {
+  color: var(--color-text-faint);
+  font-size: 10px;
+}
+.cxcomposer__doc-remove {
+  background: transparent;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+}
+.cxcomposer__doc-remove:hover { color: var(--color-error, #f87171); }
+.cxcomposer__doc-status { font-size: var(--text-xs); color: var(--color-accent); align-self: center; }
+.citation-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 3px;
+  padding: 2px 8px;
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid var(--color-accent, #38bdf8);
+  border-radius: 6px;
+  color: var(--color-accent, #38bdf8);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+.citation-pill:hover {
+  background: rgba(56, 189, 248, 0.2);
+  transform: translateY(-1px);
+}
+.citation-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: var(--space-4);
+}
+.citation-modal {
+  background: var(--color-surface, #1e242c);
+  border: 1px solid var(--color-border-strong, #333d4b);
+  border-radius: 12px;
+  width: 100%;
+  max-width: 580px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.citation-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border-soft, #2a333f);
+}
+.citation-modal__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-text);
+}
+.citation-modal__score {
+  font-size: 11px;
+  color: var(--color-accent, #38bdf8);
+  background: rgba(56, 189, 248, 0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.citation-modal__body {
+  padding: var(--space-4);
+  overflow-y: auto;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-subtle, #cbd5e1);
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  background: rgba(0, 0, 0, 0.2);
+  margin: var(--space-3);
+  border-radius: 8px;
+}
+.citation-modal__footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border-soft, #2a333f);
+}
+

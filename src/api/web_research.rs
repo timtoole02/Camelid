@@ -17,7 +17,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket},
     process::{Command, Stdio},
     sync::{Arc, Mutex, OnceLock},
     thread,
@@ -1252,6 +1252,13 @@ fn classify_prompt(prompt: &str) -> ResearchDecision {
         "score right now",
         "news now",
         "weather now",
+        "weather in ",
+        "weather for ",
+        "weather report",
+        // Deliberately weather-anchored. A bare "forecast for" also matches
+        // "revenue forecast for next year", and a false positive here sends the
+        // user's prompt to a search engine.
+        "weather forecast",
         "price now",
         "schedule now",
         "score now",
@@ -3960,6 +3967,59 @@ fn validated_redirect_target(current: &Url, location: &str) -> Result<Url, Strin
     Ok(next)
 }
 
+/// Which IP families this host has a route for.
+///
+/// `to_socket_addrs` does not set `AI_ADDRCONFIG`, so a dual-stack DNS answer
+/// comes back whatever the host can actually reach. Deciding from the shape of
+/// that answer would only ever be right for one kind of host; this asks the host
+/// instead. A UDP `connect` sends no packet — it just needs a route to exist —
+/// so this costs a syscall, blocks on nothing, and is probed once per process.
+///
+/// Both flags false means the question could not be answered (no network, or a
+/// sandbox that refuses the bind), and the caller pins the answer unchanged.
+fn host_reachable_families() -> (bool, bool) {
+    static FAMILIES: OnceLock<(bool, bool)> = OnceLock::new();
+    *FAMILIES.get_or_init(|| {
+        // Documentation prefixes: only a default route can match them, which is
+        // exactly the property being tested.
+        let v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .and_then(|socket| socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)))
+            .is_ok();
+        let v6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+            .and_then(|socket| socket.connect((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9)))
+            .is_ok();
+        (v4, v6)
+    })
+}
+
+/// Choose which of the already-validated addresses to pin with `--resolve`.
+///
+/// A dual-stack DNS answer on a single-stack host (a v4-only GCP Compute Engine
+/// VM, say) hands curl records that can never connect, and the hop can die with
+/// `couldn't connect to server` instead of using the usable record beside it.
+/// The families the host cannot reach are dropped — in either direction, so an
+/// IPv6-only host is not handed A records for the same reason.
+///
+/// This only ever narrows, and never to nothing: an unreachable pin is still a
+/// bound pin, whereas pinning nothing would hand the hostname back to curl's own
+/// resolver and unbind the SSRF check.
+fn addresses_to_pin(addresses: &[IpAddr], families: (bool, bool)) -> Vec<IpAddr> {
+    let (v4_reachable, v6_reachable) = families;
+    if v4_reachable == v6_reachable {
+        return addresses.to_vec();
+    }
+    let reachable: Vec<IpAddr> = addresses
+        .iter()
+        .copied()
+        .filter(|address| address.is_ipv4() == v4_reachable)
+        .collect();
+    if reachable.is_empty() {
+        addresses.to_vec()
+    } else {
+        reachable
+    }
+}
+
 // This is the final SSRF/auth boundary before spawning curl. Keeping every
 // validated input explicit makes accidental credential or redirect widening
 // visible at each call site.
@@ -4042,7 +4102,18 @@ fn curl_single_hop(
         .host()
         .is_some_and(|host| matches!(host, Host::Domain(_)))
     {
-        for address in addresses {
+        let pinned = addresses_to_pin(addresses, host_reachable_families());
+        if pinned.len() < addresses.len() {
+            // Every address still pinned is one family; tell curl so too, so a
+            // cache miss cannot send it back to the resolver and out over the
+            // family this host cannot reach.
+            command.arg(if pinned.iter().all(IpAddr::is_ipv4) {
+                "--ipv4"
+            } else {
+                "--ipv6"
+            });
+        }
+        for address in pinned {
             let pinned = match address {
                 IpAddr::V4(address) => format!("{host}:{port}:{address}"),
                 IpAddr::V6(address) => format!("{host}:{port}:[{address}]"),
@@ -4257,6 +4328,30 @@ mod tests {
             let error = fetch_cache_ttl_from_value(Some(invalid)).unwrap_err();
             assert!(error.contains(FETCH_CACHE_TTL_ENV), "{error}");
         }
+    }
+
+    #[test]
+    fn dual_stack_answers_pin_only_the_reachable_family() {
+        let v4: IpAddr = "93.184.216.34".parse().unwrap();
+        let v4b: IpAddr = "93.184.216.35".parse().unwrap();
+        let v6: IpAddr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
+        let v4_only = (true, false);
+        let v6_only = (false, true);
+        let dual = (true, true);
+        let unknown = (false, false);
+
+        // A v4-only host drops the AAAA records it could never dial.
+        assert_eq!(addresses_to_pin(&[v6, v4, v4b], v4_only), vec![v4, v4b]);
+        // And the mirror image: a v6-only host drops the A records.
+        assert_eq!(addresses_to_pin(&[v6, v4, v4b], v6_only), vec![v6]);
+        // Narrowing must never empty the set, or the SSRF pin would stop binding
+        // and curl would resolve for itself.
+        assert_eq!(addresses_to_pin(&[v6], v4_only), vec![v6]);
+        assert_eq!(addresses_to_pin(&[v4], v6_only), vec![v4]);
+        // A dual-stack host keeps both and lets curl choose; so does a host whose
+        // families could not be probed.
+        assert_eq!(addresses_to_pin(&[v6, v4], dual), vec![v6, v4]);
+        assert_eq!(addresses_to_pin(&[v6, v4], unknown), vec![v6, v4]);
     }
 
     #[test]

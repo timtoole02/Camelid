@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "spotlight-ui",
+  "description": "Allows the Camelid Spotlight loopback window to manage only its own window state.",
+  "windows": ["spotlight"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": ["core:window:allow-hide"]
+}

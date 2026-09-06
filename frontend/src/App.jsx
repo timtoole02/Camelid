@@ -34,11 +34,21 @@ const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
+const ArenaView = lazy(() => import('./views/ArenaView'))
+const SpotlightView = lazy(() => import('./views/SpotlightView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
+  if (typeof window !== 'undefined' && window.location.hash === '#spotlight') {
+    return (
+      <Suspense fallback={<div className="view-loading" role="status">Loading Spotlight…</div>}>
+        <SpotlightView />
+      </Suspense>
+    )
+  }
+
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
   const { preference, resolved, cyclePreference, setPreference } = useTheme()
 
@@ -431,6 +441,16 @@ function App() {
               capabilities={dashboard?.capabilities}
               selectedModel={selectedModel}
               runtime={runtime}
+              setTab={navigateTab}
+            />
+          )}
+
+          {tab === 'arena' && (
+            <ArenaView
+              models={models}
+              runtime={runtime}
+              apiBase={apiBase}
+              loadDashboard={loadDashboard}
               setTab={navigateTab}
             />
           )}

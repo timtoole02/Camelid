@@ -1398,7 +1398,14 @@ mod tests {
             let mut stream = rustls::StreamOwned::new(connection, socket);
             let mut request = Vec::new();
             let mut buffer = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            // The declared body has to be drained as well as the head. The
+            // client writes them separately, so the body can still be queued
+            // unread when this thread returns, and closing a socket that holds
+            // unread bytes is an abortive close (RST) rather than a FIN. The
+            // client then observes ECONNRESET instead of the response that was
+            // just written. This is the same completeness check `canned_node`
+            // applies on the plaintext path.
+            while !request_complete(&request) {
                 let read = match stream.read(&mut buffer) {
                     Ok(0) | Err(_) => return,
                     Ok(read) => read,

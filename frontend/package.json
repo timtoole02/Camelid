@@ -27,6 +27,7 @@
     "smoke:gemma4-mtp12-target-render": "node scripts/gemma4-mtp12-target-render-smoke.mjs",
     "smoke:lfm2-chat-gate": "node scripts/lfm2-chat-gate-smoke.mjs",
     "smoke:streaming": "node scripts/streaming-parser-smoke.mjs",
+    "smoke:arena": "node scripts/arena-smoke.mjs",
     "smoke:harness": "node scripts/smoke-harness-self-test.mjs",
     "smoke:capability-readiness": "node scripts/capability-readiness-smoke.mjs",
     "smoke:observatory": "node scripts/observatory-smoke.mjs",
@@ -41,6 +42,8 @@
     "smoke:web-research": "node scripts/web-research-smoke.mjs",
     "smoke:web-research-browser": "node scripts/web-research-browser-smoke.mjs",
     "smoke:byte-units": "node scripts/byte-units-smoke.mjs",
+    "smoke:context-meter": "node scripts/context-meter-smoke.mjs",
+    "smoke:context-compaction": "node scripts/context-compaction-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },
   "dependencies": {

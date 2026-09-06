@@ -148,6 +148,11 @@ const CURRENT_INFO_PATTERNS = [
   /\bcurrently available\b/i,
   /\b(?:today's|today’s)\s+(?:news|weather|price|schedule|score)\b/i,
   /\b(?:news|weather|price|schedule|score)\s+(?:today|right now|now)\b/i,
+  /\bweather\b[^.!?\n]{0,80}\b(?:today|tomorrow|now|tonight|week|weekend|days?|forecast)\b/i,
+  /\bweather\s+(?:in|for|at|around|report|forecast)\b/i,
+  // `weather` is required: a bare "forecast for next quarter" is not a
+  // real-time question, and a false positive sends the prompt to a search engine.
+  /\bweather\s+forecast\s+(?:for|in|today|this|next)\b/i,
   /\brecent\s+(?:news|events|developments|changes|updates|releases)\b/i,
   /\bwho is (?:the )?current\b/i,
 ]

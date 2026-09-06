@@ -7,3 +7,6 @@ qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json text eol=lf
 
 # Agent task manifests hash fixture and scorer bytes across operating systems.
 qa/benchmarks/agent/** text eol=lf
+
+# Benchmark process supervisors execute inside Linux isolation boundaries.
+tools/bench/system/process/*.sh text eol=lf

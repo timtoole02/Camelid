@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { existsSync, readFileSync, statSync } from 'node:fs'
-import { extname, resolve } from 'node:path'
+import { extname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { launchBrowser } from './lib/launch-browser.mjs'
@@ -294,7 +294,7 @@ const server = createServer(async (req, res) => {
 
     const relative = path === '/' ? 'index.html' : decodeURIComponent(path.replace(/^\//, ''))
     const filePath = resolve(distDir, relative)
-    if ((filePath === distDir || filePath.startsWith(`${distDir}/`)) && isFile(filePath)) return sendFile(res, filePath)
+    if ((filePath === distDir || filePath.startsWith(`${distDir}${sep}`)) && isFile(filePath)) return sendFile(res, filePath)
     return sendFile(res, resolve(distDir, 'index.html'))
   } catch (error) {
     if (!res.headersSent) return sendJson(res, 500, { error: { message: error.message } })

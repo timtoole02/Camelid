@@ -1,0 +1,138 @@
+{
+  "schema": "camelid.benchmark.native-contracts/v1",
+  "contracts": [
+    {
+      "id": "native_write_requires_policy",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "write_requires_approval_and_denial_is_handled", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_exec_not_blanket_auto",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "auto_all_promotes_writes_but_never_run_shell", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_production_refuses_unattended",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "production_refuses_yolo_for_exec", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_path_escape_refused",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "auto_approve_still_enforces_sandbox", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "read_file_rejects_sandbox_escape", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "js_test", "file": "tools/bench/system/test-task-foundation.mjs", "marker": "verifySymlinkRejected", "platforms": ["windows", "linux"] }
+      ]
+    },
+    {
+      "id": "native_network_absent_by_default",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "http_fetch_offered_only_with_net", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "web_search_offered_only_with_net", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_mcp_absent_by_default",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/mcp.rs", "test": "disabled_by_default", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_workspace_read_only",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "workspace_profile_is_exactly_the_read_only_tool_set", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_step_cap_inconclusive",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "step_cap_is_enforced", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "exec_exit_codes_are_tri_state", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_repeat_break_inconclusive",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "repeated_identical_call_breaks_the_loop", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "exec_exit_codes_are_tri_state", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_driver_error_failed",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "exec_exit_codes_are_tri_state", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_cancel_discards_partial",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "cancellation_during_model_step_discards_partial_answer", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_compaction_preserves_goal",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "compaction_keeps_the_safety_spine_and_the_goal", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_tool_output_untrusted",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "fenced_output_cannot_change_an_approval_tier", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_mcp_round_trip",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/mcp.rs", "test": "stub_server_end_to_end", "platforms": ["linux"] }
+      ]
+    },
+    {
+      "id": "native_subagent_cleanup",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/subagent.rs", "test": "timed_out_subagent_is_reaped_and_its_task_file_is_removed", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "js_test", "file": "tools/bench/system/test-native-adapter.mjs", "marker": "assertPortReusable", "platforms": ["windows", "linux"] }
+      ]
+    },
+    {
+      "id": "native_outside_canary_unchanged",
+      "evidence": [
+        { "kind": "js_test", "file": "tools/bench/system/test-native-adapter.mjs", "marker": "outside_task_root", "platforms": ["windows", "linux"] }
+      ]
+    },
+    {
+      "id": "native_edit_self_healing",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "edit_file_tolerates_uniform_indentation_shift", "platforms": ["windows", "macos", "linux"] },
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "edit_file_provides_actionable_near_miss_diagnostics", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_path_suggestion",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "sandbox_resolve_suggests_nearest_file_path", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_compaction_working_set",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "compaction_records_active_working_set_ledger", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_search_path_filter",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/tools.rs", "test": "search_respects_path_filter", "platforms": ["windows", "macos", "linux"] }
+      ]
+    },
+    {
+      "id": "native_verification_gate",
+      "evidence": [
+        { "kind": "rust_test", "file": "src/chat/agent.rs", "test": "verification_gate_requires_test_run_after_mutating_files", "platforms": ["windows", "macos", "linux"] }
+      ]
+    }
+  ]
+}

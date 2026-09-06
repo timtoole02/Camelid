@@ -21,6 +21,19 @@
         "url": "index.html",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
+      },
+      {
+        "label": "spotlight",
+        "title": "Camelid Spotlight",
+        "width": 640,
+        "height": 400,
+        "center": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "transparent": true,
+        "url": "index.html#spotlight"
       }
     ],
     "security": {

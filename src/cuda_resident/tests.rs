@@ -9931,3 +9931,170 @@ fn moe_weighted_sum_batched_maps_csr_assignments_in_router_order_bitwise() {
         "degenerate mapped MoE fixture produced only zeros"
     );
 }
+
+/// Regression: `attention_batched_q8_0` dropped most of the KV once a prompt exceeded
+/// `head_dim` tokens.
+///
+/// The kernel splits the weighted-V accumulation into `G = ceil(position_count /
+/// head_dim)` groups but derived `gid` straight from `tid`, while the launcher fixes
+/// `block_dim` at 128. For `head_dim == 128` that made `gid` always 0, so only
+/// `1/G` of the positions were accumulated and the `g >= 1` slots of the shared
+/// `vpart` buffer were summed back **uninitialised**. The f16 sibling grid-strides
+/// over all `G * head_dim` partials and was always correct.
+///
+/// It is invisible below `head_dim` positions (`G == 1`) and wrong above, which is why
+/// it shipped: short smoke prompts pass. Measured against a CPU f32 reference on
+/// Llama 3.2 3B, the worst single-token logit error was 8.6 before the fix and 0.195
+/// after — the latter matching the CPU implementation of the same format (0.170).
+///
+/// This test drives the kernel either side of that boundary and compares to a CPU
+/// reference computed from the same dequantized blocks.
+#[test]
+#[ignore = "requires a CUDA device; q8_0 batched attention parity across the G boundary"]
+fn q8_0_batched_attention_matches_cpu_reference_past_the_head_dim_boundary() {
+    let k = match CudaResidentKernels::new() {
+        Ok(k) => k,
+        Err(e) => panic!("cuda kernels: {e}"),
+    };
+    let s = k.stream.clone();
+
+    let (n_heads, n_kv_heads) = (1usize, 1usize);
+    let max_pos = 512usize;
+
+    // head_dim is swept because the defect took a different shape at each width, and
+    // `launch_attention_batched` pins blockDim at 128 regardless:
+    //   128 / 100 pos -> G == 1, the one regime the old kernel got right
+    //   128 / 200 pos -> G == 2, over-subscribed: only half the positions accumulated
+    //    64 /  40 pos -> G == 1 but UNDER-subscribed: threads 64..127 raced on vpart
+    //    64 / 200 pos -> G == 4
+    // head_dim 64 is a shipped shape (the TinyLlama-shaped decode tests above use it),
+    // so pinning 128 alone would let a regression that only broke 64 through.
+    for &(head_dim, n_pos) in &[(128usize, 100usize), (128, 200), (64, 40), (64, 200)] {
+        let blocks_per_head = head_dim / 32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let kv: Vec<f32> = (0..n_pos * head_dim)
+            .map(|i| ((i * 31 % 97) as f32 / 97.0 - 0.5) * 2.0)
+            .collect();
+        let vv: Vec<f32> = (0..n_pos * head_dim)
+            .map(|i| ((i * 53 % 89) as f32 / 89.0 - 0.5) * 2.0)
+            .collect();
+        let q: Vec<f32> = (0..head_dim)
+            .map(|i| ((i * 17 % 41) as f32 / 41.0 - 0.5) * 2.0)
+            .collect();
+
+        // Stage the KV through the device scatter so the test exercises the same
+        // quantization the engine uses.
+        let d_kv = s.clone_htod(&kv).expect("htod k");
+        let d_vv = s.clone_htod(&vv).expect("htod v");
+        let mut cache_k: CudaSlice<u8> = s
+            .alloc_zeros::<u8>(n_kv_heads * max_pos * blocks_per_head * 34)
+            .expect("alloc k");
+        let mut cache_v: CudaSlice<u8> = s
+            .alloc_zeros::<u8>(n_kv_heads * max_pos * blocks_per_head * 34)
+            .expect("alloc v");
+        super::launch_kv_scatter_batched_q8_0(
+            &s,
+            &k.kv_scatter_batched_q8_0,
+            &d_kv,
+            &mut cache_k,
+            0,
+            n_kv_heads,
+            head_dim,
+            max_pos,
+            head_dim,
+            n_pos,
+        )
+        .expect("scatter k");
+        super::launch_kv_scatter_batched_q8_0(
+            &s,
+            &k.kv_scatter_batched_q8_0,
+            &d_vv,
+            &mut cache_v,
+            0,
+            n_kv_heads,
+            head_dim,
+            max_pos,
+            head_dim,
+            n_pos,
+        )
+        .expect("scatter v");
+
+        // One query at the last position, attending over all n_pos keys.
+        let d_q = s.clone_htod(&q).expect("htod q");
+        let mut d_out: CudaSlice<f32> = s.alloc_zeros::<f32>(head_dim).expect("alloc out");
+        let mut d_scores: CudaSlice<f32> = s
+            .alloc_zeros::<f32>(n_heads * max_pos)
+            .expect("alloc scores");
+        super::launch_attention_batched(
+            &s,
+            &k.attention_batched_q8_0,
+            &d_q,
+            &cache_k,
+            &cache_v,
+            &mut d_out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_pos - 1,
+            max_pos,
+            scale,
+            head_dim,
+            1,
+            0,
+            &mut d_scores,
+        )
+        .expect("launch attention_batched_q8_0");
+        k.ctx.synchronize().expect("sync");
+        let got = s.clone_dtoh(&d_out).expect("dtoh out");
+
+        // CPU reference over the SAME dequantized blocks, so the only thing under test
+        // is the kernel's attention arithmetic, not the quantizer.
+        let deq = |src: &[f32]| -> Vec<f32> {
+            let mut blocks = vec![crate::tensor::kv_quant::BlockQ8_0::default(); blocks_per_head];
+            let mut out = vec![0.0f32; src.len()];
+            for p in 0..n_pos {
+                crate::tensor::kv_quant::quantize_row_q8_0(
+                    &src[p * head_dim..(p + 1) * head_dim],
+                    &mut blocks,
+                );
+                crate::tensor::kv_quant::dequantize_row_q8_0(
+                    &blocks,
+                    &mut out[p * head_dim..(p + 1) * head_dim],
+                );
+            }
+            out
+        };
+        let kd = deq(&kv);
+        let vd = deq(&vv);
+
+        let mut scores = vec![0.0f32; n_pos];
+        for p in 0..n_pos {
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q[d] * kd[p * head_dim + d];
+            }
+            scores[p] = dot * scale;
+        }
+        let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for v in scores.iter_mut() {
+            *v = (*v - m).exp();
+            sum += *v;
+        }
+        let mut want = vec![0.0f32; head_dim];
+        for p in 0..n_pos {
+            let w = scores[p] / sum;
+            for d in 0..head_dim {
+                want[d] += w * vd[p * head_dim + d];
+            }
+        }
+
+        let worst = (0..head_dim).fold(0.0f32, |a, d| a.max((got[d] - want[d]).abs()));
+        assert!(
+            worst < 1e-3,
+            "q8_0 batched attention diverged from the CPU reference: head_dim {head_dim}, \
+             {n_pos} positions (G = {}), worst |delta| {worst}",
+            n_pos.div_ceil(head_dim)
+        );
+    }
+}

@@ -1,0 +1,52 @@
+{
+  "schema": "camelid.benchmark.pi-openai-compatibility/v1",
+  "pi": {
+    "version": "0.84.3",
+    "archive_sha256": "6f8bb67c21bc6b8a8a106d354f56d7fd4a190a3cd8ad3a32db45f6d281a5d008",
+    "executable_sha256": "ca858fde375ab91531353b22fac6ebdf29c0a153efe754f5f9b8a72a7423ed08"
+  },
+  "provider_api": "openai-completions",
+  "system_prompt_append_sha256": "baece18797824ed0f6bfa73a7e8a839adec45cfb05683680ec2d6f657eaad582",
+  "observed_requests": [
+    {
+      "turn": "initial",
+      "fields": ["max_tokens", "messages", "model", "stream", "stream_options", "temperature", "tools"],
+      "roles": ["system", "user"],
+      "stream": true,
+      "stream_include_usage": true,
+      "max_tokens": 256,
+      "tools": ["read", "bash", "edit", "write", "ls"],
+      "strict_tool_fields": [null, null, null, null, null]
+    },
+    {
+      "turn": "after_tool_result",
+      "fields": ["max_tokens", "messages", "model", "stream", "stream_options", "temperature", "tools"],
+      "roles": ["system", "user", "assistant", "tool"],
+      "stream": true,
+      "stream_include_usage": true,
+      "max_tokens": 256,
+      "tool_result_has_name": false
+    }
+  ],
+  "observed_responses": {
+    "tool_call_id_stable": true,
+    "tool_arguments_stream_as_json": true,
+    "tool_finish_reason": "tool_calls",
+    "final_finish_reason": "stop",
+    "terminal_usage_chunk": true,
+    "done_marker": true
+  },
+  "omitted_request_fields": [
+    "developer_role",
+    "max_completion_tokens",
+    "reasoning_effort",
+    "store",
+    "strict_tools"
+  ],
+  "explicitly_unqualified": [
+    "reasoning_controls",
+    "store",
+    "strict_tools",
+    "grammar_tools"
+  ]
+}

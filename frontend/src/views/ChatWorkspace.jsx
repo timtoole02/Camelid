@@ -3,17 +3,34 @@ import { getChatGateState } from '../lib/chatGate'
 import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
 import { formatModelLabel } from '../lib/formatters'
 import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
-import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget } from '../lib/responseLimits'
+import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget, verifiedContextBound } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
-import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch } from '../components/ui/icons'
+import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch, IconFile } from '../components/ui/icons'
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
+import { ContextMeter } from '../components/chat/ContextMeter'
+import { composeContextBudget } from '../lib/contextBudget.js'
+import {
+  AUTO_COMPACT_THRESHOLD_PERCENT,
+  applySendCompaction,
+  compactForSend,
+  getAutoCompactEnabled,
+  setAutoCompactEnabled,
+  getCompactionOverride,
+  setCompactionOverride,
+} from '../lib/conversationCompaction.js'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
 import { classifyWebResearchNeed } from '../lib/webResearch.js'
+import {
+  ATTACHED_DOCUMENTS_STORAGE_KEY,
+  normalizeAttachedDocuments,
+  readAttachedDocuments,
+  writeAttachedDocuments,
+} from '../lib/documentAttachments.js'
 import { isGemma4Mtp12TargetVerifiedVideoOptedIn, shouldUseGemma4Mtp12TargetVerifiedRender } from '../lib/targetVerifiedRender.js'
 import { isGemma4Mtp12SegmentedVideoOptedIn, readGemma4Mtp12PreparedSegments } from '../lib/segmentedWebResearchSynthesis.js'
 
@@ -67,6 +84,17 @@ const readAsDataUrl = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader()
   reader.onload = () => resolve(String(reader.result || ''))
   reader.onerror = () => reject(reader.error || new Error('Could not read the image.'))
+  reader.readAsDataURL(blob)
+})
+
+const readAsBase64 = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => {
+    const res = String(reader.result || '')
+    const comma = res.indexOf(',')
+    resolve(comma !== -1 ? res.slice(comma + 1) : res)
+  }
+  reader.onerror = () => reject(reader.error || new Error('Could not read the document.'))
   reader.readAsDataURL(blob)
 })
 
@@ -178,11 +206,25 @@ export default function ChatWorkspace({
   const [userScrolledAway, setUserScrolledAway] = useState(false)
   const [composerImage, setComposerImage] = useState(null)
   const [imageError, setImageError] = useState('')
+  const [attachedDocuments, setAttachedDocumentsState] = useState(readAttachedDocuments)
+  const [documentIngesting, setDocumentIngesting] = useState(false)
+  const [documentError, setDocumentError] = useState('')
+  const [activeCitation, setActiveCitation] = useState(null)
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const imageInputRef = useRef(null)
+  const docInputRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
   const composerReadinessId = 'camelid-chat-readiness-note'
+
+  const setAttachedDocuments = (valueOrUpdater) => {
+    setAttachedDocumentsState((current) => {
+      const value = typeof valueOrUpdater === 'function'
+        ? valueOrUpdater(current)
+        : valueOrUpdater
+      return writeAttachedDocuments(value)
+    })
+  }
 
   const rawVisibleMessages = useMemo(
     () => (selectedConversation?.messages || []).filter((message) => !isBootstrapMessage(message)),
@@ -409,6 +451,40 @@ export default function ChatWorkspace({
     }
   }, [visionReady, selectedModelId])
 
+  // Document ids contain no file contents or local paths. Persist this small
+  // association so an attached RAG source survives a reload, app navigation,
+  // or a second browser tab. Reconcile it against the server when possible so
+  // a cleaned temporary database cannot leave a permanently stale pill.
+  useEffect(() => {
+    let cancelled = false
+    if (attachedDocuments.length) {
+      fetch('/api/documents')
+        .then((response) => (response.ok ? response.json() : null))
+        .then((documents) => {
+          if (cancelled || !Array.isArray(documents)) return
+          const availableIds = new Set(documents.map((document) => document.id))
+          setAttachedDocumentsState((current) => {
+            const next = current.filter((document) => availableIds.has(document.doc_id))
+            return next.length === current.length ? current : writeAttachedDocuments(next)
+          })
+        })
+        .catch(() => {})
+    }
+    const handleStorage = (event) => {
+      if (event.key === ATTACHED_DOCUMENTS_STORAGE_KEY) {
+        setAttachedDocumentsState(readAttachedDocuments())
+      }
+    }
+    window.addEventListener('storage', handleStorage)
+    return () => {
+      cancelled = true
+      window.removeEventListener('storage', handleStorage)
+    }
+    // Reconcile the persisted initial snapshot once; later edits already come
+    // from successful ingest/remove actions in this component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   useEffect(() => {
     if (!generationActive) return undefined
     autoFollowGenerationRef.current = true
@@ -480,11 +556,100 @@ export default function ChatWorkspace({
     return () => window.cancelAnimationFrame(frame)
   }, [composerDraftUnlocked, generationActive, isFreshThread, selectedConversation?.id])
 
+  useEffect(() => {
+    const handleCitationClick = (e) => {
+      const cite = e.detail?.citation
+      if (cite) {
+        setActiveCitation(cite)
+      }
+    }
+    window.addEventListener('camelid-citation-click', handleCitationClick)
+    return () => window.removeEventListener('camelid-citation-click', handleCitationClick)
+  }, [])
+
+  const handleDocumentFiles = async (files) => {
+    if (!files || !files.length) return
+    setDocumentError('')
+    setDocumentIngesting(true)
+    for (const file of Array.from(files)) {
+      try {
+        const lowerName = file.name.toLowerCase()
+        const isBinary = lowerName.endsWith('.pdf') || lowerName.endsWith('.docx')
+        let content = ''
+        let is_base64 = false
+        if (isBinary) {
+          content = await readAsBase64(file)
+          is_base64 = true
+        } else {
+          content = await file.text()
+        }
+        const res = await fetch('/api/documents/ingest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: file.name,
+            content,
+            is_base64,
+          }),
+        })
+        if (!res.ok) {
+          const failure = await res.json().catch(() => null)
+          throw new Error(failure?.error?.message || failure?.message || `Could not index ${file.name}.`)
+        }
+        const doc = await res.json()
+        setAttachedDocuments((prev) => [
+          ...prev.filter((item) => item.doc_id !== doc.doc_id && item.filename !== doc.filename),
+          doc,
+        ])
+      } catch (err) {
+        console.error('Failed to ingest document:', file.name, err)
+        setDocumentError(err?.message || `Could not index ${file.name}.`)
+      }
+    }
+    setDocumentIngesting(false)
+  }
+
   const handleSendMessage = async () => {
     const image = composerImage
     setComposerImage(null)
     setImageError('')
-    await sendMessage({ overrideImage: image })
+
+    let contentToSend = composer
+    let requestCitations = []
+    if (attachedDocuments.length > 0) {
+      try {
+        const res = await fetch('/api/documents/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: composer,
+            doc_ids: attachedDocuments.map((d) => d.doc_id),
+            top_k: 4,
+          }),
+        })
+        if (res.ok) {
+          const data = await res.json()
+          if (data.results && data.results.length > 0) {
+            const citations = data.results
+            requestCitations = citations
+
+            const contextText = citations
+              .map((c, idx) => `[Citation ${idx + 1} from ${c.filename}]:\n${c.excerpt}`)
+              .join('\n\n')
+
+            contentToSend = `Refer to the following retrieved document excerpts to answer the prompt. Cite your sources inline using [1], [2], etc.\n\n--- DOCUMENT CONTEXT ---\n${contextText}\n--- END CONTEXT ---\n\nUser Question: ${composer}`
+          }
+        }
+      } catch (err) {
+        console.error('Document search error:', err)
+      }
+    }
+
+    await sendMessage({
+      overrideImage: image,
+      requestContent: contentToSend !== composer ? contentToSend : null,
+      citations: requestCitations,
+    })
   }
 
   const handleVisionFile = async (event) => {
@@ -567,10 +732,11 @@ export default function ChatWorkspace({
     runtime?.gemma4_serve_lane,
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
+  const activeContextLength = runtime?.active_context_length || modelContextLength(selectedModel)
   const rawSendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
-    contextLength: runtime?.active_context_length || modelContextLength(selectedModel),
+    contextLength: activeContextLength,
   })
   const segmentedVideoComposerBypass = isGemma4Mtp12SegmentedVideoOptedIn()
     && Boolean(readGemma4Mtp12PreparedSegments())
@@ -588,6 +754,61 @@ export default function ChatWorkspace({
   const sendBudget = segmentedVideoComposerBypass && rawSendBudget.level === 'error'
     ? { ...rawSendBudget, level: 'ok', message: null }
     : rawSendBudget
+
+  /* The meter reads the same three numbers the budget check does, so the chip
+     and the notice under the composer can never disagree. The verified bound is
+     drawn as a marker rather than a limit: past it the row is still served, it
+     simply has no committed evidence pack. */
+  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
+  const executionLane = runtime?.execution_plan?.selected_backend || ''
+
+  /* Compaction preview. The panel must describe what the NEXT send will do, so
+     it runs the same pure trim the send path runs, over the same preference
+     store -- there is no second copy of the rule to drift. */
+  const conversationId = selectedConversation?.id || ''
+  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
+  const [compactionOverride, setCompactionOverrideState] = useState(null)
+  useEffect(() => {
+    setCompactionOverrideState(getCompactionOverride(conversationId))
+  }, [conversationId])
+
+  const contextBudget = composeContextBudget({
+    contextLength: activeContextLength,
+    promptTokens: estimatedPromptTokens,
+    reservedTokens: effectiveMaxTokens,
+    verifiedBound,
+    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
+  })
+  const compactionPreview = applySendCompaction(visibleMessages, {
+    enabled: compactionOverride === 'off' ? false : autoCompact,
+    forced: compactionOverride === 'force',
+    filledPercent: contextBudget?.filledPercent ?? 0,
+  })
+  const elidedTokenEstimate = compactionPreview.compacted    ? visibleMessages
+      .filter((message) => !compactionPreview.messages.includes(message))
+      .reduce((sum, message) => {
+        const text = String(message?.content || '')
+        const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
+        return sum + Math.round(Math.max(pieces.length, text.length / 4))
+      }, 0)
+    : 0
+
+  const handleToggleAutoCompact = (next) => {
+    setAutoCompactEnabled(next)
+    setAutoCompactState(next)
+    /* Changing the preference clears a per-chat override, otherwise the
+       checkbox would appear to do nothing in this conversation. */
+    setCompactionOverride(conversationId, null)
+    setCompactionOverrideState(null)
+  }
+  const handleCompactNow = () => {
+    setCompactionOverride(conversationId, 'force')
+    setCompactionOverrideState('force')
+  }
+  const handleSendEverything = () => {
+    setCompactionOverride(conversationId, 'off')
+    setCompactionOverrideState('off')
+  }
 
   /* Folded fine print: everything that used to stack under the composer now
      lives in the status line's tooltip. Error and budget notices still render
@@ -610,7 +831,40 @@ export default function ChatWorkspace({
           onClose={() => setShowControls(false)}
         />
       )}
-      <div className="cxcomposer__box">
+      <div
+        className="cxcomposer__box"
+        onDragOver={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+        }}
+        onDrop={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          if (e.dataTransfer.files?.length) {
+            handleDocumentFiles(e.dataTransfer.files)
+          }
+        }}
+      >
+        {(attachedDocuments.length > 0 || documentIngesting) && (
+          <div className="cxcomposer__docs">
+            {attachedDocuments.map((doc) => (
+              <div key={doc.doc_id} className="cxcomposer__doc-pill">
+                <IconFile size={14} />
+                <span className="cxcomposer__doc-name" title={doc.filename}>{doc.filename}</span>
+                <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
+                <button
+                  type="button"
+                  className="cxcomposer__doc-remove"
+                  title="Remove document"
+                  onClick={() => setAttachedDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id))}
+                >
+                  <IconClose size={12} />
+                </button>
+              </div>
+            ))}
+            {documentIngesting && <span className="cxcomposer__doc-status">Indexing document…</span>}
+          </div>
+        )}
         {composerImage && (
           <div className="cxcomposer__image" role="status">
             <img src={composerImage.data_url} alt={`Attached ${composerImage.name}`} />
@@ -705,6 +959,31 @@ export default function ChatWorkspace({
                 </button>
               </>
             )}
+            <input
+              ref={docInputRef}
+              className="sr-only"
+              type="file"
+              accept=".pdf,.docx,.md,.txt,.csv,.json"
+              multiple
+              onChange={(e) => {
+                handleDocumentFiles(e.target.files)
+                e.target.value = ''
+              }}
+              tabIndex={-1}
+            />
+            <button
+              type="button"
+              className={`cxcomposer__tool cxcomposer__tool--collapsible ${attachedDocuments.length > 0 ? 'is-on' : ''}`}
+              onClick={() => docInputRef.current?.click()}
+              disabled={requestActive || documentIngesting}
+              aria-label="Attach documents for RAG"
+              title="Drag & drop or attach .pdf, .docx, .md, .txt, .csv documents for local RAG"
+            >
+              <IconFile size={16} />{' '}
+              <span className="cxcomposer__tool-label">
+                {documentIngesting ? 'Indexing…' : attachedDocuments.length > 0 ? `Docs (${attachedDocuments.length})` : 'Docs'}
+              </span>
+            </button>
             {!demoMode && setWebResearchEnabled && (
               <button
                 type="button"
@@ -794,6 +1073,7 @@ export default function ChatWorkspace({
       </div>
 
       {imageError && <p className="cxcomposer__image-error" role="alert">{imageError}</p>}
+      {documentError && <p className="cxcomposer__image-error" role="alert">{documentError}</p>}
 
       {sendBudget.level === 'error' && (
         <p className="cxcomposer__budget-error" role="alert">
@@ -812,6 +1092,25 @@ export default function ChatWorkspace({
           <StatusDot tone={statusTone} pulse={supportedChatReady || verifiedChatReady || varianceChatReady} />
           <span className="cxcomposer__status-text">{statusLine}</span>
         </span>
+        <ContextMeter
+          contextLength={activeContextLength}
+          promptTokens={estimatedPromptTokens}
+          reservedTokens={effectiveMaxTokens}
+          verifiedBound={verifiedBound}
+          executionLane={executionLane}
+          autoCompact={autoCompact}
+          onToggleAutoCompact={handleToggleAutoCompact}
+          onCompactNow={compactionPreview.compacted ? null : handleCompactNow}
+          canCompact={compactForSend(visibleMessages) !== null}
+          compaction={compactionPreview.compacted
+            ? {
+              active: true,
+              elidedCount: compactionPreview.elidedCount,
+              freedTokens: elidedTokenEstimate,
+            }
+            : null}
+          onSendEverything={compactionPreview.compacted ? handleSendEverything : null}
+        />
         {statusDetail && (
           <Tooltip content={statusDetail} placement="top">
             <button type="button" className="cxcomposer__status-info" aria-label="Chat status details">
@@ -953,6 +1252,34 @@ export default function ChatWorkspace({
           {renderComposer()}
         </div>
       </div>
+
+      {activeCitation && (
+        <div className="citation-modal-overlay" onClick={() => setActiveCitation(null)}>
+          <div className="citation-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="citation-modal__header">
+              <div className="citation-modal__title">
+                <IconFile size={16} />
+                <span>{activeCitation.filename || 'Source Document'}</span>
+              </div>
+              {activeCitation.retrieval === 'attached' ? (
+                <span className="citation-modal__score">Attached context</span>
+              ) : activeCitation.score != null && (
+                <span className="citation-modal__score">
+                  Relevance: {(activeCitation.score * 100).toFixed(0)}%
+                </span>
+              )}
+            </div>
+            <div className="citation-modal__body">
+              <p>{activeCitation.excerpt}</p>
+            </div>
+            <div className="citation-modal__footer">
+              <button type="button" className="button" onClick={() => setActiveCitation(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   )
 }

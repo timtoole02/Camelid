@@ -1025,6 +1025,45 @@ pub fn gemma4_cuda_lane_selectable() -> bool {
     cuda_resident_decode_will_run()
 }
 
+/// Whether the qwen35 serve lane should run on the CUDA-resident engine.
+///
+/// **Default ON** where a CUDA device is actually driving this process; opt out
+/// with `CAMELID_QWEN35_CUDA=0` (0/off/false/no/disabled). It used to be opt-IN
+/// for every row except Prism low-bit on Windows, which is the gemma4 Phase 0
+/// finding wearing different clothes: the certified Ornith K-quant rows decoded
+/// on the CPU out of the box on a CUDA host — `select_kquant_plan` advertised
+/// `cuda_resident_kquant_runtime` off `platform.cuda_resident_active` while
+/// `generate_qwen35_streaming` read `CAMELID_QWEN35_CUDA` itself and fell to the
+/// CPU runnable lane, because the two consulted different things.
+///
+/// This is the POLICY half only. It says nothing about whether a given file
+/// FITS: capacity is enforced per request by `qwen35_generation_budget` against
+/// `CAMELID_QWEN35_CUDA_MAXPOS`, and every CUDA error raised before a token is
+/// emitted falls back to the CPU oracle (`qwen35_cuda_with_cpu_fallback`).
+///
+/// `--gpu off` and the UI's live toggle stay authoritative: they clear
+/// `gpu_accel_enabled`, which `cuda_resident_decode_will_run` requires. An
+/// explicit `CAMELID_QWEN35_CUDA=1` is an opt-IN to this lane, never an override
+/// of that master switch.
+///
+/// The default flips only on Windows, which is where the qwen35 CUDA lane
+/// carries receipts (the Ornith Q4_K_M parity + agent-eval PASS receipts, and
+/// the Prism Windows CUDA branch this predicate replaces). Other CUDA hosts keep
+/// the historical opt-in until the same evidence exists for them, so this change
+/// cannot alter a platform it has not been measured on.
+pub fn qwen35_cuda_lane_selectable() -> bool {
+    if matches!(requested_profile().0, ExecutionProfile::Safe) {
+        return false;
+    }
+    if env_flag_disabled("CAMELID_QWEN35_CUDA") {
+        return false;
+    }
+    if !cfg!(windows) && !env_flag_enabled("CAMELID_QWEN35_CUDA") {
+        return false;
+    }
+    cuda_resident_decode_will_run()
+}
+
 /// Everything the gemma4 CUDA-resident lane puts in VRAM BESIDES the per-layer
 /// projections: the small per-layer norms, the f16 KV cache at the load site's
 /// 4096-position window, the GPU tied head, the GPU PLE context projection, and
@@ -1793,6 +1832,11 @@ fn cuda_resident_q8_runnable_plan() -> (
 /// CUDA-resident windowed plan on a CUDA host).
 fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
     let arch = gguf.architecture().unwrap_or("");
+    // mobilemoe is the one MoE arch the resident lane routes on the GPU (expert-indexed
+    // GEMV + on-device top-k), so it is admitted despite its non-zero expert_count.
+    if arch == "mobilemoe" {
+        return true;
+    }
     if !matches!(arch, "llama" | "qwen2" | "qwen3" | "mistral") {
         return false;
     }
@@ -2574,6 +2618,57 @@ mod tests {
         assert!(!lfm2_metal_plan_selectable());
         env::remove_var("CAMELID_PROFILE");
         env::remove_var("CAMELID_LFM2_METAL");
+    }
+
+    /// The qwen35 CUDA lane must ROUTE where the plan DISCLOSES it.
+    /// `select_kquant_plan` advertises `cuda_resident_kquant_runtime` off
+    /// `platform.cuda_resident_active` alone, but routing additionally required the
+    /// output tensor to be a Prism low-bit quant — so a certified Ornith Q4_K_M row
+    /// (qwen35) reported the CUDA lane in `/v1/health` and decoded on the CPU.
+    /// Measured on an RTX 3060 Laptop: 0.42 tok/s served, 6.14 tok/s once the lane
+    /// was reachable, same row, same host.
+    ///
+    /// Pins the two halves to one predicate: with no operator opt-out, Windows
+    /// routing tracks `cuda_resident_decode_will_run` exactly — the same signal the
+    /// plan reads — for every qwen35 row, Prism or K-quant.
+    #[test]
+    fn qwen35_cuda_routing_tracks_the_disclosed_resident_lane() {
+        let _guard = crate::test_support::env_lock();
+        env::remove_var("CAMELID_QWEN35_CUDA");
+        env::remove_var("CAMELID_PROFILE");
+        env::remove_var("CAMELID_DETERMINISTIC");
+
+        if cfg!(windows) {
+            assert_eq!(
+                qwen35_cuda_lane_selectable(),
+                cuda_resident_decode_will_run(),
+                "with no opt-out, routing must follow the same signal the plan discloses \
+                 — not a per-row quant test the plan never applied"
+            );
+        }
+
+        env::set_var("CAMELID_QWEN35_CUDA", "0");
+        assert!(
+            !qwen35_cuda_lane_selectable(),
+            "an explicit opt-out must still pin the CPU oracle"
+        );
+
+        env::set_var("CAMELID_QWEN35_CUDA", "1");
+        env::set_var("CAMELID_PROFILE", "safe");
+        assert!(
+            !qwen35_cuda_lane_selectable(),
+            "safe profile must beat an explicit opt-in"
+        );
+        env::remove_var("CAMELID_PROFILE");
+
+        env::set_var("CAMELID_DETERMINISTIC", "1");
+        assert!(
+            !qwen35_cuda_lane_selectable(),
+            "deterministic mode must pin the CPU oracle even with an explicit opt-in"
+        );
+
+        env::remove_var("CAMELID_DETERMINISTIC");
+        env::remove_var("CAMELID_QWEN35_CUDA");
     }
 
     use super::*;

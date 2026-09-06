@@ -1,0 +1,11 @@
+{"type":"session","version":3,"id":"pi-session-1","timestamp":"2026-08-25T00:00:00Z","cwd":"/workspace"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"assistant","content":[]}}
+{"type":"message_update","usage":{"input":100,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":107},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done"}}
+{"type":"tool_execution_start","toolCallId":"call-1","toolName":"read","args":{"path":"src/pricing.cjs"}}
+{"type":"tool_execution_end","toolCallId":"call-1","toolName":"read","result":{"content":"source"},"isError":false}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"},"toolResults":[]}
+{"type":"agent_end","messages":[]}
+{"type":"agent_settled"}

@@ -16,6 +16,7 @@ import {
   shouldCreateConversationForSend,
 } from '../src/lib/chatState.js'
 import { normalizeStoredConversations } from '../src/lib/conversationStorage.js'
+import { normalizeAttachedDocuments } from '../src/lib/documentAttachments.js'
 import { conversationToJson, conversationToMarkdown } from '../src/lib/conversationExport.js'
 import { canonicalStatementLabel, splitCanonicalStatement } from '../src/lib/canonicalStatement.js'
 import { describeExecutionPlan, executionRuntimeFields } from '../src/lib/executionPlan.js'
@@ -102,6 +103,11 @@ assert.equal(revivedInterruptedChat.messages[0].finish_reason, 'interrupted', 'r
 assert.equal(revivedInterruptedChat.messages[0].content, '(generation interrupted)', 'blank reloaded interrupted streams should render safely')
 const liveStreamingChat = normalizeStoredConversations([{ id: 'live-chat', messages: [{ id: 'live-assistant', role: 'assistant', content: 'partial', streaming: true, streaming_phase: 'streaming' }] }])[0]
 assert.equal(liveStreamingChat.messages[0].streaming, true, 'live in-memory stream normalization should preserve active generation state')
+
+assert.deepEqual(normalizeAttachedDocuments([
+  { doc_id: ' doc-1 ', filename: ' notes.txt ', chunk_count: 2, byte_size: 30, ignored: '/private/path' },
+  { doc_id: '', filename: 'invalid.txt' },
+]), [{ doc_id: 'doc-1', filename: 'notes.txt', chunk_count: 2, byte_size: 30 }], 'persisted document attachments must retain only server ids and display metadata')
 
 /* ---- Conversation export must be path-free by construction (I7) ---- */
 const sneakyConversation = {

@@ -117,6 +117,8 @@ pub struct ChatOptions {
     /// Headless one-shot (`camelid agent exec`): run this goal to completion and
     /// exit, instead of opening a REPL. Implies `agent` + `plain`.
     pub exec_goal: Option<String>,
+    /// Secret-safe benchmark trace emitted only by headless `agent exec`.
+    pub benchmark_events: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +246,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
                 return Ok(2);
             }
         };
+        let benchmark_exec = opts.benchmark_events.is_some();
         let cfg = agent::AgentConfig {
             workdir: opts.workdir.unwrap_or_else(|| PathBuf::from(".")),
             max_steps: opts.max_steps,
@@ -256,7 +259,11 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             temperature: opts.temperature,
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
-            tool_profile: tools::ToolProfile::Full,
+            tool_profile: if benchmark_exec {
+                tools::ToolProfile::BenchmarkShared
+            } else {
+                tools::ToolProfile::Full
+            },
             // Exact prompt-plus-reply budget after intersecting the active
             // model, validated agent lane, and this server process's limits.
             ctx_budget: Some(runtime_budget.context_tokens),
@@ -296,7 +303,13 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
 
         // Headless one-shot: no REPL, tri-state exit, answer on stdout.
         if let Some(goal) = opts.exec_goal.as_deref() {
-            let code = agent::run_exec(&mut session, opts.addr, cfg, goal);
+            let code = agent::run_exec(
+                &mut session,
+                opts.addr,
+                cfg,
+                goal,
+                opts.benchmark_events.as_deref(),
+            );
             mcp::shutdown();
             return code;
         }

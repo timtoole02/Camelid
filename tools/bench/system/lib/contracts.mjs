@@ -67,6 +67,8 @@ const AGENT_OUTCOMES = new Set([
   'INVALID_SCORER',
   'INVALID_INFRASTRUCTURE',
 ])
+const EXEC_TRACE_REASONS = new Set(['answered', 'aborted', 'step_capped', 'repeated', 'driver_error'])
+const EXEC_TRACE_OUTCOMES = new Set(['completed', 'inconclusive', 'failed'])
 
 export class ContractError extends Error {
   constructor(contract, issues) {
@@ -592,6 +594,99 @@ export function validateTaskCheck(value) {
   }
   if (issues.length > 0) fail('task-check/v1', issues)
   return value
+}
+
+export function validateAgentExecTrace(value) {
+  const issues = []
+  object(value, '$', issues)
+  if (issues.length > 0) fail('agent-exec-trace/v1', issues)
+  exactKeys(value, '$', ['schema', 'terminal', 'summary', 'steps', 'audit_events'], [], issues)
+  equal(value.schema, 'camelid.agent-exec-trace/v1', '$.schema', issues)
+  nestedObject(value.terminal, '$.terminal', ['reason', 'outcome', 'exit_code', 'wall_ms'], issues, (terminal) => {
+    member(terminal.reason, EXEC_TRACE_REASONS, '$.terminal.reason', issues)
+    member(terminal.outcome, EXEC_TRACE_OUTCOMES, '$.terminal.outcome', issues)
+    if (![0, 1, 3].includes(terminal.exit_code)) issues.push('$.terminal.exit_code must be 0, 1, or 3')
+    nonNegativeInteger(terminal.wall_ms, '$.terminal.wall_ms', issues)
+    const expected = terminal.reason === 'answered'
+      ? ['completed', 0]
+      : terminal.reason === 'driver_error'
+        ? ['failed', 1]
+        : ['inconclusive', 3]
+    if (terminal.outcome !== expected[0]) issues.push(`$.terminal.outcome must equal ${JSON.stringify(expected[0])} for reason ${terminal.reason}`)
+    if (terminal.exit_code !== expected[1]) issues.push(`$.terminal.exit_code must equal ${expected[1]} for reason ${terminal.reason}`)
+  })
+  nestedObject(value.summary, '$.summary', [
+    'model_steps', 'tool_calls', 'tool_errors', 'compactions', 'model_ms', 'output_tokens',
+  ], issues, (summary) => {
+    for (const field of ['model_steps', 'tool_calls', 'tool_errors', 'compactions', 'model_ms']) {
+      nonNegativeInteger(summary[field], `$.summary.${field}`, issues)
+    }
+    nullableNonNegativeInteger(summary.output_tokens, '$.summary.output_tokens', issues)
+    if (Number.isInteger(summary.tool_errors) && Number.isInteger(summary.tool_calls)
+      && summary.tool_errors > summary.tool_calls) issues.push('$.summary.tool_errors cannot exceed $.summary.tool_calls')
+  })
+  array(value.steps, '$.steps', issues)
+  if (Array.isArray(value.steps)) {
+    value.steps.forEach((step, index) => validateExecStep(step, index, issues))
+    if (value.summary?.model_steps !== value.steps.length) issues.push('$.summary.model_steps must equal $.steps.length')
+    const modelMs = value.steps.reduce((sum, step) => sum + (Number.isSafeInteger(step?.model_ms) ? step.model_ms : 0), 0)
+    if (value.summary?.model_ms !== modelMs) issues.push('$.summary.model_ms must equal the sum of $.steps[].model_ms')
+    const outputKnown = value.steps.every((step) => Number.isSafeInteger(step?.output_tokens))
+    const outputTokens = outputKnown ? value.steps.reduce((sum, step) => sum + step.output_tokens, 0) : null
+    if (value.summary?.output_tokens !== outputTokens) issues.push('$.summary.output_tokens must equal the known step-token sum or null')
+  }
+  array(value.audit_events, '$.audit_events', issues)
+  if (Array.isArray(value.audit_events)) {
+    value.audit_events.forEach((event, index) => validateExecAuditEvent(event, index, issues))
+    const calls = value.audit_events.filter((event) => event?.event === 'agent.tool_call').length
+    const errors = value.audit_events.filter((event) => event?.event === 'agent.tool_result' && event?.outcome === 'error').length
+    if (value.summary?.tool_calls !== calls) issues.push('$.summary.tool_calls must equal the agent.tool_call count')
+    if (value.summary?.tool_errors !== errors) issues.push('$.summary.tool_errors must equal the error tool-result count')
+  }
+  if (issues.length > 0) fail('agent-exec-trace/v1', issues)
+  return value
+}
+
+function validateExecStep(value, index, issues) {
+  const path = `$.steps[${index}]`
+  nestedObject(value, path, ['index', 'model_ms', 'ttft_ms', 'output_tokens', 'context'], issues, (step) => {
+    nonNegativeInteger(step.index, `${path}.index`, issues)
+    if (step.index !== index) issues.push(`${path}.index must equal ${index}`)
+    nonNegativeInteger(step.model_ms, `${path}.model_ms`, issues)
+    nullableNonNegativeInteger(step.ttft_ms, `${path}.ttft_ms`, issues)
+    nullableNonNegativeInteger(step.output_tokens, `${path}.output_tokens`, issues)
+    if (step.context !== null) validateExecContext(step.context, `${path}.context`, issues)
+  })
+}
+
+function validateExecContext(value, path, issues) {
+  const fields = [
+    'prompt_tokens', 'generation_tokens', 'budget_tokens', 'system_tokens_estimate',
+    'tool_definition_tokens_estimate', 'message_tokens_estimate', 'recent_memory_tokens_estimate',
+    'retrieved_memory_tokens_estimate', 'evidence_memory_tokens_estimate', 'tool_result_tokens_estimate',
+  ]
+  nestedObject(value, path, fields, issues, (context) => {
+    for (const field of fields) nonNegativeInteger(context[field], `${path}.${field}`, issues)
+  })
+}
+
+function validateExecAuditEvent(value, index, issues) {
+  const path = `$.audit_events[${index}]`
+  nestedObject(value, path, ['event', 'tool', 'approval_tier', 'args_digest', 'outcome', 'duration_ms'], issues, (event) => {
+    member(event.event, new Set(['agent.tool_call', 'agent.tool_result']), `${path}.event`, issues)
+    nonEmpty(event.tool, `${path}.tool`, issues)
+    nonEmpty(event.approval_tier, `${path}.approval_tier`, issues)
+    if (typeof event.args_digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(event.args_digest)) {
+      issues.push(`${path}.args_digest must be a tagged SHA-256 digest`)
+    }
+    if (event.event === 'agent.tool_call') {
+      if (event.outcome !== null) issues.push(`${path}.outcome must be null for agent.tool_call`)
+      if (event.duration_ms !== null) issues.push(`${path}.duration_ms must be null for agent.tool_call`)
+    } else {
+      member(event.outcome, new Set(['ok', 'error']), `${path}.outcome`, issues)
+      nonNegativeInteger(event.duration_ms, `${path}.duration_ms`, issues)
+    }
+  })
 }
 
 export function validateBenchGenerateRecord(value) {

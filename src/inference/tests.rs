@@ -1165,6 +1165,7 @@ fn tiny_prefill_schedule_weights(attention_q: CpuTensor) -> LlamaLoadedWeights {
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0; 2])
                 .unwrap(),
             attention_q,
@@ -1615,6 +1616,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: dense_vector("blk.0.attn_norm.weight"),
             attention_q,
             attention_k: dense_matrix("blk.0.attn_k.weight"),
@@ -1731,6 +1733,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: dense_vector("blk.0.attn_norm.weight"),
             attention_q,
             attention_k: dense_matrix("blk.0.attn_k.weight"),
@@ -11263,6 +11266,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         ),
         rope_freqs: None,
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 1.0])
                 .unwrap(),
             attention_q: CpuTensor::from_f32(
@@ -11552,6 +11556,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         ),
         rope_freqs: None,
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 0.8])
                 .unwrap(),
             attention_q: CpuTensor::from_f32(
@@ -11771,6 +11776,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         mla: None,
     };
     let layer = LlamaLayerWeights {
+        moe_expert_bias: None,
         attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 1.0])
             .unwrap(),
         attention_q: CpuTensor::from_f32(
@@ -12065,6 +12071,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         ),
         rope_freqs: None,
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 0.8])
                 .unwrap(),
             attention_q: CpuTensor::from_f32(
@@ -13965,6 +13972,7 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
         layer_range: None,
         output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
+            moe_expert_bias: None,
             attention_norm: t("blk.0.attn_norm.weight", vec![2], 2),
             attention_q: t("blk.0.attn_q.weight", vec![2, 2], 4),
             attention_k: t("blk.0.attn_k.weight", vec![2, 2], 4),

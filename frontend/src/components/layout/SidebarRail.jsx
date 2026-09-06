@@ -8,6 +8,7 @@ import { apiSurfaceAllowsTab } from '../../lib/apiSurface.js'
 import {
   IconAnalytics, IconApi, IconBolt, IconChart, IconChat, IconClose, IconHistory, IconMemory, IconModels,
   IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
+  IconScale,
 } from '../ui/icons'
 
 const NAV_SECTIONS = [
@@ -24,6 +25,7 @@ const NAV_SECTIONS = [
     label: 'Models',
     items: [
       { tab: 'library', label: 'Models', Icon: IconModels },
+      { tab: 'arena', label: 'Model Arena', Icon: IconScale },
       { tab: 'downloads', label: 'Downloaded models', Icon: IconDownload },
     ],
   },

@@ -41,23 +41,61 @@ export const IconMemory = (p) => <Svg {...p}><path d="M17 3H7a2 2 0 0 0-2 2v16l7
 export const IconImage = (p) => <Svg {...p} strokeIcon><rect x="3" y="4" width="18" height="16" rx="2.5" /><circle cx="8.5" cy="9" r="1.5" /><path d="m5 17 4.5-4.5 3.2 3.2 2.1-2.1L19 17" /></Svg>
 export const IconSend = (p) => <Svg {...p}><path d="M12 4 6 10l1.4 1.4L11 7.8V20h2V7.8l3.6 3.6L18 10l-6-6z" /></Svg>
 export const IconStop = (p) => <Svg {...p}><rect x="6" y="6" width="12" height="12" rx="2.5" /></Svg>
-export const IconCopy = (p) => <Svg {...p}><path d="M16 1H4a2 2 0 0 0-2 2v12h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" /></Svg>
-export const IconCheck = (p) => <Svg {...p}><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z" /></Svg>
+export const IconCopy = (p) => (
+  <Svg {...p} strokeIcon>
+    <rect x="4.5" y="8.5" width="11" height="11" rx="2.5" />
+    <path d="M8.5 8.5V7a2.5 2.5 0 0 1 2.5-2.5h6A2.5 2.5 0 0 1 19.5 7v6a2.5 2.5 0 0 1-2.5 2.5H15.5" />
+  </Svg>
+)
+export const IconCheck = (p) => (
+  <Svg {...p} strokeIcon>
+    <polyline points="20 6 9 17 4 12" />
+  </Svg>
+)
 export const IconSun = (p) => <Svg {...p}><path d="M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10zm0-5 2 3h-4l2-3zm0 20-2-3h4l-2 3zM2 12l3-2v4l-3-2zm20 0-3 2v-4l3 2zM4.5 4.5 7 7 5.5 8.5 3 6l1.5-1.5zm15 15L17 17l1.5-1.5L21 18l-1.5 1.5zm0-15L18 6l-1.5-1.5L18 3l1.5 1.5zM4.5 19.5 6 17l1.5 1.5L6 21l-1.5-1.5z" /></Svg>
 export const IconMoon = (p) => <Svg {...p}><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36A6 6 0 0 1 11.36 3.1 9.4 9.4 0 0 0 12 3z" /></Svg>
 export const IconMonitor = (p) => <Svg {...p}><path d="M21 3H3a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h7v2H7v2h10v-2h-3v-2h7a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 13H3V5h18v11z" /></Svg>
 export const IconSearch = (p) => <Svg {...p} strokeIcon><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></Svg>
 export const IconTrash = (p) => <Svg {...p}><path d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2h4v2H4V6h4l1-2zm1 6v8h2v-8h-2zm4 0v8h2v-8h-2z" /></Svg>
 export const IconClose = (p) => <Svg {...p}><path d="m18.3 5.7-1.4-1.4L12 9.2 7.1 4.3 5.7 5.7 10.6 10.6 5.7 15.5l1.4 1.4L12 12l4.9 4.9 1.4-1.4-4.9-4.9 4.9-4.9z" /></Svg>
+export const IconFile = (p) => (
+  <Svg {...p} strokeIcon>
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+    <line x1="16" y1="13" x2="8" y2="13" />
+    <line x1="16" y1="17" x2="8" y2="17" />
+  </Svg>
+)
+export const IconScale = (p) => (
+  <Svg {...p} strokeIcon>
+    <path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+    <path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+    <path d="M7 21h10" />
+    <path d="M12 3v18" />
+    <path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />
+  </Svg>
+)
 export const IconChevronDown = (p) => <Svg {...p} strokeIcon><path d="m6 9 6 6 6-6" /></Svg>
 export const IconChevronRight = (p) => <Svg {...p} strokeIcon><path d="m9 6 6 6-6 6" /></Svg>
 export const IconPlus = (p) => <Svg {...p}><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5z" /></Svg>
 export const IconDownload = (p) => <Svg {...p}><path d="M12 3v10.2l3.6-3.6L17 11l-5 5-5-5 1.4-1.4L11 13.2V3h2zM5 19h14v2H5z" /></Svg>
 export const IconExternal = (p) => <Svg {...p}><path d="M14 3h7v7h-2V6.4l-9.3 9.3-1.4-1.4L17.6 5H14V3zM5 5h5v2H5v12h12v-5h2v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z" /></Svg>
-export const IconRefresh = (p) => <Svg {...p}><path d="M12 6V3L8 7l4 4V8a4 4 0 1 1-4 4H6a6 6 0 1 0 6-6z" /></Svg>
+export const IconRefresh = (p) => (
+  <Svg {...p} strokeIcon>
+    <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+    <path d="M3 3v5h5" />
+    <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+    <path d="M16 21h5v-5" />
+  </Svg>
+)
 export const IconDots = (p) => <Svg {...p}><path d="M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4z" /></Svg>
 export const IconPin = (p) => <Svg {...p}><path d="M16 4v2l-1 1v5l2 2v2h-4v5l-1 1-1-1v-5H7v-2l2-2V7L8 6V4h8z" /></Svg>
-export const IconEdit = (p) => <Svg {...p}><path d="M3 17.25V21h3.75L17.8 9.94l-3.75-3.75L3 17.25zM20.7 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" /></Svg>
+export const IconEdit = (p) => (
+  <Svg {...p} strokeIcon>
+    <path d="M17.5 3.5a2.121 2.121 0 0 1 3 3L7 20l-4 1 1-4L17.5 3.5z" />
+    <path d="m15 6 3 3" />
+  </Svg>
+)
 export const IconWarning = (p) => <Svg {...p}><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" /></Svg>
 export const IconInfo = (p) => <Svg {...p}><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" /></Svg>
 export const IconCheckCircle = (p) => <Svg {...p}><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-2 15-5-5 1.4-1.4L10 14.2l7.6-7.6L19 8l-9 9z" /></Svg>

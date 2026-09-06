@@ -6540,22 +6540,42 @@ extern "C" __global__ void attention_batched_q8_0(
         int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
         int G = (position_count + head_dim - 1) / head_dim;
         if (G < 1) G = 1; if (G > max_groups) G = max_groups;
-        float* vpart = shared + head_dim;
-        int gid = tid / head_dim;
-        int did = tid % head_dim;
-        int b = did / 32;
-        int bi = did % 32;
-        int p_lo = (int)((long)gid * position_count / G);
-        int p_hi = (int)((long)(gid + 1) * position_count / G);
-        float acc = 0.0f;
-        for (int p = p_lo; p < p_hi; p++) {
-            const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
-            float d = f16_bits_to_f32(vp->scale);
-            acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+        float* vpart = shared + head_dim; // [max_groups * head_dim]
+        // Grid-stride over all G*head_dim partials, exactly as the f16
+        // `attention_batched` does.
+        //
+        // The two launcher families use opposite conventions. `launch_attention`
+        // (decode) sets blockDim = groups*head_dim and the kernel recovers
+        // G = blockDim.x/head_dim, so deriving gid from tid is self-consistent there.
+        // `launch_attention_batched` instead pins blockDim at 128 and computes G from
+        // position_count, so the kernel MUST stride. This one was written to the decode
+        // convention and launched with the batched one, which breaks in both directions
+        // whenever blockDim.x != G*head_dim:
+        //   head_dim 128, G>=2 (over-subscribed): gid was always 0, so only 1/G of the
+        //     positions were accumulated and the g>=1 slots of `vpart` were summed back
+        //     uninitialised. Correct at G==1 only.
+        //   head_dim 64 (under-subscribed): threads 64..127 got gid==1 even at G==1,
+        //     scanned positions past the live prefix, and wrote vpart[did+1] on top of
+        //     the gid==0 writer for dim did+1 — a race at every context length.
+        //   head_dim 256: gid was always 0 and did never exceeded 127, so output dims
+        //     128..255 were never written at any context length.
+        // Striding to exactly G*head_dim fixes all three.
+        for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
+            int gid = idx / head_dim, did = idx % head_dim;
+            int b = did / 32;
+            int bi = did % 32;
+            int p_lo = (int)((long)gid * position_count / G);
+            int p_hi = (int)((long)(gid + 1) * position_count / G);
+            float acc = 0.0f;
+            for (int p = p_lo; p < p_hi; p++) {
+                const block_q8_0* vp = vbase + ((long)p * blocks_per_head + b);
+                float d = f16_bits_to_f32(vp->scale);
+                acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+            }
+            vpart[(long)did * G + gid] = acc;
         }
-        vpart[(long)did * G + gid] = acc;
         __syncthreads();
-        if (gid == 0) {
+        for (int did = tid; did < head_dim; did += blockDim.x) {
             float sum = 0.0f;
             for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
             out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
@@ -13734,6 +13754,21 @@ fn prism_cuda_bmma_enabled() -> bool {
     })
 }
 
+/// Opt-in for the parity-correct Q4_K/Q6_K batched-prefill tiles (see
+/// `prefers_batched_prefill`). Default OFF: the serial GEMVs stay the shipped
+/// policy for K-quant rows until a device carries a receipt.
+fn kquant_batched_prefill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CAMELID_KQUANT_BATCHED_PREFILL")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
 fn prism_cuda_bmma_min_tokens() -> usize {
     static MIN_TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MIN_TOKENS.get_or_init(|| {
@@ -14934,14 +14969,35 @@ impl CudaResidentDecode {
     /// Default policy after same-host Windows/WDDM benchmarking. Q8_0 batching
     /// remains a clear win; the parity-correct Q4_K/Q6_K tiles stay opt-in until
     /// a device shows a sustained gain over the mature serial GEMVs.
+    ///
+    /// `CAMELID_KQUANT_BATCHED_PREFILL=1` is that opt-in: it admits the Q4_K/Q6_K
+    /// tiles so a device can be measured against the serial GEMVs on a real row.
+    /// It only ever widens the set, and only where `supports_batched_prefill`
+    /// already holds — which requires full residency, so an offloaded model keeps
+    /// the serial path that streams its offloaded weights correctly.
+    ///
+    /// MEASURED NULL — qwen35 Ornith-1.0-9B Q4_K_M, RTX 3060 Laptop, fully resident
+    /// (`CAMELID_QWEN35_CUDA_HEADROOM_MB=0`), 2813-token prompt, paired A/B with
+    /// matched thermal start: serial 141.6s / 149.8s vs batched 148.5s / 151.7s =
+    /// 0.95x and 0.99x. Completions were token-for-token identical across all four
+    /// runs, so the tiles are parity-correct — they are simply not faster on this
+    /// row. MECHANISM: 24 of these 32 layers are SSM, and the gated-delta
+    /// recurrence is sequential ACROSS tokens, so a batched chunk can only amortize
+    /// weight reads for the 8 full-attention layers and the FFNs; the SSM majority
+    /// still walks token by token. Expect a null on any SSM-heavy qwen35 row and
+    /// spend the effort elsewhere. Dense K-quant rows are NOT covered by this
+    /// measurement and remain genuinely open.
     pub fn prefers_batched_prefill(&self) -> bool {
-        self.supports_batched_prefill()
-            && self.layers.iter().all(|layer| {
-                layer
-                    .quants
-                    .iter()
-                    .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
-            })
+        if !self.supports_batched_prefill() {
+            return false;
+        }
+        let mature_quants_only = self.layers.iter().all(|layer| {
+            layer
+                .quants
+                .iter()
+                .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
+        });
+        mature_quants_only || kquant_batched_prefill_enabled()
     }
 
     /// Whether linear speculative verification can use the batched stack,

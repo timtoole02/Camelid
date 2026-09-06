@@ -5,8 +5,9 @@ use serde::Serialize;
 use crate::{
     model::{DenseLlamaDims, LlamaModelConfig},
     tensor::kv_quant::{
-        dequantize_row_q4_0, dequantize_row_q8_0, quantize_row_q4_0, quantize_row_q8_0, BlockQ4_0,
-        BlockQ8_0, KV_QUANT_BLOCK_VALUES,
+        dequantize_row_fp8_e4m3, dequantize_row_fp8_e5m2, dequantize_row_q4_0, dequantize_row_q8_0,
+        quantize_row_fp8_e4m3, quantize_row_fp8_e5m2, quantize_row_q4_0, quantize_row_q8_0,
+        BlockFp8E4m3, BlockFp8E5m2, BlockQ4_0, BlockQ8_0, KV_QUANT_BLOCK_VALUES,
     },
     BackendError, Result,
 };
@@ -126,6 +127,10 @@ pub struct LlamaKvCache {
     pub values_q8_0: Vec<BlockQ8_0>,
     pub keys_q4_0: Vec<BlockQ4_0>,
     pub values_q4_0: Vec<BlockQ4_0>,
+    pub keys_fp8_e4m3: Vec<BlockFp8E4m3>,
+    pub values_fp8_e4m3: Vec<BlockFp8E4m3>,
+    pub keys_fp8_e5m2: Vec<BlockFp8E5m2>,
+    pub values_fp8_e5m2: Vec<BlockFp8E5m2>,
     pub allocated_sequence_length: usize,
     pub position: usize,
     /// Materialized-through watermark: positions `[0, materialized_through)` have had
@@ -169,6 +174,10 @@ impl PartialEq for LlamaKvCache {
             && self.values_q8_0 == other.values_q8_0
             && self.keys_q4_0 == other.keys_q4_0
             && self.values_q4_0 == other.values_q4_0
+            && self.keys_fp8_e4m3 == other.keys_fp8_e4m3
+            && self.values_fp8_e4m3 == other.values_fp8_e4m3
+            && self.keys_fp8_e5m2 == other.keys_fp8_e5m2
+            && self.values_fp8_e5m2 == other.values_fp8_e5m2
             && self.allocated_sequence_length == other.allocated_sequence_length
             && self.position == other.position
             && self.materialized_through == other.materialized_through
@@ -218,6 +227,8 @@ pub enum KvDtype {
     F16,
     Q8_0,
     Q4_0,
+    Fp8E4m3,
+    Fp8E5m2,
 }
 
 /// Env gate for f16 storage, read once per cache construction. Requires the
@@ -253,6 +264,8 @@ impl LlamaKvCache {
             match quant {
                 crate::model::KvCacheQuantization::Q8_0 => KvDtype::Q8_0,
                 crate::model::KvCacheQuantization::Q4_0 => KvDtype::Q4_0,
+                crate::model::KvCacheQuantization::Fp8E4m3 => KvDtype::Fp8E4m3,
+                crate::model::KvCacheQuantization::Fp8E5m2 => KvDtype::Fp8E5m2,
                 crate::model::KvCacheQuantization::F16 => {
                     if kv_f16_enabled() {
                         KvDtype::F16
@@ -268,6 +281,8 @@ impl LlamaKvCache {
             match quant {
                 crate::model::KvCacheQuantization::Q8_0 => KvDtype::Q8_0,
                 crate::model::KvCacheQuantization::Q4_0 => KvDtype::Q4_0,
+                crate::model::KvCacheQuantization::Fp8E4m3 => KvDtype::Fp8E4m3,
+                crate::model::KvCacheQuantization::Fp8E5m2 => KvDtype::Fp8E5m2,
                 _ => KvDtype::F32,
             },
         );
@@ -298,6 +313,10 @@ impl LlamaKvCache {
             values_q8_0: Vec::new(),
             keys_q4_0: Vec::new(),
             values_q4_0: Vec::new(),
+            keys_fp8_e4m3: Vec::new(),
+            values_fp8_e4m3: Vec::new(),
+            keys_fp8_e5m2: Vec::new(),
+            values_fp8_e5m2: Vec::new(),
             allocated_sequence_length: 0,
             position: 0,
             materialized_through: 0,
@@ -484,6 +503,30 @@ impl LlamaKvCache {
                 v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
                 streams,
             ),
+            KvDtype::Fp8E4m3 => grow_buffers(
+                &mut self.keys_fp8_e4m3,
+                &mut self.values_fp8_e4m3,
+                self.layout,
+                row_count * k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                row_count * v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                self.allocated_sequence_length,
+                target_sequence_length,
+                k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                streams,
+            ),
+            KvDtype::Fp8E5m2 => grow_buffers(
+                &mut self.keys_fp8_e5m2,
+                &mut self.values_fp8_e5m2,
+                self.layout,
+                row_count * k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                row_count * v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                self.allocated_sequence_length,
+                target_sequence_length,
+                k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                streams,
+            ),
         }
         self.allocated_sequence_length = target_sequence_length;
         Ok(())
@@ -520,6 +563,14 @@ impl LlamaKvCache {
             KvDtype::Q4_0 => {
                 ((self.keys_q4_0.len() + self.values_q4_0.len()) * std::mem::size_of::<BlockQ4_0>())
                     as u64
+            }
+            KvDtype::Fp8E4m3 => {
+                ((self.keys_fp8_e4m3.len() + self.values_fp8_e4m3.len())
+                    * std::mem::size_of::<BlockFp8E4m3>()) as u64
+            }
+            KvDtype::Fp8E5m2 => {
+                ((self.keys_fp8_e5m2.len() + self.values_fp8_e5m2.len())
+                    * std::mem::size_of::<BlockFp8E5m2>()) as u64
             }
         }
     }
@@ -767,6 +818,22 @@ impl LlamaKvCache {
                     * blocks_per_stream
                     * std::mem::size_of::<BlockQ4_0>()) as u64
             }
+            KvDtype::Fp8E4m3 => {
+                let blocks_per_stream = self.plan.k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)
+                    + self.plan.v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                (self.plan.layer_count
+                    * self.plan.kv_head_count
+                    * blocks_per_stream
+                    * std::mem::size_of::<BlockFp8E4m3>()) as u64
+            }
+            KvDtype::Fp8E5m2 => {
+                let blocks_per_stream = self.plan.k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)
+                    + self.plan.v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                (self.plan.layer_count
+                    * self.plan.kv_head_count
+                    * blocks_per_stream
+                    * std::mem::size_of::<BlockFp8E5m2>()) as u64
+            }
         }
     }
 
@@ -848,6 +915,40 @@ impl LlamaKvCache {
                     );
                 }
             }
+            KvDtype::Fp8E4m3 => {
+                let key_blocks = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let key_dst = self.quantized_offset(layer_idx, position, kv_head, key_blocks);
+                quantize_row_fp8_e4m3(
+                    key_row,
+                    &mut self.keys_fp8_e4m3[key_dst..key_dst + key_blocks],
+                );
+                if v_dim > 0 {
+                    let value_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let value_dst =
+                        self.quantized_offset(layer_idx, position, kv_head, value_blocks);
+                    quantize_row_fp8_e4m3(
+                        value_row,
+                        &mut self.values_fp8_e4m3[value_dst..value_dst + value_blocks],
+                    );
+                }
+            }
+            KvDtype::Fp8E5m2 => {
+                let key_blocks = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let key_dst = self.quantized_offset(layer_idx, position, kv_head, key_blocks);
+                quantize_row_fp8_e5m2(
+                    key_row,
+                    &mut self.keys_fp8_e5m2[key_dst..key_dst + key_blocks],
+                );
+                if v_dim > 0 {
+                    let value_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let value_dst =
+                        self.quantized_offset(layer_idx, position, kv_head, value_blocks);
+                    quantize_row_fp8_e5m2(
+                        value_row,
+                        &mut self.values_fp8_e5m2[value_dst..value_dst + value_blocks],
+                    );
+                }
+            }
         }
     }
 
@@ -880,6 +981,22 @@ impl LlamaKvCache {
                 let block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
                 let block_src = self.quantized_offset(layer_idx, position, kv_head, block_count);
                 dequantize_row_q4_0(&self.keys_q4_0[block_src..block_src + block_count], out);
+            }
+            KvDtype::Fp8E4m3 => {
+                let block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let block_src = self.quantized_offset(layer_idx, position, kv_head, block_count);
+                dequantize_row_fp8_e4m3(
+                    &self.keys_fp8_e4m3[block_src..block_src + block_count],
+                    out,
+                );
+            }
+            KvDtype::Fp8E5m2 => {
+                let block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let block_src = self.quantized_offset(layer_idx, position, kv_head, block_count);
+                dequantize_row_fp8_e5m2(
+                    &self.keys_fp8_e5m2[block_src..block_src + block_count],
+                    out,
+                );
             }
         }
     }
@@ -947,6 +1064,36 @@ impl LlamaKvCache {
                     &self.values_q4_0[block_src..block_src + block_count]
                 };
                 dequantize_row_q4_0(blocks, out);
+            }
+            KvDtype::Fp8E4m3 => {
+                let blocks = if is_mla {
+                    let key_block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, key_block_count);
+                    &self.keys_fp8_e4m3
+                        [block_src..block_src + v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)]
+                } else {
+                    let block_count = v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, block_count);
+                    &self.values_fp8_e4m3[block_src..block_src + block_count]
+                };
+                dequantize_row_fp8_e4m3(blocks, out);
+            }
+            KvDtype::Fp8E5m2 => {
+                let blocks = if is_mla {
+                    let key_block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, key_block_count);
+                    &self.keys_fp8_e5m2
+                        [block_src..block_src + v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)]
+                } else {
+                    let block_count = v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, block_count);
+                    &self.values_fp8_e5m2[block_src..block_src + block_count]
+                };
+                dequantize_row_fp8_e5m2(blocks, out);
             }
         }
     }

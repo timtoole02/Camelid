@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.ai/schemas/benchmark/agent-exec-trace-v1.schema.json",
+  "title": "Camelid agent exec benchmark trace v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "terminal", "summary", "steps", "audit_events"],
+  "properties": {
+    "schema": { "const": "camelid.agent-exec-trace/v1" },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "outcome", "exit_code", "wall_ms"],
+      "properties": {
+        "reason": { "enum": ["answered", "aborted", "step_capped", "repeated", "driver_error"] },
+        "outcome": { "enum": ["completed", "inconclusive", "failed"] },
+        "exit_code": { "enum": [0, 1, 3] },
+        "wall_ms": { "$ref": "#/$defs/non_negative_integer" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_steps", "tool_calls", "tool_errors", "compactions", "model_ms", "output_tokens"],
+      "properties": {
+        "model_steps": { "$ref": "#/$defs/non_negative_integer" },
+        "tool_calls": { "$ref": "#/$defs/non_negative_integer" },
+        "tool_errors": { "$ref": "#/$defs/non_negative_integer" },
+        "compactions": { "$ref": "#/$defs/non_negative_integer" },
+        "model_ms": { "$ref": "#/$defs/non_negative_integer" },
+        "output_tokens": {
+          "oneOf": [
+            { "$ref": "#/$defs/non_negative_integer" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "model_ms", "ttft_ms", "output_tokens", "context"],
+        "properties": {
+          "index": { "$ref": "#/$defs/non_negative_integer" },
+          "model_ms": { "$ref": "#/$defs/non_negative_integer" },
+          "ttft_ms": {
+            "oneOf": [
+              { "$ref": "#/$defs/non_negative_integer" },
+              { "type": "null" }
+            ]
+          },
+          "output_tokens": {
+            "oneOf": [
+              { "$ref": "#/$defs/non_negative_integer" },
+              { "type": "null" }
+            ]
+          },
+          "context": {
+            "oneOf": [
+              { "$ref": "#/$defs/context" },
+              { "type": "null" }
+            ]
+          }
+        }
+      }
+    },
+    "audit_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["event", "tool", "approval_tier", "args_digest", "outcome", "duration_ms"],
+        "properties": {
+          "event": { "enum": ["agent.tool_call", "agent.tool_result"] },
+          "tool": { "type": "string", "minLength": 1 },
+          "approval_tier": { "type": "string", "minLength": 1 },
+          "args_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "outcome": { "enum": ["ok", "error", null] },
+          "duration_ms": {
+            "oneOf": [
+              { "$ref": "#/$defs/non_negative_integer" },
+              { "type": "null" }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "non_negative_integer": { "type": "integer", "minimum": 0 },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prompt_tokens",
+        "generation_tokens",
+        "budget_tokens",
+        "system_tokens_estimate",
+        "tool_definition_tokens_estimate",
+        "message_tokens_estimate",
+        "recent_memory_tokens_estimate",
+        "retrieved_memory_tokens_estimate",
+        "evidence_memory_tokens_estimate",
+        "tool_result_tokens_estimate"
+      ],
+      "properties": {
+        "prompt_tokens": { "$ref": "#/$defs/non_negative_integer" },
+        "generation_tokens": { "$ref": "#/$defs/non_negative_integer" },
+        "budget_tokens": { "$ref": "#/$defs/non_negative_integer" },
+        "system_tokens_estimate": { "$ref": "#/$defs/non_negative_integer" },
+        "tool_definition_tokens_estimate": { "$ref": "#/$defs/non_negative_integer" },
+        "message_tokens_estimate": { "$ref": "#/$defs/non_negative_integer" },
+        "recent_memory_tokens_estimate": { "$ref": "#/$defs/non_negative_integer" },
+        "retrieved_memory_tokens_estimate": { "$ref": "#/$defs/non_negative_integer" },
+        "evidence_memory_tokens_estimate": { "$ref": "#/$defs/non_negative_integer" },
+        "tool_result_tokens_estimate": { "$ref": "#/$defs/non_negative_integer" }
+      }
+    }
+  }
+}

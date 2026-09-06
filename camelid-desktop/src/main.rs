@@ -14,8 +14,10 @@ mod ui_storage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use engine::Engine;
 use ui_storage::UiStorageState;
@@ -270,6 +272,22 @@ fn emit_error(app: &tauri::AppHandle, title: &str, guidance: &str, detail: &str)
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        if let Some(spotlight) = app.get_webview_window("spotlight") {
+                            if spotlight.is_visible().unwrap_or(false) {
+                                let _ = spotlight.hide();
+                            } else {
+                                let _ = spotlight.show();
+                                let _ = spotlight.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(),
+        )
         .manage(EngineState::default())
         .manage(StartupState::default())
         .manage(UiStorageState::default())
@@ -283,6 +301,35 @@ fn main() {
             ui_storage::replace_ui_storage
         ])
         .setup(|app| {
+            let _ = app
+                .global_shortcut()
+                .register("CommandOrControl+Shift+Space");
+
+            if let Some(icon) = app.default_window_icon() {
+                let _ = TrayIconBuilder::new()
+                    .icon(icon.clone())
+                    .tooltip("Camelid Spotlight")
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(spotlight) = app.get_webview_window("spotlight") {
+                                if spotlight.is_visible().unwrap_or(false) {
+                                    let _ = spotlight.hide();
+                                } else {
+                                    let _ = spotlight.show();
+                                    let _ = spotlight.set_focus();
+                                }
+                            }
+                        }
+                    })
+                    .build(app);
+            }
+
             let handle = app.handle().clone();
             // Start the sidecar off the UI thread so the splash paints immediately.
             std::thread::spawn(move || start_engine(handle));
@@ -364,6 +411,13 @@ fn start_engine(app: tauri::AppHandle) {
                         "Retry. If the problem persists, review the technical details.",
                         &format!("invalid engine URL {url}: {e}"),
                     ),
+                }
+
+                if let Some(spotlight) = app.get_webview_window("spotlight") {
+                    if let Ok(mut parsed_spotlight) = tauri::Url::parse(&url) {
+                        parsed_spotlight.set_fragment(Some("spotlight"));
+                        let _ = spotlight.navigate(parsed_spotlight);
+                    }
                 }
             } else {
                 emit_error(

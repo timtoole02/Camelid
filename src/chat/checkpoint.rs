@@ -284,6 +284,9 @@ pub fn all() -> Vec<Checkpoint> {
 /// user asked for, so problems are swallowed. The one thing it will not do is
 /// write outside the jail.
 pub fn prepare(sandbox: &Sandbox, path: &Path, tool: &str) -> Option<Pending> {
+    if !sandbox.checkpoints_enabled() {
+        return None;
+    }
     // Only files inside the workspace are snapshotted (canonical_rel returns
     // None for anything outside the canonical root). With --allow-fs the agent
     // may legitimately write elsewhere, but copying those into an in-workspace
@@ -909,6 +912,36 @@ pub(crate) mod tests {
         );
         undo(&sandbox, false).unwrap();
         assert!(!d.path().join("a.txt").exists());
+        clear();
+    }
+
+    #[test]
+    fn disabled_checkpoints_leave_no_agent_state() {
+        use super::super::tools::{validate, ToolCall};
+        use serde_json::json;
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path()).with_checkpoints(false);
+        std::fs::write(d.path().join("a.txt"), "before\n").unwrap();
+
+        let outcome = validate(
+            &ToolCall {
+                name: "edit_file".into(),
+                args: json!({"path":"a.txt","old":"before","new":"after"}),
+            },
+            &sandbox,
+        )
+        .unwrap()
+        .execute(&sandbox);
+
+        assert!(!outcome.is_err());
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "after\n"
+        );
+        assert!(all().is_empty());
+        assert!(!d.path().join(".camelid").exists());
         clear();
     }
 

@@ -30,11 +30,13 @@ use tower_http::trace::TraceLayer;
 #[allow(dead_code)]
 mod continuous_batch;
 mod contract;
+pub(crate) mod documents;
 mod engine;
 mod metrics;
 mod responses;
 mod responses_store;
 mod server;
+mod tool_envelope;
 mod web_research;
 pub(crate) mod workspace;
 
@@ -2779,8 +2781,16 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             "/api/agent/workspace/sessions/:id/decisions",
             post(workspace::decide),
         )
+        .route("/api/documents/ingest", post(documents::ingest_document))
+        .route("/api/documents/search", post(documents::search_documents))
+        .route(
+            "/api/documents/:id",
+            axum::routing::delete(documents::delete_document),
+        )
+        .route("/api/documents", get(documents::list_documents))
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
+        .route("/api/models/quantize", post(quantize_model_endpoint))
         .route(
             "/api/models/default",
             get(default_model).post(set_default_model),
@@ -17675,7 +17685,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false, false);
+        return stream_completion(&state, prepared, false, false, None);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -17927,6 +17937,11 @@ async fn chat_completions(
     let tools_active = req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
     let tools_declared = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    // Captured before `req` is consumed downstream. This is the only thing that
+    // authorises undoing a schema envelope the model echoed around its arguments.
+    let declared_tool_parameters = tool_envelope::ToolParameterNames::from_request_tools(
+        req.tools.as_deref().unwrap_or_default(),
+    );
     let tools_unsupported_on_lane = |lane: &str| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -18204,7 +18219,11 @@ async fn chat_completions(
             prepared,
             true,
             include_usage,
-            tools_active && !constraint_active,
+            if tools_active && !constraint_active {
+                Some(declared_tool_parameters)
+            } else {
+                None
+            },
         );
     }
 
@@ -18251,7 +18270,7 @@ async fn chat_completions(
             // request supplied tools and tool_choice permits it. On a tool call,
             // content is emptied and finish_reason flips to "tool_calls".
             let tool_calls = if should_parse_tool_calls(tools_active, constraint_active) {
-                parse_tool_calls(&content)
+                parse_tool_calls(&content, &declared_tool_parameters)
             } else {
                 None
             };
@@ -19416,6 +19435,7 @@ fn estimate_cpu_weight_materialization_bytes_with_q8_storage_and_ownership(
                 gate_experts,
                 up_experts,
                 down_experts,
+                ..
             } => {
                 for desc in [shared_gate, shared_up, shared_down] {
                     total = total
@@ -22426,7 +22446,14 @@ fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool 
 /// The parser tolerates trailing junk after a complete JSON value but remains
 /// strict about function names and JSON arguments, so ordinary prose is never
 /// reclassified as a call.
-fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+///
+/// `declared` carries the parameter names the request advertised, which is what
+/// authorises undoing a schema envelope the model echoed around its arguments;
+/// see [`tool_envelope`].
+fn parse_tool_calls(
+    text: &str,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<Vec<ToolCall>> {
     let trimmed = text.trim();
     let trimmed = trimmed
         .strip_prefix("<|python_tag|>")
@@ -22462,7 +22489,7 @@ fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         .collect::<Vec<_>>();
     let calls = values
         .iter()
-        .filter_map(tool_call_from_value)
+        .filter_map(|value| tool_call_from_value(value, declared))
         .collect::<Vec<_>>();
     (!calls.is_empty()).then_some(calls)
 }
@@ -22474,7 +22501,10 @@ fn first_json_value(text: &str) -> Option<serde_json::Value> {
         .ok()
 }
 
-fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
+fn tool_call_from_value(
+    value: &serde_json::Value,
+    declared: &tool_envelope::ToolParameterNames,
+) -> Option<ToolCall> {
     let obj = value.as_object()?;
     let function = obj.get("function").and_then(serde_json::Value::as_object);
     let name = function
@@ -22497,6 +22527,7 @@ fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
         }
         args => args,
     };
+    let args = tool_envelope::unwrap_schema_envelope(name, args, declared);
     let arguments = serde_json::to_string(&args).ok()?;
     Some(ToolCall {
         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
@@ -23622,7 +23653,7 @@ fn stream_completion(
     mut prepared: PreparedGeneration,
     chat: bool,
     include_usage: bool,
-    parse_stream_tool_calls: bool,
+    stream_tool_calls: Option<tool_envelope::ToolParameterNames>,
 ) -> Response {
     // Streaming keeps whatever speculation `prepare_generation` admitted, and
     // with it that call's resident-path decision. Forcing both off here meant a
@@ -23727,7 +23758,7 @@ fn stream_completion(
                             Some(stream_started.elapsed().as_millis());
                     }
                     if chat {
-                        if parse_stream_tool_calls {
+                        if stream_tool_calls.is_some() {
                             tool_candidate.push_str(&delta);
                             continue;
                         }
@@ -23790,8 +23821,8 @@ fn stream_completion(
                     });
                     if chat {
                         let mut resolved_finish_reason = finish_reason;
-                        if parse_stream_tool_calls {
-                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate) {
+                        if let Some(declared) = stream_tool_calls.as_ref() {
+                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate, declared) {
                                 resolved_finish_reason = "tool_calls";
                                 let tool_calls = tool_calls
                                     .into_iter()
@@ -24650,6 +24681,22 @@ fn render_chat_prompt_for_tokenization_fallback(
                 parse_special: tokenizer.chat_prompt_parse_special(),
             };
         }
+        // Llama 4's header-marker family (Meta MobileMoE and siblings). Kept
+        // ahead of the Llama 3 branch because the two are one lineage with two
+        // marker spellings; neither recognizer can fire on the other's
+        // template, so the order documents the kinship rather than guarding it.
+        if is_llama4_header_template(template) {
+            return RenderedPrompt {
+                text: render_llama4_header_prompt(messages),
+                // No BOS text in the rendered string; add_bos_token=true puts
+                // <|begin_of_text|> in exactly once at token level.
+                add_special: true,
+                // <|header_start|>/<|header_end|>/<|eot|> are control tokens in
+                // this vocabulary; special parsing is what turns them into their
+                // ids instead of spelling them out as ordinary text.
+                parse_special: tokenizer.chat_prompt_parse_special(),
+            };
+        }
         if is_llama3_instruct_template(template) {
             return RenderedPrompt {
                 text: render_llama3_instruct_prompt(messages),
@@ -25248,6 +25295,22 @@ fn is_llama3_instruct_template(template: &str) -> bool {
         && template.contains("<|eot_id|>")
 }
 
+/// Llama 4's header-marker chat template — the family Meta's MobileMoE ships
+/// (`general.architecture = mobilemoe`): every turn is
+/// `<|header_start|>{role}<|header_end|>\n\n{content}<|eot|>`, closed by a bare
+/// assistant header. Same shape as Llama 3 instruct with different marker
+/// spellings, and the two cannot cross-match: `<|header_start|>` never appears
+/// in a Llama 3 template, and `<|eot|>` is not a substring of `<|eot_id|>`
+/// (after `<|eot` comes `_`, not `|`). Without this branch the template fell
+/// through the whole chain to `render_role_colon_prompt` and served a
+/// `"User: …"` transcript these weights were never trained on, so the model
+/// continued the transcript instead of ending its turn.
+fn is_llama4_header_template(template: &str) -> bool {
+    template.contains("<|header_start|>")
+        && template.contains("<|header_end|>")
+        && template.contains("<|eot|>")
+}
+
 fn is_exact_llama31_instruct_template(template: &str) -> bool {
     template.len() == 4613
         && format!("{:x}", Sha256::digest(template.as_bytes()))
@@ -25589,6 +25652,39 @@ fn render_llama3_instruct_prompt_with_options(
     if append_generation_prompt {
         prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     }
+    prompt
+}
+
+/// Render Llama 4's header-marker template byte-faithfully for the
+/// `add_generation_prompt = true` case.
+///
+/// The source template opens with `{{ bos_token }}`, but the rendered string
+/// carries NO BOS text. The GGUF declares `add_bos_token = true` and this
+/// branch encodes with `add_special = true`, so `<|begin_of_text|>` lands
+/// exactly once at token level — the resolution `render_llama3_instruct_prompt`
+/// and `render_gemma3_prompt` took for the same conflict. Spelling BOS into the
+/// text as well is the Mistral shape, which works only because that branch
+/// pairs it with `add_special: false`; doing both here would double the BOS.
+///
+/// Every message is closed with `<|eot|>`, the trailing user turn included: the
+/// template's `{{ content + '<|eot|>' }}` runs unconditionally inside the loop.
+/// The generation prompt is the assistant header with its two literal newlines
+/// and deliberately no `<|eot|>` — that is the token the model must produce to
+/// end its turn, and it is what the GGUF declares as EOS.
+///
+/// Content is emitted untrimmed because the template has no `| trim`. The role
+/// is trimmed: it arrives from the HTTP wire, and stray whitespace inside
+/// `<|header_start|>…<|header_end|>` would break the header into ordinary text.
+fn render_llama4_header_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str("<|header_start|>");
+        prompt.push_str(message.role.trim());
+        prompt.push_str("<|header_end|>\n\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("<|eot|>");
+    }
+    prompt.push_str("<|header_start|>assistant<|header_end|>\n\n");
     prompt
 }
 
@@ -26299,6 +26395,8 @@ fn detect_chat_template_format(template: &str) -> &'static str {
         "gemma2_it_exact"
     } else if is_gemma3_chat_template(template) {
         "gemma3_turn_markers"
+    } else if is_llama4_header_template(template) {
+        "llama4_header_markers"
     } else if is_llama3_instruct_template(template) {
         "llama3_instruct"
     } else if is_mistral_instruct_template(template) {
@@ -26830,7 +26928,7 @@ mod tests {
             orphan_test_prepared("model-a.gguf"),
             true,
             false,
-            false,
+            None,
         );
 
         // Drive the SSE body the way a client does. The reader task polls the
@@ -27292,6 +27390,12 @@ mod tests {
         assert!(validate_choice_and_logprob_fields(&oob).is_err());
     }
 
+    /// No tools declared, so the schema-envelope repair can never fire: these
+    /// cases must behave exactly as they did before it existed.
+    fn no_declared_tools() -> tool_envelope::ToolParameterNames {
+        tool_envelope::ToolParameterNames::from_request_tools(&[])
+    }
+
     #[test]
     fn constrained_output_is_never_reclassified_as_tool_call() {
         // M3 regression: a schema that legitimately declares a `name` property
@@ -27301,7 +27405,7 @@ mod tests {
         // "tool_calls"). OpenAI allows tools + response_format together.
         let constrained_content = r#"{"name":"x","parameters":{}}"#;
         assert!(
-            parse_tool_calls(constrained_content).is_some(),
+            parse_tool_calls(constrained_content, &no_declared_tools()).is_some(),
             "the gate, not the parser, is what protects constrained output"
         );
         assert!(!should_parse_tool_calls(true, true));
@@ -27313,8 +27417,11 @@ mod tests {
     #[test]
     fn parse_tool_calls_extracts_llama_format() {
         // Llama 3.x: {"name", "parameters"}; arguments becomes a JSON string.
-        let tc = parse_tool_calls(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0].function.name, "get_weather");
         assert_eq!(tc[0].kind, "function");
@@ -27324,16 +27431,51 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_envelope_echoed_by_the_model_is_unwrapped_for_the_client() {
+        // Observed on Llama-3.2-1B-Instruct-Q8_0: the model replied with the
+        // schema shape it was shown, leaving `arguments.city` unreachable to an
+        // ordinary OpenAI client.
+        let echoed = r#"{"name": "get_weather", "parameters": {"properties": {"city": "Paris"}}}"#;
+        let declared =
+            tool_envelope::ToolParameterNames::from_request_tools(&[serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }
+            })]);
+
+        let repaired = parse_tool_calls(echoed, &declared).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&repaired[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"city": "Paris"}));
+
+        // The declared schema is the only thing that authorises the rewrite: with
+        // no tools declared the model's output is relayed exactly as produced.
+        let untouched = parse_tool_calls(echoed, &no_declared_tools()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&untouched[0].function.arguments).unwrap();
+        assert_eq!(args, serde_json::json!({"properties": {"city": "Paris"}}));
+    }
+
+    #[test]
     fn parse_tool_calls_tolerates_python_tag_and_junk() {
         // python_tag prefix + trailing junk small models emit; "arguments" variant.
-        let tc = parse_tool_calls(r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#)
-            .unwrap();
+        let tc = parse_tool_calls(
+            r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#,
+            &no_declared_tools(),
+        )
+        .unwrap();
         assert_eq!(tc[0].function.name, "f");
         let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
         assert_eq!(args["x"], 1);
         // prose is not a tool call; a JSON object without "name" is not either.
-        assert!(parse_tool_calls("The weather in Paris is sunny.").is_none());
-        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#).is_none());
+        assert!(parse_tool_calls("The weather in Paris is sunny.", &no_declared_tools()).is_none());
+        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#, &no_declared_tools()).is_none());
     }
 
     #[test]
@@ -27341,6 +27483,7 @@ mod tests {
         let qwen = parse_tool_calls(
             r#"<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>
 <tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(qwen.len(), 2);
@@ -27350,6 +27493,7 @@ mod tests {
 
         let mistral = parse_tool_calls(
             r#"[TOOL_CALLS] [{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}]"#,
+            &no_declared_tools(),
         )
         .unwrap();
         assert_eq!(mistral.len(), 1);
@@ -27390,9 +27534,12 @@ mod tests {
 
     #[test]
     fn chat_tool_call_delta_uses_openai_stream_shape() {
-        let call = parse_tool_calls(r#"{"name":"weather","parameters":{"city":"Paris"}}"#)
-            .unwrap()
-            .remove(0);
+        let call = parse_tool_calls(
+            r#"{"name":"weather","parameters":{"city":"Paris"}}"#,
+            &no_declared_tools(),
+        )
+        .unwrap()
+        .remove(0);
         let delta = ChatCompletionDelta {
             role: None,
             content: None,
@@ -29262,6 +29409,7 @@ mod tests {
     #[test]
     fn mixtral_multi_token_generation_stays_fail_closed_until_explicitly_enabled() {
         let mixtral = crate::model::MixtralMoeMetadata {
+            expert_shared_feed_forward_length: None,
             family_label: "Mixtral",
             expert_count: 8,
             expert_used_count: 2,
@@ -32037,6 +32185,117 @@ mod tests {
         );
     }
 
+    /// The MobileMoE GGUF's chat template, verbatim. Before this family was
+    /// recognised it fell through to the role-colon renderer, and the model
+    /// answered a greeting by continuing the transcript forever.
+    const LLAMA4_HEADER_TEMPLATE: &str = "{{ bos_token }}{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|header_start|>' + message['role'] + '<|header_end|>\\n\\n' %}{% if message['content'] is string %}{% set content = content + message['content'] %}{% else %}{% for item in message['content'] %}{% if item['type'] == 'text' %}{% set content = content + item['text'] %}{% endif %}{% endfor %}{% endif %}{{ content + '<|eot|>' }}{% endfor %}{% if add_generation_prompt %}{{ '<|header_start|>assistant<|header_end|>\\n\\n' }}{% endif %}";
+
+    #[test]
+    fn renders_llama4_header_prompt_with_header_tokens_and_special_parsing() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(LLAMA4_HEADER_TEMPLATE.to_string()),
+            specials_index: OnceLock::new(),
+        };
+
+        assert!(tokenizer.chat_prompt_parse_special());
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "llama4_header_markers"
+        );
+        assert_eq!(
+            render_chat_prompt(
+                &[ChatMessage {
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                    role: "user".to_string(),
+                    content: " hello ".to_string(),
+                }],
+                &tokenizer,
+            ),
+            "<|header_start|>user<|header_end|>\n\n hello <|eot|><|header_start|>assistant<|header_end|>\n\n"
+        );
+    }
+
+    #[test]
+    fn renders_llama4_header_prompt_with_system_and_multi_turn_messages() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(LLAMA4_HEADER_TEMPLATE.to_string()),
+            specials_index: OnceLock::new(),
+        };
+
+        let message = |role: &str, content: &str| ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: role.to_string(),
+            content: content.to_string(),
+        };
+
+        assert_eq!(
+            render_chat_prompt(
+                &[
+                    message("system", "Be helpful."),
+                    message("user", "Hello"),
+                    message("assistant", "Hi"),
+                    message("user", "Again"),
+                ],
+                &tokenizer,
+            ),
+            concat!(
+                "<|header_start|>system<|header_end|>\n\nBe helpful.<|eot|>",
+                "<|header_start|>user<|header_end|>\n\nHello<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\nHi<|eot|>",
+                "<|header_start|>user<|header_end|>\n\nAgain<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn llama4_header_recognizer_does_not_collide_with_llama3_instruct() {
+        // `<|eot|>` is not a substring of `<|eot_id|>`, and neither family's
+        // markers appear in the other's template. A collision here would route
+        // one family through the other's renderer and stop token.
+        let llama3 = "<|start_header_id|>{{ role }}<|end_header_id|>{{ content }}<|eot_id|>";
+        assert!(is_llama3_instruct_template(llama3));
+        assert!(!is_llama4_header_template(llama3));
+        assert!(is_llama4_header_template(LLAMA4_HEADER_TEMPLATE));
+        assert!(!is_llama3_instruct_template(LLAMA4_HEADER_TEMPLATE));
+    }
+
     #[test]
     fn renders_llama3_instruct_prompt_with_header_tokens_and_special_parsing() {
         let _guard = crate::test_support::env_lock();
@@ -34072,6 +34331,7 @@ mod tests {
             )),
             rope_freqs: None,
             layers: vec![LlamaLayerWeights {
+                moe_expert_bias: None,
                 attention_norm: ones("blk.0.attn_norm.weight", hidden),
                 attention_q: select_rows("blk.0.attn_q.weight", hidden, hidden, &[0, 1, 2, 3]),
                 attention_k: select_rows("blk.0.attn_k.weight", 2, hidden, &[0, 1]),
@@ -37367,6 +37627,86 @@ async fn delete_local_model(
         }),
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuantizeModelRequest {
+    pub input_path: String,
+    pub output_path: Option<String>,
+    #[serde(default = "default_quant_type")]
+    pub quant_type: String,
+}
+
+fn default_quant_type() -> String {
+    "q4_k_m".to_string()
+}
+
+pub async fn quantize_model_endpoint(
+    State(_state): State<AppState>,
+    Json(payload): Json<QuantizeModelRequest>,
+) -> Result<Json<crate::quantize::QuantizeReceipt>, Response> {
+    let input = PathBuf::from(payload.input_path.trim());
+    if !input.exists() {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "file_not_found",
+            format!("Input model file not found: {}", input.display()),
+            None,
+        ));
+    }
+
+    let target_quant = match payload.quant_type.to_lowercase().as_str() {
+        "q8_0" | "q8" => crate::quantize::TargetQuant::Q8_0,
+        "q4_0" | "q4" => crate::quantize::TargetQuant::Q4_0,
+        "q4_k_m" | "q4_k" | "q4km" => crate::quantize::TargetQuant::Q4_K_M,
+        other => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_quant_type",
+                format!("Unsupported quantization type '{other}'. Supported: q8_0, q4_0, q4_k_m"),
+                None,
+            ));
+        }
+    };
+
+    let output = match payload.output_path {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
+        _ => {
+            let stem = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            let suffix = match target_quant {
+                crate::quantize::TargetQuant::Q8_0 => "Q8_0",
+                crate::quantize::TargetQuant::Q4_0 => "Q4_0",
+                crate::quantize::TargetQuant::Q4_K_M => "Q4_K_M",
+            };
+            input.with_file_name(format!("{stem}-{suffix}.gguf"))
+        }
+    };
+
+    let receipt = tokio::task::spawn_blocking(move || {
+        crate::quantize::quantize_model(&input, &output, target_quant)
+    })
+    .await
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quantize_thread_error",
+            format!("Quantization thread join failed: {e}"),
+            None,
+        )
+    })?
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quantize_failed",
+            format!("Quantization failed: {e}"),
+            None,
+        )
+    })?;
+
+    Ok(Json(receipt))
 }
 
 /// Cached metadata-derived facts for one local model, keyed by (mtime, size) so a

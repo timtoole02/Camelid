@@ -41,6 +41,6 @@ async function walk(directory, files) {
     }
     if (!entry.isFile()) continue
     const relativeName = entry.name.toLowerCase()
-    if (relativeName.endsWith('.mjs') || relativeName.endsWith('.schema.json')) files.push(path)
+    if (relativeName.endsWith('.mjs') || relativeName.endsWith('.schema.json') || relativeName.endsWith('.sh')) files.push(path)
   }
 }

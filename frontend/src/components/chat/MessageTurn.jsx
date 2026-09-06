@@ -99,17 +99,13 @@ function WebResearchSources({ research }) {
 }
 
 /* Per-message metadata footer. Token counts are labeled by source (backend
-   usage vs client estimate). TTFT and duration are browser measurements; an
-   explicitly target-verified MTP response may replace the browser tok/s
-   estimate with the native decode-clock result. The Evidence Chip cites the
-   contract row that was active when this reply was generated. */
+   usage vs client estimate); TTFT and tok/s are always client-measured and say
+   so — operational telemetry, never support evidence (I4). The Evidence Chip
+   cites the contract row that was active when this reply was generated. */
 function MessageMetaFooter({ message }) {
   const usage = message.usage
   const ttft = formatMs(message.first_content_ms)
-  // Exact target-verified turns show their native aggregate in the ordinary
-  // Developer Diagnostics control. Do not also label that native clock as the
-  // footer's browser-measured rate.
-  const rate = message.target_verified_render ? null : formatRate(message.tokens_out_per_sec)
+  const rate = formatRate(message.tokens_out_per_sec)
   const duration = formatMs(message.elapsed_ms)
   const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
   const sentAt = formatTimeOfDay(message.created_at)
@@ -188,59 +184,73 @@ function UserTurn({ message, messageContent, onEditResend }) {
   }
   return (
     <article className="cxturn cxturn--user">
-      <div className="cxturn__user-chip">
-        {message.image?.data_url && (
-          <img
-            className="cxturn__user-image"
-            src={message.image.data_url}
-            alt={message.image.name ? `Uploaded ${message.image.name}` : 'Uploaded image'}
-          />
-        )}
-        {editing ? (
-          <div className="cxturn__edit">
-            <textarea
-              className="cxturn__edit-input"
-              value={draft}
-              rows={Math.min(8, Math.max(2, draft.split('\n').length))}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault()
-                  submitEdit()
-                }
-                if (event.key === 'Escape') {
-                  event.stopPropagation()
-                  setEditing(false)
-                  setDraft(messageContent)
-                }
-              }}
-              aria-label="Edit message and resend"
-              autoFocus
+      <div className="cxturn__user-wrapper">
+        <div className="cxturn__user-chip">
+          {message.image?.data_url && (
+            <img
+              className="cxturn__user-image"
+              src={message.image.data_url}
+              alt={message.image.name ? `Uploaded ${message.image.name}` : 'Uploaded image'}
             />
-            <div className="cxturn__edit-actions">
-              <button type="button" className="cxturn__action" onClick={submitEdit}>Resend</button>
-              <button type="button" className="cxturn__action" onClick={() => { setEditing(false); setDraft(messageContent) }}>Cancel</button>
-            </div>
-          </div>
-        ) : (
-          <p>{messageContent}</p>
-        )}
-      </div>
-      {!editing && (
-        <div className="cxturn__actions cxturn__actions--user" aria-label="Message actions">
-          {sentAt && (
-            <time className="cxturn__action-time" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>
           )}
-          <button type="button" className="cxturn__action" onClick={handleCopy} title="Copy message">
-            {copied ? <IconCheck size={14} /> : <IconCopy size={14} />} <span>{copied ? 'Copied' : 'Copy'}</span>
-          </button>
-          {onEditResend && (
-            <button type="button" className="cxturn__action" onClick={() => { setDraft(messageContent); setEditing(true) }} title="Edit this message and resend — replaces the replies after it">
-              <IconEdit size={14} /> <span>Edit &amp; resend</span>
-            </button>
+          {editing ? (
+            <div className="cxturn__edit">
+              <textarea
+                className="cxturn__edit-input"
+                value={draft}
+                rows={Math.min(8, Math.max(2, draft.split('\n').length))}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
+                    submitEdit()
+                  }
+                  if (event.key === 'Escape') {
+                    event.stopPropagation()
+                    setEditing(false)
+                    setDraft(messageContent)
+                  }
+                }}
+                aria-label="Edit message and resend"
+                autoFocus
+              />
+              <div className="cxturn__edit-actions">
+                <button type="button" className="cxturn__action" onClick={submitEdit}>Resend</button>
+                <button type="button" className="cxturn__action" onClick={() => { setEditing(false); setDraft(messageContent) }}>Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <p>{messageContent}</p>
           )}
         </div>
-      )}
+        {!editing && (
+          <div className="cxturn__actions cxturn__actions--user" aria-label="Message actions">
+            {sentAt && (
+              <time className="cxturn__action-time" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>
+            )}
+            <button
+              type="button"
+              className={`cxturn__action cxturn__action--icon ${copied ? 'is-copied' : ''}`}
+              onClick={handleCopy}
+              title={copied ? 'Copied' : 'Copy'}
+              aria-label={copied ? 'Copied' : 'Copy message'}
+            >
+              {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+            </button>
+            {onEditResend && (
+              <button
+                type="button"
+                className="cxturn__action cxturn__action--icon"
+                onClick={() => { setDraft(messageContent); setEditing(true) }}
+                title="Edit message"
+                aria-label="Edit message"
+              >
+                <IconEdit size={16} />
+              </button>
+            )}
+          </div>
+        )}
+      </div>
     </article>
   )
 }
@@ -305,15 +315,15 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
       </div>
       <div className="cxturn__body">
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
-        {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
+        {(messageContent || !assistantStreaming) && (
+          <AssistantMarkdown
+            content={messageContent}
+            streaming={assistantStreaming}
+            citations={message.citations}
+          />
+        )}
         <WebResearchSources research={message.web_research} />
-        {showLiveGenerationBadge && <LiveGenerationBadge
-          elapsedSeconds={generationElapsedSeconds}
-          label={liveStatusLabel}
-          tokensPerSec={message.tokens_out_per_sec}
-          nativeSegmentRate={message.streaming_native_segment_rate}
-          waitForNativeRate={message.synthesis_mode === 'prepared_web_research_multi_pass_lossless'}
-        />}
+        {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
 
         {noVisibleResponse && (
           <div className="cxturn__warning" role="status">
@@ -336,19 +346,30 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
         {(showMessageActions || showReusePromptAction) && (
           <div className="cxturn__actions" aria-label="Message actions">
             {showMessageActions && (
-              <button type="button" className="cxturn__action" onClick={handleCopyMessage}>
+              <button
+                type="button"
+                className={`cxturn__action cxturn__action--icon ${copied ? 'is-copied' : ''}`}
+                onClick={handleCopyMessage}
+                title={copied ? 'Copied' : 'Copy response'}
+                aria-label={copied ? 'Copied' : 'Copy response'}
+              >
                 {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-                <span>{copied ? 'Copied' : 'Copy'}</span>
               </button>
             )}
             {showMessageActions && onRegenerate && (
-              <button type="button" className="cxturn__action" onClick={() => onRegenerate()} title="Resend the prompt that produced this reply with the current Chat and Web Auto settings">
-                <IconRefresh size={16} /> <span>Regenerate</span>
+              <button
+                type="button"
+                className="cxturn__action cxturn__action--icon"
+                onClick={() => onRegenerate()}
+                title="Regenerate response"
+                aria-label="Regenerate response"
+              >
+                <IconRefresh size={16} />
               </button>
             )}
             {showReusePromptAction && (
-              <button type="button" className="cxturn__action" onClick={() => onReusePrompt?.(priorUserPrompt)}>
-                <IconRefresh size={16} /> <span>Use prompt again</span>
+              <button type="button" className="cxturn__action" onClick={() => onReusePrompt?.(priorUserPrompt)} title="Use prompt again">
+                <IconRefresh size={14} /> <span>Use prompt again</span>
               </button>
             )}
           </div>

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { chmod, cp, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -24,6 +24,7 @@ const tempRoot = await mkdtemp(join(tmpdir(), 'camelid-agent-task-'))
 try {
   for (const taskRoot of taskRoots) await verifyControls(taskRoot)
   await verifyPackageTampering()
+  await verifySymlinkRejected()
   await verifyScorerSelfMutation()
   await verifyTaskDefinitionMutation()
 } finally {
@@ -147,4 +148,18 @@ async function verifyTaskDefinitionMutation() {
   const result = await scoreTaskAttempt(packageRoot, workspace.workspaceRoot)
   assert.equal(result.outcome, 'INVALID_SCORER')
   assert.match(result.errors.join('\n'), /task package changed while the scorer ran/)
+}
+
+async function verifySymlinkRejected() {
+  const packageRoot = join(tempRoot, 'symlink-package')
+  const outsideRoot = join(tempRoot, 'symlink-outside')
+  await cp(taskRoots[0], packageRoot, { recursive: true })
+  await mkdir(outsideRoot)
+  await writeFile(join(outsideRoot, 'outside.txt'), 'outside\n')
+  await symlink(
+    outsideRoot,
+    join(packageRoot, 'fixture', 'escape'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  )
+  await assert.rejects(loadTaskPackage(packageRoot), /symbolic links are not allowed/)
 }
