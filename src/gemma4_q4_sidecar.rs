@@ -471,9 +471,8 @@ pub fn repack_exact_gemma4_q4_sidecar(
             source_file
                 .seek(SeekFrom::Start(spec.source_offset))
                 .map_err(|error| io(source, error))?;
-            let source_len = usize::try_from(spec.source_len).map_err(|_| {
-                invalid(format!("{} source length does not fit usize", spec.name))
-            })?;
+            let source_len = usize::try_from(spec.source_len)
+                .map_err(|_| invalid(format!("{} source length does not fit usize", spec.name)))?;
             let mut wire = vec![0u8; source_len];
             source_file
                 .read_exact(&mut wire)

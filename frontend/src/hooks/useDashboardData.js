@@ -1834,7 +1834,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
             total_tokens: promptTokenEstimate + realTokens,
           },
           usage_source: 'client_estimate',
-        }, { immediate: firstRenderedContent })
+        }, { immediate: firstVisibleContent })
         if (paceHasPendingText(displayedContent, fullContent)) startPacing()
       }, {
         estimateTokenCount,

@@ -13,16 +13,14 @@ mod gemma4_mtp12;
 
 #[cfg(target_os = "macos")]
 pub use gemma4_mtp12::{
-    validate_gemma4_12b_shared_kv_schedule, Gemma4Mtp12AssistantMetal,
-    Gemma4Mtp12ChainLedger, Gemma4Mtp12ChainProposal, Gemma4Mtp12ChainTiming,
-    Gemma4Mtp12TreeProposal,
-    Gemma4Mtp12CpuKv, Gemma4Mtp12DeviceKv, Gemma4Mtp12DeviceRecurrentHidden,
-    Gemma4Mtp12MetalBufferView, Gemma4Mtp12Proposal, Gemma4Mtp12ProposalTiming,
-    Gemma4Mtp12Q6KEmbeddingRow, Gemma4Mtp12Q6KEmbeddingTable,
-    Gemma4Mtp12ResidentLedger, GEMMA4_12B_MTP_ASSISTANT_SHA256,
-    GEMMA4_12B_MTP_FULL_HOST_LAYER, GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES,
-    GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES, GEMMA4_12B_MTP_SLIDING_HOST_LAYER,
-    GEMMA4_12B_MTP_MAX_DRAFTS, GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
+    validate_gemma4_12b_shared_kv_schedule, Gemma4Mtp12AssistantMetal, Gemma4Mtp12ChainLedger,
+    Gemma4Mtp12ChainProposal, Gemma4Mtp12ChainTiming, Gemma4Mtp12CpuKv, Gemma4Mtp12DeviceKv,
+    Gemma4Mtp12DeviceRecurrentHidden, Gemma4Mtp12MetalBufferView, Gemma4Mtp12Proposal,
+    Gemma4Mtp12ProposalTiming, Gemma4Mtp12Q6KEmbeddingRow, Gemma4Mtp12Q6KEmbeddingTable,
+    Gemma4Mtp12ResidentLedger, Gemma4Mtp12TreeProposal, GEMMA4_12B_MTP_ASSISTANT_SHA256,
+    GEMMA4_12B_MTP_FULL_HOST_LAYER, GEMMA4_12B_MTP_MAX_DRAFTS,
+    GEMMA4_12B_MTP_Q6K_EMBEDDING_ROW_BYTES, GEMMA4_12B_MTP_Q6K_EMBEDDING_TABLE_BYTES,
+    GEMMA4_12B_MTP_SLIDING_HOST_LAYER, GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
 };
 
 #[cfg(target_os = "macos")]
@@ -14390,9 +14388,7 @@ impl MetalLinearKernel {
                     post_attn_residual_norm_quantize_stage_fm: make(
                         "gemma4_verify_post_attn_residual_norm_quantize_stage_fm_f32",
                     )?,
-                    post_ffw_residual_scale: make(
-                        "gemma4_verify_post_ffw_residual_scale_f32",
-                    )?,
+                    post_ffw_residual_scale: make("gemma4_verify_post_ffw_residual_scale_f32")?,
                 })
             })
             .as_ref()
@@ -14400,9 +14396,7 @@ impl MetalLinearKernel {
 
     /// Compiled on first request only (the strict shader is recompiled with
     /// the segment entry appended, under the identical strict options).
-    pub(crate) fn gemma4_verify_glue_mma_pipelines(
-        &self,
-    ) -> Option<&Gemma4VerifyGlueMmaPipelines> {
+    pub(crate) fn gemma4_verify_glue_mma_pipelines(&self) -> Option<&Gemma4VerifyGlueMmaPipelines> {
         self.gemma4_verify_glue_mma
             .get_or_init(|| {
                 let options = CompileOptions::new();
@@ -14931,9 +14925,7 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .get_function("attention_decode_v2_kv16_tree", None)
                 .ok()?;
             let attention_decode_v2_kv16_tree_pipeline = device
-                .new_compute_pipeline_state_with_function(
-                    &attention_decode_v2_kv16_tree_function,
-                )
+                .new_compute_pipeline_state_with_function(&attention_decode_v2_kv16_tree_function)
                 .ok()?;
             let attention_decode_splitk_kv16_tree_function = elementwise_library
                 .get_function("attention_decode_splitk_kv16_tree", None)
@@ -15253,10 +15245,7 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .ok()
                 });
             let q4_0_q8_ordered_columns_mma_native_register_k16_pipeline = strict_q8k_library
-                .get_function(
-                    "q4_0_q8_ordered_columns_mma_native_register_k16",
-                    None,
-                )
+                .get_function("q4_0_q8_ordered_columns_mma_native_register_k16", None)
                 .ok()
                 .and_then(|function| {
                     device
@@ -15303,18 +15292,14 @@ pub(crate) fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                         .new_compute_pipeline_state_with_function(&function)
                         .ok()
                 });
-            let q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline =
-                strict_q8k_library
-                    .get_function(
-                        "q4_0_q8_ordered_columns_mma_register_fragment_k16",
-                        None,
-                    )
-                    .ok()
-                    .and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    });
+            let q4_0_q8_ordered_columns_mma_register_fragment_k16_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_columns_mma_register_fragment_k16", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let gemma4_q4_native_v2 = {
                 let selected = gemma4_q4_native_register_v2_variant();
                 GEMMA4_Q4_NATIVE_V2_VARIANTS
@@ -17130,7 +17115,6 @@ fn gemma4_dense_attention_rows_policy(requested: bool, encoded: bool) -> Option<
     }
 }
 
-
 /// Opt-in latency-hiding V2 of the dense Gemma verifier's row-aware attention
 /// (`CAMELID_GEMMA4_DENSE_ATTN_ROWS_V2=1`).  Same floating-point universe as the
 /// `(head,row)` kernel (see the shader note on `gemma4_attn_rows_v2_scores_fused`);
@@ -17479,13 +17463,41 @@ pub(crate) struct Gemma4Q4NativeV2Variant {
 
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_Q4_NATIVE_V2_VARIANTS: &[Gemma4Q4NativeV2Variant] = &[
-    Gemma4Q4NativeV2Variant { name: "u2", tiles: 1, fragment_major: false },
-    Gemma4Q4NativeV2Variant { name: "u4", tiles: 1, fragment_major: false },
-    Gemma4Q4NativeV2Variant { name: "fm_u1", tiles: 1, fragment_major: true },
-    Gemma4Q4NativeV2Variant { name: "fm_u4", tiles: 1, fragment_major: true },
-    Gemma4Q4NativeV2Variant { name: "fm_bits_u4", tiles: 1, fragment_major: true },
-    Gemma4Q4NativeV2Variant { name: "fm_t2_u2", tiles: 2, fragment_major: true },
-    Gemma4Q4NativeV2Variant { name: "fm_t2_u4", tiles: 2, fragment_major: true },
+    Gemma4Q4NativeV2Variant {
+        name: "u2",
+        tiles: 1,
+        fragment_major: false,
+    },
+    Gemma4Q4NativeV2Variant {
+        name: "u4",
+        tiles: 1,
+        fragment_major: false,
+    },
+    Gemma4Q4NativeV2Variant {
+        name: "fm_u1",
+        tiles: 1,
+        fragment_major: true,
+    },
+    Gemma4Q4NativeV2Variant {
+        name: "fm_u4",
+        tiles: 1,
+        fragment_major: true,
+    },
+    Gemma4Q4NativeV2Variant {
+        name: "fm_bits_u4",
+        tiles: 1,
+        fragment_major: true,
+    },
+    Gemma4Q4NativeV2Variant {
+        name: "fm_t2_u2",
+        tiles: 2,
+        fragment_major: true,
+    },
+    Gemma4Q4NativeV2Variant {
+        name: "fm_t2_u4",
+        tiles: 2,
+        fragment_major: true,
+    },
 ];
 
 /// Compiled pipelines of one V2 variant: the padded-eight K<=8 kernel, the
@@ -17638,8 +17650,7 @@ enum Gemma4Q4DirectThreadgroupMode {
 /// established global-slab encoder.
 #[cfg(target_os = "macos")]
 fn gemma4_q4_direct_threadgroup_mode() -> Gemma4Q4DirectThreadgroupMode {
-    static MODE: std::sync::OnceLock<Gemma4Q4DirectThreadgroupMode> =
-        std::sync::OnceLock::new();
+    static MODE: std::sync::OnceLock<Gemma4Q4DirectThreadgroupMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         let Ok(value) = std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG") else {
             return Gemma4Q4DirectThreadgroupMode::Off;
@@ -17799,12 +17810,7 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns(
     weight_wire: &[u8],
     rows: usize,
 ) -> Option<Vec<Vec<f32>>> {
-    try_gemma4_q4_0_matmul_q8_columns_impl(
-        inputs,
-        weight_wire,
-        rows,
-        Gemma4Q4ColumnsTestPath::Slab,
-    )
+    try_gemma4_q4_0_matmul_q8_columns_impl(inputs, weight_wire, rows, Gemma4Q4ColumnsTestPath::Slab)
 }
 
 /// Explicit slab-free sibling of [`try_gemma4_q4_0_matmul_q8_columns`].
@@ -17833,12 +17839,7 @@ pub(crate) fn try_gemma4_q4_0_matmul_q8_columns_mma(
     weight_wire: &[u8],
     rows: usize,
 ) -> Option<Vec<Vec<f32>>> {
-    try_gemma4_q4_0_matmul_q8_columns_impl(
-        inputs,
-        weight_wire,
-        rows,
-        Gemma4Q4ColumnsTestPath::Mma,
-    )
+    try_gemma4_q4_0_matmul_q8_columns_impl(inputs, weight_wire, rows, Gemma4Q4ColumnsTestPath::Mma)
 }
 
 /// Explicit row-major A-staging sibling for exactness and performance A/Bs.
@@ -18052,9 +18053,7 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
         | Gemma4Q4ColumnsTestPath::MmaNativeRegister
         | Gemma4Q4ColumnsTestPath::MmaSerial2
         | Gemma4Q4ColumnsTestPath::MmaSerial4
-        | Gemma4Q4ColumnsTestPath::MmaSerial2Fragment => {
-            gemma4_q4_mma_stage_bytes(blocks_per_row)?
-        }
+        | Gemma4Q4ColumnsTestPath::MmaSerial2Fragment => gemma4_q4_mma_stage_bytes(blocks_per_row)?,
         Gemma4Q4ColumnsTestPath::MmaNativeRegisterK16
         | Gemma4Q4ColumnsTestPath::MmaRegisterFragmentK16 => {
             gemma4_q4_mma_stage16_bytes(blocks_per_row)?
@@ -18138,21 +18137,19 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
             blocks_per_row,
             columns,
         ),
-        Gemma4Q4ColumnsTestPath::MmaRowMajor => {
-            encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor(
-                encoder,
-                kernel,
-                &scales_buf,
-                &quants_buf,
-                &weight_buf,
-                0,
-                &output_buf,
-                terms_buf.as_ref()?,
-                rows,
-                blocks_per_row,
-                columns,
-            )
-        }
+        Gemma4Q4ColumnsTestPath::MmaRowMajor => encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor(
+            encoder,
+            kernel,
+            &scales_buf,
+            &quants_buf,
+            &weight_buf,
+            0,
+            &output_buf,
+            terms_buf.as_ref()?,
+            rows,
+            blocks_per_row,
+            columns,
+        ),
         Gemma4Q4ColumnsTestPath::MmaRowMajorFragment => {
             encode_gemma4_q4_0_q8_ordered_columns_mma_rowmajor_fragment(
                 encoder,
@@ -18241,8 +18238,7 @@ fn try_gemma4_q4_0_matmul_q8_columns_impl(
                 columns,
             )
         }
-        Gemma4Q4ColumnsTestPath::MmaSerial2
-        | Gemma4Q4ColumnsTestPath::MmaSerial4 => {
+        Gemma4Q4ColumnsTestPath::MmaSerial2 | Gemma4Q4ColumnsTestPath::MmaSerial4 => {
             let row_tiles = if path == Gemma4Q4ColumnsTestPath::MmaSerial2 {
                 2
             } else {
@@ -19899,9 +19895,7 @@ impl Gemma4Q6KHead {
     /// Split one admitted verifier width into exact SPEC50 head calls. SPEC50
     /// has separately-qualified K=1/2/4/8 kernels; W16 deliberately bootstraps
     /// as two ordered K8 calls instead of introducing new head arithmetic.
-    fn gemma4_spec50_head_chunk_ranges(
-        columns: usize,
-    ) -> Option<Vec<std::ops::Range<usize>>> {
+    fn gemma4_spec50_head_chunk_ranges(columns: usize) -> Option<Vec<std::ops::Range<usize>>> {
         match columns {
             1 | 2 | 4 | 8 => Some(vec![0..columns]),
             16 => Some(vec![0..8, 8..16]),
@@ -19939,16 +19933,18 @@ impl Gemma4Q6KHead {
         let kernels = spec50_head::spec50_head_kernels_for(state.hidden)?;
         if state.batch.is_none() {
             let shared = |bytes: usize| {
-                kernels.device.new_buffer(
-                    bytes.max(4) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
+                kernels
+                    .device
+                    .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
             };
             let max_k = if dual_k16 { 16 } else { 8 };
             state.batch = Some(Gemma4Q6KBatchScratch {
                 scales: shared(max_k * n_superblocks * std::mem::size_of::<f32>()),
                 quants: shared(max_k * state.hidden),
-                permuted: shared(spec50_head::spec50_activation_scratch_bytes(max_k, state.hidden)),
+                permuted: shared(spec50_head::spec50_activation_scratch_bytes(
+                    max_k,
+                    state.hidden,
+                )),
                 logits: shared(max_k * state.vocab * std::mem::size_of::<f32>()),
                 argmax_ids: shared(max_k * std::mem::size_of::<u32>()),
                 argmax_vals: shared(max_k * std::mem::size_of::<f32>()),
@@ -19961,14 +19957,11 @@ impl Gemma4Q6KHead {
             let chunk_columns = rows.end.checked_sub(rows.start)?;
             let mut scales = Vec::with_capacity(chunk_columns * n_superblocks);
             let mut quants = Vec::with_capacity(chunk_columns * state.hidden);
-            let row_values = rows.start.checked_mul(state.hidden)?
-                ..rows.end.checked_mul(state.hidden)?;
+            let row_values =
+                rows.start.checked_mul(state.hidden)?..rows.end.checked_mul(state.hidden)?;
             for hidden in hidden_rows.get(row_values)?.chunks_exact(state.hidden) {
-                let normalized = crate::gemma4_runtime::rms_norm(
-                    hidden,
-                    Some(&state.output_norm),
-                    state.eps,
-                );
+                let normalized =
+                    crate::gemma4_runtime::rms_norm(hidden, Some(&state.output_norm), state.eps);
                 let q8 = crate::inference::quantize_q8_k_blocks(&normalized);
                 if q8.len() != n_superblocks {
                     return None;
@@ -20255,16 +20248,14 @@ impl Gemma4Dense12bVerifierScratch {
     fn q4_work_bytes() -> Option<usize> {
         let hidden_blocks = Self::HIDDEN / 32;
         let activation_blocks = Self::FFN / 32;
-        let legacy_terms = gemma4_q4_column_term_slab_bytes(
-            Self::FFN,
-            hidden_blocks,
-            Self::LEGACY_MAX_K,
-        )?
-        .max(gemma4_q4_column_term_slab_bytes(
-            Self::HIDDEN,
-            activation_blocks,
-            Self::LEGACY_MAX_K,
-        )?);
+        let legacy_terms =
+            gemma4_q4_column_term_slab_bytes(Self::FFN, hidden_blocks, Self::LEGACY_MAX_K)?.max(
+                gemma4_q4_column_term_slab_bytes(
+                    Self::HIDDEN,
+                    activation_blocks,
+                    Self::LEGACY_MAX_K,
+                )?,
+            );
         Some(legacy_terms.max(gemma4_q4_mma_stage16_bytes(activation_blocks)?))
     }
 
@@ -20702,7 +20693,8 @@ impl Gemma4ResidentModel {
             if inputs.len() != LAYERS {
                 return None;
             }
-            let position = base_position + tree_plan.map_or(row, |plan| plan.depths()[row] as usize);
+            let position =
+                base_position + tree_plan.map_or(row, |plan| plan.depths()[row] as usize);
             let filled = position + 1;
             for (layer_idx, input) in inputs.iter().enumerate() {
                 let sliding = layer_idx % 6 != 5;
@@ -20816,10 +20808,9 @@ impl Gemma4ResidentModel {
         // C7 implies the single staging of C1 for the segments it fuses, and
         // C6 forces the same split (its stage half is simply not encoded).
         let stage_split = fused_v2.filter(|_| {
-            glue
-                & (GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
-                    | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE
-                    | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA)
+            glue & (GEMMA4_FUSED_GLUE_C1_STAGE_ONCE
+                | GEMMA4_FUSED_GLUE_C6_QUANTIZE_STAGE
+                | GEMMA4_FUSED_GLUE_C7_SEGMENT_MMA)
                 != 0
         });
 
@@ -20986,34 +20977,34 @@ impl Gemma4ResidentModel {
                         columns,
                     ))
                     && if let Some(mma) = glue_mma {
-                    encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
-                        encoder,
-                        v2,
-                        mma,
-                        v2_simdgroups,
-                        &scratch.input_scales,
-                        &scratch.q4_terms,
-                        &segments,
-                        hidden_blocks,
-                        columns,
-                    )
-                } else {
-                    segments.iter().all(|&(weight, offset, output, rows)| {
-                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
                             encoder,
                             v2,
+                            mma,
                             v2_simdgroups,
                             &scratch.input_scales,
-                            weight,
-                            offset,
-                            output,
                             &scratch.q4_terms,
-                            rows,
+                            &segments,
                             hidden_blocks,
                             columns,
                         )
-                    })
-                };
+                    } else {
+                        segments.iter().all(|&(weight, offset, output, rows)| {
+                            encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                                encoder,
+                                v2,
+                                v2_simdgroups,
+                                &scratch.input_scales,
+                                weight,
+                                offset,
+                                output,
+                                &scratch.q4_terms,
+                                rows,
+                                hidden_blocks,
+                                columns,
+                            )
+                        })
+                    };
                 if !encoded {
                     encoder.end_encoding();
                     return None;
@@ -21307,8 +21298,9 @@ impl Gemma4ResidentModel {
             // is receipt-bearing and therefore fail-closed; only the default-off route
             // may retain the immutable per-row scalar blocks and 3*K dispatches.
             let attention_rows_v2_requested = gemma4_dense_attention_rows_v2_enabled();
-            let attention_rows_requested =
-                tree_plan.is_some() || gemma4_dense_attention_rows_enabled() || attention_rows_v2_requested;
+            let attention_rows_requested = tree_plan.is_some()
+                || gemma4_dense_attention_rows_enabled()
+                || attention_rows_v2_requested;
             // Opt-in `CAMELID_GEMMA4_LINEAR_K8_VIA_TREE=1`: a linear (non-branched) K=8 V2
             // verify takes the tree encoder with the static chain plan (its row plan and
             // addressing equal the linear path's; prefix scores cover the whole union and
@@ -21325,11 +21317,23 @@ impl Gemma4ResidentModel {
             let attention_rows_encoded = attention_rows_requested
                 && if let Some(plan) = attention_plan {
                     gemma4_tree::encode_tree_attention(
-                        encoder, kernel, &scratch.q_normed, cache_k, cache_v,
-                        &scratch.q4_terms, &scratch.rows_denom, &scratch.context,
-                        HEADS, layer.n_kv_heads, layer.head_dim, self.max_positions,
-                        base_position, sliding.then_some(SLIDING_WINDOW), 1.0,
-                        plan, gemma4_dense_attention_rows_v2_variant(),
+                        encoder,
+                        kernel,
+                        &scratch.q_normed,
+                        cache_k,
+                        cache_v,
+                        &scratch.q4_terms,
+                        &scratch.rows_denom,
+                        &scratch.context,
+                        HEADS,
+                        layer.n_kv_heads,
+                        layer.head_dim,
+                        self.max_positions,
+                        base_position,
+                        sliding.then_some(SLIDING_WINDOW),
+                        1.0,
+                        plan,
+                        gemma4_dense_attention_rows_v2_variant(),
                     )
                 } else if attention_rows_v2_requested {
                     encode_gemma4_dense_attention_rows_v2_f32(
@@ -21624,34 +21628,34 @@ impl Gemma4ResidentModel {
                         columns,
                     ))
                     && if let Some(mma) = glue_mma {
-                    encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
-                        encoder,
-                        v2,
-                        mma,
-                        v2_simdgroups,
-                        &scratch.input_scales,
-                        &scratch.q4_terms,
-                        &segments,
-                        hidden_blocks,
-                        columns,
-                    )
-                } else {
-                    segments.iter().all(|&(weight, offset, output, rows)| {
-                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                        encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_segments(
                             encoder,
                             v2,
+                            mma,
                             v2_simdgroups,
                             &scratch.input_scales,
-                            weight,
-                            offset,
-                            output,
                             &scratch.q4_terms,
-                            rows,
+                            &segments,
                             hidden_blocks,
                             columns,
                         )
-                    })
-                };
+                    } else {
+                        segments.iter().all(|&(weight, offset, output, rows)| {
+                            encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_mma(
+                                encoder,
+                                v2,
+                                v2_simdgroups,
+                                &scratch.input_scales,
+                                weight,
+                                offset,
+                                output,
+                                &scratch.q4_terms,
+                                rows,
+                                hidden_blocks,
+                                columns,
+                            )
+                        })
+                    };
                 if !encoded {
                     encoder.end_encoding();
                     return None;
@@ -22906,7 +22910,11 @@ fn gemma4_dense_attention_v2_fixture(
     let mut values = vec![0.0f32; keys.len()];
     for kv_head in 0..n_kv_heads {
         for position in 0..max_positions {
-            let tail_poison = if position >= candidate_end { 128.0 } else { 0.0 };
+            let tail_poison = if position >= candidate_end {
+                128.0
+            } else {
+                0.0
+            };
             let candidate_marker = if position > base_position {
                 (position - base_position) as f32 * 0.5
             } else {
@@ -22918,8 +22926,7 @@ fn gemma4_dense_attention_v2_fixture(
                     + noise() * 0.0625
                     + tail_poison
                     + candidate_marker;
-                values[index] = (((index * 19) % 53) as f32 - 26.0) * 0.015625
-                    + noise() * 0.0625
+                values[index] = (((index * 19) % 53) as f32 - 26.0) * 0.015625 + noise() * 0.0625
                     - tail_poison
                     - candidate_marker;
             }
@@ -25009,10 +25016,8 @@ fn encode_resident_kquant_matmul_f32(
                 // Q4K stages y as half (values exact, half the traffic); Q6K
                 // stages f32 (its w16 exceeds half's exact-integer range, so
                 // the whole MMA lane runs f32 fragments).
-                let y_stage = pool_get(
-                    k,
-                    (input_width * k_pad * if is_q6k { 4 } else { 2 }) as u64,
-                );
+                let y_stage =
+                    pool_get(k, (input_width * k_pad * if is_q6k { 4 } else { 2 }) as u64);
                 let mma_scalar = pool_get(k, 24);
                 unsafe {
                     let p = mma_scalar.contents() as *mut u32;
@@ -25078,7 +25083,11 @@ fn encode_resident_kquant_matmul_f32(
                 t0 += gn;
                 continue;
             }
-            e.set_compute_pipeline_state(if gn == 1 { single_pipeline } else { mc_pipeline });
+            e.set_compute_pipeline_state(if gn == 1 {
+                single_pipeline
+            } else {
+                mc_pipeline
+            });
             e.set_buffer(0, Some(scales), (t0 * n_sb * 4) as u64);
             e.set_buffer(1, Some(quants), (t0 * input_width) as u64);
             e.set_buffer(2, Some(&weight.buffer), 0);
@@ -26362,10 +26371,7 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_k16(
     {
         return false;
     }
-    let Some(stage_pipeline) = kernel
-        .q4_0_q8_ordered_columns_mma_stage16_pipeline
-        .as_ref()
-    else {
+    let Some(stage_pipeline) = kernel.q4_0_q8_ordered_columns_mma_stage16_pipeline.as_ref() else {
         return false;
     };
     let Some(mma_pipeline) = admitted_32_lane_pipeline(
@@ -26477,10 +26483,7 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns_mma_register_fragment_k16(
     {
         return false;
     }
-    let Some(stage_pipeline) = kernel
-        .q4_0_q8_ordered_columns_mma_stage16_pipeline
-        .as_ref()
-    else {
+    let Some(stage_pipeline) = kernel.q4_0_q8_ordered_columns_mma_stage16_pipeline.as_ref() else {
         return false;
     };
     let Some(mma_pipeline) = admitted_32_lane_pipeline(
@@ -26606,9 +26609,7 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_impl(
         return false;
     };
     let mma_candidate = match layout {
-        Gemma4Q4MmaLayout::TransposedA => {
-            kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref()
-        }
+        Gemma4Q4MmaLayout::TransposedA => kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref(),
         Gemma4Q4MmaLayout::RowMajorA => kernel
             .q4_0_q8_ordered_columns_mma_rowmajor_pipeline
             .as_ref(),
@@ -26806,22 +26807,15 @@ fn encode_gemma4_q4_0_q8_ordered_columns_mma_serial_impl(
     {
         return false;
     }
-    let Some(stage_pipeline) = kernel
-        .q4_0_q8_ordered_columns_mma_stage_pipeline
-        .as_ref()
-    else {
+    let Some(stage_pipeline) = kernel.q4_0_q8_ordered_columns_mma_stage_pipeline.as_ref() else {
         return false;
     };
     let serial_pipeline = match (row_tiles, fragment_accumulator) {
         (2, true) => kernel
             .q4_0_q8_ordered_columns_mma_serial2_fragment_pipeline
             .as_ref(),
-        (2, false) => kernel
-            .q4_0_q8_ordered_columns_mma_serial2_pipeline
-            .as_ref(),
-        (4, false) => kernel
-            .q4_0_q8_ordered_columns_mma_serial4_pipeline
-            .as_ref(),
+        (2, false) => kernel.q4_0_q8_ordered_columns_mma_serial2_pipeline.as_ref(),
+        (4, false) => kernel.q4_0_q8_ordered_columns_mma_serial4_pipeline.as_ref(),
         _ => None,
     };
     let Some(serial_pipeline) = admitted_32_lane_pipeline(serial_pipeline) else {
@@ -31349,8 +31343,7 @@ fn encode_gemma4_dense_attention_rows_v2_f32(
     let Some((scores_name, scores_pairs)) = variant.scores_kernel(head_dim) else {
         return false;
     };
-    let Some((context_name, context_pairs, context_span)) = variant.context_kernel(head_dim)
-    else {
+    let Some((context_name, context_pairs, context_span)) = variant.context_kernel(head_dim) else {
         return false;
     };
     let (Some(scores_pipeline), Some(softmax_pipeline), Some(context_pipeline)) = (
@@ -31399,8 +31392,16 @@ fn encode_gemma4_dense_attention_rows_v2_f32(
     let Some(total_pairs) = group.checked_mul(rows) else {
         return false;
     };
-    let union_start = row_plan.iter().map(|meta| meta.window_start).min().unwrap_or(0);
-    let union_end = row_plan.iter().map(|meta| meta.visible_end).max().unwrap_or(0);
+    let union_start = row_plan
+        .iter()
+        .map(|meta| meta.window_start)
+        .min()
+        .unwrap_or(0);
+    let union_end = row_plan
+        .iter()
+        .map(|meta| meta.visible_end)
+        .max()
+        .unwrap_or(0);
     let max_count = row_plan
         .iter()
         .map(|meta| meta.position_count as usize)
@@ -31815,10 +31816,8 @@ fn encode_attention_tree(
 ) {
     let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-    let splitk = v2
-        && splitk_attention_enabled()
-        && (1..=4).contains(&group)
-        && position_count >= 128;
+    let splitk =
+        v2 && splitk_attention_enabled() && (1..=4).contains(&group) && position_count >= 128;
     if splitk {
         let n_splits = position_count.div_ceil(64).clamp(2, 64);
         let partials = pool_get(k, (n_heads * n_splits * (head_dim + 2) * 4) as u64);
@@ -31990,10 +31989,7 @@ fn encode_attention_splitk_kv16_batch(
         .map(|&pc| pc.div_ceil(64).clamp(2, 64))
         .collect();
     let max_splits = split_counts.iter().copied().max().unwrap_or(0);
-    let partials = pool_get(
-        k,
-        (rows * n_heads * max_splits * (head_dim + 2) * 4) as u64,
-    );
+    let partials = pool_get(k, (rows * n_heads * max_splits * (head_dim + 2) * 4) as u64);
     let row_meta = pool_get(k, (rows * 8) as u64);
     let batch_scalars = pool_get(k, 12);
 
@@ -37559,9 +37555,7 @@ fn eagle3_parse_env_bool(name: &str, value: Option<&str>) -> std::result::Result
         None | Some("") | Some("0") | Some("false") | Some("off") | Some("no")
         | Some("disabled") => Ok(false),
         Some("1") | Some("true") | Some("on") | Some("yes") | Some("enabled") => Ok(true),
-        Some(value) => Err(format!(
-            "EAGLE-3 {name} must be a boolean, got {value:?}"
-        )),
+        Some(value) => Err(format!("EAGLE-3 {name} must be a boolean, got {value:?}")),
     }
 }
 
@@ -38973,9 +38967,7 @@ mod eagle3_metal_contract_tests {
 
     #[test]
     fn eagle3_q8_head_transform_matches_the_runtime_quantizer() {
-        let values: Vec<f32> = (0..64)
-            .map(|index| (index as f32 - 31.0) / 8.0)
-            .collect();
+        let values: Vec<f32> = (0..64).map(|index| (index as f32 - 31.0) / 8.0).collect();
         let bf16: Vec<u8> = values
             .iter()
             .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
@@ -40108,16 +40100,8 @@ impl ResidentDecodeState {
         sin_all: &[f32],
         scale: f32,
     ) -> Option<()> {
-        self.prefill_tokens_inner(
-            embeddings,
-            n_tokens,
-            layers,
-            cos_all,
-            sin_all,
-            scale,
-            &[],
-        )
-        .map(|_| ())
+        self.prefill_tokens_inner(embeddings, n_tokens, layers, cos_all, sin_all, scale, &[])
+            .map(|_| ())
     }
 
     /// Resident prompt prefill with snapshots of selected target decoder layer inputs.
@@ -40185,9 +40169,7 @@ impl ResidentDecodeState {
             || capture_layer_ids
                 .last()
                 .is_some_and(|&layer_id| layer_id >= self.n_layers)
-            || capture_layer_ids
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+            || capture_layer_ids.windows(2).any(|pair| pair[0] >= pair[1])
             || self.filled != 0
             || !self.ensure_capacity(n_tokens)
         {
@@ -43509,9 +43491,7 @@ impl ResidentDecodeState {
         if capture_layer_ids
             .last()
             .is_some_and(|&layer_id| layer_id >= self.n_layers)
-            || capture_layer_ids
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+            || capture_layer_ids.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return None;
         }
@@ -45662,8 +45642,8 @@ mod tests {
     fn gemma4_w16_spec50_head_is_two_ordered_k8_chunks() {
         use super::Gemma4Q6KHead;
 
-        let chunks = Gemma4Q6KHead::gemma4_spec50_head_chunk_ranges(16)
-            .expect("W16 head chunk plan");
+        let chunks =
+            Gemma4Q6KHead::gemma4_spec50_head_chunk_ranges(16).expect("W16 head chunk plan");
         assert_eq!(chunks, vec![0..8, 8..16]);
 
         // The production loop appends each chunk's ids in this exact order.
@@ -45701,14 +45681,8 @@ mod tests {
         assert_eq!(Scratch::row_elements(Scratch::FFN), Some(245_760));
         assert_eq!(Scratch::row_elements(Scratch::MAX_Q), Some(131_072));
         assert_eq!(Scratch::row_elements(Scratch::MAX_KV), Some(32_768));
-        assert_eq!(
-            Scratch::row_elements(Scratch::HIDDEN / 32),
-            Some(1_920)
-        );
-        assert_eq!(
-            Scratch::row_elements(Scratch::FFN / 32),
-            Some(7_680)
-        );
+        assert_eq!(Scratch::row_elements(Scratch::HIDDEN / 32), Some(1_920));
+        assert_eq!(Scratch::row_elements(Scratch::FFN / 32), Some(7_680));
         assert_eq!(Scratch::q4_work_bytes(), Some(58_982_400));
         assert!(
             Scratch::q4_work_bytes().unwrap()
@@ -45719,14 +45693,9 @@ mod tests {
         // projection and checks its exact byte need before encoding.  Pin the
         // official 512-position W16 harness edge so that integration cannot
         // silently resize one side without the other.
-        let (_, attention_bytes) = gemma4_dense_attention_row_plan(
-            512 - Scratch::MAX_K,
-            Scratch::MAX_K,
-            None,
-            512,
-            16,
-        )
-        .expect("W16 global attention plan at verifier capacity");
+        let (_, attention_bytes) =
+            gemma4_dense_attention_row_plan(512 - Scratch::MAX_K, Scratch::MAX_K, None, 512, 16)
+                .expect("W16 global attention plan at verifier capacity");
         assert_eq!(attention_bytes, 516_608);
         assert!(Scratch::q4_work_bytes().unwrap() >= attention_bytes);
     }
@@ -45996,14 +45965,17 @@ mod tests {
             buffer
         };
 
-        for (head_dim, kv_heads, geometry) in [
-            (256usize, 8usize, "sliding"),
-            (512usize, 1usize, "global"),
-        ] {
+        for (head_dim, kv_heads, geometry) in
+            [(256usize, 8usize, "sliding"), (512usize, 1usize, "global")]
+        {
             let weight: Vec<f32> = (0..head_dim)
                 .map(|index| {
                     let magnitude = (1 + (index * 13 + head_dim) % 37) as f32 / 32.0;
-                    if index % 5 == 0 { -magnitude } else { magnitude }
+                    if index % 5 == 0 {
+                        -magnitude
+                    } else {
+                        magnitude
+                    }
                 })
                 .collect();
             let weight_buffer = f32_buffer(&weight);
@@ -46366,17 +46338,7 @@ mod tests {
         let cos_all = vec![1.0f32; tokens * (head_dim / 2)];
         let sin_all = vec![0.0f32; cos_all.len()];
         let mut session = ResidentDecodeState::new(
-            n_layers,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            hidden,
-            ffn,
-            16,
-            16,
-            1.0e-5,
-            false,
-            None,
+            n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn, 16, 16, 1.0e-5, false, None,
         )
         .expect("resident session");
         let captures = session
@@ -48849,8 +48811,10 @@ mod tests {
             let c = i % cols;
             *y = ((((t * 131 + c * 17) % 251) as f32) - 125.0) * 0.017 + t as f32 * 0.0011;
         }
-        let y_buf =
-            device.new_buffer((y_flat.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let y_buf = device.new_buffer(
+            (y_flat.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         write_buffer_f32(&y_buf, &y_flat);
 
         // One shared Q8K staging for all columns; the reference dispatches
@@ -48860,10 +48824,8 @@ mod tests {
             (max_k * n_sb * 4) as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let quants_buf = device.new_buffer(
-            (max_k * cols) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let quants_buf =
+            device.new_buffer((max_k * cols) as u64, MTLResourceOptions::StorageModeShared);
         let qscalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
         unsafe {
             let p = qscalar.contents() as *mut u32;
@@ -48930,8 +48892,7 @@ mod tests {
             for (i, b) in wire.iter_mut().enumerate() {
                 *b = ((i * 13 + i / 97 + 5) % 256) as u8;
             }
-            let w_buf =
-                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let w_buf = device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
             for k in [2usize, 3, 8, 16] {
@@ -48949,8 +48910,8 @@ mod tests {
                 // Metal tests in the binary, which then read untouched output
                 // and fail as a bogus bit mismatch (see the queue-occupancy note
                 // at metal_resident_window_start_beyond_512).
-                let ref_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let ref_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&ref_buf, k * rows);
                 {
                     let cb = kernel.queue.new_command_buffer();
@@ -48963,8 +48924,7 @@ mod tests {
                         e.set_buffer(3, Some(&ref_buf), (t * rows * 4) as u64);
                         e.set_buffer(4, Some(&scalar), 0);
                         e.set_buffer(5, Some(&scalar), 4);
-                        let tg_bytes =
-                            (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
+                        let tg_bytes = (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
                         e.set_threadgroup_memory_length(0, tg_bytes as u64);
                         e.dispatch_thread_groups(
                             metal::MTLSize {
@@ -48988,8 +48948,8 @@ mod tests {
                 assert_no_sentinel(&reference, case.name, k);
 
                 // Candidate: one multi-column dispatch over the same staging.
-                let out_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let out_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&out_buf, k * rows);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
@@ -49001,8 +48961,7 @@ mod tests {
                 e.set_buffer(4, Some(&scalar), 0);
                 e.set_buffer(5, Some(&scalar), 4);
                 e.set_buffer(6, Some(&scalar), 8);
-                let tg_bytes =
-                    (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
+                let tg_bytes = (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16);
                 e.set_threadgroup_memory_length(0, tg_bytes as u64);
                 e.dispatch_thread_groups(
                     metal::MTLSize {
@@ -49030,7 +48989,9 @@ mod tests {
                 // replay is a scheduling/visibility artifact of the shared
                 // serial queue under parallel tests. Without this, a rare
                 // failure carries no evidence about which it was.
-                if let Some(bad) = (0..k * rows).find(|&i| batched[i].to_bits() != reference[i].to_bits()) {
+                if let Some(bad) =
+                    (0..k * rows).find(|&i| batched[i].to_bits() != reference[i].to_bits())
+                {
                     let replay_mc = device
                         .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                     let replay_single = device
@@ -49052,8 +49013,16 @@ mod tests {
                             (n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16) as u64,
                         );
                         e.dispatch_thread_groups(
-                            metal::MTLSize { width: rows as u64, height: 1, depth: 1 },
-                            metal::MTLSize { width: 32, height: 1, depth: 1 },
+                            metal::MTLSize {
+                                width: rows as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32,
+                                height: 1,
+                                depth: 1,
+                            },
                         );
                     }
                     e.set_compute_pipeline_state(mc_pipeline);
@@ -49069,8 +49038,16 @@ mod tests {
                         (k * n_sb * case.scratch_ints_per_sb * 4).next_multiple_of(16) as u64,
                     );
                     e.dispatch_thread_groups(
-                        metal::MTLSize { width: rows as u64, height: 1, depth: 1 },
-                        metal::MTLSize { width: 32, height: 1, depth: 1 },
+                        metal::MTLSize {
+                            width: rows as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
                     );
                     e.end_encoding();
                     cb.commit();
@@ -49146,8 +49123,10 @@ mod tests {
                 let c = i % cols;
                 *y = ((((t * 131 + c * 17) % 251) as f32) - 125.0) * 0.017 + t as f32 * 0.0011;
             }
-            let y_buf =
-                device.new_buffer((y_flat.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_buf = device.new_buffer(
+                (y_flat.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             write_buffer_f32(&y_buf, &y_flat);
             let scales_buf = device.new_buffer(
                 (max_k * n_sb * 4) as u64,
@@ -49181,8 +49160,7 @@ mod tests {
             for (i, b) in wire.iter_mut().enumerate() {
                 *b = ((i * 13 + i / 97 + 5) % 256) as u8;
             }
-            let w_buf =
-                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let w_buf = device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
             for k in [2usize, 3, 8, 16] {
@@ -49200,8 +49178,8 @@ mod tests {
                 // Metal test in the binary — they read back untouched output and
                 // fail as a bogus "bit mismatch" (see the note on queue
                 // occupancy at metal_resident_window_start_beyond_512).
-                let ref_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let ref_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&ref_buf, k * rows);
                 {
                     let cb = kernel.queue.new_command_buffer();
@@ -49237,8 +49215,8 @@ mod tests {
                 read_buffer_f32(&ref_buf, &mut reference);
                 assert_no_sentinel(&reference, "q4k_v2 reference", k);
 
-                let out_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let out_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q4k_mc);
@@ -49312,8 +49290,8 @@ mod tests {
                     *p.add(3) = width as u32;
                     *p.add(4) = k_pad as u32;
                 }
-                let mma_out = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let mma_out =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q4k_mma_stage_y);
@@ -49399,8 +49377,10 @@ mod tests {
                 let c = i % cols;
                 *y = ((((t * 137 + c * 19) % 249) as f32) - 124.0) * 0.019 + t as f32 * 0.0013;
             }
-            let y_buf =
-                device.new_buffer((y_flat.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_buf = device.new_buffer(
+                (y_flat.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             write_buffer_f32(&y_buf, &y_flat);
             let scales_buf = device.new_buffer(
                 (max_k * n_sb * 4) as u64,
@@ -49433,8 +49413,7 @@ mod tests {
             for (i, b) in wire.iter_mut().enumerate() {
                 *b = ((i * 17 + i / 89 + 3) % 256) as u8;
             }
-            let w_buf =
-                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let w_buf = device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&w_buf, &wire);
 
             for k in [2usize, 3, 8, 16] {
@@ -49448,8 +49427,8 @@ mod tests {
                 // ONE command buffer for all k reference dispatches (shared
                 // serial queue — see the q4k sibling and the queue-occupancy
                 // note at metal_resident_window_start_beyond_512).
-                let ref_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let ref_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 fill_buffer_sentinel(&ref_buf, k * rows);
                 {
                     let cb = kernel.queue.new_command_buffer();
@@ -49488,8 +49467,8 @@ mod tests {
                 assert_no_sentinel(&reference, "q6k_v2 reference", k);
 
                 // Scalar mc_v2.
-                let out_buf = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let out_buf =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q6k_mc);
@@ -49546,8 +49525,8 @@ mod tests {
                     *p.add(3) = width as u32;
                     *p.add(4) = k_pad as u32;
                 }
-                let mma_out = device
-                    .new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let mma_out =
+                    device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 e.set_compute_pipeline_state(&v2.q6k_mma_stage_y);
@@ -49827,10 +49806,7 @@ mod tests {
                     path
                 })
                 .collect();
-            let tree_pc: Vec<usize> = tail_slots
-                .iter()
-                .map(|slots| base + slots.len())
-                .collect();
+            let tree_pc: Vec<usize> = tail_slots.iter().map(|slots| base + slots.len()).collect();
             assert_case(
                 &format!("branching-tree-k{rows}"),
                 &tree_pc,
@@ -50851,13 +50827,11 @@ mod tests {
                 "strict direct-threadgroup Q4_0 column pipeline K={width} must admit one 32-lane SIMD group"
             );
         }
-        assert!(kernel
-            .q4_0_q8_ordered_columns_mma_stage_pipeline
-            .is_some());
-        assert!(admitted_32_lane_pipeline(
-            kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref()
-        )
-        .is_some());
+        assert!(kernel.q4_0_q8_ordered_columns_mma_stage_pipeline.is_some());
+        assert!(
+            admitted_32_lane_pipeline(kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref())
+                .is_some()
+        );
         assert!(admitted_32_lane_pipeline(
             kernel
                 .q4_0_q8_ordered_columns_mma_rowmajor_pipeline
@@ -51021,35 +50995,24 @@ mod tests {
                     }
                 }
 
-                let mma = try_gemma4_q4_0_matmul_q8_columns_mma(&refs, &wire, rows)
-                    .unwrap_or_else(|| {
-                        panic!("padded-eight MMA Q4_0 columns: {label} K={columns}")
-                    });
+                let mma = try_gemma4_q4_0_matmul_q8_columns_mma(&refs, &wire, rows).unwrap_or_else(
+                    || panic!("padded-eight MMA Q4_0 columns: {label} K={columns}"),
+                );
                 let mma_rowmajor =
                     try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor(&refs, &wire, rows)
                         .unwrap_or_else(|| {
-                            panic!(
-                                "row-major padded-eight MMA Q4_0 columns: {label} K={columns}"
-                            )
+                            panic!("row-major padded-eight MMA Q4_0 columns: {label} K={columns}")
                         });
                 let mma_rowmajor_fragment =
-                    try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor_fragment(
-                        &refs, &wire, rows,
-                    )
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "fragment-owned row-major MMA Q4_0 columns: {label} K={columns}"
-                        )
-                    });
+                    try_gemma4_q4_0_matmul_q8_columns_mma_rowmajor_fragment(&refs, &wire, rows)
+                        .unwrap_or_else(|| {
+                            panic!("fragment-owned row-major MMA Q4_0 columns: {label} K={columns}")
+                        });
                 let mma_register_fragment =
-                    try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment(
-                        &refs, &wire, rows,
-                    )
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "register-fed MMA Q4_0 columns: {label} K={columns}"
-                        )
-                    });
+                    try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment(&refs, &wire, rows)
+                        .unwrap_or_else(|| {
+                            panic!("register-fed MMA Q4_0 columns: {label} K={columns}")
+                        });
                 let mma_native = try_gemma4_q4_0_matmul_q8_columns_mma_native(&refs, &wire, rows)
                     .unwrap_or_else(|| {
                         panic!("native-octet padded-eight MMA Q4_0 columns: {label} K={columns}")
@@ -51057,9 +51020,7 @@ mod tests {
                 let mma_native_register =
                     try_gemma4_q4_0_matmul_q8_columns_mma_native_register(&refs, &wire, rows)
                         .unwrap_or_else(|| {
-                            panic!(
-                                "native register-fed MMA Q4_0 columns: {label} K={columns}"
-                            )
+                            panic!("native register-fed MMA Q4_0 columns: {label} K={columns}")
                         });
                 for column in 0..columns {
                     for row in 0..rows {
@@ -51097,17 +51058,13 @@ mod tests {
                 }
 
                 for row_tiles in [2usize, 4] {
-                    let serial = try_gemma4_q4_0_matmul_q8_columns_mma_serial(
-                        &refs,
-                        &wire,
-                        rows,
-                        row_tiles,
-                    )
-                    .unwrap_or_else(|| {
-                        panic!(
+                    let serial =
+                        try_gemma4_q4_0_matmul_q8_columns_mma_serial(&refs, &wire, rows, row_tiles)
+                            .unwrap_or_else(|| {
+                                panic!(
                             "serial MMA Q4_0 columns: {label} K={columns} row_tiles={row_tiles}"
                         )
-                    });
+                            });
                     for column in 0..columns {
                         for row in 0..rows {
                             assert_eq!(
@@ -51120,14 +51077,10 @@ mod tests {
                 }
 
                 let serial2_fragment =
-                    try_gemma4_q4_0_matmul_q8_columns_mma_serial2_fragment(
-                        &refs, &wire, rows,
-                    )
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "fragment-owned serial2 MMA Q4_0 columns: {label} K={columns}"
-                        )
-                    });
+                    try_gemma4_q4_0_matmul_q8_columns_mma_serial2_fragment(&refs, &wire, rows)
+                        .unwrap_or_else(|| {
+                            panic!("fragment-owned serial2 MMA Q4_0 columns: {label} K={columns}")
+                        });
                 for column in 0..columns {
                     for row in 0..rows {
                         assert_eq!(
@@ -51249,10 +51202,9 @@ mod tests {
             }
 
             let before = gemma4_q4_column_dispatch_counts();
-            let got = try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment_k16(
-                &refs, &wire, rows,
-            )
-            .unwrap_or_else(|| panic!("register-fed K=16: {label}"));
+            let got =
+                try_gemma4_q4_0_matmul_q8_columns_mma_register_fragment_k16(&refs, &wire, rows)
+                    .unwrap_or_else(|| panic!("register-fed K=16: {label}"));
             let after = gemma4_q4_column_dispatch_counts();
             assert_eq!(after.k16 - before.k16, 1, "one K=16 dispatch: {label}");
             assert_eq!(after.k1 - before.k1, 0, "no hidden K=1 dispatch: {label}");
@@ -51343,8 +51295,7 @@ mod tests {
                                 5 => 0,
                                 6 => 1,
                                 _ => {
-                                    (((column * 67 + block * 29 + j * 13) % 255) as i16 - 127)
-                                        as i8
+                                    (((column * 67 + block * 29 + j * 13) % 255) as i16 - 127) as i8
                                 }
                             }),
                         })
@@ -51359,8 +51310,7 @@ mod tests {
                     wire.extend_from_slice(&scale.to_le_bytes());
                     for j in 0..16 {
                         wire.push(
-                            packed_patterns
-                                [(row * 11 + block * 7 + j * 3) % packed_patterns.len()],
+                            packed_patterns[(row * 11 + block * 7 + j * 3) % packed_patterns.len()],
                         );
                     }
                 }
@@ -51676,10 +51626,10 @@ mod tests {
             return;
         }
         let kernel = metal_linear_kernel().expect("strict Metal kernel library");
-        assert!(admitted_32_lane_pipeline(
-            kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref()
-        )
-        .is_some());
+        assert!(
+            admitted_32_lane_pipeline(kernel.q4_0_q8_ordered_columns_mma_pipeline.as_ref())
+                .is_some()
+        );
         assert!(admitted_32_lane_pipeline(
             kernel
                 .q4_0_q8_ordered_columns_mma_rowmajor_pipeline
@@ -51955,11 +51905,8 @@ mod tests {
                 read_buffer_f32(&sg1_buf, &mut sg1);
                 read_buffer_f32(&serial2_buf, &mut serial2);
                 read_buffer_f32(&serial4_buf, &mut serial4);
-                for (index, ((&two, &four), &one)) in serial2
-                    .iter()
-                    .zip(&serial4)
-                    .zip(&sg1)
-                    .enumerate()
+                for (index, ((&two, &four), &one)) in
+                    serial2.iter().zip(&serial4).zip(&sg1).enumerate()
                 {
                     assert_eq!(
                         two.to_bits(),
@@ -52208,11 +52155,8 @@ mod tests {
             read_buffer_f32(&control_buf, &mut control);
             read_buffer_f32(&accumulator_buf, &mut accumulator);
             read_buffer_f32(&register_buf, &mut register);
-            for (index, ((&acc, &reg), &established)) in accumulator
-                .iter()
-                .zip(&register)
-                .zip(&control)
-                .enumerate()
+            for (index, ((&acc, &reg), &established)) in
+                accumulator.iter().zip(&register).zip(&control).enumerate()
             {
                 assert_eq!(
                     acc.to_bits(),
@@ -52796,23 +52740,21 @@ mod tests {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         let encoded = match arm {
-            Some((v2, simdgroups)) => {
-                encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2(
-                    encoder,
-                    kernel,
-                    v2,
-                    simdgroups,
-                    &fixture.scales_buf,
-                    &fixture.quants_buf,
-                    &fixture.weight_buf,
-                    0,
-                    output,
-                    &fixture.stage_buf,
-                    fixture.rows,
-                    fixture.blocks_per_row,
-                    fixture.columns,
-                )
-            }
+            Some((v2, simdgroups)) => encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2(
+                encoder,
+                kernel,
+                v2,
+                simdgroups,
+                &fixture.scales_buf,
+                &fixture.quants_buf,
+                &fixture.weight_buf,
+                0,
+                output,
+                &fixture.stage_buf,
+                fixture.rows,
+                fixture.blocks_per_row,
+                fixture.columns,
+            ),
             None if fixture.columns == 16 => {
                 encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_k16(
                     encoder,
@@ -52887,9 +52829,15 @@ mod tests {
             );
         }
         assert_eq!(gemma4_q4_native_v2_stage_bytes(120, 8, true), Some(65_280));
-        assert_eq!(gemma4_q4_native_v2_stage_bytes(480, 16, true), Some(522_240));
+        assert_eq!(
+            gemma4_q4_native_v2_stage_bytes(480, 16, true),
+            Some(522_240)
+        );
         assert_eq!(gemma4_q4_native_v2_stage_bytes(120, 8, false), Some(61_440));
-        assert_eq!(gemma4_q4_native_v2_stage_bytes(480, 16, false), Some(491_520));
+        assert_eq!(
+            gemma4_q4_native_v2_stage_bytes(480, 16, false),
+            Some(491_520)
+        );
 
         let half_scales = [
             0x0000u16, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3555, 0x3c00, 0xbc00, 0x7bff, 0xfbff,
@@ -52930,8 +52878,7 @@ mod tests {
                                 5 => 0,
                                 6 => 1,
                                 _ => {
-                                    (((column * 67 + block * 29 + j * 13) % 255) as i16 - 127)
-                                        as i8
+                                    (((column * 67 + block * 29 + j * 13) % 255) as i16 - 127) as i8
                                 }
                             }),
                         })
@@ -52945,16 +52892,14 @@ mod tests {
                     wire.extend_from_slice(&scale.to_le_bytes());
                     for j in 0..16 {
                         wire.push(
-                            packed_patterns
-                                [(row * 11 + block * 7 + j * 3) % packed_patterns.len()],
+                            packed_patterns[(row * 11 + block * 7 + j * 3) % packed_patterns.len()],
                         );
                     }
                 }
             }
 
             for columns in [1usize, 2, 4, 8, 16] {
-                let refs: Vec<&[Q8_0Block]> =
-                    inputs[..columns].iter().map(Vec::as_slice).collect();
+                let refs: Vec<&[Q8_0Block]> = inputs[..columns].iter().map(Vec::as_slice).collect();
                 let fixture = native_v2_fixture(&kernel, &refs, &wire, rows, blocks_per_row);
                 let output_bytes = (columns * rows * std::mem::size_of::<f32>()) as u64;
                 let control_buf = kernel
@@ -53094,8 +53039,7 @@ mod tests {
             }
 
             for columns in [8usize, 16] {
-                let refs: Vec<&[Q8_0Block]> =
-                    inputs[..columns].iter().map(Vec::as_slice).collect();
+                let refs: Vec<&[Q8_0Block]> = inputs[..columns].iter().map(Vec::as_slice).collect();
                 let fixture = native_v2_fixture(&kernel, &refs, &wire, rows, blocks_per_row);
                 let output_bytes = (columns * rows * std::mem::size_of::<f32>()) as u64;
                 let control_buf = kernel
@@ -53225,10 +53169,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn fused_glue_shared(kernel: &MetalLinearKernel, bytes: usize) -> Buffer {
-        kernel.device.new_buffer(
-            bytes.max(4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        kernel
+            .device
+            .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
     }
 
     #[cfg(target_os = "macos")]
@@ -53280,7 +53223,10 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn fused_glue_run(kernel: &MetalLinearKernel, encode: impl FnOnce(&metal::ComputeCommandEncoderRef)) -> u128 {
+    fn fused_glue_run(
+        kernel: &MetalLinearKernel,
+        encode: impl FnOnce(&metal::ComputeCommandEncoderRef),
+    ) -> u128 {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         encode(encoder);
@@ -53321,7 +53267,8 @@ mod tests {
             let weight = fused_glue_norm_weight(WIDTH, weight_scale, 11 + weight_index as u64);
             let weight_buf = fused_glue_f32_buffer(kernel, &weight);
             for columns in [1usize, 2, 4, 8] {
-                let label = format!("rms_norm_quantize_batch weight_scale={weight_scale} K={columns}");
+                let label =
+                    format!("rms_norm_quantize_batch weight_scale={weight_scale} K={columns}");
                 let input = fused_glue_adversarial_rows(
                     columns * WIDTH,
                     3.0,
@@ -53336,8 +53283,24 @@ mod tests {
                 write_buffer_u8(&fused_quants, &vec![0xa5u8; columns * WIDTH]);
                 let nblocks = fused_glue_u32_buffer(kernel, &[(columns * BLOCKS) as u32]);
                 fused_glue_run(kernel, |e| {
-                    encode_rms_norm_batch(kernel, e, &input_buf, &weight_buf, &norm_buf, &scalar, columns);
-                    encode_quantize(e, kernel, &norm_buf, &ref_scales, &ref_quants, &nblocks, columns * BLOCKS);
+                    encode_rms_norm_batch(
+                        kernel,
+                        e,
+                        &input_buf,
+                        &weight_buf,
+                        &norm_buf,
+                        &scalar,
+                        columns,
+                    );
+                    encode_quantize(
+                        e,
+                        kernel,
+                        &norm_buf,
+                        &ref_scales,
+                        &ref_quants,
+                        &nblocks,
+                        columns * BLOCKS,
+                    );
                     encode_gemma4_verify_rms_norm_quantize_batch(
                         e,
                         glue,
@@ -53349,8 +53312,18 @@ mod tests {
                         columns,
                     );
                 });
-                fused_glue_assert_f32_bits(&format!("{label} scales"), &ref_scales, &fused_scales, columns * BLOCKS);
-                fused_glue_assert_i8(&format!("{label} quants"), &ref_quants, &fused_quants, columns * WIDTH);
+                fused_glue_assert_f32_bits(
+                    &format!("{label} scales"),
+                    &ref_scales,
+                    &fused_scales,
+                    columns * BLOCKS,
+                );
+                fused_glue_assert_i8(
+                    &format!("{label} quants"),
+                    &ref_quants,
+                    &fused_quants,
+                    columns * WIDTH,
+                );
             }
         }
     }
@@ -53373,8 +53346,16 @@ mod tests {
         for (scale_index, scale) in [1.0f32, 0.05, 6.0].into_iter().enumerate() {
             for columns in [1usize, 2, 4, 8] {
                 let label = format!("gelu_mul_quantize scale={scale} K={columns}");
-                let gate = fused_glue_adversarial_rows(columns * FFN, scale, 300 + columns as u64 + scale_index as u64 * 5);
-                let up = fused_glue_adversarial_rows(columns * FFN, 2.0, 400 + columns as u64 + scale_index as u64 * 5);
+                let gate = fused_glue_adversarial_rows(
+                    columns * FFN,
+                    scale,
+                    300 + columns as u64 + scale_index as u64 * 5,
+                );
+                let up = fused_glue_adversarial_rows(
+                    columns * FFN,
+                    2.0,
+                    400 + columns as u64 + scale_index as u64 * 5,
+                );
                 let gate_buf = fused_glue_f32_buffer(kernel, &gate);
                 let up_buf = fused_glue_f32_buffer(kernel, &up);
                 let activation = fused_glue_shared(kernel, columns * FFN * 4);
@@ -53386,8 +53367,24 @@ mod tests {
                 let n = fused_glue_u32_buffer(kernel, &[(columns * FFN) as u32]);
                 let nblocks = fused_glue_u32_buffer(kernel, &[(columns * BLOCKS) as u32]);
                 fused_glue_run(kernel, |e| {
-                    encode_binary(e, &kernel.gelu_mul_pipeline, &gate_buf, &up_buf, &activation, &n, columns * FFN);
-                    encode_quantize(e, kernel, &activation, &ref_scales, &ref_quants, &nblocks, columns * BLOCKS);
+                    encode_binary(
+                        e,
+                        &kernel.gelu_mul_pipeline,
+                        &gate_buf,
+                        &up_buf,
+                        &activation,
+                        &n,
+                        columns * FFN,
+                    );
+                    encode_quantize(
+                        e,
+                        kernel,
+                        &activation,
+                        &ref_scales,
+                        &ref_quants,
+                        &nblocks,
+                        columns * BLOCKS,
+                    );
                     encode_gemma4_verify_gelu_mul_quantize(
                         e,
                         glue,
@@ -53399,8 +53396,18 @@ mod tests {
                         columns * BLOCKS,
                     );
                 });
-                fused_glue_assert_f32_bits(&format!("{label} scales"), &ref_scales, &fused_scales, columns * BLOCKS);
-                fused_glue_assert_i8(&format!("{label} quants"), &ref_quants, &fused_quants, columns * FFN);
+                fused_glue_assert_f32_bits(
+                    &format!("{label} scales"),
+                    &ref_scales,
+                    &fused_scales,
+                    columns * BLOCKS,
+                );
+                fused_glue_assert_i8(
+                    &format!("{label} quants"),
+                    &ref_quants,
+                    &fused_quants,
+                    columns * FFN,
+                );
             }
         }
     }
@@ -53449,20 +53456,43 @@ mod tests {
                     *args.add(8).cast::<u32>() = use_weight;
                 }
             }
-            let rope_q = fused_glue_u32_buffer(kernel, &[HEADS as u32, head_dim as u32, half as u32, 1]);
-            let rope_k = fused_glue_u32_buffer(kernel, &[n_kv as u32, head_dim as u32, half as u32, 1]);
+            let rope_q =
+                fused_glue_u32_buffer(kernel, &[HEADS as u32, head_dim as u32, half as u32, 1]);
+            let rope_k =
+                fused_glue_u32_buffer(kernel, &[n_kv as u32, head_dim as u32, half as u32, 1]);
             let scatter = fused_glue_u32_buffer(
                 kernel,
-                &[head_dim as u32, MAX_POSITIONS as u32, BASE as u32, kv_dim as u32],
+                &[
+                    head_dim as u32,
+                    MAX_POSITIONS as u32,
+                    BASE as u32,
+                    kv_dim as u32,
+                ],
             );
-            let q_norm = fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(head_dim, 0.88, 500 + shape as u64));
-            let k_norm = fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(head_dim, 0.05, 600 + shape as u64));
+            let q_norm = fused_glue_f32_buffer(
+                kernel,
+                &fused_glue_norm_weight(head_dim, 0.88, 500 + shape as u64),
+            );
+            let k_norm = fused_glue_f32_buffer(
+                kernel,
+                &fused_glue_norm_weight(head_dim, 0.05, 600 + shape as u64),
+            );
             for columns in [1usize, 2, 4, 8] {
-                let label = format!("head_norm head_dim={head_dim} n_kv={n_kv} has_v={has_v} K={columns}");
+                let label =
+                    format!("head_norm head_dim={head_dim} n_kv={n_kv} has_v={has_v} K={columns}");
                 let seed = 700 + shape as u64 * 31 + columns as u64;
-                let q_raw = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * q_dim, 2.0, seed));
-                let k_raw = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * kv_dim, 2.0, seed + 1));
-                let v_raw = fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * kv_dim, 2.0, seed + 2));
+                let q_raw = fused_glue_f32_buffer(
+                    kernel,
+                    &fused_glue_adversarial_rows(columns * q_dim, 2.0, seed),
+                );
+                let k_raw = fused_glue_f32_buffer(
+                    kernel,
+                    &fused_glue_adversarial_rows(columns * kv_dim, 2.0, seed + 1),
+                );
+                let v_raw = fused_glue_f32_buffer(
+                    kernel,
+                    &fused_glue_adversarial_rows(columns * kv_dim, 2.0, seed + 2),
+                );
                 let v_src = if has_v { &v_raw } else { &k_raw };
                 let mut cos = Vec::with_capacity(columns * half);
                 let mut sin = Vec::with_capacity(columns * half);
@@ -53500,9 +53530,36 @@ mod tests {
 
                 // Phase 1: the three batched per-head norms vs C5-lite.
                 fused_glue_run(kernel, |e| {
-                    encode_rms_norm_per_head(e, kernel, &q_raw, &q_norm, &q_normed_ref, &weighted, columns * HEADS, 0);
-                    encode_rms_norm_per_head(e, kernel, &k_raw, &k_norm, &k_normed_ref, &weighted, columns * n_kv, 0);
-                    encode_rms_norm_per_head(e, kernel, v_src, &q_norm, &v_normed_ref, &unweighted, columns * n_kv, 0);
+                    encode_rms_norm_per_head(
+                        e,
+                        kernel,
+                        &q_raw,
+                        &q_norm,
+                        &q_normed_ref,
+                        &weighted,
+                        columns * HEADS,
+                        0,
+                    );
+                    encode_rms_norm_per_head(
+                        e,
+                        kernel,
+                        &k_raw,
+                        &k_norm,
+                        &k_normed_ref,
+                        &weighted,
+                        columns * n_kv,
+                        0,
+                    );
+                    encode_rms_norm_per_head(
+                        e,
+                        kernel,
+                        v_src,
+                        &q_norm,
+                        &v_normed_ref,
+                        &unweighted,
+                        columns * n_kv,
+                        0,
+                    );
                     encode_gemma4_verify_head_norm(
                         e,
                         glue,
@@ -53517,13 +53574,31 @@ mod tests {
                         head_args,
                     );
                 });
-                fused_glue_assert_f32_bits(&format!("{label} lite q_normed"), &q_normed_ref, &q_normed_lite, columns * q_dim);
-                fused_glue_assert_f32_bits(&format!("{label} lite k_normed"), &k_normed_ref, &k_normed_lite, columns * kv_dim);
-                fused_glue_assert_f32_bits(&format!("{label} lite v_normed"), &v_normed_ref, &v_normed_lite, columns * kv_dim);
+                fused_glue_assert_f32_bits(
+                    &format!("{label} lite q_normed"),
+                    &q_normed_ref,
+                    &q_normed_lite,
+                    columns * q_dim,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} lite k_normed"),
+                    &k_normed_ref,
+                    &k_normed_lite,
+                    columns * kv_dim,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} lite v_normed"),
+                    &v_normed_ref,
+                    &v_normed_lite,
+                    columns * kv_dim,
+                );
 
                 // Phase 2: RoPE (in place, as the plan encodes it) + scatter vs C5.
                 fused_glue_run(kernel, |e| {
-                    for (data, args, heads) in [(&q_normed_ref, &rope_q, HEADS), (&k_normed_ref, &rope_k, n_kv)] {
+                    for (data, args, heads) in [
+                        (&q_normed_ref, &rope_q, HEADS),
+                        (&k_normed_ref, &rope_k, n_kv),
+                    ] {
                         e.set_compute_pipeline_state(&kernel.rope_rotate_batch_pipeline);
                         e.set_buffer(0, Some(data), 0);
                         e.set_buffer(1, Some(&cos_buf), 0);
@@ -53531,7 +53606,12 @@ mod tests {
                         for index in 0..4u64 {
                             e.set_buffer(3 + index, Some(args), index * 4);
                         }
-                        dispatch_2d_rows(e, &kernel.rope_rotate_batch_pipeline, heads * half, columns);
+                        dispatch_2d_rows(
+                            e,
+                            &kernel.rope_rotate_batch_pipeline,
+                            heads * half,
+                            columns,
+                        );
                     }
                     e.set_compute_pipeline_state(&kernel.kv_scatter_batch_pipeline);
                     e.set_buffer(0, Some(&k_normed_ref), 0);
@@ -53562,9 +53642,24 @@ mod tests {
                         head_args,
                     );
                 });
-                fused_glue_assert_f32_bits(&format!("{label} C5 q_normed"), &q_normed_ref, &q_normed_fused, columns * q_dim);
-                fused_glue_assert_f32_bits(&format!("{label} C5 cache_k"), &cache_k_ref, &cache_k_fused, cache_len);
-                fused_glue_assert_f32_bits(&format!("{label} C5 cache_v"), &cache_v_ref, &cache_v_fused, cache_len);
+                fused_glue_assert_f32_bits(
+                    &format!("{label} C5 q_normed"),
+                    &q_normed_ref,
+                    &q_normed_fused,
+                    columns * q_dim,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} C5 cache_k"),
+                    &cache_k_ref,
+                    &cache_k_fused,
+                    cache_len,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} C5 cache_v"),
+                    &cache_v_ref,
+                    &cache_v_fused,
+                    cache_len,
+                );
             }
         }
     }
@@ -53721,7 +53816,11 @@ mod tests {
                         _ => unreachable!(),
                     };
                     for (index, delta) in deltas.into_iter().enumerate() {
-                        let expected = if index == selected { segments.len() as u64 } else { 0 };
+                        let expected = if index == selected {
+                            segments.len() as u64
+                        } else {
+                            0
+                        };
                         assert_eq!(
                             delta, expected,
                             "{label} K={columns} simdgroups={simdgroups}: the counter advances once per segment at the selected width"
@@ -53739,7 +53838,6 @@ mod tests {
             }
         }
     }
-
 
     /// Byte-for-byte comparison of two fragment-major activation records
     /// (`blocks_per_row * 544` bytes: 512 bytes of panel halves then 32 bytes
@@ -53795,10 +53893,7 @@ mod tests {
             .expect("fm_bits_u4 V2 variant compiles under cfg(test)");
         // 3840 = hidden, 15360 = FFN, 4096/8192 = the head_dim 256/512
         // attention contexts the O projection quantizes.
-        for (width_index, width) in [3_840usize, 15_360, 4_096, 8_192]
-            .into_iter()
-            .enumerate()
-        {
+        for (width_index, width) in [3_840usize, 15_360, 4_096, 8_192].into_iter().enumerate() {
             let blocks = width / 32;
             let panel_bytes = blocks * 544;
             let weight = fused_glue_f32_buffer(
@@ -53807,10 +53902,14 @@ mod tests {
             );
             for columns in [1usize, 2, 4, 8] {
                 let seed = 1_200 + width_index as u64 * 17 + columns as u64;
-                let input =
-                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * width, 3.0, seed));
-                let up =
-                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * width, 2.0, seed + 1));
+                let input = fused_glue_f32_buffer(
+                    kernel,
+                    &fused_glue_adversarial_rows(columns * width, 3.0, seed),
+                );
+                let up = fused_glue_f32_buffer(
+                    kernel,
+                    &fused_glue_adversarial_rows(columns * width, 2.0, seed + 1),
+                );
                 let scales = fused_glue_shared(kernel, columns * blocks * 4);
                 let quants = fused_glue_shared(kernel, columns * width);
                 let normed = fused_glue_shared(kernel, columns * width * 4);
@@ -53839,14 +53938,26 @@ mod tests {
                         // quantizer and then the production stage kernel.
                         match arm {
                             "quantize" => encode_quantize(
-                                e, kernel, &input, &scales, &quants, &nblocks, columns * blocks,
+                                e,
+                                kernel,
+                                &input,
+                                &scales,
+                                &quants,
+                                &nblocks,
+                                columns * blocks,
                             ),
                             "rms_norm_quantize" => {
                                 encode_rms_norm_batch(
                                     kernel, e, &input, &weight, &normed, &scalar, columns,
                                 );
                                 encode_quantize(
-                                    e, kernel, &normed, &scales, &quants, &nblocks, columns * blocks,
+                                    e,
+                                    kernel,
+                                    &normed,
+                                    &scales,
+                                    &quants,
+                                    &nblocks,
+                                    columns * blocks,
                                 );
                             }
                             _ => {
@@ -53860,7 +53971,12 @@ mod tests {
                                     columns * width,
                                 );
                                 encode_quantize(
-                                    e, kernel, &activation, &scales, &quants, &nblocks,
+                                    e,
+                                    kernel,
+                                    &activation,
+                                    &scales,
+                                    &quants,
+                                    &nblocks,
                                     columns * blocks,
                                 );
                             }
@@ -53922,18 +54038,28 @@ mod tests {
             *args.add(4).cast::<f32>() = EPS;
         }
         for (weight_index, weight_scale) in [0.0f32, 0.05, 0.88].into_iter().enumerate() {
-            let post_attn_norm =
-                fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(WIDTH, weight_scale, 1_300 + weight_index as u64));
-            let ffn_norm =
-                fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(WIDTH, weight_scale, 1_400 + weight_index as u64));
-            let post_ffw_norm =
-                fused_glue_f32_buffer(kernel, &fused_glue_norm_weight(WIDTH, weight_scale, 1_500 + weight_index as u64));
+            let post_attn_norm = fused_glue_f32_buffer(
+                kernel,
+                &fused_glue_norm_weight(WIDTH, weight_scale, 1_300 + weight_index as u64),
+            );
+            let ffn_norm = fused_glue_f32_buffer(
+                kernel,
+                &fused_glue_norm_weight(WIDTH, weight_scale, 1_400 + weight_index as u64),
+            );
+            let post_ffw_norm = fused_glue_f32_buffer(
+                kernel,
+                &fused_glue_norm_weight(WIDTH, weight_scale, 1_500 + weight_index as u64),
+            );
             for columns in [1usize, 2, 4, 8] {
                 let seed = 1_600 + weight_index as u64 * 23 + columns as u64;
-                let projection =
-                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * WIDTH, 3.0, seed));
-                let residual =
-                    fused_glue_f32_buffer(kernel, &fused_glue_adversarial_rows(columns * WIDTH, 1.5, seed + 1));
+                let projection = fused_glue_f32_buffer(
+                    kernel,
+                    &fused_glue_adversarial_rows(columns * WIDTH, 3.0, seed),
+                );
+                let residual = fused_glue_f32_buffer(
+                    kernel,
+                    &fused_glue_adversarial_rows(columns * WIDTH, 1.5, seed + 1),
+                );
                 let poison_f32 = |len: usize| fused_glue_f32_buffer(kernel, &vec![f32::NAN; len]);
                 let poison_panel = |value: u8| -> Buffer {
                     let buffer = fused_glue_shared(kernel, panel_bytes);
@@ -53963,7 +54089,13 @@ mod tests {
                 let panel_fused = poison_panel(0xa5);
                 fused_glue_run(kernel, |e| {
                     encode_rms_norm_batch(
-                        kernel, e, &projection, &post_attn_norm, &post_ref, &scalar, columns,
+                        kernel,
+                        e,
+                        &projection,
+                        &post_attn_norm,
+                        &post_ref,
+                        &scalar,
+                        columns,
                     );
                     encode_binary(
                         e,
@@ -53974,13 +54106,28 @@ mod tests {
                         &n,
                         columns * WIDTH,
                     );
-                    encode_rms_norm_batch(kernel, e, &mid_ref, &ffn_norm, &norm_ref, &scalar, columns);
+                    encode_rms_norm_batch(
+                        kernel, e, &mid_ref, &ffn_norm, &norm_ref, &scalar, columns,
+                    );
                     encode_quantize(
-                        e, kernel, &norm_ref, &scales_ref, &quants_ref, &nblocks, columns * BLOCKS,
+                        e,
+                        kernel,
+                        &norm_ref,
+                        &scales_ref,
+                        &quants_ref,
+                        &nblocks,
+                        columns * BLOCKS,
                     );
                     assert!(
                         encode_gemma4_q4_0_q8_ordered_columns_mma_native_register_v2_stage(
-                            e, kernel, v2, &scales_ref, &quants_ref, &panel_ref, BLOCKS, columns,
+                            e,
+                            kernel,
+                            v2,
+                            &scales_ref,
+                            &quants_ref,
+                            &panel_ref,
+                            BLOCKS,
+                            columns,
                         ),
                         "reference stage refused: {label}"
                     );
@@ -54021,19 +54168,55 @@ mod tests {
                         "fused C4+C6 post-attention refused: {label}"
                     );
                 });
-                fused_glue_assert_f32_bits(&format!("{label} post"), &post_ref, &post_fused, columns * WIDTH);
-                fused_glue_assert_f32_bits(&format!("{label} mid"), &mid_ref, &mid_fused, columns * WIDTH);
-                fused_glue_assert_f32_bits(&format!("{label} scales"), &scales_ref, &scales_fused, columns * BLOCKS);
-                fused_glue_assert_i8(&format!("{label} quants"), &quants_ref, &quants_fused, columns * WIDTH);
-                fused_glue_assert_f32_bits(&format!("{label} panel post"), &post_ref, &post_panel, columns * WIDTH);
-                fused_glue_assert_f32_bits(&format!("{label} panel mid"), &mid_ref, &mid_panel, columns * WIDTH);
-                fused_glue_assert_panel(&format!("{label} panel"), &panel_ref, &panel_fused, BLOCKS);
+                fused_glue_assert_f32_bits(
+                    &format!("{label} post"),
+                    &post_ref,
+                    &post_fused,
+                    columns * WIDTH,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} mid"),
+                    &mid_ref,
+                    &mid_fused,
+                    columns * WIDTH,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} scales"),
+                    &scales_ref,
+                    &scales_fused,
+                    columns * BLOCKS,
+                );
+                fused_glue_assert_i8(
+                    &format!("{label} quants"),
+                    &quants_ref,
+                    &quants_fused,
+                    columns * WIDTH,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} panel post"),
+                    &post_ref,
+                    &post_panel,
+                    columns * WIDTH,
+                );
+                fused_glue_assert_f32_bits(
+                    &format!("{label} panel mid"),
+                    &mid_ref,
+                    &mid_panel,
+                    columns * WIDTH,
+                );
+                fused_glue_assert_panel(
+                    &format!("{label} panel"),
+                    &panel_ref,
+                    &panel_fused,
+                    BLOCKS,
+                );
 
                 // Post-FFN half, including the exact-1.0-bits case in which the
                 // plan encodes no scale_f32 dispatch at all.
                 for layer_scale in [1.0f32, 0.05, 0.88] {
-                    let label =
-                        format!("post_ffw weight_scale={weight_scale} K={columns} scale={layer_scale}");
+                    let label = format!(
+                        "post_ffw weight_scale={weight_scale} K={columns} scale={layer_scale}"
+                    );
                     let post_ref = poison_f32(columns * WIDTH);
                     let next_ref = poison_f32(columns * WIDTH);
                     let post_fused = poison_f32(columns * WIDTH);
@@ -54046,7 +54229,13 @@ mod tests {
                     }
                     fused_glue_run(kernel, |e| {
                         encode_rms_norm_batch(
-                            kernel, e, &projection, &post_ffw_norm, &post_ref, &scalar, columns,
+                            kernel,
+                            e,
+                            &projection,
+                            &post_ffw_norm,
+                            &post_ref,
+                            &scalar,
+                            columns,
                         );
                         encode_binary(
                             e,
@@ -54059,7 +54248,12 @@ mod tests {
                         );
                         if layer_scale.to_bits() != 1.0f32.to_bits() {
                             encode_scale_f32(
-                                e, kernel, &next_ref, &next_ref, &scale_args, columns * WIDTH,
+                                e,
+                                kernel,
+                                &next_ref,
+                                &next_ref,
+                                &scale_args,
+                                columns * WIDTH,
                             );
                         }
                         encode_gemma4_verify_post_ffw_residual_scale(
@@ -54076,8 +54270,18 @@ mod tests {
                             columns,
                         );
                     });
-                    fused_glue_assert_f32_bits(&format!("{label} post"), &post_ref, &post_fused, columns * WIDTH);
-                    fused_glue_assert_f32_bits(&format!("{label} next"), &next_ref, &next_fused, columns * WIDTH);
+                    fused_glue_assert_f32_bits(
+                        &format!("{label} post"),
+                        &post_ref,
+                        &post_fused,
+                        columns * WIDTH,
+                    );
+                    fused_glue_assert_f32_bits(
+                        &format!("{label} next"),
+                        &next_ref,
+                        &next_fused,
+                        columns * WIDTH,
+                    );
                 }
             }
         }
@@ -54127,7 +54331,15 @@ mod tests {
             let add_us = fused_glue_run(kernel, |e| {
                 for index in 0..DISPATCHES {
                     let (x, out) = if index % 2 == 0 { (&a, &c) } else { (&c, &a) };
-                    encode_binary(e, &kernel.residual_add_pipeline, x, &b, out, &n, ROWS * WIDTH);
+                    encode_binary(
+                        e,
+                        &kernel.residual_add_pipeline,
+                        x,
+                        &b,
+                        out,
+                        &n,
+                        ROWS * WIDTH,
+                    );
                 }
             });
             let pair_us = fused_glue_run(kernel, |e| {
@@ -58710,7 +58922,6 @@ mod tests {
         }
     }
 
-
     /// Production 12B geometries for the V2 dense attention comparators:
     /// (label, heads, kv_heads, head_dim, max_positions, base_position, rows, window).
     /// Sliding cases straddle the window edge (base 1020) and sit fully inside it
@@ -58734,7 +58945,16 @@ mod tests {
             ("k8-global-1k", 16, 1, 512, 2_048, 1_030, 8, None),
             ("k8-sliding-128", 16, 8, 256, 2_048, 128, 8, Some(1_024)),
             ("k8-sliding-512", 16, 8, 256, 2_048, 512, 8, Some(1_024)),
-            ("k8-sliding-app-ragged", 16, 8, 256, 2_048, 529, 8, Some(1_024)),
+            (
+                "k8-sliding-app-ragged",
+                16,
+                8,
+                256,
+                2_048,
+                529,
+                8,
+                Some(1_024),
+            ),
             ("k8-sliding-768", 16, 8, 256, 2_048, 768, 8, Some(1_024)),
             ("k8-sliding-1023", 16, 8, 256, 2_048, 1_023, 8, Some(1_024)),
             ("k8-sliding-1024", 16, 8, 256, 2_048, 1_024, 8, Some(1_024)),
@@ -58744,7 +58964,16 @@ mod tests {
             ("k8-global-app-ragged", 16, 1, 512, 2_048, 529, 8, None),
             ("k8-global-768", 16, 1, 512, 2_048, 768, 8, None),
             ("k8-global-1024", 16, 1, 512, 2_048, 1_024, 8, None),
-            ("k16-sliding-edge", 16, 8, 256, 2_048, 1_017, 16, Some(1_024)),
+            (
+                "k16-sliding-edge",
+                16,
+                8,
+                256,
+                2_048,
+                1_017,
+                16,
+                Some(1_024),
+            ),
             ("k16-global-1k", 16, 1, 512, 2_048, 1_000, 16, None),
             ("k4-sliding-full", 16, 8, 256, 2_048, 1_300, 4, Some(1_024)),
             ("k2-global-short", 16, 1, 512, 2_048, 33, 2, None),
@@ -58787,7 +59016,11 @@ mod tests {
                 return Some(format!("{label}: comparator declined"));
             };
             if candidate.len() != oracle.len() {
-                return Some(format!("{label}: length {} != {}", candidate.len(), oracle.len()));
+                return Some(format!(
+                    "{label}: length {} != {}",
+                    candidate.len(),
+                    oracle.len()
+                ));
             }
             let mismatches = oracle
                 .iter()
@@ -58856,7 +59089,11 @@ mod tests {
             }
         }
         println!("[attn-v2-matrix] exact forms: {}", exact.join(" "));
-        assert!(failed.is_empty(), "non-exact V2 forms: {}", failed.join("; "));
+        assert!(
+            failed.is_empty(),
+            "non-exact V2 forms: {}",
+            failed.join("; ")
+        );
     }
 
     /// Production-shape timing receipt: one verifier round of attention (40 sliding
@@ -58885,8 +59122,9 @@ mod tests {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut fill = |buffer: &Buffer| {
             let elements = buffer.length() as usize / 4;
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), elements) };
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(buffer.contents().cast::<f32>(), elements)
+            };
             for value in slice.iter_mut() {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -58924,7 +59162,10 @@ mod tests {
         enum ReceiptConfig {
             RowsV1,
             V2(Gemma4DenseAttentionRowsV2Variant),
-            Tree(Gemma4DenseAttentionRowsV2Variant, gemma4_tree::TreeContextSelection),
+            Tree(
+                Gemma4DenseAttentionRowsV2Variant,
+                gemma4_tree::TreeContextSelection,
+            ),
         }
         // Tree mode (`CAMELID_ATTN_V2_RECEIPT_TREE=1`): the same 48-layer round is encoded
         // through `gemma4_tree::encode_tree_attention_with_form` with the static W8 chain
@@ -58982,30 +59223,29 @@ mod tests {
                 format!("fork{:?}", plan.parents())
             }
         });
-        let variants: Vec<Gemma4DenseAttentionRowsV2Variant> = match std::env::var(
-            "CAMELID_ATTN_V2_RECEIPT_VARIANTS",
-        ) {
-            Ok(spec) => spec
-                .split(';')
-                .map(|item| {
-                    Gemma4DenseAttentionRowsV2Variant::parse(item)
-                        .unwrap_or_else(|| panic!("bad variant {item:?}"))
-                })
-                .collect(),
-            Err(_) if tree_mode => vec![Gemma4DenseAttentionRowsV2Variant {
-                scores: 2,
-                context: 3,
-            }],
-            Err(_) => {
-                let mut list = vec![Gemma4DenseAttentionRowsV2Variant::DEFAULT];
-                if Gemma4DenseAttentionRowsV2Variant::DEFAULT
-                    != Gemma4DenseAttentionRowsV2Variant::NEST
-                {
-                    list.push(Gemma4DenseAttentionRowsV2Variant::NEST);
+        let variants: Vec<Gemma4DenseAttentionRowsV2Variant> =
+            match std::env::var("CAMELID_ATTN_V2_RECEIPT_VARIANTS") {
+                Ok(spec) => spec
+                    .split(';')
+                    .map(|item| {
+                        Gemma4DenseAttentionRowsV2Variant::parse(item)
+                            .unwrap_or_else(|| panic!("bad variant {item:?}"))
+                    })
+                    .collect(),
+                Err(_) if tree_mode => vec![Gemma4DenseAttentionRowsV2Variant {
+                    scores: 2,
+                    context: 3,
+                }],
+                Err(_) => {
+                    let mut list = vec![Gemma4DenseAttentionRowsV2Variant::DEFAULT];
+                    if Gemma4DenseAttentionRowsV2Variant::DEFAULT
+                        != Gemma4DenseAttentionRowsV2Variant::NEST
+                    {
+                        list.push(Gemma4DenseAttentionRowsV2Variant::NEST);
+                    }
+                    list
                 }
-                list
-            }
-        };
+            };
         let mut configs = Vec::new();
         if !tree_mode {
             configs.push(ReceiptConfig::RowsV1);
@@ -59080,25 +59320,27 @@ mod tests {
                                 window,
                                 1.0,
                             ),
-                            ReceiptConfig::V2(variant) => encode_gemma4_dense_attention_rows_v2_f32(
-                                encoder,
-                                kernel,
-                                &query,
-                                k,
-                                v,
-                                &scores,
-                                &denom,
-                                &out,
-                                HEADS,
-                                n_kv_heads,
-                                head_dim,
-                                MAX_POSITIONS,
-                                base,
-                                rows,
-                                window,
-                                1.0,
-                                *variant,
-                            ),
+                            ReceiptConfig::V2(variant) => {
+                                encode_gemma4_dense_attention_rows_v2_f32(
+                                    encoder,
+                                    kernel,
+                                    &query,
+                                    k,
+                                    v,
+                                    &scores,
+                                    &denom,
+                                    &out,
+                                    HEADS,
+                                    n_kv_heads,
+                                    head_dim,
+                                    MAX_POSITIONS,
+                                    base,
+                                    rows,
+                                    window,
+                                    1.0,
+                                    *variant,
+                                )
+                            }
                             ReceiptConfig::Tree(variant, form) => {
                                 gemma4_tree::encode_tree_attention_with_form(
                                     encoder,
@@ -65171,10 +65413,7 @@ mod tests {
                     "base={base} layer-0 capture element {i}: {actual} != {expected}"
                 );
             }
-            for (i, (&actual, &expected)) in captures[1]
-                .iter()
-                .zip(&ref_layer1_inputs)
-                .enumerate()
+            for (i, (&actual, &expected)) in captures[1].iter().zip(&ref_layer1_inputs).enumerate()
             {
                 assert_eq!(
                     actual.to_bits(),
@@ -65758,10 +65997,7 @@ mod tests {
         );
         assert!(f32y_gemv_enabled(), "CAMELID_METAL_F32Y=1 required");
         assert!(wire_weights_enabled(), "CAMELID_METAL_WIRE=1 required");
-        assert!(
-            wire_nsg8_enabled(),
-            "CAMELID_METAL_WIRE_NSG8=1 required"
-        );
+        assert!(wire_nsg8_enabled(), "CAMELID_METAL_WIRE_NSG8=1 required");
         assert!(attn2_enabled(), "CAMELID_METAL_ATTN2=1 required");
         assert!(
             splitk_attention_enabled(),

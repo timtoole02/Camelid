@@ -11,12 +11,18 @@ const DEFAULT_MAX_MARGIN: f32 = 2.0;
 const MAX_MARGIN_ENV: &str = "CAMELID_GEMMA4_MTP12_TREE_MAX_MARGIN";
 
 fn parse_max_margin(value: Option<&str>) -> Result<f32> {
-    let Some(text) = value else { return Ok(DEFAULT_MAX_MARGIN); };
+    let Some(text) = value else {
+        return Ok(DEFAULT_MAX_MARGIN);
+    };
     let margin = text.parse::<f32>().map_err(|_| {
-        invalid(format!("{MAX_MARGIN_ENV} must be a finite nonnegative number; got {text:?}"))
+        invalid(format!(
+            "{MAX_MARGIN_ENV} must be a finite nonnegative number; got {text:?}"
+        ))
     })?;
     if !margin.is_finite() || margin.is_sign_negative() {
-        return Err(invalid(format!("{MAX_MARGIN_ENV} must be a finite nonnegative number; got {text:?}")));
+        return Err(invalid(format!(
+            "{MAX_MARGIN_ENV} must be a finite nonnegative number; got {text:?}"
+        )));
     }
     Ok(margin)
 }
@@ -558,8 +564,7 @@ impl Gemma4Mtp12AssistantMetal {
         }
         .try_into()
         .unwrap();
-        let margins: [f32; PRIMARY] =
-            std::array::from_fn(|i| top[i].values[0] - top[i].values[1]);
+        let margins: [f32; PRIMARY] = std::array::from_fn(|i| top[i].values[0] - top[i].values[1]);
         if policy == menu::Policy::Legacy {
             // Byte-for-byte the qualified V3 proposal: the same earliest
             // eligible fork rule, the same two argmax continuations off the
@@ -791,8 +796,8 @@ impl Gemma4Mtp12AssistantMetal {
         .iter()
         .map(|pair| menu::ForwardTop::from_pair(pair.values, pair.ids, VOCAB))
         .collect();
-        let finalized =
-            menu::finalize(&plan, &forward_top, &gpu_tokens, anchor_token, calib).map_err(invalid)?;
+        let finalized = menu::finalize(&plan, &forward_top, &gpu_tokens, anchor_token, calib)
+            .map_err(invalid)?;
         if finalized.tokens.iter().any(|t| *t as usize >= VOCAB) {
             return Err(invalid("tree returned invalid token"));
         }
@@ -862,17 +867,35 @@ mod tests {
     #[test]
     fn tree_max_margin_parse_is_explicit_and_defaults_to_two() {
         assert_eq!(parse_max_margin(None).unwrap().to_bits(), 2.0f32.to_bits());
-        for (text, expected) in [("0", 0.0f32), ("0.5", 0.5), ("2", 2.0), ("2.5", 2.5), ("3e0", 3.0)] {
-            assert_eq!(parse_max_margin(Some(text)).unwrap().to_bits(), expected.to_bits());
+        for (text, expected) in [
+            ("0", 0.0f32),
+            ("0.5", 0.5),
+            ("2", 2.0),
+            ("2.5", 2.5),
+            ("3e0", 3.0),
+        ] {
+            assert_eq!(
+                parse_max_margin(Some(text)).unwrap().to_bits(),
+                expected.to_bits()
+            );
         }
-        for text in ["", " ", " 2", "2 ", "two", "2,5", "-1", "-0.5", "-0", "-1e-100", "NaN", "inf", "+inf", "-inf", "1e100"] {
-            assert!(parse_max_margin(Some(text)).is_err(), "must reject {text:?}");
+        for text in [
+            "", " ", " 2", "2 ", "two", "2,5", "-1", "-0.5", "-0", "-1e-100", "NaN", "inf", "+inf",
+            "-inf", "1e100",
+        ] {
+            assert!(
+                parse_max_margin(Some(text)).is_err(),
+                "must reject {text:?}"
+            );
         }
     }
 
     #[test]
     fn tree_max_margin_boundaries_preserve_first_eligible_and_linear_fallback() {
-        let wide = TopTwo { values: [4.0, 0.0], ids: [8, 9] };
+        let wide = TopTwo {
+            values: [4.0, 0.0],
+            ids: [8, 9],
+        };
         let mut pairs = [wide; PRIMARY];
         pairs[0].values[0] = f32::from_bits(2.5f32.to_bits() + 1);
         pairs[1].values[0] = 2.5;
@@ -938,7 +961,10 @@ mod tests {
                 assert_eq!(plan.depths, depths, "fork {step} depths");
                 assert_eq!(plan.primary_rows, primary_rows, "fork {step} primary rows");
                 assert_eq!(plan.fork_forwards, vec![step]);
-                assert_eq!(plan.runner_up_write, Some((menu::runner_up_slot(step), step)));
+                assert_eq!(
+                    plan.runner_up_write,
+                    Some((menu::runner_up_slot(step), step))
+                );
             }
             // Legacy may still fork at the fourth primary, which the menu
             // itself never does; the gate covers that topology all the same.
@@ -1032,7 +1058,10 @@ mod tests {
                     (0..count).filter(|i| !logits[*i].is_nan()).collect();
                 expected
                     .sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap().then(a.cmp(b)));
-                if expected.first().is_none_or(|i| logits[*i] == f32::NEG_INFINITY) {
+                if expected
+                    .first()
+                    .is_none_or(|i| logits[*i] == f32::NEG_INFINITY)
+                {
                     expected.retain(|i| *i != 0);
                     expected.insert(0, 0);
                 }
@@ -1060,7 +1089,11 @@ mod tests {
                     wanted[0]
                 );
                 for (j, id) in expected.iter().take(2).enumerate() {
-                    let value = if logits[*id].is_nan() { f32::NEG_INFINITY } else { logits[*id] };
+                    let value = if logits[*id].is_nan() {
+                        f32::NEG_INFINITY
+                    } else {
+                        logits[*id]
+                    };
                     assert_eq!(actual.values[j].to_bits(), value.to_bits());
                 }
             }
@@ -1086,18 +1119,22 @@ mod tests {
 
     /// Prefix lengths from `CAMELID_MTP12_BENCH_PREFIX` (comma separated).
     fn bench_prefixes() -> Vec<usize> {
-        let raw = std::env::var("CAMELID_MTP12_BENCH_PREFIX")
-            .unwrap_or_else(|_| "620,1500".to_string());
+        let raw =
+            std::env::var("CAMELID_MTP12_BENCH_PREFIX").unwrap_or_else(|_| "620,1500".to_string());
         let prefixes: Vec<usize> = raw
             .split(',')
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(|text| {
-                text.parse::<usize>()
-                    .unwrap_or_else(|_| panic!("CAMELID_MTP12_BENCH_PREFIX entry {text:?} is not an integer"))
+                text.parse::<usize>().unwrap_or_else(|_| {
+                    panic!("CAMELID_MTP12_BENCH_PREFIX entry {text:?} is not an integer")
+                })
             })
             .collect();
-        assert!(!prefixes.is_empty(), "CAMELID_MTP12_BENCH_PREFIX listed no prefixes");
+        assert!(
+            !prefixes.is_empty(),
+            "CAMELID_MTP12_BENCH_PREFIX listed no prefixes"
+        );
         assert!(prefixes.iter().all(|p| *p > 0), "prefixes must be positive");
         prefixes
     }
@@ -1144,11 +1181,21 @@ mod tests {
         for layer in 0..N_LAYERS {
             let local = layer < 3;
             let (kv, heads, dim, cos, sin) = if local {
-                (sliding, LOCAL_KV_HEADS, LOCAL_HEAD_DIM,
-                 &assistant.scratch.local_cos, &assistant.scratch.local_sin)
+                (
+                    sliding,
+                    LOCAL_KV_HEADS,
+                    LOCAL_HEAD_DIM,
+                    &assistant.scratch.local_cos,
+                    &assistant.scratch.local_sin,
+                )
             } else {
-                (full, FULL_KV_HEADS, FULL_HEAD_DIM,
-                 &assistant.scratch.full_cos, &assistant.scratch.full_sin)
+                (
+                    full,
+                    FULL_KV_HEADS,
+                    FULL_HEAD_DIM,
+                    &assistant.scratch.full_cos,
+                    &assistant.scratch.full_sin,
+                )
             };
             let compact = if local {
                 chain_query_position(position, 0, assistant.single_position)
@@ -1158,15 +1205,32 @@ mod tests {
                 0
             };
             let (next_norm, next_normed) = if layer + 1 < N_LAYERS {
-                (&assistant.layers[layer + 1].input_norm, &assistant.scratch.normed)
+                (
+                    &assistant.layers[layer + 1].input_norm,
+                    &assistant.scratch.normed,
+                )
             } else {
                 (&assistant.final_norm, &assistant.scratch.final_normalized)
             };
             assistant.encode_layer_k1_fused(
-                encoder, layer, kv.key.buffer, kv.value.buffer,
-                kv.key.byte_offset, kv.value.byte_offset, kv.max_positions,
-                heads, dim, prefix, compact, prefix - compact, cos, sin, 0,
-                scores, next_norm, next_normed,
+                encoder,
+                layer,
+                kv.key.buffer,
+                kv.value.buffer,
+                kv.key.byte_offset,
+                kv.value.byte_offset,
+                kv.max_positions,
+                heads,
+                dim,
+                prefix,
+                compact,
+                prefix - compact,
+                cos,
+                sin,
+                0,
+                scores,
+                next_norm,
+                next_normed,
             );
         }
     }
@@ -1187,14 +1251,17 @@ mod tests {
         let requested = std::env::var("CAMELID_GEMMA4_MTP12_ASSISTANT").ok();
         let mut assistant = match requested.as_deref() {
             None => {
-                eprintln!("[mtp12-tree-bench] weights SYNTHETIC (sparse unit weights in a full-size \
+                eprintln!(
+                    "[mtp12-tree-bench] weights SYNTHETIC (sparse unit weights in a full-size \
                            Q4_0 pack: bandwidth-representative, numerically trivial). Set \
-                           CAMELID_GEMMA4_MTP12_ASSISTANT=1 for the staged official assistant.");
+                           CAMELID_GEMMA4_MTP12_ASSISTANT=1 for the staged official assistant."
+                );
                 super::super::tests::synthetic_assistant(&default_device)
             }
             Some("1") | Some("true") => {
                 eprintln!("[mtp12-tree-bench] weights REAL (staged official assistant)");
-                Gemma4Mtp12AssistantMetal::load_staged_official().expect("staged official assistant")
+                Gemma4Mtp12AssistantMetal::load_staged_official()
+                    .expect("staged official assistant")
             }
             Some(path) => {
                 eprintln!("[mtp12-tree-bench] weights REAL ({path})");
@@ -1212,14 +1279,19 @@ mod tests {
             let (token_clusters, selected) =
                 super::super::tests::synthetic_head_selection(&device, VOCAB, 384, 0xb0a7);
             assistant.shortlist = Some(Mtp12Shortlist {
-                centroids: f32_buffer(&device, &vec![0.0f32; MTP12_SHORTLIST_CLUSTERS * ASSISTANT_HIDDEN])
-                    .expect("bench centroids"),
+                centroids: f32_buffer(
+                    &device,
+                    &vec![0.0f32; MTP12_SHORTLIST_CLUSTERS * ASSISTANT_HIDDEN],
+                )
+                .expect("bench centroids"),
                 token_clusters,
                 scores: shared_buffer(&device, MTP12_SHORTLIST_CLUSTERS * 4),
                 selected,
                 top: 384,
             });
-            eprintln!("[mtp12-tree-bench] shortlist SYNTHETIC top=384/2048 (~46.4% of vocab retained)");
+            eprintln!(
+                "[mtp12-tree-bench] shortlist SYNTHETIC top=384/2048 (~46.4% of vocab retained)"
+            );
         } else {
             eprintln!("[mtp12-tree-bench] shortlist REAL (CAMELID_GEMMA4_MTP12_SHORTLIST)");
         }
@@ -1242,7 +1314,10 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 q6_row.as_ptr(),
-                table_buffer.contents().cast::<u8>().add(table_offset as usize),
+                table_buffer
+                    .contents()
+                    .cast::<u8>()
+                    .add(table_offset as usize),
                 q6_row.len(),
             );
         }
@@ -1257,10 +1332,20 @@ mod tests {
             target_model_sha256: GEMMA4_12B_QAT_Q4_0_TARGET_SHA256,
         };
 
-        let (_, _, sliding_key, sliding_value) =
-            super::super::tests::synthetic_kv(LOCAL_KV_HEADS, LOCAL_HEAD_DIM, capacity - 32, capacity, 3);
-        let (_, _, full_key, full_value) =
-            super::super::tests::synthetic_kv(FULL_KV_HEADS, FULL_HEAD_DIM, capacity - 32, capacity, 19);
+        let (_, _, sliding_key, sliding_value) = super::super::tests::synthetic_kv(
+            LOCAL_KV_HEADS,
+            LOCAL_HEAD_DIM,
+            capacity - 32,
+            capacity,
+            3,
+        );
+        let (_, _, full_key, full_value) = super::super::tests::synthetic_kv(
+            FULL_KV_HEADS,
+            FULL_HEAD_DIM,
+            capacity - 32,
+            capacity,
+            19,
+        );
         let kv_buffer = |values: &[f32]| f32_buffer(&device, values).expect("bench KV buffer");
         let sliding_key_buffer = kv_buffer(&sliding_key);
         let sliding_value_buffer = kv_buffer(&sliding_value);
@@ -1288,12 +1373,19 @@ mod tests {
             gemv_staged_rows: rows,
             ..Mtp12FuseFlags::default()
         };
-        let mut singles: Vec<(String, Mtp12FuseFlags)> = vec![
-            ("GEMV_X4=1".to_string(), Mtp12FuseFlags { gemv_x4: 1, ..Default::default() }),
-        ];
+        let mut singles: Vec<(String, Mtp12FuseFlags)> = vec![(
+            "GEMV_X4=1".to_string(),
+            Mtp12FuseFlags {
+                gemv_x4: 1,
+                ..Default::default()
+            },
+        )];
         for level in [2u8, 3] {
             for rows in [2u32, 4, 8] {
-                singles.push((format!("GEMV_X4={level} STAGED_ROWS={rows}"), staged(level, rows)));
+                singles.push((
+                    format!("GEMV_X4={level} STAGED_ROWS={rows}"),
+                    staged(level, rows),
+                ));
             }
         }
         // Levels 4/5 fold each row in a different order: they change the
@@ -1301,18 +1393,54 @@ mod tests {
         // shippable lane without an acceptance re-measurement.
         for level in [4u8, 5] {
             singles.push((
-                format!("GEMV_X4={level} (INEXACT split x{})", if level == 4 { 2 } else { 4 }),
-                Mtp12FuseFlags { gemv_x4: level, ..Default::default() },
+                format!(
+                    "GEMV_X4={level} (INEXACT split x{})",
+                    if level == 4 { 2 } else { 4 }
+                ),
+                Mtp12FuseFlags {
+                    gemv_x4: level,
+                    ..Default::default()
+                },
             ));
         }
-        singles.push(("GATEUP=1".to_string(), Mtp12FuseFlags { gate_up: true, ..Default::default() }));
-        singles.push(("NORM=1".to_string(), Mtp12FuseFlags { norm: true, ..Default::default() }));
-        singles.push(("QROPE=1".to_string(), Mtp12FuseFlags { qrope: true, ..Default::default() }));
+        singles.push((
+            "GATEUP=1".to_string(),
+            Mtp12FuseFlags {
+                gate_up: true,
+                ..Default::default()
+            },
+        ));
+        singles.push((
+            "NORM=1".to_string(),
+            Mtp12FuseFlags {
+                norm: true,
+                ..Default::default()
+            },
+        ));
+        singles.push((
+            "QROPE=1".to_string(),
+            Mtp12FuseFlags {
+                qrope: true,
+                ..Default::default()
+            },
+        ));
         for level in 1u8..=3 {
-            singles.push((format!("SOFTMAX_CTX={level}"), Mtp12FuseFlags { softmax_ctx: level, ..Default::default() }));
+            singles.push((
+                format!("SOFTMAX_CTX={level}"),
+                Mtp12FuseFlags {
+                    softmax_ctx: level,
+                    ..Default::default()
+                },
+            ));
         }
         for level in 1u8..=2 {
-            singles.push((format!("HEAD_PREFETCH={level}"), Mtp12FuseFlags { head_prefetch: level, ..Default::default() }));
+            singles.push((
+                format!("HEAD_PREFETCH={level}"),
+                Mtp12FuseFlags {
+                    head_prefetch: level,
+                    ..Default::default()
+                },
+            ));
         }
 
         for &prefix in &prefixes {
@@ -1329,16 +1457,32 @@ mod tests {
                 prefix - local_window
             );
 
-            let step = |assistant: &Gemma4Mtp12AssistantMetal, encoder: &metal::ComputeCommandEncoderRef| {
+            let step = |assistant: &Gemma4Mtp12AssistantMetal,
+                        encoder: &metal::ComputeCommandEncoderRef| {
                 assistant.encode_tree_step(
-                    encoder, table, sliding, full, prefix, position, 0, 0, 1,
-                    &assistant.scratch.chain_initial_recurrent_hidden, 0, 0, &scores, true,
+                    encoder,
+                    table,
+                    sliding,
+                    full,
+                    prefix,
+                    position,
+                    0,
+                    0,
+                    1,
+                    &assistant.scratch.chain_initial_recurrent_hidden,
+                    0,
+                    0,
+                    &scores,
+                    true,
                 );
             };
 
             assistant.fuse = Mtp12FuseFlags::default();
             let baseline = bench_median_us(&queue, &|encoder| step(&assistant, encoder));
-            eprintln!("[mtp12-tree-bench] {:<34} {baseline:9.1} us/step", "all-off (baseline)");
+            eprintln!(
+                "[mtp12-tree-bench] {:<34} {baseline:9.1} us/step",
+                "all-off (baseline)"
+            );
 
             let mut measured: Vec<(String, Mtp12FuseFlags, f64)> = Vec::new();
             for (label, flags) in &singles {
@@ -1352,16 +1496,18 @@ mod tests {
             }
 
             // Per-selector best (never worse than off), then the combinations.
-            let best = |pick: &dyn Fn(&Mtp12FuseFlags) -> bool| -> Option<(String, Mtp12FuseFlags, f64)> {
-                measured
-                    .iter()
-                    .filter(|(_, flags, us)| pick(flags) && *us < baseline)
-                    .min_by(|a, b| a.2.total_cmp(&b.2))
-                    .cloned()
-            };
+            let best =
+                |pick: &dyn Fn(&Mtp12FuseFlags) -> bool| -> Option<(String, Mtp12FuseFlags, f64)> {
+                    measured
+                        .iter()
+                        .filter(|(_, flags, us)| pick(flags) && *us < baseline)
+                        .min_by(|a, b| a.2.total_cmp(&b.2))
+                        .cloned()
+                };
             // The all-on-best combination stays bit-identical: the split
             // levels are measured above but never folded into it.
-            let best_gemv = best(&|f| f.gemv_x4 != 0 && f.gemv_x4 < MTP12_FUSE_GEMV_X4_FIRST_INEXACT);
+            let best_gemv =
+                best(&|f| f.gemv_x4 != 0 && f.gemv_x4 < MTP12_FUSE_GEMV_X4_FIRST_INEXACT);
             let best_softmax = best(&|f| f.softmax_ctx != 0);
             let best_head = best(&|f| f.head_prefetch != 0);
             let best_gateup = best(&|f| f.gate_up);
@@ -1372,13 +1518,21 @@ mod tests {
                 all_on.gemv_x4 = f.gemv_x4;
                 all_on.gemv_staged_rows = f.gemv_staged_rows;
             }
-            if let Some((_, f, _)) = &best_softmax { all_on.softmax_ctx = f.softmax_ctx; }
-            if let Some((_, f, _)) = &best_head { all_on.head_prefetch = f.head_prefetch; }
+            if let Some((_, f, _)) = &best_softmax {
+                all_on.softmax_ctx = f.softmax_ctx;
+            }
+            if let Some((_, f, _)) = &best_head {
+                all_on.head_prefetch = f.head_prefetch;
+            }
             all_on.gate_up = best_gateup.is_some();
             all_on.norm = best_norm.is_some();
             all_on.qrope = best_qrope.is_some();
 
-            let mut norm_qrope = Mtp12FuseFlags { norm: true, qrope: true, ..Default::default() };
+            let mut norm_qrope = Mtp12FuseFlags {
+                norm: true,
+                qrope: true,
+                ..Default::default()
+            };
             let mut combos = vec![("NORM=1 QROPE=1".to_string(), norm_qrope)];
             norm_qrope.head_prefetch = best_head.as_ref().map_or(2, |(_, f, _)| f.head_prefetch);
             combos.push((
@@ -1401,40 +1555,65 @@ mod tests {
             assistant.fuse = Mtp12FuseFlags::default();
             let gather_pre = bench_median_us(&queue, &|encoder| {
                 encode_q6k_embedding_and_recurrent_gather(
-                    encoder, &assistant.pipelines.gather_q6k_embedding_and_recurrent,
-                    &assistant.scratch.output_token, 0, table,
-                    &assistant.scratch.chain_initial_recurrent_hidden, 0,
+                    encoder,
+                    &assistant.pipelines.gather_q6k_embedding_and_recurrent,
+                    &assistant.scratch.output_token,
+                    0,
+                    table,
+                    &assistant.scratch.chain_initial_recurrent_hidden,
+                    0,
                     &assistant.scratch.pre_input,
                 );
                 assistant.encode_dense_gemv(
-                    encoder, &assistant.scratch.pre_input, &assistant.scratch.hidden,
-                    assistant.layout.pre_projection, true,
+                    encoder,
+                    &assistant.scratch.pre_input,
+                    &assistant.scratch.hidden,
+                    assistant.layout.pre_projection,
+                    true,
                 );
             });
             let layers = bench_median_us(&queue, &|encoder| {
-                bench_encode_layers(&assistant, encoder, sliding, full, prefix, position, &scores);
+                bench_encode_layers(
+                    &assistant, encoder, sliding, full, prefix, position, &scores,
+                );
             });
             let post_final = bench_median_us(&queue, &|encoder| {
                 encode_rms_norm(
-                    encoder, &assistant.pipelines.rms_norm, &assistant.scratch.hidden,
-                    &assistant.final_norm, &assistant.scratch.final_normalized, ASSISTANT_HIDDEN, 1,
+                    encoder,
+                    &assistant.pipelines.rms_norm,
+                    &assistant.scratch.hidden,
+                    &assistant.final_norm,
+                    &assistant.scratch.final_normalized,
+                    ASSISTANT_HIDDEN,
+                    1,
                 );
                 // The step's test-only draft-query dump, kept here so the
                 // stages account for every dispatch the measured step issues.
                 encode_copy_f32_to_offset(
-                    encoder, &assistant.pipelines.copy_f32, &assistant.scratch.final_normalized,
-                    &assistant.scratch.chain_final_normalized, 0, ASSISTANT_HIDDEN,
+                    encoder,
+                    &assistant.pipelines.copy_f32,
+                    &assistant.scratch.final_normalized,
+                    &assistant.scratch.chain_final_normalized,
+                    0,
+                    ASSISTANT_HIDDEN,
                 );
                 assistant.encode_dense_gemv_at_offset(
-                    encoder, &assistant.scratch.final_normalized,
-                    &assistant.scratch.chain_recurrent_hidden, 0,
-                    assistant.layout.post_projection, true,
+                    encoder,
+                    &assistant.scratch.final_normalized,
+                    &assistant.scratch.chain_recurrent_hidden,
+                    0,
+                    assistant.layout.post_projection,
+                    true,
                 );
             });
             let head = bench_median_us(&queue, &|encoder| assistant.encode_draft_head(encoder));
             let top2 = bench_median_us(&queue, &|encoder| {
                 assistant.tree_state.as_ref().unwrap().encode(
-                    encoder, &assistant.scratch.logits, &assistant.scratch.output_token, 0, VOCAB,
+                    encoder,
+                    &assistant.scratch.logits,
+                    &assistant.scratch.output_token,
+                    0,
+                    VOCAB,
                 );
             });
             let sum = gather_pre + layers + post_final + head + top2;

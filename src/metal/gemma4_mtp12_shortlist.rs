@@ -13,10 +13,8 @@ const HEADER_BYTES: usize = 56;
 const CENTROID_BYTES: usize = CLUSTERS * HIDDEN * 4;
 const FILE_BYTES: usize = HEADER_BYTES + CENTROID_BYTES + VOCAB * 4 * 2;
 const ASSISTANT_SHA256: [u8; 32] = [
-    0x67, 0xf1, 0x42, 0x0c, 0xf2, 0x4a, 0xa5, 0x06,
-    0x50, 0x89, 0xaa, 0xed, 0x17, 0x52, 0x23, 0xf7,
-    0xc2, 0x45, 0xcc, 0xfd, 0xa1, 0x61, 0x11, 0xb6,
-    0xc5, 0x67, 0x65, 0xaf, 0xd7, 0x28, 0x0d, 0xb6,
+    0x67, 0xf1, 0x42, 0x0c, 0xf2, 0x4a, 0xa5, 0x06, 0x50, 0x89, 0xaa, 0xed, 0x17, 0x52, 0x23, 0xf7,
+    0xc2, 0x45, 0xcc, 0xfd, 0xa1, 0x61, 0x11, 0xb6, 0xc5, 0x67, 0x65, 0xaf, 0xd7, 0x28, 0x0d, 0xb6,
 ];
 
 pub(super) struct Mtp12ShortlistData {
@@ -44,19 +42,18 @@ fn parse_sidecar(bytes: &[u8]) -> Result<Mtp12ShortlistData> {
     if bytes.len() != FILE_BYTES {
         return Err(invalid("wrong file length"));
     }
-    let word = |offset: usize| {
-        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-    };
+    let word = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
     if &bytes[..4] != b"C4SL" || word(4) != 1 {
         return Err(invalid("unsupported magic or version"));
     }
     if bytes[8..40] != ASSISTANT_SHA256 {
         return Err(invalid("assistant source identity does not match"));
     }
-    if [word(40), word(44), word(48), word(52)]
-        != [CLUSTERS as u32, HIDDEN as u32, VOCAB as u32, 3]
+    if [word(40), word(44), word(48), word(52)] != [CLUSTERS as u32, HIDDEN as u32, VOCAB as u32, 3]
     {
-        return Err(invalid("expected dimensions 2048 x 1024, vocab 262144, overlap 3"));
+        return Err(invalid(
+            "expected dimensions 2048 x 1024, vocab 262144, overlap 3",
+        ));
     }
     let centroids: Vec<f32> = bytes[HEADER_BYTES..HEADER_BYTES + CENTROID_BYTES]
         .chunks_exact(4)
@@ -77,7 +74,10 @@ fn parse_sidecar(bytes: &[u8]) -> Result<Mtp12ShortlistData> {
             return Err(invalid("expected three distinct clusters and zero padding"));
         }
     }
-    Ok(Mtp12ShortlistData { centroids, token_clusters })
+    Ok(Mtp12ShortlistData {
+        centroids,
+        token_clusters,
+    })
 }
 
 #[cfg(test)]

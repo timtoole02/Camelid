@@ -1159,8 +1159,9 @@ pub(crate) struct Spec50HeadKernels {
 
 /// One compiled pipeline set per geometry, kept for the life of the process
 /// (a failed compile is remembered too, so the diagnostic prints once).
-static SPEC50_HEAD_KERNELS: OnceLock<Mutex<Vec<(Spec50Geometry, Option<&'static Spec50HeadKernels>)>>> =
-    OnceLock::new();
+static SPEC50_HEAD_KERNELS: OnceLock<
+    Mutex<Vec<(Spec50Geometry, Option<&'static Spec50HeadKernels>)>>,
+> = OnceLock::new();
 
 /// The pipelines for a head of `hidden` width (see
 /// [`spec50_selected_geometry_for`]). This is the production accessor.
@@ -1177,14 +1178,16 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
 /// Compile (once per geometry) the speculative Q6_K head library. Returns
 /// `None` and prints the compiler diagnostic on failure so the caller can keep
 /// the existing lane.
-pub(crate) fn spec50_head_kernels_with(geometry: Spec50Geometry) -> Option<&'static Spec50HeadKernels> {
+pub(crate) fn spec50_head_kernels_with(
+    geometry: Spec50Geometry,
+) -> Option<&'static Spec50HeadKernels> {
     let cache = SPEC50_HEAD_KERNELS.get_or_init(|| Mutex::new(Vec::new()));
     let mut cache = cache.lock().ok()?;
     if let Some((_, kernels)) = cache.iter().find(|(cached, _)| *cached == geometry) {
         return *kernels;
     }
-    let kernels = compile_spec50_head_kernels(geometry)
-        .map(|kernels| &*Box::leak(Box::new(kernels)));
+    let kernels =
+        compile_spec50_head_kernels(geometry).map(|kernels| &*Box::leak(Box::new(kernels)));
     cache.push((geometry, kernels));
     kernels
 }
@@ -1261,7 +1264,6 @@ fn compile_spec50_head_kernels(geometry: Spec50Geometry) -> Option<Spec50HeadKer
 pub(crate) fn spec50_activation_scratch_bytes(max_k: usize, hidden: usize) -> usize {
     max_k * hidden * 4
 }
-
 
 /// An exact matrix-unit K8 head, independently compiled only when requested.
 /// K1/2/4 retain the existing kernels; the two-pass unit fold is admitted only
@@ -1348,18 +1350,78 @@ pub(crate) const SPEC50_FORM_BASE: Spec50HeadForm = Spec50HeadForm {
 /// too, so a bench candidate can be driven in situ without a rebuild.
 const SPEC50_NAMED_FORMS: &[Spec50HeadForm] = &[
     SPEC50_FORM_BASE,
-    Spec50HeadForm { name: "sg1", simdgroups: 1, lean: 0, prefetch: 0 },
-    Spec50HeadForm { name: "sg2", simdgroups: 2, lean: 0, prefetch: 0 },
-    Spec50HeadForm { name: "sg8", simdgroups: 8, lean: 0, prefetch: 0 },
-    Spec50HeadForm { name: "sg16", simdgroups: 16, lean: 0, prefetch: 0 },
-    Spec50HeadForm { name: "lean", simdgroups: 4, lean: 1, prefetch: 0 },
-    Spec50HeadForm { name: "lean-pf", simdgroups: 4, lean: 1, prefetch: 1 },
-    Spec50HeadForm { name: "lean-sg2", simdgroups: 2, lean: 1, prefetch: 0 },
-    Spec50HeadForm { name: "lean-sg8", simdgroups: 8, lean: 1, prefetch: 0 },
-    Spec50HeadForm { name: "lean-sg16", simdgroups: 16, lean: 1, prefetch: 0 },
-    Spec50HeadForm { name: "lean-pf-sg2", simdgroups: 2, lean: 1, prefetch: 1 },
-    Spec50HeadForm { name: "lean-pf-sg8", simdgroups: 8, lean: 1, prefetch: 1 },
-    Spec50HeadForm { name: "lean-pf-sg16", simdgroups: 16, lean: 1, prefetch: 1 },
+    Spec50HeadForm {
+        name: "sg1",
+        simdgroups: 1,
+        lean: 0,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "sg2",
+        simdgroups: 2,
+        lean: 0,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "sg8",
+        simdgroups: 8,
+        lean: 0,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "sg16",
+        simdgroups: 16,
+        lean: 0,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "lean",
+        simdgroups: 4,
+        lean: 1,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "lean-pf",
+        simdgroups: 4,
+        lean: 1,
+        prefetch: 1,
+    },
+    Spec50HeadForm {
+        name: "lean-sg2",
+        simdgroups: 2,
+        lean: 1,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "lean-sg8",
+        simdgroups: 8,
+        lean: 1,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "lean-sg16",
+        simdgroups: 16,
+        lean: 1,
+        prefetch: 0,
+    },
+    Spec50HeadForm {
+        name: "lean-pf-sg2",
+        simdgroups: 2,
+        lean: 1,
+        prefetch: 1,
+    },
+    Spec50HeadForm {
+        name: "lean-pf-sg8",
+        simdgroups: 8,
+        lean: 1,
+        prefetch: 1,
+    },
+    Spec50HeadForm {
+        name: "lean-pf-sg16",
+        simdgroups: 16,
+        lean: 1,
+        prefetch: 1,
+    },
 ];
 
 impl Spec50HeadForm {
@@ -1554,42 +1616,61 @@ fn spec50_mma16_simdgroups() -> usize {
     static SG: OnceLock<usize> = OnceLock::new();
     *SG.get_or_init(|| {
         std::env::var("CAMELID_GEMMA4_SPEC50_MMA_K16_SIMDGROUPS")
-            .ok().and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| matches!(value, 4 | 8)).unwrap_or(8)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| matches!(value, 4 | 8))
+            .unwrap_or(8)
     })
 }
 
 pub(crate) fn spec50_mma16_available(hidden: usize) -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    hidden == 3840 && *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_GEMMA4_SPEC50_MMA_K16").is_ok_and(|value| value == "1")
-    }) && spec50_mma16_head_kernels().is_some()
+    hidden == 3840
+        && *ENABLED.get_or_init(|| {
+            std::env::var("CAMELID_GEMMA4_SPEC50_MMA_K16").is_ok_and(|value| value == "1")
+        })
+        && spec50_mma16_head_kernels().is_some()
 }
 
 fn spec50_mma16_head_kernels() -> Option<&'static Spec50Mma16HeadKernels> {
     static KERNELS: OnceLock<Option<Spec50Mma16HeadKernels>> = OnceLock::new();
-    KERNELS.get_or_init(|| {
-        let device = Device::system_default()?;
-        let options = CompileOptions::new();
-        options.set_fast_math_enabled(false);
-        let library = device.new_library_with_source(include_str!("spec50_mma_head.metal"), &options)
-            .map_err(|err| eprintln!("[metal] SPEC50 K16 MMA head compile failed: {err}")).ok()?;
-        let pipeline = |name: &str| {
-            let function = library.get_function(name, None).ok()?;
-            device.new_compute_pipeline_state_with_function(&function).ok()
-        };
-        let expand = pipeline("q6k_spec50_mma_expand16_f16")?;
-        let batch4 = pipeline("q6k_spec50_mma_k16_sg4")?;
-        let batch8 = pipeline("q6k_spec50_mma_k16_sg8")?;
-        if expand.max_total_threads_per_threadgroup() < 256
-            || batch4.thread_execution_width() != 32 || batch8.thread_execution_width() != 32
-            || batch4.max_total_threads_per_threadgroup() < 128
-            || batch8.max_total_threads_per_threadgroup() < 256 {
-            return None;
-        }
-        eprintln!("[metal] SPEC50 K16 MMA head: 3840-wide, {} simdgroups, exact dual-group fold", spec50_mma16_simdgroups());
-        Some(Spec50Mma16HeadKernels { expand, batch4, batch8 })
-    }).as_ref()
+    KERNELS
+        .get_or_init(|| {
+            let device = Device::system_default()?;
+            let options = CompileOptions::new();
+            options.set_fast_math_enabled(false);
+            let library = device
+                .new_library_with_source(include_str!("spec50_mma_head.metal"), &options)
+                .map_err(|err| eprintln!("[metal] SPEC50 K16 MMA head compile failed: {err}"))
+                .ok()?;
+            let pipeline = |name: &str| {
+                let function = library.get_function(name, None).ok()?;
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()
+            };
+            let expand = pipeline("q6k_spec50_mma_expand16_f16")?;
+            let batch4 = pipeline("q6k_spec50_mma_k16_sg4")?;
+            let batch8 = pipeline("q6k_spec50_mma_k16_sg8")?;
+            if expand.max_total_threads_per_threadgroup() < 256
+                || batch4.thread_execution_width() != 32
+                || batch8.thread_execution_width() != 32
+                || batch4.max_total_threads_per_threadgroup() < 128
+                || batch8.max_total_threads_per_threadgroup() < 256
+            {
+                return None;
+            }
+            eprintln!(
+                "[metal] SPEC50 K16 MMA head: 3840-wide, {} simdgroups, exact dual-group fold",
+                spec50_mma16_simdgroups()
+            );
+            Some(Spec50Mma16HeadKernels {
+                expand,
+                batch4,
+                batch8,
+            })
+        })
+        .as_ref()
 }
 
 /// Encode only after the exact 12B/K16 shape guard. Compiling failure encodes
@@ -1610,7 +1691,10 @@ fn encode_q6k_spec50_mma16(
     softcap: f32,
     simdgroups: usize,
 ) -> bool {
-    if !matches!(simdgroups, 4 | 8) || rows == 0 || !(hidden == 3840 && n_superblocks == 15 && k_batch == 16) {
+    if !matches!(simdgroups, 4 | 8)
+        || rows == 0
+        || !(hidden == 3840 && n_superblocks == 15 && k_batch == 16)
+    {
         return false;
     }
     let Some(kernels) = spec50_mma16_head_kernels() else {
@@ -1636,7 +1720,11 @@ fn encode_q6k_spec50_mma16(
             depth: 1,
         },
     );
-    encoder.set_compute_pipeline_state(if simdgroups == 4 { &kernels.batch4 } else { &kernels.batch8 });
+    encoder.set_compute_pipeline_state(if simdgroups == 4 {
+        &kernels.batch4
+    } else {
+        &kernels.batch8
+    });
     encoder.set_buffer(0, Some(input_scales), 0);
     encoder.set_buffer(1, Some(activation_perm), 0);
     encoder.set_buffer(2, Some(weight), weight_offset);
@@ -1831,18 +1919,41 @@ pub(crate) fn encode_q6k_spec50_batch_with_form(
 ) -> bool {
     if k_batch == 16 && spec50_mma16_available(hidden) {
         return encode_q6k_spec50_mma16(
-            encoder, input_scales, input_quants, activation_perm, weight,
-            weight_offset, output, n_superblocks, rows, k_batch, hidden, softcap,
+            encoder,
+            input_scales,
+            input_quants,
+            activation_perm,
+            weight,
+            weight_offset,
+            output,
+            n_superblocks,
+            rows,
+            k_batch,
+            hidden,
+            softcap,
             spec50_mma16_simdgroups(),
         );
     }
     if k_batch == 0 || k_batch > 8 || rows == 0 || n_superblocks == 0 {
         return false;
     }
-    if spec50_mma_requested() && encode_q6k_spec50_mma8_form(
-        encoder, input_scales, input_quants, activation_perm, weight,
-        weight_offset, output, n_superblocks, rows, k_batch, hidden, softcap, form,
-    ) {
+    if spec50_mma_requested()
+        && encode_q6k_spec50_mma8_form(
+            encoder,
+            input_scales,
+            input_quants,
+            activation_perm,
+            weight,
+            weight_offset,
+            output,
+            n_superblocks,
+            rows,
+            k_batch,
+            hidden,
+            softcap,
+            form,
+        )
+    {
         return true;
     }
     let count = (k_batch * hidden) as u32;
@@ -2138,7 +2249,9 @@ mod tests {
             "q6k_linear_turbo_batch_k8",
         ] {
             let needle = format!("\nkernel void {name}(\n");
-            let start = source.find(&needle).unwrap_or_else(|| panic!("{name} not found"))
+            let start = source
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{name} not found"))
                 + 1;
             let end = source[start..].find("\n}\n").expect("kernel end") + start + 3;
             let original = &source[start..end];
@@ -2188,8 +2301,21 @@ mod tests {
 
         let cb = refs.queue.new_command_buffer();
         let e = cb.new_compute_command_encoder();
-        encode_reference(e, &refs, &sbuf, &qbuf, &wbuf, &out_single, rows, 1, 0.0, false);
-        encode_reference(e, &refs, &sbuf, &qbuf, &wbuf, &out_batch, rows, 1, 0.0, true);
+        encode_reference(
+            e,
+            &refs,
+            &sbuf,
+            &qbuf,
+            &wbuf,
+            &out_single,
+            rows,
+            1,
+            0.0,
+            false,
+        );
+        encode_reference(
+            e, &refs, &sbuf, &qbuf, &wbuf, &out_batch, rows, 1, 0.0, true,
+        );
         e.set_compute_pipeline_state(&refs.probe_inline_acc);
         e.set_buffer(0, Some(&sbuf), 0);
         e.set_buffer(1, Some(&qbuf), 0);
@@ -2200,8 +2326,16 @@ mod tests {
         e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
         e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
         e.dispatch_thread_groups(
-            metal::MTLSize { width: rows.div_ceil(16) as u64, height: 1, depth: 1 },
-            metal::MTLSize { width: 128, height: 1, depth: 1 },
+            metal::MTLSize {
+                width: rows.div_ceil(16) as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
         );
         e.end_encoding();
         cb.commit();
@@ -2220,8 +2354,7 @@ mod tests {
             for i in 0..a.len() {
                 if a[i].to_bits() != b[i].to_bits() {
                     diff += 1;
-                    worst =
-                        worst.max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
+                    worst = worst.max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
                 }
             }
             (diff, worst)
@@ -2284,11 +2417,20 @@ mod tests {
                 // Reference == the kernel the oracle-verified chained lane runs
                 // for this K: batch_k8 at K=8, batch_k otherwise.
                 encode_reference(
-                    e, &refs, &sbuf, &qbuf, &wbuf, &out_ref, rows, k, SOFTCAP, k == 1,
+                    e,
+                    &refs,
+                    &sbuf,
+                    &qbuf,
+                    &wbuf,
+                    &out_ref,
+                    rows,
+                    k,
+                    SOFTCAP,
+                    k == 1,
                 );
                 assert!(encode_q6k_spec50_batch(
-                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out_new, N_SB, rows, k,
-                    HIDDEN, SOFTCAP,
+                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out_new, N_SB, rows, k, HIDDEN,
+                    SOFTCAP,
                 ));
                 e.end_encoding();
                 cb.commit();
@@ -2304,8 +2446,8 @@ mod tests {
                 for i in 0..k * rows {
                     if a[i].to_bits() != b[i].to_bits() {
                         diff += 1;
-                        worst_ulp = worst_ulp
-                            .max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
+                        worst_ulp =
+                            worst_ulp.max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
                     }
                 }
                 assert_eq!(
@@ -2329,7 +2471,10 @@ mod tests {
         let refs = reference_kernels();
         // The production accessor: the 12B width default (or the env override).
         let kernels = spec50_head_kernels_for(HIDDEN_12B).expect("spec50 pipelines");
-        eprintln!("[spec50] 12B geometry under test: {:?}", kernels.geometry.name);
+        eprintln!(
+            "[spec50] 12B geometry under test: {:?}",
+            kernels.geometry.name
+        );
         let mut rng = Rng(0x12b0_3840_2621_4400);
         let weights = build_weights_for(&mut rng, ROWS, N_SB_12B);
         let (scales, quants) = build_activations_for(&mut rng, 8, HIDDEN_12B, N_SB_12B);
@@ -2339,10 +2484,7 @@ mod tests {
         write_buffer_f32(&sbuf, &scales);
         let qbuf = shared(&refs.device, quants.len());
         write_buffer_i8(&qbuf, &quants);
-        let fbuf = shared(
-            &refs.device,
-            spec50_activation_scratch_bytes(8, HIDDEN_12B),
-        );
+        let fbuf = shared(&refs.device, spec50_activation_scratch_bytes(8, HIDDEN_12B));
 
         for k in [1usize, 2, 4, 8] {
             let out_ref = shared(&refs.device, k * ROWS * 4);
@@ -2363,19 +2505,8 @@ mod tests {
                 k == 1,
             );
             assert!(encode_q6k_spec50_batch(
-                encoder,
-                kernels,
-                &sbuf,
-                &qbuf,
-                &fbuf,
-                &wbuf,
-                0,
-                &out_new,
-                N_SB_12B,
-                ROWS,
-                k,
-                HIDDEN_12B,
-                SOFTCAP,
+                encoder, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out_new, N_SB_12B, ROWS, k,
+                HIDDEN_12B, SOFTCAP,
             ));
             encoder.end_encoding();
             cb.commit();
@@ -2487,9 +2618,12 @@ mod tests {
                 let out8 = shared(&refs.device, 8 * ROWS * 4);
                 let cb = refs.queue.new_command_buffer();
                 let encoder = cb.new_compute_command_encoder();
-                assert!(encode_q6k_spec50_mma8(encoder, &s8, &q8, &perm, &wbuf, 0,
-                    &out8, N_SB, ROWS, 8, HIDDEN, softcap));
-                encoder.end_encoding(); cb.commit(); cb.wait_until_completed();
+                assert!(encode_q6k_spec50_mma8(
+                    encoder, &s8, &q8, &perm, &wbuf, 0, &out8, N_SB, ROWS, 8, HIDDEN, softcap
+                ));
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
                 assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
                 let mut values = vec![0.0; 8 * ROWS];
                 read_buffer_f32(&out8, &mut values);
@@ -2498,15 +2632,22 @@ mod tests {
             for simdgroups in [4, 8] {
                 let cb = refs.queue.new_command_buffer();
                 let encoder = cb.new_compute_command_encoder();
-                assert!(encode_q6k_spec50_mma16(encoder, &sbuf, &qbuf, &perm, &wbuf, 0,
-                    &out, N_SB, ROWS, 16, HIDDEN, softcap, simdgroups));
-                encoder.end_encoding(); cb.commit(); cb.wait_until_completed();
+                assert!(encode_q6k_spec50_mma16(
+                    encoder, &sbuf, &qbuf, &perm, &wbuf, 0, &out, N_SB, ROWS, 16, HIDDEN, softcap,
+                    simdgroups
+                ));
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
                 assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
                 let mut actual = vec![0.0; 16 * ROWS];
                 read_buffer_f32(&out, &mut actual);
                 for (index, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
-                    assert_eq!(actual.to_bits(), expected.to_bits(),
-                        "K16 sg={simdgroups} cap={softcap} output={index}");
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "K16 sg={simdgroups} cap={softcap} output={index}"
+                    );
                 }
             }
         }
@@ -2613,11 +2754,7 @@ mod tests {
         read_buffer_f32(&vals, &mut got_vals);
         let mut got_ids = vec![0u32; k];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                ids.contents().cast::<u32>(),
-                got_ids.as_mut_ptr(),
-                k,
-            );
+            std::ptr::copy_nonoverlapping(ids.contents().cast::<u32>(), got_ids.as_mut_ptr(), k);
         }
         for t in 0..k {
             let row = &logits[t * rows..(t + 1) * rows];
@@ -2627,7 +2764,10 @@ mod tests {
                 .enumerate()
                 .max_by(|a, b| a.1.total_cmp(&b.1))
                 .expect("non-empty logits row");
-            assert_eq!(got_ids[t] as usize, best_i, "argmax id mismatch at token {t}");
+            assert_eq!(
+                got_ids[t] as usize, best_i,
+                "argmax id mismatch at token {t}"
+            );
             assert_eq!(
                 got_vals[t].to_bits(),
                 best.to_bits(),
@@ -2746,46 +2886,58 @@ mod tests {
                     .device
                     .new_compute_pipeline_state_with_function(&f)
                     .unwrap();
-                let encode = |e: &metal::ComputeCommandEncoderRef,
-                              w: &Buffer,
-                              o: &Buffer,
-                              n_rows: usize| {
-                    let count = (k * HIDDEN) as u32;
-                    let n_sb_e = N_SB as u32;
-                    let k_e = k as u32;
-                    e.set_compute_pipeline_state(&expand);
-                    e.set_buffer(0, Some(&qbuf), 0);
-                    e.set_buffer(1, Some(&fbuf), 0);
-                    e.set_bytes(2, 4, &n_sb_e as *const u32 as *const _);
-                    e.set_bytes(3, 4, &k_e as *const u32 as *const _);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize { width: (count as u64).div_ceil(256), height: 1, depth: 1 },
-                        metal::MTLSize { width: 256, height: 1, depth: 1 },
-                    );
-                    e.set_compute_pipeline_state(&pipe);
-                    e.set_buffer(0, Some(&sbuf), 0);
-                    e.set_buffer(1, Some(&fbuf), 0);
-                    e.set_buffer(2, Some(w), 0);
-                    e.set_buffer(3, Some(o), 0);
-                    let n_sb_u32 = N_SB as u32;
-                    let rows_u32 = n_rows as u32;
-                    let cap = SOFTCAP;
-                    e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
-                    e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
-                    e.set_bytes(6, 4, &cap as *const f32 as *const _);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize {
-                            width: n_rows.div_ceil(sg * rb) as u64,
-                            height: 1,
-                            depth: 1,
-                        },
-                        metal::MTLSize { width: 32 * sg as u64, height: 1, depth: 1 },
-                    );
-                };
+                let encode =
+                    |e: &metal::ComputeCommandEncoderRef, w: &Buffer, o: &Buffer, n_rows: usize| {
+                        let count = (k * HIDDEN) as u32;
+                        let n_sb_e = N_SB as u32;
+                        let k_e = k as u32;
+                        e.set_compute_pipeline_state(&expand);
+                        e.set_buffer(0, Some(&qbuf), 0);
+                        e.set_buffer(1, Some(&fbuf), 0);
+                        e.set_bytes(2, 4, &n_sb_e as *const u32 as *const _);
+                        e.set_bytes(3, 4, &k_e as *const u32 as *const _);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: (count as u64).div_ceil(256),
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 256,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        e.set_compute_pipeline_state(&pipe);
+                        e.set_buffer(0, Some(&sbuf), 0);
+                        e.set_buffer(1, Some(&fbuf), 0);
+                        e.set_buffer(2, Some(w), 0);
+                        e.set_buffer(3, Some(o), 0);
+                        let n_sb_u32 = N_SB as u32;
+                        let rows_u32 = n_rows as u32;
+                        let cap = SOFTCAP;
+                        e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
+                        e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+                        e.set_bytes(6, 4, &cap as *const f32 as *const _);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: n_rows.div_ceil(sg * rb) as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32 * sg as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    };
                 // exactness gate
                 let cb = refs.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
-                encode_reference(e, &refs, &sbuf, &qbuf, &swbuf, &sout_ref, SROWS, k, SOFTCAP, false);
+                encode_reference(
+                    e, &refs, &sbuf, &qbuf, &swbuf, &sout_ref, SROWS, k, SOFTCAP, false,
+                );
                 encode(e, &swbuf, &sout_new, SROWS);
                 e.end_encoding();
                 cb.commit();
@@ -2794,9 +2946,14 @@ mod tests {
                 let mut b = vec![0f32; k * SROWS];
                 read_buffer_f32(&sout_ref, &mut a);
                 read_buffer_f32(&sout_new, &mut b);
-                let bad = (0..k * SROWS).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
+                let bad = (0..k * SROWS)
+                    .filter(|&i| a[i].to_bits() != b[i].to_bits())
+                    .count();
                 if ablate == 0 {
-                    assert_eq!(bad, 0, "rb={rb} rg={rg} sg={sg} flat={flat} yfmt={yfmt} K={k} not bitwise exact");
+                    assert_eq!(
+                        bad, 0,
+                        "rb={rb} rg={rg} sg={sg} flat={flat} yfmt={yfmt} K={k} not bitwise exact"
+                    );
                 }
 
                 for pass in 0..2 {
@@ -2904,42 +3061,52 @@ mod tests {
                         continue;
                     }
                 };
-                let encode = |e: &metal::ComputeCommandEncoderRef,
-                              w: &Buffer,
-                              o: &Buffer,
-                              n_rows: usize| {
-                    let count = (k * hidden) as u32;
-                    let n_sb_e = n_sb as u32;
-                    let k_e = k as u32;
-                    e.set_compute_pipeline_state(&expand);
-                    e.set_buffer(0, Some(&qbuf), 0);
-                    e.set_buffer(1, Some(&fbuf), 0);
-                    e.set_bytes(2, 4, &n_sb_e as *const u32 as *const _);
-                    e.set_bytes(3, 4, &k_e as *const u32 as *const _);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize { width: (count as u64).div_ceil(256), height: 1, depth: 1 },
-                        metal::MTLSize { width: 256, height: 1, depth: 1 },
-                    );
-                    e.set_compute_pipeline_state(&pipe);
-                    e.set_buffer(0, Some(&sbuf), 0);
-                    e.set_buffer(1, Some(&fbuf), 0);
-                    e.set_buffer(2, Some(w), 0);
-                    e.set_buffer(3, Some(o), 0);
-                    let n_sb_u32 = n_sb as u32;
-                    let rows_u32 = n_rows as u32;
-                    let cap = SOFTCAP;
-                    e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
-                    e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
-                    e.set_bytes(6, 4, &cap as *const f32 as *const _);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize {
-                            width: n_rows.div_ceil(sg * rb) as u64,
-                            height: 1,
-                            depth: 1,
-                        },
-                        metal::MTLSize { width: 32 * sg as u64, height: 1, depth: 1 },
-                    );
-                };
+                let encode =
+                    |e: &metal::ComputeCommandEncoderRef, w: &Buffer, o: &Buffer, n_rows: usize| {
+                        let count = (k * hidden) as u32;
+                        let n_sb_e = n_sb as u32;
+                        let k_e = k as u32;
+                        e.set_compute_pipeline_state(&expand);
+                        e.set_buffer(0, Some(&qbuf), 0);
+                        e.set_buffer(1, Some(&fbuf), 0);
+                        e.set_bytes(2, 4, &n_sb_e as *const u32 as *const _);
+                        e.set_bytes(3, 4, &k_e as *const u32 as *const _);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: (count as u64).div_ceil(256),
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 256,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        e.set_compute_pipeline_state(&pipe);
+                        e.set_buffer(0, Some(&sbuf), 0);
+                        e.set_buffer(1, Some(&fbuf), 0);
+                        e.set_buffer(2, Some(w), 0);
+                        e.set_buffer(3, Some(o), 0);
+                        let n_sb_u32 = n_sb as u32;
+                        let rows_u32 = n_rows as u32;
+                        let cap = SOFTCAP;
+                        e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
+                        e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+                        e.set_bytes(6, 4, &cap as *const f32 as *const _);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: n_rows.div_ceil(sg * rb) as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32 * sg as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    };
                 // Exactness gate: bitwise against the reference on the small table.
                 let cb = refs.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
@@ -2954,7 +3121,9 @@ mod tests {
                 let mut b = vec![0f32; k * SROWS];
                 read_buffer_f32(&sout_ref, &mut a);
                 read_buffer_f32(&sout_new, &mut b);
-                let bad = (0..k * SROWS).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
+                let bad = (0..k * SROWS)
+                    .filter(|&i| a[i].to_bits() != b[i].to_bits())
+                    .count();
                 if ablate == 0 && bad != 0 {
                     eprintln!("[spec50] sweep rb={rb} rg={rg} sg={sg} flat={flat} yfmt={yfmt} K={k}: NOT EXACT ({bad} values differ), not timed");
                     continue;
@@ -3077,11 +3246,21 @@ mod tests {
                 let cb = refs.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 encode_reference_n_sb(
-                    e, &refs, &sbuf, &qbuf, &wbuf, &out_ref, ROWS, N_SB_12B, k, SOFTCAP, k == 1,
+                    e,
+                    &refs,
+                    &sbuf,
+                    &qbuf,
+                    &wbuf,
+                    &out_ref,
+                    ROWS,
+                    N_SB_12B,
+                    k,
+                    SOFTCAP,
+                    k == 1,
                 );
                 assert!(encode_q6k_spec50_batch(
-                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k,
-                    HIDDEN_12B, SOFTCAP,
+                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k, HIDDEN_12B,
+                    SOFTCAP,
                 ));
                 e.end_encoding();
                 cb.commit();
@@ -3091,8 +3270,14 @@ mod tests {
                 let mut b = vec![0f32; k * ROWS];
                 read_buffer_f32(&out_ref, &mut a);
                 read_buffer_f32(&out, &mut b);
-                let bad = (0..k * ROWS).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
-                assert_eq!(bad, 0, "geometry {:?} K={k}: {bad} logits differ from the reference", g.name);
+                let bad = (0..k * ROWS)
+                    .filter(|&i| a[i].to_bits() != b[i].to_bits())
+                    .count();
+                assert_eq!(
+                    bad, 0,
+                    "geometry {:?} K={k}: {bad} logits differ from the reference",
+                    g.name
+                );
             }
             let run = |label: &str, new: bool, with_argmax: bool| {
                 for pass in 0..2 {
@@ -3102,8 +3287,8 @@ mod tests {
                     for _ in 0..reps {
                         if new {
                             assert!(encode_q6k_spec50_batch(
-                                e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS,
-                                k, HIDDEN_12B, SOFTCAP,
+                                e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k,
+                                HIDDEN_12B, SOFTCAP,
                             ));
                             if with_argmax {
                                 encode_q6k_spec50_argmax(e, kernels, &out, &ids, &vals, ROWS, k);
@@ -3146,7 +3331,10 @@ mod tests {
     #[test]
     fn spec50_geometry_selector_parses_names_and_generic_form() {
         assert_eq!(Spec50Geometry::parse("26b"), Some(SPEC50_GEOMETRY_DEFAULT));
-        assert_eq!(Spec50Geometry::parse(" 26B "), Some(SPEC50_GEOMETRY_DEFAULT));
+        assert_eq!(
+            Spec50Geometry::parse(" 26B "),
+            Some(SPEC50_GEOMETRY_DEFAULT)
+        );
         let twelve = Spec50Geometry::parse("12b").expect("12b is named");
         assert!(twelve.admitted());
         assert_eq!(twelve, SPEC50_GEOMETRY_12B);
@@ -3157,7 +3345,14 @@ mod tests {
         let custom = Spec50Geometry::parse("rb8-rg2-sg4-flat1-y2").expect("generic form");
         assert_eq!(
             custom,
-            Spec50Geometry { name: "custom", rows_per_sg: 8, rows_per_step: 2, sg_per_tg: 4, flat: 1, yfmt: 2 }
+            Spec50Geometry {
+                name: "custom",
+                rows_per_sg: 8,
+                rows_per_step: 2,
+                sg_per_tg: 4,
+                flat: 1,
+                yfmt: 2
+            }
         );
         assert_eq!(custom.rows_per_tg(), 32);
         assert_eq!(custom.threads_per_tg(), 128);
@@ -3190,7 +3385,8 @@ mod tests {
         {
             let mut rng = Rng(0x2718_2818_2845_9045);
             // Fill in place: no 605 MB host-side staging copy.
-            let dst = unsafe { std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), bytes) };
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), bytes) };
             for block in dst.chunks_exact_mut(Q6K_WIRE) {
                 fill_q6k_block(&mut rng, block);
             }
@@ -3290,7 +3486,9 @@ mod tests {
         match kind {
             1 => (vec![0.0; n], vec![0i8; k * hidden]),
             2 => (
-                (0..n).map(|i| f32::from_bits(1 + (i as u32 % 64))).collect(),
+                (0..n)
+                    .map(|i| f32::from_bits(1 + (i as u32 % 64)))
+                    .collect(),
                 (0..k * hidden).map(|_| rng.byte() as i8).collect(),
             ),
             3 => (
@@ -3302,7 +3500,9 @@ mod tests {
                     .collect(),
             ),
             4 => (
-                (0..n).map(|i| if i % 3 == 0 { -0.0 } else { 0.0 }).collect(),
+                (0..n)
+                    .map(|i| if i % 3 == 0 { -0.0 } else { 0.0 })
+                    .collect(),
                 (0..k * hidden).map(|_| rng.byte() as i8).collect(),
             ),
             5 => (
@@ -3387,11 +3587,7 @@ mod tests {
         read_buffer_f32(&out, &mut logits);
         let mut id_values = vec![0u32; 8];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                ids.contents().cast::<u32>(),
-                id_values.as_mut_ptr(),
-                8,
-            );
+            std::ptr::copy_nonoverlapping(ids.contents().cast::<u32>(), id_values.as_mut_ptr(), 8);
         }
         (
             logits.iter().map(|value| value.to_bits()).collect(),
@@ -3436,8 +3632,17 @@ mod tests {
             write_buffer_i8(&qbuf, &quants);
             for softcap in [0.0f32, SOFTCAP] {
                 let (base_logits, base_ids) = run_mma8_form(
-                    &refs, kernels, &sbuf, &qbuf, &fbuf, &wbuf, N_SB_12B, ROWS, HIDDEN_12B,
-                    softcap, SPEC50_FORM_BASE,
+                    &refs,
+                    kernels,
+                    &sbuf,
+                    &qbuf,
+                    &fbuf,
+                    &wbuf,
+                    N_SB_12B,
+                    ROWS,
+                    HIDDEN_12B,
+                    softcap,
+                    SPEC50_FORM_BASE,
                 );
                 // The duplicated rows must actually collide, or the tie rule
                 // was never reached on this input.
@@ -3505,8 +3710,8 @@ mod tests {
                 let cb = refs.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
                 assert!(encode_q6k_spec50_batch_with_form(
-                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k,
-                    HIDDEN_12B, SOFTCAP, *form,
+                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, k, HIDDEN_12B,
+                    SOFTCAP, *form,
                 ));
                 e.end_encoding();
                 cb.commit();
@@ -3534,10 +3739,19 @@ mod tests {
         assert_eq!(Spec50HeadForm::parse(" BASE "), Some(SPEC50_FORM_BASE));
         assert_eq!(
             Spec50HeadForm::parse("sg8-lean0-pf0"),
-            Some(Spec50HeadForm { name: "custom", simdgroups: 8, lean: 0, prefetch: 0 })
+            Some(Spec50HeadForm {
+                name: "custom",
+                simdgroups: 8,
+                lean: 0,
+                prefetch: 0
+            })
         );
         assert_eq!(
-            Spec50HeadForm::parse("lean-pf-sg8").map(|form| (form.simdgroups, form.lean, form.prefetch)),
+            Spec50HeadForm::parse("lean-pf-sg8").map(|form| (
+                form.simdgroups,
+                form.lean,
+                form.prefetch
+            )),
             Some((8, 1, 1))
         );
         assert_eq!(
@@ -3552,7 +3766,11 @@ mod tests {
         assert_eq!(Spec50HeadForm::parse("sg4-lean0-pf1"), None);
         assert_eq!(Spec50HeadForm::parse(""), None);
         for form in SPEC50_NAMED_FORMS {
-            assert!(form.admitted(), "named form {:?} is not admitted", form.name);
+            assert!(
+                form.admitted(),
+                "named form {:?} is not admitted",
+                form.name
+            );
         }
     }
 
@@ -3600,15 +3818,27 @@ mod tests {
                 flat,
                 yfmt,
             };
-            if geometry.admitted() && !out.iter().any(|seen: &Spec50Geometry| {
-                (seen.rows_per_sg, seen.rows_per_step, seen.sg_per_tg, seen.flat, seen.yfmt)
-                    == (rb, rg, sg, flat, yfmt)
-            }) {
+            if geometry.admitted()
+                && !out.iter().any(|seen: &Spec50Geometry| {
+                    (
+                        seen.rows_per_sg,
+                        seen.rows_per_step,
+                        seen.sg_per_tg,
+                        seen.flat,
+                        seen.yfmt,
+                    ) == (rb, rg, sg, flat, yfmt)
+                })
+            {
                 out.push(geometry);
             }
         };
         let (rbs, rgs, sgs, yfmts): (&[usize], &[usize], &[usize], &[u32]) = if full {
-            (&[1, 2, 4, 8, 16, 32], &[1, 2, 4, 8], &[1, 2, 4, 8, 16], &[0, 1, 2])
+            (
+                &[1, 2, 4, 8, 16, 32],
+                &[1, 2, 4, 8],
+                &[1, 2, 4, 8, 16],
+                &[0, 1, 2],
+            )
         } else {
             (&[4, 8, 16], &[1, 2, 4], &[2, 4, 8], &[2])
         };
@@ -3736,8 +3966,8 @@ mod tests {
             }
             let encode = |e: &metal::ComputeCommandEncoderRef| {
                 assert!(encode_q6k_spec50_mma8_form(
-                    e, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, 8, HIDDEN_12B,
-                    SOFTCAP, form,
+                    e, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out, N_SB_12B, ROWS, 8, HIDDEN_12B, SOFTCAP,
+                    form,
                 ));
             };
             let us = time(&encode);
@@ -3762,14 +3992,19 @@ mod tests {
         let mut geometries = vec![spec50_selected_geometry_for(HIDDEN_12B)];
         for geometry in spec50_bench_geometries(full) {
             if !geometries.iter().any(|seen: &Spec50Geometry| {
-                (seen.rows_per_sg, seen.rows_per_step, seen.sg_per_tg, seen.flat, seen.yfmt)
-                    == (
-                        geometry.rows_per_sg,
-                        geometry.rows_per_step,
-                        geometry.sg_per_tg,
-                        geometry.flat,
-                        geometry.yfmt,
-                    )
+                (
+                    seen.rows_per_sg,
+                    seen.rows_per_step,
+                    seen.sg_per_tg,
+                    seen.flat,
+                    seen.yfmt,
+                ) == (
+                    geometry.rows_per_sg,
+                    geometry.rows_per_step,
+                    geometry.sg_per_tg,
+                    geometry.flat,
+                    geometry.yfmt,
+                )
             }) {
                 geometries.push(geometry);
             }
@@ -3783,17 +4018,18 @@ mod tests {
         options.set_fast_math_enabled(false);
         for geometry in geometries {
             let src = format!("{}{SPEC50_HEAD_SHADER}", geometry.shader_defines());
-            let library = match refs.device.new_library_with_source(&src, &options) {
-                Ok(library) => library,
-                Err(err) => {
-                    eprintln!(
+            let library =
+                match refs.device.new_library_with_source(&src, &options) {
+                    Ok(library) => library,
+                    Err(err) => {
+                        eprintln!(
                         "[spec50-head-bench] geom rb{} rg{} sg{} flat{} y{}: compile failed: {err}",
                         geometry.rows_per_sg, geometry.rows_per_step, geometry.sg_per_tg,
                         geometry.flat, geometry.yfmt
                     );
-                    continue;
-                }
-            };
+                        continue;
+                    }
+                };
             let pipeline = |name: &str| -> Option<ComputePipelineState> {
                 let function = library.get_function(name, None).ok()?;
                 refs.device
@@ -3803,8 +4039,11 @@ mod tests {
             let Some(expand) = pipeline(geometry.expand_kernel()) else {
                 eprintln!(
                     "[spec50-head-bench] geom rb{} rg{} sg{} flat{} y{}: no expand pipeline",
-                    geometry.rows_per_sg, geometry.rows_per_step, geometry.sg_per_tg,
-                    geometry.flat, geometry.yfmt
+                    geometry.rows_per_sg,
+                    geometry.rows_per_step,
+                    geometry.sg_per_tg,
+                    geometry.flat,
+                    geometry.yfmt
                 );
                 continue;
             };
@@ -3836,7 +4075,11 @@ mod tests {
                             height: 1,
                             depth: 1,
                         },
-                        metal::MTLSize { width: 256, height: 1, depth: 1 },
+                        metal::MTLSize {
+                            width: 256,
+                            height: 1,
+                            depth: 1,
+                        },
                     );
                     e.set_compute_pipeline_state(&batch);
                     e.set_buffer(0, Some(&sbuf), 0);

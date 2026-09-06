@@ -10245,10 +10245,7 @@ mod gemma4_template_tests {
             gemma4_mtp12_clamp_output_tokens(3_000, 1_080, 4_096),
             Ok(1_080)
         );
-        assert_eq!(
-            gemma4_mtp12_clamp_output_tokens(2_031, 500, 2_048),
-            Ok(1)
-        );
+        assert_eq!(gemma4_mtp12_clamp_output_tokens(2_031, 500, 2_048), Ok(1));
         // A prompt that leaves no room is the only genuine failure.
         for prompt in [2_032, 2_048, 9_000] {
             let error = gemma4_mtp12_clamp_output_tokens(prompt, 1, 2_048)

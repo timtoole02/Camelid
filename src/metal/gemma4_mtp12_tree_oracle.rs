@@ -42,8 +42,11 @@ fn snapshot_view<'a>(
 fn tree_snapshot_primary_and_fork_bits() {
     // These frozen captures and alternate-selection assertions qualify only
     // the original threshold. An explicit experiment must use a new oracle.
-    assert_eq!(max_margin_from_env().unwrap().to_bits(), DEFAULT_MAX_MARGIN.to_bits(),
-        "captured tree replay requires the default max margin 2");
+    assert_eq!(
+        max_margin_from_env().unwrap().to_bits(),
+        DEFAULT_MAX_MARGIN.to_bits(),
+        "captured tree replay requires the default max margin 2"
+    );
     let config: serde_json::Value = serde_json::from_slice(
         &std::fs::read(std::env::var("CAMELID_MTP12_TREE_ORACLE_CONFIG").unwrap()).unwrap(),
     )
@@ -279,7 +282,9 @@ fn tree_snapshot_primary_and_fork_bits() {
         // and the menu's linear shape. Running it under `fixed:lin7` is what
         // re-proves that recording a top-2 on the continuation forwards leaves
         // the seven drafted tokens and their recurrent bits unchanged.
-        let selected = match std::env::var(crate::gemma4_mtp12_tree_menu::POLICY_ENV).ok().as_deref()
+        let selected = match std::env::var(crate::gemma4_mtp12_tree_menu::POLICY_ENV)
+            .ok()
+            .as_deref()
         {
             None | Some("legacy") => margins
                 .iter()

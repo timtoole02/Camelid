@@ -23,9 +23,9 @@ pub mod fabric;
 pub mod fit;
 pub mod fit_dims;
 pub mod gait;
-pub mod gemma4_distributed;
 #[cfg(target_os = "macos")]
 pub(crate) mod gemma4_attention_metal;
+pub mod gemma4_distributed;
 pub mod gemma4_mtp;
 /// Metal-free decision logic for the Gemma 4 12B W8 draft tree.
 pub(crate) mod gemma4_mtp12_tree_menu;

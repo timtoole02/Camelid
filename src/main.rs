@@ -264,10 +264,7 @@ mod ghost_moe_cli_tests {
                     ..
                 }) => {
                     assert_eq!(path, PathBuf::from("target.gguf"));
-                    assert_eq!(
-                        assistant,
-                        PathBuf::from("assistant/model.safetensors")
-                    );
+                    assert_eq!(assistant, PathBuf::from("assistant/model.safetensors"));
                     assert_eq!(max_tokens, 96);
                     assert_eq!(widths, vec![2, 4, 8, 16]);
                 }
@@ -5261,10 +5258,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 widths.sort_unstable();
                 widths.dedup();
-                if widths.is_empty()
-                    || widths
-                        .iter()
-                        .any(|width| !matches!(width, 2 | 4 | 8 | 16))
+                if widths.is_empty() || widths.iter().any(|width| !matches!(width, 2 | 4 | 8 | 16))
                 {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
                         "Gemma 4 MTP12 verifier widths must be a non-empty subset of 2,4,8,16; got {widths:?}"
@@ -5287,9 +5281,7 @@ async fn main() -> anyhow::Result<()> {
                     if std::env::var(forbidden_env)
                         .ok()
                         .as_deref()
-                        .is_some_and(|value| {
-                            value == "1" || value.eq_ignore_ascii_case("true")
-                        })
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                     {
                         return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
                             "Gemma 4 MTP12 benchmark requires {forbidden_env} to be unset"
@@ -5334,9 +5326,7 @@ async fn main() -> anyhow::Result<()> {
                     .into());
                 }
 
-                eprintln!(
-                    "[gemma4-mtp12] qualifying established vs ordered K1 target output..."
-                );
+                eprintln!("[gemma4-mtp12] qualifying established vs ordered K1 target output...");
                 let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
                 if qualification.token_ids.len() < max_width {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
@@ -5357,8 +5347,7 @@ async fn main() -> anyhow::Result<()> {
                     assistant.display()
                 );
                 let assistant_load_started = std::time::Instant::now();
-                let mut drafter =
-                    camelid::metal::Gemma4Mtp12AssistantMetal::load(&assistant)?;
+                let mut drafter = camelid::metal::Gemma4Mtp12AssistantMetal::load(&assistant)?;
                 let assistant_load_us = assistant_load_started.elapsed().as_micros();
                 let mut runs = Vec::with_capacity(widths.len());
                 let mut exact_all = true;
@@ -5398,17 +5387,15 @@ async fn main() -> anyhow::Result<()> {
                     let decode_output_tok_s = if generation.stats.decode_us == 0 {
                         0.0
                     } else {
-                        decode_outputs as f64 * 1_000_000.0
-                            / generation.stats.decode_us as f64
+                        decode_outputs as f64 * 1_000_000.0 / generation.stats.decode_us as f64
                     };
                     let end_to_end_tok_s = if generation_wall_us == 0 {
                         0.0
                     } else {
-                        generation.token_ids.len() as f64 * 1_000_000.0
-                            / generation_wall_us as f64
+                        generation.token_ids.len() as f64 * 1_000_000.0 / generation_wall_us as f64
                     };
-                    let qualified_generation_us = generation_wall_us
-                        .saturating_sub(generation.stats.target_identity_us);
+                    let qualified_generation_us =
+                        generation_wall_us.saturating_sub(generation.stats.target_identity_us);
                     let qualified_end_to_end_tok_s = if qualified_generation_us == 0 {
                         0.0
                     } else {
@@ -5524,8 +5511,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             #[cfg(target_os = "macos")]
             {
-                let established_ordered_env = std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4")
-                    .ok();
+                let established_ordered_env = std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok();
                 if established_ordered_env
                     .as_deref()
                     .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -5541,9 +5527,11 @@ async fn main() -> anyhow::Result<()> {
                     "CAMELID_GEMMA4_METAL_HEAD_TIMING",
                     "CAMELID_GEMMA4_GPU_TIMING",
                 ] {
-                    if std::env::var(timing_env).ok().as_deref().is_some_and(|value| {
-                        value == "1" || value.eq_ignore_ascii_case("true")
-                    }) {
+                    if std::env::var(timing_env)
+                        .ok()
+                        .as_deref()
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    {
                         return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
                             "gemma4 verifier timing receipt requires {timing_env} to be unset"
                         ))
@@ -5660,8 +5648,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let started = std::time::Instant::now();
                     let mut predictions = Vec::with_capacity(tokens.len());
-                    let mut hidden_bits =
-                        Vec::with_capacity(tokens.len().saturating_mul(3_840));
+                    let mut hidden_bits = Vec::with_capacity(tokens.len().saturating_mul(3_840));
                     let mut position = prefill.prompt_token_count;
                     for chunk in tokens.chunks_exact(width) {
                         let batch = runtime.verify_consecutive_greedy(chunk, position)?;
@@ -5684,10 +5671,9 @@ async fn main() -> anyhow::Result<()> {
                 // sixteen cache rows. Zero/full pin the boundary cases; 1, 7 and
                 // 15 span a large tail, the K8-fragment boundary, and a one-row tail.
                 let rejected_tail_width = max_width;
-                let rejected_tail_prefixes = gemma4_rejected_tail_commit_prefixes(
-                    rejected_tail_width,
-                )
-                .expect("validated verifier width has an overwrite-prefix plan");
+                let rejected_tail_prefixes =
+                    gemma4_rejected_tail_commit_prefixes(rejected_tail_width)
+                        .expect("validated verifier width has an overwrite-prefix plan");
                 if qualification.token_ids.len() < rejected_tail_width {
                     return Err(camelid::BackendError::UnsupportedModelArchitecture(
                         format!(
@@ -5767,11 +5753,9 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .into());
                     }
-                    let mut reference_ids =
-                        Vec::with_capacity(committed + rejected_tail_width);
-                    let mut reference_hidden_bits = Vec::with_capacity(
-                        (committed + rejected_tail_width).saturating_mul(3_840),
-                    );
+                    let mut reference_ids = Vec::with_capacity(committed + rejected_tail_width);
+                    let mut reference_hidden_bits =
+                        Vec::with_capacity((committed + rejected_tail_width).saturating_mul(3_840));
                     let mut reference_position = reference_prefill.prompt_token_count;
                     for &token in tail_a[..committed].iter().chain(&tail_b) {
                         let (prediction, hidden) =
@@ -5851,14 +5835,13 @@ async fn main() -> anyhow::Result<()> {
                 let mut exact_all = true;
                 for &width in widths.iter().filter(|&&width| width != 1) {
                     let _ = run_width(width, &teacher_tokens[..width])?;
-                    let (predictions, hidden_bits, wall_us) =
-                        run_width(width, teacher_tokens)?;
+                    let (predictions, hidden_bits, wall_us) = run_width(width, teacher_tokens)?;
                     let first_id_divergence = reference
                         .iter()
                         .zip(&predictions)
                         .position(|(left, right)| left != right);
-                    let ids_exact = first_id_divergence.is_none()
-                        && predictions.len() == reference.len();
+                    let ids_exact =
+                        first_id_divergence.is_none() && predictions.len() == reference.len();
                     let first_hidden_divergence = reference_hidden_bits
                         .iter()
                         .zip(&hidden_bits)

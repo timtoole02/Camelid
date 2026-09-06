@@ -528,7 +528,11 @@ fn target_verify_fused_glue_masks_are_bit_exact_against_legacy() {
                     exact(&format!("final hidden {label} row={row}"), expected, actual);
                 }
                 assert_eq!(ids, ids_m, "SPEC50 argmax ids {label}");
-                exact(&format!("all SPEC50 logits {label}"), &logits_ref, &logits_m);
+                exact(
+                    &format!("all SPEC50 logits {label}"),
+                    &logits_ref,
+                    &logits_m,
+                );
                 assert_eq!(kv, kv_m, "48-layer K/V bits {label}");
                 comparisons += 1;
             }

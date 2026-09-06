@@ -225,8 +225,16 @@ impl TreeContextSelection {
         }
         let form = TreeContextForm::parse(value)?;
         Some(Self {
-            sliding: if form.available(256) { form } else { TreeContextForm::P2 },
-            global: if form.available(512) { form } else { TreeContextForm::P2 },
+            sliding: if form.available(256) {
+                form
+            } else {
+                TreeContextForm::P2
+            },
+            global: if form.available(512) {
+                form
+            } else {
+                TreeContextForm::P2
+            },
         })
     }
 
@@ -314,9 +322,9 @@ impl TreeContextSelection {
             "p2", "p2x,p2", "p4,p2", "p8,p2", "p2,p2x", "p2,p4", "p2,p8", "p2,p16", "p2x,p2x",
             "p2x,p4", "p4,p4", "p4,p8", "p8,p8",
         ]
-            .into_iter()
-            .map(|spec| Self::parse(spec).expect("static receipt form"))
-            .collect()
+        .into_iter()
+        .map(|spec| Self::parse(spec).expect("static receipt form"))
+        .collect()
     }
 }
 
@@ -411,7 +419,13 @@ impl Gemma4ResidentModel {
         base_position: usize,
         plan: &Gemma4DenseTreePlan,
     ) -> Option<Vec<f32>> {
-        self.verify_tree_hidden_ordered_q4_with_glue(h0_rows, inputs_by_row, base_position, plan, None)
+        self.verify_tree_hidden_ordered_q4_with_glue(
+            h0_rows,
+            inputs_by_row,
+            base_position,
+            plan,
+            None,
+        )
     }
 
     /// [`Self::verify_tree_hidden_ordered_q4`] with an explicit fused-glue
@@ -871,7 +885,9 @@ mod tests {
         // visible_end / window_start / position_count / score_offset and scratch bytes,
         // across the sliding-window edges and the capacity edge.
         for window in [Some(1024), None] {
-            for base in [0, 1, 529, 640, 647, 1016, 1017, 1023, 1024, 1025, 1500, 2040] {
+            for base in [
+                0, 1, 529, 640, 647, 1016, 1017, 1023, 1024, 1025, 1500, 2040,
+            ] {
                 let (tree_rows, tree_bytes) = chain.row_plan(base, window, 2048, 16).unwrap();
                 let (linear_rows, linear_bytes) =
                     gemma4_dense_attention_row_plan(base, ROWS, window, 2048, 16).unwrap();
@@ -958,10 +974,13 @@ mod tests {
         // Explicit pairs refuse a missing instantiation; garbage is refused.
         assert_eq!(TreeContextSelection::parse("p16,p8"), None);
         assert_eq!(TreeContextSelection::parse("p16,p2x"), None);
-        assert_eq!(TreeContextSelection::parse("p2x,p16x"), Some(TreeContextSelection {
-            sliding: P2X,
-            global: P16
-        }));
+        assert_eq!(
+            TreeContextSelection::parse("p2x,p16x"),
+            Some(TreeContextSelection {
+                sliding: P2X,
+                global: P16
+            })
+        );
         assert_eq!(TreeContextSelection::parse("p3"), None);
         assert_eq!(TreeContextSelection::parse(""), None);
         assert_eq!(TreeContextSelection::parse("p8,p8,p8"), None);
@@ -1107,8 +1126,8 @@ mod tests {
                         let encoder = command.new_compute_command_encoder();
                         assert!(
                             encode_tree_attention_with_form(
-                                encoder, kernel, &tq, &tk, &tv, &ts, &td, &to, heads, kv_heads,
-                                hd, capacity, base, window, 1.0, &plan, variant, form
+                                encoder, kernel, &tq, &tk, &tv, &ts, &td, &to, heads, kv_heads, hd,
+                                capacity, base, window, 1.0, &plan, variant, form
                             ),
                             "hd={hd} base={base} parents={:?} variant={variant:?} form={} declined",
                             plan.parents,
@@ -1193,8 +1212,11 @@ mod tests {
                             if std::env::var_os("CAMELID_TREE_DEBUG_ROUNDING").is_some() {
                                 let expected = &output[depth * qdim..(depth + 1) * qdim];
                                 let actual = &tree_output[node * qdim..(node + 1) * qdim];
-                                if let Some(index) = expected.iter().zip(actual)
-                                    .position(|(a, b)| a.to_bits() != b.to_bits()) {
+                                if let Some(index) = expected
+                                    .iter()
+                                    .zip(actual)
+                                    .position(|(a, b)| a.to_bits() != b.to_bits())
+                                {
                                     let head = index / hd;
                                     let dim = index % hd;
                                     let kv_head = head / (heads / kv_heads);
@@ -1202,25 +1224,38 @@ mod tests {
                                     let mut terms = Vec::new();
                                     for p in 0..tm.position_count as usize {
                                         let logical = tm.window_start as usize + p;
-                                        let physical = if logical < base { logical } else {
+                                        let physical = if logical < base {
+                                            logical
+                                        } else {
                                             base + plan.ancestors[node][logical - base] as usize
                                         };
-                                        let score = tree_scores[tm.score_offset as usize + head * tm.position_count as usize + p];
-                                        let value = values[(kv_head * capacity + physical) * hd + dim];
+                                        let score = tree_scores[tm.score_offset as usize
+                                            + head * tm.position_count as usize
+                                            + p];
+                                        let value =
+                                            values[(kv_head * capacity + physical) * hd + dim];
                                         terms.push((score, value));
                                     }
                                     eprintln!("[tree-rounding] {label} index={index} head={head} dim={dim} denom={:08x} expected={:08x} actual={:08x}",
                                         denominator.to_bits(), expected[index].to_bits(), actual[index].to_bits());
                                     if terms.len() <= 8 {
                                         for (p, &(score, value)) in terms.iter().enumerate() {
-                                            eprintln!("[tree-rounding] p={p} exp={:08x} value={:08x}", score.to_bits(), value.to_bits());
+                                            eprintln!(
+                                                "[tree-rounding] p={p} exp={:08x} value={:08x}",
+                                                score.to_bits(),
+                                                value.to_bits()
+                                            );
                                         }
                                     }
                                     // Rust f32 mul_add provides an explicit one-rounding FMA.
                                     // Screen rounded divide and its adjacent representations;
                                     // GPU inverse/contraction still needs direct evidence.
                                     let inverse = 1.0f32 / denominator;
-                                    for inverse_bits in [inverse.to_bits() - 1, inverse.to_bits(), inverse.to_bits() + 1] {
+                                    for inverse_bits in [
+                                        inverse.to_bits() - 1,
+                                        inverse.to_bits(),
+                                        inverse.to_bits() + 1,
+                                    ] {
                                         let inv = f32::from_bits(inverse_bits);
                                         let mut svi_fma = 0.0f32;
                                         let mut siv_fma = 0.0f32;
@@ -1236,10 +1271,14 @@ mod tests {
                                             dot_fma = score.mul_add(value, dot_fma);
                                             dot_unfused = dot_unfused + score * value;
                                         }
-                                        for (name, value) in [("fma(score*value,inv,acc)", svi_fma),
-                                            ("fma(score*inv,value,acc)", siv_fma), ("fma(value*inv,score,acc)", vis_fma),
-                                            ("add(mul(mul(score,inv),value))", unfused), ("fma_dot_then_inv", dot_fma * inv),
-                                            ("unfused_dot_then_inv", dot_unfused * inv)] {
+                                        for (name, value) in [
+                                            ("fma(score*value,inv,acc)", svi_fma),
+                                            ("fma(score*inv,value,acc)", siv_fma),
+                                            ("fma(value*inv,score,acc)", vis_fma),
+                                            ("add(mul(mul(score,inv),value))", unfused),
+                                            ("fma_dot_then_inv", dot_fma * inv),
+                                            ("unfused_dot_then_inv", dot_unfused * inv),
+                                        ] {
                                             eprintln!("[tree-rounding] inv={inverse_bits:08x} form={name} value={:08x} expected_match={} actual_match={}",
                                                 value.to_bits(), value.to_bits() == expected[index].to_bits(), value.to_bits() == actual[index].to_bits());
                                         }

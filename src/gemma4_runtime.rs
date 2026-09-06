@@ -35,15 +35,15 @@ use std::sync::Arc;
 #[path = "gemma4_mtp12_snapshot.rs"]
 pub(crate) mod mtp12_snapshot;
 
+#[cfg(all(target_os = "macos", test))]
+#[path = "gemma4_mtp12_tree_model_tests.rs"]
+mod mtp12_tree_model_tests;
 #[cfg(any(target_os = "macos", test))]
 #[path = "gemma4_mtp12_tree_policy.rs"]
 pub(crate) mod mtp12_tree_policy;
 #[cfg(target_os = "macos")]
 #[path = "gemma4_mtp12_tree_runtime.rs"]
 mod mtp12_tree_runtime;
-#[cfg(all(target_os = "macos", test))]
-#[path = "gemma4_mtp12_tree_model_tests.rs"]
-mod mtp12_tree_model_tests;
 
 /// Q8_0 wire-block geometry (GGUF on-disk format): 32 quantized values per block,
 /// stored as a 2-byte little-endian f16 scale followed by 32 i8 quants = 34 bytes.
@@ -6899,8 +6899,7 @@ impl Gemma4DenseVerifierState {
 #[cfg(all(test, target_os = "macos"))]
 mod dense_verifier_state_tests {
     use super::{
-        gemma4_dense_verify_width_admitted, Gemma4DenseSequenceLane,
-        Gemma4DenseVerifierState,
+        gemma4_dense_verify_width_admitted, Gemma4DenseSequenceLane, Gemma4DenseVerifierState,
     };
 
     #[test]
@@ -7616,8 +7615,7 @@ impl Gemma4Mtp12MetalStats {
         if self.decode_us == 0 {
             0.0
         } else {
-            self.emitted_tokens.saturating_sub(1) as f64 * 1_000_000.0
-                / self.decode_us as f64
+            self.emitted_tokens.saturating_sub(1) as f64 * 1_000_000.0 / self.decode_us as f64
         }
     }
 }
@@ -7859,9 +7857,8 @@ mod gemma4_mtp12_metal_generation_tests {
         gemma4_mtp12_acceptance_decision, gemma4_mtp12_materialize_candidate_rows,
         gemma4_mtp12_tail_verify_width, gemma4_mtp12_w16_oneshot_w8_pad16_policy,
         gemma4_mtp12_w16_warmup8_policy, gemma4_mtp12_w8_padded_tail_policy,
-        Gemma4Mtp12AcceptanceDecision, Gemma4Mtp12MetalStats,
-        Gemma4Mtp12WidthScheduleState, Gemma4Mtp12WidthScheduleTransition,
-        Gemma4Mtp12WidthScheduler,
+        Gemma4Mtp12AcceptanceDecision, Gemma4Mtp12MetalStats, Gemma4Mtp12WidthScheduleState,
+        Gemma4Mtp12WidthScheduleTransition, Gemma4Mtp12WidthScheduler,
     };
 
     #[test]
@@ -7912,10 +7909,20 @@ mod gemma4_mtp12_metal_generation_tests {
         }
         // Exact end-of-cache padding is allowed; one slot less uses old K4.
         let max_positions = 512usize;
-        assert_eq!(padded.plan_round_with_capacity(7, max_positions - 504)
-            .unwrap().physical_verify_width, 8);
-        assert_eq!(padded.plan_round_with_capacity(7, max_positions - 505)
-            .unwrap().physical_verify_width, 4);
+        assert_eq!(
+            padded
+                .plan_round_with_capacity(7, max_positions - 504)
+                .unwrap()
+                .physical_verify_width,
+            8
+        );
+        assert_eq!(
+            padded
+                .plan_round_with_capacity(7, max_positions - 505)
+                .unwrap()
+                .physical_verify_width,
+            4
+        );
     }
 
     #[test]
@@ -7926,10 +7933,14 @@ mod gemma4_mtp12_metal_generation_tests {
                 let plan = scheduler.plan_round_with_capacity(remaining, 8).unwrap();
                 let anchor = 7;
                 let drafts = (10..10 + (plan.logical_verify_width - 1) as u32).collect::<Vec<_>>();
-                let (candidates, padding) = gemma4_mtp12_materialize_candidate_rows(plan, anchor, &drafts)
-                    .expect("logical drafts followed by repeat-anchor padding");
+                let (candidates, padding) =
+                    gemma4_mtp12_materialize_candidate_rows(plan, anchor, &drafts)
+                        .expect("logical drafts followed by repeat-anchor padding");
                 assert_eq!(candidates.len(), 8);
-                assert_eq!(&candidates[plan.logical_verify_width..], vec![anchor; plan.padding_rows]);
+                assert_eq!(
+                    &candidates[plan.logical_verify_width..],
+                    vec![anchor; plan.padding_rows]
+                );
                 assert_eq!(padding, vec![anchor; plan.padding_rows]);
                 let mut predictions = drafts.clone();
                 predictions.push(42);
@@ -7939,16 +7950,22 @@ mod gemma4_mtp12_metal_generation_tests {
                 // A stop in padding must have no effect on the decision.
                 predictions.resize(8, 99);
                 let decision = gemma4_mtp12_acceptance_decision(
-                    &drafts, &predictions[..plan.logical_verify_width], &[99],
-                ).unwrap();
+                    &drafts,
+                    &predictions[..plan.logical_verify_width],
+                    &[99],
+                )
+                .unwrap();
                 assert_eq!(decision.accepted_drafts, accepted);
                 assert_eq!(decision.committed_input_rows, 1 + accepted);
                 assert!(decision.committed_input_rows <= plan.logical_verify_width);
                 assert_eq!(decision.stop_token, None);
-                assert_eq!(scheduler.finish_round(plan, accepted, false), Some((
-                    Gemma4Mtp12WidthScheduleState::Fixed,
-                    Gemma4Mtp12WidthScheduleTransition::BudgetTailHold,
-                )));
+                assert_eq!(
+                    scheduler.finish_round(plan, accepted, false),
+                    Some((
+                        Gemma4Mtp12WidthScheduleState::Fixed,
+                        Gemma4Mtp12WidthScheduleTransition::BudgetTailHold,
+                    ))
+                );
             }
         }
     }
@@ -7958,43 +7975,71 @@ mod gemma4_mtp12_metal_generation_tests {
         // Targets through the first rejection follow this deterministic oracle;
         // rows after that point are irrelevant and never committed. This tests
         // the host acceptance/bonus path independently of physical row count.
-        fn generate(budget: usize, stop_at: usize, reject_mod: usize, padded: bool)
-            -> (Vec<u32>, usize)
-        {
+        fn generate(
+            budget: usize,
+            stop_at: usize,
+            reject_mod: usize,
+            padded: bool,
+        ) -> (Vec<u32>, usize) {
             let mut scheduler = if padded {
                 Gemma4Mtp12WidthScheduler::new_w8_padded_tail(8).unwrap()
             } else {
                 Gemma4Mtp12WidthScheduler::new(8, false)
             };
-            let oracle = |position: usize| if position == stop_at { 99 } else { 100 + position as u32 };
+            let oracle = |position: usize| {
+                if position == stop_at {
+                    99
+                } else {
+                    100 + position as u32
+                }
+            };
             let mut emitted = Vec::new();
             let mut rounds = 0;
             while emitted.len() < budget {
                 let start = emitted.len();
                 let anchor = oracle(start);
-                if anchor == 99 { break; }
+                if anchor == 99 {
+                    break;
+                }
                 let Some(plan) = scheduler.plan_round_with_capacity(budget - start, 64) else {
                     emitted.push(anchor);
                     break;
                 };
-                let drafts = (1..plan.logical_verify_width).map(|i| {
-                    let correct = oracle(start + i);
-                    if reject_mod > 0 && (start + i) % reject_mod == 0 { correct + 1000 } else { correct }
-                }).collect::<Vec<_>>();
+                let drafts = (1..plan.logical_verify_width)
+                    .map(|i| {
+                        let correct = oracle(start + i);
+                        if reject_mod > 0 && (start + i) % reject_mod == 0 {
+                            correct + 1000
+                        } else {
+                            correct
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 let mut predictions = (1..=plan.logical_verify_width)
-                    .map(|i| oracle(start + i)).collect::<Vec<_>>();
+                    .map(|i| oracle(start + i))
+                    .collect::<Vec<_>>();
                 predictions.resize(plan.physical_verify_width, 99);
                 let decision = gemma4_mtp12_acceptance_decision(
-                    &drafts, &predictions[..plan.logical_verify_width], &[99],
-                ).unwrap();
+                    &drafts,
+                    &predictions[..plan.logical_verify_width],
+                    &[99],
+                )
+                .unwrap();
                 assert!(decision.committed_input_rows <= plan.logical_verify_width);
                 emitted.push(anchor);
                 emitted.extend_from_slice(&drafts[..decision.accepted_drafts]);
                 assert!(emitted.len() <= budget);
                 rounds += 1;
-                scheduler.finish_round(plan, decision.accepted_drafts, decision.stop_token.is_some())
+                scheduler
+                    .finish_round(
+                        plan,
+                        decision.accepted_drafts,
+                        decision.stop_token.is_some(),
+                    )
                     .expect("logical acceptance preserves the scheduler contract");
-                if decision.stop_token.is_some() { break; }
+                if decision.stop_token.is_some() {
+                    break;
+                }
                 assert_eq!(decision.next_anchor_token, Some(oracle(emitted.len())));
             }
             (emitted, rounds)
@@ -8004,9 +8049,14 @@ mod gemma4_mtp12_metal_generation_tests {
                 for reject_mod in 0..=9 {
                     let baseline = generate(budget, stop_at, reject_mod, false);
                     let padded = generate(budget, stop_at, reject_mod, true);
-                    let expected = (0..budget.min(stop_at)).map(|i| 100 + i as u32).collect::<Vec<_>>();
+                    let expected = (0..budget.min(stop_at))
+                        .map(|i| 100 + i as u32)
+                        .collect::<Vec<_>>();
                     assert_eq!(baseline.0, expected);
-                    assert_eq!(padded.0, expected, "budget={budget}, stop={stop_at}, rejection_mod={reject_mod}");
+                    assert_eq!(
+                        padded.0, expected,
+                        "budget={budget}, stop={stop_at}, rejection_mod={reject_mod}"
+                    );
                 }
             }
         }
@@ -8346,12 +8396,8 @@ mod gemma4_mtp12_metal_generation_tests {
     #[test]
     fn mismatch_commit_includes_anchor_and_only_the_agreed_prefix() {
         let drafts = [10, 11, 12];
-        let immediate = gemma4_mtp12_acceptance_decision(
-            &drafts,
-            &[20, 21, 22, 23],
-            &[99],
-        )
-        .expect("valid target rows");
+        let immediate = gemma4_mtp12_acceptance_decision(&drafts, &[20, 21, 22, 23], &[99])
+            .expect("valid target rows");
         assert_eq!(
             immediate,
             Gemma4Mtp12AcceptanceDecision {
@@ -8363,12 +8409,8 @@ mod gemma4_mtp12_metal_generation_tests {
             }
         );
 
-        let two = gemma4_mtp12_acceptance_decision(
-            &drafts,
-            &[10, 11, 20, 23],
-            &[99],
-        )
-        .expect("valid target rows");
+        let two = gemma4_mtp12_acceptance_decision(&drafts, &[10, 11, 20, 23], &[99])
+            .expect("valid target rows");
         assert_eq!(two.accepted_drafts, 2);
         assert_eq!(two.committed_input_rows, 3);
         assert_eq!(two.mismatch_draft_index, Some(2));
@@ -8377,12 +8419,8 @@ mod gemma4_mtp12_metal_generation_tests {
 
     #[test]
     fn all_accepted_commits_every_candidate_and_uses_final_bonus() {
-        let decision = gemma4_mtp12_acceptance_decision(
-            &[10, 11, 12],
-            &[10, 11, 12, 42],
-            &[99],
-        )
-        .expect("valid target rows");
+        let decision = gemma4_mtp12_acceptance_decision(&[10, 11, 12], &[10, 11, 12, 42], &[99])
+            .expect("valid target rows");
         assert_eq!(decision.accepted_drafts, 3);
         assert_eq!(decision.committed_input_rows, 4);
         assert_eq!(decision.mismatch_draft_index, None);
@@ -8406,12 +8444,8 @@ mod gemma4_mtp12_metal_generation_tests {
 
     #[test]
     fn target_agreed_stop_is_neither_accepted_output_nor_committed_input() {
-        let decision = gemma4_mtp12_acceptance_decision(
-            &[10, 99, 12],
-            &[10, 99, 12, 42],
-            &[99],
-        )
-        .expect("valid target rows");
+        let decision = gemma4_mtp12_acceptance_decision(&[10, 99, 12], &[10, 99, 12, 42], &[99])
+            .expect("valid target rows");
         assert_eq!(decision.accepted_drafts, 1);
         assert_eq!(decision.committed_input_rows, 2);
         assert_eq!(decision.mismatch_draft_index, None);
@@ -8421,24 +8455,16 @@ mod gemma4_mtp12_metal_generation_tests {
 
     #[test]
     fn target_stop_on_mismatch_or_bonus_terminates_without_forwarding_it() {
-        let mismatch = gemma4_mtp12_acceptance_decision(
-            &[10, 11, 12],
-            &[10, 99, 12, 42],
-            &[99],
-        )
-        .expect("valid target rows");
+        let mismatch = gemma4_mtp12_acceptance_decision(&[10, 11, 12], &[10, 99, 12, 42], &[99])
+            .expect("valid target rows");
         assert_eq!(mismatch.accepted_drafts, 1);
         assert_eq!(mismatch.committed_input_rows, 2);
         assert_eq!(mismatch.mismatch_draft_index, Some(1));
         assert_eq!(mismatch.stop_token, Some(99));
         assert_eq!(mismatch.next_anchor_token, None);
 
-        let bonus = gemma4_mtp12_acceptance_decision(
-            &[10, 11, 12],
-            &[10, 11, 12, 99],
-            &[99],
-        )
-        .expect("valid target rows");
+        let bonus = gemma4_mtp12_acceptance_decision(&[10, 11, 12], &[10, 11, 12, 99], &[99])
+            .expect("valid target rows");
         assert_eq!(bonus.accepted_drafts, 3);
         assert_eq!(bonus.committed_input_rows, 4);
         assert_eq!(bonus.stop_token, Some(99));
@@ -8447,8 +8473,7 @@ mod gemma4_mtp12_metal_generation_tests {
 
     #[test]
     fn malformed_target_row_count_fails_closed() {
-        assert!(gemma4_mtp12_acceptance_decision(&[10, 11, 12], &[10, 11, 12], &[])
-            .is_none());
+        assert!(gemma4_mtp12_acceptance_decision(&[10, 11, 12], &[10, 11, 12], &[]).is_none());
     }
 
     #[test]
@@ -8805,9 +8830,7 @@ impl Gemma4GpuRuntime {
             if head.is_some() {
                 eprintln!("[gemma4-dense] ordered file-backed Metal Q6_K head enabled");
             } else {
-                eprintln!(
-                    "[gemma4-dense] Metal Q6_K head unavailable; retaining CPU fallback"
-                );
+                eprintln!("[gemma4-dense] Metal Q6_K head unavailable; retaining CPU fallback");
             }
             head
         } else {
@@ -8820,9 +8843,7 @@ impl Gemma4GpuRuntime {
         if std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         {
-            eprintln!(
-                "[gemma4-dense] strict ordered Q4_0 x Q8 K=1 projection universe requested"
-            );
+            eprintln!("[gemma4-dense] strict ordered Q4_0 x Q8 K=1 projection universe requested");
         }
         let model = crate::metal::Gemma4ResidentModel::new(
             layers,
@@ -9036,11 +9057,12 @@ impl Gemma4GpuRuntime {
                 fused_glue,
                 |head, hidden_flat| {
                     let greedy_ids =
-                        head.forward_argmax_spec50_batch(hidden_flat).ok_or_else(|| {
-                            BackendError::UnsupportedModelArchitecture(
-                                "SPEC50 K-wide Q6_K target head failed".into(),
-                            )
-                        })?;
+                        head.forward_argmax_spec50_batch(hidden_flat)
+                            .ok_or_else(|| {
+                                BackendError::UnsupportedModelArchitecture(
+                                    "SPEC50 K-wide Q6_K target head failed".into(),
+                                )
+                            })?;
                     let head_timing = head.last_spec50_timing();
                     if greedy_ids.len() != candidate_tokens.len() {
                         return Err(BackendError::RuntimeShapeMismatch(
@@ -9054,8 +9076,8 @@ impl Gemma4GpuRuntime {
                     Ok((greedy_ids, final_hidden, head_timing))
                 },
             )?;
-        let decoder_gpu_us = crate::metal::GEMMA4_LAST_VERIFY_GPU_US
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let decoder_gpu_us =
+            crate::metal::GEMMA4_LAST_VERIFY_GPU_US.load(std::sync::atomic::Ordering::Relaxed);
         Ok(Gemma4DenseVerifierBatch {
             ticket,
             start_position,
@@ -9075,7 +9097,12 @@ impl Gemma4GpuRuntime {
         start_position: usize,
         project: impl FnOnce(&crate::metal::Gemma4Q6KHead, &[f32]) -> Result<R>,
     ) -> Result<(u64, R)> {
-        self.with_consecutive_hidden_ordered_q4_glue(candidate_tokens, start_position, None, project)
+        self.with_consecutive_hidden_ordered_q4_glue(
+            candidate_tokens,
+            start_position,
+            None,
+            project,
+        )
     }
 
     /// [`Self::with_consecutive_hidden_ordered_q4`] with an explicit
@@ -9261,11 +9288,13 @@ impl Gemma4GpuRuntime {
                     // prompt row needs a vocabulary projection. K1 uses the
                     // same ordered head arithmetic as each row of K2/4/8/16.
                     let last_hidden = &hidden_flat[hidden_flat.len() - self.hidden..];
-                    let ids = head.forward_argmax_spec50_batch(last_hidden).ok_or_else(|| {
-                        BackendError::UnsupportedModelArchitecture(
-                            "SPEC50 final prompt Q6_K target head failed".into(),
-                        )
-                    })?;
+                    let ids = head
+                        .forward_argmax_spec50_batch(last_hidden)
+                        .ok_or_else(|| {
+                            BackendError::UnsupportedModelArchitecture(
+                                "SPEC50 final prompt Q6_K target head failed".into(),
+                            )
+                        })?;
                     if ids.len() != 1 {
                         return Err(BackendError::RuntimeShapeMismatch(
                             "final prompt head returned an invalid row count".into(),
@@ -9418,7 +9447,9 @@ impl Gemma4GpuRuntime {
     ) -> Result<crate::metal::Gemma4Mtp12ChainProposal> {
         self.require_mtp12_target_identity()?;
         if pending_target_raw_hidden.len() != self.hidden
-            || pending_target_raw_hidden.iter().any(|value| !value.is_finite())
+            || pending_target_raw_hidden
+                .iter()
+                .any(|value| !value.is_finite())
         {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "Gemma 4 MTP raw target hidden has width {} (expected {}) or non-finite values",
@@ -9432,11 +9463,8 @@ impl Gemma4GpuRuntime {
                 crate::metal::GEMMA4_12B_MTP_MAX_DRAFTS,
             )));
         }
-        let normalized_hidden = rms_norm(
-            pending_target_raw_hidden,
-            Some(&self.output_norm),
-            self.eps,
-        );
+        let normalized_hidden =
+            rms_norm(pending_target_raw_hidden, Some(&self.output_norm), self.eps);
         if normalized_hidden.iter().any(|value| !value.is_finite()) {
             return Err(BackendError::RuntimeShapeMismatch(
                 "Gemma 4 MTP normalized target hidden contains non-finite values".into(),
@@ -9792,10 +9820,7 @@ impl Gemma4GpuRuntime {
         })
     }
 
-    fn generate_greedy_mtp12_ordered_q4_controlled<
-        F: FnMut(&str),
-        C: FnMut() -> bool,
-    >(
+    fn generate_greedy_mtp12_ordered_q4_controlled<F: FnMut(&str), C: FnMut() -> bool>(
         &self,
         assistant: &mut crate::metal::Gemma4Mtp12AssistantMetal,
         prompt: &str,
@@ -9811,16 +9836,19 @@ impl Gemma4GpuRuntime {
         }
 
         let tree_value = std::env::var(mtp12_tree_policy::TREE_W8_ENV)
-            .map(Some).or_else(|error| match error {
+            .map(Some)
+            .or_else(|error| match error {
                 std::env::VarError::NotPresent => Ok(None),
                 other => Err(BackendError::RuntimeShapeMismatch(format!(
-                    "{}: {other}", mtp12_tree_policy::TREE_W8_ENV,
+                    "{}: {other}",
+                    mtp12_tree_policy::TREE_W8_ENV,
                 ))),
             })?;
         let tree_enabled = mtp12_tree_policy::enabled(tree_value.as_deref())
             .map_err(BackendError::RuntimeShapeMismatch)?;
-        if tree_enabled && std::env::var_os("CAMELID_MTP12_DUMP_DRAFT_QUERIES")
-            .is_some_and(|path| !path.is_empty())
+        if tree_enabled
+            && std::env::var_os("CAMELID_MTP12_DUMP_DRAFT_QUERIES")
+                .is_some_and(|path| !path.is_empty())
         {
             return Err(BackendError::RuntimeShapeMismatch(
                 "linear draft-query dumps do not represent tree proposals; disable CAMELID_MTP12_DUMP_DRAFT_QUERIES for tree runs".into(),
@@ -9907,7 +9935,9 @@ impl Gemma4GpuRuntime {
                     adaptive_selector_value
                 },
                 enabled: adaptive_enabled || one_shot_enabled || w8_padded_tail_enabled,
-                active_for_configured_width: adaptive_active || one_shot_active || w8_padded_tail_active,
+                active_for_configured_width: adaptive_active
+                    || one_shot_active
+                    || w8_padded_tail_active,
                 warmup_verify_width: (adaptive_active || one_shot_active).then_some(8),
                 padded_tail_policy: if w8_padded_tail_active {
                     Some("remaining_5_through_8_reserves_bonus_anchor; logical_remaining_minus_1; physical_w8; repeat_anchor_padding; insufficient_kv_capacity_uses_existing_tail")
@@ -9972,56 +10002,102 @@ impl Gemma4GpuRuntime {
             let assistant_started = std::time::Instant::now();
             // Only full W8 rounds use the tree. Existing padded/short/capacity
             // tails retain the already-qualified linear proposal and verifier.
-            let tree_proposal = if tree_enabled && mtp12_tree_policy::round_eligible(
-                logical_width, physical_width, position, self.model.max_positions(),
-            ) {
+            let tree_proposal = if tree_enabled
+                && mtp12_tree_policy::round_eligible(
+                    logical_width,
+                    physical_width,
+                    position,
+                    self.model.max_positions(),
+                ) {
                 Some(self.propose_mtp12_tree_ordered_q4(
-                    assistant, anchor_token, &pending_target_raw_hidden, position,
+                    assistant,
+                    anchor_token,
+                    &pending_target_raw_hidden,
+                    position,
                 )?)
-            } else { None };
+            } else {
+                None
+            };
             let draft_proposal = if let Some(tree) = tree_proposal.as_ref() {
-                let linear_topology = tree.parents.iter().enumerate()
+                let linear_topology = tree
+                    .parents
+                    .iter()
+                    .enumerate()
                     .all(|(row, &parent)| parent == row as i32 - 1);
                 if tree.tokens.first() != Some(&anchor_token)
-                    || !mtp12_tree_policy::validate(&tree.tokens, &tree.parents, &tree.depths, self.vocab)
+                    || !mtp12_tree_policy::validate(
+                        &tree.tokens,
+                        &tree.parents,
+                        &tree.depths,
+                        self.vocab,
+                    )
                     || (linear_topology == tree.branch_primary_step.is_some())
                 {
-                    return Err(BackendError::RuntimeShapeMismatch("assistant returned an invalid tree proposal".into()));
+                    return Err(BackendError::RuntimeShapeMismatch(
+                        "assistant returned an invalid tree proposal".into(),
+                    ));
                 }
                 crate::metal::Gemma4Mtp12ChainProposal {
-                    tokens: tree.tokens[1..].to_vec(), timing: tree.timing, ledger: tree.ledger,
+                    tokens: tree.tokens[1..].to_vec(),
+                    timing: tree.timing,
+                    ledger: tree.ledger,
                 }
             } else {
                 self.propose_mtp12_chain_ordered_q4(
-                    assistant, anchor_token, &pending_target_raw_hidden, position, draft_k,
+                    assistant,
+                    anchor_token,
+                    &pending_target_raw_hidden,
+                    position,
+                    draft_k,
                 )?
             };
             let assistant_call_us = assistant_started.elapsed().as_micros();
             if draft_proposal.tokens.len() != draft_k {
                 return Err(BackendError::RuntimeShapeMismatch(format!(
-                    "MTP assistant returned {} drafts for requested K={draft_k}", draft_proposal.tokens.len(),
+                    "MTP assistant returned {} drafts for requested K={draft_k}",
+                    draft_proposal.tokens.len(),
                 )));
             }
             let (candidates, padding_candidate_ids) = gemma4_mtp12_materialize_candidate_rows(
-                round_plan, anchor_token, &draft_proposal.tokens,
-            ).ok_or_else(|| BackendError::RuntimeShapeMismatch(
-                "MTP candidate materialization refused verifier widths or draft count".into(),
-            ))?;
-            let branched = tree_proposal.as_ref().is_some_and(|tree| tree.branch_primary_step.is_some());
+                round_plan,
+                anchor_token,
+                &draft_proposal.tokens,
+            )
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "MTP candidate materialization refused verifier widths or draft count".into(),
+                )
+            })?;
+            let branched = tree_proposal
+                .as_ref()
+                .is_some_and(|tree| tree.branch_primary_step.is_some());
             let verify_started = std::time::Instant::now();
             let target_batch = if branched {
                 let tree = tree_proposal.as_ref().expect("branched proposal");
                 self.verify_tree_greedy(&candidates, &tree.parents, &tree.depths, position)?
-            } else { self.verify_consecutive_greedy(&candidates, position)? };
+            } else {
+                self.verify_consecutive_greedy(&candidates, position)?
+            };
             let target_verify_us = verify_started.elapsed().as_micros();
-            let tree_decision = tree_proposal.as_ref().map(|tree| {
-                mtp12_tree_policy::accept(
-                    &candidates, &tree.parents, &tree.depths, &target_batch.greedy_ids, &stop_ids, self.vocab,
-                ).ok_or_else(|| {
-                    let _ = self.rollback_verifier_batch(target_batch.ticket);
-                    BackendError::RuntimeShapeMismatch("target tree acceptance contract failed".into())
+            let tree_decision = tree_proposal
+                .as_ref()
+                .map(|tree| {
+                    mtp12_tree_policy::accept(
+                        &candidates,
+                        &tree.parents,
+                        &tree.depths,
+                        &target_batch.greedy_ids,
+                        &stop_ids,
+                        self.vocab,
+                    )
+                    .ok_or_else(|| {
+                        let _ = self.rollback_verifier_batch(target_batch.ticket);
+                        BackendError::RuntimeShapeMismatch(
+                            "target tree acceptance contract failed".into(),
+                        )
+                    })
                 })
-            }).transpose()?;
+                .transpose()?;
             let decision = if branched {
                 let tree = tree_decision.as_ref().expect("branched target decision");
                 Gemma4Mtp12AcceptanceDecision {
@@ -10029,20 +10105,29 @@ impl Gemma4GpuRuntime {
                     committed_input_rows: tree.path.len(),
                     // Linear draft-index mismatch has no meaning on a branch.
                     mismatch_draft_index: None,
-                    stop_token: tree.stop_token, next_anchor_token: tree.next_anchor_token,
+                    stop_token: tree.stop_token,
+                    next_anchor_token: tree.next_anchor_token,
                 }
             } else {
                 (target_batch.greedy_ids.len() == physical_width)
                     .then(|| &target_batch.greedy_ids[..logical_width])
-                    .and_then(|target_ids| gemma4_mtp12_acceptance_decision(
-                        &draft_proposal.tokens, target_ids, &stop_ids,
-                    ))
+                    .and_then(|target_ids| {
+                        gemma4_mtp12_acceptance_decision(
+                            &draft_proposal.tokens,
+                            target_ids,
+                            &stop_ids,
+                        )
+                    })
                     .ok_or_else(|| {
                         let _ = self.rollback_verifier_batch(target_batch.ticket);
-                        BackendError::RuntimeShapeMismatch("MTP linear acceptance contract failed".into())
+                        BackendError::RuntimeShapeMismatch(
+                            "MTP linear acceptance contract failed".into(),
+                        )
                     })?
             };
-            let path = tree_decision.as_ref().map(|tree| tree.path.clone())
+            let path = tree_decision
+                .as_ref()
+                .map(|tree| tree.path.clone())
                 .unwrap_or_else(|| (0..decision.committed_input_rows).collect());
             let hidden_index = *path.last().expect("anchor always committed");
             let next_raw_hidden = target_batch.final_hidden.get(hidden_index).cloned();
@@ -10059,19 +10144,36 @@ impl Gemma4GpuRuntime {
             } else {
                 self.commit_verifier_prefix(target_batch.ticket, decision.committed_input_rows)?
             };
-            let compaction_us = if branched { compaction_started.elapsed().as_micros() } else { 0 };
-            let tree_receipt = tree_proposal.as_ref().map(|tree| Gemma4Mtp12TreeRoundReceipt {
-                parents: tree.parents.clone(), depths: tree.depths.clone(),
-                primary_rows: tree.primary_rows.clone(), branch_primary_step: tree.branch_primary_step,
-                fork_forwards: tree.fork_forwards.clone(),
-                primary_margins: tree.primary_margins, assistant_steps: tree.assistant_steps as usize,
-                forward_margins: tree.forward_margins.clone(), runner_up_ids: tree.runner_up_ids.clone(),
-                node_p: tree.node_p.clone(), policy: tree.policy.clone(), shape: tree.shape.clone(),
-                committed_path: path, mismatch_parent: tree_decision.as_ref().and_then(|d| d.mismatch_parent),
-                compaction_us,
-            });
-            if tree_proposal.is_some() { stats.tree_proposal_rounds += 1; }
-            if branched { stats.tree_branch_rounds += 1; }
+            let compaction_us = if branched {
+                compaction_started.elapsed().as_micros()
+            } else {
+                0
+            };
+            let tree_receipt = tree_proposal
+                .as_ref()
+                .map(|tree| Gemma4Mtp12TreeRoundReceipt {
+                    parents: tree.parents.clone(),
+                    depths: tree.depths.clone(),
+                    primary_rows: tree.primary_rows.clone(),
+                    branch_primary_step: tree.branch_primary_step,
+                    fork_forwards: tree.fork_forwards.clone(),
+                    primary_margins: tree.primary_margins,
+                    assistant_steps: tree.assistant_steps as usize,
+                    forward_margins: tree.forward_margins.clone(),
+                    runner_up_ids: tree.runner_up_ids.clone(),
+                    node_p: tree.node_p.clone(),
+                    policy: tree.policy.clone(),
+                    shape: tree.shape.clone(),
+                    committed_path: path,
+                    mismatch_parent: tree_decision.as_ref().and_then(|d| d.mismatch_parent),
+                    compaction_us,
+                });
+            if tree_proposal.is_some() {
+                stats.tree_proposal_rounds += 1;
+            }
+            if branched {
+                stats.tree_branch_rounds += 1;
+            }
             stats.tree_compaction_us = stats.tree_compaction_us.saturating_add(compaction_us);
             generated.extend_from_slice(&emitted_token_ids);
             if let Some(on_delta) = on_delta.as_mut() {

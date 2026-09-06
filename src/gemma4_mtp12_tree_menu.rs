@@ -607,14 +607,15 @@ pub(crate) fn finalize(
             }
             NodeSource::RunnerUp(forward) => {
                 if !top[forward].runner_up_valid {
-                    return Err(format!("tree finalize kept an invalid rank-two at {forward}"));
+                    return Err(format!(
+                        "tree finalize kept an invalid rank-two at {forward}"
+                    ));
                 }
                 tokens[row] = top[forward].runner_up_id;
                 let parent = layout.parents[row] as usize;
                 let margin = top[forward].margin;
-                node_p[row] = node_p[parent]
-                    * (1.0 - calib.p_accept(margin))
-                    * calib.q_runner_up(margin);
+                node_p[row] =
+                    node_p[parent] * (1.0 - calib.p_accept(margin)) * calib.q_runner_up(margin);
             }
         }
     }
@@ -745,8 +746,22 @@ mod tests {
             assert_eq!(parse_policy(Some(&text)).unwrap().name(), text);
         }
         for text in [
-            "", " ", "Legacy", "legacy ", " legacy", "DYN", "dynamic", "fixed", "fixed:",
-            "fixed:lin", "fixed:4+1+3", "fixed: 6+1", "fixed:6+1 ", "1", "0", "4+1+2",
+            "",
+            " ",
+            "Legacy",
+            "legacy ",
+            " legacy",
+            "DYN",
+            "dynamic",
+            "fixed",
+            "fixed:",
+            "fixed:lin",
+            "fixed:4+1+3",
+            "fixed: 6+1",
+            "fixed:6+1 ",
+            "1",
+            "0",
+            "4+1+2",
         ] {
             assert!(parse_policy(Some(text)).is_err(), "must reject {text:?}");
         }
@@ -759,9 +774,14 @@ mod tests {
             DEFAULT_LAMBDA.to_bits()
         );
         for (text, expected) in [("0", 0.0f32), ("0.08", 0.08), ("1", 1.0), ("2e-2", 0.02)] {
-            assert_eq!(parse_lambda(Some(text)).unwrap().to_bits(), expected.to_bits());
+            assert_eq!(
+                parse_lambda(Some(text)).unwrap().to_bits(),
+                expected.to_bits()
+            );
         }
-        for text in ["", " ", "-1", "-0.0", "NaN", "inf", "-inf", "0,08", "0.08 ", "x"] {
+        for text in [
+            "", " ", "-1", "-0.0", "NaN", "inf", "-inf", "0,08", "0.08 ", "x",
+        ] {
             assert!(parse_lambda(Some(text)).is_err(), "must reject {text:?}");
         }
         assert_eq!(parse_calibration(None).unwrap(), Calibration::default());
@@ -779,7 +799,10 @@ mod tests {
             "-1.079,1.346,-0.1,0.3,0.15,0.5,0.6,0.55,0.6,0.6",
             "NaN,1.346,0.4,0.3,0.15,0.5,0.6,0.55,0.6,0.6",
         ] {
-            assert!(parse_calibration(Some(text)).is_err(), "must reject {text:?}");
+            assert!(
+                parse_calibration(Some(text)).is_err(),
+                "must reject {text:?}"
+            );
         }
     }
 
@@ -871,7 +894,16 @@ mod tests {
             assert_eq!(l.parents, vec![-1, 0, 1, 2, 3, step as i32, 5, 6]);
             assert_eq!(
                 l.depths,
-                vec![0, 1, 2, 3, 4, step as u32 + 1, step as u32 + 2, step as u32 + 3]
+                vec![
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    step as u32 + 1,
+                    step as u32 + 2,
+                    step as u32 + 3
+                ]
             );
             assert_eq!(l.primary_rows, vec![0, 1, 2, 3, 4]);
         }
@@ -985,7 +1017,10 @@ mod tests {
                 for spec in &l.cb2 {
                     assert!(spec.query_step <= 6, "{shape} query step");
                     assert!(spec.input_slot < 16, "{shape} input slot");
-                    assert!(spec.recurrent_slot < spec.history_step, "{shape} recurrence");
+                    assert!(
+                        spec.recurrent_slot < spec.history_step,
+                        "{shape} recurrence"
+                    );
                     assert!(spec.history_step < 7, "{shape} history slot");
                 }
                 assert!(l.depths.iter().all(|depth| (*depth as usize) < NODES));
@@ -1040,7 +1075,17 @@ mod tests {
     #[test]
     fn tree_menu_finalize_holds_the_round_loop_invariants_over_a_margin_grid() {
         let calib = Calibration::default();
-        let grid = [0.0f32, 0.1, 0.5, 1.0, 2.0, 4.0, 10.0, f32::INFINITY, f32::NAN];
+        let grid = [
+            0.0f32,
+            0.1,
+            0.5,
+            1.0,
+            2.0,
+            4.0,
+            10.0,
+            f32::INFINITY,
+            f32::NAN,
+        ];
         let anchor = 5u32;
         let gated = gate_topologies();
         let mut seen_shapes = 0;
@@ -1113,12 +1158,14 @@ mod tests {
             for slot in 0..PRIMARY {
                 let mut round = top.clone();
                 round[slot] = bad;
-                let primary: [ForwardTop; PRIMARY] =
-                    std::array::from_fn(|i| round[i]);
+                let primary: [ForwardTop; PRIMARY] = std::array::from_fn(|i| round[i]);
                 let menu = Menu::new(&primary, calib);
                 assert!(menu.reach.iter().all(|p| p.is_finite()));
                 assert!(menu.alts.iter().all(|(_, value)| value.is_finite()));
-                assert!(menu.alts.iter().all(|(step, _)| *step != slot || slot >= ALT_STEPS));
+                assert!(menu
+                    .alts
+                    .iter()
+                    .all(|(step, _)| *step != slot || slot >= ALT_STEPS));
                 let shape = choose(Policy::Dyn, &menu, DEFAULT_LAMBDA);
                 let steps = menu.alt_steps(shape).unwrap();
                 let l = layout(shape, &steps).unwrap();
@@ -1148,7 +1195,14 @@ mod tests {
         assert_eq!(choose(Policy::Dyn, &menu, DEFAULT_LAMBDA), Shape::Lin7);
         for shape in Shape::ALL {
             let chosen = choose(Policy::Fixed(shape), &menu, DEFAULT_LAMBDA);
-            assert_eq!(chosen, if shape == Shape::Lin7 { shape } else { Shape::Lin7 });
+            assert_eq!(
+                chosen,
+                if shape == Shape::Lin7 {
+                    shape
+                } else {
+                    Shape::Lin7
+                }
+            );
         }
         // A finalize asked for an invalid sibling refuses instead of emitting
         // an out-of-vocabulary or duplicate-sibling tree.
@@ -1191,7 +1245,10 @@ mod tests {
         for shape in Shape::ALL {
             assert_eq!(choose(Policy::Fixed(shape), &shaky, DEFAULT_LAMBDA), shape);
         }
-        assert_eq!(choose(Policy::Legacy, &shaky, DEFAULT_LAMBDA), Shape::P4A1C2);
+        assert_eq!(
+            choose(Policy::Legacy, &shaky, DEFAULT_LAMBDA),
+            Shape::P4A1C2
+        );
         // The value of a shape never depends on the common four-node prefix.
         for shape in Shape::ALL {
             assert!(shaky.value(shape).unwrap().is_finite());
