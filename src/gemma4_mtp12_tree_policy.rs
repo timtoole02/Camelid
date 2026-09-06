@@ -91,7 +91,7 @@ pub(crate) fn accept(
         if let Some(child) = child {
             path.push(child);
         } else {
-            let has_children = parents.iter().any(|&p| p == parent as i32);
+            let has_children = parents.contains(&(parent as i32));
             return Some(Decision {
                 path,
                 stop_token: None,

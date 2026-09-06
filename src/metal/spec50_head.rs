@@ -1159,9 +1159,8 @@ pub(crate) struct Spec50HeadKernels {
 
 /// One compiled pipeline set per geometry, kept for the life of the process
 /// (a failed compile is remembered too, so the diagnostic prints once).
-static SPEC50_HEAD_KERNELS: OnceLock<
-    Mutex<Vec<(Spec50Geometry, Option<&'static Spec50HeadKernels>)>>,
-> = OnceLock::new();
+type Spec50HeadKernelCache = Mutex<Vec<(Spec50Geometry, Option<&'static Spec50HeadKernels>)>>;
+static SPEC50_HEAD_KERNELS: OnceLock<Spec50HeadKernelCache> = OnceLock::new();
 
 /// The pipelines for a head of `hidden` width (see
 /// [`spec50_selected_geometry_for`]). This is the production accessor.
@@ -1525,9 +1524,8 @@ pub(crate) fn spec50_head_form() -> Spec50HeadForm {
 /// failed compile is remembered too, so the diagnostic prints once). The base
 /// form is delegated to [`spec50_mma_head_kernels`] so the established lane
 /// keeps its own single `OnceLock` and its unprefixed source.
-static SPEC50_MMA_FORM_KERNELS: OnceLock<
-    Mutex<Vec<(Spec50HeadForm, Option<&'static Spec50MmaHeadKernels>)>>,
-> = OnceLock::new();
+type Spec50MmaKernelCache = Mutex<Vec<(Spec50HeadForm, Option<&'static Spec50MmaHeadKernels>)>>;
+static SPEC50_MMA_FORM_KERNELS: OnceLock<Spec50MmaKernelCache> = OnceLock::new();
 
 fn spec50_mma_head_kernels_for(form: Spec50HeadForm) -> Option<&'static Spec50MmaHeadKernels> {
     if form == SPEC50_FORM_BASE {

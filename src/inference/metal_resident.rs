@@ -633,11 +633,7 @@ impl super::LlamaInferenceSession {
             )));
         }
         let mut layer_inputs = Vec::with_capacity(prefix_inputs.len());
-        for (slot, (mut prefix, last)) in prefix_inputs
-            .drain(..)
-            .zip(last_inputs.into_iter())
-            .enumerate()
-        {
+        for (slot, (mut prefix, last)) in prefix_inputs.drain(..).zip(last_inputs).enumerate() {
             let expected_prefix = prefix_len * dims.embedding_length;
             if prefix.len() != expected_prefix || last.len() != dims.embedding_length {
                 return Err(BackendError::RuntimeShapeMismatch(format!(

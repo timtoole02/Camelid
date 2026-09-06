@@ -11081,6 +11081,7 @@ async fn gemma4_prompt_token_count(
 /// Effective output budget for an MTP12 request. `max_tokens` is an upper bound,
 /// so an over-budget limit is clamped to the room left rather than rejected;
 /// only a prompt that fills the resident window is an error.
+#[allow(clippy::result_large_err)] // Err is the shared axum Response type used by every handler
 fn clamp_gemma4_mtp12_request_context(
     runtime: &Gemma4ServeRuntime,
     prompt_tokens: usize,
@@ -11207,6 +11208,7 @@ fn validate_target_verified_segmented_render_request_shape(
     Ok(Some(total_tokens))
 }
 
+#[allow(clippy::result_large_err)] // Err is the shared axum Response type used by every handler
 fn validate_target_verified_render_request(
     req: &ChatCompletionRequest,
 ) -> std::result::Result<Option<usize>, Response> {
@@ -20354,9 +20356,7 @@ async fn prepare_generation(
             None
         }
         Some(SpecDecodeMode::Suffix) => Some(PreparedSpeculative {
-            drafter: SpeculativeDrafter::Suffix(Box::new(
-                crate::inference::suffix_decoding::SuffixDecodingDrafter::default(),
-            )),
+            drafter: SpeculativeDrafter::Suffix(Box::default()),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,

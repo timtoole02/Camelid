@@ -785,7 +785,7 @@ mod tests {
         let mut row_partials = Vec::new();
 
         if batched {
-            batch_scratch = Some(encode_batch(&encoder, &q, &k, &v, &output, plan)?);
+            batch_scratch = Some(encode_batch(encoder, &q, &k, &v, &output, plan)?);
         } else {
             let head_dim = plan.kind.head_dim();
             for row in 0..plan.rows.len() {

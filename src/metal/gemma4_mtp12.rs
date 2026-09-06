@@ -2914,7 +2914,7 @@ kernel void mtp12_argmax_merge(
 const MTP12_ARGMAX_CHUNK: usize = 1024;
 
 /// Partial slots the assistant scratch reserves for the chunked argmax.
-const MTP12_ARGMAX_MAX_PARTIALS: usize = (VOCAB + MTP12_ARGMAX_CHUNK - 1) / MTP12_ARGMAX_CHUNK;
+const MTP12_ARGMAX_MAX_PARTIALS: usize = VOCAB.div_ceil(MTP12_ARGMAX_CHUNK);
 
 /// `CAMELID_GEMMA4_MTP12_ARGMAX_LEGACY=1` restores the single-threadgroup
 /// `mtp12_argmax` scan (an A/B control).  The chunked form is the default
@@ -2962,9 +2962,9 @@ struct Mtp12FuseFlags {
     /// rows per simdgroup) for cols <= 1024 with the established kernel for
     /// wider rows, `3` = staged for every shape.  Levels `4` and `5` select
     /// `mtp12_q4_0_gemv_split` with two and four simdgroups per row: those two
-    /// fold each row in a different order and are therefore NOT bit-identical
-    /// - they are a measurement lane only, and enabling them changes the
-    /// drafts and invalidates the acceptance rate.
+    /// fold each row in a different order and are therefore NOT bit-identical:
+    /// they are a measurement lane only, and enabling them changes the drafts
+    /// and invalidates the acceptance rate.
     gemv_x4: u8,
     /// `CAMELID_GEMMA4_MTP12_GEMV_STAGED_ROWS` (1..=64, default 4): rows each
     /// simdgroup of `mtp12_q4_0_gemv_staged` walks.
@@ -4762,6 +4762,7 @@ impl Gemma4Mtp12AssistantMetal {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // one argument per bound device view / position
     pub fn propose_chain_device_resident(
         &mut self,
         anchor_token: u32,
@@ -6119,7 +6120,7 @@ fn mtp12_attention_v2_enabled() -> bool {
 /// Geometry the V2 kernels cover: the staged query fits threadgroup memory and the
 /// context grid's 128-dim blocks tile the head exactly (both 12B head shapes qualify).
 fn mtp12_attention_v2_covers(head_dim: usize) -> bool {
-    head_dim % 128 == 0 && head_dim <= 512
+    head_dim.is_multiple_of(128) && head_dim <= 512
 }
 
 const MTP12_ATTN_FORM_ENV: &str = "CAMELID_GEMMA4_MTP12_ATTN_FORM";
@@ -6239,10 +6240,10 @@ impl Mtp12ContextForm {
         let group = N_HEADS / kv_heads;
         mtp12_attention_v2_covers(head_dim)
             && kv_heads > 0
-            && N_HEADS % kv_heads == 0
-            && group % pairs == 0
-            && N_HEADS % pairs == 0
-            && head_dim % (32 * lane_dims) == 0
+            && N_HEADS.is_multiple_of(kv_heads)
+            && group.is_multiple_of(pairs)
+            && N_HEADS.is_multiple_of(pairs)
+            && head_dim.is_multiple_of(32 * lane_dims)
     }
 }
 
@@ -6304,9 +6305,9 @@ impl Mtp12ScoresForm {
         let group = N_HEADS / kv_heads;
         mtp12_attention_v2_covers(head_dim)
             && kv_heads > 0
-            && N_HEADS % kv_heads == 0
-            && group % pairs == 0
-            && N_HEADS % pairs == 0
+            && N_HEADS.is_multiple_of(kv_heads)
+            && group.is_multiple_of(pairs)
+            && N_HEADS.is_multiple_of(pairs)
     }
 }
 
@@ -9377,7 +9378,7 @@ mod tests {
                 .map(|v| round_bf16_cpu(1.0 + v * 0.25))
                 .collect()
         };
-        for (case, scale) in [None, Some(0.707_106_8f32), Some(1.0), Some(-1.5), Some(0.0)]
+        for (case, scale) in [None, Some(0.703_125f32), Some(1.0), Some(-1.5), Some(0.0)]
             .into_iter()
             .enumerate()
         {

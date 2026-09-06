@@ -842,11 +842,9 @@ static METAL_LINEAR_KERNEL: OnceLock<Option<MetalLinearKernel>> = OnceLock::new(
 #[cfg(target_os = "macos")]
 static METAL_LINEAR_CACHE: OnceLock<Mutex<MetalLinearCache>> = OnceLock::new();
 #[cfg(target_os = "macos")]
-mod spec50_head;
-#[cfg(target_os = "macos")]
-pub(crate) use spec50_head::*;
-#[cfg(target_os = "macos")]
 mod gemma4_tree;
+#[cfg(target_os = "macos")]
+mod spec50_head;
 #[cfg(target_os = "macos")]
 pub(crate) use gemma4_tree::Gemma4DenseTreePlan;
 
@@ -16778,6 +16776,7 @@ pub fn try_gemma4_q4_0_matmul_f32y(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // native-sidecar matmul entry point kept beside the wire variant
 fn try_gemma4_q4_0_matmul_f32y_native(
     y: &[f32],
     weight_wire: &[u8],
@@ -17223,6 +17222,7 @@ struct Gemma4DenseAttentionRowsV2Variant {
 impl Gemma4DenseAttentionRowsV2Variant {
     const SCORES_FORMS: u8 = 3;
     const CONTEXT_FORMS: u8 = 4;
+    #[cfg_attr(not(test), allow(dead_code))] // named form used by the variant-matrix tests
     const NEST: Self = Self {
         scores: 1,
         context: 0,
@@ -17236,6 +17236,7 @@ impl Gemma4DenseAttentionRowsV2Variant {
         context: 0,
     };
 
+    #[cfg_attr(not(test), allow(dead_code))] // enumerated by the variant-matrix tests
     fn all() -> impl Iterator<Item = Self> {
         (0..Self::SCORES_FORMS).flat_map(|scores| {
             (0..Self::CONTEXT_FORMS).map(move |context| Self { scores, context })
@@ -19895,6 +19896,7 @@ impl Gemma4Q6KHead {
     /// Split one admitted verifier width into exact SPEC50 head calls. SPEC50
     /// has separately-qualified K=1/2/4/8 kernels; W16 deliberately bootstraps
     /// as two ordered K8 calls instead of introducing new head arithmetic.
+    #[allow(clippy::single_range_in_vec_init)] // K<=8 is deliberately one chunk; K=16 is two
     fn gemma4_spec50_head_chunk_ranges(columns: usize) -> Option<Vec<std::ops::Range<usize>>> {
         match columns {
             1 | 2 | 4 | 8 => Some(vec![0..columns]),
@@ -19911,6 +19913,7 @@ impl Gemma4Q6KHead {
     /// This API is deliberately separate from
     /// [`Self::forward`]: the established ordered full-logit path remains the
     /// default until whole-model token parity admits this lane.
+    #[allow(clippy::single_range_in_vec_init)] // the dual-K16 head is deliberately one 0..16 chunk
     pub(crate) fn forward_argmax_spec50_batch(&self, hidden_rows: &[f32]) -> Option<Vec<u32>> {
         let call_started = std::time::Instant::now();
         let timing_enabled = gemma4_metal_head_timing_enabled();
@@ -20078,6 +20081,7 @@ impl Gemma4Q6KHead {
     /// This is the target-embedding seam used by the Gemma 4 12B MTP assistant.
     /// `row_bytes` is `hidden / 256 * 210` (3,150 bytes for the 3,840-wide
     /// target), and `row_offset` is relative to the beginning of `buffer`.
+    #[allow(dead_code)] // scoped Q6_K row view kept beside the full-table scope
     pub(crate) fn with_selected_row_device<R>(
         &self,
         token: u32,
@@ -22650,7 +22654,7 @@ fn try_gemma4_dense_attention_rows_for_test(
         n_heads,
     )?;
     if n_kv_heads == 0
-        || n_heads % n_kv_heads != 0
+        || !n_heads.is_multiple_of(n_kv_heads)
         || query.len() != rows.checked_mul(q_dim)?
         || keys.len() != cache_elements
         || values.len() != cache_elements
@@ -22785,7 +22789,7 @@ fn try_gemma4_dense_attention_rows_v2_for_test(
         n_heads,
     )?;
     if n_kv_heads == 0
-        || n_heads % n_kv_heads != 0
+        || !n_heads.is_multiple_of(n_kv_heads)
         || query.len() != rows.checked_mul(q_dim)?
         || keys.len() != cache_elements
         || values.len() != cache_elements
@@ -25613,6 +25617,7 @@ fn encode_gemma4_q8_matmul(
 /// unpacks nibbles inline). `scalar` holds blocks_per_row at offset 0 and rows
 /// at offset 4, exactly as the Q8 path.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)] // one argument per bound Metal buffer
 fn encode_gemma4_q4_0_matmul(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
@@ -26914,6 +26919,7 @@ pub(crate) fn encode_gemma4_q4_0_q8_ordered_columns(
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::if_same_then_else)] // each arm ENCODES a different kernel in its condition; the bodies are just the success flag
 fn encode_gemma4_q4_0_q8_ordered_columns_with_layout(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
@@ -31241,7 +31247,7 @@ fn encode_gemma4_dense_attention_rows_f32(
     };
     if n_kv_heads == 0
         || group == 0
-        || n_heads % n_kv_heads != 0
+        || !n_heads.is_multiple_of(n_kv_heads)
         || head_dim == 0
         || !scale.is_finite()
         || query.length() < query_bytes as u64
@@ -31409,10 +31415,10 @@ fn encode_gemma4_dense_attention_rows_v2_f32(
         .unwrap_or(0);
     if n_kv_heads == 0
         || group == 0
-        || n_heads % n_kv_heads != 0
+        || !n_heads.is_multiple_of(n_kv_heads)
         || head_dim == 0
-        || head_dim % 4 != 0
-        || (context_pairs != 0 && head_dim % context_span != 0)
+        || !head_dim.is_multiple_of(4)
+        || (context_pairs != 0 && !head_dim.is_multiple_of(context_span))
         || union_end <= union_start
         || max_count == 0
         || !scale.is_finite()
@@ -43462,6 +43468,7 @@ impl ResidentDecodeState {
     const MAX_VERIFY_K: usize = 16;
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)] // (ids, hidden, captures) is the verifier batch payload
     fn verify_batch_inner(
         &mut self,
         embeddings: &[f32],
@@ -45639,6 +45646,7 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 mod tests {
     #[cfg(target_os = "macos")]
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one chunk covering the whole batch
     fn gemma4_w16_spec50_head_is_two_ordered_k8_chunks() {
         use super::Gemma4Q6KHead;
 
@@ -45838,7 +45846,7 @@ mod tests {
                 ] {
                     encode_rms_norm_per_head(
                         encoder,
-                        &kernel,
+                        kernel,
                         &input,
                         norm,
                         output,
@@ -52900,12 +52908,12 @@ mod tests {
 
             for columns in [1usize, 2, 4, 8, 16] {
                 let refs: Vec<&[Q8_0Block]> = inputs[..columns].iter().map(Vec::as_slice).collect();
-                let fixture = native_v2_fixture(&kernel, &refs, &wire, rows, blocks_per_row);
+                let fixture = native_v2_fixture(kernel, &refs, &wire, rows, blocks_per_row);
                 let output_bytes = (columns * rows * std::mem::size_of::<f32>()) as u64;
                 let control_buf = kernel
                     .device
                     .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
-                native_v2_run(&kernel, &fixture, None, &control_buf);
+                native_v2_run(kernel, &fixture, None, &control_buf);
                 let mut control = vec![0.0f32; columns * rows];
                 read_buffer_f32(&control_buf, &mut control);
                 for (column, input) in refs.iter().enumerate() {
@@ -52929,7 +52937,7 @@ mod tests {
                     for simdgroups in [1usize, 4] {
                         write_buffer_f32(&output_buf, &poison);
                         let before = gemma4_q4_column_dispatch_counts();
-                        native_v2_run(&kernel, &fixture, Some((v2, simdgroups)), &output_buf);
+                        native_v2_run(kernel, &fixture, Some((v2, simdgroups)), &output_buf);
                         let after = gemma4_q4_column_dispatch_counts();
                         let deltas = [
                             after.k1 - before.k1,
@@ -53040,7 +53048,7 @@ mod tests {
 
             for columns in [8usize, 16] {
                 let refs: Vec<&[Q8_0Block]> = inputs[..columns].iter().map(Vec::as_slice).collect();
-                let fixture = native_v2_fixture(&kernel, &refs, &wire, rows, blocks_per_row);
+                let fixture = native_v2_fixture(kernel, &refs, &wire, rows, blocks_per_row);
                 let output_bytes = (columns * rows * std::mem::size_of::<f32>()) as u64;
                 let control_buf = kernel
                     .device
@@ -53049,7 +53057,7 @@ mod tests {
                     .device
                     .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
                 for _ in 0..2 {
-                    native_v2_run(&kernel, &fixture, None, &control_buf);
+                    native_v2_run(kernel, &fixture, None, &control_buf);
                 }
                 let mut control = vec![0.0f32; columns * rows];
                 read_buffer_f32(&control_buf, &mut control);
@@ -53057,7 +53065,7 @@ mod tests {
                 let mut got = vec![0.0f32; columns * rows];
                 for &(v2, simdgroups) in &arms {
                     write_buffer_f32(&output_buf, &poison);
-                    native_v2_run(&kernel, &fixture, Some((v2, simdgroups)), &output_buf);
+                    native_v2_run(kernel, &fixture, Some((v2, simdgroups)), &output_buf);
                     read_buffer_f32(&output_buf, &mut got);
                     for (index, (&value, &expected)) in got.iter().zip(&control).enumerate() {
                         assert_eq!(
@@ -53076,11 +53084,11 @@ mod tests {
                     for step in 0..order {
                         let slot = (step + repeat) % order;
                         if slot == 0 {
-                            control_us.push(native_v2_run(&kernel, &fixture, None, &control_buf));
+                            control_us.push(native_v2_run(kernel, &fixture, None, &control_buf));
                         } else {
                             let (v2, simdgroups) = arms[slot - 1];
                             arm_us[slot - 1].push(native_v2_run(
-                                &kernel,
+                                kernel,
                                 &fixture,
                                 Some((v2, simdgroups)),
                                 &output_buf,
@@ -58842,6 +58850,7 @@ mod tests {
     /// shape whose cache retains poisoned rejected slots beyond the visible end.
     #[cfg(target_os = "macos")]
     #[test]
+    #[allow(clippy::type_complexity)] // test fixture tuple
     fn metal_gemma4_dense_attention_rows_is_bit_exact_and_causal() {
         if !detect_metal_device().available {
             return;
@@ -58927,6 +58936,7 @@ mod tests {
     /// Sliding cases straddle the window edge (base 1020) and sit fully inside it
     /// (base 1500); global cases grow past 1k so every lane stride is exercised.
     #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)] // the tuple IS the documented case table above
     fn gemma4_dense_attention_v2_cases() -> Vec<(
         &'static str,
         usize,

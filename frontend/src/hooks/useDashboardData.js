@@ -1466,8 +1466,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let firstContentEmitted = false
       let firstTokenAt = null
       let decodeStartTokens = 0
-      let liveWindowStartedAt = null
-      let liveWindowStartTokens = 0
       let latestNativeSegmentRate = null
       let lastProgressAt = 0
       // The private, prepared research lane completes independently verified
@@ -1772,8 +1770,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
           firstContentEmitted = true
           emitFirstContent(lifecycleId, liveElapsedMs)
         }
-        const decodedTokens = liveWindowStartedAt === null ? 0 : Math.max(0, realTokens - liveWindowStartTokens)
-        const decodeElapsedMs = liveWindowStartedAt === null ? 0 : now - liveWindowStartedAt
+        // The decode window opens at the first GENERATED token, never at request
+        // start, so public-web research and model TTFT cannot dilute this rate.
+        const decodedTokens = firstTokenAt === null ? 0 : Math.max(0, realTokens - decodeStartTokens)
+        const decodeElapsedMs = firstTokenAt === null ? 0 : now - firstTokenAt
         // This live value is a browser-observed delivery rate computed from
         // real SSE token arrivals. The backend's native target-verifier clock
         // replaces it after each verified segment and in terminal diagnostics.
@@ -1846,8 +1846,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
             // Start a new browser-arrival window for the next independently
             // verified section. The completed section's backend-native rate is
             // surfaced alongside it and is never confused with this clock.
-            liveWindowStartedAt = null
-            liveWindowStartTokens = Number(event.completionTokens) || 0
             if (!segmentedPacingReady && completedVerifiedSegments >= 2) {
               segmentedPacingReady = true
               const initialContent = paceFirstVisiblePrefix(
@@ -1880,10 +1878,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
             if (firstTokenAt === null) {
               firstTokenAt = performance.now()
               decodeStartTokens = Number(event.completionTokens) || 0
-            }
-            if (liveWindowStartedAt === null) {
-              liveWindowStartedAt = performance.now()
-              liveWindowStartTokens = Number(event.completionTokens) || 0
             }
           }
           if (event.type === 'bytes' || event.type === 'role' || event.type === 'json_fallback') {

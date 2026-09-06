@@ -7240,6 +7240,7 @@ impl Gemma4Mtp12WidthScheduler {
         Some(scheduler)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // read by the width-scheduler tests
     fn state(&self) -> Gemma4Mtp12WidthScheduleState {
         self.state
     }
@@ -8491,6 +8492,9 @@ mod gemma4_mtp12_metal_generation_tests {
 }
 
 #[cfg(target_os = "macos")]
+/// One cached rotary table: (head_dim, theta bits, has rope factors, cos, sin).
+type RotaryTableEntry = (usize, u32, bool, Vec<f32>, Vec<f32>);
+
 impl Gemma4GpuRuntime {
     /// Load the model with the Q8 layer weights resident on the GPU. `max_positions`
     /// is the KV-cache capacity (must cover prompt + generated tokens).
@@ -8983,7 +8987,7 @@ impl Gemma4GpuRuntime {
         // Layers sharing a rotary configuration use identical tables at this
         // position. Compute the original expressions once for each configuration
         // instead of repeating powf/sin_cos across all 48 layers.
-        let mut rotary_tables: Vec<(usize, u32, bool, Vec<f32>, Vec<f32>)> = Vec::new();
+        let mut rotary_tables: Vec<RotaryTableEntry> = Vec::new();
         for layer in 0..self.n_layers {
             let head_dim = self.g.head_dim_at(layer) as usize;
             let theta = self.g.rope_freq_base_at(layer);
@@ -10158,7 +10162,7 @@ impl Gemma4GpuRuntime {
                     branch_primary_step: tree.branch_primary_step,
                     fork_forwards: tree.fork_forwards.clone(),
                     primary_margins: tree.primary_margins,
-                    assistant_steps: tree.assistant_steps as usize,
+                    assistant_steps: tree.assistant_steps,
                     forward_margins: tree.forward_margins.clone(),
                     runner_up_ids: tree.runner_up_ids.clone(),
                     node_p: tree.node_p.clone(),
@@ -10312,6 +10316,7 @@ impl Gemma4GpuRuntime {
     }
 
     /// Scoped no-copy target embedding row for the MTP assistant.
+    #[allow(dead_code)] // scoped device-view API kept beside with_target_kv_device_views
     pub(crate) fn with_q6k_embedding_row_device<R>(
         &self,
         token: u32,
@@ -10323,6 +10328,7 @@ impl Gemma4GpuRuntime {
     }
 
     /// Scoped f32 target KV views (notably layers 46 and 47 for MTP-12).
+    #[allow(dead_code)] // scoped device-view API kept beside with_q6k_embedding_row_device
     pub(crate) fn with_target_kv_device_views<R>(
         &self,
         source_layers: &[usize],

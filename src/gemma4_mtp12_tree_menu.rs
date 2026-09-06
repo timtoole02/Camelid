@@ -655,6 +655,7 @@ pub(crate) fn finalize(
 /// Every distinct non-linear topology the runtime can emit under any policy
 /// value, including today's legacy fork steps. The model-level bit-exactness
 /// gate iterates this so the gated set equals the emittable set.
+#[cfg(test)]
 pub(crate) fn gate_topologies() -> Vec<(Vec<i32>, Vec<u32>)> {
     let mut out: Vec<(Vec<i32>, Vec<u32>)> = Vec::new();
     let mut push = |parents: Vec<i32>, depths: Vec<u32>| {
@@ -697,6 +698,7 @@ pub(crate) fn gate_topologies() -> Vec<(Vec<i32>, Vec<u32>)> {
 }
 
 /// Ascending `k`-subsets of the eligible fork steps.
+#[cfg(test)]
 pub(crate) fn alt_step_sets(k: usize) -> Vec<Vec<usize>> {
     let mut out = vec![Vec::new()];
     for _ in 0..k {

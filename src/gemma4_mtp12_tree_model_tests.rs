@@ -366,6 +366,7 @@ enum GlueCase {
 /// argmax ids, every SPEC50 logit and the 48-layer K/V bits of the rows the
 /// call wrote. The batch is rolled back so every run starts from the same
 /// committed prefix.
+#[allow(clippy::type_complexity)] // the tuple is the full per-case comparison payload
 fn glue_observe(
     runtime: &Gemma4GpuRuntime,
     tokens: &[u32],

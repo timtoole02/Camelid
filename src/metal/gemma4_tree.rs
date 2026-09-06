@@ -37,6 +37,7 @@ impl Gemma4DenseTreePlan {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // accessor kept beside depths(); used by the tree tests
     pub(crate) fn parents(&self) -> &[i32] {
         &self.parents
     }
@@ -691,7 +692,7 @@ fn encode_tree_attention_inner(
     u32::try_from(kv_elements).ok()?;
     u32::try_from(q_elements).ok()?;
     if group == 0
-        || n_heads % n_kv_heads != 0
+        || !n_heads.is_multiple_of(n_kv_heads)
         || !matches!(head_dim, 256 | 512)
         || !scale.is_finite()
         || query.length() < q_elements.checked_mul(4)? as u64
@@ -850,6 +851,29 @@ pub(super) fn fork_plan(step: usize) -> Gemma4DenseTreePlan {
         ],
     )
     .unwrap()
+}
+
+// Append to src/metal/gemma4_tree.rs. Test-only readback of already completed
+// SPEC50 output; no additional projection or production behavior.
+#[cfg(test)]
+impl Gemma4Q6KHead {
+    pub(crate) fn tree_test_last_spec50_logits(&self, columns: usize) -> Option<Vec<f32>> {
+        if !matches!(columns, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let state = self.inner.lock().ok()?;
+        if state.last_spec50_timing.columns != columns as u32 {
+            return None;
+        }
+        let batch = state.batch.as_ref()?;
+        let elements = columns.checked_mul(state.vocab)?;
+        if batch.logits.length() < elements.checked_mul(4)? as u64 {
+            return None;
+        }
+        let mut logits = vec![0.0; elements];
+        read_buffer_f32(&batch.logits, &mut logits);
+        Some(logits)
+    }
 }
 
 #[cfg(test)]
@@ -1267,9 +1291,9 @@ mod tests {
                                             svi_fma = (score * value).mul_add(inv, svi_fma);
                                             siv_fma = (score * inv).mul_add(value, siv_fma);
                                             vis_fma = (value * inv).mul_add(score, vis_fma);
-                                            unfused = unfused + ((score * inv) * value);
+                                            unfused += (score * inv) * value;
                                             dot_fma = score.mul_add(value, dot_fma);
-                                            dot_unfused = dot_unfused + score * value;
+                                            dot_unfused += score * value;
                                         }
                                         for (name, value) in [
                                             ("fma(score*value,inv,acc)", svi_fma),
@@ -1365,28 +1389,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-// Append to src/metal/gemma4_tree.rs. Test-only readback of already completed
-// SPEC50 output; no additional projection or production behavior.
-#[cfg(test)]
-impl Gemma4Q6KHead {
-    pub(crate) fn tree_test_last_spec50_logits(&self, columns: usize) -> Option<Vec<f32>> {
-        if !matches!(columns, 1 | 2 | 4 | 8) {
-            return None;
-        }
-        let state = self.inner.lock().ok()?;
-        if state.last_spec50_timing.columns != columns as u32 {
-            return None;
-        }
-        let batch = state.batch.as_ref()?;
-        let elements = columns.checked_mul(state.vocab)?;
-        if batch.logits.length() < elements.checked_mul(4)? as u64 {
-            return None;
-        }
-        let mut logits = vec![0.0; elements];
-        read_buffer_f32(&batch.logits, &mut logits);
-        Some(logits)
     }
 }

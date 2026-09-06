@@ -5756,13 +5756,17 @@ async fn main() -> anyhow::Result<()> {
                     let mut reference_ids = Vec::with_capacity(committed + rejected_tail_width);
                     let mut reference_hidden_bits =
                         Vec::with_capacity((committed + rejected_tail_width).saturating_mul(3_840));
-                    let mut reference_position = reference_prefill.prompt_token_count;
+                    // The replay cursor advances by one committed position per
+                    // token, so it is state carried across iterations, not a
+                    // loop bound. `Cell` keeps that explicit for clippy.
+                    let reference_position =
+                        std::cell::Cell::new(reference_prefill.prompt_token_count);
                     for &token in tail_a[..committed].iter().chain(&tail_b) {
                         let (prediction, hidden) =
-                            runtime.forward_greedy_ordered_q4(token, reference_position)?;
+                            runtime.forward_greedy_ordered_q4(token, reference_position.get())?;
                         reference_ids.push(prediction);
                         reference_hidden_bits.extend(hidden.iter().map(|value| value.to_bits()));
-                        reference_position += 1;
+                        reference_position.set(reference_position.get() + 1);
                     }
 
                     let mut experiment_ids = a_ids[..committed].to_vec();
@@ -9553,9 +9557,7 @@ fn run_bench_speculative(
             // Suffix drafting flattened to a chain: fills the verify window the
             // n-gram drafter leaves mostly empty, without paying the tree
             // verify's per-round cost.
-            "suffix" => Ok(SpeculativeDrafter::Suffix(Box::new(
-                camelid::inference::suffix_decoding::SuffixDecodingDrafter::default(),
-            ))),
+            "suffix" => Ok(SpeculativeDrafter::Suffix(Box::default())),
             "draft" => {
                 let path = draft_model.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--drafter draft requires --draft-model <gguf>")
@@ -9934,6 +9936,7 @@ fn run_plain_resident_greedy(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // one argument per benchmark knob
 fn run_eagle3_resident_greedy(
     config: &LlamaModelConfig,
     weights: &Arc<LlamaLoadedWeights>,

@@ -1,132 +1,6 @@
 //! Bounded W8 target tree integration. The ordinary linear path is unchanged.
 use super::*;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tree_round_gate_preserves_budget_tail_and_checks_physical_capacity() {
-        for (remaining, capacity, expected) in
-            [(8, 8, false), (9, 8, true), (8, 7, false), (9, 7, false)]
-        {
-            let schedule = Gemma4Mtp12WidthScheduler::new_w8_padded_tail(8).unwrap();
-            let plan = schedule
-                .plan_round_with_capacity(remaining, capacity)
-                .unwrap();
-            assert_eq!(
-                mtp12_tree_policy::round_eligible(
-                    plan.logical_verify_width,
-                    plan.physical_verify_width,
-                    529,
-                    529 + capacity,
-                ),
-                expected,
-                "remaining={remaining} physical_capacity={capacity}"
-            );
-        }
-        assert!(!mtp12_tree_policy::round_eligible(
-            8,
-            8,
-            usize::MAX - 7,
-            usize::MAX
-        ));
-        assert!(!mtp12_tree_policy::round_eligible(7, 8, 529, 2048));
-        assert!(!mtp12_tree_policy::round_eligible(8, 16, 529, 2048));
-    }
-
-    fn pending_tree(state: &mut Gemma4DenseVerifierState) -> Gemma4PendingVerifierBatch {
-        let ticket = state.record_completed_batch(128, 8).unwrap();
-        let pending = state.pending.as_mut().unwrap();
-        pending.tree_parents = Some([-1, 0, 1, 2, 3, 1, 5, 6]);
-        assert_eq!(pending.ticket, ticket);
-        *pending
-    }
-
-    #[test]
-    fn tree_ticket_rejects_wrong_consumers_and_supports_abort() {
-        let mut state = Gemma4DenseVerifierState {
-            lane: Gemma4DenseSequenceLane::OrderedVerifier,
-            logical_len: 128,
-            next_ticket: 7,
-            pending: None,
-        };
-        let pending = pending_tree(&mut state);
-        for rows in 1..=8 {
-            assert!(!pending.permits_linear_commit(pending.ticket, rows));
-        }
-        assert!(!pending.permits_linear_commit(pending.ticket + 1, 0));
-        for path in [
-            &[][..],
-            &[1][..],
-            &[0, 5][..],
-            &[0, 1, 1][..],
-            &[0, 1, 8][..],
-        ] {
-            assert!(!pending.permits_tree_path(pending.ticket, path));
-            assert_eq!(state.logical_len, 128);
-            assert_eq!(state.pending, Some(pending));
-        }
-        assert!(!pending.permits_tree_path(pending.ticket + 1, &[0, 1, 5]));
-        assert!(pending.permits_linear_commit(pending.ticket, 0));
-        assert_eq!(state.resolve_prefix(pending.ticket, 0), Some(128));
-        assert_eq!(state.resolve_prefix(pending.ticket, 0), None);
-        let linear = state.record_completed_batch(128, 4).unwrap();
-        assert!(state.pending.unwrap().permits_linear_commit(linear, 3));
-        assert!(!state.pending.unwrap().permits_tree_path(linear, &[0, 1, 2]));
-        assert_eq!(state.resolve_prefix(linear, 3), Some(131));
-    }
-
-    #[test]
-    fn compacted_path_advances_by_count_and_selects_physical_leaf_hidden() {
-        let mut state = Gemma4DenseVerifierState {
-            lane: Gemma4DenseSequenceLane::OrderedVerifier,
-            logical_len: 128,
-            next_ticket: 1,
-            pending: None,
-        };
-        let pending = pending_tree(&mut state);
-        let path = [0, 1, 5, 6, 7];
-        assert!(pending.permits_tree_path(pending.ticket, &path));
-        let hidden = (0..8).map(|i| vec![i as f32; 4]).collect::<Vec<_>>();
-        assert_eq!(hidden[*path.last().unwrap()], [7.0; 4]);
-        // Runtime invokes this resolution only after successful GPU compaction.
-        assert_eq!(state.resolve_prefix(pending.ticket, path.len()), Some(133));
-        assert_eq!(state.logical_len, 133);
-        assert!(state.pending.is_none());
-    }
-
-    #[test]
-    fn no_branch_acceptance_matches_linear_for_every_rejection_and_stop() {
-        let tokens = [10, 11, 12, 13, 14, 15, 16, 17];
-        let parents = [-1, 0, 1, 2, 3, 4, 5, 6];
-        let depths = [0, 1, 2, 3, 4, 5, 6, 7];
-        for mismatch_at in 0..=8 {
-            for stop_at in 0..=8 {
-                let mut target = [11, 12, 13, 14, 15, 16, 17, 18];
-                if mismatch_at < 8 {
-                    target[mismatch_at] = 98;
-                }
-                if stop_at < 8 {
-                    target[stop_at] = 99;
-                }
-                let tree =
-                    mtp12_tree_policy::accept(&tokens, &parents, &depths, &target, &[99], 100)
-                        .unwrap();
-                let linear =
-                    gemma4_mtp12_acceptance_decision(&tokens[1..], &target, &[99]).unwrap();
-                assert_eq!(
-                    tree.path,
-                    (0..linear.committed_input_rows).collect::<Vec<_>>()
-                );
-                assert_eq!(tree.stop_token, linear.stop_token);
-                assert_eq!(tree.next_anchor_token, linear.next_anchor_token);
-                assert_eq!(tree.path.len() - 1, linear.accepted_drafts);
-            }
-        }
-    }
-}
-
 impl Gemma4PendingVerifierBatch {
     pub(super) fn permits_linear_commit(&self, ticket: u64, rows: usize) -> bool {
         self.ticket == ticket && rows <= self.width && (self.tree_parents.is_none() || rows == 0)
@@ -437,5 +311,131 @@ impl Gemma4GpuRuntime {
         // assistant is reading its borrowed KV buffers.
         drop(sequence);
         proposal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_round_gate_preserves_budget_tail_and_checks_physical_capacity() {
+        for (remaining, capacity, expected) in
+            [(8, 8, false), (9, 8, true), (8, 7, false), (9, 7, false)]
+        {
+            let schedule = Gemma4Mtp12WidthScheduler::new_w8_padded_tail(8).unwrap();
+            let plan = schedule
+                .plan_round_with_capacity(remaining, capacity)
+                .unwrap();
+            assert_eq!(
+                mtp12_tree_policy::round_eligible(
+                    plan.logical_verify_width,
+                    plan.physical_verify_width,
+                    529,
+                    529 + capacity,
+                ),
+                expected,
+                "remaining={remaining} physical_capacity={capacity}"
+            );
+        }
+        assert!(!mtp12_tree_policy::round_eligible(
+            8,
+            8,
+            usize::MAX - 7,
+            usize::MAX
+        ));
+        assert!(!mtp12_tree_policy::round_eligible(7, 8, 529, 2048));
+        assert!(!mtp12_tree_policy::round_eligible(8, 16, 529, 2048));
+    }
+
+    fn pending_tree(state: &mut Gemma4DenseVerifierState) -> Gemma4PendingVerifierBatch {
+        let ticket = state.record_completed_batch(128, 8).unwrap();
+        let pending = state.pending.as_mut().unwrap();
+        pending.tree_parents = Some([-1, 0, 1, 2, 3, 1, 5, 6]);
+        assert_eq!(pending.ticket, ticket);
+        *pending
+    }
+
+    #[test]
+    fn tree_ticket_rejects_wrong_consumers_and_supports_abort() {
+        let mut state = Gemma4DenseVerifierState {
+            lane: Gemma4DenseSequenceLane::OrderedVerifier,
+            logical_len: 128,
+            next_ticket: 7,
+            pending: None,
+        };
+        let pending = pending_tree(&mut state);
+        for rows in 1..=8 {
+            assert!(!pending.permits_linear_commit(pending.ticket, rows));
+        }
+        assert!(!pending.permits_linear_commit(pending.ticket + 1, 0));
+        for path in [
+            &[][..],
+            &[1][..],
+            &[0, 5][..],
+            &[0, 1, 1][..],
+            &[0, 1, 8][..],
+        ] {
+            assert!(!pending.permits_tree_path(pending.ticket, path));
+            assert_eq!(state.logical_len, 128);
+            assert_eq!(state.pending, Some(pending));
+        }
+        assert!(!pending.permits_tree_path(pending.ticket + 1, &[0, 1, 5]));
+        assert!(pending.permits_linear_commit(pending.ticket, 0));
+        assert_eq!(state.resolve_prefix(pending.ticket, 0), Some(128));
+        assert_eq!(state.resolve_prefix(pending.ticket, 0), None);
+        let linear = state.record_completed_batch(128, 4).unwrap();
+        assert!(state.pending.unwrap().permits_linear_commit(linear, 3));
+        assert!(!state.pending.unwrap().permits_tree_path(linear, &[0, 1, 2]));
+        assert_eq!(state.resolve_prefix(linear, 3), Some(131));
+    }
+
+    #[test]
+    fn compacted_path_advances_by_count_and_selects_physical_leaf_hidden() {
+        let mut state = Gemma4DenseVerifierState {
+            lane: Gemma4DenseSequenceLane::OrderedVerifier,
+            logical_len: 128,
+            next_ticket: 1,
+            pending: None,
+        };
+        let pending = pending_tree(&mut state);
+        let path = [0, 1, 5, 6, 7];
+        assert!(pending.permits_tree_path(pending.ticket, &path));
+        let hidden = (0..8).map(|i| vec![i as f32; 4]).collect::<Vec<_>>();
+        assert_eq!(hidden[*path.last().unwrap()], [7.0; 4]);
+        // Runtime invokes this resolution only after successful GPU compaction.
+        assert_eq!(state.resolve_prefix(pending.ticket, path.len()), Some(133));
+        assert_eq!(state.logical_len, 133);
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn no_branch_acceptance_matches_linear_for_every_rejection_and_stop() {
+        let tokens = [10, 11, 12, 13, 14, 15, 16, 17];
+        let parents = [-1, 0, 1, 2, 3, 4, 5, 6];
+        let depths = [0, 1, 2, 3, 4, 5, 6, 7];
+        for mismatch_at in 0..=8 {
+            for stop_at in 0..=8 {
+                let mut target = [11, 12, 13, 14, 15, 16, 17, 18];
+                if mismatch_at < 8 {
+                    target[mismatch_at] = 98;
+                }
+                if stop_at < 8 {
+                    target[stop_at] = 99;
+                }
+                let tree =
+                    mtp12_tree_policy::accept(&tokens, &parents, &depths, &target, &[99], 100)
+                        .unwrap();
+                let linear =
+                    gemma4_mtp12_acceptance_decision(&tokens[1..], &target, &[99]).unwrap();
+                assert_eq!(
+                    tree.path,
+                    (0..linear.committed_input_rows).collect::<Vec<_>>()
+                );
+                assert_eq!(tree.stop_token, linear.stop_token);
+                assert_eq!(tree.next_anchor_token, linear.next_anchor_token);
+                assert_eq!(tree.path.len() - 1, linear.accepted_drafts);
+            }
+        }
     }
 }
