@@ -144,9 +144,21 @@ export function summarizeMetrics(text) {
     },
     memory: {
       residentBytes: read(values, 'camelid_process_resident_memory_bytes'),
-      vramTotalBytes: vramTotal,
-      vramFreeBytes: vramFree,
-      vramUsedBytes: vramTotal !== null && vramFree !== null ? Math.max(0, vramTotal - vramFree) : null,
+      /* A ZERO TOTAL IS NOT A READING. `src/api/metrics.rs` writes both CUDA VRAM
+         gauges UNCONDITIONALLY, and `HardwareProfile::detect()` leaves them at 0
+         whenever `cuda::probe_capability()` returns None — which is every macOS
+         host, always. Guarding on presence alone (both gauges ARE present, at 0)
+         rendered "VRAM in use: 0 B of 0 B" on every Metal machine: a confident
+         zero for a device that was never asked, which is the same mistake the
+         prefix-cache rate avoids by returning null on zero attempts.
+
+         Zero FREE is left alone — a fully committed device legitimately reports
+         it. Only a zero TOTAL is impossible for a real one. */
+      vramTotalBytes: vramTotal !== null && vramTotal > 0 ? vramTotal : null,
+      vramFreeBytes: vramTotal !== null && vramTotal > 0 ? vramFree : null,
+      vramUsedBytes: vramTotal !== null && vramTotal > 0 && vramFree !== null
+        ? Math.max(0, vramTotal - vramFree)
+        : null,
     },
     /* Every figure here is a LIFETIME AVERAGE over the process, never a current
        rate. Named `lifetime` so a caller cannot accidentally present it as now. */
@@ -182,15 +194,95 @@ export const LANE_RISK = {
 /* Backends whose decode path carries its own parity evidence in this repo. A
    backend absent from this set is not accused of being wrong — it is reported as
    not carrying an evidence claim on this surface, which is a different statement
-   and the only one the frontend can support. */
+   and the only one the frontend can support.
+
+   THIS LIST IS A LIABILITY, and the smoke treats it as one. It is a copy of a
+   fact that lives in `src/execution_plan.rs`, and the first version of it was
+   itself a copy — of the display-only `METAL_BACKENDS` in `executionPlan.js`,
+   which had gone stale at one entry while the planner grew to six. Carried here
+   unchanged, that staleness stopped being cosmetic: three lanes that are DEFAULT
+   ON macOS (`metal_resident_qwen35_runtime`, `metal_resident_qwen35_kquant_runtime`
+   and `metal_resident_lfm2_runtime`, each an opt-OUT) rendered as carrying no
+   evidence claim, while their CUDA counterparts rendered as evidenced. Two of the
+   three are lanes whose receipts in `src/api/mod.rs` assert the backend string
+   itself as the proof — the LFM2 row's evidence reads "the Mac receipt asserts
+   selected_backend=metal_resident_lfm2_runtime", and the Ornith agent-eval PASS
+   was earned on `metal_resident_qwen35_kquant_runtime`.
+
+   So the smoke extracts every backend the planner can select and asserts each one
+   is classified here or in UNEVIDENCED_BACKENDS below. A new lane fails the smoke
+   until someone decides which it is, rather than defaulting to "unevidenced"
+   silently. */
 const EVIDENCED_BACKENDS = new Set([
   'cpu_reference',
   'cpu_q8_runtime_repack',
   'cpu_kquant_block_dot',
   'cuda_resident_q8_runtime',
   'cuda_resident_kquant_runtime',
+  'cuda_resident_windowed_runtime',
+  'cuda_resident_prism_low_bit_runtime',
+  'gemma4_cpu_runtime',
+  'gemma4_cuda_resident_runtime',
   'metal_resident_q8_runtime',
+  'metal_resident_kquant_runtime',
+  'metal_resident_lfm2_runtime',
+  'metal_resident_prism_low_bit_runtime',
+  'metal_resident_qwen35_runtime',
+  'metal_resident_qwen35_kquant_runtime',
 ])
+
+/* Lanes deliberately left OUT of the set above, so that "not listed" cannot mean
+   "nobody looked". The smoke asserts this partition covers the planner. */
+export const UNEVIDENCED_BACKENDS = new Set([
+  /* The engine itself treats this one as unvalidated: the admission check in
+     `src/api/mod.rs` gates on `selected_backend.contains("_runnable_unvalidated")`.
+     Claiming evidence for it here would contradict the engine. */
+  'cuda_resident_q8_runtime_runnable_unvalidated',
+])
+
+/* The GPU row, which is NOT one row with a portable meaning.
+
+   `cuda_resident_active` is a plain `bool` on the plan, so macOS serializes it as
+   `false` rather than omitting it — it survives any presence check and rendered a
+   "CUDA resident: false" row on Metal hosts with no Metal row anywhere, reading as
+   "the GPU is off" while a Metal resident lane was decoding.
+
+   The second half of that row was wrong too. It pointed at Settings → GPU
+   acceleration, and that control does not reach Metal: `POST /api/runtime/gpu`
+   sets `cuda::set_gpu_accel_enabled` / `set_runtime_enabled`, and every reader of
+   those two atoms is a CUDA or BitNet path. The planner's Metal arms gate on
+   `platform.metal_available` plus per-lane opt-outs (`CAMELID_METAL_RESIDENT_DECODE`,
+   `CAMELID_QWEN35_METAL`, `CAMELID_LFM2_METAL`), none of which the toggle writes.
+   So on a Metal host NOTHING here is live-settable, and saying so is the honest
+   answer — this panel's whole premise is that a control which does nothing is
+   worse than no control.
+
+   Host comes from the plan's own `operating_system`, falling back to the backend
+   prefix for an engine too old to report it. */
+function acceleratorRow(plan, backend) {
+  const metalHost = plan.operating_system === 'macos'
+    || (!plan.operating_system && typeof backend === 'string' && backend.startsWith('metal_'))
+
+  if (metalHost) {
+    return {
+      key: 'metal_resident_active',
+      label: 'Metal resident',
+      value: typeof backend === 'string' && backend.startsWith('metal_') ? 'true' : 'false',
+      changeable: 'restart',
+      note: 'Whether weights stay on the GPU. The GPU acceleration toggle in Settings drives the CUDA lane only and does not reach this one; the planner picks it at model load.',
+    }
+  }
+
+  return {
+    key: 'cuda_resident_active',
+    label: 'CUDA resident',
+    value: plan.cuda_resident_active === null || plan.cuda_resident_active === undefined
+      ? null
+      : String(plan.cuda_resident_active),
+    changeable: 'gpu_toggle',
+    note: 'Whether weights stay on the GPU. The GPU setting reaches this; the lane still reselects on the next model load.',
+  }
+}
 
 export function readActiveLane(runtime) {
   const plan = runtime?.execution_plan
@@ -229,15 +321,7 @@ export function readActiveLane(runtime) {
       changeable: 'restart',
       note: 'How the prompt is evaluated before the first token.',
     },
-    {
-      key: 'cuda_resident_active',
-      label: 'CUDA resident',
-      value: plan.cuda_resident_active === null || plan.cuda_resident_active === undefined
-        ? null
-        : String(plan.cuda_resident_active),
-      changeable: 'gpu_toggle',
-      note: 'Whether weights stay on the GPU. The GPU setting reaches this; the lane still reselects on the next model load.',
-    },
+    acceleratorRow(plan, backend),
     {
       key: 'q8_policy',
       label: 'Q8 loader policy',
