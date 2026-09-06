@@ -856,6 +856,33 @@ pub fn host_ram_status() -> Option<(u64, u64)> {
 /// gate rather than blocking.
 #[cfg(target_os = "macos")]
 pub fn host_ram_status() -> Option<(u64, u64)> {
+    macos_ram_stats().map(|(total, available, _wired)| (total, available))
+}
+
+/// Physical RAM that cannot be evicted, compressed or swapped out under pressure —
+/// `wire_count` × page size on macOS. `None` on platforms with no probe wired up.
+///
+/// This exists for the pre-load fit floor: `total - unevictable` is the largest
+/// allocation the machine could satisfy *even after evicting everything evictable*,
+/// which is the one memory claim that is a hard fact rather than a snapshot. Callers
+/// must treat `None` as "no claim" and fall back to a total-RAM policy, never as zero.
+#[cfg(target_os = "macos")]
+pub fn host_ram_unevictable_bytes() -> Option<u64> {
+    macos_ram_stats().map(|(_total, _available, wired)| wired)
+}
+
+/// `None` off macOS: neither `GlobalMemoryStatusEx` nor `/proc/meminfo` exposes a
+/// directly comparable non-evictable figure, and guessing one would turn the fit
+/// floor into a fabricated gate. Those hosts keep the total-RAM policy alone.
+#[cfg(not(target_os = "macos"))]
+pub fn host_ram_unevictable_bytes() -> Option<u64> {
+    None
+}
+
+/// `(total, available, wired)` in bytes from one Mach probe, so the two public
+/// accessors above cannot disagree about the same instant.
+#[cfg(target_os = "macos")]
+fn macos_ram_stats() -> Option<(u64, u64, u64)> {
     // total physical RAM: hw.memsize, the same sysctl Activity Monitor reports.
     let mut memsize: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
@@ -909,7 +936,8 @@ pub fn host_ram_status() -> Option<(u64, u64)> {
     let available = (vm.free_count as u64)
         .saturating_add(vm.inactive_count as u64)
         .saturating_mul(page);
-    Some((memsize, available))
+    let wired = (vm.wire_count as u64).saturating_mul(page);
+    Some((memsize, available, wired))
 }
 
 /// `None` on the remaining unixes (no portable cheap probe wired up): the caller then

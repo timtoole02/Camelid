@@ -558,6 +558,15 @@ pub struct LoadModelRequest {
     /// explicitly. Omitted preserves the historical activate-on-load behavior.
     #[serde(default)]
     pub set_active: Option<bool>,
+    /// Skip the fit preflight for this one request — the per-request equivalent of
+    /// `CAMELID_SKIP_FIT_CHECK=1`.
+    ///
+    /// Exists because the preflight's only escape hatch used to be a process-wide env
+    /// var, which the desktop app cannot set (its sidecar is spawned args-only). An
+    /// error whose stated remedy its own audience cannot perform is a dead end, so the
+    /// UI needs an override it can put on a button.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -8202,7 +8211,70 @@ fn resident_load_is_idempotent(
     requested_id.is_none_or(|id| id == resident_id)
 }
 
-/// The refusal for a load-blocking verdict: a stable error code plus its message.
+/// What the pre-load fit preflight decided: proceed silently, proceed with advice, or
+/// refuse.
+///
+/// The three states exist because the fit axis mixes two different kinds of "no". A
+/// host that is *busy right now* is a moment; a host that is *too small* is a machine.
+/// Collapsing them into one refusal is what made an explicitly advisory check
+/// (`src/fit.rs`) start returning 422 for ordinary models on healthy laptops. The
+/// verdict's own classification is unchanged — [`crate::fit::FitVerdict::refuses_load`]
+/// still governs catalog rows — this type governs only what the *load endpoint* does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FitPreflight {
+    /// Nothing to say; load normally.
+    Proceed,
+    /// Load anyway, but tell the caller what it is walking into.
+    Warn { code: &'static str, message: String },
+    /// Do not load. Either the machine cannot hold this at all, or there is a
+    /// specific action that would make it fit.
+    Refuse { code: &'static str, message: String },
+}
+
+#[cfg(test)]
+impl FitPreflight {
+    fn refusal(self) -> Option<(&'static str, String)> {
+        match self {
+            FitPreflight::Refuse { code, message } => Some((code, message)),
+            _ => None,
+        }
+    }
+
+    fn warning(self) -> Option<(&'static str, String)> {
+        match self {
+            FitPreflight::Warn { code, message } => Some((code, message)),
+            _ => None,
+        }
+    }
+
+    fn proceeds(&self) -> bool {
+        matches!(self, FitPreflight::Proceed)
+    }
+}
+
+/// A non-fatal advisory attached to an otherwise successful response.
+///
+/// Serialized into `POST /api/models/load`'s 200 body as `warnings: [...]`, and omitted
+/// entirely when empty so an existing client's parse is unchanged.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadWarning {
+    pub code: &'static str,
+    pub severity: &'static str,
+    pub message: String,
+}
+
+/// `POST /api/models/load`'s success body: the loaded model, flattened, plus any
+/// advisories. Wrapping rather than adding a field to [`LoadedModel`] keeps the
+/// warning out of every other surface that serializes a loaded model.
+#[derive(Debug, Serialize)]
+struct LoadModelResponse {
+    #[serde(flatten)]
+    model: LoadedModel,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<LoadWarning>,
+}
+
+/// The preflight decision for a (host, footprint) pair: a stable code plus its message.
 ///
 /// A host that is out of room *because something else is already loaded* is a
 /// different situation from a host that is too small for the model, and it has a
@@ -8212,81 +8284,102 @@ fn resident_load_is_idempotent(
 ///
 /// There is a third case with a third remedy: nothing of ours is resident, the
 /// machine is big enough, but *other applications* have the memory right now
-/// (`FitVerdict::InsufficientFreeMemory`). Closing something is the fix, and saying
-/// "larger than this machine can hold" there is simply false.
+/// (`FitVerdict::InsufficientFreeMemory`). That one is transient by construction, so
+/// it **warns and proceeds** — the operator can see the cost and decide. The one thing
+/// that still stops it is [`crate::fit::exceeds_hard_floor`]: an allocation larger than
+/// total RAM minus wired pages cannot succeed no matter what is closed, and on Metal
+/// hosts no downstream guard would catch it (`VramShortfall` is CUDA-only; the KV
+/// budget guards cache growth, not weights).
 fn fit_preload_message(
     hw: &crate::capability::HardwareProfile,
     footprint: &crate::fit::FitInputs,
     size_bytes: u64,
     reclaim: Option<&ResidentReclaim>,
-) -> Option<(&'static str, String)> {
+) -> FitPreflight {
     let verdict = crate::fit::assess(hw, footprint);
     if !verdict.refuses_load() {
-        return None;
+        return FitPreflight::Proceed;
     }
     let size_gb = size_bytes as f64 / 1e9;
     // Something else of ours is resident: name it, and point at the remedy that
-    // works. Checked first because it is the most specific and most actionable.
+    // works. Checked first because it is the most specific and most actionable —
+    // and because it is the one refusal a caller can clear in a single retry, which
+    // is why it stays a refusal rather than joining the warn path.
     if let Some(r) = reclaim.filter(|r| !r.is_empty()) {
         let names = r.ids.join(", ");
         let freed = r.bytes as f64 / 1e9;
-        return Some((
-            "model_requires_unload",
-            format!(
+        return FitPreflight::Refuse {
+            code: "model_requires_unload",
+            message: format!(
                 "This model (~{size_gb:.1} GB) does not fit while {names} is still loaded. \
                  Releasing it frees ~{freed:.1} GB, which should be enough. \
                  Retry with \"replace\": true to swap models in one step (the app's \
                  Load button does this), or POST /api/models/unload first."
             ),
-        ));
+        };
     }
-    // The machine is big enough; it is just busy. Do not send the user shopping
-    // for smaller models — tell them what is actually in the way.
-    if verdict == crate::fit::FitVerdict::InsufficientFreeMemory {
+    let footprint_bytes = footprint.footprint_bytes();
+    let footprint_gb = footprint_bytes as f64 / 1e9;
+    let total_gb = hw.host_ram_total_bytes as f64 / 1e9;
+    // The machine is big enough; it is just busy. Do not send the user shopping for
+    // smaller models, and do not refuse — say what it will cost and load it.
+    if verdict.is_transient() {
+        // ...unless it physically cannot be satisfied. Wired memory is the one part of
+        // the shortfall that closing an application cannot recover.
+        if crate::fit::exceeds_hard_floor(hw, footprint_bytes) {
+            let floor_gb = crate::fit::hard_floor_bytes(hw).unwrap_or(0) as f64 / 1e9;
+            let wired_gb = hw.host_ram_unevictable_bytes as f64 / 1e9;
+            return FitPreflight::Refuse {
+                code: "host_memory_exhausted",
+                message: format!(
+                    "This model's estimated in-memory footprint is ~{footprint_gb:.1} GB, but \
+                     this machine can supply at most ~{floor_gb:.1} GB even after evicting \
+                     everything evictable: ~{wired_gb:.1} GB of its ~{total_gb:.1} GB is wired \
+                     and cannot be freed. Closing applications will not recover this. \
+                     The app's \"Load anyway\" button attempts it regardless, or send \
+                     \"force\": true."
+                ),
+            };
+        }
         let free_gb = hw.host_ram_free_bytes as f64 / 1e9;
-        let total_gb = hw.host_ram_total_bytes as f64 / 1e9;
-        let footprint_gb = footprint.footprint_bytes() as f64 / 1e9;
-        let usable_gb = crate::fit::usable_host_ram_bytes(hw).unwrap_or(0) as f64 / 1e9;
-        return Some((
-            "host_memory_unavailable",
-            format!(
+        return FitPreflight::Warn {
+            code: "host_memory_unavailable",
+            message: format!(
                 "This model's ~{size_gb:.1} GB file fits this machine, but its estimated \
                  in-memory footprint is ~{footprint_gb:.1} GB including weights, KV cache, \
-                 and scratch space. Only ~{free_gb:.1} GB of ~{total_gb:.1} GB memory is free \
-                 right now; after Camelid's safety reserve, ~{usable_gb:.1} GB is usable. \
-                 Close some applications and retry, or set \
-                 CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+                 and scratch space, and only ~{free_gb:.1} GB of ~{total_gb:.1} GB memory is \
+                 free right now. Loading anyway: expect a slower load, slower generation, and \
+                 possible swapping. Close some applications for more headroom."
             ),
-        ));
+        };
     }
     let base =
         format!("This model (~{size_gb:.1} GB) is larger than this machine can hold in memory.");
-    Some((
-        "model_too_large_for_host",
-        match best_fitting_catalog_suggestion(hw) {
+    FitPreflight::Refuse {
+        code: "model_too_large_for_host",
+        message: match best_fitting_catalog_suggestion(hw) {
             Some(alt) => format!(
                 "{base} The largest catalog model that fits here is {alt}. \
-                 Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+                 The app's \"Load anyway\" button attempts it regardless, or send \
+                 \"force\": true."
             ),
-            None => format!("{base} Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."),
+            None => format!(
+                "{base} The app's \"Load anyway\" button attempts it regardless, or send \
+                 \"force\": true."
+            ),
         },
-    ))
+    }
 }
 
-/// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
-/// memory and computes an **exact** footprint from the GGUF's real dimensions
-/// (weights + KV + a bounded scratch margin) whenever the header parses. Resident
-/// Metal uses its real on-demand initial KV allocation; CPU/CUDA retain the normal-
-/// use advisory context. Falls back to the coarse size pad otherwise. Returns a typed
-/// 422 only on a load-refusing verdict ([`crate::fit::FitVerdict::refuses_load`]);
-/// `None` (proceed unchanged) on the `CAMELID_SKIP_FIT_CHECK=1` override, a
-/// missing/zero-size file, or any `Fits*`/`Unknown` verdict — a fail-fast
-/// convenience, never a new hard gate.
 /// Whether the load-time fit preflight is overridden off. `CAMELID_SKIP_FIT_CHECK=1`
 /// restores the pre-advisor behavior: `POST /api/models/load` attempts the load
 /// unconditionally, letting the authoritative `VramShortfall`/`KvCache` guards be
 /// the only gate. Exactly the trimmed value `"1"` enables the override; anything
 /// else (including unset) keeps the preflight on.
+///
+/// The env var is a process-wide operator escape hatch and is **not** reachable from
+/// the desktop app, whose sidecar is spawned args-only. `LoadModelRequest::force` is
+/// the per-request equivalent that a UI can actually offer; both must stay wired.
 fn fit_check_skipped(raw: Option<&str>) -> bool {
     raw.map(str::trim) == Some("1")
 }
@@ -8347,16 +8440,29 @@ fn exact_preload_footprint(
     crate::fit::exact_footprint_with_scratch(size, dims, context_tokens, kv_dtype, scratch_bytes)
 }
 
+/// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
+/// memory and computes an **exact** footprint from the GGUF's real dimensions
+/// (weights + KV + a bounded scratch margin) whenever the header parses. Resident
+/// Metal uses its real on-demand initial KV allocation; CPU/CUDA retain the normal-
+/// use advisory context. Falls back to the coarse size pad otherwise.
+///
+/// [`FitPreflight::Proceed`] on the `CAMELID_SKIP_FIT_CHECK=1` override, a `force`
+/// request, a missing/zero-size file, or any non-refusing verdict. A busy host warns;
+/// only a footprint this machine could never hold refuses.
 fn fit_preload_guard(
     path: &std::path::Path,
     reclaim: Option<&ResidentReclaim>,
-) -> Option<Response> {
-    if fit_check_skipped(std::env::var("CAMELID_SKIP_FIT_CHECK").ok().as_deref()) {
-        return None;
+    force: bool,
+) -> FitPreflight {
+    if force || fit_check_skipped(std::env::var("CAMELID_SKIP_FIT_CHECK").ok().as_deref()) {
+        return FitPreflight::Proceed;
     }
-    let size = std::fs::metadata(path).ok()?.len();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return FitPreflight::Proceed;
+    };
+    let size = meta.len();
     if size == 0 {
-        return None;
+        return FitPreflight::Proceed;
     }
     // Live probe (not the cached startup snapshot): free VRAM/RAM shift as other
     // apps run or a model is already loaded, and this decision must reflect *now*.
@@ -8389,13 +8495,7 @@ fn fit_preload_guard(
             })
             .unwrap_or_else(|| crate::fit::advisory_footprint(size))
     });
-    let (code, message) = fit_preload_message(&hw, &footprint, size, reclaim)?;
-    Some(api_error(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        code,
-        message,
-        Some("path"),
-    ))
+    fit_preload_message(&hw, &footprint, size, reclaim)
 }
 
 fn enforce_distributed_model_sha256(state: &AppState, path: &std::path::Path) -> crate::Result<()> {
@@ -8428,6 +8528,7 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         id,
         replace,
         set_active,
+        force,
     } = req;
     let lan_chat_only = state.api_surface == ApiSurface::LanChatOnly;
     // Full mode keeps the operator's historical path semantics. LAN Chat uses
@@ -8538,24 +8639,41 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         reclaim = ResidentReclaim::default();
     }
 
-    // Advisory fail-fast (fit axis, never a support claim): steer away from a
-    // near-certain OOM before the expensive load. Overridable via
-    // CAMELID_SKIP_FIT_CHECK=1; only fires on a WontFit verdict from a probed host.
+    // Fit preflight (capacity axis, never a support claim): steer away from a
+    // near-certain OOM before the expensive load, and describe a merely-busy host
+    // without refusing it. Overridable per request via `force` or process-wide via
+    // CAMELID_SKIP_FIT_CHECK=1.
     //
     // The guard does blocking I/O (metadata + GGUF header read) and a live hardware
     // probe (HardwareProfile::detect initializes a CUDA context on GPU hosts), so run
     // it on a blocking thread rather than stalling the async worker — consistent with
     // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
-    // fall through to the load, where VramShortfall/KvCache remain the hard net.
+    // fall through to the load, where VramShortfall/KvCache remain what net there is.
+    let mut warnings: Vec<LoadWarning> = Vec::new();
     if !idempotent_resident {
         let guard_path = path.clone();
-        {
+        let preflight = {
             let _reader = state.model_file_lifecycle.read().await;
-            if let Ok(Some(resp)) =
-                tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path, Some(&reclaim)))
-                    .await
-            {
-                return resp;
+            tokio::task::spawn_blocking(move || {
+                fit_preload_guard(&guard_path, Some(&reclaim), force)
+            })
+            .await
+            .unwrap_or(FitPreflight::Proceed)
+        };
+        match preflight {
+            FitPreflight::Proceed => {}
+            FitPreflight::Warn { code, message } => warnings.push(LoadWarning {
+                code,
+                severity: "warning",
+                message,
+            }),
+            FitPreflight::Refuse { code, message } => {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    code,
+                    message,
+                    Some("path"),
+                );
             }
         }
     }
@@ -8571,7 +8689,14 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     )
     .await
     {
-        Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
+        Ok(loaded) => (
+            StatusCode::OK,
+            Json(LoadModelResponse {
+                model: loaded,
+                warnings,
+            }),
+        )
+            .into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
         // dedicated-lane redirect (e.g. `camelid diffusion-gemma-chat`).
@@ -8633,6 +8758,7 @@ mod distributed_model_pin_tests {
                 id: None,
                 replace: true,
                 set_active: None,
+                force: false,
             }),
         )
         .await;
@@ -40338,6 +40464,7 @@ mod catalog_fit_tests {
             cpu_logical_cores: 8,
             host_ram_total_bytes: ram_total,
             host_ram_free_bytes: ram_free,
+            host_ram_unevictable_bytes: 0,
             simd: SimdCaps::default(),
         }
     }
@@ -40725,12 +40852,15 @@ mod catalog_fit_tests {
         // 8 GB RAM, no GPU: a 40 GB model won't fit → actionable message.
         let hw = host(false, 0, 8 * GIB, 5 * GIB);
         let fp = crate::fit::advisory_footprint(40 * GIB);
-        let (code, msg) =
-            super::fit_preload_message(&hw, &fp, 40 * GIB, None).expect("won't fit -> message");
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 40 * GIB, None)
+            .refusal()
+            .expect("won't fit -> refusal");
         assert_eq!(code, "model_too_large_for_host");
         assert!(msg.contains("larger than this machine"));
         assert!(msg.contains("camelid pull"));
-        assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"));
+        // The override a UI can actually offer, not the env var it cannot set.
+        assert!(msg.contains("\"force\": true"), "{msg}");
+        assert!(!msg.contains("CAMELID_SKIP_FIT_CHECK"), "{msg}");
     }
 
     #[test]
@@ -40745,7 +40875,8 @@ mod catalog_fit_tests {
             bytes: 3 * GIB,
         };
         let (code, msg) = super::fit_preload_message(&hw, &fp, 40 * GIB, Some(&reclaim))
-            .expect("won't fit -> message");
+            .refusal()
+            .expect("won't fit -> refusal");
         assert_eq!(code, "model_requires_unload");
         assert!(msg.contains("Llama-3.2-1B-Instruct-Q8_0.gguf"), "{msg}");
         assert!(msg.contains("replace"), "{msg}");
@@ -40761,7 +40892,8 @@ mod catalog_fit_tests {
         let fp = crate::fit::advisory_footprint(40 * GIB);
         let empty = super::ResidentReclaim::default();
         let (code, _) = super::fit_preload_message(&hw, &fp, 40 * GIB, Some(&empty))
-            .expect("won't fit -> message");
+            .refusal()
+            .expect("won't fit -> refusal");
         assert_eq!(code, "model_too_large_for_host");
     }
 
@@ -40769,7 +40901,7 @@ mod catalog_fit_tests {
     fn preload_message_is_none_when_the_model_fits() {
         let hw = host(false, 0, 64 * GIB, 48 * GIB);
         let fp = crate::fit::advisory_footprint(2 * GIB);
-        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, None).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, None).proceeds());
     }
 
     #[test]
@@ -40781,7 +40913,7 @@ mod catalog_fit_tests {
             ids: vec!["other.gguf".to_string()],
             bytes: 3 * GIB,
         };
-        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, Some(&reclaim)).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, Some(&reclaim)).proceeds());
     }
 
     #[test]
@@ -40789,7 +40921,7 @@ mod catalog_fit_tests {
         // Unknown verdict must never hard-block a load.
         let hw = host(false, 0, 0, 0);
         let fp = crate::fit::advisory_footprint(40 * GIB);
-        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB, None).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB, None).proceeds());
     }
 
     #[test]
@@ -40808,7 +40940,10 @@ mod catalog_fit_tests {
             crate::fit::ADVISORY_CONTEXT_TOKENS,
             crate::fit::KvDtype::F32,
         );
-        assert!(super::fit_preload_message(&hw, &fp, 5 * GIB, None).is_some());
+        let (code, _) = super::fit_preload_message(&hw, &fp, 5 * GIB, None)
+            .refusal()
+            .expect("5 GiB of weights cannot fit a 4 GiB host");
+        assert_eq!(code, "model_too_large_for_host");
     }
 
     #[test]
@@ -40825,14 +40960,19 @@ mod catalog_fit_tests {
 
         // Regression: the old policy treated a Metal host as CPU-only and demanded
         // a full 4096-position F32 cache before load, producing the confusing
-        // "0.6 GB model / 1.6 GB free" refusal on this 8 GiB Mac.
+        // "0.6 GB model / 1.6 GB free" complaint on this 8 GiB Mac. That footprint
+        // still trips the advisor — but as a WARNING now, because an 8 GiB machine is
+        // plainly big enough for a 0.6 GB model and refusing said otherwise.
         let old = crate::fit::exact_footprint(
             size,
             dims,
             crate::fit::ADVISORY_CONTEXT_TOKENS,
             crate::fit::KvDtype::F32,
         );
-        assert!(super::fit_preload_message(&hw, &old, size, None).is_some());
+        let (code, _) = super::fit_preload_message(&hw, &old, size, None)
+            .warning()
+            .expect("a busy host warns, it does not refuse");
+        assert_eq!(code, "host_memory_unavailable");
 
         let metal = super::exact_preload_footprint(size, dims, &hw, true, crate::fit::KvDtype::F16);
         assert_eq!(
@@ -40846,8 +40986,8 @@ mod catalog_fit_tests {
             )
         );
         assert!(
-            super::fit_preload_message(&hw, &metal, size, None).is_none(),
-            "the real initial Metal allocation fits the live-memory scenario"
+            super::fit_preload_message(&hw, &metal, size, None).proceeds(),
+            "the real initial Metal allocation fits the live-memory scenario silently"
         );
     }
 
@@ -41016,23 +41156,79 @@ mod catalog_fit_tests {
     }
 
     #[test]
-    fn a_busy_host_is_refused_without_being_called_too_small() {
-        // 64 GB machine with 2 GB free, asked for a ~4 GB model. It is refused (the
-        // load would be at risk), but telling the operator to buy a smaller model
-        // would be false: the machine is one of the biggest in the catalog's range.
+    fn a_busy_host_warns_and_loads_instead_of_refusing() {
+        // 64 GB machine with 2 GB free, asked for a ~4 GB model. The machine is one of
+        // the biggest in the catalog's range and the shortfall is a moment, not a
+        // property — so this advises and proceeds. Refusing here is the bug: it told
+        // operators to close applications before an ordinary model would load.
         let hw = host(false, 0, 64 * GIB, 2 * GIB);
         let fp = crate::fit::advisory_footprint(4 * GIB);
-        let (code, msg) =
-            super::fit_preload_message(&hw, &fp, 4 * GIB, None).expect("refused -> message");
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 4 * GIB, None)
+            .warning()
+            .expect("busy host -> warning");
         assert_eq!(code, "host_memory_unavailable");
         assert!(msg.contains("free right now"), "{msg}");
-        assert!(msg.contains("Close some applications"), "{msg}");
+        assert!(msg.contains("Loading anyway"), "{msg}");
         assert!(msg.contains("estimated in-memory footprint"), "{msg}");
-        assert!(msg.contains("safety reserve"), "{msg}");
-        assert!(msg.contains("usable"), "{msg}");
         assert!(!msg.contains("larger than this machine"), "{msg}");
-        // The override is still offered, exactly as for the too-large case.
-        assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"), "{msg}");
+        // A warning must not send the operator to a terminal for an env var.
+        assert!(!msg.contains("CAMELID_SKIP_FIT_CHECK"), "{msg}");
+    }
+
+    #[test]
+    fn a_busy_host_still_refuses_what_the_machine_cannot_physically_hold() {
+        // Same transient verdict, but the shortfall is wired memory: closing
+        // applications cannot recover it, and on Metal nothing downstream would catch
+        // the oversized weight allocation. This is the floor that makes warning safe.
+        let mut hw = host(false, 0, 8 * GIB, 2 * GIB);
+        hw.host_ram_unevictable_bytes = 7 * GIB;
+        let fp = crate::fit::advisory_footprint(4 * GIB);
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 4 * GIB, None)
+            .refusal()
+            .expect("beyond the hard floor -> refusal");
+        assert_eq!(code, "host_memory_exhausted");
+        assert!(msg.contains("wired"), "{msg}");
+        assert!(msg.contains("\"force\": true"), "{msg}");
+    }
+
+    #[test]
+    fn an_unprobed_wired_figure_never_manufactures_a_refusal() {
+        // host_ram_unevictable_bytes == 0 means "not measured on this platform", not
+        // "nothing is wired". An unmeasured host must warn, exactly as before.
+        let hw = host(false, 0, 8 * GIB, 2 * GIB);
+        assert_eq!(hw.host_ram_unevictable_bytes, 0);
+        let fp = crate::fit::advisory_footprint(4 * GIB);
+        assert_eq!(
+            super::fit_preload_message(&hw, &fp, 4 * GIB, None)
+                .warning()
+                .map(|(code, _)| code),
+            Some("host_memory_unavailable")
+        );
+    }
+
+    #[test]
+    fn force_bypasses_the_preflight_entirely() {
+        // The per-request override must short-circuit before any probe or file read,
+        // so it works on a path that does not exist and cannot be defeated by a
+        // refusing verdict. This is what the UI's "Load anyway" button rides on.
+        assert!(super::fit_preload_guard(
+            std::path::Path::new("/nonexistent/model.gguf"),
+            None,
+            true,
+        )
+        .proceeds());
+    }
+
+    #[test]
+    fn a_missing_or_empty_file_is_left_to_the_loader() {
+        // The preflight is a capacity check, not a validation layer: a path problem
+        // must surface as the loader's own typed error, not as a fit refusal.
+        assert!(super::fit_preload_guard(
+            std::path::Path::new("/nonexistent/model.gguf"),
+            None,
+            false,
+        )
+        .proceeds());
     }
 
     #[test]
@@ -41046,7 +41242,8 @@ mod catalog_fit_tests {
             bytes: 4 * GIB,
         };
         let (code, msg) = super::fit_preload_message(&hw, &fp, 4 * GIB, Some(&reclaim))
-            .expect("refused -> message");
+            .refusal()
+            .expect("a releasable resident model -> refusal");
         assert_eq!(code, "model_requires_unload");
         assert!(msg.contains("Qwen3-4B-Q8_0.gguf"), "{msg}");
     }

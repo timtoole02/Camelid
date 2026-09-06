@@ -158,7 +158,11 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
   assert.equal(isPositiveFit('fits_with_offload'), true)
   assert.equal(isPositiveFit('unknown'), false)
 
-  // The whole point of the new verdict: refused, but NOT "too big".
+  // Refused, but NOT "too big". This axis is the catalog's own pre-download
+  // advisory about THIS host, and it is a separate vocabulary from the load
+  // endpoint's refusal codes — that guard now lets a merely-busy host through
+  // with a warning. What the verdict still decides here is narrower: whether a
+  // row may chain straight into an unattended download-and-start.
   assert.equal(isRefusingFit('insufficient_free_memory'), true)
   assert.equal(isRefusingFit('wont_fit'), true)
   assert.equal(isRefusingFit('unknown'), false, 'unknown is the absence of a claim, not a negative')
@@ -187,6 +191,32 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
   assert.equal(fitIsRecheckable('cpu_only_ok'), false)
   assert.equal(fitIsRecheckable('unknown'), false)
   assert.equal(fitIsRecheckable(undefined), false)
+
+  // The two vocabularies must not bleed into each other. A load-time refusal code
+  // arriving where a fit verdict is expected renders nothing rather than an
+  // invented badge — the same fail-closed rule `unknown` already gets.
+  for (const loadCode of [
+    'host_memory_unavailable',
+    'host_memory_exhausted',
+    'model_too_large_for_host',
+    'model_requires_unload',
+  ]) {
+    assert.equal(fitLabel(loadCode), null, `${loadCode} is a load refusal code, not a fit verdict`)
+    assert.equal(fitDetail(loadCode), null, `${loadCode} must not acquire fit prose`)
+    assert.equal(isRefusingFit(loadCode), false)
+    assert.equal(fitIsRecheckable(loadCode), false)
+  }
+
+  // Every remedy must be one its reader can actually perform. The load guard used
+  // to close its refusal with "set CAMELID_SKIP_FIT_CHECK=1" — unreachable from the
+  // desktop app, whose sidecar is spawned args-only — and that is the regression
+  // this whole lane exists to undo. No fit copy may reacquire the habit.
+  for (const verdict of ['fits_resident', 'fits_with_offload', 'cpu_only_ok', 'insufficient_free_memory', 'wont_fit', 'unknown']) {
+    for (const copy of [fitLabel(verdict), fitDetail(verdict)]) {
+      if (copy === null) continue
+      assert.doesNotMatch(copy, /CAMELID_[A-Z_]+|environment variable/, `${verdict} copy must not ask for an environment variable`)
+    }
+  }
 }
 
 /* --- unchecked vs. settled ------------------------------------------------ */

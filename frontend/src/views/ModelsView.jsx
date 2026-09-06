@@ -61,6 +61,12 @@ export default function ModelsView({
   // Typed fail-closed blocker from a pre-load inspect ({ code, message }), shown
   // verbatim instead of attempting a multi-GB load that cannot run.
   const [blocker, setBlocker] = useState(null)
+  // The exact request a blocker refused, so an override re-issues that load rather
+  // than making the user find the row again.
+  const [blockedRequest, setBlockedRequest] = useState(null)
+  // Advisory `warnings` from a load that SUCCEEDED. These are notices, never
+  // blockers: the model is resident and usable while they are on screen.
+  const [loadWarnings, setLoadWarnings] = useState([])
   const [laneError, setLaneError] = useState('')
   const [cancelingDownloads, setCancelingDownloads] = useState(new Set())
   const [canceledCatalogIds, setCanceledCatalogIds] = useState(new Set())
@@ -181,12 +187,14 @@ export default function ModelsView({
   // lib/modelActivation so this page and the first-run card cannot drift; what stays
   // here is the page's own state wiring. The spine's `/api/models/current` refresh
   // answers the identity check, so the confirmation costs no extra request.
-  const loadModelForChat = (filename, { onStage, model = null } = {}) => {
+  const loadModelForChat = (filename, { onStage, model = null, force = false } = {}) => {
     const run = async () => {
       loadInFlightRef.current = filename
       setUsingFilename(filename)
       setLaneError('')
       setBlocker(null)
+      setBlockedRequest(null)
+      setLoadWarnings([])
       try {
         const result = await loadLocalModelForChat({
           apiBase: spine.base,
@@ -194,12 +202,17 @@ export default function ModelsView({
           model: model || spine.local?.models.find((entry) => entry.filename === filename) || null,
           onStage,
           readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
+          force,
         })
         if (!result.ok) {
-          if (result.blocker) setBlocker(result.blocker)
+          if (result.blocker) {
+            setBlocker(result.blocker)
+            setBlockedRequest({ filename, model })
+          }
           setLaneError(result.message)
           return result
         }
+        setLoadWarnings(result.warnings || [])
         await Promise.all([
           spine.refreshLoadedModels(),
           refreshDashboard?.({ silent: true }),
@@ -214,6 +227,18 @@ export default function ModelsView({
     const queued = loadQueueRef.current.then(run, run)
     loadQueueRef.current = queued.catch(() => {})
     return queued
+  }
+
+  // Re-issue the refused load unchanged except for the preflight skip, so whatever
+  // comes back — success, its warnings, or a different refusal — surfaces the same
+  // way the first attempt did.
+  const forceLoadBlockedModel = () => {
+    if (!blockedRequest) return
+    loadModelForChat(blockedRequest.filename, { model: blockedRequest.model, force: true })
+  }
+
+  const dismissLoadWarning = (index) => {
+    setLoadWarnings((current) => current.filter((_, position) => position !== index))
   }
 
   const unloadEmbeddingModel = async (filename) => {
@@ -524,6 +549,16 @@ export default function ModelsView({
         onUnload={handleUnload}
       />
       <Notice notice={laneError} tone="error" onDismiss={() => setLaneError('')} />
+      {/* The model is loaded and usable; a warning here qualifies that success (a
+          busy host, say) and must not read as the load having been refused. */}
+      {loadWarnings.map((warning, index) => (
+        <Notice
+          key={`${warning?.code || 'load-warning'}-${index}`}
+          notice={warning?.message}
+          tone={warning?.severity === 'info' ? 'info' : 'warning'}
+          onDismiss={() => dismissLoadWarning(index)}
+        />
+      ))}
       <Notice notice={deleteNotice} tone="success" onDismiss={() => setDeleteNotice('')} />
       {deleteBlockedReason ? (
         <p className="lane-delete-guard" id="model-delete-guard">{deleteBlockedReason}</p>
@@ -575,7 +610,14 @@ export default function ModelsView({
         count={laneBuckets ? experimentalRows.length : undefined}
         subtitle="Verification varies by exact row; each model shows what has actually passed."
       >
-        {blocker ? <UnsupportedBlocker blocker={blocker} className="local-lane-blocker" /> : null}
+        {blocker ? (
+          <UnsupportedBlocker
+            blocker={blocker}
+            className="local-lane-blocker"
+            onForceLoad={blockedRequest ? forceLoadBlockedModel : null}
+            forceBusy={Boolean(usingFilename)}
+          />
+        ) : null}
         {!laneBuckets ? (
           <p className="lane-empty">
             {spine.localLoading ? 'Scanning local models…' : runtimeOnline ? 'Local model scan unavailable.' : 'Runtime offline — the local scan resumes when the backend is back.'}
