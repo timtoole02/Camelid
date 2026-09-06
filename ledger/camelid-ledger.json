@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "d1a9b57a",
+    "source_head": "f470238c",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -267,6 +267,41 @@
         "id": "rich_logprobs",
         "status": "supported_current_gate_nonstreaming",
         "notes": "POST /v1/chat/completions supports OpenAI-shaped logprobs/top_logprobs and POST /v1/completions supports legacy parallel-array logprobs for one non-streaming choice. Streaming and n>1 logprobs remain typed unsupported."
+      },
+      {
+        "id": "sampling_temperature",
+        "status": "supported_current_gate",
+        "notes": "temperature is applied on the dense and runnable chat lanes, streaming and non-streaming. Values below 0 are a typed 400; there is no upper bound and high values produce incoherent text. Parity evidence for supported rows is greedy (temperature 0) only — sampled output is outside it. The gemma4 lane ignores sampling and always decodes greedily."
+      },
+      {
+        "id": "sampling_top_p",
+        "status": "supported_current_gate",
+        "notes": "top_p is applied on the dense and runnable chat lanes, streaming and non-streaming. Must be finite and in (0, 1]; anything else is a typed 400. Only meaningful with temperature above 0. The gemma4 lane ignores sampling and always decodes greedily."
+      },
+      {
+        "id": "sampling_top_k",
+        "status": "supported_current_gate",
+        "notes": "top_k is applied on the dense and runnable chat lanes, streaming and non-streaming. top_k of 1 reproduces greedy decoding exactly. A negative value fails to deserialize as a typed 400. Only meaningful with temperature above 0. The gemma4 lane ignores sampling and always decodes greedily."
+      },
+      {
+        "id": "sampling_min_p",
+        "status": "supported_current_gate",
+        "notes": "min_p is applied on the dense and runnable chat lanes, streaming and non-streaming. Must be finite and in [0, 1]; anything else is a typed 400. Only meaningful with temperature above 0. The gemma4 lane ignores sampling and always decodes greedily."
+      },
+      {
+        "id": "sampling_seed",
+        "status": "supported_current_gate",
+        "notes": "seed makes sampled generation reproducible on the dense and runnable chat lanes: the same seed and request return the same text, and different seeds diverge. Without a seed, sampled decoding is still deterministic per request. A seed has no observable effect at temperature 0, where decoding is greedy. The gemma4 lane ignores sampling and always decodes greedily."
+      },
+      {
+        "id": "sampling_stop",
+        "status": "supported_current_gate",
+        "notes": "Up to 4 stop strings truncate the reply on the dense and runnable chat lanes, streaming and non-streaming; the response reports finish_reason stop. A stop string may span or split tokens, so the token that completes it is retained in the token ids and in usage.completion_tokens while only the text is cut. An empty array, an empty string, or more than 4 sequences is a typed 400. The gemma4 lane does not read stop."
+      },
+      {
+        "id": "sampling_repeat_penalty",
+        "status": "supported_current_gate",
+        "notes": "repeat_penalty, presence_penalty and frequency_penalty are applied on the dense and runnable chat lanes over the penalty window. Their effect is only observable on a generation with something to penalize; a short reply may be unchanged. Parity evidence for supported rows is greedy and unpenalized. The gemma4 lane ignores sampling and always decodes greedily."
       }
     ],
     "notes": [
