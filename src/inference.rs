@@ -1517,6 +1517,20 @@ pub struct LlamaForwardOutput {
     pub output_norm_state: CpuTensor,
 }
 
+/// Greedy batched target verification plus exact transformer-layer input captures.
+///
+/// EAGLE-3 consumes three target activations from inside the decoder rather than the
+/// final hidden state. Keeping this as a generic layer-input capture seam makes the
+/// target forward authoritative and leaves the learned drafter out of the core Llama
+/// implementation. `layer_inputs[i]` corresponds to `capture_layer_ids[i]` supplied
+/// to [`LlamaInferenceSession::forward_greedy_verify_chunk_with_layer_inputs`].
+#[derive(Debug, Clone)]
+pub struct LlamaGreedyVerifyCapture {
+    pub predictions: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub timings: LlamaForwardTimings,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaTensorCheckpoint {
     pub shape: Vec<usize>,
@@ -4752,6 +4766,48 @@ impl LlamaInferenceSession {
         Ok((greedy_sample_rows(&logits)?, timings))
     }
 
+    /// Run the authoritative batched verify while retaining the input to a small,
+    /// caller-selected set of transformer layers for every row.
+    ///
+    /// Layer ids are absolute, unique, and returned in caller order. Like the
+    /// ordinary verify call, KV is appended for every row and the caller must roll
+    /// rejected rows back.
+    pub fn forward_greedy_verify_chunk_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<LlamaGreedyVerifyCapture> {
+        let (logits, timings, layer_inputs) = self.forward_verify_chunk_logits_with_layer_inputs(
+            token_ids,
+            capture_layer_ids,
+            false,
+        )?;
+        Ok(LlamaGreedyVerifyCapture {
+            predictions: greedy_sample_rows(&logits)?,
+            layer_inputs,
+            timings,
+        })
+    }
+
+    /// Prompt-prefill sibling of
+    /// [`Self::forward_greedy_verify_chunk_with_layer_inputs`]. It appends KV and captures
+    /// every input row, but applies the final norm/output projection to the last row only.
+    /// This avoids materializing `[prompt_tokens, vocab]` logits merely to obtain the first
+    /// generated token (about 2 GiB at a 4k Llama-3.2 prompt).
+    pub fn forward_greedy_prefill_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<LlamaGreedyVerifyCapture> {
+        let (logits, timings, layer_inputs) =
+            self.forward_verify_chunk_logits_with_layer_inputs(token_ids, capture_layer_ids, true)?;
+        Ok(LlamaGreedyVerifyCapture {
+            predictions: greedy_sample_rows(&logits)?,
+            layer_inputs,
+            timings,
+        })
+    }
+
     /// Stochastic speculative-verification forward. Returns the fully filtered target
     /// distribution for each row under the same sampling configuration and history semantics
     /// used by ordinary one-token generation.
@@ -4797,6 +4853,18 @@ impl LlamaInferenceSession {
         &mut self,
         token_ids: &[u32],
     ) -> Result<(CpuTensor, LlamaForwardTimings)> {
+        let (logits, timings, captures) =
+            self.forward_verify_chunk_logits_with_layer_inputs(token_ids, &[], false)?;
+        debug_assert!(captures.is_empty());
+        Ok((logits, timings))
+    }
+
+    fn forward_verify_chunk_logits_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+        logits_last_row_only: bool,
+    ) -> Result<(CpuTensor, LlamaForwardTimings, Vec<CpuTensor>)> {
         if token_ids.is_empty() {
             return Err(BackendError::RuntimeShapeMismatch(
                 "speculative verify chunk requires at least one token".to_string(),
@@ -4812,6 +4880,19 @@ impl LlamaInferenceSession {
                 "speculative verify chunk of {} token(s) exceeds remaining context capacity {}",
                 token_ids.len(),
                 self.remaining_context()
+            )));
+        }
+        let n_layers = self.weights.layers.len();
+        let mut sorted_capture_ids = capture_layer_ids.to_vec();
+        sorted_capture_ids.sort_unstable();
+        if sorted_capture_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "verify layer-input capture ids must be unique".to_string(),
+            ));
+        }
+        if let Some(&bad) = sorted_capture_ids.iter().find(|&&id| id >= n_layers) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "verify layer-input capture id {bad} is outside target layer range 0..{n_layers}"
             )));
         }
 
@@ -4849,11 +4930,19 @@ impl LlamaInferenceSession {
         let config = &self.config;
         let weights = &self.weights;
         let kv_cache = &mut self.kv_cache;
-        let layer_results =
-            run_on_prefill_pool(|| -> Result<(CpuTensor, Vec<LlamaLayerTimings>)> {
+        let layer_results = run_on_prefill_pool(
+            || -> Result<(CpuTensor, Vec<LlamaLayerTimings>, Vec<CpuTensor>)> {
                 let mut layer_timings = Vec::with_capacity(weights.layers.len());
                 let mut hidden_inner = hidden;
+                let mut captures: Vec<Option<CpuTensor>> = vec![None; capture_layer_ids.len()];
                 for (layer_idx, layer) in weights.layers.iter().enumerate() {
+                    if let Some(capture_slot) =
+                        capture_layer_ids.iter().position(|&id| id == layer_idx)
+                    {
+                        let mut captured = hidden_inner.clone();
+                        captured.name = format!("verify_layer_{layer_idx}_input");
+                        captures[capture_slot] = Some(captured);
+                    }
                     let timed = forward_prefill_layer_chunk_timed(
                         &hidden_inner,
                         layer,
@@ -4871,17 +4960,41 @@ impl LlamaInferenceSession {
                     hidden_inner = timed.output;
                     layer_timings.push(timed.timings);
                 }
-                Ok((hidden_inner, layer_timings))
-            })?;
-        let (hidden, layer_timings) = layer_results;
+                let captures = captures
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, captured)| {
+                        captured.ok_or_else(|| {
+                            BackendError::RuntimeShapeMismatch(format!(
+                                "verify did not reach requested layer-input capture {}",
+                                capture_layer_ids[slot]
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((hidden_inner, layer_timings, captures))
+            },
+        )?;
+        let (hidden, layer_timings, layer_inputs) = layer_results;
         timings.layers = layer_timings;
         timings.layers_total = layers_started.elapsed().as_micros();
 
         let final_norm_started = Instant::now();
-        let norm = if self.weights.output_norm.shape.dims[0] == 0 {
-            hidden
+        let hidden_for_logits = if logits_last_row_only {
+            let width = hidden.dim(1)?;
+            let start = (token_ids.len() - 1) * width;
+            CpuTensor::from_f32(
+                "verify_chunk_last_hidden",
+                vec![1, width],
+                hidden.data[start..start + width].to_vec(),
+            )?
         } else {
-            hidden.rms_norm(
+            hidden
+        };
+        let norm = if self.weights.output_norm.shape.dims[0] == 0 {
+            hidden_for_logits
+        } else {
+            hidden_for_logits.rms_norm(
                 &self.weights.output_norm,
                 rms_norm_epsilon,
                 "output_norm_verify_chunk",
@@ -4901,7 +5014,7 @@ impl LlamaInferenceSession {
         self.kv_cache.position += token_ids.len();
         timings.total = total_started.elapsed().as_micros();
         metal_seam::end_inference_session();
-        Ok((logits, timings))
+        Ok((logits, timings, layer_inputs))
     }
 
     fn forward_prefill_layer_major_timed_fast(

@@ -13600,7 +13600,11 @@ pub struct CudaResidentDecode {
 /// per-row block-order reduction — the result stays bit-identical). A larger K
 /// lets each weight read verify more drafts per round, raising the ceiling on
 /// repetitive/structured output where n-gram acceptance is high.
-pub(crate) const MAX_VERIFY_K: usize = 8;
+// 16 (was 8): the host draft/verify gate in inference.rs clamps BOTH GPU
+// lanes with this constant, and the Metal multi-column verify profits from
+// deeper windows. CUDA-side cost is scratch sizing only (d_verify_scores and
+// friends scale linearly with this constant).
+pub(crate) const MAX_VERIFY_K: usize = 16;
 const MAX_PRISM_PREFILL_K: usize = 128;
 const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
 

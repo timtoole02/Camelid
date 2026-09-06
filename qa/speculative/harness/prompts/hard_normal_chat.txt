@@ -1,0 +1,1 @@
+Explain in a few clear sentences what the difference is between a process and a thread, and when you would choose one over the other.

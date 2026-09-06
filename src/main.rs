@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::Write,
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
@@ -12,6 +13,52 @@ extern "C" {
         qos_class: u32,
         relative_priority: std::os::raw::c_int,
     ) -> std::os::raw::c_int;
+}
+
+/// Commit prefixes used by the rejected-tail overwrite receipt for one physical
+/// verifier width. The middle case straddles the boundary between the two K8
+/// fragments at W16, while zero/full pin rollback and complete-commit behavior.
+#[cfg(any(target_os = "macos", test))]
+fn gemma4_rejected_tail_commit_prefixes(width: usize) -> Option<Vec<usize>> {
+    if !matches!(width, 1 | 2 | 4 | 8 | 16) {
+        return None;
+    }
+    let mut prefixes = vec![
+        0,
+        1,
+        (width / 2).saturating_sub(1),
+        width.saturating_sub(1),
+        width,
+    ];
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    Some(prefixes)
+}
+
+#[cfg(test)]
+mod gemma4_verifier_receipt_tests {
+    use super::gemma4_rejected_tail_commit_prefixes;
+
+    #[test]
+    fn rejected_tail_prefixes_scale_through_physical_w16() {
+        let cases: [(usize, &[usize]); 5] = [
+            (1, &[0, 1]),
+            (2, &[0, 1, 2]),
+            (4, &[0, 1, 3, 4]),
+            (8, &[0, 1, 3, 7, 8]),
+            (16, &[0, 1, 7, 15, 16]),
+        ];
+        for (width, expected) in cases {
+            assert_eq!(
+                gemma4_rejected_tail_commit_prefixes(width).as_deref(),
+                Some(expected),
+                "physical W{width}",
+            );
+        }
+        for refused in [0usize, 3, 6, 12, 15, 17, usize::MAX] {
+            assert!(gemma4_rejected_tail_commit_prefixes(refused).is_none());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +135,98 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn bench_eagle3_dynamic_tree_flags_are_optional_and_deterministic() {
+        on_cli_test_stack(|| {
+            let defaults =
+                Cli::try_parse_from(["camelid", "bench-eagle3", "target.gguf", "--eagle3", "head"])
+                    .expect("parse EAGLE-3 linear defaults");
+            match defaults.command {
+                Some(Command::BenchEagle3 {
+                    draft_tokens,
+                    tree_nodes,
+                    tree_topk,
+                    tree_expansions,
+                    suffix_first,
+                    ..
+                }) => {
+                    assert_eq!(draft_tokens, 4);
+                    assert_eq!(tree_nodes, None);
+                    assert_eq!(tree_topk, 4);
+                    assert_eq!(tree_expansions, 4);
+                    assert!(!suffix_first);
+                }
+                other => panic!("expected BenchEagle3, got {other:?}"),
+            }
+
+            let tree = Cli::try_parse_from([
+                "camelid",
+                "bench-eagle3",
+                "target.gguf",
+                "--eagle3",
+                "head",
+                "--draft-tokens",
+                "7",
+                "--tree-nodes",
+                "12",
+                "--tree-topk",
+                "8",
+                "--tree-expansions",
+                "5",
+                "--suffix-first",
+            ])
+            .expect("parse EAGLE-3 dynamic tree flags");
+            match tree.command {
+                Some(Command::BenchEagle3 {
+                    draft_tokens,
+                    tree_nodes,
+                    tree_topk,
+                    tree_expansions,
+                    suffix_first,
+                    ..
+                }) => {
+                    assert_eq!(draft_tokens, 7);
+                    assert_eq!(tree_nodes, Some(12));
+                    assert_eq!(tree_topk, 8);
+                    assert_eq!(tree_expansions, 5);
+                    assert!(suffix_first);
+                }
+                other => panic!("expected BenchEagle3, got {other:?}"),
+            }
+
+            let suffix_without_tree = Cli::try_parse_from([
+                "camelid",
+                "bench-eagle3",
+                "target.gguf",
+                "--eagle3",
+                "head",
+                "--suffix-first",
+            ])
+            .expect_err("--suffix-first must require --tree-nodes");
+            assert_eq!(
+                suffix_without_tree.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        });
+    }
+
+    #[test]
+    fn deepest_suffix_chain_prefers_the_first_deepest_branch_within_budget() {
+        let tree = camelid::inference::spec_tree::TokenTree {
+            tokens: vec![10, 20, 30, 21, 31, 22],
+            parent: vec![-1, 0, 0, 1, 2, 3],
+            depth: vec![0, 1, 1, 2, 2, 3],
+        };
+        assert_eq!(deepest_suffix_chain(&tree, 3), vec![20, 21, 22]);
+        assert_eq!(deepest_suffix_chain(&tree, 2), vec![20, 21]);
+        assert!(deepest_suffix_chain(&tree, 0).is_empty());
+        assert!(deepest_suffix_chain(
+            &camelid::inference::spec_tree::TokenTree::linear(10, &[]),
+            4
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn inspect_source_accepts_a_hugging_face_directory() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from(["camelid", "inspect-source", "hf-model"])
@@ -98,6 +237,67 @@ mod ghost_moe_cli_tests {
                 }
                 other => panic!("expected InspectSource, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn gemma4_mtp12_gpu_parses_exact_assistant_and_target_widths() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "gemma4-mtp12-gpu",
+                "target.gguf",
+                "--assistant",
+                "assistant/model.safetensors",
+                "--max-tokens",
+                "96",
+                "--widths",
+                "2,4,8,16",
+            ])
+            .expect("parse Gemma 4 MTP12 Metal harness");
+            match cli.command {
+                Some(Command::Gemma4Mtp12Gpu {
+                    path,
+                    assistant,
+                    max_tokens,
+                    widths,
+                    ..
+                }) => {
+                    assert_eq!(path, PathBuf::from("target.gguf"));
+                    assert_eq!(assistant, PathBuf::from("assistant/model.safetensors"));
+                    assert_eq!(max_tokens, 96);
+                    assert_eq!(widths, vec![2, 4, 8, 16]);
+                }
+                other => panic!("expected Gemma4Mtp12Gpu, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn gemma4_q4_repack_requires_an_explicit_sidecar_destination() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "gemma4-q4-repack",
+                "target.gguf",
+                "--output",
+                "target.q4-native",
+            ])
+            .expect("parse Gemma 4 native Q4 repack command");
+            match cli.command {
+                Some(Command::Gemma4Q4Repack { path, output }) => {
+                    assert_eq!(path, PathBuf::from("target.gguf"));
+                    assert_eq!(output, PathBuf::from("target.q4-native"));
+                }
+                other => panic!("expected Gemma4Q4Repack, got {other:?}"),
+            }
+
+            let missing = Cli::try_parse_from(["camelid", "gemma4-q4-repack", "target.gguf"])
+                .expect_err("native Q4 repack must not invent an output path");
+            assert_eq!(
+                missing.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
         });
     }
 
@@ -2428,6 +2628,14 @@ enum Command {
         #[arg(long)]
         receipt: Option<PathBuf>,
     },
+    /// Offline, exact-target repack of dense Gemma 4 Q4_0 projections into the
+    /// native scale-plane/quant-plane sidecar consumed by the Metal runtime.
+    /// The source GGUF is never modified and an existing output is refused.
+    Gemma4Q4Repack {
+        path: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Generate text with a Gemma 4 model on the GPU (resident decode; macOS/Metal).
     Gemma4GenerateGpu {
         path: PathBuf,
@@ -2435,6 +2643,50 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
+    },
+    /// Qualify and benchmark lossless Gemma 4 12B MTP speculative decode on
+    /// Metal. The exact official assistant drafts 1/3/7/15 tokens for target
+    /// verifier widths 2/4/8/16; every run must reproduce ordered K1 token IDs.
+    /// For an explicitly configured W16 run, the default-off strict selector
+    /// `CAMELID_GEMMA4_MTP_W16_WARMUP8=1` starts at W8 and promotes only after
+    /// a complete W8 acceptance round.
+    /// `CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1` is a mutually-exclusive
+    /// experiment: run one W8 bootstrap, stay W16 regardless of its acceptance,
+    /// and admit a causally padded physical-W16 tail when it replaces two tails.
+    /// With configured W8, `CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL=1` executes
+    /// remaining budgets 5–8 as a padded physical W8, reserves the exact bonus
+    /// anchor, and falls back to the existing tail if eight KV slots do not fit.
+    Gemma4Mtp12Gpu {
+        path: PathBuf,
+        /// Exact official 12B assistant `model.safetensors` file.
+        #[arg(long)]
+        assistant: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 96)]
+        max_tokens: usize,
+        /// Target verifier widths. The anchor row is included, so these map to
+        /// assistant draft counts 1/3/7/15. The default remains the established
+        /// 2/4/8 sweep; pass 16 explicitly to exercise the opt-in K16 Q4 lane.
+        #[arg(long, value_delimiter = ',', default_value = "2,4,8")]
+        widths: Vec<usize>,
+    },
+    /// Qualify and time the strict K<=16 ordered-Q4 Gemma 4 target verifier.
+    /// This is a developer harness: it first requires whole-output K=1 parity
+    /// with the established GPU lane, then teacher-forces one fixed sequence
+    /// through each requested width and requires every target prediction to
+    /// equal the ordered K=1 result.
+    Gemma4VerifyGpu {
+        path: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 96)]
+        max_tokens: usize,
+        /// Verifier row widths. Only 1,2,4,8,16 are admitted; each timed batch
+        /// is full-width so rows/s cannot be inflated by a scalar tail. The
+        /// default remains the established K<=8 sweep.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
+        widths: Vec<usize>,
     },
     /// Chat with a DiffusionGemma model: render the chat template, run the
     /// bit-exact multi-canvas block-autoregressive denoise loop, detokenize.
@@ -2863,7 +3115,7 @@ enum Command {
         /// Draft model GGUF for --drafter draft. Must share the target's token mapping.
         #[arg(long)]
         draft_model: Option<PathBuf>,
-        /// Drafted tokens per round (γ). Capped at MAX_VERIFY_K - 1 = 7 by the verify path.
+        /// Drafted tokens per round (γ). Capped at MAX_VERIFY_K - 1 = 15 by the verify path.
         #[arg(long)]
         draft_tokens: Option<usize>,
         /// Force the draft model onto the CPU forward path (Path 3 in SPEC_RECHECK). Default
@@ -2894,6 +3146,53 @@ enum Command {
         #[arg(long, default_value_t = false)]
         warmup: bool,
         /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
+    /// Benchmark-only Llama 3.2 3B EAGLE-3 speculative decode. The learned head
+    /// and target verifier run on resident Metal, with target output authoritative.
+    /// This is learned EAGLE-3 speculation, not a native target MTP head.
+    BenchEagle3 {
+        /// Exact Llama-3.2-3B-Instruct target GGUF.
+        model: PathBuf,
+        /// Directory containing the pinned EAGLE-3 config.json and model.safetensors.
+        #[arg(long)]
+        eagle3: PathBuf,
+        /// Top-1 draft-chain length per verify round.
+        #[arg(long, default_value_t = 4)]
+        draft_tokens: usize,
+        /// Enable dynamic EAGLE tree verification with this node budget (including the root).
+        /// Omit to preserve the existing top-1 linear-chain path.
+        #[arg(long)]
+        tree_nodes: Option<usize>,
+        /// Retained draft-head alternatives per expanded tree parent (1..=8).
+        #[arg(long, default_value_t = 4)]
+        tree_topk: usize,
+        /// Learned-head parent expansions per tree round, including the root expansion.
+        #[arg(long, default_value_t = 4)]
+        tree_expansions: usize,
+        /// Try a model-free suffix chain first, falling back to the dynamic EAGLE tree
+        /// when history contains no usable suffix continuation. Benchmark-only and
+        /// valid only with --tree-nodes.
+        #[arg(long, default_value_t = false, requires = "tree_nodes")]
+        suffix_first: bool,
+        /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Inline prompt text (used when --prompt-file is absent).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Render the supplied text as one user turn through the same no-tools
+        /// chat-template path used by /v1/chat/completions.
+        #[arg(long, default_value_t = false)]
+        chat: bool,
+        /// Workload label recorded in the JSON receipt.
+        #[arg(long, default_value = "unlabeled")]
+        workload: String,
+        /// Maximum generated tokens, including the first target anchor.
+        #[arg(long, default_value_t = 96)]
+        max_tokens: usize,
+        /// Override Rayon worker threads for the target verifier.
         #[arg(long)]
         threads: Option<usize>,
     },
@@ -4903,6 +5202,16 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Gemma4Q4Repack { path, output } => {
+            eprintln!(
+                "[gemma4-q4-repack] validating and repacking {} -> {}",
+                path.display(),
+                output.display()
+            );
+            let manifest =
+                camelid::gemma4_q4_sidecar::repack_exact_gemma4_q4_sidecar(&path, &output)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
         Command::Gemma4GenerateGpu {
             path,
             prompt,
@@ -4934,6 +5243,708 @@ async fn main() -> anyhow::Result<()> {
                 let _ = (&path, &prompt, max_tokens);
                 return Err(camelid::BackendError::UnsupportedModelArchitecture(
                     "gemma4 GPU runtime requires macOS/Metal".into(),
+                )
+                .into());
+            }
+        }
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        Command::Gemma4Mtp12Gpu {
+            path,
+            assistant,
+            prompt,
+            max_tokens,
+            mut widths,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                widths.sort_unstable();
+                widths.dedup();
+                if widths.is_empty() || widths.iter().any(|width| !matches!(width, 2 | 4 | 8 | 16))
+                {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 verifier widths must be a non-empty subset of 2,4,8,16; got {widths:?}"
+                    ))
+                    .into());
+                }
+                let max_width = *widths.last().expect("non-empty MTP12 widths");
+                if max_tokens == 0 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 MTP12 qualification requires max_tokens > 0".into(),
+                    )
+                    .into());
+                }
+                for forbidden_env in [
+                    "CAMELID_GEMMA4_DENSE_ORDERED_Q4",
+                    "CAMELID_GEMMA4_VERIFY_TRACE",
+                    "CAMELID_GEMMA4_METAL_HEAD_TIMING",
+                    "CAMELID_GEMMA4_GPU_TIMING",
+                ] {
+                    if std::env::var(forbidden_env)
+                        .ok()
+                        .as_deref()
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "Gemma 4 MTP12 benchmark requires {forbidden_env} to be unset"
+                        ))
+                        .into());
+                    }
+                }
+
+                let max_positions = 512usize;
+                let conservative_positions = prompt
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(max_width);
+                if conservative_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 benchmark is capped at {max_positions} KV rows; UTF-8-byte upper bound is {conservative_positions}"
+                    ))
+                    .into());
+                }
+                let model_bytes = std::fs::metadata(&path)?.len();
+                let assistant_bytes = std::fs::metadata(&assistant)?.len();
+
+                eprintln!(
+                    "[gemma4-mtp12] loading target {} with KV capacity {max_positions}...",
+                    path.display()
+                );
+                let load_started = std::time::Instant::now();
+                let runtime =
+                    camelid::gemma4_runtime::Gemma4GpuRuntime::load(&path, max_positions)?;
+                let target_load_us = load_started.elapsed().as_micros();
+                eprintln!("[gemma4-mtp12] admitting exact target SHA-256...");
+                let target_identity_us = runtime.admit_mtp12_target_identity()?;
+                let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?;
+                let required_positions = prompt_tokens
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(max_width);
+                if required_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 needs {required_positions} KV positions, capacity is {max_positions}"
+                    ))
+                    .into());
+                }
+
+                eprintln!("[gemma4-mtp12] qualifying established vs ordered K1 target output...");
+                let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
+                if qualification.token_ids.len() < max_width {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 MTP12 benchmark needs at least {max_width} qualified outputs; got {}",
+                        qualification.token_ids.len(),
+                    ))
+                    .into());
+                }
+                let qualification_decode_forwards_per_s = if qualification.decode_us == 0 {
+                    0.0
+                } else {
+                    qualification.decode_forward_count as f64 * 1_000_000.0
+                        / qualification.decode_us as f64
+                };
+
+                eprintln!(
+                    "[gemma4-mtp12] loading exact assistant {}...",
+                    assistant.display()
+                );
+                let assistant_load_started = std::time::Instant::now();
+                let mut drafter = camelid::metal::Gemma4Mtp12AssistantMetal::load(&assistant)?;
+                let assistant_load_us = assistant_load_started.elapsed().as_micros();
+                let mut runs = Vec::with_capacity(widths.len());
+                let mut exact_all = true;
+
+                for width in widths.iter().copied() {
+                    eprintln!(
+                        "[gemma4-mtp12] lossless decode W={width} / drafts={}...",
+                        width - 1
+                    );
+                    let wall_started = std::time::Instant::now();
+                    let generation = runtime.generate_greedy_mtp12_ordered_q4(
+                        &mut drafter,
+                        &prompt,
+                        max_tokens,
+                        width,
+                    )?;
+                    let generation_wall_us = wall_started.elapsed().as_micros();
+                    let first_id_divergence = qualification
+                        .token_ids
+                        .iter()
+                        .zip(&generation.token_ids)
+                        .position(|(left, right)| left != right)
+                        .or_else(|| {
+                            (qualification.token_ids.len() != generation.token_ids.len()).then_some(
+                                qualification
+                                    .token_ids
+                                    .len()
+                                    .min(generation.token_ids.len()),
+                            )
+                        });
+                    let ids_exact = first_id_divergence.is_none()
+                        && generation.token_ids.len() == qualification.token_ids.len();
+                    let text_exact = generation.text == qualification.text;
+                    let exact = ids_exact && text_exact;
+                    exact_all &= exact;
+                    let decode_outputs = generation.token_ids.len().saturating_sub(1);
+                    let decode_output_tok_s = if generation.stats.decode_us == 0 {
+                        0.0
+                    } else {
+                        decode_outputs as f64 * 1_000_000.0 / generation.stats.decode_us as f64
+                    };
+                    let end_to_end_tok_s = if generation_wall_us == 0 {
+                        0.0
+                    } else {
+                        generation.token_ids.len() as f64 * 1_000_000.0 / generation_wall_us as f64
+                    };
+                    let qualified_generation_us =
+                        generation_wall_us.saturating_sub(generation.stats.target_identity_us);
+                    let qualified_end_to_end_tok_s = if qualified_generation_us == 0 {
+                        0.0
+                    } else {
+                        generation.token_ids.len() as f64 * 1_000_000.0
+                            / qualified_generation_us as f64
+                    };
+                    eprintln!(
+                        "[gemma4-mtp12] W={width}: {decode_output_tok_s:.3} decode tok/s, alpha={:.3}, accepted={}/{}, exact={exact}",
+                        generation.stats.alpha(),
+                        generation.stats.accepted_drafts,
+                        generation.stats.drafted,
+                    );
+                    runs.push(serde_json::json!({
+                        "configured_verify_width": width,
+                        "cold_generation_wall_us": generation_wall_us,
+                        "qualified_generation_wall_us": qualified_generation_us,
+                        "decode_output_count": decode_outputs,
+                        "decode_output_tok_s": decode_output_tok_s,
+                        "cold_end_to_end_output_tok_s": end_to_end_tok_s,
+                        "qualified_end_to_end_output_tok_s": qualified_end_to_end_tok_s,
+                        "first_id_divergence_vs_ordered_k1": first_id_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "ids_exact": ids_exact,
+                        "text_exact": text_exact,
+                        "exact": exact,
+                        "target_model_sha256": generation.target_model_sha256,
+                        "assistant_model_sha256": generation.assistant_model_sha256,
+                        "assistant_source_path": generation.assistant_source_path,
+                        "assistant_resident_ledger": generation.assistant_resident_ledger,
+                        "stats": generation.stats,
+                        "token_ids": generation.token_ids,
+                        "text": generation.text
+                    }));
+                }
+
+                let receipt = serde_json::json!({
+                    "schema": "camelid.gemma4_mtp12_metal_lossless_sweep.v1",
+                    "camelid_version": VERSION,
+                    "source_commit": option_env!("CAMELID_GIT_COMMIT"),
+                    "model_path": path,
+                    "model_bytes": model_bytes,
+                    "assistant_path": assistant,
+                    "assistant_bytes": assistant_bytes,
+                    "prompt": prompt,
+                    "prompt_tokens": prompt_tokens.len(),
+                    "max_tokens": max_tokens,
+                    "max_positions": max_positions,
+                    "target_load_us": target_load_us,
+                    "target_identity_us": target_identity_us,
+                    "assistant_load_us": assistant_load_us,
+                    "environment": {
+                        "CAMELID_GEMMA4_MTP_W16_WARMUP8": std::env::var("CAMELID_GEMMA4_MTP_W16_WARMUP8").ok(),
+                        "CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16": std::env::var("CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16").ok(),
+                        "CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL": std::env::var("CAMELID_GEMMA4_MTP12_W8_PADDED_TAIL").ok(),
+                        "CAMELID_GEMMA4_MTP12_DENSE_BF16": std::env::var("CAMELID_GEMMA4_MTP12_DENSE_BF16").ok(),
+                        "CAMELID_GEMMA4_MTP12_SINGLE_POSITION": std::env::var("CAMELID_GEMMA4_MTP12_SINGLE_POSITION").ok(),
+                        "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
+                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
+                        "CAMELID_GEMMA4_Q4_ROW_OPS": std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_ROWMAJOR": std::env::var("CAMELID_GEMMA4_Q4_MMA_ROWMAJOR").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
+                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16").ok(),
+                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
+                        "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
+                        "CAMELID_GEMMA4_DENSE_ORDERED_Q4": std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok(),
+                        "CAMELID_GEMMA4_DENSE_ATTN_ROWS": std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS").ok(),
+                        "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
+                        "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
+                        "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
+                    },
+                    "dense_attention_rows_contract": {
+                        "selector": "CAMELID_GEMMA4_DENSE_ATTN_ROWS",
+                        "explicit_request_admission": "all_48_dense_layers_per_target_batch_or_fail_closed",
+                        "default_when_unset": "per_row_split3"
+                    },
+                    "ordered_k1_qualification": {
+                        "exact_vs_established": true,
+                        "prefill_us": qualification.prefill_us,
+                        "decode_us": qualification.decode_us,
+                        "decode_forward_count": qualification.decode_forward_count,
+                        "decode_target_forwards_per_s": qualification_decode_forwards_per_s,
+                        "token_ids": qualification.token_ids,
+                        "text": qualification.text
+                    },
+                    "runs": runs,
+                    "exact_all_widths": exact_all,
+                    "timing_scope": "Qualified generation wall includes ordered prompt replay plus lossless decode; decode_output_tok_s excludes prompt and first output produced by prefill; one-time target identity hash and assistant load are separately accounted"
+                });
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+                if !exact_all {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 MTP12 output diverged from qualified ordered K1".into(),
+                    )
+                    .into());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (&path, &assistant, &prompt, max_tokens, &widths);
+                return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                    "Gemma 4 MTP12 Metal runtime requires macOS".into(),
+                )
+                .into());
+            }
+        }
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        Command::Gemma4VerifyGpu {
+            path,
+            prompt,
+            max_tokens,
+            mut widths,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                let established_ordered_env = std::env::var("CAMELID_GEMMA4_DENSE_ORDERED_Q4").ok();
+                if established_ordered_env
+                    .as_deref()
+                    .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "gemma4 verifier qualification requires the production established baseline; unset CAMELID_GEMMA4_DENSE_ORDERED_Q4"
+                            .into(),
+                    )
+                    .into());
+                }
+                for timing_env in [
+                    "CAMELID_GEMMA4_VERIFY_TRACE",
+                    "CAMELID_GEMMA4_METAL_HEAD_TIMING",
+                    "CAMELID_GEMMA4_GPU_TIMING",
+                ] {
+                    if std::env::var(timing_env)
+                        .ok()
+                        .as_deref()
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "gemma4 verifier timing receipt requires {timing_env} to be unset"
+                        ))
+                        .into());
+                    }
+                }
+                if max_tokens == 0 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "gemma4 verifier qualification requires max_tokens > 0".into(),
+                    )
+                    .into());
+                }
+                widths.sort_unstable();
+                widths.dedup();
+                if widths.is_empty()
+                    || widths
+                        .iter()
+                        .any(|width| !matches!(width, 1 | 2 | 4 | 8 | 16))
+                {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 ordered verifier widths must be a non-empty subset of 1,2,4,8,16; got {widths:?}"
+                    ))
+                    .into());
+                }
+                if !widths.contains(&1) {
+                    widths.insert(0, 1);
+                }
+                let max_width = *widths.last().expect("non-empty verifier widths");
+                // UTF-8 bytes are a conservative upper bound for the tokenizer's
+                // byte-fallback pieces. Keep this Mini2 harness deliberately
+                // short-context: never turn a long raw prompt into an accidental
+                // multi-GiB KV allocation on a 16 GB machine.
+                let max_positions = 512usize;
+                let conservative_positions = prompt
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(max_width);
+                if conservative_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "gemma4 verifier is capped at {max_positions} KV rows; UTF-8-byte upper bound is {conservative_positions}"
+                    ))
+                    .into());
+                }
+                let model_bytes = std::fs::metadata(&path)?.len();
+                let model_sha256 = camelid::receipt::sha256_file_hex_cached(&path)?;
+                eprintln!(
+                    "[gemma4-verify] loading {} with KV capacity {max_positions}...",
+                    path.display()
+                );
+                let load_started = std::time::Instant::now();
+                let runtime =
+                    camelid::gemma4_runtime::Gemma4GpuRuntime::load(&path, max_positions)?;
+                let prompt_tokens = runtime.tokenizer().encode(&prompt, true, true)?;
+                let required_positions = prompt_tokens
+                    .len()
+                    .saturating_add(max_tokens)
+                    .saturating_add(max_width);
+                if required_positions > max_positions {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 verifier needs {required_positions} KV positions for prompt={} + max_new={max_tokens} + K={max_width}, but capacity is {max_positions}",
+                        prompt_tokens.len(),
+                    ))
+                    .into());
+                }
+                let load_us = load_started.elapsed().as_micros();
+
+                eprintln!(
+                    "[gemma4-verify] whole-target established-vs-ordered K1 qualification..."
+                );
+                let qualification = runtime.qualify_ordered_q4_k1(&prompt, max_tokens)?;
+                let qualification_decode_forwards_per_s = if qualification.decode_us == 0 {
+                    0.0
+                } else {
+                    qualification.decode_forward_count as f64 * 1_000_000.0
+                        / qualification.decode_us as f64
+                };
+                eprintln!(
+                    "[gemma4-verify] K1 IDs exact: {} outputs; ordered prefill {:.3}s, decode {:.3}s ({qualification_decode_forwards_per_s:.3} target forwards/s)",
+                    qualification.token_ids.len(),
+                    qualification.prefill_us as f64 / 1_000_000.0,
+                    qualification.decode_us as f64 / 1_000_000.0,
+                );
+
+                let timed_rows = qualification.token_ids.len() / max_width * max_width;
+                if timed_rows == 0 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "Gemma 4 verifier generated sequence has {} rows, fewer than K={max_width}",
+                        qualification.token_ids.len(),
+                    ))
+                    .into());
+                }
+                let teacher_tokens = &qualification.token_ids[..timed_rows];
+
+                let run_width = |width: usize,
+                                 tokens: &[u32]|
+                 -> anyhow::Result<(Vec<u32>, Vec<u32>, u128)> {
+                    if !tokens.len().is_multiple_of(width) {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "teacher-forced row count {} is not divisible by K={width}",
+                            tokens.len(),
+                        ))
+                        .into());
+                    }
+                    // Replay the prompt into this width's fresh ordered cache
+                    // outside the clock. Only post-prompt candidate rows are
+                    // part of the target-verifier throughput receipt.
+                    let prefill = runtime.prefill_ordered_q4(&prompt)?;
+                    if prefill.first_greedy_id != tokens[0] {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "ordered prefill predicted {}, but the qualified teacher trajectory starts with {}",
+                            prefill.first_greedy_id, tokens[0],
+                        ))
+                        .into());
+                    }
+                    let started = std::time::Instant::now();
+                    let mut predictions = Vec::with_capacity(tokens.len());
+                    let mut hidden_bits = Vec::with_capacity(tokens.len().saturating_mul(3_840));
+                    let mut position = prefill.prompt_token_count;
+                    for chunk in tokens.chunks_exact(width) {
+                        let batch = runtime.verify_consecutive_greedy(chunk, position)?;
+                        predictions.extend_from_slice(&batch.greedy_ids);
+                        hidden_bits.extend(
+                            batch
+                                .final_hidden
+                                .iter()
+                                .flatten()
+                                .map(|value| value.to_bits()),
+                        );
+                        position = runtime.commit_verifier_prefix(batch.ticket, width)?;
+                    }
+                    Ok((predictions, hidden_bits, started.elapsed().as_micros()))
+                };
+
+                // Exercise the transactional invariant used by real speculative
+                // decode, not merely the full-commit throughput path. Use the
+                // requested maximum physical width so a W16 receipt really writes
+                // sixteen cache rows. Zero/full pin the boundary cases; 1, 7 and
+                // 15 span a large tail, the K8-fragment boundary, and a one-row tail.
+                let rejected_tail_width = max_width;
+                let rejected_tail_prefixes =
+                    gemma4_rejected_tail_commit_prefixes(rejected_tail_width)
+                        .expect("validated verifier width has an overwrite-prefix plan");
+                if qualification.token_ids.len() < rejected_tail_width {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        format!(
+                            "Gemma 4 rejected-tail W{rejected_tail_width} gate requires at least {rejected_tail_width} qualified output tokens"
+                        ),
+                    )
+                    .into());
+                }
+                let tail_a = &qualification.token_ids[..rejected_tail_width];
+                let stop_ids = runtime.stop_token_ids();
+                let mut candidate_pool: Vec<u32> = prompt_tokens
+                    .iter()
+                    .chain(&qualification.token_ids)
+                    .copied()
+                    .filter(|token| !stop_ids.contains(token))
+                    .collect();
+                candidate_pool.sort_unstable();
+                candidate_pool.dedup();
+                if candidate_pool.len() < 2 {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 rejected-tail gate needs two distinct non-stop candidate tokens"
+                            .into(),
+                    )
+                    .into());
+                }
+                let mut rejected_tail_runs = Vec::with_capacity(rejected_tail_prefixes.len());
+                for committed in rejected_tail_prefixes.iter().copied() {
+                    let overlap = rejected_tail_width - committed;
+                    let mut tail_b = Vec::with_capacity(rejected_tail_width);
+                    for row in 0..rejected_tail_width {
+                        let stale = (row < overlap).then(|| tail_a[committed + row]);
+                        let replacement = candidate_pool
+                            .iter()
+                            .copied()
+                            .find(|token| Some(*token) != stale)
+                            .expect("two-token pool always has a non-stale replacement");
+                        tail_b.push(replacement);
+                    }
+
+                    let experiment_prefill = runtime.prefill_ordered_q4(&prompt)?;
+                    if experiment_prefill.first_greedy_id != tail_a[0] {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "rejected-tail experiment prefill predicted {}, expected {}",
+                            experiment_prefill.first_greedy_id, tail_a[0],
+                        ))
+                        .into());
+                    }
+                    let start = experiment_prefill.prompt_token_count;
+                    let a_batch = runtime.verify_consecutive_greedy(tail_a, start)?;
+                    let a_ids = a_batch.greedy_ids.clone();
+                    let a_hidden_bits: Vec<u32> = a_batch
+                        .final_hidden
+                        .iter()
+                        .take(committed)
+                        .flatten()
+                        .map(|value| value.to_bits())
+                        .collect();
+                    if committed == 0 {
+                        runtime.rollback_verifier_batch(a_batch.ticket)?;
+                    } else {
+                        runtime.commit_verifier_prefix(a_batch.ticket, committed)?;
+                    }
+                    let b_batch = runtime.verify_consecutive_greedy(&tail_b, start + committed)?;
+                    let b_ids = b_batch.greedy_ids.clone();
+                    let b_hidden_bits: Vec<u32> = b_batch
+                        .final_hidden
+                        .iter()
+                        .flatten()
+                        .map(|value| value.to_bits())
+                        .collect();
+                    runtime.commit_verifier_prefix(b_batch.ticket, rejected_tail_width)?;
+
+                    let reference_prefill = runtime.prefill_ordered_q4(&prompt)?;
+                    if reference_prefill.first_greedy_id != tail_a[0] {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                            "rejected-tail reference prefill left the qualified trajectory".into(),
+                        )
+                        .into());
+                    }
+                    let mut reference_ids = Vec::with_capacity(committed + rejected_tail_width);
+                    let mut reference_hidden_bits =
+                        Vec::with_capacity((committed + rejected_tail_width).saturating_mul(3_840));
+                    // The replay cursor advances by one committed position per
+                    // token, so it is state carried across iterations, not a
+                    // loop bound. `Cell` keeps that explicit for clippy.
+                    let reference_position =
+                        std::cell::Cell::new(reference_prefill.prompt_token_count);
+                    for &token in tail_a[..committed].iter().chain(&tail_b) {
+                        let (prediction, hidden) =
+                            runtime.forward_greedy_ordered_q4(token, reference_position.get())?;
+                        reference_ids.push(prediction);
+                        reference_hidden_bits.extend(hidden.iter().map(|value| value.to_bits()));
+                        reference_position.set(reference_position.get() + 1);
+                    }
+
+                    let mut experiment_ids = a_ids[..committed].to_vec();
+                    experiment_ids.extend_from_slice(&b_ids);
+                    let mut experiment_hidden_bits = a_hidden_bits;
+                    experiment_hidden_bits.extend_from_slice(&b_hidden_bits);
+                    let first_id_divergence = experiment_ids
+                        .iter()
+                        .zip(&reference_ids)
+                        .position(|(left, right)| left != right);
+                    let first_hidden_divergence = experiment_hidden_bits
+                        .iter()
+                        .zip(&reference_hidden_bits)
+                        .position(|(left, right)| left != right);
+                    let ids_exact = first_id_divergence.is_none()
+                        && experiment_ids.len() == reference_ids.len();
+                    let hidden_bit_exact = first_hidden_divergence.is_none()
+                        && experiment_hidden_bits.len() == reference_hidden_bits.len();
+                    if !ids_exact || !hidden_bit_exact {
+                        return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                            "Gemma 4 rejected-tail W{rejected_tail_width}/commit-{committed} gate diverged: id={first_id_divergence:?}, hidden_scalar={first_hidden_divergence:?}"
+                        ))
+                        .into());
+                    }
+                    rejected_tail_runs.push(serde_json::json!({
+                        "physical_width": rejected_tail_width,
+                        "committed_prefix": committed,
+                        "rejected_rows_overwritten": overlap,
+                        "overwrite_tokens": tail_b,
+                        "first_id_divergence_vs_fresh_k1": -1,
+                        "first_hidden_scalar_divergence_vs_fresh_k1": -1,
+                        "ids_exact": true,
+                        "hidden_bit_exact": true,
+                        "exact": true
+                    }));
+                }
+
+                // Allocate scratch, compile lazy pipelines, and touch every target
+                // weight before each timed width. Reset makes the warm row invisible.
+                let _ = run_width(1, &teacher_tokens[..1])?;
+                let (reference, reference_hidden_bits, reference_us) =
+                    run_width(1, teacher_tokens)?;
+                if let Some(divergence) = reference
+                    .iter()
+                    .take(timed_rows.saturating_sub(1))
+                    .zip(teacher_tokens.iter().skip(1))
+                    .position(|(prediction, teacher)| prediction != teacher)
+                {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(format!(
+                        "ordered K1 teacher trajectory diverged after decode row {divergence}: predicted={} teacher={}",
+                        reference[divergence], teacher_tokens[divergence + 1],
+                    ))
+                    .into());
+                }
+                let reference_rows_per_s = timed_rows as f64 * 1_000_000.0 / reference_us as f64;
+                let mut runs = Vec::with_capacity(widths.len());
+                runs.push(serde_json::json!({
+                    "width": 1,
+                    "batches": timed_rows,
+                    "wall_us": reference_us,
+                    "target_rows_per_s": reference_rows_per_s,
+                    "speedup_vs_k1": 1.0,
+                    "first_id_divergence_vs_k1": -1,
+                    "first_hidden_scalar_divergence_vs_k1": -1,
+                    "ids_exact": true,
+                    "hidden_bit_exact": true,
+                    "exact": true
+                }));
+
+                let mut exact_all = true;
+                for &width in widths.iter().filter(|&&width| width != 1) {
+                    let _ = run_width(width, &teacher_tokens[..width])?;
+                    let (predictions, hidden_bits, wall_us) = run_width(width, teacher_tokens)?;
+                    let first_id_divergence = reference
+                        .iter()
+                        .zip(&predictions)
+                        .position(|(left, right)| left != right);
+                    let ids_exact =
+                        first_id_divergence.is_none() && predictions.len() == reference.len();
+                    let first_hidden_divergence = reference_hidden_bits
+                        .iter()
+                        .zip(&hidden_bits)
+                        .position(|(left, right)| left != right);
+                    let hidden_bit_exact = first_hidden_divergence.is_none()
+                        && hidden_bits.len() == reference_hidden_bits.len();
+                    let exact = ids_exact && hidden_bit_exact;
+                    exact_all &= exact;
+                    let rows_per_s = timed_rows as f64 * 1_000_000.0 / wall_us as f64;
+                    let speedup = reference_us as f64 / wall_us as f64;
+                    eprintln!(
+                        "[gemma4-verify] K={width}: {rows_per_s:.3} target rows/s, {speedup:.3}x K1, ids_exact={ids_exact}, hidden_bit_exact={hidden_bit_exact}"
+                    );
+                    runs.push(serde_json::json!({
+                        "width": width,
+                        "batches": timed_rows / width,
+                        "wall_us": wall_us,
+                        "target_rows_per_s": rows_per_s,
+                        "speedup_vs_k1": speedup,
+                        "first_id_divergence_vs_k1": first_id_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "first_hidden_scalar_divergence_vs_k1": first_hidden_divergence.map(|index| index as i64).unwrap_or(-1),
+                        "ids_exact": ids_exact,
+                        "hidden_bit_exact": hidden_bit_exact,
+                        "exact": exact
+                    }));
+                }
+
+                let receipt = serde_json::json!({
+                    "schema": "camelid.gemma4_ordered_q4_target_sweep.v1",
+                    "model_path": path,
+                    "model_bytes": model_bytes,
+                    "model_sha256": model_sha256,
+                    "camelid_version": VERSION,
+                    "source_commit": option_env!("CAMELID_GIT_COMMIT"),
+                    "prompt": prompt,
+                    "prompt_tokens": prompt_tokens.len(),
+                    "generated_tokens": qualification.token_ids.len(),
+                    "candidate_rows_available": qualification.token_ids.len(),
+                    "timed_rows": timed_rows,
+                    "max_positions": max_positions,
+                    "load_us": load_us,
+                    "environment": {
+                        "CAMELID_GEMMA4_Q4_NATIVE_SIDECAR": std::env::var_os("CAMELID_GEMMA4_Q4_NATIVE_SIDECAR").map(|value| value.to_string_lossy().into_owned()),
+                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA": std::env::var("CAMELID_GEMMA4_Q4_MMA").ok(),
+                        "CAMELID_GEMMA4_Q4_ROW_OPS": std::env::var("CAMELID_GEMMA4_Q4_ROW_OPS").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_ROWMAJOR": std::env::var("CAMELID_GEMMA4_Q4_MMA_ROWMAJOR").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT").ok(),
+                        "CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_MMA_REGISTER_FRAGMENT_K16").ok(),
+                        "CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16": std::env::var("CAMELID_GEMMA4_Q4_NATIVE_REGISTER_FRAGMENT_K16").ok(),
+                        "CAMELID_GEMMA4_DENSE_ORDERED_Q4": established_ordered_env,
+                        "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD": std::env::var("CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD").ok(),
+                        "CAMELID_GEMMA4_DENSE_ATTN_ROWS": std::env::var("CAMELID_GEMMA4_DENSE_ATTN_ROWS").ok(),
+                        "CAMELID_GEMMA4_Q4_DIRECT_TG": std::env::var("CAMELID_GEMMA4_Q4_DIRECT_TG").ok(),
+                        "CAMELID_GEMMA4_VERIFY_TRACE": std::env::var("CAMELID_GEMMA4_VERIFY_TRACE").ok(),
+                        "CAMELID_GEMMA4_METAL_HEAD_TIMING": std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING").ok(),
+                        "CAMELID_GEMMA4_GPU_TIMING": std::env::var("CAMELID_GEMMA4_GPU_TIMING").ok()
+                    },
+                    "dense_attention_rows_contract": {
+                        "selector": "CAMELID_GEMMA4_DENSE_ATTN_ROWS",
+                        "explicit_request_admission": "all_48_dense_layers_per_target_batch_or_fail_closed",
+                        "default_when_unset": "per_row_split3"
+                    },
+                    "ordered_k1_qualification": {
+                        "exact_vs_established": true,
+                        "prefill_us": qualification.prefill_us,
+                        "decode_us": qualification.decode_us,
+                        "decode_forward_count": qualification.decode_forward_count,
+                        "decode_target_forwards_per_s": qualification_decode_forwards_per_s,
+                        "token_ids": qualification.token_ids
+                    },
+                    "runs": runs,
+                    "rejected_tail_overwrite_gate": {
+                        "physical_width": rejected_tail_width,
+                        "commit_prefixes": rejected_tail_prefixes,
+                        "includes_zero_rollback": true,
+                        "includes_full_commit": true,
+                        "exact_all_commit_prefixes": true,
+                        "runs": rejected_tail_runs
+                    },
+                    "exact_all_widths": exact_all,
+                    "timing_scope": "Warm target-only teacher-forced decode-row verifier wall; full-width batches; prompt replay/assistant excluded"
+                });
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+                if !exact_all {
+                    return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                        "Gemma 4 K-wide verifier diverged from ordered K1".into(),
+                    )
+                    .into());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (&path, &prompt, max_tokens, &widths);
+                return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                    "gemma4 ordered verifier requires macOS/Metal".into(),
                 )
                 .into());
             }
@@ -5462,6 +6473,37 @@ async fn main() -> anyhow::Result<()> {
                 workload,
                 max_tokens,
                 warmup,
+                threads,
+            )?;
+        }
+        Command::BenchEagle3 {
+            model,
+            eagle3,
+            draft_tokens,
+            tree_nodes,
+            tree_topk,
+            tree_expansions,
+            suffix_first,
+            prompt_file,
+            prompt,
+            chat,
+            workload,
+            max_tokens,
+            threads,
+        } => {
+            run_bench_eagle3(
+                model,
+                eagle3,
+                draft_tokens,
+                tree_nodes,
+                tree_topk,
+                tree_expansions,
+                suffix_first,
+                prompt_file,
+                prompt,
+                chat,
+                workload,
+                max_tokens,
                 threads,
             )?;
         }
@@ -6182,7 +7224,7 @@ fn ghost_spec_decode(
 ) -> anyhow::Result<()> {
     use camelid::inference::speculative::{accepted_draft_prefix, NGramDrafter};
 
-    let draft_len = draft_len.min(7); // verify-batch width cap (MAX_VERIFY_K - 1)
+    let draft_len = draft_len.min(15); // verify-batch width cap (MAX_VERIFY_K - 1)
     let drafter = NGramDrafter::default();
     let mut history: Vec<u32> = prompt_ids.to_vec();
     let is_stop = |t: u32| tokenizer.special.eos == Some(t) || tokenizer.special.eot == Some(t);
@@ -7877,6 +8919,15 @@ fn generate_run_speculative(
     // the server with CAMELID_SPEC_GPU on); resident decode is the default when a CUDA
     // device is present, so this is the natural state, asserted explicitly here.
     session.set_resident_paths_disabled(false);
+    // The TARGET must not pre-commit encode-ahead graphs in the speculative lane: its next
+    // GPU work after a single-token step is a batched VERIFY, never the pre-encoded
+    // single-token graph, so the pending graph is always stale waste — and worse, it sits
+    // COMMITTED-BUT-UNGATED at the head of Metal's shared serial queue, where a coexisting
+    // draft model's next command buffer queues behind it (measured: a multi-second stall on
+    // the drafter's first step after the target's TTFT). The drafter's own session keeps
+    // encode-ahead ON — its sequential greedy steps are exactly what the pipeline is for,
+    // and its pending graphs are pre-signaled (already draining), so they never clog.
+    session.set_resident_encode_ahead_enabled(false);
 
     let mut history: Vec<u32> = prompt_tokens.to_vec();
     let mut input: Vec<u32> = prompt_tokens.to_vec();
@@ -8307,9 +9358,20 @@ fn generate_run_speculative(
 struct BenchSpeculativeRecord {
     runtime: &'static str,
     commit: String,
+    camelid_version: String,
+    binary_sha256: String,
     workload: String,
+    input_sha256: String,
+    prompt_sha256: String,
+    prompt_format: &'static str,
+    add_bos: bool,
+    add_eos: bool,
+    parse_special: bool,
     model: String,
+    model_sha256: String,
+    tokenizer_metadata_sha256: Option<String>,
     draft_model: Option<String>,
+    draft_model_sha256: Option<String>,
     quantization: String,
     drafter: String,
     cpu_draft: bool,
@@ -8360,10 +9422,37 @@ struct BenchSpeculativeRecord {
     // Lossless gate (intra-Camelid: spec stream vs this run's plain greedy stream).
     first_divergent_generated_token_index: i64,
     lossless: bool,
+    plain_token_ids: Vec<u32>,
+    spec_token_ids: Vec<u32>,
+
+    metal_device: Option<String>,
+    host_isa: String,
+    effective_env: BTreeMap<String, Option<String>>,
+    planner_env_updates: BTreeMap<String, Option<String>>,
+    execution_plan: camelid::execution_plan::ExecutionPlan,
 
     peak_memory_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     offload: Option<camelid::offload::OffloadRunStatus>,
+}
+
+fn speculative_effective_env() -> BTreeMap<String, Option<String>> {
+    const EXTRA_KEYS: &[&str] = &[
+        "CAMELID_SPEC_GPU",
+        "CAMELID_SPEC_DECODE",
+        "CAMELID_SPEC_TREE_GATE",
+        "CAMELID_SPEC_NGRAM_MIN",
+        "CAMELID_METAL_ATTN_SPLITK",
+        "CAMELID_METAL_KV_DTYPE",
+        "CAMELID_KQUANT_MC_GEMV",
+    ];
+    let mut values = eagle3_effective_env();
+    values.extend(
+        EXTRA_KEYS
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok())),
+    );
+    values
 }
 
 /// Load a draft GGUF and wrap it as a `ModelDrafter`. Mirrors the target load path so the
@@ -8428,11 +9517,27 @@ fn run_bench_speculative(
         (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
     };
 
+    let current_exe = std::env::current_exe()?;
+    let binary_sha256 = camelid::receipt::sha256_file_hex(&current_exe)
+        .map_err(|error| anyhow::anyhow!("hashing benchmark binary: {error}"))?;
+    let model_sha256 = camelid::receipt::sha256_file_hex_cached(&model)
+        .map_err(|error| anyhow::anyhow!("hashing target {}: {error}", model.display()))?;
+    let draft_model_sha256 = draft_model
+        .as_deref()
+        .map(camelid::receipt::sha256_file_hex_cached)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("hashing draft model: {error}"))?;
+
     // Load the target exactly as bench-generate does (execution plan applied before weights).
     let gguf = read_metadata(&model)?;
     ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let planner_env_updates = plan_outcome
+        .env_updates
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+        .collect();
     let config = LlamaModelConfig::from_gguf(&gguf)?;
     let binding = LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&model, &gguf);
@@ -8451,13 +9556,19 @@ fn run_bench_speculative(
     let build_drafter = || -> anyhow::Result<SpeculativeDrafter> {
         match drafter_kind.as_str() {
             "ngram" => Ok(SpeculativeDrafter::NGram(NGramDrafter::default())),
+            // Suffix drafting flattened to a chain: fills the verify window the
+            // n-gram drafter leaves mostly empty, without paying the tree
+            // verify's per-round cost.
+            "suffix" => Ok(SpeculativeDrafter::Suffix(Box::default())),
             "draft" => {
                 let path = draft_model.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--drafter draft requires --draft-model <gguf>")
                 })?;
                 load_model_drafter(path, &tokenizer, cpu_draft, threads)
             }
-            other => anyhow::bail!("unknown --drafter {other:?}; expected \"ngram\" or \"draft\""),
+            other => anyhow::bail!(
+                "unknown --drafter {other:?}; expected \"ngram\", \"suffix\" or \"draft\""
+            ),
         }
     };
 
@@ -8468,7 +9579,7 @@ fn run_bench_speculative(
     // reserve) is established BEFORE any target build, so the target builds once under the
     // coexistence budget and the draft stays GPU-resident; the plain reference then reuses that
     // same resident target (so its tps is the coexistence-config target, flagged in the record).
-    let (plain, spec, (draft_fwd_us, draft_resident_steps, draft_cpu_steps)) = if spec_only {
+    let (plain, spec, draft_stats) = if spec_only {
         if warmup {
             eprintln!("[bench-speculative] warmup (unmeasured, spec-only)...");
             let mut w = build_drafter()?;
@@ -8551,6 +9662,7 @@ fn run_bench_speculative(
         let draft_stats = drafter.take_forward_stats();
         (plain, spec, draft_stats)
     };
+    let (draft_fwd_us, draft_resident_steps, draft_cpu_steps, draft_max_step_us) = draft_stats;
     let plain_decode_tokens = plain.generated.len().saturating_sub(1);
     let plain_tps = if plain.decode_ms > 0.0 && plain_decode_tokens > 0 {
         plain_decode_tokens as f64 / (plain.decode_ms / 1000.0)
@@ -8565,16 +9677,27 @@ fn run_bench_speculative(
     };
     // Draft-decode profiling: the GPU forward time of the draft steps vs the wall-clock draft
     // time tells whether the draft cost is in the forward kernels or in sync/overhead around them.
+    // Mean AND max/steady: a lazily-paid one-time cost (engine build, first-touch paging) lands
+    // in ONE step, and a bare mean smears it into what reads as uniform per-step slowness.
     if draft_resident_steps + draft_cpu_steps > 0 {
+        let steady_ms = if draft_resident_steps > 1 {
+            (draft_fwd_us.saturating_sub(draft_max_step_us)) as f64
+                / 1000.0
+                / (draft_resident_steps - 1) as f64
+        } else {
+            draft_fwd_us as f64 / 1000.0
+        };
         eprintln!(
-            "[draft-profile] resident steps {} ({:.1} ms/step GPU forward) | cpu-fallback steps {} | \
-             wall draft {:.1} ms total = {:.1} ms/step | GPU-forward fraction {:.0}%",
+            "[draft-profile] resident steps {} ({:.1} ms/step GPU forward; max {:.1} ms, steady {:.1} ms/step) | \
+             cpu-fallback steps {} | wall draft {:.1} ms total = {:.1} ms/step | GPU-forward fraction {:.0}%",
             draft_resident_steps,
             if draft_resident_steps > 0 {
                 draft_fwd_us as f64 / 1000.0 / draft_resident_steps as f64
             } else {
                 0.0
             },
+            draft_max_step_us as f64 / 1000.0,
+            steady_ms,
             draft_cpu_steps,
             spec.draft_us as f64 / 1000.0,
             if draft_resident_steps + draft_cpu_steps > 0 {
@@ -8622,9 +9745,20 @@ fn run_bench_speculative(
     let record = BenchSpeculativeRecord {
         runtime: "camelid",
         commit: benchmark_commit(),
+        camelid_version: camelid::receipt::camelid_version(),
+        binary_sha256,
         workload,
+        input_sha256: camelid::receipt::sha256_hex(prompt_text.as_bytes()),
+        prompt_sha256: camelid::receipt::sha256_hex(prompt_text.as_bytes()),
+        prompt_format: "raw_completion_bos_no_eos",
+        add_bos: true,
+        add_eos: false,
+        parse_special: false,
         model: model.display().to_string(),
+        model_sha256,
+        tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
         draft_model: draft_model.as_ref().map(|p| p.display().to_string()),
+        draft_model_sha256,
         quantization: camelid::receipt::quantization_label(&gguf),
         drafter: drafter_kind,
         cpu_draft,
@@ -8655,6 +9789,13 @@ fn run_bench_speculative(
         cpu_verify_rounds: spec.cpu_verify_rounds,
         first_divergent_generated_token_index: first_divergent,
         lossless: first_divergent < 0,
+        plain_token_ids: plain.generated,
+        spec_token_ids: spec.generated,
+        metal_device: camelid::metal::detect_metal_device().device_name,
+        host_isa: camelid::receipt::host_isa_marker(),
+        effective_env: speculative_effective_env(),
+        planner_env_updates,
+        execution_plan: plan_outcome.plan,
         peak_memory_bytes: peak_rss_bytes(),
         offload: camelid::offload::offload_run_status(),
     };
@@ -8688,6 +9829,861 @@ fn run_bench_speculative(
         record.cpu_verify_rounds,
         record.drafted,
         record.rounds,
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct Eagle3BenchRun {
+    generated: Vec<u32>,
+    drafted_token_ids: Vec<u32>,
+    ttft_ms: f64,
+    decode_ms: f64,
+    head_upload_ms: f64,
+    head_seed_ms: f64,
+    bootstrap_capture_ms: f64,
+    draft_us: u128,
+    verify_us: u128,
+    head_update_us: u128,
+    rounds: u64,
+    drafted: u64,
+    accepted_drafts: u64,
+    verify_nodes: u64,
+    resident_verify_rounds: u64,
+    cpu_verify_rounds: u64,
+    resident_normal_steps: u64,
+    suffix_rounds: u64,
+    suffix_offered: u64,
+    suffix_emitted_tokens: u64,
+    suffix_head_catchups: u64,
+    suffix_head_catchup_rows: u64,
+    suffix_head_discarded_rows: u64,
+    suffix_head_buffer_us: u128,
+    dynamic_tree_rounds: u64,
+    dynamic_tree_offered: u64,
+    dynamic_tree_emitted_tokens: u64,
+    materialized_head_forwards: u64,
+    dynamic_tree_max_depth_sum: u64,
+}
+
+/// Flatten the first deepest suffix-tree branch, bounded by the verify depth.
+/// Suffix children are inserted in descending frequency order, so choosing the
+/// earliest node at a tied depth preserves the drafter's deterministic ranking.
+fn deepest_suffix_chain(
+    tree: &camelid::inference::spec_tree::TokenTree,
+    max_depth: usize,
+) -> Vec<u32> {
+    let mut leaf = 0usize;
+    for (node, &depth) in tree.depth.iter().enumerate().skip(1) {
+        let depth = depth as usize;
+        if depth <= max_depth && depth > tree.depth[leaf] as usize {
+            leaf = node;
+        }
+    }
+    if leaf == 0 {
+        return Vec::new();
+    }
+    tree.path_to(leaf)
+        .into_iter()
+        .skip(1)
+        .map(|node| tree.tokens[node])
+        .collect()
+}
+
+fn run_plain_resident_greedy(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+) -> anyhow::Result<Eagle3BenchRun> {
+    let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
+    // Populate the shared resident weight cache outside the measured decode span. This is a
+    // model-load cost, not a per-token cost, and the EAGLE run below reuses the same cache.
+    let _ = session.prewarm_resident_weights();
+    let ttft_started = Instant::now();
+    let first = session
+        .generate_next_token_with_history_diagnostics(
+            prompt_tokens,
+            LlamaSampler::Greedy,
+            prompt_tokens,
+            false,
+            None,
+        )?
+        .next_token_id;
+    let ttft_ms = ttft_started.elapsed().as_secs_f64() * 1000.0;
+    let mut generated = vec![first];
+    let mut resident_normal_steps = 0;
+    let decode_started = Instant::now();
+    while generated.len() < max_tokens && !tokenizer.special.eog.contains(generated.last().unwrap())
+    {
+        let anchor = *generated.last().expect("generated is seeded");
+        let next = match session.generate_next_token_greedy_resident(anchor)? {
+            Some((token, _)) => {
+                resident_normal_steps += 1;
+                token
+            }
+            None => anyhow::bail!(
+                "the Llama-3.2 3B target did not enter the resident Metal decode lane"
+            ),
+        };
+        generated.push(next);
+    }
+    Ok(Eagle3BenchRun {
+        generated,
+        ttft_ms,
+        decode_ms: decode_started.elapsed().as_secs_f64() * 1000.0,
+        resident_normal_steps,
+        ..Eagle3BenchRun::default()
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // one argument per benchmark knob
+fn run_eagle3_resident_greedy(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    draft_tokens: usize,
+    tree_nodes: Option<usize>,
+    tree_topk: usize,
+    tree_expansions: usize,
+    suffix_first: bool,
+    checkpoint: camelid::eagle3::Eagle3DraftModel,
+) -> anyhow::Result<Eagle3BenchRun> {
+    use camelid::eagle3::TARGET_LAYER_INPUT_IDS;
+    use camelid::eagle3_runtime::{
+        Eagle3AuthoritativeCatchup, Eagle3Drafter, Eagle3DynamicFrontierConfig,
+    };
+    use camelid::inference::spec_tree::TreeDrafter;
+    use camelid::inference::suffix_decoding::SuffixDecodingDrafter;
+
+    let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
+    let _ = session.prewarm_resident_weights();
+    // EAGLE alternates target and head command buffers on Metal's shared serial queue.
+    // Do not leave a pre-committed target graph waiting ahead of a head update.
+    session.set_resident_encode_ahead_enabled(false);
+    let ttft_started = Instant::now();
+    let prompt = session
+        .forward_greedy_resident_prefill_with_layer_inputs(prompt_tokens, &TARGET_LAYER_INPUT_IDS)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "resident Metal prompt prefill with EAGLE-3 activation capture is unavailable"
+            )
+        })?;
+    let first = *prompt
+        .predictions
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 target prompt produced no prediction"))?;
+    let ttft_ms = ttft_started.elapsed().as_secs_f64() * 1000.0;
+
+    let head_capacity = prompt_tokens
+        .len()
+        .checked_add(max_tokens)
+        .and_then(|n| n.checked_add(draft_tokens + 1))
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
+    let head_upload_started = Instant::now();
+    let mut drafter = Eagle3Drafter::new(checkpoint, head_capacity)?;
+    let head_upload_ms = head_upload_started.elapsed().as_secs_f64() * 1000.0;
+    let mut run = Eagle3BenchRun {
+        generated: vec![first],
+        ttft_ms,
+        bootstrap_capture_ms: ttft_ms,
+        head_upload_ms,
+        ..Eagle3BenchRun::default()
+    };
+    let seed_started = Instant::now();
+    drafter.seed_prompt(weights, prompt_tokens, first, &prompt.layer_inputs)?;
+    run.head_seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+    let tree_lattice_nodes = tree_nodes
+        .map(|node_budget| {
+            tree_topk
+                .checked_mul(tree_expansions)
+                .and_then(|nodes| nodes.checked_add(1))
+                .map(|explored| explored.max(node_budget))
+                .ok_or_else(|| anyhow::anyhow!("EAGLE-3 dynamic lattice budget overflow"))
+        })
+        .transpose()?;
+    let mut suffix_drafter = suffix_first.then(SuffixDecodingDrafter::default);
+    let mut pending_suffix_head = Eagle3AuthoritativeCatchup::default();
+    let mut suffix_history = suffix_first.then(|| {
+        let mut history = Vec::with_capacity(prompt_tokens.len() + max_tokens);
+        history.extend_from_slice(prompt_tokens);
+        history.push(first);
+        history
+    });
+
+    let decode_started = Instant::now();
+    while run.generated.len() < max_tokens
+        && !tokenizer
+            .special
+            .eog
+            .contains(run.generated.last().expect("generated is seeded"))
+    {
+        let remaining = max_tokens - run.generated.len();
+        let context_room = session.remaining_context();
+        if context_room == 0 {
+            break;
+        }
+        let budget = draft_tokens
+            .min(remaining.saturating_sub(1))
+            .min(context_room.saturating_sub(1));
+
+        // A final single token has no successor to draft. Keep it on the resident target;
+        // no head update is needed once the requested output length is reached.
+        if budget == 0 {
+            let anchor = *run.generated.last().expect("generated is seeded");
+            let next = session
+                .generate_next_token_greedy_resident(anchor)?
+                .ok_or_else(|| anyhow::anyhow!("resident Metal target became unavailable"))?
+                .0;
+            run.resident_normal_steps += 1;
+            run.generated.push(next);
+            if let Some(history) = suffix_history.as_mut() {
+                history.push(next);
+            }
+            continue;
+        }
+
+        let anchor = *run.generated.last().expect("generated is seeded");
+        let target_before = session.kv_position();
+        let (emitted, offered, verify_nodes) = if let Some(node_budget) = tree_nodes {
+            let round_node_budget = node_budget.min(context_room);
+            let suffix_drafts = if let (Some(suffix), Some(history)) =
+                (suffix_drafter.as_mut(), suffix_history.as_ref())
+            {
+                let draft_started = Instant::now();
+                let suffix_depth = budget.min(round_node_budget.saturating_sub(1));
+                let tree = suffix.draft_tree(history, anchor, round_node_budget, suffix_depth);
+                let drafts = deepest_suffix_chain(&tree, suffix_depth);
+                run.draft_us += draft_started.elapsed().as_micros();
+                drafts
+            } else {
+                Vec::new()
+            };
+
+            if !suffix_drafts.is_empty() {
+                run.drafted_token_ids.extend_from_slice(&suffix_drafts);
+                let verify_started = Instant::now();
+                let verified = session
+                    .verify_drafts_metal_with_layer_inputs(
+                        anchor,
+                        &suffix_drafts,
+                        &TARGET_LAYER_INPUT_IDS,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "resident Metal suffix-first verification became unavailable at position {target_before}"
+                        )
+                    })?;
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    verified.predictions.len() == suffix_drafts.len() + 1,
+                    "suffix-first target returned {} predictions for {} draft tokens",
+                    verified.predictions.len(),
+                    suffix_drafts.len()
+                );
+                let accepted = accepted_draft_prefix(&suffix_drafts, &verified.predictions);
+                let emitted = verified.predictions[..=accepted].to_vec();
+                // Suffix proposals do not read the learned head. Keep the authoritative
+                // token/capture pairs in order, but defer all EAGLE work until a dynamic-tree
+                // round actually needs a current stable seed. An all-suffix completion never
+                // pays this update at all.
+                let buffer_started = Instant::now();
+                pending_suffix_head.push(&verified.layer_inputs, &emitted)?;
+                run.suffix_head_buffer_us += buffer_started.elapsed().as_micros();
+                let offered = suffix_drafts.len();
+                run.suffix_rounds += 1;
+                run.suffix_offered += offered as u64;
+                run.suffix_emitted_tokens += emitted.len() as u64;
+                (emitted, offered, offered + 1)
+            } else {
+                if !pending_suffix_head.is_empty() {
+                    let update_started = Instant::now();
+                    let catchup_rows =
+                        drafter.accept_authoritative_catchup(weights, &mut pending_suffix_head)?;
+                    run.head_update_us += update_started.elapsed().as_micros();
+                    run.suffix_head_catchups += 1;
+                    run.suffix_head_catchup_rows += catchup_rows as u64;
+                }
+                anyhow::ensure!(
+                    drafter.filled() == session.kv_position(),
+                    "EAGLE-3 catch-up did not reach target watermark: head={} target={}",
+                    drafter.filled(),
+                    session.kv_position()
+                );
+                let draft_started = Instant::now();
+                let frontier = drafter.draft_dynamic_frontier(
+                    weights,
+                    anchor,
+                    Eagle3DynamicFrontierConfig {
+                        max_verify_nodes: round_node_budget,
+                        max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
+                        max_depth: budget,
+                        candidates_per_parent: tree_topk,
+                        max_head_expansions: tree_expansions,
+                    },
+                )?;
+                let materialized_head_forwards = frontier.materialized_head_forwards();
+                let forest = frontier.finish()?;
+                let actual_nodes = forest.scored.tree.nodes();
+                let actual_max_depth = forest.scored.tree.max_depth();
+                anyhow::ensure!(
+                    (2..=round_node_budget).contains(&actual_nodes),
+                    "dynamic EAGLE forest produced {actual_nodes} rows for round node budget {round_node_budget}"
+                );
+                run.drafted_token_ids
+                    .extend_from_slice(&forest.scored.tree.tokens[1..]);
+                run.draft_us += draft_started.elapsed().as_micros();
+
+                let verify_started = Instant::now();
+                let verified = session
+                    .verify_tree_metal_with_layer_inputs(
+                        &forest.scored.tree,
+                        &TARGET_LAYER_INPUT_IDS,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "resident Metal EAGLE-3 tree verification became unavailable at position {target_before}"
+                        )
+                    })?;
+                run.verify_us += verify_started.elapsed().as_micros();
+                anyhow::ensure!(
+                    verified.predictions.len() == actual_nodes,
+                    "EAGLE-3 tree target returned {} predictions for {actual_nodes} rows",
+                    verified.predictions.len()
+                );
+                let acceptance = forest.accept_target_predictions(&verified.predictions)?;
+                anyhow::ensure!(
+                    acceptance.capture_rows.len() == acceptance.emitted_tokens.len(),
+                    "EAGLE-3 tree emitted/capture path lengths diverged: {}/{}",
+                    acceptance.emitted_tokens.len(),
+                    acceptance.capture_rows.len()
+                );
+                let update_started = Instant::now();
+                drafter.accept_authoritative_forest(
+                    weights,
+                    &verified.layer_inputs,
+                    &acceptance,
+                )?;
+                run.head_update_us += update_started.elapsed().as_micros();
+                let emitted_count = acceptance.emitted_tokens.len();
+                let offered = actual_nodes.saturating_sub(1);
+                run.dynamic_tree_rounds += 1;
+                run.dynamic_tree_offered += offered as u64;
+                run.dynamic_tree_emitted_tokens += emitted_count as u64;
+                run.materialized_head_forwards += materialized_head_forwards as u64;
+                run.dynamic_tree_max_depth_sum += actual_max_depth as u64;
+                (acceptance.emitted_tokens, offered, actual_nodes)
+            }
+        } else {
+            // Existing top-1 chain path: kept independent of every dynamic-tree option.
+            let draft_started = Instant::now();
+            let drafts = drafter.draft(weights, budget)?;
+            run.drafted_token_ids.extend_from_slice(&drafts);
+            run.draft_us += draft_started.elapsed().as_micros();
+            let verify_started = Instant::now();
+            let verified = session
+                .verify_drafts_metal_with_layer_inputs(
+                    anchor,
+                    &drafts,
+                    &TARGET_LAYER_INPUT_IDS,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resident Metal EAGLE-3 verification became unavailable at position {target_before}"
+                    )
+                })?;
+            run.verify_us += verify_started.elapsed().as_micros();
+            let accepted = accepted_draft_prefix(&drafts, &verified.predictions);
+            let emitted = verified.predictions[..=accepted].to_vec();
+            let update_started = Instant::now();
+            drafter.accept_authoritative(weights, &verified.layer_inputs, &emitted)?;
+            run.head_update_us += update_started.elapsed().as_micros();
+            let offered = drafts.len();
+            (emitted, offered, offered + 1)
+        };
+
+        anyhow::ensure!(
+            session.kv_position() == target_before + emitted.len(),
+            "EAGLE-3 target watermark advanced {} rows for {} emitted tokens",
+            session.kv_position().saturating_sub(target_before),
+            emitted.len()
+        );
+        run.resident_verify_rounds += 1;
+        let effective_head_filled = pending_suffix_head.effective_filled(drafter.filled())?;
+        anyhow::ensure!(
+            effective_head_filled == session.kv_position(),
+            "EAGLE-3/target cache watermarks diverged: materialized_head={} pending_head={} target={}",
+            drafter.filled(),
+            pending_suffix_head.pending_rows(),
+            session.kv_position()
+        );
+
+        run.rounds += 1;
+        run.drafted += offered as u64;
+        run.accepted_drafts += emitted.len().saturating_sub(1) as u64;
+        run.verify_nodes += verify_nodes as u64;
+        let generated_before = run.generated.len();
+        for token in emitted {
+            if run.generated.len() >= max_tokens {
+                break;
+            }
+            run.generated.push(token);
+            if tokenizer.special.eog.contains(&token) {
+                break;
+            }
+        }
+        if let Some(history) = suffix_history.as_mut() {
+            history.extend_from_slice(&run.generated[generated_before..]);
+        }
+    }
+    // Once generation has stopped, no consumer can observe the learned head again. Deliberately
+    // drop a final suffix-only streak instead of paying a useless catch-up in the epilogue.
+    run.suffix_head_discarded_rows = pending_suffix_head.pending_rows() as u64;
+    run.decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+    anyhow::ensure!(
+        run.cpu_verify_rounds == 0 && run.resident_verify_rounds == run.rounds,
+        "EAGLE-3 benchmark left the resident verifier: resident={} cpu={} rounds={}",
+        run.resident_verify_rounds,
+        run.cpu_verify_rounds,
+        run.rounds
+    );
+
+    Ok(run)
+}
+
+#[derive(Serialize)]
+struct BenchEagle3Record {
+    runtime: &'static str,
+    commit: String,
+    camelid_version: String,
+    binary_sha256: String,
+    workload: String,
+    input_sha256: String,
+    prompt_sha256: String,
+    prompt_format: &'static str,
+    add_bos: bool,
+    add_eos: bool,
+    parse_special: bool,
+    model: String,
+    model_sha256: String,
+    tokenizer_metadata_sha256: Option<String>,
+    eagle3: String,
+    eagle3_sha256: String,
+    eagle3_revision: &'static str,
+    quantization: String,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    draft_tokens: usize,
+    draft_mode: &'static str,
+    tree_node_budget: Option<usize>,
+    tree_topk: Option<usize>,
+    tree_expansions: Option<usize>,
+    plain_generated_tokens: usize,
+    eagle3_generated_tokens: usize,
+    head_load_ms: f64,
+    head_upload_ms: f64,
+    head_seed_ms: f64,
+    bootstrap_capture_ms: f64,
+    plain_ttft_ms: f64,
+    plain_decode_ms: f64,
+    plain_tokens_per_second: f64,
+    eagle3_ttft_ms: f64,
+    eagle3_decode_ms: f64,
+    eagle3_tokens_per_second: f64,
+    plain_request_tokens_per_second: f64,
+    eagle3_warm_head_request_tokens_per_second: f64,
+    eagle3_head_cold_tokens_per_second: f64,
+    rounds: u64,
+    drafted: u64,
+    accepted_drafts: u64,
+    accept_rate: f64,
+    mean_emitted_tokens_per_round: f64,
+    mean_verify_nodes_per_round: f64,
+    draft_ms: f64,
+    verify_ms: f64,
+    head_update_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_catchups: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_catchup_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_discarded_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix_head_buffer_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tree_rounds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tree_offered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tree_emitted_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    materialized_head_forwards: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_materialized_head_forwards_per_dynamic_round: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_dynamic_tree_max_depth: Option<f64>,
+    resident_verify_rounds: u64,
+    cpu_verify_rounds: u64,
+    resident_normal_steps: u64,
+    speedup: f64,
+    first_divergent_generated_token_index: i64,
+    lossless: bool,
+    plain_token_ids: Vec<u32>,
+    eagle3_token_ids: Vec<u32>,
+    eagle3_drafted_token_ids: Vec<u32>,
+    metal_device: Option<String>,
+    host_isa: String,
+    effective_env: BTreeMap<String, Option<String>>,
+    planner_env_updates: BTreeMap<String, Option<String>>,
+    execution_plan: camelid::execution_plan::ExecutionPlan,
+    peak_memory_bytes: u64,
+}
+
+fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
+    const KEYS: &[&str] = &[
+        "CAMELID_EAGLE3_FULL_AUTHORITATIVE",
+        "CAMELID_EAGLE3_LM_HEAD_Q8",
+        "CAMELID_EAGLE3_LM_HEAD_ROWS",
+        "CAMELID_METAL_LINEAR",
+        "CAMELID_METAL_Q8",
+        "CAMELID_METAL_RESIDENT_DECODE",
+        "CAMELID_METAL_RESIDENT_PREFILL",
+        "CAMELID_METAL_ATTN2",
+        "CAMELID_METAL_ATTN_BATCH_K",
+        "CAMELID_METAL_KV_DTYPE",
+        "CAMELID_METAL_WIRE",
+        "CAMELID_METAL_WIRE_NSG8",
+        "CAMELID_METAL_F32Y",
+        "CAMELID_METAL_NOCOPY",
+        "CAMELID_METAL_KQUANT",
+        "CAMELID_KQUANT_V2",
+        "CAMELID_KQUANT_V3",
+        "CAMELID_KQUANT_V4",
+        "CAMELID_KQUANT_V4_TRACE",
+        "CAMELID_KQUANT_MMA",
+        "CAMELID_SPEC_TREE",
+    ];
+    KEYS.iter()
+        .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_eagle3(
+    model: PathBuf,
+    eagle3_dir: PathBuf,
+    draft_tokens: usize,
+    tree_nodes: Option<usize>,
+    tree_topk: usize,
+    tree_expansions: usize,
+    suffix_first: bool,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    chat: bool,
+    workload: String,
+    max_tokens: usize,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    const PINNED_TARGET_SHA256: &str =
+        "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
+    const PINNED_EAGLE3_SHA256: &str =
+        "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
+    const PINNED_EAGLE3_REVISION: &str = "02d343789b502a3edfe351bdd4537a44affb98cd";
+    anyhow::ensure!(max_tokens >= 2, "--max-tokens must be at least 2");
+    anyhow::ensure!(
+        (1..=15).contains(&draft_tokens),
+        "--draft-tokens must be in 1..=15"
+    );
+    if let Some(nodes) = tree_nodes {
+        anyhow::ensure!(
+            (2..=camelid::inference::spec_tree::TREE_MAX_NODES).contains(&nodes),
+            "--tree-nodes must be in 2..={}",
+            camelid::inference::spec_tree::TREE_MAX_NODES
+        );
+    }
+    anyhow::ensure!(
+        !suffix_first || tree_nodes.is_some(),
+        "--suffix-first requires --tree-nodes"
+    );
+    anyhow::ensure!(
+        (1..=camelid::metal::EAGLE3_TOP_K_CANDIDATES).contains(&tree_topk),
+        "--tree-topk must be in 1..={}",
+        camelid::metal::EAGLE3_TOP_K_CANDIDATES
+    );
+    anyhow::ensure!(
+        (1..=camelid::inference::spec_tree::TREE_MAX_NODES).contains(&tree_expansions),
+        "--tree-expansions must be in 1..={} (including the root)",
+        camelid::inference::spec_tree::TREE_MAX_NODES
+    );
+    configure_rayon_threads(threads)?;
+    let input_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+
+    let model_sha256 = camelid::receipt::sha256_file_hex_cached(&model)
+        .map_err(|error| anyhow::anyhow!("hashing target {}: {error}", model.display()))?;
+    anyhow::ensure!(
+        model_sha256 == PINNED_TARGET_SHA256,
+        "the learned head is pinned to target SHA-256 {PINNED_TARGET_SHA256}, got {model_sha256}"
+    );
+    let eagle3_weights = eagle3_dir.join("model.safetensors");
+    let eagle3_sha256 = camelid::receipt::sha256_file_hex(&eagle3_weights).map_err(|error| {
+        anyhow::anyhow!(
+            "hashing EAGLE-3 checkpoint {}: {error}",
+            eagle3_weights.display()
+        )
+    })?;
+    anyhow::ensure!(
+        eagle3_sha256 == PINNED_EAGLE3_SHA256,
+        "expected pinned EAGLE-3 SHA-256 {PINNED_EAGLE3_SHA256}, got {eagle3_sha256}"
+    );
+    let current_exe = std::env::current_exe()?;
+    let binary_sha256 = camelid::receipt::sha256_file_hex(&current_exe)
+        .map_err(|error| anyhow::anyhow!("hashing benchmark binary: {error}"))?;
+
+    let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let planner_env_updates = plan_outcome
+        .env_updates
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+        .collect();
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    anyhow::ensure!(
+        config.architecture == "llama"
+            && config.embedding_length == 3_072
+            && config.block_count == 28
+            && config.feed_forward_length == 8_192
+            && config.attention_head_count == 24
+            && config.attention_head_count_kv == 8
+            && config.vocab_size == Some(128_256),
+        "the pinned EAGLE-3 head requires the exact Llama-3.2-3B target geometry; got arch={} hidden={} layers={} ffn={} heads={}/{} vocab={:?}",
+        config.architecture,
+        config.embedding_length,
+        config.block_count,
+        config.feed_forward_length,
+        config.attention_head_count,
+        config.attention_head_count_kv,
+        config.vocab_size,
+    );
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+    let (prompt_text, prompt_format, add_special, parse_special) = if chat {
+        let (rendered, add_special, parse_special) =
+            camelid::api::render_single_user_chat_prompt_for_benchmark(&input_text, &tokenizer)
+                .map_err(|error| anyhow::anyhow!("rendering benchmark chat prompt: {error}"))?;
+        (
+            rendered,
+            "served_single_user_chat_template",
+            add_special,
+            parse_special,
+        )
+    } else {
+        (input_text.clone(), "raw_completion_bos_no_eos", true, false)
+    };
+    let prompt_token_ids = tokenizer.encode(&prompt_text, add_special, parse_special)?;
+    anyhow::ensure!(
+        prompt_token_ids.len() >= 3,
+        "resident EAGLE-3 capture requires at least three encoded prompt tokens, got {}",
+        prompt_token_ids.len()
+    );
+    anyhow::ensure!(
+        prompt_token_ids.len() + max_tokens <= config.context_length as usize,
+        "prompt plus generation exceeds target context"
+    );
+
+    eprintln!("[bench-eagle3] plain resident Metal target lane...");
+    let plain =
+        run_plain_resident_greedy(&config, &weights, &tokenizer, &prompt_token_ids, max_tokens)?;
+    eprintln!("[bench-eagle3] loading strict EAGLE-3 checkpoint...");
+    let head_load_started = Instant::now();
+    let checkpoint = camelid::eagle3::Eagle3DraftModel::load(&eagle3_dir)?;
+    let head_load_ms = head_load_started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[bench-eagle3] learned recurrent draft + resident target verify...");
+    let eagle = run_eagle3_resident_greedy(
+        &config,
+        &weights,
+        &tokenizer,
+        &prompt_token_ids,
+        max_tokens,
+        draft_tokens,
+        tree_nodes,
+        tree_topk,
+        tree_expansions,
+        suffix_first,
+        checkpoint,
+    )?;
+
+    let decode_tps = |run: &Eagle3BenchRun| {
+        let tokens = run.generated.len().saturating_sub(1);
+        if tokens == 0 || run.decode_ms <= 0.0 {
+            0.0
+        } else {
+            tokens as f64 / (run.decode_ms / 1000.0)
+        }
+    };
+    let plain_tps = decode_tps(&plain);
+    let eagle_tps = decode_tps(&eagle);
+    let lossless = plain.generated == eagle.generated;
+    let mut first_divergent = first_divergence(&plain.generated, &eagle.generated);
+    if !lossless && first_divergent < 0 {
+        first_divergent = plain.generated.len().min(eagle.generated.len()) as i64;
+    }
+    let accept_rate = if eagle.drafted == 0 {
+        0.0
+    } else {
+        eagle.accepted_drafts as f64 / eagle.drafted as f64
+    };
+    let mean_emitted = if eagle.rounds == 0 {
+        0.0
+    } else {
+        (eagle.accepted_drafts + eagle.rounds) as f64 / eagle.rounds as f64
+    };
+    let mean_verify_nodes = if eagle.rounds == 0 {
+        0.0
+    } else {
+        eagle.verify_nodes as f64 / eagle.rounds as f64
+    };
+    let mean_materialized_head_forwards = if eagle.dynamic_tree_rounds == 0 {
+        0.0
+    } else {
+        eagle.materialized_head_forwards as f64 / eagle.dynamic_tree_rounds as f64
+    };
+    let mean_dynamic_tree_max_depth = if eagle.dynamic_tree_rounds == 0 {
+        0.0
+    } else {
+        eagle.dynamic_tree_max_depth_sum as f64 / eagle.dynamic_tree_rounds as f64
+    };
+    let record = BenchEagle3Record {
+        runtime: "camelid-eagle3-resident-metal",
+        commit: benchmark_commit(),
+        camelid_version: camelid::receipt::camelid_version(),
+        binary_sha256,
+        workload,
+        input_sha256: camelid::receipt::sha256_hex(input_text.as_bytes()),
+        prompt_sha256: camelid::receipt::sha256_hex(prompt_text.as_bytes()),
+        prompt_format,
+        add_bos: add_special,
+        add_eos: false,
+        parse_special,
+        model: model.display().to_string(),
+        model_sha256,
+        tokenizer_metadata_sha256: camelid::receipt::tokenizer_metadata_sha256(&gguf),
+        eagle3: eagle3_dir.display().to_string(),
+        eagle3_sha256,
+        eagle3_revision: PINNED_EAGLE3_REVISION,
+        quantization: camelid::receipt::quantization_label(&gguf),
+        prompt_tokens: prompt_token_ids.len(),
+        max_tokens,
+        draft_tokens,
+        draft_mode: if suffix_first {
+            "suffix_then_dynamic_tree"
+        } else if tree_nodes.is_some() {
+            "dynamic_tree"
+        } else {
+            "linear_top1"
+        },
+        tree_node_budget: tree_nodes,
+        tree_topk: tree_nodes.map(|_| tree_topk),
+        tree_expansions: tree_nodes.map(|_| tree_expansions),
+        plain_generated_tokens: plain.generated.len(),
+        eagle3_generated_tokens: eagle.generated.len(),
+        head_load_ms,
+        head_upload_ms: eagle.head_upload_ms,
+        head_seed_ms: eagle.head_seed_ms,
+        bootstrap_capture_ms: eagle.bootstrap_capture_ms,
+        plain_ttft_ms: plain.ttft_ms,
+        plain_decode_ms: plain.decode_ms,
+        plain_tokens_per_second: plain_tps,
+        eagle3_ttft_ms: eagle.ttft_ms,
+        eagle3_decode_ms: eagle.decode_ms,
+        eagle3_tokens_per_second: eagle_tps,
+        plain_request_tokens_per_second: plain.generated.len() as f64
+            / ((plain.ttft_ms + plain.decode_ms) / 1000.0),
+        eagle3_warm_head_request_tokens_per_second: eagle.generated.len() as f64
+            / ((eagle.ttft_ms + eagle.head_seed_ms + eagle.decode_ms) / 1000.0),
+        eagle3_head_cold_tokens_per_second: eagle.generated.len() as f64
+            / ((head_load_ms
+                + eagle.head_upload_ms
+                + eagle.ttft_ms
+                + eagle.head_seed_ms
+                + eagle.decode_ms)
+                / 1000.0),
+        rounds: eagle.rounds,
+        drafted: eagle.drafted,
+        accepted_drafts: eagle.accepted_drafts,
+        accept_rate,
+        mean_emitted_tokens_per_round: mean_emitted,
+        mean_verify_nodes_per_round: mean_verify_nodes,
+        draft_ms: eagle.draft_us as f64 / 1000.0,
+        verify_ms: eagle.verify_us as f64 / 1000.0,
+        head_update_ms: eagle.head_update_us as f64 / 1000.0,
+        suffix_rounds: suffix_first.then_some(eagle.suffix_rounds),
+        suffix_offered: suffix_first.then_some(eagle.suffix_offered),
+        suffix_emitted_tokens: suffix_first.then_some(eagle.suffix_emitted_tokens),
+        suffix_head_catchups: suffix_first.then_some(eagle.suffix_head_catchups),
+        suffix_head_catchup_rows: suffix_first.then_some(eagle.suffix_head_catchup_rows),
+        suffix_head_discarded_rows: suffix_first.then_some(eagle.suffix_head_discarded_rows),
+        suffix_head_buffer_ms: suffix_first.then_some(eagle.suffix_head_buffer_us as f64 / 1000.0),
+        dynamic_tree_rounds: suffix_first.then_some(eagle.dynamic_tree_rounds),
+        dynamic_tree_offered: suffix_first.then_some(eagle.dynamic_tree_offered),
+        dynamic_tree_emitted_tokens: suffix_first.then_some(eagle.dynamic_tree_emitted_tokens),
+        materialized_head_forwards: tree_nodes.map(|_| eagle.materialized_head_forwards),
+        mean_materialized_head_forwards_per_dynamic_round: tree_nodes
+            .map(|_| mean_materialized_head_forwards),
+        mean_dynamic_tree_max_depth: tree_nodes.map(|_| mean_dynamic_tree_max_depth),
+        resident_verify_rounds: eagle.resident_verify_rounds,
+        cpu_verify_rounds: eagle.cpu_verify_rounds,
+        resident_normal_steps: eagle.resident_normal_steps,
+        speedup: if plain_tps > 0.0 {
+            eagle_tps / plain_tps
+        } else {
+            0.0
+        },
+        first_divergent_generated_token_index: first_divergent,
+        lossless,
+        plain_token_ids: plain.generated,
+        eagle3_token_ids: eagle.generated,
+        eagle3_drafted_token_ids: eagle.drafted_token_ids,
+        metal_device: camelid::metal::detect_metal_device().device_name,
+        host_isa: camelid::receipt::host_isa_marker(),
+        effective_env: eagle3_effective_env(),
+        planner_env_updates,
+        execution_plan: plan_outcome.plan,
+        peak_memory_bytes: peak_rss_bytes(),
+    };
+    println!("{}", serde_json::to_string(&record)?);
+    eprintln!(
+        "[bench-eagle3] mode={} γ={} nodes/round {:.2} accept {:.1}% emitted/round {:.2} | plain {:.2} → EAGLE-3 {:.2} tok/s ({:.2}x) | {}",
+        record.draft_mode,
+        record.draft_tokens,
+        record.mean_verify_nodes_per_round,
+        100.0 * record.accept_rate,
+        record.mean_emitted_tokens_per_round,
+        record.plain_tokens_per_second,
+        record.eagle3_tokens_per_second,
+        record.speedup,
+        if record.lossless { "LOSSLESS ✓" } else { "DIVERGED" },
+    );
+    anyhow::ensure!(
+        record.lossless,
+        "EAGLE-3 output diverged from the resident plain target at generated token {}",
+        record.first_divergent_generated_token_index
     );
     Ok(())
 }
@@ -9840,13 +11836,71 @@ fn apply_spec_decode_env(
         // weights, but the Metal-resident plan deliberately keeps CPU-side weights file-backed
         // (the GPU owns the resident copy), so each verify round would pay a file-speed weight
         // pass — fall back to the validated CPU repack plan in that case only.
-        let spec_gpu = matches!(
-            std::env::var("CAMELID_SPEC_GPU").ok().as_deref(),
+        // A Metal host defaults to GPU verify. Leaving it unset used to select the
+        // CPU plan silently, so a spec-decode run on this host measured the repack
+        // path while reporting itself as speculative. An explicit CAMELID_SPEC_GPU
+        // still wins in both directions; the auto-arm only fills in the unset case,
+        // and only when there is actually a resident lane for the batched verify to
+        // run on (see `should_auto_arm_spec_gpu` for the full precondition list).
+        let spec_gpu_var = std::env::var("CAMELID_SPEC_GPU").ok();
+        // `var_os().is_none()` is this file's explicitly-set-vs-defaulted test
+        // (`apply_default_fast_stack`, `apply_serve_nocopy_default`): an explicit
+        // value, INCLUDING `0`, is the operator's call and is never overwritten.
+        let spec_gpu_set = std::env::var_os("CAMELID_SPEC_GPU").is_some();
+        let spec_gpu_truthy = matches!(
+            spec_gpu_var.as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
         );
+        // `apply_default_fast_stack` has already run (it is applied before the
+        // subcommand match), so this reads "1" unless the operator opted out or
+        // `apply_deterministic_mode` forced the whole Metal stack off.
+        let resident_decode_armed = std::env::var("CAMELID_METAL_RESIDENT_DECODE")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        let deterministic = std::env::var("CAMELID_DETERMINISTIC")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        // One probe, once, at startup; `log_acceleration_state` performs the same one
+        // moments later. False on every non-macOS build (the `detect_metal_device`
+        // stub), which is what keeps CPU-only and CUDA hosts on today's behavior.
+        let metal_device_available = detect_metal_device().available;
+        let spec_gpu = if should_auto_arm_spec_gpu(
+            spec_gpu_set,
+            resident_decode_armed,
+            deterministic,
+            metal_device_available,
+        ) {
+            std::env::set_var("CAMELID_SPEC_GPU", "1");
+            // Printed, not only traced: `RUST_LOG` is unset on a stock install, and this
+            // line decides which execution plan every request on this server takes.
+            eprintln!(
+                "[spec] Metal host: defaulting CAMELID_SPEC_GPU=1, so drafts are verified by \
+                 the batched GPU verify and the resident decode/prefill lanes stay on. Set \
+                 CAMELID_SPEC_GPU=0 to force the CPU verify plan instead."
+            );
+            tracing::info!(
+                "speculative decoding on a Metal host: defaulting CAMELID_SPEC_GPU=1 \
+                 (set CAMELID_SPEC_GPU=0 to force the CPU verify plan)"
+            );
+            true
+        } else {
+            spec_gpu_truthy
+        };
         if !spec_gpu {
             std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
             std::env::set_var("CAMELID_METAL_RESIDENT_PREFILL", "0");
+            // Printed, not only traced: this demotion is server-wide and expensive
+            // enough that no benchmark should be able to take it without seeing it.
+            // Only when there WAS a lane to lose.
+            if resident_decode_armed && metal_device_available {
+                eprintln!(
+                    "[spec] speculative decoding is running the CPU verify plan \
+                     (CAMELID_SPEC_GPU is set to a non-enabling value), so the Metal \
+                     resident decode and prefill lanes are now OFF for every request on \
+                     this server, not just speculative ones. Unset CAMELID_SPEC_GPU (or \
+                     set it to 1) to keep the resident lane."
+                );
+            }
             tracing::info!(
                 "speculative decoding enabled; selecting the CPU execution plan \
                  (Metal resident paths disabled server-wide)"
@@ -9864,6 +11918,43 @@ fn apply_spec_decode_env(
     if let Some(tokens) = spec_draft_tokens.filter(|tokens| *tokens > 0) {
         std::env::set_var("CAMELID_SPEC_DRAFT_TOKENS", tokens.to_string());
     }
+}
+
+/// Pure decision for the `CAMELID_SPEC_GPU` auto-arm in [`apply_spec_decode_env`].
+///
+/// Speculative decoding without GPU verify switches `CAMELID_METAL_RESIDENT_DECODE` and
+/// `CAMELID_METAL_RESIDENT_PREFILL` off SERVER-WIDE — for every request on the process, not
+/// just the speculative ones — because the CPU chunk verify needs materialized CPU-side
+/// blocks that the Metal-resident plan deliberately does not keep. Selecting that plan merely
+/// because a variable was UNSET meant `--spec-decode ngram` silently benchmarked the CPU plan
+/// on the exact host whose fast lane is being measured. A Metal host arms GPU verify instead,
+/// but only when every precondition holds:
+///
+/// * `spec_gpu_set` — an explicit `CAMELID_SPEC_GPU`, INCLUDING `0`, is the operator's call
+///   and is never overwritten in either direction. Same `var_os().is_none()` test
+///   `apply_default_fast_stack` and `apply_serve_nocopy_default` use.
+/// * `resident_decode_armed` — with `CAMELID_METAL_RESIDENT_DECODE=0` there is no resident
+///   engine for `verify_batch` to run on: `verify_drafts_metal` checks that same flag and
+///   returns `Ok(None)` every round, so arming the flag would advertise a lane that cannot
+///   engage. Keep today's CPU plan there.
+/// * `deterministic` — the deterministic lane fails every GPU gate closed by contract
+///   (DECISIONS.md §D9). It must never be handed a GPU verify arm, even a dormant one.
+/// * `metal_device_available` — no device, no resident lane. False on every non-macOS build
+///   (the `detect_metal_device` stub), which is what keeps CPU-only and CUDA hosts exactly as
+///   they are: their resident lane is gated per-request by `set_resident_paths_disabled`,
+///   not by these Metal variables.
+///
+/// Losslessness is not a factor in this decision. Both verify arms emit the target's own
+/// greedy argmax: `verify_batch` is bit-identical to `k` single-token decodes, and
+/// `verify_drafts_gpu` returns `Ok(None)` into the lossless CPU chunk verify whenever the
+/// engine is not materialized exactly at the current KV position.
+fn should_auto_arm_spec_gpu(
+    spec_gpu_set: bool,
+    resident_decode_armed: bool,
+    deterministic: bool,
+    metal_device_available: bool,
+) -> bool {
+    !spec_gpu_set && resident_decode_armed && !deterministic && metal_device_available
 }
 
 fn log_acceleration_state() {
@@ -11320,12 +13411,37 @@ mod tensor_dump_tests {
         assert!(should_default_serve_nocopy(false, true, true, true));
         // User set it either way (incl. an explicit =0): never override.
         assert!(!should_default_serve_nocopy(true, true, true, true));
-        // Speculative decoding turns resident decode off -> stay off (its CPU
-        // repack plan needs materialized blocks, not wire pages).
+        // Speculative decoding on the CPU verify plan (an explicit non-enabling
+        // CAMELID_SPEC_GPU) turns resident decode off -> stay off, since that plan
+        // needs materialized blocks, not wire pages. With GPU verify armed (the
+        // Metal default) resident stays on and this arm does fire.
         assert!(!should_default_serve_nocopy(false, false, true, true));
         // Any wire-stack component off -> the wire kernels can't consume pages.
         assert!(!should_default_serve_nocopy(false, true, false, true));
         assert!(!should_default_serve_nocopy(false, true, true, false));
+    }
+
+    /// Phase 0 FIX A. Asking for `--spec-decode ngram` on a Mac used to switch
+    /// `CAMELID_METAL_RESIDENT_DECODE`/`_PREFILL` off SERVER-WIDE just because
+    /// `CAMELID_SPEC_GPU` was unset, and said so only through a `tracing::info!` that a
+    /// stock install (no `RUST_LOG`) never prints — so every speculative measurement
+    /// silently timed the CPU repack plan. The auto-arm closes that, without ever
+    /// overriding an operator who has spoken.
+    #[test]
+    fn spec_gpu_auto_arms_on_metal_but_never_overrides_an_explicit_opt_out() {
+        // The regression: unset flag, stock fast stack, real Metal device.
+        assert!(should_auto_arm_spec_gpu(false, true, false, true));
+        // An explicit CAMELID_SPEC_GPU is the operator's call in BOTH directions --
+        // including `0`, which must keep selecting the CPU repack plan.
+        assert!(!should_auto_arm_spec_gpu(true, true, false, true));
+        // No resident decode lane to preserve: `verify_drafts_metal` would decline every
+        // round, so don't advertise GPU verify.
+        assert!(!should_auto_arm_spec_gpu(false, false, false, true));
+        // Deterministic mode fails every GPU gate closed by contract (DECISIONS.md D9).
+        assert!(!should_auto_arm_spec_gpu(false, true, true, true));
+        // No Metal device -> no resident lane. False on every non-macOS build, which is
+        // what keeps CPU-only and CUDA hosts byte-identical to today.
+        assert!(!should_auto_arm_spec_gpu(false, true, false, false));
     }
 
     #[test]

@@ -31,6 +31,8 @@ import {
   readAttachedDocuments,
   writeAttachedDocuments,
 } from '../lib/documentAttachments.js'
+import { isGemma4Mtp12TargetVerifiedVideoOptedIn, shouldUseGemma4Mtp12TargetVerifiedRender } from '../lib/targetVerifiedRender.js'
+import { isGemma4Mtp12SegmentedVideoOptedIn, readGemma4Mtp12PreparedSegments } from '../lib/segmentedWebResearchSynthesis.js'
 
 const isBootstrapMessage = (message) =>
   message?.role === 'assistant' &&
@@ -731,11 +733,28 @@ export default function ChatWorkspace({
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
   const activeContextLength = runtime?.active_context_length || modelContextLength(selectedModel)
-  const sendBudget = validateSendBudget({
+  const rawSendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
     contextLength: activeContextLength,
   })
+  const segmentedVideoComposerBypass = isGemma4Mtp12SegmentedVideoOptedIn()
+    && Boolean(readGemma4Mtp12PreparedSegments())
+    && shouldUseGemma4Mtp12TargetVerifiedRender({
+      runtime,
+      requestModelId: runtime?.active_model_id,
+      compatibilityRowId: selectedChatGate.hint?.target?.id,
+      research: { sources: [{}, {}] },
+      receiptMode,
+      videoRigOptIn: isGemma4Mtp12TargetVerifiedVideoOptedIn(),
+    })
+  // The private segmented lane verifies six independently bounded prompts;
+  // the long product brief itself is Web Auto input, not a 512-position model
+  // prompt. Keep the ordinary composer fail-closed everywhere else.
+  const sendBudget = segmentedVideoComposerBypass && rawSendBudget.level === 'error'
+    ? { ...rawSendBudget, level: 'ok', message: null }
+    : rawSendBudget
+
   /* The meter reads the same three numbers the budget check does, so the chip
      and the notice under the composer can never disagree. The verified bound is
      drawn as a marker rather than a limit: past it the row is still served, it

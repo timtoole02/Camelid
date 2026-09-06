@@ -1,0 +1,1 @@
+Explain how speculative decoding accelerates autoregressive inference, why target-model verification preserves exact greedy output, and what determines whether it achieves a speedup. Discuss acceptance rate, draft cost, batch verification, and memory bandwidth.

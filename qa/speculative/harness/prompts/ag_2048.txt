@@ -1,0 +1,160 @@
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a coding agent in a Rust repository.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Speculative decoding never fires on streamed requests. Find why and fix it.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Reading src/inference/speculative.rs.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/speculative.rs"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+41	pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+42	
+43	/// Default drafted tokens per round for the draft-model drafter. Each draft
+44	/// token costs a sequential forward through the draft model, so the window
+45	/// stays shorter.
+46	pub const DEFAULT_MODEL_DRAFT_TOKENS: usize = 5;
+47	
+48	/// Count the longest accepted prefix: drafted tokens that equal the target's
+49	/// own greedy predictions position by position.
+50	pub fn accepted_draft_prefix(drafts: &[u32], target_predictions: &[u32]) -> usize {
+51	    drafts
+52	        .iter()
+53	        .zip(target_predictions.iter())
+54	        .take_while(|(draft, prediction)| draft == prediction)
+55	        .count()
+56	}
+57	
+58	/// Result of lossless speculative rejection sampling for a single verification round.
+59	#[derive(Debug, Clone, PartialEq, Eq)]
+60	pub struct SpeculativeRejectionResult {
+61	    /// Emitted tokens for this round: accepted prefix of draft tokens, followed by the
+62	    /// corrective or terminal bonus token from the target distribution.
+63	    pub emitted_tokens: Vec<u32>,
+64	    /// Number of draft tokens accepted before a rejection or full draft acceptance.
+65	    pub accepted_draft_count: usize,
+66	}
+67	
+68	/// Sample a token index from a discrete probability distribution given a uniform random value in [0, 1).
+69	pub fn sample_from_probs(probs: &[f32], uniform_r: f32) -> u32 {
+70	    let mut cumsum = 0.0f32;
+71	    let u = uniform_r.clamp(0.0, 0.9999999);
+72	    for (idx, &p) in probs.iter().enumerate() {
+73	        if p > 0.0 {
+74	            cumsum += p;
+75	            if cumsum > u {
+76	                return idx as u32;
+77	            }
+78	        }
+79	    }
+80	    // Fallback if sum of probabilities < 1 due to floating point rounding
+81	    probs
+82	        .iter()
+83	        .enumerate()
+84	        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+85	        .map(|(idx, _)| idx as u32)
+86	        .unwrap_or(0)
+87	}
+88	
+89	/// Deterministic random stream for one stochastic speculative-verification round.
+90	///
+91	/// Each committed token position owns a disjoint block of draws, so repeated runs with the same
+92	/// seed are reproducible even though a round may consume a variable number of random values.
+93	pub fn seeded_rejection_rng(seed: u64, committed_tokens: u64) -> impl FnMut() -> f32 {
+94	    let stream_base = committed_tokens.wrapping_mul(64);
+95	    let mut draw_index = 0u64;<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Applying the edit to src/inference/speculative.rs.
+<tool_call>{"name":"Edit","args":{"old_string":"41	pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+42	
+43	/// Default drafted tokens per round for the draft-model drafter. Each draft
+44	/// token costs a sequential forward through the draft model, so the window
+45	/// stays shorter.
+46	pub const DEFAULT_MODEL_DRAFT_TOKENS: usize = 5;
+47	
+48	/// Count the longest accepted prefix: drafted tokens that equal the target's"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Reading src/inference/spec_tree.rs.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/spec_tree.rs"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+101	    pub fn node_depth(&self) -> Vec<i32> {
+102	        self.depth.iter().map(|&d| d as i32).collect()
+103	    }
+104	
+105	    /// Per-node KV slot relative to `base` (the current KV position). Every
+106	    /// node gets a UNIQUE slot = `base + BFS index`, so the batched verify can
+107	    /// scatter each node's K/V into its own cache row without collision. The
+108	    /// per-node attention mask (which earlier slots a node may read) is the
+109	    /// ancestor bitset, not the slot itself.
+110	    pub fn node_kvslot(&self, base: usize) -> Vec<i32> {
+111	        (0..self.nodes()).map(|i| (base + i) as i32).collect()
+112	    }
+113	
+114	    /// Ancestor bitset: `ceil(N/32)` u32 words per node. For node `i`, bit `j`
+115	    /// (word `j/32`, bit `j%32`) is set iff node `j` is an ancestor of `i` or
+116	    /// `i` itself. This is the causal attention mask for tree verify — a node
+117	    /// attends only to the tokens on its own root-to-node path. Returns the
+118	    /// flat bitset and the stride (words per node).
+119	    pub fn ancestor_bitset(&self) -> (Vec<u32>, usize) {
+120	        let n = self.nodes();
+121	        let words = n.div_ceil(32);
+122	        let mut bits = vec![0u32; n * words];
+123	        for i in 0..n {
+124	            // Walk i and all its ancestors, setting the corresponding bits.
+125	            let mut cur = i as i32;
+126	            while cur >= 0 {
+127	                let c = cur as usize;
+128	                bits[i * words + c / 32] |= 1u32 << (c % 32);
+129	                cur = self.parent[c];
+130	            }
+131	        }
+132	        (bits, words)
+133	    }
+134	
+135	    /// Lossless greedy-exact tree accept.
+136	    ///
+137	    /// `predicted[i]` is the target model's greedy argmax for node `i` (i.e.
+138	    /// the token that should follow node `i` along its path). The root is
+139	    /// always accepted: `predicted[0]` is the guaranteed +1 bonus. At an
+140	    /// accepted node `c` we look for the child `ch` whose token equals
+141	    /// `predicted[c]` (the model's own next token); if one exists we accept and
+142	    /// emit it and recurse from `ch`. When no child matches we stop and emit
+143	    /// `predicted[c]` as the final bonus token (the model's greedy next token,
+144	    /// which no draft branch covered).
+145	    ///
+146	    /// Returns `(emitted_tokens, leaf_node)` where `leaf_node` is the last
+147	    /// accepted DRAFT node (its KV is committed by the caller advancing the
+148	    /// position). For an anchor-only tree the leaf is the root (0).
+149	    ///
+150	    /// Every emitted token is `predicted[c]` for some accepted node `c`, i.e.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Applying the edit to src/inference/spec_tree.rs.
+<tool_call>{"name":"Edit","args":{"old_string":"101	    pub fn node_depth(&self) -> Vec<i32> {
+102	        self.depth.iter().map(|&d| d as i32).collect()
+103	    }
+104	
+105	    /// Per-node KV slot relative to `base` (the current KV position). Every
+106	    /// node gets a UNIQUE slot = `base + BFS index`, so the batched verify can
+107	    /// scatter each node's K/V into its own cache row without collision. The
+108	    /// per-node attention m"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Reading src/api/mod.rs.
+<tool_call>{"name":"Read","args":{"file_path":"src/api/mod.rs"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+17151	    max_tokens > 1
+17152	        && moe.is_some_and(|metadata| metadata.family_label == "Mixtral")
+17153	        && !explicitly_enabled
+17154	}
+17155	
+17156	/// Whether lossless greedy or distribution-preserving stochastic speculation may engage.
+17157	///
+17158	/// Per-step logit consumers and pipeline-sharded verify remain unsupported.
+17159	///
+17160	/// The windowed-arch disqualifier is Phase 3c finding F4. `serve --spec-decode`
+17161	/// (CPU speculation) pins the target off the resident paths so the chunk-verify
+17162	/// rollback has CPU-authoritative KV — which for gemma3 means every request
+17163	/// lands on the CPU dense forward a<|start_header_id|>assistant<|end_header_id|>
+
