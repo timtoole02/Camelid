@@ -176,6 +176,9 @@ export default function ChatWorkspace({
   sending,
   receiptMode = false,
   setReceiptMode = null,
+  inspectMode = false,
+  setInspectMode = null,
+  tokenInspections = {},
   thinkingMode = false,
   setThinkingMode = null,
   webResearchEnabled = true,
@@ -1014,6 +1017,22 @@ export default function ChatWorkspace({
                 <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
               </button>
             )}
+            {/* Token inspection is a pre-send choice because the scores are
+                CAPTURED during the reply's own decode. Inspecting afterwards would
+                mean decoding a second time, and those numbers would describe that
+                other generation — on a sampled row, a different reply entirely. */}
+            {!demoMode && setInspectMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${inspectMode ? 'is-on' : ''}`}
+                title="Record the model's per-token scores for the next reply (sends it without streaming)"
+                aria-label="Token probabilities"
+                aria-pressed={inspectMode}
+                onClick={() => setInspectMode(!inspectMode)}
+              >
+                <IconChart size={16} /> <span className="cxcomposer__tool-label">{inspectMode ? 'Tokens on' : 'Tokens'}</span>
+              </button>
+            )}
             {!demoMode && setThinkingMode && !selectedBitNetChatModel && (
               <button
                 type="button"
@@ -1208,6 +1227,7 @@ export default function ChatWorkspace({
                       onReusePrompt={setComposer}
                       onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
+                      tokenInspection={tokenInspections?.[message.id] || null}
                     />
                   </Fragment>
                 )

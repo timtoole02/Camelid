@@ -18,6 +18,7 @@ import {
 } from '../lib/conversationCompaction.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
+import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, readInspectionContract } from '../lib/tokenInspection'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import {
   createPacerState,
@@ -58,7 +59,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena'])
+const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena', 'observatory'])
 // Where the UI looks for the camelid API by default:
 //   1. an explicit VITE_CAMELID_API_BASE override always wins;
 //   2. otherwise use the page origin. Production is served by Camelid directly;
@@ -707,6 +708,20 @@ export function useDashboardData({ showNotice, clearNotice }) {
   // Opt-in parity receipts: sends the next message non-streaming with
   // camelid_receipt:true so the response carries a verifiable receipt.
   const [receiptMode, setReceiptMode] = useState(false)
+  /* Opt-in token inspection: sends the next message non-streaming with
+     logprobs:true so the reply carries the model's per-token scores. Captured
+     DURING the decode that produces the visible reply — never reconstructed by a
+     second generation, which would describe a different generation.
+
+     Deliberately held OUTSIDE the conversation: a 120-token reply carries roughly
+     414 bytes per token at depth 5 and 1.4 KB per token at depth 20 — two orders
+     of magnitude more than the reply text. Persisting that would march a
+     conversation into the localStorage quota, and persistConversations swallows
+     the quota error, so the failure would silently stop saving the WHOLE
+     conversation rather than just this record. Session-scoped by design; the
+     panel says so and offers a download. */
+  const [inspectMode, setInspectMode] = useState(false)
+  const [tokenInspections, setTokenInspections] = useState({})
   // Opt-in thinking mode (experimental — NOT parity-locked): sends
   // camelid_enable_thinking:true so the model emits its own <think>…</think>
   // reasoning. Default OFF so chat stays on the parity-locked thinking-DISABLED
@@ -1593,6 +1608,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // must not cause the browser to advertise Prism's sampling controls that
       // this model does not use.
       const useExperimentalSampling = sendGate.chatMode === 'experimental' && !bitNetB158Chat
+      /* Token inspection rides on THIS request rather than a later replay, so the
+         scores describe the decode the reader is about to see. The contract is
+         resolved once per send and reused for both the stream flag and the
+         request fields. */
+      const inspectionContract = readInspectionContract(dashboard?.capabilities)
+      const inspecting = !targetVerifiedRender
+        && inspectionForcesNonStreaming({ enabled: inspectMode, contract: inspectionContract })
       const baseRequestBody = {
         model: requestModelId,
         messages: requestMessages,
@@ -1692,17 +1714,24 @@ export function useDashboardData({ showNotice, clearNotice }) {
         signal: requestController.signal,
         body: JSON.stringify({
           ...baseRequestBody,
-          // Receipts only attach to non-streaming responses; the JSON
-          // fallback in readStreamingChatCompletion handles that shape.
-          stream: targetVerifiedRender || !receiptMode,
+          // Receipts and token inspection only attach to non-streaming
+          // responses; the JSON fallback in readStreamingChatCompletion handles
+          // that shape. The engine returns a typed 400 for logprobs with
+          // stream:true, so `inspecting` MUST also clear the stream flag — the
+          // two conditions are derived from one source in tokenInspection.js
+          // rather than restated, so they cannot drift apart.
+          stream: targetVerifiedRender || !(receiptMode || inspecting),
           // Ask for the authoritative token count in the final stream chunk.
           // Without it the client can only ESTIMATE from visible content, which
           // undercounts badly on a thinking model: LFM2 emits its reasoning as
           // `reasoning_content`, so a reply that is mostly reasoning looked like
           // almost no tokens and the tok/s readout reported a fraction of the
           // real rate.
-          ...(targetVerifiedRender || !receiptMode ? { stream_options: { include_usage: true } } : {}),
+          ...(targetVerifiedRender || !(receiptMode || inspecting) ? { stream_options: { include_usage: true } } : {}),
           ...(!targetVerifiedRender && receiptMode ? { camelid_receipt: true } : {}),
+          /* Contributes nothing unless the contract permits inspection on this
+             engine, so a guarded row simply never reaches the wire. */
+          ...(targetVerifiedRender ? {} : inspectionRequestFields({ enabled: inspectMode, contract: inspectionContract })),
           ...(targetVerifiedRender ? {
             // The private verifier contract is exact: its output allowance is
             // the complete fresh draft, not the planner's larger upper bound.
@@ -1921,6 +1950,22 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // turn is fail-closed above, so it never falls through to client timing.
       const nativeMtp12 = readTargetVerifiedMtp12(streamed.camelid)
         || readTargetVerifiedMtp12(targetVerifiedPlannerCamelid)
+      /* Inspection lands in session state keyed by message id, NOT on the message
+         object — see the state declaration for why persisting it is unsafe.
+         Absence is recorded too: a lane that answers 200 without the key must be
+         reported as an unmeasured position, never as a flat distribution. */
+      if (inspecting) {
+        const absence = inspectionAbsenceReason({
+          requested: true,
+          responded: true,
+          hasLogprobs: Boolean(streamed.logprobs),
+          streamed: responseIsStreaming,
+        })
+        setTokenInspections((current) => ({
+          ...current,
+          [assistantId]: { logprobs: streamed.logprobs || null, absence },
+        }))
+      }
       const assistantMessage = {
         ...assistantMessageBase,
         content: paceDrain(pacer, streamed.content || ''),
@@ -2445,6 +2490,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     webResearchStatus,
     receiptMode,
     setReceiptMode,
+    inspectMode,
+    setInspectMode,
+    tokenInspections,
     thinkingMode,
     setThinkingMode,
     loadingModelId,

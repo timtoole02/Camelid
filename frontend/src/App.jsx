@@ -84,6 +84,7 @@ function App() {
     dashboard, authRequired, tab, setTab, selectedConversationId, setSelectedConversationId,
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
+    inspectMode, setInspectMode, tokenInspections,
     thinkingMode, setThinkingMode,
     webResearchEnabled, setWebResearchEnabled, webResearchStatus,
     loadingModelId, registerForm, setRegisterForm,
@@ -420,6 +421,9 @@ function App() {
               sending={sending}
               receiptMode={receiptMode}
               setReceiptMode={setReceiptMode}
+              inspectMode={inspectMode}
+              setInspectMode={setInspectMode}
+              tokenInspections={tokenInspections}
               thinkingMode={thinkingMode}
               setThinkingMode={setThinkingMode}
               webResearchEnabled={webResearchEnabled}

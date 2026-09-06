@@ -13,6 +13,7 @@ import {
 } from './render/StreamingIndicator'
 import { ParityReceiptCard } from './render/ParityReceipt'
 import { DeveloperDiagnosticsBlock } from './render/Diagnostics'
+import { TokenInspectorCard } from './render/TokenInspector'
 
 const formatMs = (value) => {
   const ms = Number(value)
@@ -255,7 +256,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend }) {
+export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, tokenInspection = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -384,6 +385,12 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
 
         {message.role === 'assistant' && !assistantStreaming && message.camelid_receipt && (
           <ParityReceiptCard receipt={message.camelid_receipt} />
+        )}
+        {message.role === 'assistant' && !assistantStreaming && tokenInspection && (
+          <TokenInspectorCard
+            inspection={tokenInspection.logprobs}
+            absence={tokenInspection.absence}
+          />
         )}
         <DeveloperDiagnosticsBlock message={message} />
       </div>

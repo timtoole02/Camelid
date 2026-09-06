@@ -559,6 +559,18 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:ui
 
+      - name: Token inspector smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:token-inspector
+
+      # Wired here because the token inspector adds the first value-encoding
+      # colors to the UI. The script has existed since the design-token work but
+      # was never added to this job, so every palette change since then shipped
+      # unaudited — the same gap this file already records for other lanes.
+      - name: Design token contrast audit
+        if: ${{ !cancelled() }}
+        run: npm run smoke:contrast
+
   # ---------------------------------------------------------------------------
   # Single aggregate gate. Make THIS the only required status check in branch
   # protection (see the note in the PR/commit). It runs on every event and

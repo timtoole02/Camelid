@@ -62,6 +62,12 @@ export function readChatCompletionJsonPayload(payload, { estimateTokenCount = de
     completionTokens: payload?.usage?.completion_tokens ?? estimateTokenCount(content),
     firstContentMs: null,
     usage: payload?.usage || null,
+    /* Per-token logprobs ride on the choice, and the engine OMITS the key rather
+       than sending null when they were not requested — so presence is the test,
+       never `=== null`. Reading it here rather than in the caller keeps the
+       non-streaming shape in one place; the streaming path has no equivalent,
+       because the engine refuses logprobs with stream:true. */
+    logprobs: Object.prototype.hasOwnProperty.call(choice || {}, 'logprobs') ? choice.logprobs : null,
   }
 }
 
@@ -91,7 +97,7 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
   }
 
   const reader = response.body?.getReader()
-  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null, camelid: null, camelidReceipt: null }
+  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null, camelid: null, camelidReceipt: null, logprobs: null }
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
@@ -197,6 +203,7 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
   }
   buffer += decoder.decode()
   if (buffer.trim()) consumeEvent(buffer.replace(/\r\n/g, '\n'))
-  // Receipts only attach to non-streaming responses (the JSON fallback above).
-  return { content, finishReason, completionTokens, firstContentMs, firstByteMs, firstEventMs, usage, camelid, camelidReceipt: null }
+  // Receipts and logprobs only attach to non-streaming responses (the JSON
+  // fallback above); the engine rejects logprobs with stream:true outright.
+  return { content, finishReason, completionTokens, firstContentMs, firstByteMs, firstEventMs, usage, camelid, camelidReceipt: null, logprobs: null }
 }
