@@ -11321,6 +11321,7 @@ fn validate_segmented_render_expected_sha(
 
 enum Gemma4StreamItem {
     Delta(String),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     SegmentBoundary(Gemma4TargetVerifiedSegmentProgress),
     Complete {
         completion_tokens: usize,
@@ -11409,6 +11410,7 @@ struct Gemma4StreamingOutcome {
     diagnostics: Option<serde_json::Value>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Gemma4PreparedRenderSegment {
     prompt: String,
     prompt_tokens: usize,
@@ -11834,6 +11836,7 @@ impl Gemma4ServeRuntime {
 
     /// Effective output budget for this lane: the request's own limit, clamped
     /// to the room left after the prompt and the verifier headroom.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     fn clamp_mtp12_output_tokens(
         &self,
         prompt_tokens: usize,
