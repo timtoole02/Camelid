@@ -1861,14 +1861,30 @@ impl RunnableModel {
     ) -> Result<Vec<u32>> {
         #[cfg(target_os = "macos")]
         {
-            self.generate_qwen35_vision_metal(prefix, image, suffix, max_new, stop, None, &|_| false, on_token)
+            self.generate_qwen35_vision_metal(
+                prefix,
+                image,
+                suffix,
+                max_new,
+                stop,
+                None,
+                &|_| false,
+                on_token,
+            )
         }
         #[cfg(not(target_os = "macos"))]
         {
             #[cfg(feature = "cuda")]
             {
                 self.generate_qwen35_vision_cuda(
-                    prefix, image, suffix, max_new, stop, None, &|_| false, on_token,
+                    prefix,
+                    image,
+                    suffix,
+                    max_new,
+                    stop,
+                    None,
+                    &|_| false,
+                    on_token,
                 )
             }
             #[cfg(not(feature = "cuda"))]
@@ -1890,13 +1906,21 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: &SamplingConfig,
+        should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         #[cfg(target_os = "macos")]
         {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
             self.generate_qwen35_vision_metal(
-                prefix, image, suffix, max_new, stop, sampling, on_token,
+                prefix,
+                image,
+                suffix,
+                max_new,
+                stop,
+                sampling,
+                should_stop,
+                on_token,
             )
         }
         #[cfg(not(target_os = "macos"))]
@@ -1905,12 +1929,28 @@ impl RunnableModel {
             {
                 let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
                 self.generate_qwen35_vision_cuda(
-                    prefix, image, suffix, max_new, stop, sampling, &|_| false, on_token,
+                    prefix,
+                    image,
+                    suffix,
+                    max_new,
+                    stop,
+                    sampling,
+                    should_stop,
+                    on_token,
                 )
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (prefix, image, suffix, max_new, stop, sampling, on_token);
+                let _ = (
+                    prefix,
+                    image,
+                    suffix,
+                    max_new,
+                    stop,
+                    sampling,
+                    should_stop,
+                    on_token,
+                );
                 Err(BackendError::UnsupportedGguf(
                     "Prism image generation requires Metal or CUDA".into(),
                 ))
@@ -2939,6 +2979,7 @@ impl RunnableModel {
     /// Like [`generate_qwen35`](Self::generate_qwen35) but invokes `on_token` for
     /// every emitted token as soon as it is decided — the serve lane's SSE source.
     /// Token order/content identical to the non-streaming path by construction.
+    #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_streaming(
         &self,
         prompt: &[u32],
@@ -2954,7 +2995,8 @@ impl RunnableModel {
 
         #[cfg(target_os = "macos")]
         if qwen35_metal_enabled() {
-            match self.generate_qwen35_metal(prompt, max_new, stop, sampling, should_stop, on_token) {
+            match self.generate_qwen35_metal(prompt, max_new, stop, sampling, should_stop, on_token)
+            {
                 Ok(tokens) => return Ok(tokens),
                 Err(err) => {
                     eprintln!("[qwen35] resident Metal lane failed ({err}); using hybrid fallback");
@@ -2978,10 +3020,24 @@ impl RunnableModel {
                     on_token,
                     stream_tokens_observable,
                     |tracked_on_token| {
-                        self.generate_qwen35_cuda(prompt, max_new, stop, sampling, should_stop, tracked_on_token)
+                        self.generate_qwen35_cuda(
+                            prompt,
+                            max_new,
+                            stop,
+                            sampling,
+                            should_stop,
+                            tracked_on_token,
+                        )
                     },
                     |fallback_on_token| {
-                        self.generate_qwen35_cpu(prompt, max_new, stop, sampling, should_stop, fallback_on_token)
+                        self.generate_qwen35_cpu(
+                            prompt,
+                            max_new,
+                            stop,
+                            sampling,
+                            should_stop,
+                            fallback_on_token,
+                        )
                     },
                 );
             }
@@ -3758,6 +3814,13 @@ impl RunnableModel {
                     generated.push(id);
                     token_history.push(id);
                     on_token(id);
+                    // Same placement as the per-token loops: judged after the token is
+                    // retained. Without this the predicate is evaluated only once,
+                    // before the chunk loop, and a stop string is honored for the first
+                    // generated token and then never again on this lane.
+                    if should_stop(&generated) {
+                        break 'device;
+                    }
                     if generated.len() >= max_new || qwen35_repetition_loop(&generated) {
                         break 'device;
                     }
@@ -4082,7 +4145,15 @@ impl RunnableModel {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
         if self.qwen35.is_some() {
-            return self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &|_| false, &mut |_| {});
+            return self.generate_qwen35_streaming(
+                prompt,
+                max_new,
+                stop,
+                None,
+                false,
+                &|_| false,
+                &mut |_| {},
+            );
         }
         self.generate_stopping_streaming(prompt, max_new, stop, &mut |_| {})
     }
@@ -4136,7 +4207,14 @@ impl RunnableModel {
         stop: &[u32],
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
-        self.generate_stopping_streaming_cancelled(prompt, max_new, stop, &|| false, &|_| false, on_token)
+        self.generate_stopping_streaming_cancelled(
+            prompt,
+            max_new,
+            stop,
+            &|| false,
+            &|_| false,
+            on_token,
+        )
     }
 
     /// Greedy streaming with cooperative cancellation. The predicate is checked
@@ -4188,6 +4266,7 @@ impl RunnableModel {
     /// Sampling-capable runnable generation with cooperative cancellation. Unlike
     /// the previous generic bridge, BitNet now honors non-greedy sampling instead
     /// of silently ignoring the OpenAI request parameters.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_stopping_streaming_with_sampling_cancelled(
         &self,
         prompt: &[u32],
@@ -4208,12 +4287,27 @@ impl RunnableModel {
         }
         if self.qwen35.is_some() {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
-            return self.generate_qwen35_streaming(prompt, max_new, stop, sampling, true, should_stop, on_token);
+            return self.generate_qwen35_streaming(
+                prompt,
+                max_new,
+                stop,
+                sampling,
+                true,
+                should_stop,
+                on_token,
+            );
         }
         #[cfg(target_os = "macos")]
         if self.lfm2.is_some() && lfm2_metal_enabled() {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
-            return self.generate_lfm2_metal(prompt, max_new, stop, sampling, should_stop, on_token);
+            return self.generate_lfm2_metal(
+                prompt,
+                max_new,
+                stop,
+                sampling,
+                should_stop,
+                on_token,
+            );
         }
 
         let mut cache = self.new_cache();
