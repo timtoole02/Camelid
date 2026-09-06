@@ -1,0 +1,161 @@
+/* Structured output — what a constrained reply demonstrates.
+
+   COLOR POSTURE. No new color tokens. The verdict chip is the one place a status
+   colour is used, and the choice is deliberate: "Mask observed" is the only state
+   backed by an observation, and it still does not earn copper — copper is
+   reserved for supported/verified support claims, and a mask acting on one reply
+   is not a support claim. It uses amber (--color-evidence), the bounded-evidence
+   ink, which is exactly what this is. The weaker states are muted text, not
+   colour, so the scale reads as strength-of-evidence rather than pass/fail. */
+
+.structout {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.structout__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.structout__label {
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-text-faint);
+  font-weight: 600;
+}
+
+.structout__verdict {
+  font-size: var(--text-micro);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border-soft);
+  color: var(--color-text-muted);
+}
+
+/* Only the observed state is inked. */
+.structout__verdict--diverted {
+  color: var(--color-evidence);
+  border-color: color-mix(in srgb, var(--color-evidence) 45%, transparent);
+}
+
+.structout__detail,
+.structout__unchecked {
+  margin: 0;
+  font-size: var(--text-micro);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+}
+
+.structout__rows {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+  font-size: var(--text-micro);
+}
+
+.structout__row { display: flex; flex-direction: column; gap: 1px; }
+.structout__row dt { color: var(--color-text-faint); text-transform: uppercase; letter-spacing: var(--tracking-label); }
+.structout__row dd { margin: 0; color: var(--color-text); }
+
+.structout__problems {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: var(--text-micro);
+  color: var(--color-text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.structout__toggle {
+  align-self: flex-start;
+  padding: 3px var(--space-2);
+  font-size: var(--text-micro);
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.structout__toggle:hover { color: var(--color-text); border-color: var(--color-border-strong); }
+.structout__toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.structout__json {
+  margin: 0;
+  padding: var(--space-2);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: var(--leading-snug);
+  color: var(--color-text);
+  max-height: 16rem;
+  overflow: auto;
+}
+
+/* Composer schema editor. A bare textarea by choice: adding a code-editor
+   dependency to ship one field would be a larger decision than this feature. */
+.structout-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-2);
+}
+
+.structout-editor__modes { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+
+.structout-editor__mode {
+  padding: 2px var(--space-2);
+  font-size: var(--text-micro);
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.structout-editor__mode.is-on {
+  color: var(--color-accent-text);
+  border-color: var(--color-accent);
+}
+
+.structout-editor__mode:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.structout-editor__field {
+  width: 100%;
+  min-height: 8rem;
+  resize: vertical;
+  padding: var(--space-2);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: var(--leading-snug);
+  color: var(--color-text);
+}
+
+.structout-editor__field:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.structout-editor__status {
+  margin: 0;
+  font-size: var(--text-micro);
+  color: var(--color-text-muted);
+}
+
+.structout-editor__status.is-invalid { color: var(--color-warning); }

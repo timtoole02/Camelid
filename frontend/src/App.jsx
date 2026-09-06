@@ -85,6 +85,8 @@ function App() {
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
     inspectMode, setInspectMode, tokenInspections, inspectionSupported,
+    structuredMode, setStructuredMode, structuredSchema, setStructuredSchema,
+    structuredGrammar, setStructuredGrammar, structuredRecords, structuredSupported, structuredReadiness,
     thinkingMode, setThinkingMode,
     webResearchEnabled, setWebResearchEnabled, webResearchStatus,
     loadingModelId, registerForm, setRegisterForm,
@@ -425,6 +427,15 @@ function App() {
               setInspectMode={setInspectMode}
               tokenInspections={tokenInspections}
               inspectionSupported={inspectionSupported}
+              structuredMode={structuredMode}
+              setStructuredMode={setStructuredMode}
+              structuredSchema={structuredSchema}
+              setStructuredSchema={setStructuredSchema}
+              structuredGrammar={structuredGrammar}
+              setStructuredGrammar={setStructuredGrammar}
+              structuredRecords={structuredRecords}
+              structuredSupported={structuredSupported}
+              structuredReadiness={structuredReadiness}
               thinkingMode={thinkingMode}
               setThinkingMode={setThinkingMode}
               webResearchEnabled={webResearchEnabled}

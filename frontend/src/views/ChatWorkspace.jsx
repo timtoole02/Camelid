@@ -180,6 +180,15 @@ export default function ChatWorkspace({
   setInspectMode = null,
   tokenInspections = {},
   inspectionSupported = false,
+  structuredMode = 'off',
+  setStructuredMode = null,
+  structuredSchema = '',
+  setStructuredSchema = null,
+  structuredGrammar = '',
+  setStructuredGrammar = null,
+  structuredRecords = {},
+  structuredSupported = false,
+  structuredReadiness = { ready: false, reason: null },
   thinkingMode = false,
   setThinkingMode = null,
   webResearchEnabled = true,
@@ -835,6 +844,50 @@ export default function ChatWorkspace({
           onClose={() => setShowControls(false)}
         />
       )}
+      {structuredSupported && structuredMode !== 'off' && setStructuredMode && (
+        <div className="structout-editor">
+          <div className="structout-editor__modes" role="group" aria-label="Constraint form">
+            {[
+              ['json_schema', 'JSON schema'],
+              ['json_object', 'Any JSON'],
+              ['grammar', 'Grammar'],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={`structout-editor__mode ${structuredMode === value ? 'is-on' : ''}`}
+                aria-pressed={structuredMode === value}
+                onClick={() => setStructuredMode(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {structuredMode === 'json_schema' && (
+            <textarea
+              className="structout-editor__field"
+              aria-label="JSON schema"
+              spellCheck={false}
+              value={structuredSchema}
+              onChange={(event) => setStructuredSchema?.(event.target.value)}
+            />
+          )}
+          {structuredMode === 'grammar' && (
+            <textarea
+              className="structout-editor__field"
+              aria-label="Grammar"
+              spellCheck={false}
+              value={structuredGrammar}
+              onChange={(event) => setStructuredGrammar?.(event.target.value)}
+            />
+          )}
+          <p className={`structout-editor__status ${structuredReadiness.ready ? '' : 'is-invalid'}`}>
+            {structuredReadiness.ready
+              ? 'The next reply is constrained to this. Turn on Tokens as well to see whether the constraint actually diverted the decode.'
+              : structuredReadiness.reason}
+          </p>
+        </div>
+      )}
       <div
         className="cxcomposer__box"
         onDragOver={(e) => {
@@ -1016,6 +1069,29 @@ export default function ChatWorkspace({
                 onClick={() => setReceiptMode(!receiptMode)}
               >
                 <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
+              </button>
+            )}
+            {/* Constrained decoding is a pre-send choice: the engine refuses a
+                constraint on a streaming request, and its streaming decoder never
+                builds a grammar state at all, so the turn must be composed
+                non-streaming before it is sent. Guarded when the contract does not
+                advertise it, rather than live-with-a-disclaimer. */}
+            {!demoMode && setStructuredMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${structuredMode !== 'off' && structuredSupported ? 'is-on' : ''}`}
+                title={structuredSupported
+                  ? 'Constrain the next reply to a JSON schema or grammar (sends it without streaming)'
+                  : 'This engine does not advertise constrained decoding.'}
+                aria-label={structuredSupported ? 'Structured output' : 'Structured output — unavailable on this engine'}
+                aria-pressed={structuredSupported ? structuredMode !== 'off' : undefined}
+                disabled={!structuredSupported}
+                onClick={() => setStructuredMode(structuredMode === 'off' ? 'json_schema' : 'off')}
+              >
+                <IconFile size={16} />
+                <span className="cxcomposer__tool-label">
+                  {!structuredSupported ? 'Schema unavailable' : structuredMode === 'off' ? 'Schema' : 'Schema on'}
+                </span>
               </button>
             )}
             {/* Token inspection is a pre-send choice because the scores are
@@ -1240,6 +1316,7 @@ export default function ChatWorkspace({
                       onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
                       tokenInspection={tokenInspections?.[message.id] || null}
+                      structuredRecord={structuredRecords?.[message.id] || null}
                     />
                   </Fragment>
                 )
