@@ -96,3 +96,46 @@ frontend cannot — and will not fake — a chat session against the runnable la
 
 Until then the Compatible rows stay receipt-only with an explicit "CLI only — no HTTP serve
 yet" note; membership and evidence remain fully derived, nothing is invented.
+
+## 5. Logprobs on the streaming path (Token Inspector, 2026-09-06)
+
+**Surface waiting on it:** the Token Inspector composer toggle
+(`lib/tokenInspection.js`, `components/chat/render/TokenInspector.jsx`). Because
+`rich_logprobs.unsupported_modes` contains `streaming`, an inspected turn must be
+sent with `stream: false`, so the user gives up token-by-token rendering for that
+reply and must decide to inspect BEFORE sending. Inspecting afterwards is not an
+option we are willing to take: it would mean decoding a second time, and those
+numbers would describe a different generation than the one on screen.
+
+**Ask:** carry the per-token record on the SSE path — either a `logprobs` object on
+each `choices[0].delta` (one entry per emitted token), or one terminal chunk
+carrying the whole `content[]` array in the same shape the non-streaming response
+already uses. Either shape collapses the pre-send decision into an ordinary
+disclosure of data already in hand, and the frontend keeps streaming.
+
+**Not asked:** logprobs together with `n > 1`. Those are mutually exclusive by
+contract and the UI treats the candidates surface as guarded, not pending.
+
+## 6. Logprobs fail OPEN on four serve lanes (engine defect, 2026-09-06)
+
+**Not a frontend ask — a backend correctness report.**
+
+`chat_completions` short-circuits into the gemma4 (`src/api/mod.rs:18011`), runnable
+(`:18063`) and DiffusionGemma (`:18077`) lanes BEFORE `validate_choice_and_logprob_fields`
+runs. On those lanes a request carrying `logprobs: true` returns **HTTP 200 with the
+`logprobs` key simply absent** — no error, no typed refusal. Every other invalid
+logprobs combination on the dense lane is a typed 400, so this one path fails open
+while its neighbours fail closed.
+
+That matters because the missing key is indistinguishable, to a client, from a lane
+that genuinely reported nothing — and the honest reading of "no distribution" is
+easy to confuse with "a flat or certain distribution". The Token Inspector handles
+it defensively (`inspectionAbsenceReason`, `code: 'lane_absent'`) and says the
+measurement is missing rather than flat, but the engine should refuse rather than
+leave every client to detect this independently.
+
+**Ask:** move the logprobs validation ahead of lane dispatch, and return the same
+typed 400 these lanes already return for other unsupported combinations — or add a
+lane axis to `api_conformance` so the refusal is at least machine-readable. Note
+that `unsupported_modes` today covers only the ROUTE axis (`streaming`,
+`multi_choice`) and says nothing about which serve lanes can honour the request.

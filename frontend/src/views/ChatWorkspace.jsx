@@ -176,6 +176,10 @@ export default function ChatWorkspace({
   sending,
   receiptMode = false,
   setReceiptMode = null,
+  inspectMode = false,
+  setInspectMode = null,
+  tokenInspections = {},
+  inspectionSupported = false,
   thinkingMode = false,
   setThinkingMode = null,
   webResearchEnabled = true,
@@ -1014,6 +1018,33 @@ export default function ChatWorkspace({
                 <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
               </button>
             )}
+            {/* Token inspection is a pre-send choice because the scores are
+                CAPTURED during the reply's own decode. Inspecting afterwards would
+                mean decoding a second time, and those numbers would describe that
+                other generation — on a sampled row, a different reply entirely. */}
+            {/* Guarded, not hidden, when the contract does not advertise
+                inspection: a live-looking toggle that records nothing is the
+                caveated-live surface I3 rules out, and hiding it entirely would
+                leave no explanation for why the feature is absent. The accessible
+                name contains the visible label so voice control can address it. */}
+            {!demoMode && setInspectMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${inspectMode && inspectionSupported ? 'is-on' : ''}`}
+                title={inspectionSupported
+                  ? "Record the model's per-token scores for the next reply (sends it without streaming)"
+                  : 'This engine does not advertise per-token probability reporting, so the next reply cannot record it.'}
+                aria-label={inspectionSupported ? 'Tokens — record per-token probabilities' : 'Tokens — unavailable on this engine'}
+                aria-pressed={inspectionSupported ? inspectMode : undefined}
+                disabled={!inspectionSupported}
+                onClick={() => setInspectMode(!inspectMode)}
+              >
+                <IconChart size={16} />
+                <span className="cxcomposer__tool-label">
+                  {inspectionSupported ? (inspectMode ? 'Tokens on' : 'Tokens') : 'Tokens unavailable'}
+                </span>
+              </button>
+            )}
             {!demoMode && setThinkingMode && !selectedBitNetChatModel && (
               <button
                 type="button"
@@ -1208,6 +1239,7 @@ export default function ChatWorkspace({
                       onReusePrompt={setComposer}
                       onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
+                      tokenInspection={tokenInspections?.[message.id] || null}
                     />
                   </Fragment>
                 )
