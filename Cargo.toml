@@ -12,7 +12,7 @@ resolver = "2"
 
 [package]
 name = "camelid"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 # MSRV floor, deliberately BELOW the toolchain in rust-toolchain.toml (1.95.0) —
 # these are different things and should not be "aligned". rust-toolchain.toml
