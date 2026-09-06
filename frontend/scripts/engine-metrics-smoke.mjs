@@ -23,6 +23,7 @@
  * SSR component test — no browser, no dist build required.
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
@@ -94,6 +95,7 @@ try {
     LANE_RISK,
     formatShare,
     formatBytes,
+    UNEVIDENCED_BACKENDS,
   } = mod
 
   console.log('engine metrics — parsing')
@@ -190,6 +192,129 @@ try {
     assert.equal(live.length, 1, 'only the GPU setting reaches a running engine')
     assert.equal(live[0].key, 'cuda_resident_active')
     assert.ok(lane.rows.filter((row) => row.changeable === 'restart').length >= 4)
+  })
+
+  console.log('engine metrics — the macOS lanes')
+
+  /* Every backend the planner can actually return, read out of the Rust rather
+     than retyped here — a list retyped is a list that goes stale, which is the
+     defect this block exists to catch. `selected_backend` is the first element of
+     each returned tuple, so a bare quoted string on the line after an opening
+     paren is exactly the set of them. */
+  const PLANNER = resolve(frontendRoot, '..', 'src', 'execution_plan.rs')
+  function plannerBackends() {
+    const production = readFileSync(PLANNER, 'utf8').split(/^#\[cfg\(test\)\]/m)[0]
+    const lines = production.split('\n')
+    const found = new Set()
+    for (let i = 0; i < lines.length - 1; i += 1) {
+      if (!/^\s*(return )?\($/.test(lines[i])) continue
+      const named = lines[i + 1].match(/^\s*"([a-z][a-z0-9_]*)",$/)
+      if (named) found.add(named[1])
+    }
+    return found
+  }
+
+  check('every backend the planner can select is classified, evidenced or not', () => {
+    const backends = plannerBackends()
+    /* If a reformat ever breaks the extraction this assertion fails loudly rather
+       than passing over an empty set and certifying nothing. */
+    assert.ok(backends.size >= 16, `extracted only ${backends.size} backends from execution_plan.rs`)
+    const unclassified = [...backends].filter((b) =>
+      readActiveLane({ execution_plan: { selected_backend: b } }).risk === LANE_RISK.UNEVIDENCED
+      && !UNEVIDENCED_BACKENDS.has(b))
+    assert.deepEqual(unclassified, [],
+      'a lane the planner can pick is unclassified — add it to EVIDENCED_BACKENDS or UNEVIDENCED_BACKENDS')
+  })
+
+  check('the macOS lanes that are default-on read as evidenced', () => {
+    /* Each of these is an opt-OUT in the planner, so a stock macOS serve lands on
+       one of them. The first version of this panel called all three unevidenced
+       while their CUDA counterparts read as evidenced. */
+    for (const backend of [
+      'metal_resident_q8_runtime',
+      'metal_resident_qwen35_runtime',
+      'metal_resident_qwen35_kquant_runtime',
+      'metal_resident_lfm2_runtime',
+    ]) {
+      const lane = readActiveLane({ execution_plan: { selected_backend: backend } })
+      assert.equal(lane.risk, LANE_RISK.EVIDENCED, `${backend} must not read as unevidenced`)
+    }
+  })
+
+  const macRuntime = {
+    execution_plan: {
+      operating_system: 'macos',
+      architecture: 'aarch64',
+      selected_backend: 'metal_resident_qwen35_kquant_runtime',
+      decode_path: 'qwen35_metal_resident_decode',
+      prefill_path: 'qwen35_metal_resident_prefill',
+      /* A plain `bool` on the plan struct, so macOS serializes `false` rather than
+         omitting it. Present-and-false is the shape that has to be handled. */
+      cuda_resident_active: false,
+      thread_count: 8,
+      reasons: ['profile=auto default'],
+    },
+    q8_runtime: { policy: 'wire_kquant' },
+  }
+
+  check('a Metal host is not described in CUDA terms', () => {
+    const lane = readActiveLane(macRuntime)
+    assert.equal(lane.rows.some((row) => row.key === 'cuda_resident_active'), false,
+      'a Metal host must not render a CUDA row')
+    const gpu = lane.rows.find((row) => row.key === 'metal_resident_active')
+    assert.ok(gpu, 'the accelerator row must name Metal')
+    assert.equal(gpu.value, 'true')
+  })
+
+  check('no lever is offered as live-settable on a Metal host', () => {
+    /* POST /api/runtime/gpu writes cuda::set_gpu_accel_enabled and
+       set_runtime_enabled; every reader of those is a CUDA or BitNet path, and the
+       planner's Metal arms gate on metal_available plus per-lane opt-outs instead.
+       So the toggle genuinely cannot move this lane. */
+    const lane = readActiveLane(macRuntime)
+    assert.equal(lane.rows.filter((row) => row.changeable === 'gpu_toggle').length, 0)
+    assert.ok(lane.rows.every((row) => row.changeable === 'restart'))
+  })
+
+  check('an engine too old to report its OS is read from the backend prefix', () => {
+    const lane = readActiveLane({ execution_plan: { selected_backend: 'metal_resident_q8_runtime' } })
+    assert.ok(lane.rows.find((row) => row.key === 'metal_resident_active'))
+  })
+
+  check('a zero VRAM total reads as unreported, not as an empty device', () => {
+    /* src/api/metrics.rs writes both CUDA gauges unconditionally and
+       HardwareProfile::detect() leaves them at 0 on every macOS host, so this is
+       the exposition a Mac actually serves — not a hypothetical. */
+    const macMetrics = summarizeMetrics(`# TYPE camelid_process_resident_memory_bytes gauge
+camelid_process_resident_memory_bytes 17000000000
+# TYPE camelid_cuda_vram_total_bytes gauge
+camelid_cuda_vram_total_bytes 0
+# TYPE camelid_cuda_vram_free_bytes gauge
+camelid_cuda_vram_free_bytes 0
+`)
+    assert.equal(macMetrics.memory.vramUsedBytes, null, '0 B of 0 B is not a reading')
+    assert.equal(macMetrics.memory.vramTotalBytes, null)
+    assert.equal(formatBytes(macMetrics.memory.vramUsedBytes), '—')
+    /* Resident memory still reports: only the VRAM pair is suppressed. */
+    assert.equal(macMetrics.memory.residentBytes, 17000000000)
+  })
+
+  check('a committed device still reports zero free against a real total', () => {
+    const full = summarizeMetrics(`# TYPE camelid_cuda_vram_total_bytes gauge
+camelid_cuda_vram_total_bytes 6441926656
+# TYPE camelid_cuda_vram_free_bytes gauge
+camelid_cuda_vram_free_bytes 0
+`)
+    assert.equal(full.memory.vramUsedBytes, 6441926656)
+  })
+
+  check('the Metal panel does not promise a toggle that cannot move it', () => {
+    const html = renderToStaticMarkup(React.createElement(EngineMetricsPanel, {
+      apiBase: '', runtime: macRuntime, initialMetricsText: LIVE_METRICS,
+    }))
+    assert.doesNotMatch(html, /CUDA resident/, 'no CUDA row on a Metal host')
+    assert.match(html, /Nothing on this lane is settable while the engine runs/)
+    assert.doesNotMatch(html, /the one exception the engine accepts while running/)
   })
 
   console.log('engine metrics — rendered copy')

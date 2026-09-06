@@ -193,8 +193,14 @@ export function EngineMetricsPanel({ apiBase, runtime, initialMetricsText = null
         <p className="engmetrics__note">
           These are read once when the engine starts, and several are latched for the life of the
           process — so they are shown here rather than offered as controls. Changing one means
-          restarting the engine with a different setting. The GPU acceleration toggle in Settings is
-          the one exception the engine accepts while running.
+          restarting the engine with a different setting.{' '}
+          {/* Only claim the exception where it exists. The GPU toggle writes two CUDA
+              atomics that no Metal lane reads, so on a Metal host the honest count of
+              live-settable levers is zero — and a panel built to avoid controls that do
+              nothing must not describe one. */}
+          {lane.rows.some((row) => row.changeable === 'gpu_toggle')
+            ? 'The GPU acceleration toggle in Settings is the one exception the engine accepts while running.'
+            : 'Nothing on this lane is settable while the engine runs.'}
         </p>
 
         {lane.reasons.length > 0 && (
