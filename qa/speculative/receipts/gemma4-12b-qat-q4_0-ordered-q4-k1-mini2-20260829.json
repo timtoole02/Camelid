@@ -55,8 +55,8 @@
     "ordered_k1_slowdown_ratio": 1.538812367472633
   },
   "remote_receipts": {
-    "stdout": "/Users/timtoole/gemma4-12b-speed/receipts/orderedsimd-e6c14bfe-raw-r1.stdout",
-    "stderr": "/Users/timtoole/gemma4-12b-speed/receipts/orderedsimd-e6c14bfe-raw-r1.stderr"
+    "stdout": "~/gemma4-12b-speed/receipts/orderedsimd-e6c14bfe-raw-r1.stdout",
+    "stderr": "~/gemma4-12b-speed/receipts/orderedsimd-e6c14bfe-raw-r1.stderr"
   },
   "verdict": "PASS_K1_IDENTITY_ONLY"
 }

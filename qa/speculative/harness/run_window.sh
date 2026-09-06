@@ -23,7 +23,7 @@ FAST=(CAMELID_METAL_RESIDENT_DECODE=1 CAMELID_METAL_RESIDENT_PREFILL=1 CAMELID_M
 
 run() { # run <arm> <v2> <mma> <drafts>
   echo "### $1 drafts=$4 $(date +%H:%M:%S)" >&2
-  CAM_SESSION_PID=$PPID /Users/timtoole/bin/cam-lock.sh env "${FAST[@]}" \
+  CAM_SESSION_PID=$PPID "$HOME"/bin/cam-lock.sh env "${FAST[@]}" \
     CAMELID_KQUANT_V2="$2" CAMELID_KQUANT_MMA="$3" \
     "$BIN" bench-speculative "$Q4" \
       --drafter ngram --draft-tokens "$4" --workload "win_$1_k$4" \

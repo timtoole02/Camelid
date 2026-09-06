@@ -27,4 +27,4 @@ Reproduce the production-library gate under the local GPU lock:
   cargo test --lib metal_gemma4_dense_attention_rows_v2_variant_matrix -- --nocapture
 ```
 
-Standalone source, harnesses, full sample logs and summaries are retained under `/Users/timtoole/Documents/Codex/2026-09-04/i-n/work/attention-depth/`. The final patched-source timing is `production-fixture-w8.log`; the production-library gate is `production-matrix.log`. No full model was run during this local kernel qualification.
+Standalone source, harnesses, full sample logs and summaries are retained under `~/Documents/Codex/2026-09-04/i-n/work/attention-depth/`. The final patched-source timing is `production-fixture-w8.log`; the production-library gate is `production-matrix.log`. No full model was run during this local kernel qualification.

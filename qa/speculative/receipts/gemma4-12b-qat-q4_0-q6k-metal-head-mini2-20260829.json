@@ -153,5 +153,5 @@
     "swap_events": 0,
     "verdict": "PASS"
   },
-  "remote_receipt_directory": "/Users/timtoole/gemma4-12b-speed/receipts"
+  "remote_receipt_directory": "~/gemma4-12b-speed/receipts"
 }

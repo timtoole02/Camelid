@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "5f715152",
+    "source_head": "9f4bd2d9",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -1141,6 +1141,57 @@
         "latest_checked_output": "Paris",
         "evidence": "the exact tracked gemma-4-12b-it-Q8_0 GGUF (12,669,646,240 bytes, general.architecture=gemma4, 48 layers with the per-layer attention.head_count_kv array and V-less full-attention layers parsed from the GGUF) runs as two-Mac distributed layer sharding: the CLI lane is token-identical to single-node camelid on all five basic_v1 prompts (qa/evidence-bundles/gemma4-12b-it-q8-0-two-mac-20260610T103711Z-head-96a75007b156; decode 6.2-6.75 tok/s across the pair, both 16GB nodes within budget; 3/5 prompts match the pinned comparator full-budget with two recorded reference-comparator frontiers), and the distributed SERVE lane answers /v1/chat/completions (non-streaming and SSE) and /v1/completions end-to-end across the pair (qa/evidence-bundles/gemma4-12b-it-q8-0-distributed-serve-20260610T235155Z-head-80e3dddfbdb4; master shard 0..24 + worker 24..48, wire protocol v1 with per-request worker sessions). Camelid supports exact-row text-token generation + serve smoke for this row only, and only through the two-Mac distributed lane; no single-node, bounded-context, performance, portability, multimodal, or full support is implied",
         "next_step": "durable current-head refresh, bounded context buckets through the distributed lane, and performance/RSS gates before any wider 12B claim; single-node support is not a goal on 16GB hosts"
+      }
+    },
+    {
+      "identity": {
+        "id": "gemma4_12b_it_qat_q4_0_mtp12",
+        "family": "gemma4_dense_decoder_mtp12",
+        "quantization": "Q4_0",
+        "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+        "gguf_filename": "gemma-4-12b-it-qat-q4_0.gguf"
+      },
+      "contract": {
+        "id": "gemma4_12b_it_qat_q4_0_mtp12",
+        "tool_capable": false,
+        "family": "gemma4_dense_decoder_mtp12",
+        "quantization": "Q4_0",
+        "status": "supported_exact_row_smoke",
+        "support_scope": "exact_row_single_node_base_m4_mini_mac16_10_macos_26_5_metal_lossless_mtp12_performance_smoke_only",
+        "full_support_status": "blocked_pending_normalized_full_support",
+        "full_support_blockers": "the supported claim is pinned to one target SHA and one assistant SHA on Apple Metal with the explicit MTP12 serve opt-in; the 51 tok/s receipts cover a 96-token qualification prompt at a 512-row KV capacity, not arbitrary long-form quality or a bounded-context ladder; portability, normalized API/WebUI evidence, broader prompts, and durable current-head performance/RSS gates remain pending",
+        "metadata_parses": "validated_exact_gemma4_12b_qat_q4_0_target",
+        "tokenizer_works": "validated_for_gemma4_spm",
+        "tensors_load": "validated_single_node_metal_resident_q4_0_target_plus_exact_resident_mtp12_assistant",
+        "generation_runs": "lossless_ordered_target_verified_mtp12_greedy_decode",
+        "parity_audited": "ordered_k1_token_ids_and_text_exact_for_the_qualified_96_token_run",
+        "performance_measured": "51_494_tok_s_confirmation_51_305_two_run_mean_51_399_zero_swap_on_base_m4_16gb",
+        "frontend_load_path_verified": "explicit_mtp12_api_serve_lane_pending_normalized_webui_capture",
+        "frontend_readiness_gate": "green only on the receipted base-M4 Mac mini profile (Mac16,10 / Apple M4 / macOS 26.5.x / Metal available) when the exact target filename and SHA match this row, CAMELID_GEMMA4_MTP12_ASSISTANT names the exact admitted assistant, and health reports the mtp12_metal serve lane",
+        "tested_context": "96_output_token_performance_qualification_with_512_row_kv_capacity",
+        "chat_template_renderer": "gemma4_marker",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "performance_qualification_only_not_promoted_as_context_pack",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "single_node_macos_metal_mtp12_96_token_performance_qualification",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "51.494 tok/s; confirmation 51.305 tok/s; ordered-K1 token ids and text exact; zero swaps",
+        "evidence": "The exact Gemma 4 12B QAT Q4_0 target (SHA-256 93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b) and exact official MTP12 assistant (SHA-256 67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6) ran the lossless ordered target-verification lane on a 16GB base Apple M4. The primary 96-token qualification measured 51.493947835 tok/s and the confirmation measured 51.304677961 tok/s (mean 51.399), with ordered-K1 token IDs and decoded text exact and zero swaps. The winning selector was CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1. These are native decode-forward receipts using (emitted_tokens-1)/decode_us; they do not establish response quality or transfer that rate to arbitrary prompts/context sizes.",
+        "next_step": "capture the normalized long-form API/WebUI run at a larger KV allocation, verify quality and memory behavior, and add bounded-context and portable performance gates before widening this exact-row claim"
       }
     },
     {

@@ -28,7 +28,7 @@ curl -s -m 300 -H 'Content-Type: application/json' -d \
 echo "--- top candidates at the divergence position ---"
 python3 - <<'PY'
 import json
-try: r=json.load(open('/Users/timtoole/logit_probe.json'))
+try: r=json.load(open('"$HOME"/logit_probe.json'))
 except Exception as e: print('parse fail:',e); raise SystemExit
 ch=(r.get('choices') or [{}])[0]
 print('text:', repr(ch.get('text')))

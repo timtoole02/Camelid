@@ -23,7 +23,7 @@ FAST=(CAMELID_METAL_RESIDENT_DECODE=1 CAMELID_METAL_RESIDENT_PREFILL=1 CAMELID_M
 
 gen() { # gen <arm> <v2> <mma> <model> <prompt> <label>
   echo "### gen $1 / $6 $(date +%H:%M:%S)" >&2
-  CAM_SESSION_PID=$PPID /Users/timtoole/bin/cam-lock.sh env "${FAST[@]}" \
+  CAM_SESSION_PID=$PPID "$HOME"/bin/cam-lock.sh env "${FAST[@]}" \
     CAMELID_KQUANT_V2="$2" CAMELID_KQUANT_MMA="$3" \
     "$BIN" bench-generate "$4" --prompt-file "$5" --max-tokens 64 --iterations 2 --warmup \
     2>>"$OUT/v2depth.stderr" | sed "s/^/{\"arm\":\"$1\",\"prompt\":\"$6\",\"record\":/; s/$/}/" \

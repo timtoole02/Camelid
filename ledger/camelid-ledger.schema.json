@@ -89,6 +89,7 @@
         "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
         "exact_row_macos_metal_or_windows_cuda_text_and_single_image_chat_smoke_only",
         "exact_row_metal_gpu_resident_windowed_chat_smoke_only",
+        "exact_row_single_node_base_m4_mini_mac16_10_macos_26_5_metal_lossless_mtp12_performance_smoke_only",
         "exact_row_single_node_cpu_smoke_only",
         "exact_row_smoke_only",
         "exact_row_validation_only",

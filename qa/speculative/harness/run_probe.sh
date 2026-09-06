@@ -20,7 +20,7 @@ if [ "$want" != "$got" ]; then echo "  !! MISMATCH — a parity result against a
 echo "  MATCHES the pinned fixture"
 
 # CPU reference lane, f32 KV, no repack — the lane the failure was recorded on.
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh env \
+CAM_SESSION_PID=$$ "$HOME"/bin/cam-lock.sh env \
   CAMELID_METAL_RESIDENT_DECODE=0 CAMELID_METAL_RESIDENT_PREFILL=0 \
   "$BIN" serve --addr 127.0.0.1:$PORT --model "$M" > "$OUT/probe_serve.log" 2>&1 &
 LOCKPID=$!

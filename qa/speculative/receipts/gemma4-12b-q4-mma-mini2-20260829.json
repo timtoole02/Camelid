@@ -19,7 +19,7 @@
     "swap_bytes": 0
   },
   "binary": {
-    "remote_path": "/Users/timtoole/gemma4-12b-speed/camelid-q4mma-tests-1985c7c3",
+    "remote_path": "~/gemma4-12b-speed/camelid-q4mma-tests-1985c7c3",
     "sha256": "35eee8cec2a06291f35477251081ec45ef0ae8ca4cfd662504ebaa7dea216af8",
     "profile": "release"
   },
@@ -82,8 +82,8 @@
     "scope": "projection microbenchmark only; not a whole-target or speculative tok/s claim"
   },
   "remote_receipts": {
-    "stdout": "/Users/timtoole/gemma4-12b-speed/receipts/q4mma-shapes-1985c7c3.stdout",
-    "stderr": "/Users/timtoole/gemma4-12b-speed/receipts/q4mma-shapes-1985c7c3.stderr"
+    "stdout": "~/gemma4-12b-speed/receipts/q4mma-shapes-1985c7c3.stdout",
+    "stderr": "~/gemma4-12b-speed/receipts/q4mma-shapes-1985c7c3.stderr"
   },
   "selection": {
     "default": "established scalar/slab/direct policy",

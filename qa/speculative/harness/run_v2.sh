@@ -17,7 +17,7 @@ cd /Volumes/Untitled/Camelid-3x || exit 1
 
 echo "=== build + bit-identity gates ==="
 CAM_SESSION_PID=$PPID CARGO_TARGET_DIR=/Volumes/Untitled/cargo-targets/Camelid-3x \
-  /Users/timtoole/bin/cam-lock.sh sh -c \
+  "$HOME"/bin/cam-lock.sh sh -c \
   'cargo test --lib -- metal_kquant_v2_pair_bit_identical metal_kquant_q6k_v2_bit_identical metal_kquant_mc_gemv_bit_identical metal_verify_gemv_batched_bit_identical --nocapture && cargo build --release' \
   > "$S/v2_build.log" 2>&1
 rc=$?; echo "build/test exit $rc"
@@ -30,7 +30,7 @@ FAST=(CAMELID_METAL_RESIDENT_DECODE=1 CAMELID_METAL_RESIDENT_PREFILL=1 CAMELID_M
 
 run() { # run <arm> <v2> <mma> <prompt> <label>
   echo "### $1 / $5 $(date +%H:%M:%S)" >&2
-  CAM_SESSION_PID=$PPID /Users/timtoole/bin/cam-lock.sh env "${FAST[@]}" \
+  CAM_SESSION_PID=$PPID "$HOME"/bin/cam-lock.sh env "${FAST[@]}" \
     CAMELID_KQUANT_V2="$2" CAMELID_KQUANT_MMA="$3" \
     "$BIN" bench-speculative "$Q4" \
       --drafter ngram --draft-tokens 7 --workload "$1_$5" \
