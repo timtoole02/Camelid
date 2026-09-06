@@ -1,0 +1,3 @@
+[hw] GPU: Apple A18 Pro | Metal compute | unified-memory yes | GPU-resident inference available
+[hw] CPU: 6 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 3.1 GiB free / 8.0 GiB total
+Error: no CUDA device — offloading is a no-op; the CPU backend already holds all weights in system RAM

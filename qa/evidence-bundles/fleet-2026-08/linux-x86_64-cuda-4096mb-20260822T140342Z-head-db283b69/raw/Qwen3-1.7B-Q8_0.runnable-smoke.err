@@ -1,0 +1,4 @@
+smoke-admission PASSED: qwen3/Q8_0/Bpe
+  prompt_tokens=15 logits=[-27.2, 29.4]
+  greedy: "<think>\nOkay, the user is asking for the capital of France. I know that France is a country in Europe,"
+  (runnable receipt below — attests deterministic execution, not parity)

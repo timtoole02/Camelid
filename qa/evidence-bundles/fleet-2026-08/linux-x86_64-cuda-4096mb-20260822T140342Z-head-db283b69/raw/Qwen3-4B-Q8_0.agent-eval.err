@@ -1,0 +1,11 @@
+loading [REDACTED]/ai/Camelid/models/Qwen3-4B-Q8_0.gguf (timeout 90s)…
+loaded 'Qwen3 4B Instruct' in 0.6s
+== case: read_and_count
+· model error: unsupported tensor type: estimated CPU weight materialization/retention is 9959225344 bytes, above safety limit 6442450944 bytes; dense Q8_0 linears retain expanded in-memory blocks by default and other CPU tensors may decode eagerly. Lower model size/quant target, set CAMELID_LAZY_Q8_0_LINEAR=1 only if deliberately accepting the slower file-backed Q8 path, or raise CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES deliberately for a controlled run
+== case: list_dir_find
+· model error: unsupported tensor type: estimated CPU weight materialization/retention is 9959225344 bytes, above safety limit 6442450944 bytes; dense Q8_0 linears retain expanded in-memory blocks by default and other CPU tensors may decode eagerly. Lower model size/quant target, set CAMELID_LAZY_Q8_0_LINEAR=1 only if deliberately accepting the slower file-backed Q8 path, or raise CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES deliberately for a controlled run
+== case: write_greeting
+· model error: unsupported tensor type: estimated CPU weight materialization/retention is 9959225344 bytes, above safety limit 6442450944 bytes; dense Q8_0 linears retain expanded in-memory blocks by default and other CPU tensors may decode eagerly. Lower model size/quant target, set CAMELID_LAZY_Q8_0_LINEAR=1 only if deliberately accepting the slower file-backed Q8 path, or raise CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES deliberately for a controlled run
+
+FAIL — battery complete
+receipt → qa/agent-eval/Qwen3-4B-Q8_0-1787408048-FAIL.json (5435d0eb0a84cb98882e915c187c7f3ca91cafa839b9bf6232086b020e553538)
