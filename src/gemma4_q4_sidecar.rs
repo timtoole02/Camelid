@@ -9,6 +9,10 @@
 //! mismatch is a hard refusal rather than a fallback to potentially misbound
 //! bytes.
 
+// The sidecar reader is only consulted by the macOS resident lane; keep it
+// compiled and unit-tested everywhere, without a dead-code wall off-macOS.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},

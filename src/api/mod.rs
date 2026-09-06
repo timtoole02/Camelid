@@ -8965,6 +8965,7 @@ const GEMMA4_MTP12_MAX_POSITIONS_ENV: &str = "CAMELID_GEMMA4_MTP12_MAX_POSITIONS
 const GEMMA4_MTP12_VERIFY_WIDTH_ENV: &str = "CAMELID_GEMMA4_MTP12_VERIFY_WIDTH";
 const GEMMA4_MTP12_QUALIFIED_TARGET_SHA256: &str =
     "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const GEMMA4_MTP12_QUALIFIED_ASSISTANT_SHA256: &str =
     "67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6";
 const DEFAULT_GEMMA4_MTP12_MAX_POSITIONS: usize = 4096;
@@ -9038,6 +9039,7 @@ fn gemma4_mtp12_serve_config() -> std::result::Result<Option<Gemma4Mtp12ServeCon
     )
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_mtp12_support_scope_matches(
     operating_system: &str,
     architecture: &str,
@@ -11340,6 +11342,7 @@ struct Gemma4TargetVerifiedSegmentProgress {
     boundary: &'static str,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_target_verified_segment_progress(
     index: usize,
     receipt: &Gemma4VerifiedRenderSegmentReceipt,
@@ -11412,6 +11415,7 @@ struct Gemma4PreparedRenderSegment {
     token_ids: Vec<u32>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Gemma4VerifiedRenderSegmentReceipt {
     prompt_tokens: usize,
     requested_tokens: usize,
@@ -11497,6 +11501,7 @@ fn gemma4_mtp12_diagnostics(
     diagnostics
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_required_diagnostic_u64(
     diagnostics: &serde_json::Value,
     pointer: &str,
@@ -11507,6 +11512,7 @@ fn gemma4_required_diagnostic_u64(
         .ok_or_else(|| format!("native MTP12 diagnostics omitted {pointer}"))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_required_diagnostic_str<'a>(
     diagnostics: &'a serde_json::Value,
     pointer: &str,
@@ -11520,6 +11526,7 @@ fn gemma4_required_diagnostic_str<'a>(
 /// Combine only native verifier timing. This is deliberately a ratio of sums:
 /// averaging per-section rates would overweight short sections, while wall/UI
 /// timing would not be the target decoder's measured work.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_segmented_target_verified_diagnostics(
     receipts: &[Gemma4VerifiedRenderSegmentReceipt],
 ) -> std::result::Result<serde_json::Value, String> {
@@ -11752,6 +11759,7 @@ const GEMMA4_MTP12_PHYSICAL_W16_HEADROOM: usize = 16;
 /// clamping contract in the shared generation path), so this lane clamps to the
 /// same rule instead of rejecting: the only genuine failure is a prompt that
 /// already fills the resident window, leaving no room for a single token.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_mtp12_available_output_tokens(
     prompt_tokens: usize,
     max_positions: usize,
@@ -11789,6 +11797,7 @@ fn gemma4_mtp12_context_budget_check(
 
 /// Clamp a requested response limit to what actually fits. Returns the effective
 /// output budget; errors only when the prompt itself leaves no room.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_mtp12_clamp_output_tokens(
     prompt_tokens: usize,
     requested_output_tokens: usize,

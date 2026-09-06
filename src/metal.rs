@@ -1,3 +1,8 @@
+//! Metal backend. Everything here exists for the macOS GPU lanes; the few
+//! items that are not behind a `cfg` are helpers and constants those lanes
+//! own, so they are inert -- not dead -- on other platforms.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 #[cfg(target_os = "macos")]
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,

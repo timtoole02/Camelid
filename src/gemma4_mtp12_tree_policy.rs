@@ -12,6 +12,7 @@ pub(crate) fn enabled(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn round_eligible(
     logical: usize,
     physical: usize,

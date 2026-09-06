@@ -20,6 +20,10 @@
 //! instead of the thirty-five a free fork step would produce, which is what
 //! keeps the model-level gate affordable per build cycle.
 
+// The decision logic is deliberately Metal-free so it unit-tests on every
+// platform, but every caller is behind the macOS-only MTP12 lane.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::fmt;
 
 pub(crate) const POLICY_ENV: &str = "CAMELID_GEMMA4_MTP12_TREE_POLICY";
