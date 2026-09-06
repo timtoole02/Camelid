@@ -9173,15 +9173,51 @@ mod tests {
                 "kv {kv_heads} x {head_dim} covers only {} forms",
                 geoms.len()
             );
+            // The fixture buffers are built once per shape: this gate runs ~500
+            // encodings and re-uploading a 12 MiB KV per encoding would dominate it.
+            let query = f32_buffer(&device, &query).expect("query buffer");
+            let keys = f32_buffer(&device, &keys).expect("keys buffer");
+            let values = f32_buffer(&device, &values).expect("values buffer");
+            let scores = shared_buffer(&device, N_HEADS * CAPACITY * 4);
+            let output = shared_buffer(&device, N_HEADS * head_dim * 4);
+            let stats = shared_buffer(&device, N_HEADS * 2 * 4);
+            let queue = device.new_command_queue();
+            let run = |attn: Mtp12AttnGeom, compact_base: usize, position_count: usize| {
+                write_buffer_f32(&output, &vec![f32::NAN; N_HEADS * head_dim]).expect("poison");
+                let command = queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                encode_attention_impl_ex(
+                    encoder,
+                    &pipelines,
+                    &query,
+                    &keys,
+                    &values,
+                    0,
+                    0,
+                    CAPACITY,
+                    &scores,
+                    &output,
+                    kv_heads,
+                    head_dim,
+                    compact_base + position_count,
+                    compact_base,
+                    position_count,
+                    true,
+                    0,
+                    Some(&stats),
+                    attn,
+                );
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+                let mut out = vec![0.0f32; N_HEADS * head_dim];
+                read_buffer_f32(&output, &mut out).expect("read output");
+                out
+            };
             for &position_count in &COUNTS {
                 for compact_base in [0usize, 3] {
-                    let run = |attn: Mtp12AttnGeom| {
-                        mtp12_attention_run_ex(
-                            &device, &pipelines, true, 0, attn, &query, &keys, &values,
-                            kv_heads, head_dim, CAPACITY, compact_base, position_count,
-                        )
-                    };
-                    let today = run(Mtp12AttnGeom::TODAY);
+                    let today = run(Mtp12AttnGeom::TODAY, compact_base, position_count);
                     assert!(
                         today.iter().all(|value| value.is_finite()),
                         "kv {kv_heads}x{head_dim} base {compact_base} count {position_count}: \
@@ -9193,7 +9229,11 @@ mod tests {
                              count {position_count}",
                             geom.label()
                         );
-                        assert_bits_equal(&label, &today, &run(geom));
+                        assert_bits_equal(
+                            &label,
+                            &today,
+                            &run(geom, compact_base, position_count),
+                        );
                     }
                 }
             }
