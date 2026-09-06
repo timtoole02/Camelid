@@ -50804,8 +50804,16 @@ mod tests {
     // universe. The 120- and 480-block cases are the real 3,840- and 15,360-
     // wide contractions; edge cases straddle every SIMD block scheduler seam.
     #[cfg(target_os = "macos")]
+    /// The Q4 column-dispatch counters are process-global, so the tests that
+    /// assert on a DELTA around one call must not run concurrently with each
+    /// other -- otherwise a sibling's dispatch lands inside the window.
+    static GEMMA4_Q4_DISPATCH_COUNTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn metal_gemma4_q4_0_q8_columns_are_bit_exact_for_12b_widths() {
+        let _dispatch_counts = GEMMA4_Q4_DISPATCH_COUNTS_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !detect_metal_device().available {
             return;
         }
@@ -51133,6 +51141,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_gemma4_q4_0_q8_register_fragment_k16_is_bit_exact() {
+        let _dispatch_counts = GEMMA4_Q4_DISPATCH_COUNTS_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !detect_metal_device().available {
             return;
         }
@@ -51250,6 +51261,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_gemma4_q4_0_q8_native_register_fragment_k16_is_bit_exact() {
+        let _dispatch_counts = GEMMA4_Q4_DISPATCH_COUNTS_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !detect_metal_device().available {
             return;
         }
@@ -52815,6 +52829,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_gemma4_q4_0_q8_native_register_v2_is_bit_exact() {
+        let _dispatch_counts = GEMMA4_Q4_DISPATCH_COUNTS_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !detect_metal_device().available {
             return;
         }
@@ -53680,6 +53697,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_gemma4_verify_fused_glue_segment_mma_is_bit_exact() {
+        let _dispatch_counts = GEMMA4_Q4_DISPATCH_COUNTS_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !detect_metal_device().available {
             return;
         }

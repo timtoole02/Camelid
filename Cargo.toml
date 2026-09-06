@@ -14,6 +14,13 @@ resolver = "2"
 name = "camelid"
 version = "0.6.1"
 edition = "2021"
+# MSRV floor, deliberately BELOW the toolchain in rust-toolchain.toml (1.95.0) —
+# these are different things and should not be "aligned". rust-toolchain.toml
+# says what CI and rustup developers build with; this says the oldest rustc the
+# crate claims to accept, and raising it to match would lock out hosts that
+# build with a distro/Homebrew rustc and no rustup (where the toolchain file is
+# inert). No CI leg builds at 1.89, so this floor is a declared intent rather
+# than a measured one; verifying it would need its own job.
 rust-version = "1.89"
 description = "Camelid: a Rust-native local GGUF inference backend with evidence-gated model compatibility"
 license = "MIT"

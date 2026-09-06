@@ -8491,10 +8491,11 @@ mod gemma4_mtp12_metal_generation_tests {
     }
 }
 
-#[cfg(target_os = "macos")]
 /// One cached rotary table: (head_dim, theta bits, has rope factors, cos, sin).
+#[cfg(target_os = "macos")]
 type RotaryTableEntry = (usize, u32, bool, Vec<f32>, Vec<f32>);
 
+#[cfg(target_os = "macos")]
 impl Gemma4GpuRuntime {
     /// Load the model with the Q8 layer weights resident on the GPU. `max_positions`
     /// is the KV-cache capacity (must cover prompt + generated tokens).

@@ -1,3 +1,12 @@
+# Single source of truth for the Rust toolchain this repo builds with.
+#
+# rustup reads this file as a directory override, which outranks `rustup default`
+# — so it wins over the version named by dtolnay/rust-toolchain in CI, and every
+# `cargo` invocation on a checkout of this repo runs the channel below. CI mirrors
+# it (a `uses:` ref cannot be an expression); scripts/check-toolchain-pins.sh fails
+# the build if the mirror drifts. Change the version HERE.
+#
+# Not the same as `rust-version` (MSRV) in Cargo.toml, which is a lower floor.
 [toolchain]
 channel = "1.95.0"
 profile = "minimal"

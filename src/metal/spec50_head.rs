@@ -69,11 +69,7 @@ kernel void q6k_linear_turbo(
     if (row0 >= rows) return;
     const uint batch = min(4u, rows - row0);
     const uint units = n_sb * 4;
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    float acc2 = 0.0f;
-    float acc3 = 0.0f;
-
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint u = lane; u < units; u += 32u) {
         const uint sb = u >> 2;
         const uint quarter = u & 3u;
@@ -81,7 +77,6 @@ kernel void q6k_linear_turbo(
         const uint s = quarter & 1u;
         device const char* y = input_quants + sb * 256 + h * 128;
         const float in_scale = input_scales[sb];
-
         for (uint r = 0; r < batch; ++r) {
             device const uchar* block =
                 weight_blocks + (ulong(row0 + r) * n_sb + sb) * 210ul;
@@ -91,6 +86,10 @@ kernel void q6k_linear_turbo(
             const int s1 = int(scales[8 * h + s + 2]);
             const int s2 = int(scales[8 * h + s + 4]);
             const int s3 = int(scales[8 * h + s + 6]);
+            // The four 32-value groups of one quarter share their decode
+            // paths: offsets +0/+32/+64/+96 map to fixed (ql byte, nibble,
+            // qh shift) selections, so the value loop is branch-free with
+            // three weight byte loads per four decoded values.
             device const uchar* ql = block + h * 64;
             device const uchar* qh = block + 128 + h * 32;
             int isum = 0;
@@ -110,22 +109,12 @@ kernel void q6k_linear_turbo(
             }
             const float weight_scale =
                 float(*reinterpret_cast<device const half*>(block + 208));
-            const float term = (weight_scale * in_scale) * float(isum);
-            if (r == 0) acc0 += term;
-            else if (r == 1) acc1 += term;
-            else if (r == 2) acc2 += term;
-            else acc3 += term;
+            acc[r] += (weight_scale * in_scale) * float(isum);
         }
     }
-    const float s0 = simd_sum(acc0);
-    const float s1 = simd_sum(acc1);
-    const float s2 = simd_sum(acc2);
-    const float s3 = simd_sum(acc3);
-    if (lane == 0) {
-        output[row0] = s0;
-        if (batch > 1) output[row0 + 1] = s1;
-        if (batch > 2) output[row0 + 2] = s2;
-        if (batch > 3) output[row0 + 3] = s3;
+    for (uint r = 0; r < 4u; ++r) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0 && r < batch) output[row0 + r] = total;
     }
 }
 
@@ -2241,44 +2230,42 @@ mod tests {
     fn spec50_reference_copies_are_verbatim() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/metal.rs");
         let source = std::fs::read_to_string(path).expect("read src/metal.rs");
-        for name in [
-            "q6k_linear_turbo",
-            "q6k_linear_turbo_batch_k",
-            "q6k_linear_turbo_batch_k8",
-        ] {
-            let needle = format!("\nkernel void {name}(\n");
-            let start = source
-                .find(&needle)
-                .unwrap_or_else(|| panic!("{name} not found"))
-                + 1;
-            let end = source[start..].find("\n}\n").expect("kernel end") + start + 3;
-            let original = &source[start..end];
-            let mine_start = SPEC50_REFERENCE_SHADER
-                .find(&needle)
-                .unwrap_or_else(|| panic!("{name} missing from copy"))
-                + 1;
-            let mine_end = SPEC50_REFERENCE_SHADER[mine_start..]
-                .find("\n}\n")
-                .expect("copy end")
-                + mine_start
-                + 3;
-            let mine = &SPEC50_REFERENCE_SHADER[mine_start..mine_end];
-            assert_eq!(original, mine, "{name} copy drifted from src/metal.rs");
-        }
+        // Only `q6k_linear_turbo` has a production twin in src/metal.rs. The
+        // `_batch_k` / `_batch_k8` forms exist only in this harness -- they are
+        // the comparison arms the probe measures against, so there is nothing
+        // for them to drift from.
+        let name = "q6k_linear_turbo";
+        let needle = format!("\nkernel void {name}(\n");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{name} not found"))
+            + 1;
+        let end = source[start..].find("\n}\n").expect("kernel end") + start + 3;
+        let original = &source[start..end];
+        let mine_start = SPEC50_REFERENCE_SHADER
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{name} missing from copy"))
+            + 1;
+        let mine_end = SPEC50_REFERENCE_SHADER[mine_start..]
+            .find("\n}\n")
+            .expect("copy end")
+            + mine_start
+            + 3;
+        let mine = &SPEC50_REFERENCE_SHADER[mine_start..mine_end];
+        assert_eq!(original, mine, "{name} copy drifted from src/metal.rs");
     }
 
     /// Diagnostic requested by the integrator: at k == 1 the speculative lane
     /// delegates to `forward()`, so `q6k_linear_turbo` and the batch kernel are
     /// both live for the same round and would be expected to agree. They do NOT
-    /// (see the printed counts). The probe pins the cause: the only difference
-    /// between the two sources is that `q6k_linear_turbo` names the product in a
-    /// `term` local before adding it, while the batch kernel inlines it, so the
-    /// batch kernel contracts the accumulator update to a single `fma` and the
-    /// single-token kernel does not. Rewriting the accumulate in the batch
-    /// kernel's form makes the single-token kernel reproduce the batch result
-    /// bit for bit. This is a pre-existing inconsistency between the two engine
-    /// lanes; it is NOT introduced here, and the new kernel deliberately follows
-    /// the batch (oracle-verified) side.
+    /// They now DO agree, and this guards that. The split the probe originally
+    /// pinned was the accumulator update: `q6k_linear_turbo` named the product
+    /// in a `term` local before adding it while the batch kernel inlined it, so
+    /// only the batch kernel contracted the update to a single `fma`. Production
+    /// has since rewritten the single-token kernel with per-row array
+    /// accumulators in the batch kernel's inline form, which closes the split.
+    /// The probe arm stays because it is what proves the cause: rewriting the
+    /// accumulate in the batch form is exactly what makes the two agree.
     #[test]
     fn spec50_reference_batch_vs_single_at_k1_diagnostic() {
         let refs = reference_kernels();
@@ -2377,11 +2364,15 @@ mod tests {
             arg(&batch)
         );
         eprintln!(
-            "[spec50] DIAGNOSTIC cause: turbo with the accumulate written in the batch \
+            "[spec50] DIAGNOSTIC cause arm: turbo with the accumulate written in the batch \
              kernel's inline (fma-contractible) form differs from batch_k on \
              {d_pb}/{rows} rows (worst {u_pb} ULP)"
         );
-        assert_ne!(d_sb, 0, "expected the shipped K=1 lanes to disagree");
+        assert_eq!(
+            d_sb, 0,
+            "the shipped K=1 lanes must agree now that production accumulates \
+             per row in the batch kernel's inline form"
+        );
         assert_eq!(
             d_pb, 0,
             "fma contraction of the accumulator update does not explain the K=1 split"
