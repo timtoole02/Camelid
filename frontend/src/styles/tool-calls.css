@@ -1,0 +1,130 @@
+/* Tool calls — what the model asked to call.
+
+   COLOR POSTURE. No new colour tokens. Nothing here is copper: a tool call is a
+   model output, not a verified claim. Nothing here is red either — a model asking
+   to call something is a normal turn ending, not an error. The one inked state is
+   the repeat warning, which uses amber (--color-evidence), the bounded-evidence
+   ink: "we observed the same call twice" is exactly a bounded observation. */
+
+.toolcalls {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.toolcalls__trigger {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-1) 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  color: var(--color-text-muted);
+}
+
+.toolcalls__trigger:hover { color: var(--color-text); }
+.toolcalls__trigger:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+.toolcalls__label {
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  font-weight: 600;
+}
+
+.toolcalls__summary { font-size: var(--text-2xs); color: var(--color-text-faint); font-family: var(--font-mono); }
+
+.toolcalls__body { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); }
+
+.toolcalls__note,
+.toolcalls__parse-error {
+  margin: 0;
+  font-size: var(--text-micro);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+}
+
+/* A repeated identical call is a bounded observation about this conversation,
+   not a failure — amber, never red. */
+.toolcalls__repeat {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-micro);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+  border: 1px solid color-mix(in srgb, var(--color-evidence) 40%, transparent);
+  border-radius: var(--radius-md);
+}
+
+.toolcalls__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+
+.toolcalls__call {
+  padding: var(--space-2);
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.toolcalls__call-head { display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap; }
+
+.toolcalls__name {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text);
+  background: var(--color-code-bg);
+  border-radius: 2px;
+  padding: 0 4px;
+}
+
+.toolcalls__id { font-size: var(--text-micro); color: var(--color-text-faint); font-family: var(--font-mono); }
+
+.toolcalls__args {
+  margin: 0;
+  padding: var(--space-2);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: var(--leading-snug);
+  color: var(--color-text);
+  max-height: 12rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Composer tool editor. */
+.tooldef {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-2);
+}
+
+.tooldef__field {
+  width: 100%;
+  min-height: 9rem;
+  resize: vertical;
+  padding: var(--space-2);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: var(--leading-snug);
+  color: var(--color-text);
+}
+
+.tooldef__field:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.tooldef__status { margin: 0; font-size: var(--text-micro); color: var(--color-text-muted); }
+.tooldef__status.is-invalid { color: var(--color-warning); }

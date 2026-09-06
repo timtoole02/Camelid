@@ -15,6 +15,7 @@ import { ParityReceiptCard } from './render/ParityReceipt'
 import { DeveloperDiagnosticsBlock } from './render/Diagnostics'
 import { TokenInspectorCard } from './render/TokenInspector'
 import { StructuredOutputCard } from './render/StructuredOutput'
+import { ToolCallsCard } from './render/ToolCalls'
 
 const formatMs = (value) => {
   const ms = Number(value)
@@ -257,7 +258,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, tokenInspection = null, structuredRecord = null }) {
+export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -395,6 +396,9 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
             inspection={tokenInspection.logprobs}
             absence={tokenInspection.absence}
           />
+        )}
+        {message.role === 'assistant' && !assistantStreaming && message.tool_calls && (
+          <ToolCallsCard toolCalls={message.tool_calls} repeated={toolCallRepeat} replyContent={messageContent} />
         )}
         <DeveloperDiagnosticsBlock message={message} />
       </div>

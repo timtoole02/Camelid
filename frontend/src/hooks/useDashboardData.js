@@ -20,6 +20,7 @@ import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, normalizeInspection, readInspectionContract } from '../lib/tokenInspection'
 import { STRUCTURED_MODES, DEFAULT_SCHEMA, DEFAULT_GRAMMAR, readStructuredOutputContract, structuredOutputForcesNonStreaming, structuredOutputRequestFields, structuredOutputReadiness } from '../lib/structuredOutput'
+import { DEFAULT_TOOLS, detectRepeatedCall, normalizeToolCalls, readModelToolCapability, readToolContract, toolCallSignature, toolReadiness, toolRequestFields } from '../lib/toolCalling'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import {
   createPacerState,
@@ -730,6 +731,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [structuredGrammar, setStructuredGrammar] = useState(DEFAULT_GRAMMAR)
   const [structuredRecords, setStructuredRecords] = useState({})
   const [tokenInspections, setTokenInspections] = useState({})
+  /* Tool definitions are a per-session editing surface, not a persisted setting:
+     they are a developer probe against the loaded model, and a stale definition
+     silently shaping a later conversation would be worse than retyping one. */
+  const [toolsEnabled, setToolsEnabled] = useState(false)
+  const [toolsText, setToolsText] = useState(DEFAULT_TOOLS)
+  /* Signatures of every call already requested in this conversation, so a model
+     that ignores a tool result and re-asks can be named rather than looping
+     invisibly. Verified live: Llama 3.2 3B does exactly this. */
+  const [toolCallSignatures, setToolCallSignatures] = useState({})
   // Opt-in thinking mode (experimental — NOT parity-locked): sends
   // camelid_enable_thinking:true so the model emits its own <think>…</think>
   // reasoning. Default OFF so chat stays on the parity-locked thinking-DISABLED
@@ -1090,6 +1100,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     schemaText: structuredSchema,
     grammarText: structuredGrammar,
   })
+  const toolContract = readToolContract(dashboard?.capabilities)
+  const toolCapability = readModelToolCapability(dashboard?.capabilities, selectedModel, runtime)
+  const toolsReadiness = toolReadiness({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })
   const selectedModelRunnable = selectedModelChatGate.chatUnlocked
   // Experimental lane: loaded + generation-ready implemented model that is NOT a
   // supported row. Enables a weaker chat affordance; never the supported badge.
@@ -1764,6 +1777,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
              engine, so a guarded row simply never reaches the wire. */
           ...(targetVerifiedRender ? {} : inspectionRequestFields({ enabled: inspectMode, contract: inspectionContract })),
           ...(targetVerifiedRender ? {} : structuredOutputRequestFields({ enabled: true, mode: structuredMode, contract: sendStructuredContract, schemaText: structuredSchema, grammarText: structuredGrammar })),
+          /* Tool calling is supported on BOTH the streaming and non-streaming
+             paths, so unlike receipts and constrained decoding it does not force
+             the turn off the stream. Contributes nothing unless the engine row
+             AND the loaded model both carry the capability. */
+          ...(targetVerifiedRender ? {} : toolRequestFields({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })),
           ...(targetVerifiedRender ? {
             // The private verifier contract is exact: its output allowance is
             // the complete fresh draft, not the planner's larger upper bound.
@@ -2016,6 +2034,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
           },
         }))
       }
+      /* Record what was asked so a later identical request can be named. Keyed
+         by conversation: a repeat only means something within one thread. */
+      if (streamed.toolCalls && streamed.toolCalls.length) {
+        const signatures = (normalizeToolCalls(streamed.toolCalls) || []).map(toolCallSignature).filter(Boolean)
+        if (signatures.length) {
+          setToolCallSignatures((current) => ({
+            ...current,
+            [conversation.id]: [...(current[conversation.id] || []), ...signatures],
+          }))
+        }
+      }
       const assistantMessage = {
         ...assistantMessageBase,
         content: paceDrain(pacer, streamed.content || ''),
@@ -2036,6 +2065,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
         camelid: streamed.camelid || null,
         planner_camelid: targetVerifiedPlannerCamelid,
         camelid_receipt: streamed.camelidReceipt || null,
+        /* Persisted on the message: unlike per-token logprobs these are small, and
+           a turn that ended in a tool request is meaningless without them. */
+        tool_calls: streamed.toolCalls || null,
         planner_ms: targetVerifiedPlannerMs,
         target_verified_render: targetVerifiedRender,
         segmented_target_verified_render: segmentedTargetVerifiedRender,
@@ -2553,6 +2585,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
     structuredRecords,
     structuredSupported,
     structuredReadiness,
+    toolsEnabled,
+    setToolsEnabled,
+    toolsText,
+    setToolsText,
+    toolContract,
+    toolCapability,
+    toolsReadiness,
+    toolCallSignatures,
     thinkingMode,
     setThinkingMode,
     loadingModelId,

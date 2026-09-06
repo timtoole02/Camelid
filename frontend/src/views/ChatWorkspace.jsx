@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId } from '../lib/modelState'
+import { detectRepeatedCall, normalizeToolCalls } from '../lib/toolCalling'
 import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
 import { formatModelLabel } from '../lib/formatters'
 import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
@@ -190,6 +191,13 @@ export default function ChatWorkspace({
   structuredRecords = {},
   structuredSupported = false,
   structuredReadiness = { ready: false, reason: null },
+  toolsEnabled = false,
+  setToolsEnabled = null,
+  toolsText = '',
+  setToolsText = null,
+  toolCapability = { capable: false, reason: null },
+  toolsReadiness = { ready: false, reason: null },
+  toolCallSignatures = {},
   thinkingMode = false,
   setThinkingMode = null,
   webResearchEnabled = true,
@@ -889,6 +897,22 @@ export default function ChatWorkspace({
           </p>
         </div>
       )}
+      {toolCapability.capable && toolsEnabled && setToolsText && (
+        <div className="tooldef">
+          <textarea
+            className="tooldef__field"
+            aria-label="Tool definitions"
+            spellCheck={false}
+            value={toolsText}
+            onChange={(event) => setToolsText(event.target.value)}
+          />
+          <p className={`tooldef__status ${toolsReadiness.ready ? '' : 'is-invalid'}`}>
+            {toolsReadiness.ready
+              ? 'Offered to the model on the next turn. Camelid does not execute tool calls — a request comes back for you to answer.'
+              : toolsReadiness.reason}
+          </p>
+        </div>
+      )}
       <div
         className="cxcomposer__box"
         onDragOver={(e) => {
@@ -1122,6 +1146,29 @@ export default function ChatWorkspace({
                 </span>
               </button>
             )}
+            {/* Guarded on BOTH halves of the gate: the engine must advertise the
+                protocol and the LOADED MODEL must carry a tool receipt. The second
+                half is STRICTER than the engine — POST /v1/chat/completions gates
+                on the chat template and never reads tool_capable — so the copy
+                says Camelid declines, not that the engine refuses. */}
+            {!demoMode && setToolsEnabled && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${toolsEnabled && toolCapability.capable ? 'is-on' : ''}`}
+                title={toolCapability.capable
+                  ? 'Offer tools to the model on the next turn'
+                  : toolCapability.reason || 'This model is not tool-capable.'}
+                aria-label={toolCapability.capable ? 'Tools' : 'Tools — unavailable for this model'}
+                aria-pressed={toolCapability.capable ? toolsEnabled : undefined}
+                disabled={!toolCapability.capable}
+                onClick={() => setToolsEnabled(!toolsEnabled)}
+              >
+                <IconBolt size={16} />
+                <span className="cxcomposer__tool-label">
+                  {!toolCapability.capable ? 'Tools unavailable' : toolsEnabled ? 'Tools on' : 'Tools'}
+                </span>
+              </button>
+            )}
             {!demoMode && setThinkingMode && !selectedBitNetChatModel && (
               <button
                 type="button"
@@ -1318,6 +1365,12 @@ export default function ChatWorkspace({
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
                       tokenInspection={tokenInspections?.[message.id] || null}
                       structuredRecord={structuredRecords?.[message.id] || null}
+                      toolCallRepeat={message.tool_calls
+                        ? detectRepeatedCall(
+                            (toolCallSignatures?.[selectedConversation?.id] || []).slice(0, -1 * (message.tool_calls.length || 1)),
+                            normalizeToolCalls(message.tool_calls) || [],
+                          )
+                        : null}
                     />
                   </Fragment>
                 )
