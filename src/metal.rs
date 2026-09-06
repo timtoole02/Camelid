@@ -25194,7 +25194,7 @@ fn kquant_mc_gemv_from(value: Option<&str>) -> bool {
 /// every other knob fixed. Latched once per process like the other Metal
 /// gates.
 fn kquant_mc_gemv_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         kquant_mc_gemv_from(std::env::var("CAMELID_KQUANT_MC_GEMV").ok().as_deref())
     })
@@ -25246,7 +25246,7 @@ fn kquant_v3_kernels() -> Option<&'static KquantV3Kernels> {
 /// Opt-in direct-f32 K-quant lane. Kept independent of v2 so certification and
 /// A/B runs can pin either arithmetic universe for the whole process.
 fn kquant_v3_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var("CAMELID_KQUANT_V3").ok().as_deref(),
@@ -25325,7 +25325,7 @@ fn kquant_v2_kernels() -> Option<&'static KquantV2Kernels> {
 /// this lane carries no certification until it passes its own model-level
 /// parity runs. Latched once per process like every other Metal gate.
 fn kquant_v2_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var("CAMELID_KQUANT_V2").ok().as_deref(),
@@ -25341,7 +25341,7 @@ fn kquant_v2_enabled() -> bool {
 /// intentionally rounds the largest `scale*q` integers to half and therefore
 /// forms a new, uncertified model universe.
 fn kquant_v4_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var("CAMELID_KQUANT_V4").ok().as_deref(),
@@ -25383,7 +25383,7 @@ fn trace_kquant_v4_dispatch(format: ResidentWeightFormat, n_tokens: usize, rows:
 /// the simdgroup-matrix kernel (back to the scalar mc_v2) for A/B measurement.
 /// Default on when v2 is on.
 fn kquant_mma_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("CAMELID_KQUANT_MMA").ok().as_deref(),
@@ -50803,12 +50803,13 @@ mod tests {
     // weight sweep without leaving the existing ordered K=1 arithmetic
     // universe. The 120- and 480-block cases are the real 3,840- and 15,360-
     // wide contractions; edge cases straddle every SIMD block scheduler seam.
-    #[cfg(target_os = "macos")]
     /// The Q4 column-dispatch counters are process-global, so the tests that
     /// assert on a DELTA around one call must not run concurrently with each
     /// other -- otherwise a sibling's dispatch lands inside the window.
+    #[cfg(target_os = "macos")]
     static GEMMA4_Q4_DISPATCH_COUNTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn metal_gemma4_q4_0_q8_columns_are_bit_exact_for_12b_widths() {
         let _dispatch_counts = GEMMA4_Q4_DISPATCH_COUNTS_LOCK

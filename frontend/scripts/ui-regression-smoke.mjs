@@ -239,7 +239,11 @@ assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.
 assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
 assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
 assert.match(chatWorkspaceSource, /isBitNetB158ChatModel\(selectedModel, runtime, selectedModelId\)/, 'BitNet controls must use the exact causal-model detector rather than architecture display metadata alone')
-assert.match(dashboardHookSource, /const decodeElapsedMs = liveWindowStartedAt === null \? 0 : now - liveWindowStartedAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the active generated-token window and exclude its baseline count')
+// The window opens at the first GENERATED token and subtracts the token count
+// already delivered at that instant, so research and TTFT are excluded from the
+// rate. It is expressed with firstTokenAt/decodeStartTokens, which the
+// web-research smoke pins from the other side.
+assert.match(dashboardHookSource, /const decodedTokens = firstTokenAt === null \? 0 : Math\.max\(0, realTokens - decodeStartTokens\)[\s\S]*const decodeElapsedMs = firstTokenAt === null \? 0 : now - firstTokenAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the active generated-token window and exclude its baseline count')
 assert.match(dashboardHookSource, /effectiveGenerationTokenLimit\([\s\S]*runtime\?\.max_generation_tokens/, 'the outgoing max_tokens value must obey the same live server ceiling used by research budgeting')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
