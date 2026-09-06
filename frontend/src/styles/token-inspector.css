@@ -35,7 +35,7 @@
 }
 
 .tokinsp__trigger:hover { color: var(--color-text); }
-.tokinsp__trigger:focus-visible { outline: var(--focus-ring); border-radius: var(--radius-sm); }
+.tokinsp__trigger:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
 
 .tokinsp__trigger-label {
   font-weight: 600;
@@ -103,7 +103,7 @@
   outline: 1px solid var(--color-accent);
   outline-offset: 1px;
 }
-.tokinsp__tok:focus-visible { outline: var(--focus-ring); }
+.tokinsp__tok:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
 /* Emitted-token-was-not-top marker. A shape, not a color. */
 .tokinsp__tok-rank {
@@ -259,7 +259,7 @@
 }
 
 .tokinsp__action:hover { color: var(--color-text); border-color: var(--color-border-strong); }
-.tokinsp__action:focus-visible { outline: var(--focus-ring); }
+.tokinsp__action:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
 .tokinsp__retention { font-size: var(--text-micro); color: var(--color-text-faint); }
 

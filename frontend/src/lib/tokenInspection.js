@@ -126,10 +126,40 @@ export function inspectionForcesNonStreaming({ enabled, contract } = {}) {
 
 const clampProbability = (p) => (Number.isFinite(p) ? Math.min(1, Math.max(0, p)) : null)
 
+/* Read a wire logprob, treating ABSENT as absent.
+
+   `Number(null)` is 0 and `Number.isFinite(0)` is true, so the obvious
+   `Number.isFinite(Number(x))` guard silently converts a null logprob into 0 —
+   which is exp(0) = probability 1.0, the "settled" band, and a rendered ">99.9%".
+   That turns missing data into maximum probability, the precise misreading this
+   whole surface exists to prevent. Null and undefined are rejected BEFORE any
+   numeric coercion. */
+function readLogprob(value) {
+  if (value === null || value === undefined || value === '') return null
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : null
+}
+
 function probabilityFromLogprob(logprob) {
-  const value = Number(logprob)
-  if (!Number.isFinite(value)) return null
+  const value = readLogprob(logprob)
+  if (value === null) return null
   return clampProbability(Math.exp(value))
+}
+
+/* Token identity for comparing a chosen entry against its own alternatives.
+
+   `bytes` is the ground truth — the `token` string is a lossy rendering, and the
+   wire carries no token ids. Comparing logprob VALUES instead would call any
+   alternative within measurement noise "the same token", which is a different
+   claim entirely. */
+function sameToken(a, b) {
+  if (!a || !b) return false
+  const left = Array.isArray(a.bytes) ? a.bytes : null
+  const right = Array.isArray(b.bytes) ? b.bytes : null
+  if (left && right && left.length && right.length) {
+    return left.length === right.length && left.every((value, index) => value === right[index])
+  }
+  return a.raw === b.raw
 }
 
 /* Display text for one token.
@@ -159,9 +189,21 @@ export function describeToken(entry) {
    A greedy reply is overwhelmingly high-probability; encoding probability directly
    would ink the boring 90% and fade the interesting 5% to nothing. These bands
    invert that: 'settled' gets no marking at all, and only contested positions
-   carry weight. The thresholds are presentation, not a claim about the model. */
-export function probabilityBand(probability) {
+   carry weight. The thresholds are presentation, not a claim about the model.
+
+   A band is about the MARGIN to the runner-up, not the chosen token's absolute
+   probability. Those come apart: a token at p=0.45 whose nearest rival sits at
+   p=0.02 was not contested at all — it won by more than twenty to one — while a
+   token at p=0.48 against a rival at p=0.47 genuinely was. Absolute probability
+   is only the fallback for a position with no runner-up to compare against. */
+export function probabilityBand(probability, runnerUpProbability = null) {
   if (probability === null) return 'unknown'
+  if (runnerUpProbability !== null) {
+    const margin = probability - runnerUpProbability
+    if (margin >= 0.5) return 'settled'
+    if (margin >= 0.15) return 'leading'
+    return 'contested'
+  }
   if (probability >= 0.9) return 'settled'
   if (probability >= 0.5) return 'leading'
   return 'contested'
@@ -178,15 +220,15 @@ const TIE_WINDOW_NATS = 0.01
 export function alternativesFor(entry) {
   const list = Array.isArray(entry?.top_logprobs) ? entry.top_logprobs : []
   return list.map((alt, index) => {
-    const probability = probabilityFromLogprob(alt?.logprob)
-    const previous = index > 0 ? Number(list[index - 1]?.logprob) : null
+    const logprob = readLogprob(alt?.logprob)
+    const previous = index > 0 ? readLogprob(list[index - 1]?.logprob) : null
     const tiedWithPrevious = previous !== null
-      && Number.isFinite(Number(alt?.logprob))
-      && Math.abs(Number(alt.logprob) - previous) <= TIE_WINDOW_NATS
+      && logprob !== null
+      && Math.abs(logprob - previous) <= TIE_WINDOW_NATS
     return {
       ...describeToken(alt),
-      logprob: Number.isFinite(Number(alt?.logprob)) ? Number(alt.logprob) : null,
-      probability,
+      logprob,
+      probability: probabilityFromLogprob(alt?.logprob),
       rank: index + 1,
       tiedWithPrevious,
     }
@@ -205,16 +247,19 @@ export function normalizeInspection(logprobs) {
   if (!content.length) return null
 
   const tokens = content.map((entry, index) => {
-    const logprob = Number.isFinite(Number(entry?.logprob)) ? Number(entry.logprob) : null
-    const probability = probabilityFromLogprob(logprob)
+    const logprob = readLogprob(entry?.logprob)
+    const probability = probabilityFromLogprob(entry?.logprob)
     const alternatives = alternativesFor(entry)
     const top = alternatives[0] || null
-    /* Identity by rank position and value, not by token string: two distinct
-       token ids can decode to the same text. */
-    const chosenIsTop = top !== null && logprob !== null && Math.abs(top.logprob - logprob) <= TIE_WINDOW_NATS
-    const chosenInAlternatives = alternatives.some((alt) => (
-      alt.logprob !== null && logprob !== null && Math.abs(alt.logprob - logprob) <= TIE_WINDOW_NATS && alt.raw === (entry?.token ?? '')
-    ))
+    const chosen = describeToken(entry)
+    /* Identity, not proximity. Comparing logprob VALUES would call any alternative
+       within measurement noise "the token that was emitted" — so a sampled reply
+       that picked rank 2 in a near-tie would be reported as having picked the
+       top-ranked token, and the off-top count would under-report. Whether the two
+       scores are too close to rank is a SEPARATE question, answered by
+       `tiedWithPrevious`. */
+    const chosenIsTop = sameToken(top, chosen)
+    const chosenInAlternatives = alternatives.some((alt) => sameToken(alt, chosen))
     /* Residual mass: what the shown alternatives do NOT account for. Without it,
        k rows read as a closed set — the single most likely misreading of this
        surface. Clamped at zero because a truncated set can round above 1.0. */
@@ -224,7 +269,13 @@ export function normalizeInspection(logprobs) {
       ...describeToken(entry),
       logprob,
       probability,
-      band: probabilityBand(probability),
+      /* The runner-up is the highest-scoring alternative that is NOT the emitted
+         token, so a position whose top entry simply is the chosen token compares
+         against rank 2 rather than against itself. */
+      band: probabilityBand(
+        probability,
+        alternatives.find((alt) => !sameToken(alt, chosen))?.probability ?? null,
+      ),
       alternatives,
       chosenIsTop,
       chosenInAlternatives,

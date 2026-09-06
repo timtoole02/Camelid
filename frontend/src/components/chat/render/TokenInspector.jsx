@@ -32,6 +32,23 @@ const BAND_LABEL = {
   unknown: 'not reported',
 }
 
+/* A spoken name for a token.
+
+   The raw text is useless to a screen reader for exactly the tokens most worth
+   inspecting: a space, a newline and an empty string all announce as nothing, so
+   three different positions would read identically. Whitespace and control tokens
+   get named instead. */
+function spokenToken(token) {
+  if (token.kind === 'empty') return 'empty token'
+  if (token.kind === 'special') return `control token ${token.raw}`
+  if (token.kind === 'whitespace') {
+    if (/\n/.test(token.raw)) return 'newline'
+    if (/\t/.test(token.raw)) return 'tab'
+    return token.raw.length > 1 ? `${token.raw.length} spaces` : 'space'
+  }
+  return /^ /.test(token.raw) ? `space then ${token.raw.trimStart()}` : token.raw
+}
+
 const downloadJson = (filename, value) => {
   try {
     const blob = new Blob([`${JSON.stringify(value, null, 2)}\n`], { type: 'application/json' })
@@ -95,8 +112,15 @@ export function TokenInspectorCard({ inspection, absence, candidatesContract = n
   const shown = tokens.slice(0, RENDER_CAP)
   const truncated = tokens.length - shown.length
   /* Opening on token 0 would make the panel look like it has nothing to say. The
-     lowest-probability position is the one a reader came here for. */
-  const activeIndex = selected ?? stats.lowestProbabilityIndex ?? 0
+     lowest-probability position is the one a reader came here for.
+
+     Clamped into the RENDERED range: that index is computed over every token, but
+     only the first RENDER_CAP are drawn. On a long reply whose least-likely token
+     falls past the cap, an unclamped index leaves no chip holding tabIndex 0 — the
+     strip becomes keyboard-unreachable — and the detail panel describes a token
+     that is not on screen. */
+  const preferredIndex = selected ?? stats.lowestProbabilityIndex ?? 0
+  const activeIndex = preferredIndex < shown.length ? preferredIndex : 0
   const active = tokens[activeIndex] || tokens[0]
 
   const summary = stats.contestedCount > 0
@@ -135,9 +159,13 @@ export function TokenInspectorCard({ inspection, absence, candidatesContract = n
             per-token scores, before any sampling settings were applied.
           </p>
 
+          {/* `group`, not `list`. Putting role="listitem" on the chips would
+              REPLACE their native button role, so assistive technology would
+              announce non-interactive list items while the roving-tabindex model
+              still expects buttons. The container carries the label instead. */}
           <div
             className="tokinsp__strip"
-            role="list"
+            role="group"
             ref={stripRef}
             onKeyDown={onStripKeyDown}
             aria-label="Generated tokens in order"
@@ -146,14 +174,13 @@ export function TokenInspectorCard({ inspection, absence, candidatesContract = n
               <button
                 key={token.index}
                 type="button"
-                role="listitem"
                 data-token-index={token.index}
                 tabIndex={token.index === activeIndex ? 0 : -1}
                 className={`tokinsp__tok tokinsp__tok--${token.band} ${token.index === activeIndex ? 'is-active' : ''}`}
                 onClick={() => setSelected(token.index)}
                 onFocus={() => setSelected(token.index)}
                 title={token.substituted ? `bytes: [${token.bytes.join(', ')}]` : undefined}
-                aria-label={`Token ${token.index + 1}, ${token.raw || 'empty'}, ${formatProbability(token.probability)}, ${BAND_LABEL[token.band]}`}
+                aria-label={`Token ${token.index + 1}, ${spokenToken(token)}, ${formatProbability(token.probability)}, ${BAND_LABEL[token.band]}`}
               >
                 {token.display}
                 {/* A chosen token that was not the top-ranked one is real signal

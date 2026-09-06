@@ -1068,6 +1068,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
     [models, runtime, selectedModelId],
   )
   const selectedModelChatGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
+  /* Whether this engine's contract permits token inspection at all. Surfaced so
+     the composer control can render GUARDED rather than appearing live and
+     silently recording nothing — a toggle that reads "on" while contributing no
+     request fields is exactly the caveated-live surface I3 forbids. */
+  const inspectionSupported = readInspectionContract(dashboard?.capabilities).nonStreamingSupported
   const selectedModelRunnable = selectedModelChatGate.chatUnlocked
   // Experimental lane: loaded + generation-ready implemented model that is NOT a
   // supported row. Enables a weaker chat affordance; never the supported badge.
@@ -2493,6 +2498,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     inspectMode,
     setInspectMode,
     tokenInspections,
+    inspectionSupported,
     thinkingMode,
     setThinkingMode,
     loadingModelId,

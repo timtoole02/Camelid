@@ -73,6 +73,7 @@ try {
     inspectionAbsenceReason,
     normalizeInspection,
     clampTopLogprobs,
+    formatProbability,
     MAX_TOP_LOGPROBS,
   } = inspection
 
@@ -269,6 +270,52 @@ try {
       'a sub-noise gap must not render as meaningful ordering')
   })
 
+  /* The inverse of the absent-key case, and the same lie in numeric form.
+     `Number(null)` is 0 and `Number.isFinite(0)` is true, so a naive finite check
+     turns a null logprob into exp(0) = 1.0 — a missing measurement rendered as
+     maximum probability, in the one panel whose purpose is to never do that. */
+  check('a null logprob reads as unmeasured, never as high probability', () => {
+    const model = normalizeInspection({ content: [{ token: 'x', logprob: null, bytes: [120], top_logprobs: [] }] })
+    const token = model.tokens[0]
+    assert.equal(token.logprob, null, 'null must not coerce to 0')
+    assert.equal(token.probability, null, 'null must not become probability 1')
+    assert.equal(token.band, 'unknown')
+    assert.equal(formatProbability(token.probability), '—')
+    assert.equal(model.stats.scoredCount, 0, 'an unmeasured token must not count toward the sequence statistics')
+    assert.equal(model.stats.meanLogprob, null)
+  })
+
+  check('the emitted token is identified by identity, not by proximity', () => {
+    // A sampled reply that picked rank 2 in a near-tie. Comparing logprob VALUES
+    // inside the tie window would call this "the top-ranked token".
+    const model = normalizeInspection({
+      content: [{
+        token: ' a',
+        logprob: -0.7031,
+        bytes: [32, 97],
+        top_logprobs: [
+          { token: ' the', logprob: -0.6931, bytes: [32, 116, 104, 101] },
+          { token: ' a', logprob: -0.7031, bytes: [32, 97] },
+        ],
+      }],
+    })
+    assert.equal(model.tokens[0].chosenIsTop, false, 'a rank-2 emission must not be reported as the top-ranked token')
+    assert.equal(model.tokens[0].chosenInAlternatives, true, 'it IS present in the alternatives, at rank 2')
+    assert.equal(model.stats.offTopCount, 1, 'the off-top count must include it')
+  })
+
+  check('a band reflects the margin to the runner-up, not absolute probability', () => {
+    const alt = (token, p, bytes) => ({ token, logprob: Math.log(p), bytes })
+    const wide = normalizeInspection({
+      content: [{ token: 'a', logprob: Math.log(0.45), bytes: [97], top_logprobs: [alt('a', 0.45, [97]), alt('b', 0.02, [98])] }],
+    })
+    const tight = normalizeInspection({
+      content: [{ token: 'a', logprob: Math.log(0.48), bytes: [97], top_logprobs: [alt('a', 0.48, [97]), alt('b', 0.47, [98])] }],
+    })
+    assert.notEqual(wide.tokens[0].band, 'contested', 'winning 22:1 is not a contested position, whatever the absolute probability')
+    assert.equal(tight.tokens[0].band, 'contested', 'a 0.01 margin is contested')
+  })
+
   check('an empty or malformed record yields nothing rather than a broken panel', () => {
     assert.equal(normalizeInspection(null), null)
     assert.equal(normalizeInspection({}), null)
@@ -322,6 +369,27 @@ try {
     const html = render({ absence: inspectionAbsenceReason({ requested: true, responded: true, hasLogprobs: false, streamed: false }) })
     assert.match(html, /did not report probabilities/i)
     assert.doesNotMatch(html, /<button/, 'a guarded state must offer nothing that spends a decode')
+  })
+
+  /* The strip uses a roving tabindex, so exactly one chip must be tabbable. The
+     default selection is the lowest-probability position, computed over ALL
+     tokens — but only the first RENDER_CAP are drawn. Unclamped, a long reply
+     whose least-likely token falls past the cap renders a strip no keyboard user
+     can enter, and a detail panel describing a token that is not on screen. */
+  check('a long reply still has exactly one tabbable chip', () => {
+    const long = {
+      content: Array.from({ length: 600 }, (_, index) => ({
+        token: `t${index}`,
+        logprob: index === 590 ? -9.9 : -0.1,
+        bytes: [116],
+        top_logprobs: [{ token: `t${index}`, logprob: index === 590 ? -9.9 : -0.1, bytes: [116] }],
+      })),
+    }
+    assert.equal(normalizeInspection(long).stats.lowestProbabilityIndex, 590, 'fixture must put the target past the render cap')
+    const html = render({ inspection: long })
+    const tabbable = (html.match(/tabindex="0"/g) || []).length
+    assert.equal(tabbable, 1, `expected exactly one tabbable chip, found ${tabbable}`)
+    assert.match(html, /Showing the first/, 'and it must say the strip was truncated')
   })
 
   check('the collapsed trigger summarizes without spending the panel', () => {
