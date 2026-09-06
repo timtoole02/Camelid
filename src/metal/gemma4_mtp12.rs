@@ -2435,6 +2435,352 @@ kernel void mtp12_attention_context_v2_stats4(
         physical_logical_k, stats, tg, lane);
 }
 
+// ---- Assistant attention FORM lane (CAMELID_GEMMA4_MTP12_ATTN_FORM) --------------
+// Pipelined context modelled on the verifier's gemma4_tree_context_pipelined:
+//   * PAIRS query heads of ONE kv head per threadgroup, so each V element is loaded
+//     once and reused by all of them (the V address depends only on kv_head, position
+//     and dim, never on the query head);
+//   * a 32-position block of probabilities is loaded coalesced once per head (lane l
+//     holds position p + l) and distributed with simd_broadcast, a bit-preserving move,
+//     instead of every lane re-loading every position;
+//   * the V loads of the next 8-position sub-block are issued before the current
+//     sub-block's products (software double buffering);
+//   * LANE_DIMS output dims per lane instead of the fixed four, so the head-dimension
+//     axis splits into 32*LANE_DIMS-wide blocks and far more simdgroups stay resident
+//     (HD512 at LANE_DIMS 1 is 16 dim blocks per head chunk, not 4).
+//
+// BIT-IDENTITY with mtp12_attention_context_v2, per output element (head, dim).
+// The v2 chain is four accumulators p0..p3 starting at 0.0f, walking p = 0 ..
+// position_count-1 in ascending order and adding
+//     product_p = mtp12_round_bf16(probabilities[head * position_count + p])
+//               * mtp12_round_bf16(values[kv_base + p * position_stride + dim])
+// to bucket  k = (compact_base + p >= vector_end) ? 0 : ((compact_base + p) & 3),
+// then emitting mtp12_round_bf16(((p0 + p1) + p2) + p3).
+//   INTERIOR here is p in [0, interior_end) with interior_end a multiple of 32 that is
+//   also <= vector_end - compact_base.  Every interior position therefore takes the
+//   PARITY branch (never the >= vector_end branch), and because interior_end and the
+//   block stride are multiples of 4 its bucket is ((compact_base & 3) + (p & 3)) & 3.
+//   Accumulator c<i> collects exactly the interior positions with (p & 3) == i, in
+//   ascending order, from 0.0f - i.e. exactly the head of real bucket
+//   ((compact_base & 3) + i) & 3's v2 chain.  The rotation below MOVES c<i> into that
+//   real bucket (a copy, not an add: no earlier term exists), and the TAIL loop then
+//   continues the very same chain with the v2 branch and the v2 product expression
+//   verbatim.  No term is added, dropped or reassociated.
+//   Operands are identical too: simd_broadcast(praw[j], t) returns lane t's bits of
+//   probabilities[head * position_count + p + t] (all 32 lanes are live throughout the
+//   interior because head_dim % (32 * LANE_DIMS) == 0 and p + 32 <= interior_end <=
+//   position_count), and the V element is the same mtp12_round_bf16(values[...]) for
+//   every head of the group.  Scalar versus float4 component arithmetic is already
+//   pinned bit-identical by mtp12_attention_v2_matches_established_kernels_bit_for_bit
+//   (the established kernel is scalar per dim, V2 is float4 per lane).
+// This library is compiled with fast-math OFF, so the textual order IS the bit order.
+template <uint LANE_DIMS, uint PAIRS>
+inline void mtp12_context_form(
+    device const float* values,
+    device const float* probabilities,
+    device float* output,
+    uint n_heads,
+    uint head_dim,
+    uint position_count,
+    uint group,
+    uint position_stride,
+    uint kv_head_stride,
+    uint kv_base_offset,
+    uint compact_base,
+    uint physical_logical_k,
+    uint2 tg,
+    uint lane) {
+    const uint head0 = tg.x * PAIRS;
+    if (head0 + PAIRS > n_heads || compact_base + position_count != physical_logical_k) return;
+    // PAIRS heads of one chunk share a kv head only when PAIRS divides the group.
+    if (group < PAIRS || (group % PAIRS) != 0u) return;
+    const uint kv_head = head0 / group;
+    const uint lane_dim = tg.y * (32u * LANE_DIMS) + lane * LANE_DIMS;
+    // Lanes past the head stay resident (they take part in every broadcast) but read
+    // dim 0 and never write.
+    const bool active = lane_dim + LANE_DIMS <= head_dim;
+    const uint d = active ? lane_dim : 0u;
+    const uint kv_base = kv_base_offset + kv_head * kv_head_stride + d;
+    const uint vector_end = physical_logical_k & ~3u;
+
+    uint sbase[PAIRS];
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        sbase[j] = (head0 + j) * position_count;
+    }
+
+    // Whole 32-position blocks whose absolute positions are all below vector_end.
+    const uint safe = vector_end > compact_base ? vector_end - compact_base : 0u;
+    const uint interior_end = min(position_count, safe) & ~31u;
+
+    float c0[PAIRS][LANE_DIMS];
+    float c1[PAIRS][LANE_DIMS];
+    float c2[PAIRS][LANE_DIMS];
+    float c3[PAIRS][LANE_DIMS];
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+#pragma clang loop unroll(full)
+        for (uint e = 0u; e < LANE_DIMS; ++e) {
+            c0[j][e] = 0.0f;
+            c1[j][e] = 0.0f;
+            c2[j][e] = 0.0f;
+            c3[j][e] = 0.0f;
+        }
+    }
+
+    float vbuf[8][LANE_DIMS];
+    if (interior_end >= 32u) {
+#pragma clang loop unroll(full)
+        for (uint t = 0u; t < 8u; ++t) {
+#pragma clang loop unroll(full)
+            for (uint e = 0u; e < LANE_DIMS; ++e) {
+                vbuf[t][e] = values[kv_base + t * position_stride + e];
+            }
+        }
+    }
+    for (uint p = 0u; p < interior_end; p += 32u) {
+        float praw[PAIRS];
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < PAIRS; ++j) {
+            praw[j] = probabilities[sbase[j] + p + lane];
+        }
+#pragma clang loop unroll(full)
+        for (uint sub = 0u; sub < 4u; ++sub) {
+            float v[8][LANE_DIMS];
+#pragma clang loop unroll(full)
+            for (uint t = 0u; t < 8u; ++t) {
+#pragma clang loop unroll(full)
+                for (uint e = 0u; e < LANE_DIMS; ++e) {
+                    v[t][e] = vbuf[t][e];
+                }
+            }
+            // Issue the next sub-block's V loads (after sub 3: the next block's first
+            // sub-block, if any) before this sub-block's products.
+            const uint next = p + (sub + 1u) * 8u;
+            if (sub + 1u < 4u || next < interior_end) {
+#pragma clang loop unroll(full)
+                for (uint t = 0u; t < 8u; ++t) {
+#pragma clang loop unroll(full)
+                    for (uint e = 0u; e < LANE_DIMS; ++e) {
+                        vbuf[t][e] = values[kv_base + (next + t) * position_stride + e];
+                    }
+                }
+            }
+#pragma clang loop unroll(full)
+            for (uint t = 0u; t < 8u; ++t) {
+                const uint slot = sub * 8u + t;
+#pragma clang loop unroll(full)
+                for (uint j = 0u; j < PAIRS; ++j) {
+                    const float pr = mtp12_round_bf16(simd_broadcast(praw[j], ushort(slot)));
+#pragma clang loop unroll(full)
+                    for (uint e = 0u; e < LANE_DIMS; ++e) {
+                        const float product = pr * mtp12_round_bf16(v[t][e]);
+                        // slot is a full-unroll constant, so this picks one bucket at
+                        // compile time; p is a multiple of 32 so (p + slot) & 3 == slot & 3.
+                        if ((slot & 3u) == 0u) c0[j][e] += product;
+                        else if ((slot & 3u) == 1u) c1[j][e] += product;
+                        else if ((slot & 3u) == 2u) c2[j][e] += product;
+                        else c3[j][e] += product;
+                    }
+                }
+            }
+        }
+    }
+
+    // Real bucket k continues from the interior positions whose offset parity is
+    // (k - (compact_base & 3)) & 3; c<i> becomes bucket ((compact_base & 3) + i) & 3.
+    float b0[PAIRS][LANE_DIMS];
+    float b1[PAIRS][LANE_DIMS];
+    float b2[PAIRS][LANE_DIMS];
+    float b3[PAIRS][LANE_DIMS];
+    const uint bp = compact_base & 3u;
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+#pragma clang loop unroll(full)
+        for (uint e = 0u; e < LANE_DIMS; ++e) {
+            const float x0 = c0[j][e];
+            const float x1 = c1[j][e];
+            const float x2 = c2[j][e];
+            const float x3 = c3[j][e];
+            if (bp == 0u) {
+                b0[j][e] = x0; b1[j][e] = x1; b2[j][e] = x2; b3[j][e] = x3;
+            } else if (bp == 1u) {
+                b0[j][e] = x3; b1[j][e] = x0; b2[j][e] = x1; b3[j][e] = x2;
+            } else if (bp == 2u) {
+                b0[j][e] = x2; b1[j][e] = x3; b2[j][e] = x0; b3[j][e] = x1;
+            } else {
+                b0[j][e] = x1; b1[j][e] = x2; b2[j][e] = x3; b3[j][e] = x0;
+            }
+        }
+    }
+
+    // TAIL: the v2 branch and product verbatim, ascending, onto the same chain.
+    for (uint p = interior_end; p < position_count; ++p) {
+        const uint absolute_position = compact_base + p;
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < PAIRS; ++j) {
+            const float pr = mtp12_round_bf16(probabilities[sbase[j] + p]);
+#pragma clang loop unroll(full)
+            for (uint e = 0u; e < LANE_DIMS; ++e) {
+                const float product =
+                    pr * mtp12_round_bf16(values[kv_base + p * position_stride + e]);
+                if (absolute_position >= vector_end) b0[j][e] += product;
+                else if ((absolute_position & 3u) == 0u) b0[j][e] += product;
+                else if ((absolute_position & 3u) == 1u) b1[j][e] += product;
+                else if ((absolute_position & 3u) == 2u) b2[j][e] += product;
+                else b3[j][e] += product;
+            }
+        }
+    }
+
+    if (!active) return;
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        const uint output_base = (head0 + j) * head_dim;
+#pragma clang loop unroll(full)
+        for (uint e = 0u; e < LANE_DIMS; ++e) {
+            const float folded = ((b0[j][e] + b1[j][e]) + b2[j][e]) + b3[j][e];
+            output[output_base + d + e] = mtp12_round_bf16(folded);
+        }
+    }
+}
+
+#define MTP12_CONTEXT_FORM_KERNEL(NAME, LANE_DIMS, PAIRS) \
+kernel void NAME( \
+    device const float* values [[buffer(0)]], \
+    device const float* probabilities [[buffer(1)]], \
+    device float* output [[buffer(2)]], \
+    constant uint& n_heads [[buffer(3)]], \
+    constant uint& head_dim [[buffer(4)]], \
+    constant uint& position_count [[buffer(5)]], \
+    constant uint& group [[buffer(6)]], \
+    constant uint& position_stride [[buffer(7)]], \
+    constant uint& kv_head_stride [[buffer(8)]], \
+    constant uint& kv_base_offset [[buffer(9)]], \
+    constant uint& compact_base [[buffer(10)]], \
+    constant uint& physical_logical_k [[buffer(11)]], \
+    uint2 tg [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]]) { \
+    mtp12_context_form<LANE_DIMS, PAIRS>( \
+        values, probabilities, output, n_heads, head_dim, position_count, group, \
+        position_stride, kv_head_stride, kv_base_offset, compact_base, \
+        physical_logical_k, tg, lane); \
+}
+
+// Grid (N_HEADS / PAIRS, head_dim / (32 * LANE_DIMS)) x 32 lanes.  At the 12B shapes:
+// HD256 (8 KV heads, group 2) d1p1 = 16 x 8 = 128 threadgroups, d1p2 = 8 x 8 = 64 with
+// half the V traffic, d4p2 = 8 x 2 = 16; HD512 (1 KV head, group 16) d1p1 = 16 x 16 =
+// 256, d1p2 = 128, d1p4 = 64, d1p8 = 32, and today's context_v2 grid is 32 (HD256) /
+// 64 (HD512).  Fewer dims per lane means more resident simdgroups; more pairs per
+// threadgroup means less V traffic and fewer probability loads.  Selection is by
+// receipt, never by default.
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d1p1, 1u, 1u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d2p1, 2u, 1u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d4p1, 4u, 1u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d1p2, 1u, 2u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d2p2, 2u, 2u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d4p2, 4u, 2u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d1p4, 1u, 4u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d2p4, 2u, 4u)
+MTP12_CONTEXT_FORM_KERNEL(mtp12_attention_context_d1p8, 1u, 8u)
+
+// Head-paired scores: PAIRS query heads of ONE kv head per threadgroup, so the K row
+// of this lane's position is loaded once and dotted against PAIRS staged queries.
+// The eight float4 accumulators, their update order and the final fold are
+// mtp12_attention_scores_v2 verbatim, the staged query is the same
+// mtp12_load_bf16x4, and the K operand bits do not depend on the query head, so the
+// scores are bit-identical.  Only the number of threadgroups and the number of times
+// each K row is read change.
+template <uint PAIRS>
+inline void mtp12_scores_form(
+    device const float* query,
+    device const float* keys,
+    device float* scores,
+    uint n_heads,
+    uint head_dim,
+    uint position_count,
+    uint group,
+    uint position_stride,
+    uint kv_head_stride,
+    uint kv_base_offset,
+    threadgroup float4* q_tg,
+    uint2 tg,
+    uint lane) {
+    const uint head0 = tg.x * PAIRS;
+    if (head0 + PAIRS > n_heads || (head_dim & 31u) != 0u || head_dim > 512u) return;
+    if (group < PAIRS || (group % PAIRS) != 0u) return;
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        const uint q_base = (head0 + j) * head_dim;
+        for (uint c = lane; c < head_dim / 4u; c += 32u) {
+            q_tg[j * 128u + c] = mtp12_load_bf16x4(query, q_base + c * 4u);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint p = tg.y * 32u + lane;
+    if (p >= position_count) return;
+    const uint kv_head = head0 / group;
+    const uint k_base = kv_base_offset + kv_head * kv_head_stride + p * position_stride;
+    float4 acc[PAIRS][8];
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+#pragma clang loop unroll(full)
+        for (uint a = 0u; a < 8u; ++a) {
+            acc[j][a] = 0.0f;
+        }
+    }
+    for (uint d = 0u; d < head_dim; d += 32u) {
+        const uint c = d / 4u;
+        float4 k[8];
+#pragma clang loop unroll(full)
+        for (uint a = 0u; a < 8u; ++a) {
+            k[a] = mtp12_load_bf16x4(keys, k_base + d + a * 4u);
+        }
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < PAIRS; ++j) {
+#pragma clang loop unroll(full)
+            for (uint a = 0u; a < 8u; ++a) {
+                acc[j][a] += q_tg[j * 128u + c + a] * k[a];
+            }
+        }
+    }
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < PAIRS; ++j) {
+        float4 acc0 = acc[j][0];
+        float4 acc1 = acc[j][1];
+        float4 acc2 = acc[j][2];
+        float4 acc3 = acc[j][3];
+        acc0 += acc[j][4]; acc1 += acc[j][5]; acc2 += acc[j][6]; acc3 += acc[j][7];
+        acc0 += acc2; acc1 += acc3; acc0 += acc1;
+        scores[(head0 + j) * position_count + p] =
+            mtp12_round_bf16((acc0.x + acc0.y) + (acc0.z + acc0.w));
+    }
+}
+
+#define MTP12_SCORES_FORM_KERNEL(NAME, PAIRS) \
+kernel void NAME( \
+    device const float* query [[buffer(0)]], \
+    device const float* keys [[buffer(1)]], \
+    device float* scores [[buffer(2)]], \
+    constant uint& n_heads [[buffer(3)]], \
+    constant uint& head_dim [[buffer(4)]], \
+    constant uint& position_count [[buffer(5)]], \
+    constant uint& group [[buffer(6)]], \
+    constant uint& position_stride [[buffer(7)]], \
+    constant uint& kv_head_stride [[buffer(8)]], \
+    constant uint& kv_base_offset [[buffer(9)]], \
+    uint2 tg [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]]) { \
+    threadgroup float4 q_tg[(PAIRS) * 128u]; \
+    mtp12_scores_form<PAIRS>( \
+        query, keys, scores, n_heads, head_dim, position_count, group, \
+        position_stride, kv_head_stride, kv_base_offset, q_tg, tg, lane); \
+}
+
+// Grid (N_HEADS / PAIRS, ceil(position_count / 32)) x 32 lanes.
+MTP12_SCORES_FORM_KERNEL(mtp12_attention_scores_q2, 2u)
+MTP12_SCORES_FORM_KERNEL(mtp12_attention_scores_q4, 4u)
+
 kernel void mtp12_argmax(
     device const float* logits [[buffer(0)]],
     device uint* output_id [[buffer(1)]],
@@ -2754,6 +3100,29 @@ fn mtp12_fuse_flags() -> Result<Mtp12FuseFlags> {
         .map_err(invalid)
 }
 
+/// The `CAMELID_GEMMA4_MTP12_ATTN_FORM` pipelines, parallel to
+/// [`Mtp12ContextForm::PIPELINED`] and [`Mtp12ScoresForm::PAIRED`].
+struct Mtp12AttnFormPipelines {
+    context: Vec<ComputePipelineState>,
+    scores: Vec<ComputePipelineState>,
+}
+
+impl Mtp12AttnFormPipelines {
+    fn context(&self, form: Mtp12ContextForm) -> Option<&ComputePipelineState> {
+        let index = Mtp12ContextForm::PIPELINED
+            .iter()
+            .position(|candidate| *candidate == form)?;
+        self.context.get(index)
+    }
+
+    fn scores(&self, form: Mtp12ScoresForm) -> Option<&ComputePipelineState> {
+        let index = Mtp12ScoresForm::PAIRED
+            .iter()
+            .position(|candidate| *candidate == form)?;
+        self.scores.get(index)
+    }
+}
+
 struct Mtp12Pipelines {
     gather_q6k_embedding: ComputePipelineState,
     gather_q6k_embedding_and_recurrent: ComputePipelineState,
@@ -2784,6 +3153,8 @@ struct Mtp12Pipelines {
     attention_softmax_stats: ComputePipelineState,
     attention_context_v2_stats16: ComputePipelineState,
     attention_context_v2_stats4: ComputePipelineState,
+    /// `CAMELID_GEMMA4_MTP12_ATTN_FORM` pipelined context / head-paired scores.
+    attention_forms: Mtp12AttnFormPipelines,
     add: ComputePipelineState,
     add_scale: ComputePipelineState,
     gelu_mul: ComputePipelineState,
@@ -2841,6 +3212,16 @@ impl Mtp12Pipelines {
             attention_softmax_stats: pipeline("mtp12_attention_softmax_stats")?,
             attention_context_v2_stats16: pipeline("mtp12_attention_context_v2_stats16")?,
             attention_context_v2_stats4: pipeline("mtp12_attention_context_v2_stats4")?,
+            attention_forms: Mtp12AttnFormPipelines {
+                context: Mtp12ContextForm::PIPELINED
+                    .iter()
+                    .map(|form| pipeline(form.kernel().expect("pipelined context form")))
+                    .collect::<Result<Vec<_>>>()?,
+                scores: Mtp12ScoresForm::PAIRED
+                    .iter()
+                    .map(|form| pipeline(form.kernel().expect("paired scores form")))
+                    .collect::<Result<Vec<_>>>()?,
+            },
             add: pipeline("mtp12_add_bf16")?,
             add_scale: pipeline("mtp12_add_scale_bf16")?,
             gelu_mul: pipeline("mtp12_gelu_mul")?,
@@ -5117,6 +5498,7 @@ impl Gemma4Mtp12AssistantMetal {
             mtp12_attention_v2_enabled() && covers,
             if covers { fuse.softmax_ctx } else { 0 },
             Some(&self.scratch.attention_stats),
+            mtp12_attn_geom(head_dim, kv_heads),
         );
         self.encode_dense_gemv(
             encoder,
@@ -5632,6 +6014,339 @@ fn mtp12_attention_v2_covers(head_dim: usize) -> bool {
     head_dim % 128 == 0 && head_dim <= 512
 }
 
+const MTP12_ATTN_FORM_ENV: &str = "CAMELID_GEMMA4_MTP12_ATTN_FORM";
+
+/// One assistant-attention CONTEXT kernel form.  `V2` is today's
+/// `mtp12_attention_context_v2` dispatch byte-for-byte; every
+/// `d<LANE_DIMS>p<PAIRS>` is the pipelined `mtp12_context_form<LANE_DIMS, PAIRS>`
+/// instantiation - `LANE_DIMS` output dims per lane (so the head-dimension axis
+/// splits into more threadgroups) and `PAIRS` query heads of one KV head per
+/// threadgroup (so each V element is loaded once for all of them), with the
+/// 32-position coalesced probability load distributed by `simd_broadcast` and
+/// double-buffered V loads.  All forms are bit-identical to `V2` (the shader
+/// note carries the per-element argument; pinned by
+/// `mtp12_attention_forms_match_v2_bit_for_bit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mtp12ContextForm {
+    V2,
+    D1P1,
+    D2P1,
+    D4P1,
+    D1P2,
+    D2P2,
+    D4P2,
+    D1P4,
+    D2P4,
+    D1P8,
+}
+
+impl Mtp12ContextForm {
+    /// The pipelined instantiations, in pipeline-table order.
+    const PIPELINED: [Self; 9] = [
+        Self::D1P1,
+        Self::D2P1,
+        Self::D4P1,
+        Self::D1P2,
+        Self::D2P2,
+        Self::D4P2,
+        Self::D1P4,
+        Self::D2P4,
+        Self::D1P8,
+    ];
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "v2" => Self::V2,
+            "d1p1" => Self::D1P1,
+            "d2p1" => Self::D2P1,
+            "d4p1" => Self::D4P1,
+            "d1p2" => Self::D1P2,
+            "d2p2" => Self::D2P2,
+            "d4p2" => Self::D4P2,
+            "d1p4" => Self::D1P4,
+            "d2p4" => Self::D2P4,
+            "d1p8" => Self::D1P8,
+            _ => return None,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::V2 => "v2",
+            Self::D1P1 => "d1p1",
+            Self::D2P1 => "d2p1",
+            Self::D4P1 => "d4p1",
+            Self::D1P2 => "d1p2",
+            Self::D2P2 => "d2p2",
+            Self::D4P2 => "d4p2",
+            Self::D1P4 => "d1p4",
+            Self::D2P4 => "d2p4",
+            Self::D1P8 => "d1p8",
+        }
+    }
+
+    /// `(output dims per lane, query heads per threadgroup)`; `V2` has neither.
+    fn shape(self) -> Option<(usize, usize)> {
+        Some(match self {
+            Self::V2 => return None,
+            Self::D1P1 => (1, 1),
+            Self::D2P1 => (2, 1),
+            Self::D4P1 => (4, 1),
+            Self::D1P2 => (1, 2),
+            Self::D2P2 => (2, 2),
+            Self::D4P2 => (4, 2),
+            Self::D1P4 => (1, 4),
+            Self::D2P4 => (2, 4),
+            Self::D1P8 => (1, 8),
+        })
+    }
+
+    fn kernel(self) -> Option<&'static str> {
+        Some(match self {
+            Self::V2 => return None,
+            Self::D1P1 => "mtp12_attention_context_d1p1",
+            Self::D2P1 => "mtp12_attention_context_d2p1",
+            Self::D4P1 => "mtp12_attention_context_d4p1",
+            Self::D1P2 => "mtp12_attention_context_d1p2",
+            Self::D2P2 => "mtp12_attention_context_d2p2",
+            Self::D4P2 => "mtp12_attention_context_d4p2",
+            Self::D1P4 => "mtp12_attention_context_d1p4",
+            Self::D2P4 => "mtp12_attention_context_d2p4",
+            Self::D1P8 => "mtp12_attention_context_d1p8",
+        })
+    }
+
+    /// The grid this form dispatches: `(head chunks, dim blocks)` of 32 lanes.
+    fn grid(self, head_dim: usize) -> Option<(usize, usize)> {
+        let (lane_dims, pairs) = self.shape()?;
+        Some((N_HEADS / pairs, head_dim / (32 * lane_dims)))
+    }
+
+    /// A form is available where the head chunks share one KV head, the head
+    /// dimension tiles exactly, and the V2 geometry contract holds.
+    fn available(self, head_dim: usize, kv_heads: usize) -> bool {
+        let Some((lane_dims, pairs)) = self.shape() else {
+            return true;
+        };
+        let group = N_HEADS / kv_heads;
+        mtp12_attention_v2_covers(head_dim)
+            && kv_heads > 0
+            && N_HEADS % kv_heads == 0
+            && group % pairs == 0
+            && N_HEADS % pairs == 0
+            && head_dim % (32 * lane_dims) == 0
+    }
+}
+
+/// One assistant-attention SCORES kernel form.  `Q1` is today's
+/// `mtp12_attention_scores_v2` dispatch byte-for-byte; `q<PAIRS>` is
+/// `mtp12_scores_form<PAIRS>`, which stages `PAIRS` queries of one KV head and
+/// reads each K row once for all of them.  Bit-identical to `Q1`: the eight
+/// float4 accumulators, their order and the fold are unchanged and the K bits
+/// do not depend on the query head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mtp12ScoresForm {
+    Q1,
+    Q2,
+    Q4,
+}
+
+impl Mtp12ScoresForm {
+    /// The paired instantiations, in pipeline-table order.
+    const PAIRED: [Self; 2] = [Self::Q2, Self::Q4];
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "q1" => Self::Q1,
+            "q2" => Self::Q2,
+            "q4" => Self::Q4,
+            _ => return None,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Q1 => "q1",
+            Self::Q2 => "q2",
+            Self::Q4 => "q4",
+        }
+    }
+
+    /// Query heads per threadgroup; `Q1` keeps the one-head kernel.
+    fn pairs(self) -> Option<usize> {
+        match self {
+            Self::Q1 => None,
+            Self::Q2 => Some(2),
+            Self::Q4 => Some(4),
+        }
+    }
+
+    fn kernel(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Q1 => return None,
+            Self::Q2 => "mtp12_attention_scores_q2",
+            Self::Q4 => "mtp12_attention_scores_q4",
+        })
+    }
+
+    fn available(self, head_dim: usize, kv_heads: usize) -> bool {
+        let Some(pairs) = self.pairs() else {
+            return true;
+        };
+        let group = N_HEADS / kv_heads;
+        mtp12_attention_v2_covers(head_dim)
+            && kv_heads > 0
+            && N_HEADS % kv_heads == 0
+            && group % pairs == 0
+            && N_HEADS % pairs == 0
+    }
+}
+
+/// The attention kernels one 12B head geometry binds: `<context>[:<scores>]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mtp12AttnGeom {
+    context: Mtp12ContextForm,
+    scores: Mtp12ScoresForm,
+}
+
+impl Mtp12AttnGeom {
+    /// Today's kernels byte-for-byte.
+    const TODAY: Self = Self {
+        context: Mtp12ContextForm::V2,
+        scores: Mtp12ScoresForm::Q1,
+    };
+
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let (context, scores) = match value.split_once(':') {
+            Some((context, scores)) => (context, Some(scores)),
+            None => (value, None),
+        };
+        Some(Self {
+            context: Mtp12ContextForm::parse(context)?,
+            scores: match scores {
+                Some(scores) => Mtp12ScoresForm::parse(scores)?,
+                None => Mtp12ScoresForm::Q1,
+            },
+        })
+    }
+
+    fn label(self) -> String {
+        format!("{}:{}", self.context.label(), self.scores.label())
+    }
+
+    fn available(self, head_dim: usize, kv_heads: usize) -> bool {
+        self.context.available(head_dim, kv_heads) && self.scores.available(head_dim, kv_heads)
+    }
+
+    /// Each half that does not fit this geometry falls back to today's kernel.
+    fn restrict(self, head_dim: usize, kv_heads: usize) -> Self {
+        Self {
+            context: if self.context.available(head_dim, kv_heads) {
+                self.context
+            } else {
+                Mtp12ContextForm::V2
+            },
+            scores: if self.scores.available(head_dim, kv_heads) {
+                self.scores
+            } else {
+                Mtp12ScoresForm::Q1
+            },
+        }
+    }
+}
+
+/// The assistant-attention kernel selection: one geometry for the three sliding
+/// HD256 layers and one for the single global HD512 layer.  `TODAY` is
+/// byte-for-byte today's dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mtp12AttnSelection {
+    sliding: Mtp12AttnGeom,
+    global: Mtp12AttnGeom,
+}
+
+impl Mtp12AttnSelection {
+    const TODAY: Self = Self {
+        sliding: Mtp12AttnGeom::TODAY,
+        global: Mtp12AttnGeom::TODAY,
+    };
+
+    /// `<geom>` applies one spec to both head shapes (each half that a shape
+    /// cannot host stays today's kernel); `<sliding>,<global>` selects each
+    /// explicitly and REFUSES a spec the shape cannot host.
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if let Some((sliding, global)) = value.split_once(',') {
+            let sliding = Mtp12AttnGeom::parse(sliding)?;
+            let global = Mtp12AttnGeom::parse(global)?;
+            return (sliding.available(LOCAL_HEAD_DIM, LOCAL_KV_HEADS)
+                && global.available(FULL_HEAD_DIM, FULL_KV_HEADS))
+            .then_some(Self { sliding, global });
+        }
+        let geom = Mtp12AttnGeom::parse(value)?;
+        Some(Self {
+            sliding: geom.restrict(LOCAL_HEAD_DIM, LOCAL_KV_HEADS),
+            global: geom.restrict(FULL_HEAD_DIM, FULL_KV_HEADS),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn label(self) -> String {
+        format!("{},{}", self.sliding.label(), self.global.label())
+    }
+
+    fn for_head_dim(self, head_dim: usize) -> Mtp12AttnGeom {
+        if head_dim == LOCAL_HEAD_DIM {
+            self.sliding
+        } else {
+            self.global
+        }
+    }
+}
+
+/// `CAMELID_GEMMA4_MTP12_ATTN_FORM`, read once per process: the assistant's
+/// attention kernel forms (`<context>[:<scores>]`, optionally
+/// `<sliding>,<global>`).  Context forms are `v2` (today) and
+/// `d<dims-per-lane>p<heads-per-threadgroup>`; scores forms are `q1` (today)
+/// and `q<heads-per-threadgroup>`.  Unset = today's kernels byte-for-byte; an
+/// unparsable value keeps today's kernels and says so once.  The forms are
+/// bit-identical, so the drafts and the acceptance rate never change.
+fn mtp12_attn_selection() -> Mtp12AttnSelection {
+    static SELECTION: std::sync::OnceLock<Mtp12AttnSelection> = std::sync::OnceLock::new();
+    *SELECTION.get_or_init(|| {
+        let Ok(value) = std::env::var(MTP12_ATTN_FORM_ENV) else {
+            return Mtp12AttnSelection::TODAY;
+        };
+        match Mtp12AttnSelection::parse(&value) {
+            Some(selection) => {
+                eprintln!(
+                    "[gemma4-mtp12] {MTP12_ATTN_FORM_ENV}={value:?} -> sliding HD256 {} / \
+                     global HD512 {}",
+                    selection.sliding.label(),
+                    selection.global.label()
+                );
+                selection
+            }
+            None => {
+                eprintln!(
+                    "[gemma4-mtp12] {MTP12_ATTN_FORM_ENV}={value:?} is not \
+                     <context>[:<scores>] or <sliding>,<global> with context in \
+                     v2|d1p1|d2p1|d4p1|d1p2|d2p2|d4p2|d1p4|d2p4|d1p8 and scores in \
+                     q1|q2|q4 (and hostable by that head shape); keeping today's kernels"
+                );
+                Mtp12AttnSelection::TODAY
+            }
+        }
+    })
+}
+
+/// The forms this layer's geometry actually binds.
+fn mtp12_attn_geom(head_dim: usize, kv_heads: usize) -> Mtp12AttnGeom {
+    mtp12_attn_selection()
+        .for_head_dim(head_dim)
+        .restrict(head_dim, kv_heads)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_attention(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -5712,6 +6427,7 @@ fn encode_attention_impl(
         v2,
         0,
         None,
+        mtp12_attn_geom(head_dim, kv_heads),
     );
 }
 
@@ -5745,9 +6461,11 @@ fn encode_attention_impl_ex(
     v2: bool,
     softmax_ctx: u8,
     stats: Option<&Buffer>,
+    attn: Mtp12AttnGeom,
 ) {
     debug_assert!(position_count > 0);
     debug_assert!(softmax_ctx <= 3);
+    debug_assert_eq!(attn, attn.restrict(head_dim, kv_heads));
     debug_assert!(softmax_ctx == 0 || mtp12_attention_v2_covers(head_dim));
     debug_assert!(softmax_ctx < 2 || stats.is_some());
     debug_assert_eq!(compact_base + position_count, logical_len);
@@ -5766,10 +6484,16 @@ fn encode_attention_impl_ex(
         depth: 1,
     };
 
-    encoder.set_compute_pipeline_state(if v2 {
-        &pipelines.attention_scores_v2
-    } else {
-        &pipelines.attention_scores
+    // The `q<PAIRS>` scores form stages PAIRS queries of one KV head per threadgroup
+    // and reads each K row once for all of them; same arguments, same bits.
+    let scores_pairs = if v2 { attn.scores.pairs() } else { None };
+    encoder.set_compute_pipeline_state(match scores_pairs {
+        Some(_) => pipelines
+            .attention_forms
+            .scores(attn.scores)
+            .expect("paired scores pipeline"),
+        None if v2 => &pipelines.attention_scores_v2,
+        None => &pipelines.attention_scores,
     });
     encoder.set_buffer(0, Some(query), 0);
     encoder.set_buffer(1, Some(key), key_byte_offset);
@@ -5783,7 +6507,7 @@ fn encode_attention_impl_ex(
     encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
     encoder.dispatch_thread_groups(
         MTLSize {
-            width: N_HEADS as u64,
+            width: (N_HEADS / scores_pairs.unwrap_or(1)) as u64,
             height: if v2 {
                 position_count.div_ceil(32) as u64
             } else {
@@ -5829,7 +6553,18 @@ fn encode_attention_impl_ex(
         _ => {}
     }
 
+    // A pipelined context form replaces `mtp12_attention_context_v2` on the unfused
+    // route only: the softmax-fused levels consume RAW scores and own their prologue.
+    let context_grid = if v2 && softmax_ctx == 0 {
+        attn.context.grid(head_dim as usize)
+    } else {
+        None
+    };
     encoder.set_compute_pipeline_state(match softmax_ctx {
+        _ if context_grid.is_some() => pipelines
+            .attention_forms
+            .context(attn.context)
+            .expect("pipelined context pipeline"),
         1 => &pipelines.attention_softmax_context_v2,
         2 => &pipelines.attention_context_v2_stats16,
         3 => &pipelines.attention_context_v2_stats4,
@@ -5851,14 +6586,21 @@ fn encode_attention_impl_ex(
     if softmax_ctx >= 2 {
         encoder.set_buffer(12, stats.map(|v| &**v), 0);
     }
-    encoder.dispatch_thread_groups(
-        MTLSize {
-            width: N_HEADS as u64,
-            height: if v2 || softmax_ctx != 0 {
+    let (context_width, context_height) = match context_grid {
+        Some((chunks, blocks)) => (chunks as u64, blocks as u64),
+        None => (
+            N_HEADS as u64,
+            if v2 || softmax_ctx != 0 {
                 (head_dim as usize / 128) as u64
             } else {
                 1
             },
+        ),
+    };
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: context_width,
+            height: context_height,
             depth: 1,
         },
         tg32,
@@ -7415,8 +8157,19 @@ mod tests {
         position_count: usize,
     ) -> Vec<f32> {
         mtp12_attention_run_ex(
-            device, pipelines, v2, 0, query, keys, values, kv_heads, head_dim, capacity,
-            compact_base, position_count,
+            device,
+            pipelines,
+            v2,
+            0,
+            Mtp12AttnGeom::TODAY,
+            query,
+            keys,
+            values,
+            kv_heads,
+            head_dim,
+            capacity,
+            compact_base,
+            position_count,
         )
     }
 
@@ -7429,6 +8182,7 @@ mod tests {
         pipelines: &Mtp12Pipelines,
         v2: bool,
         softmax_ctx: u8,
+        attn: Mtp12AttnGeom,
         query: &[f32],
         keys: &[f32],
         values: &[f32],
@@ -7469,6 +8223,7 @@ mod tests {
             v2,
             softmax_ctx,
             Some(&stats),
+            attn,
         );
         encoder.end_encoding();
         command.commit();
@@ -8342,8 +9097,9 @@ mod tests {
                 for compact_base in [0usize, 3] {
                     let run = |v2: bool, softmax_ctx: u8| {
                         mtp12_attention_run_ex(
-                            &device, &pipelines, v2, softmax_ctx, &query, &keys, &values,
-                            kv_heads, head_dim, CAPACITY, compact_base, position_count,
+                            &device, &pipelines, v2, softmax_ctx, Mtp12AttnGeom::TODAY,
+                            &query, &keys, &values, kv_heads, head_dim, CAPACITY,
+                            compact_base, position_count,
                         )
                     };
                     let established = run(false, 0);
@@ -8360,6 +9116,154 @@ mod tests {
                 }
             }
         }
+    }
+
+
+    /// Every form the bit gate proves for one head shape: each pipelined context
+    /// form against today's scores, each head-paired scores form against today's
+    /// context, and the combinations the receipt is most likely to select.
+    fn mtp12_attn_gate_geoms(head_dim: usize, kv_heads: usize) -> Vec<Mtp12AttnGeom> {
+        let mut geoms = Vec::new();
+        let mut push = |context, scores| {
+            let geom = Mtp12AttnGeom { context, scores };
+            if geom.available(head_dim, kv_heads) && geom != Mtp12AttnGeom::TODAY {
+                geoms.push(geom);
+            }
+        };
+        for context in Mtp12ContextForm::PIPELINED {
+            push(context, Mtp12ScoresForm::Q1);
+        }
+        for scores in Mtp12ScoresForm::PAIRED {
+            push(Mtp12ContextForm::V2, scores);
+        }
+        for (context, scores) in [
+            (Mtp12ContextForm::D1P1, Mtp12ScoresForm::Q2),
+            (Mtp12ContextForm::D1P2, Mtp12ScoresForm::Q2),
+            (Mtp12ContextForm::D1P4, Mtp12ScoresForm::Q4),
+        ] {
+            push(context, scores);
+        }
+        geoms
+    }
+
+    /// Every `CAMELID_GEMMA4_MTP12_ATTN_FORM` variant must reproduce today's
+    /// `mtp12_attention_scores_v2` + `mtp12_attention_softmax` +
+    /// `mtp12_attention_context_v2` output BIT-FOR-BIT on both 12B head shapes.
+    /// `compact_base` 3 rotates every parity bucket (and pushes the
+    /// `>= vector_end` tail inside the pipelined interior's exclusion zone);
+    /// the position counts straddle the 32-position block boundary, the
+    /// four-position unroll and the tree lane's production prefixes.
+    #[test]
+    fn mtp12_attention_forms_match_v2_bit_for_bit() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal is unavailable; skipping Gemma 4 12B MTP attention form parity");
+            return;
+        };
+        let pipelines = Mtp12Pipelines::new(&device).expect("Gemma 4 12B MTP pipelines");
+        const COUNTS: [usize; 10] = [1, 31, 32, 33, 127, 128, 129, 620, 1_024, 1_500];
+        const CAPACITY: usize = 1_503;
+        for (shape_index, &(kv_heads, head_dim)) in
+            [(LOCAL_KV_HEADS, LOCAL_HEAD_DIM), (FULL_KV_HEADS, FULL_HEAD_DIM)].iter().enumerate()
+        {
+            let (query, keys, values) =
+                mtp12_attention_fixture(kv_heads, head_dim, CAPACITY, 70 + shape_index as u64);
+            let geoms = mtp12_attn_gate_geoms(head_dim, kv_heads);
+            assert!(
+                geoms.len() >= 7,
+                "kv {kv_heads} x {head_dim} covers only {} forms",
+                geoms.len()
+            );
+            // The fixture buffers are built once per shape: this gate runs ~500
+            // encodings and re-uploading a 12 MiB KV per encoding would dominate it.
+            let query = f32_buffer(&device, &query).expect("query buffer");
+            let keys = f32_buffer(&device, &keys).expect("keys buffer");
+            let values = f32_buffer(&device, &values).expect("values buffer");
+            let scores = shared_buffer(&device, N_HEADS * CAPACITY * 4);
+            let output = shared_buffer(&device, N_HEADS * head_dim * 4);
+            let stats = shared_buffer(&device, N_HEADS * 2 * 4);
+            let queue = device.new_command_queue();
+            let run = |attn: Mtp12AttnGeom, compact_base: usize, position_count: usize| {
+                write_buffer_f32(&output, &vec![f32::NAN; N_HEADS * head_dim]).expect("poison");
+                let command = queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                encode_attention_impl_ex(
+                    encoder,
+                    &pipelines,
+                    &query,
+                    &keys,
+                    &values,
+                    0,
+                    0,
+                    CAPACITY,
+                    &scores,
+                    &output,
+                    kv_heads,
+                    head_dim,
+                    compact_base + position_count,
+                    compact_base,
+                    position_count,
+                    true,
+                    0,
+                    Some(&stats),
+                    attn,
+                );
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+                let mut out = vec![0.0f32; N_HEADS * head_dim];
+                read_buffer_f32(&output, &mut out).expect("read output");
+                out
+            };
+            for &position_count in &COUNTS {
+                for compact_base in [0usize, 3] {
+                    let today = run(Mtp12AttnGeom::TODAY, compact_base, position_count);
+                    assert!(
+                        today.iter().all(|value| value.is_finite()),
+                        "kv {kv_heads}x{head_dim} base {compact_base} count {position_count}: \
+                         today's output is not finite"
+                    );
+                    for &geom in &geoms {
+                        let label = format!(
+                            "form {} kv {kv_heads}x{head_dim} base {compact_base} \
+                             count {position_count}",
+                            geom.label()
+                        );
+                        assert_bits_equal(
+                            &label,
+                            &today,
+                            &run(geom, compact_base, position_count),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `CAMELID_GEMMA4_MTP12_ATTN_FORM` parses strictly: an unlisted form, a
+    /// form the head shape cannot host in an explicit `<sliding>,<global>`
+    /// spec, and any stray text are refused; a bare form that one shape cannot
+    /// host keeps today's kernels for that shape only.
+    #[test]
+    fn mtp12_attn_form_selector_parses_strictly() {
+        let parse = Mtp12AttnSelection::parse;
+        assert_eq!(parse("v2").unwrap(), Mtp12AttnSelection::TODAY);
+        assert_eq!(parse("v2:q1").unwrap(), Mtp12AttnSelection::TODAY);
+        assert_eq!(parse("d1p2").unwrap().label(), "d1p2:q1,d1p2:q1");
+        assert_eq!(parse("d1p2:q2").unwrap().label(), "d1p2:q2,d1p2:q2");
+        // group 2 at HD256 cannot host four heads per threadgroup; that half
+        // keeps today's kernels while HD512 (group 16) takes the form.
+        assert_eq!(parse("d1p4:q4").unwrap().label(), "v2:q1,d1p4:q4");
+        assert_eq!(parse("d1p2,d1p8").unwrap().label(), "d1p2:q1,d1p8:q1");
+        assert_eq!(parse("d1p1:q2,d1p4:q4").unwrap().label(), "d1p1:q2,d1p4:q4");
+        // Explicit per-shape specs REFUSE an unhostable form rather than
+        // silently dropping it.
+        assert!(parse("d1p4,d1p4").is_none());
+        assert!(parse("d1p2:q4,d1p2:q4").is_none());
+        assert!(parse("d1p16").is_none());
+        assert!(parse("d1p2:q3").is_none());
+        assert!(parse("").is_none());
+        assert!(parse("d1p2,").is_none());
     }
 
     /// Synthetic compact-head fixture: `rows` tokens with three random clusters
@@ -8611,6 +9515,10 @@ mod tests {
         /// `mtp12_attention_context_v2`, `_softmax_context_v2`,
         /// `_context_v2_stats16` or `_context_v2_stats4`.
         Context { softmax_ctx: u8 },
+        /// A `CAMELID_GEMMA4_MTP12_ATTN_FORM` pipelined context kernel.
+        ContextForm(Mtp12ContextForm),
+        /// A `CAMELID_GEMMA4_MTP12_ATTN_FORM` head-paired scores kernel.
+        ScoresForm(Mtp12ScoresForm),
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8662,6 +9570,52 @@ mod tests {
                         height: if v2 { position_count.div_ceil(32) as u64 } else { 1 },
                         depth: 1,
                     },
+                    tg32,
+                );
+            }
+            AttentionPhase::ScoresForm(form) => {
+                let pairs = form.pairs().expect("paired scores form");
+                encoder.set_compute_pipeline_state(
+                    pipelines.attention_forms.scores(form).expect("scores pipeline"),
+                );
+                encoder.set_buffer(0, Some(query), 0);
+                encoder.set_buffer(1, Some(key), 0);
+                encoder.set_buffer(2, Some(scores), 0);
+                encoder.set_bytes(3, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(4, 4, &head_dim_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(5, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(6, 4, &group as *const u32 as *const c_void);
+                encoder.set_bytes(7, 4, &position_stride as *const u32 as *const c_void);
+                encoder.set_bytes(8, 4, &kv_head_stride as *const u32 as *const c_void);
+                encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
+                encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: (N_HEADS / pairs) as u64,
+                        height: position_count.div_ceil(32) as u64,
+                        depth: 1,
+                    },
+                    tg32,
+                );
+            }
+            AttentionPhase::ContextForm(form) => {
+                let (chunks, blocks) = form.grid(head_dim).expect("pipelined context form");
+                encoder.set_compute_pipeline_state(
+                    pipelines.attention_forms.context(form).expect("context pipeline"),
+                );
+                encoder.set_buffer(0, Some(value), 0);
+                encoder.set_buffer(1, Some(scores), 0);
+                encoder.set_buffer(2, Some(output), 0);
+                encoder.set_bytes(3, 4, &n_heads as *const u32 as *const c_void);
+                encoder.set_bytes(4, 4, &head_dim_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(5, 4, &position_count_u32 as *const u32 as *const c_void);
+                encoder.set_bytes(6, 4, &group as *const u32 as *const c_void);
+                encoder.set_bytes(7, 4, &position_stride as *const u32 as *const c_void);
+                encoder.set_bytes(8, 4, &kv_head_stride as *const u32 as *const c_void);
+                encoder.set_bytes(9, 4, &kv_base_offset as *const u32 as *const c_void);
+                encoder.set_bytes(10, 4, &compact_base as *const u32 as *const c_void);
+                encoder.set_bytes(11, 4, &logical_len as *const u32 as *const c_void);
+                encoder.dispatch_thread_groups(
+                    MTLSize { width: chunks as u64, height: blocks as u64, depth: 1 },
                     tg32,
                 );
             }
@@ -8723,7 +9677,11 @@ mod tests {
     /// Per-kernel GPU cost of the assistant's attention phases on both 12B head
     /// shapes at the tree lane's production prefixes: the established
     /// softmax + `context_v2` pair against the fused `softmax_context_v2` and
-    /// against the stats pre-pass + stats-fed context at both load depths.
+    /// against the stats pre-pass + stats-fed context at both load depths, then
+    /// every `CAMELID_GEMMA4_MTP12_ATTN_FORM` candidate the shape can host -
+    /// each pipelined `d<dims>p<pairs>` context kernel against `context_v2`
+    /// (with its threadgroup grid, so occupancy can be read off) and each
+    /// head-paired `q<pairs>` scores kernel against `scores_v2`.
     /// Prefix lengths come from `CAMELID_MTP12_BENCH_PREFIX` (default
     /// "620,1500"); every prefix is measured with `compact_base` 0, so
     /// `position_count` is the prefix itself.
@@ -8835,6 +9793,52 @@ mod tests {
                     scores_v2 + [pair, fused, stats_pass + ctx16, stats_pass + ctx4]
                         .into_iter()
                         .fold(f64::INFINITY, f64::min)
+                );
+
+                // CAMELID_GEMMA4_MTP12_ATTN_FORM candidates (bit-identical to the
+                // scores_v2 / context_v2 kernels above; see
+                // mtp12_attention_forms_match_v2_bit_for_bit).
+                let mut best_scores = (Mtp12ScoresForm::Q1.label(), scores_v2);
+                for form in Mtp12ScoresForm::PAIRED {
+                    if !form.available(head_dim, kv_heads) {
+                        continue;
+                    }
+                    let us = run(&[AttentionPhase::ScoresForm(form)]);
+                    eprintln!(
+                        "[mtp12-attn-bench]   form   scores {:<31} {us:8.1} us                           {:+6.1}% vs scores_v2",
+                        form.label(),
+                        (us - scores_v2) * 100.0 / scores_v2
+                    );
+                    if us < best_scores.1 {
+                        best_scores = (form.label(), us);
+                    }
+                }
+                let mut best_context = (Mtp12ContextForm::V2.label(), context_v2);
+                for form in Mtp12ContextForm::PIPELINED {
+                    if !form.available(head_dim, kv_heads) {
+                        continue;
+                    }
+                    let (chunks, blocks) = form.grid(head_dim).expect("grid");
+                    let us = run(&[AttentionPhase::ContextForm(form)]);
+                    eprintln!(
+                        "[mtp12-attn-bench]   form   context {:<6} ({chunks:>2}x{blocks:>2} tg)                          {:<14} {us:8.1} us  {:+6.1}% vs context_v2",
+                        form.label(),
+                        "",
+                        (us - context_v2) * 100.0 / context_v2
+                    );
+                    if us < best_context.1 {
+                        best_context = (form.label(), us);
+                    }
+                }
+                eprintln!(
+                    "[mtp12-attn-bench]   whole  {:<38} {:8.1} us  {:+6.1}% vs today",
+                    format!(
+                        "{} + softmax + {}",
+                        best_scores.0, best_context.0
+                    ),
+                    best_scores.1 + softmax + best_context.1,
+                    (best_scores.1 + softmax + best_context.1 - (scores_v2 + pair)) * 100.0
+                        / (scores_v2 + pair)
                 );
             }
         }
