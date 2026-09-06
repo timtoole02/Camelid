@@ -5247,6 +5247,7 @@ async fn main() -> anyhow::Result<()> {
                 .into());
             }
         }
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         Command::Gemma4Mtp12Gpu {
             path,
             assistant,
@@ -5503,6 +5504,7 @@ async fn main() -> anyhow::Result<()> {
                 .into());
             }
         }
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         Command::Gemma4VerifyGpu {
             path,
             prompt,
