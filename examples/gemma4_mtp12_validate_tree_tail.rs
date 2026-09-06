@@ -156,22 +156,46 @@ fn check_generation(
                 assert!(parent < row);
                 assert_eq!(tree.depths[row], tree.depths[parent] + 1);
             }
-            assert_eq!(
-                tree.assistant_steps,
-                if tree.branch_primary_step.is_some() {
-                    6
-                } else {
-                    7
-                }
-            );
+            // Legacy is fixed at six forwards on a fork and seven on the
+            // linear fallback; the menu policies pick four to seven, and only
+            // the linear shape ever costs seven.
+            if tree.policy == "legacy" {
+                assert_eq!(
+                    tree.assistant_steps,
+                    if tree.branch_primary_step.is_some() {
+                        6
+                    } else {
+                        7
+                    }
+                );
+                assert_eq!(
+                    tree.primary_rows,
+                    (0..if tree.branch_primary_step.is_some() {
+                        5
+                    } else {
+                        8
+                    })
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                assert!((4..=7).contains(&tree.assistant_steps));
+                assert_eq!(
+                    tree.assistant_steps == 7,
+                    tree.branch_primary_step.is_none()
+                );
+                assert_eq!(tree.forward_margins.len(), tree.assistant_steps);
+                assert_eq!(tree.runner_up_ids.len(), tree.assistant_steps);
+                assert_eq!(tree.node_p.len(), 8);
+            }
+            // The ordinary chain is always a contiguous physical prefix.
             assert_eq!(
                 tree.primary_rows,
-                (0..if tree.branch_primary_step.is_some() {
-                    5
-                } else {
-                    8
-                })
-                    .collect::<Vec<_>>()
+                (0..tree.primary_rows.len()).collect::<Vec<_>>()
+            );
+            assert!(tree.branch_primary_step.is_none_or(|step| step < 4));
+            assert_eq!(
+                tree.fork_forwards.first().copied(),
+                tree.branch_primary_step
             );
             assert_eq!(tree.committed_path.first(), Some(&0));
             for edge in tree.committed_path.windows(2) {

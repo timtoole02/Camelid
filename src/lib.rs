@@ -27,6 +27,8 @@ pub mod gemma4_distributed;
 #[cfg(target_os = "macos")]
 pub(crate) mod gemma4_attention_metal;
 pub mod gemma4_mtp;
+/// Metal-free decision logic for the Gemma 4 12B W8 draft tree.
+pub(crate) mod gemma4_mtp12_tree_menu;
 pub mod gemma4_mtp_cuda;
 pub mod gemma4_q4_sidecar;
 pub mod gemma4_runtime;

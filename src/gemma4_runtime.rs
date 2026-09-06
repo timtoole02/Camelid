@@ -37,7 +37,7 @@ pub(crate) mod mtp12_snapshot;
 
 #[cfg(any(target_os = "macos", test))]
 #[path = "gemma4_mtp12_tree_policy.rs"]
-mod mtp12_tree_policy;
+pub(crate) mod mtp12_tree_policy;
 #[cfg(target_os = "macos")]
 #[path = "gemma4_mtp12_tree_runtime.rs"]
 mod mtp12_tree_runtime;
@@ -7419,8 +7419,22 @@ pub struct Gemma4Mtp12TreeRoundReceipt {
     pub parents: Vec<i32>,
     pub depths: Vec<u32>,
     pub primary_rows: Vec<usize>,
+    /// Earliest kept rank-two fork among the first four forwards, or `None` on
+    /// a linear tree. Unchanged meaning under every policy value.
     pub branch_primary_step: Option<usize>,
+    /// All primary forwards whose rank-two child this tree kept, ascending.
+    pub fork_forwards: Vec<usize>,
     pub primary_margins: [f32; 4],
+    /// Top-1 minus top-2 logit of every forward the round actually ran.
+    pub forward_margins: Vec<f32>,
+    /// Rank-two id of every forward, in the same order as `forward_margins`.
+    pub runner_up_ids: Vec<u32>,
+    /// Modeled commit probability per physical row; empty on the legacy path.
+    pub node_p: Vec<f32>,
+    /// `legacy`, `dyn` or `fixed:<shape>`, as parsed from the selector.
+    pub policy: String,
+    /// Named topology of this round, e.g. `4+1+2`, `5+1+1`, `4+3`, `lin7`.
+    pub shape: String,
     pub assistant_steps: usize,
     pub committed_path: Vec<usize>,
     pub mismatch_parent: Option<usize>,
@@ -10049,7 +10063,10 @@ impl Gemma4GpuRuntime {
             let tree_receipt = tree_proposal.as_ref().map(|tree| Gemma4Mtp12TreeRoundReceipt {
                 parents: tree.parents.clone(), depths: tree.depths.clone(),
                 primary_rows: tree.primary_rows.clone(), branch_primary_step: tree.branch_primary_step,
+                fork_forwards: tree.fork_forwards.clone(),
                 primary_margins: tree.primary_margins, assistant_steps: tree.assistant_steps as usize,
+                forward_margins: tree.forward_margins.clone(), runner_up_ids: tree.runner_up_ids.clone(),
+                node_p: tree.node_p.clone(), policy: tree.policy.clone(), shape: tree.shape.clone(),
                 committed_path: path, mismatch_parent: tree_decision.as_ref().and_then(|d| d.mismatch_parent),
                 compaction_us,
             });
