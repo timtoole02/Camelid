@@ -164,13 +164,22 @@ export const SUPPORTED_MODELS = [
     blurb: 'A compact Gemma model for multilingual chat.',
   },
   {
+    catalog_id: 'gemma4_12b_it_qat_q4_0',
+    name: 'Gemma 4 12B-It QAT',
+    repo_id: 'google/gemma-4-12B-it-qat-q4_0-gguf',
+    filename: 'gemma-4-12b-it-qat-q4_0.gguf',
+    size_bytes: 6975879296,
+    quant: 'Q4_0',
+    blurb: 'The fast single-Mac 12B option — runs on a tested 16 GB M4 Mac through Camelid’s accelerated Metal lane.',
+  },
+  {
     catalog_id: 'gemma4_12b_it_q8_0',
-    name: 'Gemma 4 12B-It (distributed)',
+    name: 'Gemma 4 12B-It Q8_0 (distributed)',
     repo_id: 'unsloth/gemma-4-12b-it-GGUF',
     filename: 'gemma-4-12b-it-Q8_0.gguf',
     size_bytes: 12669646240,
     quant: 'Q8_0',
-    blurb: 'A larger Gemma for higher-quality multilingual chat and reasoning.',
+    blurb: 'The legacy full-size 12B download for Camelid’s two-node distributed lane.',
   },
   {
     catalog_id: 'gemma4_26b_a4b_it_q4_0',
@@ -179,7 +188,7 @@ export const SUPPORTED_MODELS = [
     filename: 'gemma-4-26B_q4_0-it.gguf',
     size_bytes: 14439361440,
     quant: 'Q4_0',
-    blurb: 'A large mixture-of-experts Gemma, supported on Windows CUDA with the storage-backed Ghost MoE option.',
+    blurb: 'Runs on one tested 16 GB M4 Mac with Ghost-MoE/MTP; two-node distributed serving remains optional.',
   },
   {
     /* The one Ornith artifact that is HF-pristine; its supported Q4_K_M/Q3_K_M

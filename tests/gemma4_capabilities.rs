@@ -53,9 +53,9 @@ async fn gemma4_supported_rows_are_exactly_the_committed_set() {
     assert_eq!(
         supported,
         vec![
-            // 12B and 26B A4B QAT are supported ONLY through the two-Mac
-            // distributed serve lane (parity packs + distributed-serve smoke
-            // bundles committed); E2B/E4B are single-node supported rows.
+            // The 12B Q8 and 26B A4B QAT rows are supported only through their
+            // committed, lane-scoped evidence. The downloadable 12B QAT Q4_0
+            // single-Mac row remains active validation and must not appear here.
             "gemma4_12b_it_q8_0",
             "gemma4_26b_a4b_it_q4_0",
             "gemma4_e2b_it_q8_0",
@@ -145,7 +145,7 @@ async fn gemma4_e2b_row_records_pack_parity_oracle() {
 }
 
 #[tokio::test]
-async fn gemma4_models_catalog_lists_both_exact_rows() {
+async fn gemma4_models_catalog_lists_supported_and_single_mac_downloads() {
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -165,5 +165,8 @@ async fn gemma4_models_catalog_lists_both_exact_rows() {
         let text = body.to_string();
         assert!(text.contains("gemma4_e4b_it_q8_0"));
         assert!(text.contains("gemma4_e2b_it_q8_0"));
+        assert!(text.contains("gemma4_12b_it_qat_q4_0"));
+        assert!(text.contains("google/gemma-4-12B-it-qat-q4_0-gguf"));
+        assert!(text.contains("gemma-4-12b-it-qat-q4_0.gguf"));
     }
 }

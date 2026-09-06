@@ -35,6 +35,7 @@
         "active_validation_exact_row_hold",
         "active_validation_exact_row_smoke",
         "active_validation_partial_runtime",
+        "active_validation_single_node_metal",
         "blocked_later_generation_divergence",
         "blocked_pending_normalized_full_support",
         "current_gate_refresh_under_stricter_bar",
@@ -69,6 +70,7 @@
       "type": "string",
       "$comment": "Code-derived from `support_scope:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
       "enum": [
+        "active_validation_only",
         "current_full_gate_exact_row",
         "catalog_download_and_bounded_cross_backend_raw_decode_smoke_only",
         "catalog_download_and_bounded_raw_runtime_validation_only",
@@ -105,7 +107,8 @@
     "latestCheckedResultVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `latest_checked_result:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["active_validation_api_webui_pass_pending_context", "active_validation_blocked_load", "active_validation_blocked_parity", "active_validation_blocked_template", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "partial_pass_hold", "pass", "pass_active_validation_only", "planning_only", "runnable_exact_row_numerical_variance"]
+      "enum": ["active_validation_api_webui_pass_pending_context", "active_validation_blocked_load", "active_validation_blocked_parity", "active_validation_blocked_template", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "partial_pass_hold", "pass", "pass_active_validation",
+        "pass_active_validation_only", "planning_only", "runnable_exact_row_numerical_variance"]
     },
     "supportItem": {
       "type": "object",
