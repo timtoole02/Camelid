@@ -366,7 +366,13 @@ try {
 
   /* Generic, not scoped to this feature. `arena` shipped registered in four of
      six places, so its header read "Camelid" and Cmd+K could not reach it. The
-     defect is invisible in a screenshot, so it is asserted instead. */
+     defect is invisible in a screenshot, so it is asserted instead.
+
+     Checked in BOTH directions. The first version of this assertion only walked
+     HASH_TABS outward, which meant an id sitting in a registry with no
+     corresponding tab — a rename that updated one list, a copy-paste, a stray
+     edit — passed silently. An orphan is the same class of defect seen from the
+     other side: two lists that disagree about what the tabs are. */
   check('every deep-linkable tab appears in all five registries', () => {
     const read = (relative) => readFileSync(resolve(frontendRoot, relative), 'utf8')
     const ids = (source, pattern) => [...source.matchAll(pattern)].map((match) => match[1])
@@ -401,13 +407,23 @@ try {
       'App.jsx render chain': ids(appSource, /tab === '([a-z-]+)'/g),
     }
 
-    const missing = []
+    const problems = []
     for (const tab of hashTabs) {
       for (const [name, registered] of Object.entries(registries)) {
-        if (!registered.includes(tab)) missing.push(`${tab} missing from ${name}`)
+        if (!registered.includes(tab)) problems.push(`${tab} missing from ${name}`)
       }
     }
-    assert.deepEqual(missing, [], `tab registries disagree — every gap here is a silent defect (no TITLES entry renders the header as "Camelid"; no VIEW_LABELS entry makes the view unreachable from the command palette; no VALID_TABS entry drops the tab on reload):\n  ${missing.join('\n  ')}`)
+    /* The reverse direction: an id a registry claims but HASH_TABS does not.
+       `App.jsx render chain` is exempt — it compares `tab` against ids that are
+       deliberately not hash-routable (the Spotlight overlay is reached by its own
+       hash, not as a tab). Every other registry is a closed set. */
+    for (const [name, registered] of Object.entries(registries)) {
+      if (name === 'App.jsx render chain') continue
+      for (const id of new Set(registered)) {
+        if (!hashTabs.includes(id)) problems.push(`${id} appears in ${name} but is not a HASH_TABS tab`)
+      }
+    }
+    assert.deepEqual(problems, [], `tab registries disagree — every entry here is a silent defect (no TITLES entry renders the header as "Camelid"; no VIEW_LABELS entry makes the view unreachable from the command palette; no VALID_TABS entry drops the tab on reload; an orphan id means two lists disagree about what the tabs are):\n  ${problems.join('\n  ')}`)
   })
 
   console.log(`\n${checks} checks passed`)
