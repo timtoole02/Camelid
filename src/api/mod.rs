@@ -12914,18 +12914,50 @@ impl RunnableServeRuntime {
 
     /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
     /// (`<|im_end|>` / eos). Returns the detokenized text + the generated token ids.
+    /// Text stop-sequence predicate for the runnable decode loops.
+    ///
+    /// The loops terminate on EOG *token ids*; an OpenAI `stop` is a *string*, which
+    /// can span several tokens and can land mid-token, so it can only be judged over
+    /// decoded text. `Tokenizer::decode` is stateless and append-only (incomplete
+    /// trailing UTF-8 is held back rather than replaced), so decoding the growing
+    /// prefix each step is exactly right.
+    ///
+    /// Returns a predicate that is `false` for every input when no sequences were
+    /// requested, so a request without `stop` takes a byte-identical path to before
+    /// — which is what keeps the hash-pinned rows on this lane unaffected.
+    fn stop_text_predicate<'a>(
+        &'a self,
+        stop_sequences: &'a [String],
+    ) -> impl Fn(&[u32]) -> bool + 'a {
+        move |ids: &[u32]| {
+            if stop_sequences.is_empty() {
+                return false;
+            }
+            let text = self.tokenizer.decode(ids, true).unwrap_or_default();
+            contains_stop_sequence(&text, stop_sequences)
+        }
+    }
+
     fn generate_greedy(
         &self,
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
+        stop_sequences: &[String],
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self
-            .model
-            .generate_stopping_with_sampling(prompt_ids, max_new, &stop, sampling)?;
+        let should_stop = self.stop_text_predicate(stop_sequences);
+        let ids = self.model.generate_stopping_with_sampling(
+            prompt_ids,
+            max_new,
+            &stop,
+            sampling,
+            &should_stop,
+        )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        // The ids and the token count keep the stop-triggering token; only the text
+        // is cut. That asymmetry is the dense lane's shipped contract.
+        Ok((truncate_at_stop_sequence(text, stop_sequences), ids))
     }
 
     /// Streaming generation with a cooperative disconnect check. The generic
@@ -12938,9 +12970,11 @@ impl RunnableServeRuntime {
         max_new: usize,
         sampling: &SamplingConfig,
         is_cancelled: &dyn Fn() -> bool,
+        stop_sequences: &[String],
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let should_stop = self.stop_text_predicate(stop_sequences);
         let ids = self
             .model
             .generate_stopping_streaming_with_sampling_cancelled(
@@ -12949,10 +12983,11 @@ impl RunnableServeRuntime {
                 &stop,
                 sampling,
                 is_cancelled,
+                &should_stop,
                 &mut on_token,
             )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        Ok((truncate_at_stop_sequence(text, stop_sequences), ids))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13532,6 +13567,55 @@ mod bitnet_runnable_api_tests {
         assert_eq!(
             thinking.extensions().get::<ApiErrorDetails>().unwrap().code,
             "unsupported_parameter"
+        );
+    }
+
+    /* The runnable lane parsed `stop` and threw it away, so an OpenAI stop
+       sequence was silently a no-op on every model this lane serves — qwen35/Ornith,
+       gemma3, LFM2, BitNet, command-r — while the dense lane honored it. These pin
+       the two halves of the fix that can be tested without a model: that an absent
+       `stop` leaves behavior byte-identical, and that the text semantics match the
+       dense lane exactly. */
+
+    #[test]
+    fn absent_stop_sequences_are_a_no_op() {
+        // The whole change rests on this: the pinned rows on the runnable lane must
+        // take the path they took before, so an empty sequence set can never match
+        // and can never truncate.
+        assert!(!contains_stop_sequence("anything at all", &[]));
+        assert_eq!(
+            truncate_at_stop_sequence("untouched".to_string(), &[]),
+            "untouched"
+        );
+        assert!(stop_sequences_from_request(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_truncation_cuts_at_the_earliest_match_and_survives_utf8() {
+        let seqs = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // Earliest match wins, not first-listed.
+        assert_eq!(
+            truncate_at_stop_sequence("alpha BETA gamma".to_string(), &seqs(&["gamma", "BETA"])),
+            "alpha "
+        );
+        // Mid-token truncation: the dense lane returns "<unk" for a single <unk>
+        // token stopped on ">". The runnable lane now shares this helper, so the
+        // two lanes cannot disagree about the same request.
+        assert_eq!(
+            truncate_at_stop_sequence("<unk>".to_string(), &seqs(&[">"])),
+            "<unk"
+        );
+        // A stop sequence landing after a multi-byte character must not panic:
+        // `str::find` returns a byte index, and String::truncate panics unless that
+        // index is a char boundary.
+        assert_eq!(
+            truncate_at_stop_sequence("café STOP au lait".to_string(), &seqs(&["STOP"])),
+            "café "
+        );
+        // A sequence that never occurs leaves the text alone.
+        assert_eq!(
+            truncate_at_stop_sequence("no match here".to_string(), &seqs(&["zzz"])),
+            "no match here"
         );
     }
 
@@ -14471,12 +14555,19 @@ async fn runnable_chat_nonstreaming(
         Ok(config) => config,
         Err(response) => return response,
     };
+    // Already parsed and validated for this lane by the preflight; previously the
+    // value was dropped on the floor, so  was silently a no-op here.
+    let stop_sequences = match stop_sequences_from_request(req.stop.as_ref()) {
+        Ok(sequences) => sequences,
+        Err(response) => return *response,
+    };
     let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
     let rt = runtime.clone();
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
-            rt.generate_greedy(&prompt_ids, max_tokens, &sampling).map(
+            rt.generate_greedy(&prompt_ids, max_tokens, &sampling, &stop_sequences)
+                .map(
                 |(text, generated_token_ids)| RunnableGenerationResult {
                     text,
                     generated_token_ids,
@@ -14663,6 +14754,13 @@ async fn runnable_chat_streaming(
         Ok(config) => config,
         Err(response) => return response,
     };
+    // Same value the preflight already validates for this lane. Threaded into the
+    // decode loop so a stop sequence terminates generation here exactly as it does
+    // on the dense lane, rather than being silently dropped.
+    let stop_sequences = match stop_sequences_from_request(req.stop.as_ref()) {
+        Ok(sequences) => sequences,
+        Err(response) => return *response,
+    };
     let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
@@ -14699,6 +14797,7 @@ async fn runnable_chat_streaming(
                     max_tokens,
                     &sampling,
                     &is_cancelled,
+                    &stop_sequences,
                     |tok| {
                         if send_tx.send(StreamItem::Token(tok)).is_err() {
                             worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
