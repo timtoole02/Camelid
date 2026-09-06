@@ -526,7 +526,7 @@ function App() {
             />
           )}
 
-          {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
+          {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} metricsApiBase={apiBase} />}
 
           {tab === 'settings' && (
             <SettingsView
