@@ -21,6 +21,7 @@
     "smoke:catalog-companion": "node scripts/catalog-companion-smoke.mjs",
     "smoke:model-deletion": "node scripts/model-deletion-smoke.mjs",
     "smoke:3b-closure": "node scripts/frontend-3b-closure-smoke.mjs",
+    "smoke:structured-output": "node scripts/structured-output-smoke.mjs",
     "smoke:token-inspector": "node scripts/token-inspector-smoke.mjs",
     "smoke:ui": "node scripts/ui-regression-smoke.mjs",
     "smoke:ghost-moe-execution": "node scripts/ghost-moe-execution-plan-smoke.mjs",

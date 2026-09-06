@@ -563,6 +563,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:ui
 
+      - name: Structured output smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:structured-output
+
       - name: Token inspector smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:token-inspector

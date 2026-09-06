@@ -14,6 +14,7 @@ import {
 import { ParityReceiptCard } from './render/ParityReceipt'
 import { DeveloperDiagnosticsBlock } from './render/Diagnostics'
 import { TokenInspectorCard } from './render/TokenInspector'
+import { StructuredOutputCard } from './render/StructuredOutput'
 
 const formatMs = (value) => {
   const ms = Number(value)
@@ -256,7 +257,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, tokenInspection = null }) {
+export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, tokenInspection = null, structuredRecord = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -385,6 +386,9 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
 
         {message.role === 'assistant' && !assistantStreaming && message.camelid_receipt && (
           <ParityReceiptCard receipt={message.camelid_receipt} />
+        )}
+        {message.role === 'assistant' && !assistantStreaming && structuredRecord && (
+          <StructuredOutputCard record={structuredRecord} />
         )}
         {message.role === 'assistant' && !assistantStreaming && tokenInspection && (
           <TokenInspectorCard
