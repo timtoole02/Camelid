@@ -10220,6 +10220,37 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn gemma4_mtp12_clamps_an_over_budget_response_limit_like_every_other_lane() {
+        // max_tokens is an UPPER BOUND: an over-budget limit is clamped to the
+        // room left, matching the shared generation path's contract that the
+        // bundled web UI is written against.
+        assert_eq!(
+            gemma4_mtp12_clamp_output_tokens(12, 2_031, 2_048),
+            Ok(2_020)
+        );
+        assert_eq!(gemma4_mtp12_clamp_output_tokens(12, 96, 2_048), Ok(96));
+        assert_eq!(gemma4_mtp12_clamp_output_tokens(0, 4_096, 2_048), Ok(2_032));
+        // Exactly-fitting and one-token-of-room requests survive unclamped.
+        assert_eq!(
+            gemma4_mtp12_clamp_output_tokens(3_000, 1_080, 4_096),
+            Ok(1_080)
+        );
+        assert_eq!(
+            gemma4_mtp12_clamp_output_tokens(2_031, 500, 2_048),
+            Ok(1)
+        );
+        // A prompt that leaves no room is the only genuine failure.
+        for prompt in [2_032, 2_048, 9_000] {
+            let error = gemma4_mtp12_clamp_output_tokens(prompt, 1, 2_048)
+                .expect_err("a prompt that fills the window must fail");
+            assert!(error.contains("leaves no room for generation"), "{error}");
+        }
+        assert!(gemma4_mtp12_clamp_output_tokens(usize::MAX, 1, 4_096)
+            .unwrap_err()
+            .contains("overflowed usize"));
+    }
+
+    #[test]
     fn gemma4_mtp12_context_budget_reserves_physical_w16_headroom() {
         assert!(gemma4_mtp12_context_budget_check(3_000, 1_080, 4_096).is_ok());
         let error = gemma4_mtp12_context_budget_check(3_000, 1_081, 4_096)
@@ -11040,13 +11071,16 @@ async fn gemma4_prompt_token_count(
     }
 }
 
-fn validate_gemma4_mtp12_request_context(
+/// Effective output budget for an MTP12 request. `max_tokens` is an upper bound,
+/// so an over-budget limit is clamped to the room left rather than rejected;
+/// only a prompt that fills the resident window is an error.
+fn clamp_gemma4_mtp12_request_context(
     runtime: &Gemma4ServeRuntime,
     prompt_tokens: usize,
     requested_output_tokens: usize,
-) -> std::result::Result<(), Response> {
+) -> std::result::Result<usize, Response> {
     runtime
-        .validate_mtp12_context_budget(prompt_tokens, requested_output_tokens)
+        .clamp_mtp12_output_tokens(prompt_tokens, requested_output_tokens)
         .map_err(|message| {
             api_error_with_prompt_token_count(
                 StatusCode::BAD_REQUEST,
@@ -11662,6 +11696,29 @@ pub enum Gemma4ServeRuntime {
 
 const GEMMA4_MTP12_PHYSICAL_W16_HEADROOM: usize = 16;
 
+/// Room left for generation after the prompt and the physical W16 verifier
+/// headroom. `max_tokens` is an UPPER BOUND on every other lane (see the
+/// clamping contract in the shared generation path), so this lane clamps to the
+/// same rule instead of rejecting: the only genuine failure is a prompt that
+/// already fills the resident window, leaving no room for a single token.
+fn gemma4_mtp12_available_output_tokens(
+    prompt_tokens: usize,
+    max_positions: usize,
+) -> std::result::Result<usize, String> {
+    let reserved = prompt_tokens
+        .checked_add(GEMMA4_MTP12_PHYSICAL_W16_HEADROOM)
+        .ok_or_else(|| "Gemma 4 MTP12 context budget overflowed usize".to_string())?;
+    let available = max_positions.saturating_sub(reserved);
+    if available == 0 {
+        return Err(format!(
+            "Gemma 4 MTP12 prompt of {prompt_tokens} tokens plus {GEMMA4_MTP12_PHYSICAL_W16_HEADROOM} physical W16 verifier headroom leaves no room for generation in the runtime capacity of {max_positions}"
+        ));
+    }
+    Ok(available)
+}
+
+/// Strict fit check for replays whose output length is a DEMAND, not an upper
+/// bound (verified-render segments must emit exactly their recorded tokens).
 fn gemma4_mtp12_context_budget_check(
     prompt_tokens: usize,
     requested_output_tokens: usize,
@@ -11677,6 +11734,17 @@ fn gemma4_mtp12_context_budget_check(
         ));
     }
     Ok(())
+}
+
+/// Clamp a requested response limit to what actually fits. Returns the effective
+/// output budget; errors only when the prompt itself leaves no room.
+fn gemma4_mtp12_clamp_output_tokens(
+    prompt_tokens: usize,
+    requested_output_tokens: usize,
+    max_positions: usize,
+) -> std::result::Result<usize, String> {
+    let available = gemma4_mtp12_available_output_tokens(prompt_tokens, max_positions)?;
+    Ok(requested_output_tokens.min(available))
 }
 
 impl Gemma4ServeRuntime {
@@ -11704,19 +11772,21 @@ impl Gemma4ServeRuntime {
         }
     }
 
-    fn validate_mtp12_context_budget(
+    /// Effective output budget for this lane: the request's own limit, clamped
+    /// to the room left after the prompt and the verifier headroom.
+    fn clamp_mtp12_output_tokens(
         &self,
         prompt_tokens: usize,
         requested_output_tokens: usize,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<usize, String> {
         match self {
             #[cfg(target_os = "macos")]
-            Self::Mtp12Metal { max_positions, .. } => gemma4_mtp12_context_budget_check(
+            Self::Mtp12Metal { max_positions, .. } => gemma4_mtp12_clamp_output_tokens(
                 prompt_tokens,
                 requested_output_tokens,
                 *max_positions,
             ),
-            _ => Ok(()),
+            _ => Ok(requested_output_tokens),
         }
     }
 
@@ -12371,11 +12441,10 @@ async fn gemma4_completion_nonstreaming(
         Ok(count) => count,
         Err(response) => return response,
     };
-    if let Err(response) =
-        validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
-    {
-        return response;
-    }
+    let max_tokens = match clamp_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens) {
+        Ok(budget) => budget,
+        Err(response) => return response,
+    };
     let t_generate = std::time::Instant::now();
     let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
@@ -12445,11 +12514,10 @@ async fn gemma4_completion_streaming(
         Ok(count) => count,
         Err(response) => return response,
     };
-    if let Err(response) =
-        validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
-    {
-        return response;
-    }
+    let max_tokens = match clamp_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens) {
+        Ok(budget) => budget,
+        Err(response) => return response,
+    };
 
     let (mut rx, cancel_on_drop) =
         match gemma4_stream_on_engine(state, runtime, prompt, max_tokens, None) {
@@ -12533,11 +12601,10 @@ async fn gemma4_chat_nonstreaming(
         Ok(count) => count,
         Err(response) => return response,
     };
-    if let Err(response) =
-        validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
-    {
-        return response;
-    }
+    let max_tokens = match clamp_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens) {
+        Ok(budget) => budget,
+        Err(response) => return response,
+    };
     let t_generate = std::time::Instant::now();
     let telemetry_guard = telemetry::RequestGuard::begin(gemma4_telemetry_start(
         &id,
@@ -15345,11 +15412,28 @@ async fn gemma4_chat_streaming(
                 Ok(count) => count,
                 Err(response) => return response,
             };
-        if let Err(response) =
-            validate_gemma4_mtp12_request_context(&runtime, prompt_tokens, max_tokens)
-        {
-            return response;
-        }
+        // A verified-render replay must emit exactly its recorded draft, so its
+        // budget is a demand, not an upper bound: refuse rather than clamp. An
+        // ordinary request keeps the shared max_tokens contract and is clamped.
+        let max_tokens = match clamp_gemma4_mtp12_request_context(
+            &runtime,
+            prompt_tokens,
+            max_tokens,
+        ) {
+            Ok(budget) if render_draft_token_ids.is_some() && budget < max_tokens => {
+                return api_error_with_prompt_token_count(
+                    StatusCode::BAD_REQUEST,
+                    "context_length_exceeded",
+                    format!(
+                        "verified render of {max_tokens} tokens does not fit the resident window after a {prompt_tokens}-token prompt (room for {budget})"
+                    ),
+                    Some("max_tokens"),
+                    Some(prompt_tokens),
+                );
+            }
+            Ok(budget) => budget,
+            Err(response) => return response,
+        };
         let stream = match gemma4_stream_on_engine(
             state,
             runtime,
