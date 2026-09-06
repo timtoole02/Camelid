@@ -11,6 +11,7 @@
     "smoke:model-state": "node scripts/model-state-smoke.mjs",
     "smoke:model-lanes": "node scripts/model-lanes-smoke.mjs",
     "smoke:catalog-activation": "node scripts/catalog-activation-smoke.mjs",
+    "smoke:engine-metrics": "node scripts/engine-metrics-smoke.mjs",
     "smoke:first-run": "node scripts/first-run-activation-smoke.mjs",
     "smoke:first-run-card": "node scripts/first-run-card-smoke.mjs",
     "smoke:offline-banner": "node scripts/offline-banner-smoke.mjs",
