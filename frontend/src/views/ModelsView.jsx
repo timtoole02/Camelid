@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ModelInspector } from '../components/models/ModelInspector'
 import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
+import { RerankPlayground } from '../components/models/RerankPlayground'
 import { ActiveModelBar } from '../components/models/ActiveModelBar'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
 import { DownloadsPanel } from '../components/models/DownloadsPanel'
@@ -715,6 +716,8 @@ export default function ModelsView({
           </div>
 
           <TokenizerPlayground apiBase={catalogApiBase || apiBase} />
+
+          <RerankPlayground apiBase={catalogApiBase || apiBase} capabilities={capabilities} />
         </div>
       </details>
 

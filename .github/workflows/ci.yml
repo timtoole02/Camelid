@@ -555,6 +555,10 @@ jobs:
           curl --fail --silent http://127.0.0.1:4175/ >/dev/null
           npm run smoke:workspace-visual
 
+      - name: Retrieval rerank smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:rerank
+
       - name: Frontend UI regression smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:ui
