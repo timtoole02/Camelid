@@ -434,6 +434,7 @@ mod tests {
             cpu_logical_cores: 8,
             host_ram_total_bytes: 32 * 1024 * 1024 * 1024,
             host_ram_free_bytes: 24 * 1024 * 1024 * 1024,
+            host_ram_unevictable_bytes: 0,
             simd: SimdCaps::default(),
         }
     }

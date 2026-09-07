@@ -290,8 +290,9 @@ Portability and packaging should remain explicit:
 
 A **capacity** signal, deliberately separate from the support ledger: it estimates whether the *local machine* can load/run a catalog row, and never implies parity or support. See [`docs/architecture/MODEL_FIT_ADVISOR_PLAN.md`](docs/architecture/MODEL_FIT_ADVISOR_PLAN.md).
 
-- The verdict (`fits_resident` / `fits_with_offload` / `cpu_only_ok` / `wont_fit` / `unknown`) is derived from the detected `HardwareProfile` and the row's on-disk weight footprint; it is advisory, never a support claim, and degrades to `unknown` (never a failure) on hosts whose memory cannot be probed.
-- It informs but never enforces: catalog download stays un-gated, and the pre-load fail-fast (`model_too_large_for_host`) fires only on a `wont_fit` verdict from a probed host and is overridable with `CAMELID_SKIP_FIT_CHECK=1`.
+- The verdict (`fits_resident` / `fits_with_offload` / `cpu_only_ok` / `insufficient_free_memory` / `wont_fit` / `unknown`) is derived from the detected `HardwareProfile` and the row's on-disk weight footprint; it is advisory, never a support claim, and degrades to `unknown` (never a failure) on hosts whose memory cannot be probed.
+- Catalog download stays un-gated. At `POST /api/models/load` the preflight splits refusals by *permanence*, not severity: `insufficient_free_memory` — the machine is big enough and merely busy — **loads**, carrying a `host_memory_unavailable` warning in the `200` body's `warnings` array; `wont_fit` (`model_too_large_for_host`), an allocation past total-minus-wired RAM (`host_memory_exhausted`), and a resident model that must be released first (`model_requires_unload`) still refuse with `422`. `unknown` and every positive verdict proceed silently. Full verdict → code → status mapping in [`docs/architecture/MODEL_FIT_ADVISOR_PLAN.md`](docs/architecture/MODEL_FIT_ADVISOR_PLAN.md) §9.
+- Two overrides skip the preflight entirely: `"force": true` on the load request — per-request, and the only one the desktop app can reach, since its sidecar is spawned args-only — and `CAMELID_SKIP_FIT_CHECK=1` in the environment, process-wide and operator-only.
 - The authoritative capacity guards remain the runtime VRAM headroom check (mid-load) and the KV predict-and-abort budget (mid-generation); the advisor never relaxes them.
 
 ### Agent mode lane (DROVER)

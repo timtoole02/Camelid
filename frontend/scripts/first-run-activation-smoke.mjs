@@ -175,7 +175,15 @@ assert.equal(
 {
   assert.equal(firstRunFailureIsRetryable('model_too_large_for_host'), false, 'a host that is too small stays too small')
   assert.equal(firstRunFailureIsRetryable('unsupported_model_architecture'), false)
+  /* `host_memory_unavailable` is no longer a refusal at all — the engine loads and
+     reports it as a warning — but the classification stays, because a card talking to
+     an older engine still receives it as a 422, and it was always the retryable kind. */
   assert.equal(firstRunFailureIsRetryable('host_memory_unavailable'), true, 'memory pressure clears')
+  /* The refusal that replaced it on the hard side. Retryable for the reason the
+     blocker copy gives the user: the shortfall is memory the system itself is
+     holding, and closing applications changes that — unlike a footprint larger than
+     the whole machine, which nothing the user does can shrink. */
+  assert.equal(firstRunFailureIsRetryable('host_memory_exhausted'), true, 'a wired-memory shortfall is something the user can clear')
   assert.equal(firstRunFailureIsRetryable(''), true, 'an untyped transport failure is worth one more try')
 }
 
@@ -353,6 +361,8 @@ assert.equal(modelFilenameFromPath(null), '')
   assert.equal(calls[0].body.path, 'models/Qwen3-0.6B-Q8_0.gguf', 'the load path stays models-relative')
   assert.equal(calls[1].body.replace, true, 'loading a model is a swap, never a second resident copy')
   assert.equal(calls[1].body.set_active, true, 'a generative model becomes the active Chat model')
+  assert.equal('force' in calls[1].body, false, 'an ordinary load stays byte-identical to the request every existing server accepts')
+  assert.equal(result.warnings, undefined, 'silence from the engine must not be synthesized into an empty warning list')
 }
 
 {
@@ -548,6 +558,141 @@ for (const fixture of [
   assert.match(result.message, /larger than this machine/)
   assert.doesNotMatch(result.message, /HTTP 422/, 'the typed message replaces the raw status, it does not append to it')
   assert.equal(firstRunFailureIsRetryable(result.code), false)
+}
+
+/* --- the fit preflight is advisory ------------------------------------------
+   A host that is merely busy is a transient condition, not a property of the
+   machine, so the engine loads and qualifies the success instead of refusing it.
+   Refusing there is what shipped: a 2.0 GB Q4_K_M was turned away on an 8 GiB
+   machine that could hold it, with a remedy the GUI user could not perform. The
+   load must therefore carry `warnings` through intact AND without a blocker — the
+   model is resident and usable for as long as the notice is on screen. */
+{
+  const hostBusy = {
+    code: 'host_memory_unavailable',
+    severity: 'warning',
+    message: 'Only ~1.6 GB of ~8.6 GB memory is free right now; Camelid loaded the model anyway.',
+  }
+  const result = await loadLocalModelForChat({
+    apiBase: 'http://camelid.test',
+    filename: 'Qwen3-0.6B-Q8_0.gguf',
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/models/inspect')) return response({ body: {} })
+      if (url.endsWith('/api/models/load')) return response({ body: { id: 'Qwen3-0.6B-Q8_0.gguf', warnings: [hostBusy] } })
+      if (url.endsWith('/api/models/current')) return response({ body: { path: 'models/Qwen3-0.6B-Q8_0.gguf' } })
+      return response({ body: { loaded_now: true, generation_ready: true, active_model_id: 'Qwen3-0.6B-Q8_0.gguf' } })
+    },
+  })
+  assert.equal(result.ok, true, 'a busy host must not refuse a model that fits it')
+  assert.deepEqual(result.warnings, [hostBusy], 'the advisory reaches the caller verbatim, prose and severity included')
+  assert.equal(result.blocker, undefined, 'a warning is not a refusal and must never arrive shaped like one')
+  assert.equal(result.code, undefined, 'a successful load carries no error code for a caller to classify')
+}
+
+{
+  // Same on the encoder path: sidecar readiness is a different probe, but a load
+  // that was qualified must not lose its advisory just because it stopped earlier.
+  const warning = { code: 'host_memory_unavailable', severity: 'warning', message: 'Memory is tight on this host.' }
+  const result = await loadLocalModelForChat({
+    apiBase: 'http://camelid.test',
+    filename: 'nomic-embed-text-v1.5.Q8_0.gguf',
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/models/inspect')) return response({ body: { architecture: 'nomic-bert', embedding_only: true, native_embedding_dimensions: 768 } })
+      if (url.endsWith('/api/models/load')) return response({ body: { warnings: [warning] } })
+      if (url.endsWith('/v1/embeddings')) return response({ body: { data: [{ embedding: Array(768).fill(0) }] } })
+      throw new Error(`unexpected request ${url}`)
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.embedding, true)
+  assert.deepEqual(result.warnings, [warning], 'a sidecar load surfaces its advisory too')
+}
+
+{
+  // Absence, an empty list and a malformed field are all silence. An empty notice
+  // strip over a model that loaded cleanly is the failure this prevents.
+  for (const body of [{}, { warnings: [] }, { warnings: null }, { warnings: 'busy' }, { warnings: {} }]) {
+    const result = await loadLocalModelForChat({
+      apiBase: 'http://camelid.test',
+      filename: 'Qwen3-0.6B-Q8_0.gguf',
+      fetchImpl: async (url) => {
+        if (url.endsWith('/api/models/inspect')) return response({ body: {} })
+        if (url.endsWith('/api/models/load')) return response({ body })
+        if (url.endsWith('/api/models/current')) return response({ body: { path: 'models/Qwen3-0.6B-Q8_0.gguf' } })
+        return response({ body: { loaded_now: true, generation_ready: true, active_model_id: 'Qwen3-0.6B-Q8_0.gguf' } })
+      },
+    })
+    assert.equal(result.ok, true, `load body ${JSON.stringify(body)} is still a success`)
+    assert.equal(result.warnings, undefined, `load body ${JSON.stringify(body)} must not produce a renderable notice`)
+  }
+}
+
+/* --- the override -----------------------------------------------------------
+   `host_memory_exhausted` is the hard refusal that survives the advisory split:
+   the allocation cannot be met even after releasing everything Camelid holds. It
+   is still a refusal, so it must arrive typed — the UI builds the "Load anyway"
+   affordance from `error.code`, and a refusal that carries its reason only in
+   prose degrades to a plain error line with no way forward.
+
+   `force` is that affordance's wire form, and it is the only override a GUI user
+   has: the desktop sidecar is spawned args-only, so the equivalent environment
+   variable cannot be set from the app. */
+{
+  const refusal = {
+    code: 'host_memory_exhausted',
+    message: 'This model’s ~2.3 GB estimated footprint cannot be satisfied on this machine right now.',
+    field: 'path',
+  }
+  const bodies = []
+  // The engine's own rule, modelled exactly: `force` skips the preflight for that
+  // one request, so the identical load succeeds on the retry.
+  const fetchImpl = async (url, options) => {
+    if (url.endsWith('/api/models/inspect')) return response({ body: {} })
+    if (url.endsWith('/api/models/load')) {
+      const body = JSON.parse(options.body)
+      bodies.push(body)
+      if (!body.force) return response({ ok: false, status: 422, body: { error: refusal } })
+      return response({ body: { id: 'Qwen3-0.6B-Q8_0.gguf' } })
+    }
+    if (url.endsWith('/api/models/current')) return response({ body: { path: 'models/Qwen3-0.6B-Q8_0.gguf' } })
+    return response({ body: { loaded_now: true, generation_ready: true, active_model_id: 'Qwen3-0.6B-Q8_0.gguf' } })
+  }
+
+  const refused = await loadLocalModelForChat({ apiBase: 'http://camelid.test', filename: 'Qwen3-0.6B-Q8_0.gguf', fetchImpl })
+  assert.equal(refused.ok, false)
+  assert.equal(refused.code, 'host_memory_exhausted', 'the new code must reach the caller, not only its prose')
+  assert.deepEqual(
+    refused.blocker,
+    { code: refusal.code, message: refusal.message },
+    'a typed capacity refusal must arrive as a renderable blocker, which is what carries the override',
+  )
+  assert.equal('force' in bodies[0], false, 'the first attempt must never opt itself in')
+
+  const forced = await loadLocalModelForChat({ apiBase: 'http://camelid.test', filename: 'Qwen3-0.6B-Q8_0.gguf', force: true, fetchImpl })
+  assert.equal(forced.ok, true, 'the same refused load must succeed once the preflight is skipped')
+  assert.equal(bodies[1].force, true, '"Load anyway" re-posts the load with force: true')
+  assert.equal(bodies[1].path, 'models/Qwen3-0.6B-Q8_0.gguf', 'force rides alongside the existing flat load fields, not nested inside one')
+  assert.equal(bodies[1].id, 'Qwen3-0.6B-Q8_0.gguf')
+  assert.equal(bodies[1].replace, true, 'an override changes the preflight, nothing else about the load')
+  assert.equal(bodies[1].set_active, true)
+}
+
+{
+  // The other two capacity refusals keep their existing shape, and both must stay
+  // typed for the same reason: the affordance is built from the code.
+  for (const code of ['model_too_large_for_host', 'model_requires_unload']) {
+    const result = await loadLocalModelForChat({
+      apiBase: 'http://camelid.test',
+      filename: 'Qwen3-0.6B-Q8_0.gguf',
+      fetchImpl: async (url) => {
+        if (url.endsWith('/api/models/inspect')) return response({ body: {} })
+        return response({ ok: false, status: 422, body: { error: { code, message: `refused: ${code}`, field: 'path' } } })
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.code, code)
+    assert.deepEqual(result.blocker, { code, message: `refused: ${code}` })
+  }
 }
 
 {
