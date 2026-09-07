@@ -27,4 +27,3 @@ For private Chat across different networks, keep Camelid on `127.0.0.1`, install
 devices, and run `camelid remote-chat start` after the authenticated `--lan-chat-only` listener is
 healthy. Camelid prints a tailnet-only HTTPS URL; the browser still requires the Camelid API key.
 This workflow never enables Tailscale Funnel. See [configuration](CONFIGURATION.md#private-cross-network-browser-chat-with-tailscale).
-

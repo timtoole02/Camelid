@@ -114,4 +114,3 @@ The desktop **Models** page downloads the projector automatically with either 27
 ### Embeddings and reranking
 
 The exact Nomic Embed Text v1.5 Q8_0 row supports OpenAI-compatible `/v1/embeddings`, Matryoshka dimensions, cosine-similarity reranking through `/v1/rerank`, and optional in-memory semantic retrieval for Workspace. The encoder currently runs on CPU; other embedding families and quantizations fail closed. See the [embedding API guide](architecture/EMBEDDINGS.md) for loading and request examples.
-
