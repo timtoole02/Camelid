@@ -87,6 +87,7 @@ function App() {
     inspectMode, setInspectMode, tokenInspections, inspectionSupported,
     structuredMode, setStructuredMode, structuredSchema, setStructuredSchema,
     structuredGrammar, setStructuredGrammar, structuredRecords, structuredSupported, structuredReadiness,
+    toolsEnabled, setToolsEnabled, toolsText, setToolsText, toolContract, toolCapability, toolsReadiness, toolCallSignatures,
     thinkingMode, setThinkingMode,
     webResearchEnabled, setWebResearchEnabled, webResearchStatus,
     loadingModelId, registerForm, setRegisterForm,
@@ -436,6 +437,13 @@ function App() {
               structuredRecords={structuredRecords}
               structuredSupported={structuredSupported}
               structuredReadiness={structuredReadiness}
+              toolsEnabled={toolsEnabled}
+              setToolsEnabled={setToolsEnabled}
+              toolsText={toolsText}
+              setToolsText={setToolsText}
+              toolCapability={toolCapability}
+              toolsReadiness={toolsReadiness}
+              toolCallSignatures={toolCallSignatures}
               thinkingMode={thinkingMode}
               setThinkingMode={setThinkingMode}
               webResearchEnabled={webResearchEnabled}

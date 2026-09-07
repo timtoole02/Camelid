@@ -561,6 +561,9 @@ jobs:
       - name: Engine metrics smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:engine-metrics
+      - name: Tool calling smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:tool-calling
 
       - name: Frontend UI regression smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
