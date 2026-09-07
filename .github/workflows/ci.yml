@@ -558,6 +558,9 @@ jobs:
       - name: Retrieval rerank smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:rerank
+      - name: Engine metrics smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:engine-metrics
 
       - name: Frontend UI regression smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}

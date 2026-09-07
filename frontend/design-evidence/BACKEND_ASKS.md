@@ -139,3 +139,62 @@ typed 400 these lanes already return for other unsupported combinations — or a
 lane axis to `api_conformance` so the refusal is at least machine-readable. Note
 that `unsupported_modes` today covers only the ROUTE axis (`streaming`,
 `multi_choice`) and says nothing about which serve lanes can honour the request.
+## 7. Host RAM total/available on an HTTP surface (Wave C, 2026-09-06)
+
+**Surface waiting on it:** Settings → Response length still renders its memory
+ceiling and projected-memory gauge ABSENT (see ask 3, 2026-06-12), and the new
+System → Engine metrics panel can show resident memory and VRAM but cannot say how
+close either is to the host's ceiling.
+
+**Ask 3 is now MOSTLY satisfied** and worth re-reading: `GET /api/runtime/memory`
+already returns `process_resident_bytes`, `model_weight_bytes_estimate`,
+`kv_cache_bytes`, `kv_cache_entries`, `kv_cache_capacity` and a per-model breakdown
+carrying `cached_tokens` — which is more than that ask requested, and enough to
+derive KV bytes per token once the cache is non-empty.
+
+**What is still missing is one field:** host total and available RAM. The engine
+ALREADY COMPUTES IT — the startup hardware probe prints
+`RAM 4.9 GiB free / 15.7 GiB total` — it simply is not on any HTTP surface. Neither
+`/v1/health`, `/api/capabilities`, `/api/runtime/memory` nor `/metrics` carries it.
+
+**Ask:** add `host_total_bytes` and `host_available_bytes` to
+`GET /api/runtime/memory` (and/or `camelid_host_memory_total_bytes` /
+`camelid_host_memory_available_bytes` gauges on `/metrics`, matching the existing
+`camelid_cuda_vram_total_bytes` / `_free_bytes` pair). No new measurement is needed;
+this is exposing a value the process already has.
+
+**Not asked:** any per-model prediction. The frontend will not estimate RAM
+client-side; it wants the ceiling so it can render a real proportion instead of
+omitting the gauge.
+
+## 8. The active value of runtime levers, over HTTP (Wave C, 2026-09-06)
+
+**Surface waiting on it:** System → Active configuration reports the lane the engine
+is on using `execution_plan` plus `q8_runtime`, which is honest but partial. It
+cannot report the ACTIVE value of the levers that most affect output — the KV dtype,
+the flash-prefill and blocked-dot gates, the speculative-decode settings — because
+no endpoint discloses them by name.
+
+**The data shape already exists in this codebase.** `eagle3_effective_env()` and
+`speculative_effective_env()` build exactly such a map, and the CLI receipt structs
+carry `effective_env` and `planner_env_updates` fields. They are simply never served.
+
+**Ask:** a read-only `GET /api/runtime/config` returning the effective values of the
+levers the engine actually consulted, e.g.
+
+```json
+{ "effective": { "CAMELID_KV_QUANT": "f32", "CAMELID_FLASH_PREFILL": "0" },
+  "latched": ["CAMELID_ATTENTION_F32_BLOCKED_DOT"],
+  "planner_managed": ["CAMELID_QWEN35_CUDA"] }
+```
+
+`latched` matters as much as the values: several gates are read once into a
+`OnceLock`, so a UI must be able to say "this cannot change without a restart"
+rather than implying it is editable. `planner_managed` matters because those keys
+are written by the planner itself at every model load — presenting one as a user
+setting would invite a user to fight the planner.
+
+**Not asked:** any route that WRITES these. The levers are read at process start and
+several are latched; a write route would be a control that silently does nothing,
+which is worse than no control. If they ever become settable, that is a separate
+engine change with its own evidence.
