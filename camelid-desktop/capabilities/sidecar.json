@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/remote-schema.json",
   "identifier": "sidecar-ui",
-  "description": "Allows the Camelid loopback sidecar UI to call narrow model-directory and Camelid-keyed UI-storage commands. No arbitrary filesystem permission is granted: the folder picker is scoped on the Rust side, and UI state is confined to the app-data directory.",
+  "description": "Allows the Camelid loopback sidecar UI to call narrow model-directory and Camelid-keyed UI-storage commands. No arbitrary filesystem permission is granted: the folder picker is scoped on the Rust side, and UI state is confined to the app-data directory. It also grants start-dragging, which the macOS window cannot be moved without: the window is titleBarStyle Overlay with hiddenTitle, so there is no OS titlebar to grab and the only drag handle is the app's own data-tauri-drag-region strip -- and core:default does NOT carry that permission (core:window:default is a read-only set).",
   "windows": ["main"],
   "remote": {
     "urls": ["http://127.0.0.1:*", "http://localhost:*"]
   },
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "allow-choose-models-directory",
     "allow-reset-models-directory",
     "allow-read-ui-storage",
