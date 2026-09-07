@@ -24151,14 +24151,29 @@ fn mm_prefill_enabled() -> bool {
 /// roughly 2^-11 relative — around a fiftieth of the quantization error already present in
 /// a Q4_K weight — and the accumulate stays f32 in `simdgroup_float8x8`.
 ///
-/// Off by default: `CAMELID_METAL_KQUANT_MM=1` to arm.
+/// ON by default since the two-host qualification below; opt out with
+/// `CAMELID_METAL_KQUANT_MM=0`.
+///
+/// It shipped opt-in through v0.7.0 for want of a second host, and the cost of that was
+/// paid by every K-quant user: a stock v0.7.0 release needs **68.8 s** to first token on a
+/// 1540-token prompt with Llama-3.2-3B-Instruct-Q4_K_M, against **5.74 s** armed. Qualified
+/// 2026-09-07 on two M4 / 16 GiB hosts with the released v0.7.0 binary, three alternating
+/// stock/armed pairs per host, fresh process per arm (the gate latches once per process):
+/// 68.4 -> 5.9 s on the first host and 68.8 +/- 1.5 -> 5.74 +/- 0.09 s on the second, a
+/// 12.0x prefill speedup that no pair contradicts.
 #[cfg(target_os = "macos")]
 fn kquant_mm_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_METAL_KQUANT_MM")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        kquant_mm_prefill_from(std::env::var("CAMELID_METAL_KQUANT_MM").ok().as_deref())
     })
+}
+
+/// The env half of [`kquant_mm_prefill_enabled`], extracted so the DEFAULT itself is
+/// covered by a test rather than by a process-wide `OnceLock` no test can re-latch.
+#[cfg(target_os = "macos")]
+fn kquant_mm_prefill_from(value: Option<&str>) -> bool {
+    !matches!(value, Some(v) if v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
 /// Additionally admit the K-quant MM lane to the attention-as-matmul prefill.
@@ -30416,15 +30431,30 @@ fn kvq8_enabled() -> bool {
 /// does get split-K (1.47x), while the F32-with-split-K-forced-off control sits at 14.77 —
 /// i.e. the F16 default was performing as a no-split-K lane because it was one.
 ///
-/// Off by default: one host, and BENCHMARK_TREATY promotes nothing on one host. Arm with
-/// `CAMELID_METAL_ATTN_SPLITK_KV16_PRIMARY=1`.
+/// ON by default since the second host reproduced it; opt out with
+/// `CAMELID_METAL_ATTN_SPLITK_KV16_PRIMARY=0`.
+///
+/// The one-host reservation that kept this opt-in through v0.7.0 is discharged: qualified
+/// 2026-09-07 on a second M4 / 16 GiB with the released v0.7.0 binary, Llama-3.2-3B-Q4_K_M
+/// at a 1540-token prompt, fresh process per arm. Decode 16.83 -> 23.68 tok/s (1.41x), and
+/// the stock arm is the tighter of the two (16.86 / 16.82 / 16.82 across three pairs).
 #[cfg(target_os = "macos")]
 fn splitk_kv16_primary_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16_PRIMARY")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        splitk_kv16_primary_from(
+            std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16_PRIMARY")
+                .ok()
+                .as_deref(),
+        )
     })
+}
+
+/// The env half of [`splitk_kv16_primary_enabled`], extracted so the DEFAULT itself is
+/// covered by a test rather than by a process-wide `OnceLock` no test can re-latch.
+#[cfg(target_os = "macos")]
+fn splitk_kv16_primary_from(value: Option<&str>) -> bool {
+    !matches!(value, Some(v) if v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
 /// The KV-format half of the split-K admission predicate, extracted so the one way to get
@@ -46472,6 +46502,39 @@ mod tests {
         // An F16 primary is admitted only behind its own gate.
         assert!(!splitk_kv_format_admits(true, false));
         assert!(splitk_kv_format_admits(true, true));
+    }
+
+    /// Both K-quant Metal lanes are ON by default, and the ONLY way to turn one off is an
+    /// explicit `0`/`false`.
+    ///
+    /// This pins a default that a user cannot see and a benchmark cannot easily attribute.
+    /// Shipping them opt-in through v0.7.0 cost every K-quant user 68.8 s to first token
+    /// where 5.74 s was available, and nothing in the product said so. An unset variable,
+    /// an empty one, and a stray value all mean ON; anything else would re-create the
+    /// silent-slow-default this change exists to remove.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kquant_metal_lanes_are_on_unless_explicitly_switched_off() {
+        use super::{kquant_mm_prefill_from, splitk_kv16_primary_from};
+
+        for parse in [
+            kquant_mm_prefill_from as fn(Option<&str>) -> bool,
+            splitk_kv16_primary_from as fn(Option<&str>) -> bool,
+        ] {
+            // Unset is the case that matters: it is what every release user has.
+            assert!(parse(None));
+            assert!(parse(Some("")));
+            assert!(parse(Some("1")));
+            assert!(parse(Some("true")));
+            // Not a recognised opt-out, so it must not silently disable the lane.
+            assert!(parse(Some("no")));
+            assert!(parse(Some("00")));
+
+            // The opt-out, and only the opt-out.
+            assert!(!parse(Some("0")));
+            assert!(!parse(Some("false")));
+            assert!(!parse(Some("FALSE")));
+        }
     }
 
     /// The F16-primary resident KV cache is qualified for the K-quant lane, so
