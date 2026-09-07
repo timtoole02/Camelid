@@ -1,0 +1,84 @@
+/* Retrieval playground — rank documents by meaning.
+
+   COLOR POSTURE. No new colour tokens. A similarity score is NOT graded by
+   colour: shading cells on score would imply the absolute value is meaningful,
+   and it is not — an unrelated document still scores well above zero. The only
+   ink used is --color-accent, and only on the "moved" column, because movement is
+   the one quantity here that means something absolute. Copper stays reserved for
+   support claims; a cosine score is not one. */
+
+.rerank { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.rerank__head { display: flex; align-items: flex-start; gap: var(--space-3); flex-wrap: wrap; }
+
+.rerank__intro,
+.rerank__note,
+.rerank__guard {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+  flex: 1 1 20rem;
+}
+
+.rerank__guard {
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-subtle);
+}
+
+.rerank__field { display: flex; flex-direction: column; gap: 4px; }
+
+.rerank__label {
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-text-faint);
+}
+
+.rerank__input,
+.rerank__textarea {
+  width: 100%;
+  padding: var(--space-2);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  font-size: var(--text-2xs);
+}
+
+.rerank__textarea { font-family: var(--font-mono); resize: vertical; line-height: var(--leading-snug); }
+.rerank__input:focus-visible,
+.rerank__textarea:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.rerank__actions { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+
+.rerank__run {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-2xs);
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  border: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.rerank__run:disabled { background: var(--color-surface-strong); color: var(--color-text-faint); cursor: not-allowed; }
+.rerank__run:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.rerank__count { font-size: var(--text-micro); color: var(--color-text-faint); }
+
+.rerank__error {
+  margin: 0;
+  font-size: var(--text-2xs);
+  color: var(--color-error);
+}
+
+.rerank__results { display: flex; flex-direction: column; gap: var(--space-2); overflow-x: auto; }
+
+.rerank__table { font-size: var(--text-2xs); }
+.rerank__score { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rerank__moved { white-space: nowrap; color: var(--color-text-faint); }
+.rerank__moved.is-moved { color: var(--color-accent-text); }
+.rerank__doc { color: var(--color-text-muted); }

@@ -1,5 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
+import { getRuntimeRequestModelId } from '../lib/modelState'
+import { detectRepeatedCall, normalizeToolCalls } from '../lib/toolCalling'
 import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
 import { formatModelLabel } from '../lib/formatters'
 import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
@@ -180,6 +182,22 @@ export default function ChatWorkspace({
   setInspectMode = null,
   tokenInspections = {},
   inspectionSupported = false,
+  structuredMode = 'off',
+  setStructuredMode = null,
+  structuredSchema = '',
+  setStructuredSchema = null,
+  structuredGrammar = '',
+  setStructuredGrammar = null,
+  structuredRecords = {},
+  structuredSupported = false,
+  structuredReadiness = { ready: false, reason: null },
+  toolsEnabled = false,
+  setToolsEnabled = null,
+  toolsText = '',
+  setToolsText = null,
+  toolCapability = { capable: false, reason: null },
+  toolsReadiness = { ready: false, reason: null },
+  toolCallSignatures = {},
   thinkingMode = false,
   setThinkingMode = null,
   webResearchEnabled = true,
@@ -831,9 +849,69 @@ export default function ChatWorkspace({
       {showControls && (
         <ChatControls
           capabilities={capabilities}
-          modelId={selectedModelId}
+          modelId={getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)}
           onClose={() => setShowControls(false)}
         />
+      )}
+      {structuredSupported && structuredMode !== 'off' && setStructuredMode && (
+        <div className="structout-editor">
+          <div className="structout-editor__modes" role="group" aria-label="Constraint form">
+            {[
+              ['json_schema', 'JSON schema'],
+              ['json_object', 'Any JSON'],
+              ['grammar', 'Grammar'],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={`structout-editor__mode ${structuredMode === value ? 'is-on' : ''}`}
+                aria-pressed={structuredMode === value}
+                onClick={() => setStructuredMode(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {structuredMode === 'json_schema' && (
+            <textarea
+              className="structout-editor__field"
+              aria-label="JSON schema"
+              spellCheck={false}
+              value={structuredSchema}
+              onChange={(event) => setStructuredSchema?.(event.target.value)}
+            />
+          )}
+          {structuredMode === 'grammar' && (
+            <textarea
+              className="structout-editor__field"
+              aria-label="Grammar"
+              spellCheck={false}
+              value={structuredGrammar}
+              onChange={(event) => setStructuredGrammar?.(event.target.value)}
+            />
+          )}
+          <p className={`structout-editor__status ${structuredReadiness.ready ? '' : 'is-invalid'}`}>
+            {structuredReadiness.ready
+              ? 'The next reply is constrained to this. Turn on Tokens as well to see whether the constraint actually diverted the decode.'
+              : structuredReadiness.reason}
+          </p>
+        </div>
+      )}
+      {toolCapability.capable && toolsEnabled && setToolsText && (
+        <div className="tooldef">
+          <textarea
+            className="tooldef__field"
+            aria-label="Tool definitions"
+            spellCheck={false}
+            value={toolsText}
+            onChange={(event) => setToolsText(event.target.value)}
+          />
+          <p className={`tooldef__status ${toolsReadiness.ready ? '' : 'is-invalid'}`}>
+            {toolsReadiness.ready
+              ? 'Offered to the model on the next turn. Camelid does not execute tool calls — a request comes back for you to answer.'
+              : toolsReadiness.reason}
+          </p>
+        </div>
       )}
       <div
         className="cxcomposer__box"
@@ -1018,6 +1096,29 @@ export default function ChatWorkspace({
                 <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
               </button>
             )}
+            {/* Constrained decoding is a pre-send choice: the engine refuses a
+                constraint on a streaming request, and its streaming decoder never
+                builds a grammar state at all, so the turn must be composed
+                non-streaming before it is sent. Guarded when the contract does not
+                advertise it, rather than live-with-a-disclaimer. */}
+            {!demoMode && setStructuredMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${structuredMode !== 'off' && structuredSupported ? 'is-on' : ''}`}
+                title={structuredSupported
+                  ? 'Constrain the next reply to a JSON schema or grammar (sends it without streaming)'
+                  : 'This engine does not advertise constrained decoding.'}
+                aria-label={structuredSupported ? 'Structured output' : 'Structured output — unavailable on this engine'}
+                aria-pressed={structuredSupported ? structuredMode !== 'off' : undefined}
+                disabled={!structuredSupported}
+                onClick={() => setStructuredMode(structuredMode === 'off' ? 'json_schema' : 'off')}
+              >
+                <IconFile size={16} />
+                <span className="cxcomposer__tool-label">
+                  {!structuredSupported ? 'Schema unavailable' : structuredMode === 'off' ? 'Schema' : 'Schema on'}
+                </span>
+              </button>
+            )}
             {/* Token inspection is a pre-send choice because the scores are
                 CAPTURED during the reply's own decode. Inspecting afterwards would
                 mean decoding a second time, and those numbers would describe that
@@ -1042,6 +1143,29 @@ export default function ChatWorkspace({
                 <IconChart size={16} />
                 <span className="cxcomposer__tool-label">
                   {inspectionSupported ? (inspectMode ? 'Tokens on' : 'Tokens') : 'Tokens unavailable'}
+                </span>
+              </button>
+            )}
+            {/* Guarded on BOTH halves of the gate: the engine must advertise the
+                protocol and the LOADED MODEL must carry a tool receipt. The second
+                half is STRICTER than the engine — POST /v1/chat/completions gates
+                on the chat template and never reads tool_capable — so the copy
+                says Camelid declines, not that the engine refuses. */}
+            {!demoMode && setToolsEnabled && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${toolsEnabled && toolCapability.capable ? 'is-on' : ''}`}
+                title={toolCapability.capable
+                  ? 'Offer tools to the model on the next turn'
+                  : toolCapability.reason || 'This model is not tool-capable.'}
+                aria-label={toolCapability.capable ? 'Tools' : 'Tools — unavailable for this model'}
+                aria-pressed={toolCapability.capable ? toolsEnabled : undefined}
+                disabled={!toolCapability.capable}
+                onClick={() => setToolsEnabled(!toolsEnabled)}
+              >
+                <IconBolt size={16} />
+                <span className="cxcomposer__tool-label">
+                  {!toolCapability.capable ? 'Tools unavailable' : toolsEnabled ? 'Tools on' : 'Tools'}
                 </span>
               </button>
             )}
@@ -1240,6 +1364,13 @@ export default function ChatWorkspace({
                       onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
                       tokenInspection={tokenInspections?.[message.id] || null}
+                      structuredRecord={structuredRecords?.[message.id] || null}
+                      toolCallRepeat={message.tool_calls
+                        ? detectRepeatedCall(
+                            (toolCallSignatures?.[selectedConversation?.id] || []).slice(0, -1 * (message.tool_calls.length || 1)),
+                            normalizeToolCalls(message.tool_calls) || [],
+                          )
+                        : null}
                     />
                   </Fragment>
                 )

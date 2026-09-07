@@ -68,6 +68,10 @@ export function readChatCompletionJsonPayload(payload, { estimateTokenCount = de
        non-streaming shape in one place; the streaming path has no equivalent,
        because the engine refuses logprobs with stream:true. */
     logprobs: Object.prototype.hasOwnProperty.call(choice || {}, 'logprobs') ? choice.logprobs : null,
+    /* A tool-capable model can end a turn by asking to call something instead of
+       writing prose: finish_reason is "tool_calls" and content is empty. Dropping
+       this key made such a turn render as a blank reply. */
+    toolCalls: Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls : null,
   }
 }
 
@@ -97,7 +101,7 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
   }
 
   const reader = response.body?.getReader()
-  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null, camelid: null, camelidReceipt: null, logprobs: null }
+  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null, camelid: null, camelidReceipt: null, logprobs: null, toolCalls: null }
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
@@ -105,6 +109,12 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
   let completionTokens = 0
   let usage = null
   let camelid = null
+  /* Tool calls arrive as a delta on the assistant turn. Verified against a live
+     engine: this build sends one COMPLETE call per delta — id, name and the whole
+     argument string together — rather than streaming argument fragments that a
+     client must concatenate. Accumulated by index anyway, so a future build that
+     does fragment them does not silently truncate. */
+  const toolCallsByIndex = new Map()
   const streamStartedAt = performance.now()
   let firstByteMs = null
   let firstEventMs = null
@@ -144,6 +154,15 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
       const role = choice?.delta?.role ?? null
       const delta = choice?.delta?.content ?? choice?.text ?? ''
       const segment = choice?.delta?.camelid_segment
+      for (const call of choice?.delta?.tool_calls || []) {
+        const index = Number.isInteger(call?.index) ? call.index : toolCallsByIndex.size
+        const existing = toolCallsByIndex.get(index) || { index, id: null, type: 'function', function: { name: '', arguments: '' } }
+        if (call?.id) existing.id = call.id
+        if (call?.type) existing.type = call.type
+        if (call?.function?.name) existing.function.name = call.function.name
+        if (typeof call?.function?.arguments === 'string') existing.function.arguments += call.function.arguments
+        toolCallsByIndex.set(index, existing)
+      }
       // Reasoning deltas are GENERATED TOKENS even though they are not visible
       // content. A thinking model can spend an entire reply in `reasoning_content`
       // (LFM2's generation prompt opens a <think> block), so counting only
@@ -204,6 +223,10 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
   buffer += decoder.decode()
   if (buffer.trim()) consumeEvent(buffer.replace(/\r\n/g, '\n'))
   // Receipts and logprobs only attach to non-streaming responses (the JSON
-  // fallback above); the engine rejects logprobs with stream:true outright.
-  return { content, finishReason, completionTokens, firstContentMs, firstByteMs, firstEventMs, usage, camelid, camelidReceipt: null, logprobs: null }
+  // fallback above); the engine rejects logprobs with stream:true outright. Tool
+  // calls are the exception — they DO arrive on the streaming path.
+  const toolCalls = toolCallsByIndex.size
+    ? [...toolCallsByIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, call]) => call)
+    : null
+  return { content, finishReason, completionTokens, firstContentMs, firstByteMs, firstEventMs, usage, camelid, camelidReceipt: null, logprobs: null, toolCalls }
 }

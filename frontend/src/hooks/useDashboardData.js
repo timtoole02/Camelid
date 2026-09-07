@@ -18,7 +18,9 @@ import {
 } from '../lib/conversationCompaction.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
-import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, readInspectionContract } from '../lib/tokenInspection'
+import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, normalizeInspection, readInspectionContract } from '../lib/tokenInspection'
+import { STRUCTURED_MODES, DEFAULT_SCHEMA, DEFAULT_GRAMMAR, readStructuredOutputContract, structuredOutputForcesNonStreaming, structuredOutputRequestFields, structuredOutputReadiness } from '../lib/structuredOutput'
+import { DEFAULT_TOOLS, detectRepeatedCall, normalizeToolCalls, readModelToolCapability, readToolContract, toolCallSignature, toolReadiness, toolRequestFields } from '../lib/toolCalling'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import {
   createPacerState,
@@ -721,7 +723,23 @@ export function useDashboardData({ showNotice, clearNotice }) {
      conversation rather than just this record. Session-scoped by design; the
      panel says so and offers a download. */
   const [inspectMode, setInspectMode] = useState(false)
+  /* Constrained decoding is a per-turn choice like inspection, and for the same
+     reason: the engine refuses a constraint on a streaming request, so the turn
+     has to be composed non-streaming before it is sent. */
+  const [structuredMode, setStructuredMode] = useState(STRUCTURED_MODES.OFF)
+  const [structuredSchema, setStructuredSchema] = useState(DEFAULT_SCHEMA)
+  const [structuredGrammar, setStructuredGrammar] = useState(DEFAULT_GRAMMAR)
+  const [structuredRecords, setStructuredRecords] = useState({})
   const [tokenInspections, setTokenInspections] = useState({})
+  /* Tool definitions are a per-session editing surface, not a persisted setting:
+     they are a developer probe against the loaded model, and a stale definition
+     silently shaping a later conversation would be worse than retyping one. */
+  const [toolsEnabled, setToolsEnabled] = useState(false)
+  const [toolsText, setToolsText] = useState(DEFAULT_TOOLS)
+  /* Signatures of every call already requested in this conversation, so a model
+     that ignores a tool result and re-asks can be named rather than looping
+     invisibly. Verified live: Llama 3.2 3B does exactly this. */
+  const [toolCallSignatures, setToolCallSignatures] = useState({})
   // Opt-in thinking mode (experimental — NOT parity-locked): sends
   // camelid_enable_thinking:true so the model emits its own <think>…</think>
   // reasoning. Default OFF so chat stays on the parity-locked thinking-DISABLED
@@ -1073,6 +1091,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
      silently recording nothing — a toggle that reads "on" while contributing no
      request fields is exactly the caveated-live surface I3 forbids. */
   const inspectionSupported = readInspectionContract(dashboard?.capabilities).nonStreamingSupported
+  const structuredContract = readStructuredOutputContract(dashboard?.capabilities)
+  const structuredSupported = structuredContract.nonStreamingSupported
+  const structuredReadiness = structuredOutputReadiness({
+    enabled: structuredMode !== STRUCTURED_MODES.OFF,
+    mode: structuredMode,
+    contract: structuredContract,
+    schemaText: structuredSchema,
+    grammarText: structuredGrammar,
+  })
+  const toolContract = readToolContract(dashboard?.capabilities)
+  const toolCapability = readModelToolCapability(dashboard?.capabilities, selectedModel, runtime)
+  const toolsReadiness = toolReadiness({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })
   const selectedModelRunnable = selectedModelChatGate.chatUnlocked
   // Experimental lane: loaded + generation-ready implemented model that is NOT a
   // supported row. Enables a weaker chat affordance; never the supported badge.
@@ -1620,6 +1650,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const inspectionContract = readInspectionContract(dashboard?.capabilities)
       const inspecting = !targetVerifiedRender
         && inspectionForcesNonStreaming({ enabled: inspectMode, contract: inspectionContract })
+      /* A constraint and stream:true is a hard 400, and the streaming decode job
+         never builds a grammar state — that route refusal is the only thing
+         standing between a streamed constrained request and silently
+         unconstrained output. Derived from one predicate with the request fields
+         so the two cannot drift. */
+      const sendStructuredContract = readStructuredOutputContract(dashboard?.capabilities)
+      const constraining = !targetVerifiedRender
+        && structuredOutputForcesNonStreaming({ enabled: true, mode: structuredMode, contract: sendStructuredContract })
+        && structuredOutputReadiness({ enabled: true, mode: structuredMode, contract: sendStructuredContract, schemaText: structuredSchema, grammarText: structuredGrammar }).ready
       const baseRequestBody = {
         model: requestModelId,
         messages: requestMessages,
@@ -1725,18 +1764,24 @@ export function useDashboardData({ showNotice, clearNotice }) {
           // stream:true, so `inspecting` MUST also clear the stream flag — the
           // two conditions are derived from one source in tokenInspection.js
           // rather than restated, so they cannot drift apart.
-          stream: targetVerifiedRender || !(receiptMode || inspecting),
+          stream: targetVerifiedRender || !(receiptMode || inspecting || constraining),
           // Ask for the authoritative token count in the final stream chunk.
           // Without it the client can only ESTIMATE from visible content, which
           // undercounts badly on a thinking model: LFM2 emits its reasoning as
           // `reasoning_content`, so a reply that is mostly reasoning looked like
           // almost no tokens and the tok/s readout reported a fraction of the
           // real rate.
-          ...(targetVerifiedRender || !(receiptMode || inspecting) ? { stream_options: { include_usage: true } } : {}),
+          ...(targetVerifiedRender || !(receiptMode || inspecting || constraining) ? { stream_options: { include_usage: true } } : {}),
           ...(!targetVerifiedRender && receiptMode ? { camelid_receipt: true } : {}),
           /* Contributes nothing unless the contract permits inspection on this
              engine, so a guarded row simply never reaches the wire. */
           ...(targetVerifiedRender ? {} : inspectionRequestFields({ enabled: inspectMode, contract: inspectionContract })),
+          ...(targetVerifiedRender ? {} : structuredOutputRequestFields({ enabled: true, mode: structuredMode, contract: sendStructuredContract, schemaText: structuredSchema, grammarText: structuredGrammar })),
+          /* Tool calling is supported on BOTH the streaming and non-streaming
+             paths, so unlike receipts and constrained decoding it does not force
+             the turn off the stream. Contributes nothing unless the engine row
+             AND the loaded model both carry the capability. */
+          ...(targetVerifiedRender ? {} : toolRequestFields({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })),
           ...(targetVerifiedRender ? {
             // The private verifier contract is exact: its output allowance is
             // the complete fresh draft, not the planner's larger upper bound.
@@ -1971,6 +2016,35 @@ export function useDashboardData({ showNotice, clearNotice }) {
           [assistantId]: { logprobs: streamed.logprobs || null, absence },
         }))
       }
+      /* The strongest evidence a constrained reply can carry is a position whose
+         emitted token was not the highest-scoring one — the returned scores are
+         unmasked, so that is the mask visibly diverting the decode. It is only
+         available when token inspection was ALSO requested, which is why the
+         composer says so rather than the card inventing a weaker claim. */
+      if (constraining) {
+        const record = normalizeInspection(streamed.logprobs || null)
+        setStructuredRecords((current) => ({
+          ...current,
+          [assistantId]: {
+            content: streamed.content || '',
+            mode: structuredMode,
+            schemaText: structuredSchema,
+            divertedPositions: record ? record.stats.offTopCount : null,
+            greedy: !useExperimentalSampling,
+          },
+        }))
+      }
+      /* Record what was asked so a later identical request can be named. Keyed
+         by conversation: a repeat only means something within one thread. */
+      if (streamed.toolCalls && streamed.toolCalls.length) {
+        const signatures = (normalizeToolCalls(streamed.toolCalls) || []).map(toolCallSignature).filter(Boolean)
+        if (signatures.length) {
+          setToolCallSignatures((current) => ({
+            ...current,
+            [conversation.id]: [...(current[conversation.id] || []), ...signatures],
+          }))
+        }
+      }
       const assistantMessage = {
         ...assistantMessageBase,
         content: paceDrain(pacer, streamed.content || ''),
@@ -1991,6 +2065,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
         camelid: streamed.camelid || null,
         planner_camelid: targetVerifiedPlannerCamelid,
         camelid_receipt: streamed.camelidReceipt || null,
+        /* Persisted on the message: unlike per-token logprobs these are small, and
+           a turn that ended in a tool request is meaningless without them. */
+        tool_calls: streamed.toolCalls || null,
         planner_ms: targetVerifiedPlannerMs,
         target_verified_render: targetVerifiedRender,
         segmented_target_verified_render: segmentedTargetVerifiedRender,
@@ -2499,6 +2576,23 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setInspectMode,
     tokenInspections,
     inspectionSupported,
+    structuredMode,
+    setStructuredMode,
+    structuredSchema,
+    setStructuredSchema,
+    structuredGrammar,
+    setStructuredGrammar,
+    structuredRecords,
+    structuredSupported,
+    structuredReadiness,
+    toolsEnabled,
+    setToolsEnabled,
+    toolsText,
+    setToolsText,
+    toolContract,
+    toolCapability,
+    toolsReadiness,
+    toolCallSignatures,
     thinkingMode,
     setThinkingMode,
     loadingModelId,

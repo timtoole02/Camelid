@@ -13038,6 +13038,30 @@ impl RunnableServeRuntime {
             .is_some_and(crate::runnable::PrismVisionProjector::backend_ready)
     }
 
+    /// Text stop-sequence predicate for the runnable decode loops.
+    ///
+    /// The loops terminate on EOG *token ids*; an OpenAI `stop` is a *string*, which
+    /// can span several tokens and can land mid-token, so it can only be judged over
+    /// decoded text. `Tokenizer::decode` is stateless and append-only (incomplete
+    /// trailing UTF-8 is held back rather than replaced), so decoding the growing
+    /// prefix each step is exactly right.
+    ///
+    /// Returns a predicate that is `false` for every input when no sequences were
+    /// requested, so a request without `stop` takes a byte-identical path to before
+    /// — which is what keeps the hash-pinned rows on this lane unaffected.
+    fn stop_text_predicate<'a>(
+        &'a self,
+        stop_sequences: &'a [String],
+    ) -> impl Fn(&[u32]) -> bool + 'a {
+        move |ids: &[u32]| {
+            if stop_sequences.is_empty() {
+                return false;
+            }
+            let text = self.tokenizer.decode(ids, true).unwrap_or_default();
+            contains_stop_sequence(&text, stop_sequences)
+        }
+    }
+
     /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
     /// (`<|im_end|>` / eos). Returns the detokenized text + the generated token ids.
     fn generate_greedy(
@@ -13045,13 +13069,21 @@ impl RunnableServeRuntime {
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
+        stop_sequences: &[String],
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self
-            .model
-            .generate_stopping_with_sampling(prompt_ids, max_new, &stop, sampling)?;
+        let should_stop = self.stop_text_predicate(stop_sequences);
+        let ids = self.model.generate_stopping_with_sampling(
+            prompt_ids,
+            max_new,
+            &stop,
+            sampling,
+            &should_stop,
+        )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        // The ids and the token count keep the stop-triggering token; only the text
+        // is cut. That asymmetry is the dense lane's shipped contract.
+        Ok((truncate_at_stop_sequence(text, stop_sequences), ids))
     }
 
     /// Streaming generation with a cooperative disconnect check. The generic
@@ -13064,9 +13096,11 @@ impl RunnableServeRuntime {
         max_new: usize,
         sampling: &SamplingConfig,
         is_cancelled: &dyn Fn() -> bool,
+        stop_sequences: &[String],
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let should_stop = self.stop_text_predicate(stop_sequences);
         let ids = self
             .model
             .generate_stopping_streaming_with_sampling_cancelled(
@@ -13075,10 +13109,11 @@ impl RunnableServeRuntime {
                 &stop,
                 sampling,
                 is_cancelled,
+                &should_stop,
                 &mut on_token,
             )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        Ok((truncate_at_stop_sequence(text, stop_sequences), ids))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13091,6 +13126,7 @@ impl RunnableServeRuntime {
         max_image_tokens: usize,
         max_new: usize,
         sampling: &SamplingConfig,
+        stop_sequences: &[String],
     ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
         self.generate_vision_greedy_streaming(
             prefix,
@@ -13100,6 +13136,7 @@ impl RunnableServeRuntime {
             max_image_tokens,
             max_new,
             sampling,
+            stop_sequences,
             |_| {},
         )
     }
@@ -13114,6 +13151,7 @@ impl RunnableServeRuntime {
         max_image_tokens: usize,
         max_new: usize,
         sampling: &SamplingConfig,
+        stop_sequences: &[String],
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
         let projector = self.vision.as_ref().ok_or_else(|| {
@@ -13123,6 +13161,7 @@ impl RunnableServeRuntime {
             projector.encode_image_bytes(image_bytes, min_image_tokens, max_image_tokens)?;
         let prompt_tokens = prefix.len() + image.embeddings.len() + suffix.len();
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let should_stop = self.stop_text_predicate(stop_sequences);
         let ids = self
             .model
             .generate_vision_stopping_streaming_with_sampling(
@@ -13132,10 +13171,17 @@ impl RunnableServeRuntime {
                 max_new,
                 &stop,
                 sampling,
+                &should_stop,
                 &mut on_token,
             )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids, prompt_tokens))
+        // Same asymmetry as the text lane: the ids and the token count keep the
+        // stop-triggering token; only the text is cut.
+        Ok((
+            truncate_at_stop_sequence(text, stop_sequences),
+            ids,
+            prompt_tokens,
+        ))
     }
 }
 
@@ -13661,11 +13707,140 @@ mod bitnet_runnable_api_tests {
         );
     }
 
+    /* The runnable lane parsed `stop` and threw it away, so an OpenAI stop
+    sequence was silently a no-op on every model this lane serves — qwen35/Ornith,
+    gemma3, LFM2, BitNet, command-r — while the dense lane honored it. These pin
+    the two halves of the fix that can be tested without a model: that an absent
+    `stop` leaves behavior byte-identical, and that the text semantics match the
+    dense lane exactly. */
+
+    #[test]
+    fn absent_stop_sequences_are_a_no_op() {
+        // The whole change rests on this: the pinned rows on the runnable lane must
+        // take the path they took before, so an empty sequence set can never match
+        // and can never truncate.
+        assert!(!contains_stop_sequence("anything at all", &[]));
+        assert_eq!(
+            truncate_at_stop_sequence("untouched".to_string(), &[]),
+            "untouched"
+        );
+        assert!(stop_sequences_from_request(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_truncation_cuts_at_the_earliest_match_and_survives_utf8() {
+        let seqs = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // Earliest match wins, not first-listed.
+        assert_eq!(
+            truncate_at_stop_sequence("alpha BETA gamma".to_string(), &seqs(&["gamma", "BETA"])),
+            "alpha "
+        );
+        // Mid-token truncation: the dense lane returns "<unk" for a single <unk>
+        // token stopped on ">". The runnable lane now shares this helper, so the
+        // two lanes cannot disagree about the same request.
+        assert_eq!(
+            truncate_at_stop_sequence("<unk>".to_string(), &seqs(&[">"])),
+            "<unk"
+        );
+        // A stop sequence landing after a multi-byte character must not panic:
+        // `str::find` returns a byte index, and String::truncate panics unless that
+        // index is a char boundary.
+        assert_eq!(
+            truncate_at_stop_sequence("café STOP au lait".to_string(), &seqs(&["STOP"])),
+            "café "
+        );
+        // A sequence that never occurs leaves the text alone.
+        assert_eq!(
+            truncate_at_stop_sequence("no match here".to_string(), &seqs(&["zzz"])),
+            "no match here"
+        );
+    }
+
+    #[test]
+    fn stop_hold_back_is_inert_without_stop_sequences() {
+        // The streaming lane runs this on EVERY token of EVERY request. With no stop
+        // sequences it must return the whole length, or the pinned rows on this lane
+        // would stream different bytes than they did before.
+        assert_eq!(stop_safe_stream_len("anything at all", &[]), 15);
+        assert_eq!(stop_safe_stream_len("", &[]), 0);
+        assert_eq!(stop_safe_stream_len("caf\u{e9}", &[]), 5);
+    }
+
+    #[test]
+    fn stop_hold_back_withholds_text_a_stop_sequence_would_cut() {
+        let seqs = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // Nothing resembling the sequence: everything is safe.
+        assert_eq!(stop_safe_stream_len("hello", &seqs(&["STOP"])), 5);
+        // A complete match cuts at its start, exactly like truncate_at_stop_sequence.
+        assert_eq!(stop_safe_stream_len("abcSTOPdef", &seqs(&["STOP"])), 3);
+        // A trailing PROPER prefix is held back — it may complete next token.
+        assert_eq!(stop_safe_stream_len("abcST", &seqs(&["STOP"])), 3);
+        assert_eq!(stop_safe_stream_len("abcS", &seqs(&["STOP"])), 3);
+        // ...and released once it turns out not to be one.
+        assert_eq!(stop_safe_stream_len("abcSTx", &seqs(&["STOP"])), 6);
+        // The straddling case the whole hold-back exists for: "ST" then "OP" must
+        // never have streamed the "ST", because the final text is cut before it.
+        let straddle = seqs(&["STOP"]);
+        assert_eq!(stop_safe_stream_len("abcST", &straddle), 3);
+        assert_eq!(stop_safe_stream_len("abcSTOP", &straddle), 3);
+    }
+
+    #[test]
+    fn stop_hold_back_never_moves_backwards_on_overlapping_sequences() {
+        // The reason this takes the MIN of both limits instead of returning at the
+        // first complete match: with the early-return form "AB" reports 1 and then
+        // "ABC" reports 0, asking the stream to take back a byte it already sent.
+        let seqs = ["B".to_string(), "ABC".to_string()];
+        assert_eq!(stop_safe_stream_len("A", &seqs), 0);
+        assert_eq!(stop_safe_stream_len("AB", &seqs), 0);
+        assert_eq!(stop_safe_stream_len("ABC", &seqs), 0);
+        // Monotonic across a whole realistic reply.
+        let stop = ["\n\nUser:".to_string()];
+        let mut previous = 0usize;
+        for end in 1..="Sure.\n\nUse it well.".len() {
+            let text = &"Sure.\n\nUse it well."[..end];
+            if !text.is_char_boundary(end) {
+                continue;
+            }
+            let safe = stop_safe_stream_len(text, &stop);
+            assert!(safe >= previous, "safe_len moved backwards at {end}");
+            previous = safe;
+        }
+    }
+
+    #[test]
+    fn stop_hold_back_returns_a_char_boundary_on_multibyte_text() {
+        // Every returned index is sliced directly by the SSE emitter, so a value in
+        // the middle of a code point is an immediate panic inside a live 200 body.
+        let cases: [(&str, &str); 4] = [
+            ("caf\u{e9}", "\u{e9}x"),
+            ("\u{20ac}uro", "uro!"),
+            ("na\u{ef}ve \u{2014} yes", "\u{2014} no"),
+            ("\u{1f600}\u{1f600}", "\u{1f600}!"),
+        ];
+        for (text, sequence) in cases {
+            let stop = [sequence.to_string()];
+            let safe = stop_safe_stream_len(text, &stop);
+            assert!(safe <= text.len());
+            assert!(
+                text.is_char_boundary(safe),
+                "{safe} splits a code point in {text:?}"
+            );
+            // The slice the emitter performs must not panic.
+            let _ = &text[..safe];
+        }
+    }
+
     #[test]
     fn runnable_finish_reason_reports_a_capped_bitnet_reply_as_length() {
-        assert_eq!(runnable_finish_reason(false, 64, 64), "length");
-        assert_eq!(runnable_finish_reason(false, 12, 64), "stop");
-        assert_eq!(runnable_finish_reason(true, 64, 64), "tool_calls");
+        assert_eq!(runnable_finish_reason(false, 64, 64, false), "length");
+        assert_eq!(runnable_finish_reason(false, 12, 64, false), "stop");
+        assert_eq!(runnable_finish_reason(true, 64, 64, false), "tool_calls");
+        // A stop sequence completing on the max_tokens-th token is "stop", not
+        // "length" — the stop-triggering token is retained in the ids, and the dense
+        // lane reports "stop" for the same request.
+        assert_eq!(runnable_finish_reason(false, 64, 64, true), "stop");
+        assert_eq!(runnable_finish_reason(true, 64, 64, true), "tool_calls");
     }
 
     #[test]
@@ -14364,9 +14539,15 @@ fn runnable_finish_reason(
     has_tool_calls: bool,
     completion_tokens: usize,
     max_tokens: usize,
+    stopped_on_stop_sequence: bool,
 ) -> &'static str {
     if has_tool_calls {
         "tool_calls"
+    } else if stopped_on_stop_sequence {
+        // The stop-triggering token is RETAINED in the ids, so a stop sequence that
+        // completes on the max_tokens-th token would otherwise be reported as
+        // "length" while the dense lane reports "stop" for the same request.
+        "stop"
     } else if completion_tokens >= max_tokens {
         "length"
     } else {
@@ -14597,19 +14778,27 @@ async fn runnable_chat_nonstreaming(
         Ok(config) => config,
         Err(response) => return response,
     };
+    // Already parsed and validated for this lane by the preflight; previously the
+    // value was dropped on the floor, so `stop` was silently a no-op here.
+    let stop_sequences = match stop_sequences_from_request(req.stop.as_ref()) {
+        Ok(sequences) => sequences,
+        Err(response) => return *response,
+    };
     let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
+    // The closure below MOVES `stop_sequences`; the response path needs it again to
+    // re-apply truncation across the think split and to classify finish_reason.
+    let response_stop_sequences = stop_sequences.clone();
     let rt = runtime.clone();
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
-            rt.generate_greedy(&prompt_ids, max_tokens, &sampling).map(
-                |(text, generated_token_ids)| RunnableGenerationResult {
+            rt.generate_greedy(&prompt_ids, max_tokens, &sampling, &stop_sequences)
+                .map(|(text, generated_token_ids)| RunnableGenerationResult {
                     text,
                     generated_token_ids,
                     prompt_token_ids: Some(prompt_ids),
                     prompt_token_count,
-                },
-            )
+                })
         }
         RunnablePreparedPrompt::Vision {
             prefix,
@@ -14626,6 +14815,7 @@ async fn runnable_chat_nonstreaming(
                 max_image_tokens,
                 max_tokens,
                 &sampling,
+                &stop_sequences,
             )
             .map(
                 |(text, generated_token_ids, prompt_token_count)| RunnableGenerationResult {
@@ -14668,7 +14858,30 @@ async fn runnable_chat_nonstreaming(
     let (reasoning, content) = if runtime.architecture == "bitnet-b1.58" {
         (None, text.clone())
     } else {
-        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text))
+        match split_think_by_token(&ids, &runtime.tokenizer) {
+            // The token-level split re-decodes the RAW ids, which discards the stop
+            // truncation applied above — so without re-applying it here a stop
+            // sequence is a no-op for every reply carrying a `</think>` token (every
+            // lfm2 reply, and every thinking-on qwen35/Ornith reply). The cut is
+            // defined over the whole text, so a match inside the reasoning empties
+            // the content half rather than truncating it independently.
+            Some((reasoning, content)) if !response_stop_sequences.is_empty() => {
+                let reasoning_cut = reasoning
+                    .as_deref()
+                    .is_some_and(|value| contains_stop_sequence(value, &response_stop_sequences));
+                let reasoning = reasoning
+                    .map(|value| truncate_at_stop_sequence(value, &response_stop_sequences))
+                    .filter(|value| !value.is_empty());
+                let content = if reasoning_cut {
+                    String::new()
+                } else {
+                    truncate_at_stop_sequence(content, &response_stop_sequences)
+                };
+                (reasoning, content)
+            }
+            Some(split) => split,
+            None => split_ornith_think(&text),
+        }
     };
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
@@ -14690,7 +14903,17 @@ async fn runnable_chat_nonstreaming(
     } else {
         Vec::new()
     };
-    let finish_reason = runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
+    let stopped_on_stop_sequence = !response_stop_sequences.is_empty()
+        && contains_stop_sequence(
+            &runtime.tokenizer.decode(&ids, true).unwrap_or_default(),
+            &response_stop_sequences,
+        );
+    let finish_reason = runnable_finish_reason(
+        !tool_calls.is_empty(),
+        ids.len(),
+        max_tokens,
+        stopped_on_stop_sequence,
+    );
     let camelid_receipt = match (receipt_stamp, prompt_token_ids.as_deref()) {
         (Some(stamp), Some(prompt_token_ids)) => {
             build_runnable_server_receipt(
@@ -14789,6 +15012,13 @@ async fn runnable_chat_streaming(
         Ok(config) => config,
         Err(response) => return response,
     };
+    // Same value the preflight already validates for this lane. Threaded into the
+    // decode loop so a stop sequence terminates generation here exactly as it does
+    // on the dense lane, rather than being silently dropped.
+    let stop_sequences = match stop_sequences_from_request(req.stop.as_ref()) {
+        Ok(sequences) => sequences,
+        Err(response) => return *response,
+    };
     let max_tokens = runnable_effective_max_tokens(req.max_tokens) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
@@ -14813,6 +15043,11 @@ async fn runnable_chat_streaming(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
+    // The worker MOVES `stop_sequences` into its decode closure below; the SSE emitter
+    // needs the same list to hold back text a stop sequence will cut. Both arms of the
+    // worker now terminate and truncate on these sequences, so the emitter mirrors it
+    // unconditionally.
+    let stream_stop_sequences = stop_sequences.clone();
     let rt = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let send_tx = tx.clone();
@@ -14825,6 +15060,7 @@ async fn runnable_chat_streaming(
                     max_tokens,
                     &sampling,
                     &is_cancelled,
+                    &stop_sequences,
                     |tok| {
                         if send_tx.send(StreamItem::Token(tok)).is_err() {
                             worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
@@ -14853,6 +15089,7 @@ async fn runnable_chat_streaming(
                     max_image_tokens,
                     max_tokens,
                     &sampling,
+                    &stop_sequences,
                     |tok| {
                         if send_tx.send(StreamItem::Token(tok)).is_err() {
                             worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
@@ -14931,9 +15168,18 @@ async fn runnable_chat_streaming(
                     if decoded.ends_with('\u{FFFD}') {
                         continue;
                     }
+                    // Stop hold-back, the exact analogue of the UTF-8 one above. The
+                    // decode loop calls `on_token` BEFORE its `should_stop` predicate
+                    // breaks it, so the token completing a stop string always reaches
+                    // this channel; and with no tools in the request these deltas are
+                    // the ONLY content the client ever sees, because the truncated final
+                    // text below is sent only under `parse_stream_tool_calls`. Without
+                    // this the streamed reply would contain the stop string while the
+                    // non-streamed answer to the same request does not.
+                    let safe_len = stop_safe_stream_len(&decoded, &stream_stop_sequences);
                     let mut new_start = emitted;
                     if !seen_visible {
-                        let vis = decoded[new_start..]
+                        let vis = decoded[new_start..safe_len]
                             .find(|c: char| !c.is_whitespace())
                             .map(|off| new_start + off);
                         match vis {
@@ -14944,11 +15190,11 @@ async fn runnable_chat_streaming(
                             None => continue, // still leading whitespace — hold
                         }
                     }
-                    if new_start >= decoded.len() {
+                    if new_start >= safe_len {
                         continue;
                     }
-                    let delta_text = decoded[new_start..].to_string();
-                    emitted = decoded.len();
+                    let delta_text = decoded[new_start..safe_len].to_string();
+                    emitted = safe_len;
                     let delta = if in_think {
                         serde_json::json!({ "reasoning_content": delta_text })
                     } else {
@@ -14966,6 +15212,44 @@ async fn runnable_chat_streaming(
                     ));
                 }
                 StreamItem::Done(result) => {
+                    // Release any tail the stop hold-back is still holding. Generation
+                    // is over, so a proper prefix of a stop sequence can no longer
+                    // complete into one and only a COMPLETE match still cuts. Without
+                    // this a reply ending in such a prefix loses those bytes outright
+                    // (stop `"\n\nUser:"` and a reply ending `"\n\n"`), because with no
+                    // tools in the request the per-token deltas above are the only
+                    // content the client ever receives.
+                    if !parse_stream_tool_calls && !stream_stop_sequences.is_empty() {
+                        let decoded = tokenizer.decode(&phase_ids, true).unwrap_or_default();
+                        // A dangling incomplete code point is dropped here exactly as it
+                        // is in the token arm above; releasing it would emit U+FFFD.
+                        if !decoded.ends_with('\u{FFFD}') {
+                            let final_len =
+                                truncate_at_stop_sequence(decoded.clone(), &stream_stop_sequences)
+                                    .len();
+                            let mut start = emitted;
+                            if !seen_visible {
+                                match decoded[start..final_len]
+                                    .find(|c: char| !c.is_whitespace())
+                                {
+                                    Some(offset) => start += offset,
+                                    None => start = final_len,
+                                }
+                            }
+                            if start < final_len {
+                                let delta_text = decoded[start..final_len].to_string();
+                                let delta = if in_think {
+                                    serde_json::json!({ "reasoning_content": delta_text })
+                                } else {
+                                    serde_json::json!({ "content": delta_text })
+                                };
+                                yield Ok(Event::default().data(
+                                    runnable_stream_chunk(&id, created, delta, None, None)
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
                     final_state = Some(Ok(result));
                     break;
                 }
@@ -14993,8 +15277,17 @@ async fn runnable_chat_streaming(
                 } else {
                     Vec::new()
                 };
-                let finish =
-                    runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
+                let stopped_on_stop_sequence = !stream_stop_sequences.is_empty()
+                    && contains_stop_sequence(
+                        &tokenizer.decode(&ids, true).unwrap_or_default(),
+                        &stream_stop_sequences,
+                    );
+                let finish = runnable_finish_reason(
+                    !tool_calls.is_empty(),
+                    ids.len(),
+                    max_tokens,
+                    stopped_on_stop_sequence,
+                );
                 if !tool_calls.is_empty() {
                     let deltas: Vec<serde_json::Value> = tool_calls
                         .iter()
@@ -23178,7 +23471,7 @@ fn stream_prompt_cache_prologue(
     // with correct usage but no content delta. Longer cached streams also must
     // establish `streamed_text` before subsequent deltas are diffed.
     if !generated.is_empty() {
-        let mut text = match prepared.tokenizer.decode(generated, true) {
+        let text = match prepared.tokenizer.decode(generated, true) {
             Ok(text) => text,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
@@ -23188,9 +23481,10 @@ fn stream_prompt_cache_prologue(
                 return StreamPrologue::Stop;
             }
         };
-        if *finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
+        // A cached prefix must seed `streamed_text` with the SAME stop-safe bound the
+        // loop below uses, or the first post-prologue step diffs against an
+        // untruncated seed and reproduces the duplication this bound prevents.
+        let text = stop_visible_text(text, &prepared.stop_sequences, *finish_reason == "stop");
         if !text.is_empty() {
             *streamed_text = text.clone();
             *first_content_ms = Some(generation_started.elapsed().as_millis());
@@ -23294,6 +23588,19 @@ fn run_stream_decode_job(
             .checked_sub(generation_started.elapsed())
             .is_none()
         {
+            // The run is over: nothing further can complete a stop sequence, so
+            // release whatever the hold-back is still sitting on before the client
+            // sees the timeout frame.
+            let pending = stop_hold_back_flush(
+                &prepared.tokenizer,
+                &generated,
+                &streamed_text,
+                &prepared.stop_sequences,
+            );
+            if !pending.is_empty() {
+                streamed_text.push_str(&pending);
+                send(StreamDecodeEvent::Delta(pending));
+            }
             send(StreamDecodeEvent::TimedOut {
                 timeout: request_timeout,
                 elapsed: generation_started.elapsed(),
@@ -23378,7 +23685,7 @@ fn run_stream_decode_job(
             }
         }
 
-        let mut text = match prepared.tokenizer.decode(&generated, true) {
+        let text = match prepared.tokenizer.decode(&generated, true) {
             Ok(text) => text,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
@@ -23388,13 +23695,11 @@ fn run_stream_decode_job(
                 return;
             }
         };
-        if finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
-        let delta = text
-            .strip_prefix(&streamed_text)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
+        // Whether the loop below will terminate on this step. Computed BEFORE the
+        // emit so the final step can release the hold-back in the same delta.
+        let is_final = finish_reason != "length" || generated.len() >= prepared.max_tokens as usize;
+        let text = stop_visible_text(text, &prepared.stop_sequences, is_final);
+        let delta = stream_delta(&text, &streamed_text, &prepared.stop_sequences);
         streamed_text = text;
         if !delta.is_empty() {
             if first_content_ms.is_none() {
@@ -23590,6 +23895,19 @@ impl CooperativeStreamDecodeJob {
         if self.finished {
             return engine::StepOutcome::Complete;
         }
+        // Every clean termination funnels through here, including the re-entry path
+        // at the top of `step` that never re-decodes. Release any held tail before
+        // the Finished event; a no-op when the emit above already released it.
+        let pending = stop_hold_back_flush(
+            &self.prepared.tokenizer,
+            &self.generated,
+            &self.streamed_text,
+            &self.prepared.stop_sequences,
+        );
+        if !pending.is_empty() {
+            self.streamed_text.push_str(&pending);
+            self.send(StreamDecodeEvent::Delta(pending));
+        }
         log_speculative_summary(&self.prepared, self.generated.len());
         self.prepared.timings.generate = self.generation_started.elapsed().as_millis();
         self.prepared.timings.generation =
@@ -23675,6 +23993,18 @@ impl CooperativeStreamDecodeJob {
             .checked_sub(self.generation_started.elapsed())
             .is_none()
         {
+            // Same reasoning as the exclusive job: release the hold-back before the
+            // client sees the timeout frame, or those bytes are lost.
+            let pending = stop_hold_back_flush(
+                &self.prepared.tokenizer,
+                &self.generated,
+                &self.streamed_text,
+                &self.prepared.stop_sequences,
+            );
+            if !pending.is_empty() {
+                self.streamed_text.push_str(&pending);
+                self.send(StreamDecodeEvent::Delta(pending));
+            }
             self.send(StreamDecodeEvent::TimedOut {
                 timeout: self.request_timeout,
                 elapsed: self.generation_started.elapsed(),
@@ -23765,7 +24095,7 @@ impl CooperativeStreamDecodeJob {
                 .record_progress(self.generated.len());
         }
 
-        let mut text = match self.prepared.tokenizer.decode(&self.generated, true) {
+        let text = match self.prepared.tokenizer.decode(&self.generated, true) {
             Ok(text) => text,
             Err(err) => {
                 self.send(StreamDecodeEvent::Failed {
@@ -23776,13 +24106,12 @@ impl CooperativeStreamDecodeJob {
                 return engine::StepOutcome::Complete;
             }
         };
-        if self.finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &self.prepared.stop_sequences);
-        }
-        let delta = text
-            .strip_prefix(&self.streamed_text)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
+        // Whether this step terminates the job (same condition as the tail below).
+        // Computed BEFORE the emit so the final step releases the hold-back here.
+        let is_final = self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize;
+        let text = stop_visible_text(text, &self.prepared.stop_sequences, is_final);
+        let delta = stream_delta(&text, &self.streamed_text, &self.prepared.stop_sequences);
         self.streamed_text = text;
         if !delta.is_empty() {
             if self.first_content_ms.is_none() {
@@ -24162,6 +24491,109 @@ fn truncate_at_stop_sequence(mut text: String, stop_sequences: &[String]) -> Str
     {
         text.truncate(stop_index);
     }
+    text
+}
+
+/// Longest prefix of `text` that is safe to STREAM given `stop_sequences`.
+///
+/// A delta cannot be un-sent, so the SSE lane may only emit bytes the completed answer
+/// is guaranteed to keep. Two things make a byte unsafe: it sits at or after a COMPLETE
+/// stop match (`truncate_at_stop_sequence` cuts the final text there), or it belongs to
+/// a trailing run that is a non-empty PROPER prefix of some stop sequence — the next
+/// token may complete that sequence, retroactively putting the run inside the cut.
+///
+/// The answer is the SMALLER of the two limits. Taking the min rather than returning at
+/// the first complete match is what makes this value non-decreasing as `text` grows by
+/// appending, which the emitter depends on: with overlapping sequences
+/// (`stop = ["B", "ABC"]`) the complete-match limit alone reports 1 for `"AB"` and then
+/// 0 for `"ABC"` — it would ask the emitter to take back a byte it already sent. The
+/// hold-back on `"AB"` pins both at 0 instead.
+///
+/// Returns `text.len()` when `stop_sequences` is empty, so a request without `stop`
+/// streams exactly the bytes it streamed before this existed.
+fn stop_safe_stream_len(text: &str, stop_sequences: &[String]) -> usize {
+    if stop_sequences.is_empty() {
+        return text.len();
+    }
+    // Earliest complete match — the same rule `truncate_at_stop_sequence` applies to the
+    // final text. `str::find` returns the start of a run equal to a valid UTF-8 string,
+    // so the index is a char boundary.
+    let complete = stop_sequences
+        .iter()
+        .filter_map(|sequence| text.find(sequence.as_str()))
+        .min()
+        .unwrap_or(text.len());
+    // Longest trailing run that could still grow into a match. `char_indices().skip(1)`
+    // enumerates exactly the boundaries of the non-empty PROPER prefixes of `sequence`:
+    // it drops offset 0 and never yields `sequence.len()`, so `&sequence[..offset]`
+    // cannot panic and a whole-sequence match stays the `complete` limit's job.
+    let mut held = 0usize;
+    for sequence in stop_sequences {
+        for (offset, _) in sequence.char_indices().skip(1) {
+            if offset > held && text.ends_with(&sequence[..offset]) {
+                held = offset;
+            }
+        }
+    }
+    // `ends_with` can only succeed for `held <= text.len()`, so this cannot underflow;
+    // a byte-equal tail of a valid UTF-8 string starts on a char boundary.
+    complete.min(text.len() - held)
+}
+
+/// Incremental delta for a streaming reply.
+///
+/// With stop sequences live the visible text can be CUT, and a cut can land behind
+/// what the client already holds. The right answer then is "nothing new" — never
+/// "here is the whole reply again", which is precisely what duplicated the reply on
+/// this lane when a stop string straddled a token boundary. With no stop sequences
+/// requested the original fallback is preserved byte-for-byte, so those requests
+/// cannot take a different branch than they did before.
+fn stream_delta(visible: &str, streamed: &str, stop_sequences: &[String]) -> String {
+    match visible.strip_prefix(streamed) {
+        Some(rest) => rest.to_string(),
+        None if !stop_sequences.is_empty() => String::new(),
+        None => visible.to_string(),
+    }
+}
+
+/// Release whatever the stop hold-back is still withholding, as a delta to send.
+///
+/// Generation is over at every call site, so nothing further can complete a stop
+/// sequence and only a COMPLETE match still cuts. Without this a run that ends
+/// while a proper prefix of a stop string is held — max_tokens reached, or the
+/// request timing out — silently loses those trailing bytes.
+///
+/// Empty when no sequences were requested, so the certified no-stop path never
+/// gains an event.
+fn stop_hold_back_flush(
+    tokenizer: &Tokenizer,
+    generated: &[u32],
+    streamed_text: &str,
+    stop_sequences: &[String],
+) -> String {
+    if stop_sequences.is_empty() {
+        return String::new();
+    }
+    let Ok(text) = tokenizer.decode(generated, true) else {
+        return String::new();
+    };
+    truncate_at_stop_sequence(text, stop_sequences)
+        .strip_prefix(streamed_text)
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// The text of an in-progress reply that may be streamed on THIS step.
+///
+/// `is_final` is the step on which the decode loop terminates: the cut is settled,
+/// so the whole truncated text is released. Until then a stop string may still be
+/// straddling the token boundary, and bytes streamed before the match completes
+/// cannot be taken back — so the reply is bounded at the stop-safe length.
+fn stop_visible_text(mut text: String, stop_sequences: &[String], is_final: bool) -> String {
+    if is_final {
+        return truncate_at_stop_sequence(text, stop_sequences);
+    }
+    text.truncate(stop_safe_stream_len(&text, stop_sequences));
     text
 }
 

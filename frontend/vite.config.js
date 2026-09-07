@@ -175,6 +175,9 @@ export default defineConfig({
     port: 4175,
     proxy: {
       '/api': apiProxy(),
+      // Served by the engine, same-origin in production. Without this the dev
+      // server answers /metrics with the SPA's own HTML and a 200.
+      '/metrics': apiProxy(),
       '/v1': apiProxy(),
     },
   },
