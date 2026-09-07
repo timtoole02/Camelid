@@ -23345,7 +23345,7 @@ fn stream_prompt_cache_prologue(
     // with correct usage but no content delta. Longer cached streams also must
     // establish `streamed_text` before subsequent deltas are diffed.
     if !generated.is_empty() {
-        let mut text = match prepared.tokenizer.decode(generated, true) {
+        let text = match prepared.tokenizer.decode(generated, true) {
             Ok(text) => text,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
@@ -23355,9 +23355,10 @@ fn stream_prompt_cache_prologue(
                 return StreamPrologue::Stop;
             }
         };
-        if *finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
+        // A cached prefix must seed `streamed_text` with the SAME stop-safe bound the
+        // loop below uses, or the first post-prologue step diffs against an
+        // untruncated seed and reproduces the duplication this bound prevents.
+        let text = stop_visible_text(text, &prepared.stop_sequences, *finish_reason == "stop");
         if !text.is_empty() {
             *streamed_text = text.clone();
             *first_content_ms = Some(generation_started.elapsed().as_millis());
@@ -23461,6 +23462,19 @@ fn run_stream_decode_job(
             .checked_sub(generation_started.elapsed())
             .is_none()
         {
+            // The run is over: nothing further can complete a stop sequence, so
+            // release whatever the hold-back is still sitting on before the client
+            // sees the timeout frame.
+            let pending = stop_hold_back_flush(
+                &prepared.tokenizer,
+                &generated,
+                &streamed_text,
+                &prepared.stop_sequences,
+            );
+            if !pending.is_empty() {
+                streamed_text.push_str(&pending);
+                send(StreamDecodeEvent::Delta(pending));
+            }
             send(StreamDecodeEvent::TimedOut {
                 timeout: request_timeout,
                 elapsed: generation_started.elapsed(),
@@ -23545,7 +23559,7 @@ fn run_stream_decode_job(
             }
         }
 
-        let mut text = match prepared.tokenizer.decode(&generated, true) {
+        let text = match prepared.tokenizer.decode(&generated, true) {
             Ok(text) => text,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
@@ -23555,13 +23569,11 @@ fn run_stream_decode_job(
                 return;
             }
         };
-        if finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
-        let delta = text
-            .strip_prefix(&streamed_text)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
+        // Whether the loop below will terminate on this step. Computed BEFORE the
+        // emit so the final step can release the hold-back in the same delta.
+        let is_final = finish_reason != "length" || generated.len() >= prepared.max_tokens as usize;
+        let text = stop_visible_text(text, &prepared.stop_sequences, is_final);
+        let delta = stream_delta(&text, &streamed_text, &prepared.stop_sequences);
         streamed_text = text;
         if !delta.is_empty() {
             if first_content_ms.is_none() {
@@ -23757,6 +23769,19 @@ impl CooperativeStreamDecodeJob {
         if self.finished {
             return engine::StepOutcome::Complete;
         }
+        // Every clean termination funnels through here, including the re-entry path
+        // at the top of `step` that never re-decodes. Release any held tail before
+        // the Finished event; a no-op when the emit above already released it.
+        let pending = stop_hold_back_flush(
+            &self.prepared.tokenizer,
+            &self.generated,
+            &self.streamed_text,
+            &self.prepared.stop_sequences,
+        );
+        if !pending.is_empty() {
+            self.streamed_text.push_str(&pending);
+            self.send(StreamDecodeEvent::Delta(pending));
+        }
         log_speculative_summary(&self.prepared, self.generated.len());
         self.prepared.timings.generate = self.generation_started.elapsed().as_millis();
         self.prepared.timings.generation =
@@ -23842,6 +23867,18 @@ impl CooperativeStreamDecodeJob {
             .checked_sub(self.generation_started.elapsed())
             .is_none()
         {
+            // Same reasoning as the exclusive job: release the hold-back before the
+            // client sees the timeout frame, or those bytes are lost.
+            let pending = stop_hold_back_flush(
+                &self.prepared.tokenizer,
+                &self.generated,
+                &self.streamed_text,
+                &self.prepared.stop_sequences,
+            );
+            if !pending.is_empty() {
+                self.streamed_text.push_str(&pending);
+                self.send(StreamDecodeEvent::Delta(pending));
+            }
             self.send(StreamDecodeEvent::TimedOut {
                 timeout: self.request_timeout,
                 elapsed: self.generation_started.elapsed(),
@@ -23932,7 +23969,7 @@ impl CooperativeStreamDecodeJob {
                 .record_progress(self.generated.len());
         }
 
-        let mut text = match self.prepared.tokenizer.decode(&self.generated, true) {
+        let text = match self.prepared.tokenizer.decode(&self.generated, true) {
             Ok(text) => text,
             Err(err) => {
                 self.send(StreamDecodeEvent::Failed {
@@ -23943,13 +23980,12 @@ impl CooperativeStreamDecodeJob {
                 return engine::StepOutcome::Complete;
             }
         };
-        if self.finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &self.prepared.stop_sequences);
-        }
-        let delta = text
-            .strip_prefix(&self.streamed_text)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
+        // Whether this step terminates the job (same condition as the tail below).
+        // Computed BEFORE the emit so the final step releases the hold-back here.
+        let is_final = self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize;
+        let text = stop_visible_text(text, &self.prepared.stop_sequences, is_final);
+        let delta = stream_delta(&text, &self.streamed_text, &self.prepared.stop_sequences);
         self.streamed_text = text;
         if !delta.is_empty() {
             if self.first_content_ms.is_none() {
@@ -24376,6 +24412,63 @@ fn stop_safe_stream_len(text: &str, stop_sequences: &[String]) -> usize {
     // `ends_with` can only succeed for `held <= text.len()`, so this cannot underflow;
     // a byte-equal tail of a valid UTF-8 string starts on a char boundary.
     complete.min(text.len() - held)
+}
+
+/// Incremental delta for a streaming reply.
+///
+/// With stop sequences live the visible text can be CUT, and a cut can land behind
+/// what the client already holds. The right answer then is "nothing new" — never
+/// "here is the whole reply again", which is precisely what duplicated the reply on
+/// this lane when a stop string straddled a token boundary. With no stop sequences
+/// requested the original fallback is preserved byte-for-byte, so those requests
+/// cannot take a different branch than they did before.
+fn stream_delta(visible: &str, streamed: &str, stop_sequences: &[String]) -> String {
+    match visible.strip_prefix(streamed) {
+        Some(rest) => rest.to_string(),
+        None if !stop_sequences.is_empty() => String::new(),
+        None => visible.to_string(),
+    }
+}
+
+/// Release whatever the stop hold-back is still withholding, as a delta to send.
+///
+/// Generation is over at every call site, so nothing further can complete a stop
+/// sequence and only a COMPLETE match still cuts. Without this a run that ends
+/// while a proper prefix of a stop string is held — max_tokens reached, or the
+/// request timing out — silently loses those trailing bytes.
+///
+/// Empty when no sequences were requested, so the certified no-stop path never
+/// gains an event.
+fn stop_hold_back_flush(
+    tokenizer: &Tokenizer,
+    generated: &[u32],
+    streamed_text: &str,
+    stop_sequences: &[String],
+) -> String {
+    if stop_sequences.is_empty() {
+        return String::new();
+    }
+    let Ok(text) = tokenizer.decode(generated, true) else {
+        return String::new();
+    };
+    truncate_at_stop_sequence(text, stop_sequences)
+        .strip_prefix(streamed_text)
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// The text of an in-progress reply that may be streamed on THIS step.
+///
+/// `is_final` is the step on which the decode loop terminates: the cut is settled,
+/// so the whole truncated text is released. Until then a stop string may still be
+/// straddling the token boundary, and bytes streamed before the match completes
+/// cannot be taken back — so the reply is bounded at the stop-safe length.
+fn stop_visible_text(mut text: String, stop_sequences: &[String], is_final: bool) -> String {
+    if is_final {
+        return truncate_at_stop_sequence(text, stop_sequences);
+    }
+    text.truncate(stop_safe_stream_len(&text, stop_sequences));
+    text
 }
 
 fn validate_chat_messages(messages: &[ChatMessage]) -> std::result::Result<(), Box<Response>> {
