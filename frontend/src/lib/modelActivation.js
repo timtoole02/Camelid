@@ -39,12 +39,19 @@ export function modelFilenameFromPath(value) {
 /* Load `filename` (a bare name inside the engine's configured models directory).
 
    Generative models return `{ ok: true }`; a supported embedding sidecar returns
-   `{ ok: true, embedding: true }` after its sidecar readiness probe. Failures use
+   `{ ok: true, embedding: true }` after its sidecar readiness probe. A successful
+   load that the engine wants to qualify also carries `warnings` — the advisory
+   `[{ code, severity, message }]` array from the load response, passed through
+   untouched and ABSENT when the engine sent nothing. Failures use
    `{ ok: false, stage, message, code, blocker }`. `code` is the backend's stable
    `error.code` when it sent one — the caller needs it to tell a permanent refusal
-   (`model_too_large_for_host`) from something worth retrying, and to avoid rendering
-   a raw HTTP error. `blocker` is the fail-closed `{ code, message }` shape the Models
-   page renders verbatim.
+   (`model_too_large_for_host`, `host_memory_exhausted`) from something worth
+   retrying, and to avoid rendering a raw HTTP error. `blocker` is the fail-closed
+   `{ code, message }` shape the Models page renders verbatim.
+
+   `force` skips the engine's pre-load fit preflight for this one request. It is the
+   only override a GUI user has: the desktop sidecar is spawned args-only, so the
+   equivalent environment variable is unreachable from the app.
 
    `readActiveFilename` exists so a caller that already owns a `/api/models/current`
    poll can answer the identity check from it: that response carries the full model
@@ -58,6 +65,7 @@ export async function loadLocalModelForChat({
   onStage = () => {},
   readActiveFilename = null,
   model = null,
+  force = false,
 } = {}) {
   const base = String(apiBase || '').replace(/\/$/, '')
   /* A models-relative path, NOT the engine's absolute models_dir joined with '/'.
@@ -119,6 +127,9 @@ export async function loadLocalModelForChat({
         path,
         replace: !embeddingModel,
         set_active: !embeddingModel,
+        // Omitted rather than sent as false: the default request stays the shape
+        // every existing server already accepts.
+        ...(force ? { force: true } : {}),
       }),
     })
     if (!loadRes.ok) {
@@ -135,6 +146,12 @@ export async function loadLocalModelForChat({
         blocker: code && code !== 'invalid_model' ? { code, message } : null,
       }
     }
+
+    /* A 200 can still carry advice. The fit preflight is advisory, so a host that
+       is merely busy loads and reports it here instead of refusing. An absent
+       field is silence, not an empty list — nothing is synthesized from it. */
+    const loaded = await loadRes.json().catch(() => ({}))
+    const warnings = Array.isArray(loaded?.warnings) && loaded.warnings.length ? loaded.warnings : null
 
     if (embeddingModel) {
       const probeRes = await fetchImpl(`${base}/v1/embeddings`, {
@@ -173,6 +190,7 @@ export async function loadLocalModelForChat({
         embedding: true,
         embedding_capable: true,
         generation_capable: false,
+        ...(warnings ? { warnings } : {}),
       }
     }
 
@@ -209,7 +227,7 @@ export async function loadLocalModelForChat({
         blocker: null,
       }
     }
-    return { ok: true, id: requestModelId }
+    return { ok: true, id: requestModelId, ...(warnings ? { warnings } : {}) }
   } catch (error) {
     return { ok: false, stage, message: String(error?.message || error), code: '', blocker: null }
   }

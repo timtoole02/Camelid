@@ -8,16 +8,21 @@
 //!
 //! The math is a pure, GPU-free heuristic over byte counts, in the same spirit as
 //! [`crate::cuda_vram::evaluate`] (which this module reuses for the VRAM branch).
-//! It is **advisory**: the authoritative guards remain the mid-load
-//! [`crate::cuda_vram::VramShortfall`] and the mid-generation
-//! `BackendError::KvCacheBudgetExceeded` (`src/inference/kv_cache.rs`). This layer
-//! only helps a user *choose* before they commit; it never gates a download and
-//! never relaxes a runtime guard.
+//! It never gates a download and never relaxes a runtime guard. At load time the
+//! verdict is split by *permanence*, not by severity — see [`FitVerdict::is_transient`]:
+//! a host that is merely busy right now produces a **warning** and the load proceeds,
+//! while a footprint this machine could never hold **refuses**. The authoritative
+//! runtime guards remain the mid-load [`crate::cuda_vram::VramShortfall`] and the
+//! mid-generation `BackendError::KvCacheBudgetExceeded` (`src/inference/kv_cache.rs`);
+//! note that on Metal hosts neither covers *weight* residency, which is why
+//! [`hard_floor_bytes`] exists.
 //!
-//! On hosts where memory cannot be probed (e.g. macOS, where
-//! [`crate::capability::HardwareProfile`] reports `host_ram_total_bytes == 0`) the
-//! verdict degrades to [`FitVerdict::Unknown`] rather than guessing — an unknown
-//! host must never read as "won't fit".
+//! On hosts where memory cannot be probed, [`crate::capability::HardwareProfile`]
+//! reports `host_ram_total_bytes == 0` and the verdict degrades to
+//! [`FitVerdict::Unknown`] rather than guessing — an unknown host must never read as
+//! "won't fit". macOS **was** such a host until `587d415e` (2026-07-28) gave it a real
+//! probe; that silently converted every Mac from never-blocked to blockable and is what
+//! made an advisory check start refusing ordinary models. Do not restore a guess here.
 
 use crate::capability::HardwareProfile;
 
@@ -65,8 +70,9 @@ pub enum FitVerdict {
     /// Exceeds every available budget on this host. The pick would fail at load or
     /// generation time; the UI should steer the user to a smaller/quantized row.
     WontFit,
-    /// The host's memory could not be probed (e.g. macOS), so no honest capacity
-    /// claim can be made. Advisory-blind: never treated as a failure.
+    /// The host's memory could not be probed, so no honest capacity claim can be
+    /// made. Advisory-blind: never treated as a failure. Windows, Linux and macOS
+    /// all probe successfully today; this is the tail for everything else.
     Unknown,
 }
 
@@ -111,6 +117,28 @@ impl FitVerdict {
         }
     }
 
+    /// Whether a refusing verdict describes a *moment* rather than the *machine*.
+    ///
+    /// [`FitVerdict::InsufficientFreeMemory`] is the only one: by construction
+    /// ([`negative_verdict`]) it is chosen precisely when an idle host would have held
+    /// the footprint, so the remedy is to wait or close something, not to pick a
+    /// smaller model. A load guard should warn on it and proceed; a *catalog* row
+    /// should still mark it unavailable, which is why this is a separate question from
+    /// [`FitVerdict::refuses_load`] and does not change it.
+    ///
+    /// False for every non-refusing verdict too — "transient" is only meaningful as a
+    /// qualifier on a refusal, and callers must test [`FitVerdict::refuses_load`] first.
+    pub fn is_transient(self) -> bool {
+        match self {
+            FitVerdict::InsufficientFreeMemory => true,
+            FitVerdict::WontFit
+            | FitVerdict::FitsResident
+            | FitVerdict::FitsWithOffload
+            | FitVerdict::CpuOnlyOk
+            | FitVerdict::Unknown => false,
+        }
+    }
+
     /// Short human label for a CLI column or terse log. UI surfaces (WebUI) author
     /// their own copy; this is the terminal-facing wording.
     pub fn cli_label(self) -> &'static str {
@@ -145,9 +173,11 @@ impl FitInputs {
 }
 
 /// The usable host-RAM budget in bytes, or `None` when RAM is unknown
-/// (`host_ram_total_bytes == 0`). Applies the same `max(80% of available, 25% of
-/// total)` formula as the KV-cache budget in `kv_cache.rs`, but is an independent
-/// reimplementation, not the same guard. Two intentional differences:
+/// (`host_ram_total_bytes == 0`). **80% of available RAM, with no total-RAM floor** —
+/// deliberately stricter than the KV-cache budget in `kv_cache.rs`, which floors the
+/// same figure at 25% of total. (An earlier version of this comment claimed the floor
+/// applied here; it was removed in `e2f51ffa` and the sentence was not. The body below
+/// is the contract.) Two further intentional differences:
 ///
 /// - Source: the advisor reads [`HardwareProfile`] RAM (probed on Windows, Linux,
 ///   and macOS), whereas the KV guard reads `gait::host_ram_status` (probed on
@@ -167,6 +197,40 @@ pub(crate) fn usable_host_ram_bytes(hw: &HardwareProfile) -> Option<u64> {
     // Conservative pre-load capacity: available RAM only, no total-RAM floor
     // (see the constants above — flooring here overcommits a starved host).
     Some(by_available)
+}
+
+/// The largest host-RAM allocation this machine could satisfy **even after evicting
+/// everything evictable** — total physical RAM minus wired pages. `None` when either
+/// figure is unprobed (see `HardwareProfile::host_ram_unevictable_bytes`, where `0`
+/// means "no claim"), and callers must then fall back to the total-RAM policy.
+///
+/// This is the floor that keeps a real OOM stop after the busy-host refusal was
+/// downgraded to a warning. It is a fact about the machine, not a snapshot: unlike
+/// available RAM it cannot be improved by closing an application, because wired memory
+/// is by definition what the kernel will not give back. It matters because on Metal
+/// hosts nothing downstream catches an oversized *weight* allocation — `VramShortfall`
+/// is CUDA-only and the KV budget guards only cache growth.
+pub(crate) fn hard_floor_bytes(hw: &HardwareProfile) -> Option<u64> {
+    if hw.host_ram_total_bytes == 0 || hw.host_ram_unevictable_bytes == 0 {
+        return None;
+    }
+    Some(
+        hw.host_ram_total_bytes
+            .saturating_sub(hw.host_ram_unevictable_bytes),
+    )
+}
+
+/// Whether `footprint` cannot physically be satisfied from host RAM on this machine.
+///
+/// Always false when a usable GPU is present: the weights land in VRAM there, and
+/// `cuda_vram::evaluate` is the authority for that budget. Always false when the floor
+/// is unprobed — an unmeasured host must never read as "won't fit", the same rule
+/// [`FitVerdict::Unknown`] follows.
+pub(crate) fn exceeds_hard_floor(hw: &HardwareProfile, footprint: u64) -> bool {
+    if has_usable_gpu(hw) {
+        return false;
+    }
+    hard_floor_bytes(hw).is_some_and(|floor| footprint > floor)
 }
 
 /// Whether the host has a GPU we can actually place weights on.
@@ -542,6 +606,7 @@ mod tests {
             cpu_logical_cores: 8,
             host_ram_total_bytes: ram_total_bytes,
             host_ram_free_bytes: ram_free_bytes,
+            host_ram_unevictable_bytes: 0,
             simd: SimdCaps::default(),
         }
     }
@@ -727,6 +792,57 @@ mod tests {
         assert_eq!(m.footprint_bytes(), u64::MAX);
         let hw = profile(false, 0, 16 * GIB, 12 * GIB);
         assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::WontFit);
+    }
+
+    #[test]
+    fn only_insufficient_free_memory_is_transient() {
+        // The warn/refuse split at the load endpoint reads this. A new refusing
+        // verdict must be classified deliberately, not default into "warn and load".
+        assert!(FitVerdict::InsufficientFreeMemory.is_transient());
+        for verdict in [
+            FitVerdict::WontFit,
+            FitVerdict::FitsResident,
+            FitVerdict::FitsWithOffload,
+            FitVerdict::CpuOnlyOk,
+            FitVerdict::Unknown,
+        ] {
+            assert!(!verdict.is_transient(), "{verdict:?} must not be transient");
+        }
+    }
+
+    #[test]
+    fn the_hard_floor_is_total_minus_wired() {
+        let mut hw = profile(false, 0, 8 * GIB, 2 * GIB);
+        hw.host_ram_unevictable_bytes = 3 * GIB;
+        assert_eq!(hard_floor_bytes(&hw), Some(5 * GIB));
+        // Below the floor: allowed through to the warning path.
+        assert!(!exceeds_hard_floor(&hw, 5 * GIB));
+        assert!(exceeds_hard_floor(&hw, 5 * GIB + 1));
+    }
+
+    #[test]
+    fn the_hard_floor_abstains_rather_than_guessing() {
+        // Unprobed wired figure (0 = "no claim" on platforms without the probe) and
+        // unprobed total RAM must both yield no floor. A fabricated floor would be a
+        // new hard gate on hosts we cannot measure — the exact mistake this fix undoes.
+        let unprobed_wired = profile(false, 0, 8 * GIB, 2 * GIB);
+        assert_eq!(unprobed_wired.host_ram_unevictable_bytes, 0);
+        assert_eq!(hard_floor_bytes(&unprobed_wired), None);
+        assert!(!exceeds_hard_floor(&unprobed_wired, 64 * GIB));
+
+        let mut unprobed_total = profile(false, 0, 0, 0);
+        unprobed_total.host_ram_unevictable_bytes = 3 * GIB;
+        assert_eq!(hard_floor_bytes(&unprobed_total), None);
+        assert!(!exceeds_hard_floor(&unprobed_total, 64 * GIB));
+    }
+
+    #[test]
+    fn the_hard_floor_does_not_apply_when_a_gpu_carries_the_weights() {
+        // Host RAM is not where the weights land on a CUDA host; cuda_vram::evaluate
+        // owns that budget and this floor must not second-guess it.
+        let mut hw = profile(true, 24 * GIB, 8 * GIB, 2 * GIB);
+        hw.host_ram_unevictable_bytes = 7 * GIB;
+        assert!(!exceeds_hard_floor(&hw, 16 * GIB));
     }
 
     #[test]

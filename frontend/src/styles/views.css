@@ -1400,6 +1400,8 @@
 .unsupported-blocker__note { margin: 0 0 var(--space-2); font-size: var(--text-xs); color: var(--color-text-muted); }
 .unsupported-blocker__redirect { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .unsupported-blocker__redirect code { font-family: var(--font-mono); overflow-wrap: anywhere; word-break: break-word; }
+.unsupported-blocker__override { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--color-border-soft); }
+.unsupported-blocker__risk { margin: 0; font-size: var(--text-xs); color: var(--color-text-muted); }
 .catalog-group { margin-top: var(--space-3); }
 .catalog-group-head { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; margin-bottom: var(--space-2); }
 .catalog-group-head h3 { margin: 0; font-size: var(--text-sm); text-transform: uppercase; letter-spacing: var(--tracking-label); color: var(--color-text-muted); }

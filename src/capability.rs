@@ -49,6 +49,10 @@ pub struct HardwareProfile {
     pub cpu_logical_cores: usize,
     pub host_ram_total_bytes: u64,
     pub host_ram_free_bytes: u64,
+    /// Physical RAM the OS cannot evict, compress or swap (wired pages). `0` means
+    /// "not probed on this platform" — a capacity floor derived from it must abstain
+    /// on `0` rather than read it as "nothing is wired".
+    pub host_ram_unevictable_bytes: u64,
     pub simd: SimdCaps,
 }
 
@@ -83,6 +87,7 @@ impl HardwareProfile {
             .map(|n| n.get())
             .unwrap_or(1);
         let (host_ram_total_bytes, host_ram_free_bytes) = host_ram_bytes();
+        let host_ram_unevictable_bytes = crate::gait::host_ram_unevictable_bytes().unwrap_or(0);
         HardwareProfile {
             metal_available: metal.available,
             metal_device_name: metal.device_name,
@@ -97,6 +102,7 @@ impl HardwareProfile {
             cpu_logical_cores,
             host_ram_total_bytes,
             host_ram_free_bytes,
+            host_ram_unevictable_bytes,
             simd: detect_simd(),
         }
     }
@@ -242,6 +248,26 @@ mod tests {
         assert!(
             available <= total,
             "available {available} must not exceed total {total}"
+        );
+    }
+
+    /// The coverage gap that let an advisory check start refusing ordinary models:
+    /// nothing pinned what `available` *means* on macOS, only that it was positive.
+    /// It is `free + inactive`, which excludes wired pages by construction — so it
+    /// must never exceed what the machine could offer after evicting everything.
+    #[test]
+    fn available_never_claims_memory_the_kernel_will_not_give_back() {
+        let (total, available) = host_ram_bytes();
+        let wired =
+            crate::gait::host_ram_unevictable_bytes().expect("macOS must report wired pages");
+        assert!(wired > 0, "a running macOS host always has wired pages");
+        assert!(
+            wired < total,
+            "wired {wired} must be a fraction of total {total}"
+        );
+        assert!(
+            available <= total - wired,
+            "available {available} must not overlap wired {wired} of total {total}"
         );
     }
 }
