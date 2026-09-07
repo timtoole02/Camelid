@@ -122,6 +122,19 @@ static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environ
 #[derive(Clone)]
 pub struct AppState {
     loaded_models: Arc<RwLock<HashMap<String, LoadedModel>>>,
+    /// Cleared while the startup warm-up generation is still building the
+    /// engine, so `/health` cannot answer `generation_ready` before the engine
+    /// that will serve the first request exists.
+    ///
+    /// The warm-up runs with the listener already accepting — a client must be
+    /// able to read a health page during a long load — and it builds the engine
+    /// by firing one self-request through the ordinary chat path. Without this
+    /// flag a client that health-gates and sends immediately races that
+    /// self-request and can win, and the request that wins is served by a
+    /// colder path than the one every later request gets. `true` whenever no
+    /// warm-up is pending, so nothing changes for a server started without a
+    /// startup model.
+    generation_warm: Arc<std::sync::atomic::AtomicBool>,
     /// Gemma 4 serve runtimes (local single-node or distributed layer-sharding),
     /// keyed by model id. Populated when a gemma4 model is loaded (lane on by
     /// default; opt out with `CAMELID_GEMMA4_SERVE=0`). This is an additive,
@@ -236,6 +249,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
+            generation_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
             gemma4_serve_lanes: Arc::new(RwLock::new(HashMap::new())),
             gemma4_catalog_managed_ghosts: Arc::new(RwLock::new(HashMap::new())),
@@ -3007,6 +3021,12 @@ pub async fn serve(
     // user needs to choose a different model. Reinstalling does not help —
     // the models directory outlives the app — so the failure is permanent.
     if let Some(StartupModel { path, explicit, .. }) = initial_model {
+        // Held low from here until the warm-up below has finished, so the
+        // health gate every client is told to use cannot go green in the window
+        // where the engine is loaded but not yet built.
+        startup_state
+            .generation_warm
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Err(err) = load_model_from_path(&startup_state, path.clone(), None, true).await {
             tracing::error!(error=%err, "failed to load startup model");
             if explicit {
@@ -3064,6 +3084,12 @@ pub async fn serve(
             warmup_generation_blocking(addr, model_id, policy.auth.bearer_header_line()).await;
         }
     }
+    // Every exit from the block above — warmed, skipped, or no startup model at
+    // all — ends with the engine as built as it is going to get before the first
+    // client request, so the health gate opens here, with the banner.
+    startup_state
+        .generation_warm
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     print_ready_banner(&url);
     if workspace_cli_credential.is_some() {
         eprintln!("  Workspace CLI: ready");
@@ -3478,10 +3504,15 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         dg_serve_ready,
         model.is_some(),
     );
-    let generation_ready = gemma4_available
-        || runnable_serve_ready
-        || dg_serve_ready
-        || model.is_some_and(loaded_model_generation_ready);
+    let generation_ready = health_generation_ready(
+        gemma4_available
+            || runnable_serve_ready
+            || dg_serve_ready
+            || model.is_some_and(loaded_model_generation_ready),
+        state
+            .generation_warm
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
     // The explicit MTP12 runtime allocates a bounded resident KV cache. Report
     // that allocation, never the model metadata's much larger training window,
     // so Web Auto budgets the actual lane that will execute the request.
@@ -3895,6 +3926,36 @@ mod gemma4_serve_lane_health_tests {
         );
         assert_eq!(value["gemma4_available"], false);
         assert_eq!(value["generation_ready"], false);
+    }
+
+    /// `generation_ready` needs BOTH halves, and the warm half is the one a
+    /// client cannot see for itself.
+    ///
+    /// Clients are told to gate their first request on this field, so it has to
+    /// mean "an engine is ready to serve you", not "the weights finished
+    /// loading". Between those two moments the startup warm-up is still
+    /// building the engine with the listener already up, and a request sent in
+    /// that window is served by a colder path than every request after it.
+    #[test]
+    fn generation_ready_needs_a_loaded_engine_and_a_finished_warm_up() {
+        assert!(health_generation_ready(true, true));
+
+        // Loaded but still warming: the window this gate exists to close.
+        assert!(!health_generation_ready(true, false));
+
+        // Warm is never on its own sufficient — it defaults true precisely so a
+        // server with no startup model is unaffected by it.
+        assert!(!health_generation_ready(false, true));
+        assert!(!health_generation_ready(false, false));
+    }
+
+    /// A server that never runs a startup warm-up must not be held closed by a
+    /// flag that nothing will ever set.
+    #[test]
+    fn a_fresh_state_is_warm_so_only_the_startup_path_can_gate_on_it() {
+        assert!(AppState::default()
+            .generation_warm
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -5321,6 +5382,17 @@ async fn unsupported_messages() -> Response {
         "Anthropic Messages compatibility is not supported yet; Camelid keeps generation on /v1/completions and /v1/chat/completions until request conversion, streaming, tool, and cancellation semantics are implemented and tested",
         Some("input"),
     )
+}
+
+/// `/health`'s `generation_ready`: a loaded engine AND a finished warm-up.
+///
+/// Split out as a pure function because the conjunction is the whole point and
+/// the alternative — an `AtomicBool` read inside a handler — is not reachable
+/// from a unit test. `loaded` alone answers "are the weights here"; clients use
+/// this field to decide when to send their first request, which additionally
+/// needs the engine those weights get built into.
+fn health_generation_ready(loaded: bool, warm: bool) -> bool {
+    loaded && warm
 }
 
 fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
