@@ -498,4 +498,63 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// Every capability that owns the `main` window must grant start-dragging.
+    ///
+    /// This is a regression guard for a bug that shipped in v0.7.0 and made the
+    /// macOS window impossible to move at all. The window is `titleBarStyle:
+    /// "Overlay"` with `hiddenTitle`, so the OS titlebar is ours to draw and the
+    /// app's own `data-tauri-drag-region` strip is the window's ONLY drag
+    /// handle. That strip fires `startDragging` over IPC — and `core:default`
+    /// does not carry the permission for it: `core:window:default` is a
+    /// read-only set (sizes, positions, `is-*`, monitors, theme, and
+    /// `internal-toggle-maximize`).
+    ///
+    /// The failure is silent and easy to reintroduce, because the ACL denial
+    /// produces no build error and no crash — just a window that will not move,
+    /// while double-click-to-zoom keeps working and makes it look like the
+    /// titlebar is fine. Assert the grant instead of trusting a review to spot
+    /// its absence.
+    ///
+    /// `spotlight-ui` is deliberately excluded: that window is a centred,
+    /// always-on-top overlay that is positioned, never dragged.
+    #[test]
+    fn main_window_capabilities_grant_start_dragging() {
+        const DRAG: &str = "core:window:allow-start-dragging";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut checked = 0;
+
+        for entry in std::fs::read_dir(&dir).expect("capabilities directory") {
+            let path = entry.expect("capability entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("read capability");
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("capability is JSON");
+
+            let owns_main = value["windows"]
+                .as_array()
+                .is_some_and(|w| w.iter().any(|entry| entry == "main"));
+            if !owns_main {
+                continue;
+            }
+
+            let permissions = value["permissions"].as_array().expect("permissions array");
+            assert!(
+                permissions.iter().any(|p| p == DRAG),
+                "{} owns the main window but does not grant {DRAG}; the macOS window \
+                 cannot be moved without it",
+                path.display()
+            );
+            checked += 1;
+        }
+
+        // Both the splash capability and the remote loopback one own `main`. If
+        // this count ever drops, a capability was renamed or removed and the
+        // loop above silently stopped checking anything.
+        assert_eq!(
+            checked, 2,
+            "expected exactly two capabilities owning the main window"
+        );
+    }
 }
