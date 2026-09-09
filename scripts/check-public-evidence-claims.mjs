@@ -61,7 +61,8 @@ function validateMistralSupportPromotionManifest(bundleRel, manifest) {
 
 async function validateMistralSupportSurfaceText() {
   const required = new Map([
-    ['README.md', ['Mistral 7B Instruct v0.3 | Q8_0', 'Exact-row smoke + bounded context 512']],
+    ['README.md', ['Mistral 7B Instruct v0.3 Q8_0', 'docs/MODELS.md']],
+    ['docs/MODELS.md', ['Mistral 7B Instruct v0.3 | Q8_0', 'Exact-row smoke + bounded context 512']],
     ['docs/reference/STATUS.md', ['Mistral 7B Instruct v0.3 Q8_0 is promoted to supported exact-row smoke', 'mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json']],
     ['ROADMAP.md', ['Mistral 7B Instruct v0.3 Q8_0 is supported as exact-row smoke', 'support-promotion API/WebUI smoke bundle']],
     ['COMPATIBILITY.md', ['Mistral-7B-Instruct-v0.3.Q8_0.gguf is supported exact-row smoke', 'mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json']],

@@ -9,9 +9,10 @@
 //      ledger disagrees (provenance excluded). This is what makes "the ledger" ==
 //      "the code": a contract change with no `extract-capabilities-to-ledger.mjs`
 //      re-run is caught here.
-//   B. Surface non-contradiction — the public supported-models tables (README and
-//      COMPATIBILITY) may not claim support the contract denies. A doc row that
-//      maps to a ledger row whose status is not `supported*` is a hard failure.
+//   B. Surface non-contradiction — the public supported-models tables (the model
+//      catalog, in README or docs/MODELS.md, and COMPATIBILITY) may not claim
+//      support the contract denies. A doc row that maps to a ledger row whose
+//      status is not `supported*` is a hard failure.
 //      Rows that don't map are LOGGED, never silently skipped, and never fail
 //      (no false positives — only a confirmed contradiction goes red). This is the
 //      class of drift that produced the Mistral fixture bug fixed under Amendment 1.
@@ -116,11 +117,19 @@ async function checkSupportedTables(committed) {
     }
   }
 
-  // README supported-models table (every data row is a support claim)
-  const readme = await readFile(join(ROOT, 'README.md'), 'utf8')
-  const rt = parseTable(readme, /^\|\s*Model row\s*\|\s*Quant\s*\|/)
-  if (!rt) fail('README.md supported-models table (| Model row | Quant | ...) not found')
-  else for (const c of rt) consider('README supported-models', c[0], c[1], true)
+  // Supported-models table (every data row is a support claim). It has lived in
+  // README.md and in docs/MODELS.md; search both so relocating the table cannot
+  // silently drop the guard, and fail only if it exists on neither surface.
+  let foundSupportedTable = false
+  for (const rel of ['README.md', join('docs', 'MODELS.md')]) {
+    const p = join(ROOT, rel)
+    if (!(await exists(p))) continue
+    const rt = parseTable(await readFile(p, 'utf8'), /^\|\s*Model row\s*\|\s*Quant\s*\|/)
+    if (!rt) continue
+    foundSupportedTable = true
+    for (const c of rt) consider(`${rel} supported-models`, c[0], c[1], true)
+  }
+  if (!foundSupportedTable) fail('supported-models table (| Model row | Quant | ...) not found in README.md or docs/MODELS.md')
 
   // COMPATIBILITY at-a-glance (support claim = "Public claim" says supported)
   const compat = await readFile(join(ROOT, 'COMPATIBILITY.md'), 'utf8')
@@ -186,7 +195,7 @@ async function checkSha256(committed) {
   if (!canonicalByFile.size) { info('sha256 agreement: no ledger-anchored full sha256 to check'); return }
   const knownShas = new Set([...canonicalByFile.values()].map((v) => v.sha))
   let verified = 0
-  for (const rel of ['README.md', 'COMPATIBILITY.md', join('docs', 'reference', 'STATUS.md'), join('src', 'api', 'mod.rs')]) {
+  for (const rel of ['README.md', 'COMPATIBILITY.md', join('docs', 'MODELS.md'), join('docs', 'reference', 'STATUS.md'), join('src', 'api', 'mod.rs')]) {
     const p = join(ROOT, rel)
     if (!(await exists(p))) continue
     const { verified: v, findings } = shaFindings(rel, await readFile(p, 'utf8'), canonicalByFile, knownShas)

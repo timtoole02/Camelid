@@ -1,6 +1,6 @@
 # Camelid Documentation Index
 
-Last updated: 2026-07-30
+Last updated: 2026-09-07
 
 This index helps readers navigate the public Markdown set.
 
@@ -14,7 +14,9 @@ This index helps readers navigate the public Markdown set.
 
 Read these first:
 
-- [`README.md`](README.md) — product overview, milestone story, and current exact-row support table
+- [`README.md`](README.md) — product overview, quick start, and starter models
+- [`docs/MODELS.md`](docs/MODELS.md) — full download catalog, model setup, and validation details
+- [`docs/REMOTE_CHAT.md`](docs/REMOTE_CHAT.md) — browser chat over a private LAN or Tailscale
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support ledger and at-a-glance release contract
 - [`STATUS.md`](./docs/reference/STATUS.md) — current milestone/evidence snapshot and exact blockers
 - [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) — public performance snapshot and benchmark-claim rules
