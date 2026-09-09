@@ -3358,20 +3358,69 @@ impl LlamaInferenceSession {
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
             .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
+        // Prefix continuation: every turn of a conversation re-sends the whole
+        // history, so the leading positions of this prompt are usually the exact
+        // positions the resident engine just built for the previous turn. A KV row
+        // is a pure function of the token prefix that produced it, so those rows
+        // ARE the rows this prompt needs — reusing them is not an approximation and
+        // needs no host mirror. (That distinction is what makes this safe on a lane
+        // where the prompt-prefix cache is deliberately bypassed: the cache reseeds
+        // GPU KV from f16-rounded host history, which is NOT bit-identical to a
+        // fresh prefill. Continuation never leaves the GPU.)
+        //
+        // The last shared token is always recomputed (`.min(n - 1)`) so the prefill
+        // still ends by writing position n-1, which is the state the decode lane
+        // expects. `CAMELID_CUDA_PREFIX_CONTINUATION=0` forces a full prefill so the
+        // saving can be A/B'd against the same binary.
+        let continuation_enabled = !std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
+            .map(|v| {
+                let v = v.to_string_lossy();
+                let v = v.trim();
+                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false);
+        let reuse = if continuation_enabled {
+            slot.engine
+                .resident_prefix_len(token_ids)
+                .min(n.saturating_sub(1))
+        } else {
+            0
+        };
+        // Drop the watermark to the reused span before prefilling the rest, so a
+        // failure below leaves no claim on rows this prefill never wrote.
+        slot.engine.set_filled(reuse);
         let prefill_result = if serial_prefill {
             slot.engine
-                .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+                .prefill_from(&embeddings.data, &tables.cos, &tables.sin, n, scale, reuse)
         } else {
-            slot.engine
-                .prefill_batched(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+            slot.engine.prefill_batched_from(
+                &embeddings.data,
+                &tables.cos,
+                &tables.sin,
+                n,
+                scale,
+                reuse,
+            )
         };
         if prefill_result.is_err() {
             // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
             // decode path rebuilds/reseeds rather than trusting it.
             slot.engine.set_filled(0);
+            slot.engine.set_resident_tokens(&[]);
             return Ok(false);
         }
         slot.engine.set_filled(n);
+        // Record the sequence these rows now hold, so the NEXT turn can continue
+        // from it. Ordered after `set_filled(n)`, which truncates the record to the
+        // watermark.
+        slot.engine.set_resident_tokens(token_ids);
+        if trace && reuse > 0 {
+            eprintln!(
+                "[resident-cuda] prefix continuation: reused {reuse} of {n} positions, \
+                 prefilled {}",
+                n - reuse
+            );
+        }
         // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
         // KV cache is authoritative too: otherwise any later forward that takes the
         // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
