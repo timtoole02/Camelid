@@ -103,6 +103,42 @@ kernel harness. (`prompt_tokens` also matched across all four timing arms, which
 is the same signal more weakly: each follow-up prompt embeds the previous reply,
 so a divergence would have shifted the counts.)
 
+## This does NOT raise decode tok/s, and the headline should not be read as if it does
+
+Two different numbers get called "tok/s", and this change moves only one of them.
+A separate run with `max_tokens: 256` (`bench-tps.mjs`, raw in
+`tokens-per-second.txt`) splits them, using the engine trace's prefill time to
+isolate decode:
+
+| reply | decode tok/s ON | decode tok/s OFF | end-to-end ON | end-to-end OFF | e2e ratio |
+|------:|----------------:|-----------------:|--------------:|---------------:|----------:|
+| 250 tok | 45.4 | 44.9 | 39.2 | 15.5 | 2.52 |
+| 256 tok | 40.8 | 40.6 | 27.7 | 13.3 | 2.08 |
+| 8 tok (table above) | — | — | 8.3 | 0.74 | 11.3 |
+
+**Decode throughput is unchanged** (45.4 vs 44.9, 40.8 vs 40.6 — noise), which is
+the expected and required result: the kernels are untouched and the KV rows they
+read are bit-identical. Anything else would mean a bug.
+
+What changes is a **fixed ~10 s of prefill removed per turn**. So the end-to-end
+multiple is a function of reply length, not a property of the engine: 11.3× when
+a turn emits 8 tokens, 2.1× when it emits 256. Agent loops and chat — long
+history, short output — are the best case and are what this targets. Long-form
+generation gets the same absolute saving spread over more decode.
+
+Quote the 11.3× only with the workload attached.
+
+## Known leftover, visible in this run
+
+Turn 3's ON prefill is 2971 ms, not the ~880 ms of turn 2. The previous turn
+generated 250 tokens, which are part of turn 3's prompt but are NOT in
+`resident_tokens` — the record covers the recorded prompt only, so those rows are
+re-prefilled even though they hold exactly those tokens. That is the deliberate
+pessimistic bound (`resident.len().min(filled)`), and it costs roughly 2 s per
+turn in generation-heavy conversations. Extending the record through decoded
+tokens would recover it, but it has to survive speculative rollback and tree
+verify, so it is not in this change.
+
 ## Caveat
 
 One host, one model, one prompt shape. The ratio depends on how much of the prompt

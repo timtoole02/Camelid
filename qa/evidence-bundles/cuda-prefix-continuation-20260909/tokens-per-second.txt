@@ -1,0 +1,17 @@
+# long-reply arm (max_tokens=256): ON
+{"turn":1,"ms":10731,"prompt_tokens":1431,"completion_tokens":36}
+{"turn":2,"ms":6384,"prompt_tokens":1490,"completion_tokens":250}
+{"turn":3,"ms":9238,"prompt_tokens":1763,"completion_tokens":256}
+[resident-cuda] GPU prefill 10 tokens in 2640 ms
+[resident-cuda] GPU prefill 1430 tokens in 9873 ms
+[resident-cuda] GPU prefill 1489 tokens in 878 ms
+[resident-cuda] GPU prefill 1762 tokens in 2971 ms
+
+# long-reply arm (max_tokens=256): OFF
+{"turn":1,"ms":10854,"prompt_tokens":1431,"completion_tokens":36}
+{"turn":2,"ms":16078,"prompt_tokens":1490,"completion_tokens":250}
+{"turn":3,"ms":19233,"prompt_tokens":1763,"completion_tokens":256}
+[resident-cuda] GPU prefill 10 tokens in 2677 ms
+[resident-cuda] GPU prefill 1430 tokens in 9978 ms
+[resident-cuda] GPU prefill 1489 tokens in 10512 ms
+[resident-cuda] GPU prefill 1762 tokens in 12920 ms
