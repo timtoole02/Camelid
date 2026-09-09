@@ -1,0 +1,114 @@
+# arm lazy-1
+[resident-cuda] GPU prefill 10 tokens in 2123 ms
+[resident-cuda] prefix continuation: reused 2 of 1436 positions, prefilled 1434
+[resident-cuda] GPU prefill 1436 tokens in 9595 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] GPU prefill 1473 tokens in 309 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] GPU prefill 1511 tokens in 322 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] GPU prefill 1549 tokens in 326 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] GPU prefill 1589 tokens in 339 ms
+[resident-cuda] prefix continuation: reused 1435 of 1436 positions, prefilled 1
+[resident-cuda] GPU prefill 1436 tokens in 34 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] GPU prefill 1473 tokens in 315 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] GPU prefill 1511 tokens in 323 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] GPU prefill 1549 tokens in 326 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] GPU prefill 1589 tokens in 340 ms
+
+# arm eager-1
+[resident-cuda] KV mirror to host: 10 positions in 9 ms
+[resident-cuda] GPU prefill 10 tokens in 2891 ms
+[resident-cuda] prefix continuation: reused 2 of 1436 positions, prefilled 1434
+[resident-cuda] KV mirror to host: 1436 positions in 602 ms
+[resident-cuda] GPU prefill 1436 tokens in 10303 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] KV mirror to host: 1473 positions in 522 ms
+[resident-cuda] GPU prefill 1473 tokens in 840 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1511 positions in 750 ms
+[resident-cuda] GPU prefill 1511 tokens in 1074 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1549 positions in 575 ms
+[resident-cuda] GPU prefill 1549 tokens in 902 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] KV mirror to host: 1589 positions in 627 ms
+[resident-cuda] GPU prefill 1589 tokens in 969 ms
+[resident-cuda] prefix continuation: reused 1435 of 1436 positions, prefilled 1
+[resident-cuda] KV mirror to host: 1436 positions in 735 ms
+[resident-cuda] GPU prefill 1436 tokens in 770 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] KV mirror to host: 1473 positions in 1236 ms
+[resident-cuda] GPU prefill 1473 tokens in 1554 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1511 positions in 758 ms
+[resident-cuda] GPU prefill 1511 tokens in 1082 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1549 positions in 674 ms
+[resident-cuda] GPU prefill 1549 tokens in 1000 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] KV mirror to host: 1589 positions in 705 ms
+[resident-cuda] GPU prefill 1589 tokens in 1047 ms
+
+# arm eager-2
+[resident-cuda] KV mirror to host: 10 positions in 21 ms
+[resident-cuda] GPU prefill 10 tokens in 5399 ms
+[resident-cuda] prefix continuation: reused 2 of 1436 positions, prefilled 1434
+[resident-cuda] KV mirror to host: 1436 positions in 621 ms
+[resident-cuda] GPU prefill 1436 tokens in 10321 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] KV mirror to host: 1473 positions in 566 ms
+[resident-cuda] GPU prefill 1473 tokens in 884 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1511 positions in 567 ms
+[resident-cuda] GPU prefill 1511 tokens in 892 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1549 positions in 1184 ms
+[resident-cuda] GPU prefill 1549 tokens in 1512 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] KV mirror to host: 1589 positions in 2134 ms
+[resident-cuda] GPU prefill 1589 tokens in 2479 ms
+[resident-cuda] prefix continuation: reused 1435 of 1436 positions, prefilled 1
+[resident-cuda] KV mirror to host: 1436 positions in 1371 ms
+[resident-cuda] GPU prefill 1436 tokens in 1412 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] KV mirror to host: 1473 positions in 1387 ms
+[resident-cuda] GPU prefill 1473 tokens in 1748 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1511 positions in 1851 ms
+[resident-cuda] GPU prefill 1511 tokens in 2175 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] KV mirror to host: 1549 positions in 1759 ms
+[resident-cuda] GPU prefill 1549 tokens in 2121 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] KV mirror to host: 1589 positions in 1897 ms
+[resident-cuda] GPU prefill 1589 tokens in 2241 ms
+
+# arm lazy-2
+[resident-cuda] GPU prefill 10 tokens in 2834 ms
+[resident-cuda] prefix continuation: reused 2 of 1436 positions, prefilled 1434
+[resident-cuda] GPU prefill 1436 tokens in 9754 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] GPU prefill 1473 tokens in 317 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] GPU prefill 1511 tokens in 324 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] GPU prefill 1549 tokens in 328 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] GPU prefill 1589 tokens in 341 ms
+[resident-cuda] prefix continuation: reused 1435 of 1436 positions, prefilled 1
+[resident-cuda] GPU prefill 1436 tokens in 34 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] GPU prefill 1473 tokens in 318 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] GPU prefill 1511 tokens in 324 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] GPU prefill 1549 tokens in 327 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] GPU prefill 1589 tokens in 342 ms
+
