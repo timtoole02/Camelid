@@ -3049,6 +3049,125 @@ fn prefill_then_decode_matches_sequential() {
         close(&preb_logits, &pre_logits, 1e-4),
         "batched prefill logits diverged from serial prefill logits"
     );
+
+    // PREFIX CONTINUATION. Reusing rows a previous prefill of the same token
+    // prefix already built is not an approximation: a KV row is a pure function
+    // of the token prefix that produced it, so the reused rows are the exact
+    // rows a full prefill would have written. That claim is worth only as much
+    // as its strictest test, so this asserts BIT-IDENTITY, not a tolerance —
+    // prefill [0, split), then continue from `split` to n-1, and require the
+    // resulting logits to match the full prefill's to the bit.
+    let split = (n - 1) / 2;
+    assert!(split > 0 && split < n - 1, "split must exercise both spans");
+    for &batched in &[false, true] {
+        let mut cont = build_engine(&layers, &final_norm, &output_w);
+        // Turn 1: prefill only the first `split` tokens.
+        if batched {
+            cont.prefill_batched(
+                &flat_emb[..split * hidden],
+                &cos_all[..split * half],
+                &sin_all[..split * half],
+                split,
+                scale,
+            )
+            .unwrap();
+        } else {
+            cont.prefill(
+                &flat_emb[..split * hidden],
+                &cos_all[..split * half],
+                &sin_all[..split * half],
+                split,
+                scale,
+            )
+            .unwrap();
+        }
+        cont.set_filled(split);
+        // Turn 2: the same prompt, extended. Rows [0, split) are reused.
+        if batched {
+            cont.prefill_batched_from(
+                &flat_emb,
+                &cos_all[..(n - 1) * half],
+                &sin_all[..(n - 1) * half],
+                n - 1,
+                scale,
+                split,
+            )
+            .unwrap();
+        } else {
+            cont.prefill_from(
+                &flat_emb,
+                &cos_all[..(n - 1) * half],
+                &sin_all[..(n - 1) * half],
+                n - 1,
+                scale,
+                split,
+            )
+            .unwrap();
+        }
+        let cont_logits = cont
+            .forward_token_logits(
+                &embeddings[n - 1],
+                &cos_all[(n - 1) * half..n * half],
+                &sin_all[(n - 1) * half..n * half],
+                n - 1,
+                scale,
+            )
+            .unwrap();
+        let (label, expected) = if batched {
+            ("batched prefix continuation", &preb_logits)
+        } else {
+            ("serial prefix continuation", &pre_logits)
+        };
+        assert_same_bits(label, &cont_logits, expected);
+    }
+}
+
+// The bookkeeping half of prefix continuation, which is where a bug would be
+// silent: an over-claimed prefix does not fail, it skips prefilling rows that do
+// not hold the prompt's tokens and answers from the wrong KV. No GPU needed, so
+// unlike the parity tests above this one runs in ordinary CI.
+#[test]
+fn resident_prefix_len_is_bounded_by_the_record_and_the_watermark() {
+    use super::resident_prefix_len as prefix;
+
+    // Nothing recorded: nothing to reuse, whatever the watermark says.
+    assert_eq!(prefix(&[], 10, &[1, 2, 3]), 0);
+    // Exact re-send of the recorded prompt.
+    assert_eq!(prefix(&[1, 2, 3], 3, &[1, 2, 3]), 3);
+    // The ordinary turn-2 shape: same history, more tokens appended.
+    assert_eq!(prefix(&[1, 2, 3], 3, &[1, 2, 3, 4, 5]), 3);
+    // Divergence stops the claim at the first differing token.
+    assert_eq!(prefix(&[1, 2, 3, 4], 4, &[1, 2, 9, 4]), 2);
+    // A shorter new prompt is bounded by its own length.
+    assert_eq!(prefix(&[1, 2, 3, 4], 4, &[1, 2]), 2);
+
+    // Bounded BELOW the record by `filled`: a rewind (speculative reject, error
+    // reset) dropped the watermark, so the tail rows are no longer accounted for
+    // even though the record still lists those tokens.
+    assert_eq!(prefix(&[1, 2, 3, 4], 2, &[1, 2, 3, 4]), 2);
+    assert_eq!(prefix(&[1, 2, 3, 4], 0, &[1, 2, 3, 4]), 0);
+
+    // Bounded ABOVE by the record: decode advances `filled` past the recorded
+    // prompt, but those extra rows hold generated tokens the record cannot vouch
+    // for, so they are never claimed.
+    assert_eq!(prefix(&[1, 2, 3], 999, &[1, 2, 3, 4, 5]), 3);
+}
+
+#[test]
+fn set_filled_truncates_the_token_record_it_can_no_longer_cover() {
+    // `set_filled` is the single choke point every rewind goes through, so the
+    // truncation there is what stops a stale tail from authorizing reuse. Proven
+    // on the free function's contract: after a rewind to 2, the recorded tail
+    // (3, 4) must be unreachable even for a prompt that still matches it.
+    use super::resident_prefix_len as prefix;
+    let record = vec![1u32, 2, 3, 4];
+    let rewound: Vec<u32> = record.iter().copied().take(2).collect();
+    assert_eq!(prefix(&rewound, 2, &[1, 2, 3, 4]), 2);
+    assert_eq!(
+        prefix(&record, 4, &[1, 2, 3, 4]),
+        4,
+        "untruncated record still reuses the full span"
+    );
 }
 
 // Deterministic LCG so the tests need no rand dependency.
