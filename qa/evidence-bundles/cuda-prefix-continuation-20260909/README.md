@@ -73,20 +73,35 @@ Prefill time is the whole difference — decode is unchanged:
 | 4 | 721 ms | 11112 ms |
 | 5 | 782 ms | 11497 ms |
 
-## What this does and does not prove about output
+## Output identity
 
-Bit-identity is proven separately and properly, by
-`prefill_then_decode_matches_sequential`: it prefills half a prompt, continues
-over the reused rows, and asserts the resulting logits match a full prefill's
-**to the bit** (`assert_same_bits`, not a tolerance) on both the serial and
-batched paths. That test ran on this device in 30 s — it did not early-return on
-a missing device.
+Two independent checks, at different levels.
 
-This benchmark adds a weaker but independent corroboration: `prompt_tokens` is
-identical across all four arms at every turn (1437 / 1474 / 1512 / 1550 / 1590).
-Each follow-up prompt embeds the previous reply, so any divergence in what the
-arms generated would have shifted these counts. It did not. That is consistency,
-not token-identity — the bit-exact claim rests on the parity test.
+**Kernel level, bit-exact.** `prefill_then_decode_matches_sequential` prefills half
+a prompt, continues over the reused rows, and asserts the resulting logits match a
+full prefill's **to the bit** (`assert_same_bits`, not a tolerance) on both the
+serial and batched paths. It ran on this device in 30 s — it did not early-return
+on a missing device.
+
+**End-to-end, served.** The same 5-turn conversation was replayed through
+`/v1/chat/completions` on both arms with the replies recorded
+(`bench-replies.mjs`, `replies-on.txt` vs `replies-off.txt`). They are
+**byte-identical at every turn**:
+
+```
+turn 1 prompt_tokens=1437 reply="I have received your notes."
+turn 2 prompt_tokens=1474 reply="I have noted the additional notation."
+turn 3 prompt_tokens=1512 reply="I have recorded the new notation."
+turn 4 prompt_tokens=1550 reply="I have added the notation to the list."
+turn 5 prompt_tokens=1590 reply="I have updated the notation."
+```
+
+`diff replies-on.txt replies-off.txt` is empty. This is the check that matters for
+a user: continuing from reused KV answered exactly as re-prefilling from scratch
+did, through the real server, across a growing conversation — not just in a
+kernel harness. (`prompt_tokens` also matched across all four timing arms, which
+is the same signal more weakly: each follow-up prompt embeds the previous reply,
+so a divergence would have shifted the counts.)
 
 ## Caveat
 
