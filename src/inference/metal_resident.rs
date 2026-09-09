@@ -267,6 +267,67 @@ impl super::LlamaInferenceSession {
             .is_some())
     }
 
+    /// The arming and shape conditions the batched Metal prefill needs, DELIBERATELY
+    /// excluding the KV-position clause.
+    ///
+    /// Split out because two callers need the same predicate for different reasons.
+    /// `try_metal_resident_prefill_inner` adds `kv_cache.position == 0`, because the
+    /// batched prefill builds a cache from empty. The prompt-prefix cache asks WITHOUT
+    /// that clause, because it needs to know whether this prompt would have taken the
+    /// batched path had it not resumed a cached session — see
+    /// `metal_resident_prefill_would_apply`. Keeping one body means the two can never
+    /// drift into disagreeing about eligibility.
+    fn metal_resident_prefill_shape_admits(&self, n_tokens: usize) -> Result<bool> {
+        // Two independent arming gates for two different batched prefills:
+        //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
+        //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
+        //     head_dim > 128;
+        //   * CAMELID_GEMMA3_BATCH_PREFILL — the long-prompt TTFT campaign's
+        //     `prefill_tokens_windowed`, gemma3-only, default ON since Phase 4 with
+        //     `=0` as the operator opt-out. Its two inner flags
+        //     (CAMELID_GEMMA3_PREFILL_MM, CAMELID_GEMMA3_PREFILL_ATTN_MM) are read
+        //     inside that call and are likewise default-ON opt-outs.
+        let gemma3_batched = self.gemma3_batched_prefill_armed();
+        let resident_prefill_armed = std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        Ok((resident_prefill_armed || gemma3_batched)
+            && (2..=16384).contains(&n_tokens)
+            && self.weights.layer_range.is_none()
+            && self.resident_decode_eligible(false)?)
+    }
+
+    /// Would a prompt of `n_tokens` take the batched Metal prefill, if it started from an
+    /// empty cache?
+    ///
+    /// Asked by the prompt-prefix cache before it resumes a PARTIAL hit. A partial hit
+    /// rolls the cached session back to `kv_position = p > 0`, and the position clause in
+    /// `try_metal_resident_prefill_inner` then declines the batched prefill outright, so
+    /// the divergent suffix falls to the CPU dense forward. That is not a smaller win, it
+    /// is a large loss: measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M and a
+    /// ~500-token prompt, a cold miss prefills in 1.33 s and a partial hit takes 20.79 s —
+    /// a 15.6x REGRESSION, from the second turn of any conversation carrying a system
+    /// prompt. Q8_0 escapes it only because `kv_roundtrips_through_cpu_exactly` refuses it
+    /// entry to the pool at all, which leaves K-quant models ~18x slower than Q8_0 on
+    /// turn 2 despite being the smaller weights.
+    ///
+    /// So the cache declines the partial resume when this returns true and pays a cold GPU
+    /// prefill instead — faster, and the bit-exact reference path. Exact hits are
+    /// unaffected: they replay a stored logits vector and never prefill at all.
+    ///
+    /// This is a floor, not the ceiling. Threading a base position through
+    /// `prefill_tokens` so the batched prefill can CONTINUE from `p` would beat both arms;
+    /// the scatter and attention uniforms are already there and hardwired to zero
+    /// (`src/metal.rs`, "base position: prefill always starts an empty cache"), and the
+    /// MSL kernels already take `base_position`.
+    pub(crate) fn metal_resident_prefill_would_apply(&self, n_tokens: usize) -> bool {
+        // Eligibility probing must never itself fail a request: an Err here means "cannot
+        // establish that the batched path applies", which is exactly the conservative
+        // answer (keep the existing resume behaviour).
+        self.metal_resident_prefill_shape_admits(n_tokens)
+            .unwrap_or(false)
+    }
+
     /// Shared resident prefill builder. A successful result owns a live resident session at
     /// `token_ids.len()` and carries requested pre-layer activation snapshots; `None` keeps the
     /// ordinary lossless fallback contract.
@@ -282,25 +343,18 @@ impl super::LlamaInferenceSession {
                 token_ids.len()
             );
         }
-        // Two independent arming gates for two different batched prefills:
-        //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
-        //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
-        //     head_dim > 128;
-        //   * CAMELID_GEMMA3_BATCH_PREFILL — the long-prompt TTFT campaign's
-        //     `prefill_tokens_windowed`, gemma3-only, default ON since Phase 4 with
-        //     `=0` as the operator opt-out. Its two inner flags
-        //     (CAMELID_GEMMA3_PREFILL_MM, CAMELID_GEMMA3_PREFILL_ATTN_MM) are read
-        //     inside that call and are likewise default-ON opt-outs.
+        // Which of the two batched prefills this call will drive; the arming half of the
+        // same question lives in `metal_resident_prefill_shape_admits`, which documents
+        // both gates.
         let gemma3_batched = self.gemma3_batched_prefill_armed();
-        let resident_prefill_armed = std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if (!resident_prefill_armed && !gemma3_batched)
-            || token_ids.len() < 2
-            || token_ids.len() > 16384
-            || self.kv_cache.position != 0
-            || self.weights.layer_range.is_some()
-            || !self.resident_decode_eligible(false)?
+        // Position first, deliberately. `resident_decode_eligible` inside
+        // `metal_resident_prefill_shape_admits` emits `[resident-eligible]` trace lines,
+        // and the original `||` chain short-circuited at this clause before reaching it.
+        // Testing position first preserves that exactly: a resumed session at position>0
+        // declines here without ever probing eligibility, so CAMELID_RESIDENT_TRACE output
+        // is unchanged. Every other clause is a pure predicate, so their order is free.
+        if self.kv_cache.position != 0
+            || !self.metal_resident_prefill_shape_admits(token_ids.len())?
         {
             if trace {
                 eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 1");

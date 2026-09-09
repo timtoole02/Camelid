@@ -1,0 +1,58 @@
+=========================================================================
+A. THE REGRESSION  (origin/main @ fabbb818, unmodified binary)
+   3B-Q4_K_M, ~500-token prompt, max_tokens=8, temperature=0.
+   "shared prefix" = a system message + a fixed lead-in, i.e. ordinary chat.
+-------------------------------------------------------------------------
+   NO shared prefix (every request a cache MISS)
+     req0  1336.9 ms      req1  1325.2 ms      req2  1321.6 ms
+   SHARED prefix (req0 MISS, req1+ PARTIAL HIT)
+     req0  1368.6 ms      req1 20700.8 ms      req2 20810.5 ms
+                                 ^^^^^^^^^^           ^^^^^^^^^^
+   => a partial prompt-prefix-cache HIT is 15.6x SLOWER than a MISS.
+
+   Causal chain, from CAMELID_RESIDENT_TRACE=1 on the same run:
+     "declined at site 1"  x2   -- exactly the two slow requests; zero on the
+                                   four fast ones.
+   Site 1 is the gate in try_metal_resident_prefill_inner, whose clause
+   `|| self.kv_cache.position != 0` fires because the resume set position>0.
+   The divergent suffix then runs on the CPU dense forward.
+
+B. CONTROL: Q8_0, identical prompts, same machine
+     NO shared prefix   1128.8 / 1121.2 / 1117.3 ms
+     SHARED prefix      1149.3 / 1146.0 / 1148.8 ms      declines: 0
+   Q8_0 is refused entry to the pool by kv_roundtrips_through_cpu_exactly, so it
+   never takes a partial hit and never regresses. That leaves K-quant ~18x slower
+   than Q8_0 from turn 2 of a conversation, despite the smaller weights.
+
+=========================================================================
+C. THE FIX  (this branch; ONE binary, both arms, ABBA)
+   CAMELID_METAL_PREFIX_PARTIAL_RESUME=1 restores the old unconditional resume.
+   max_tokens=16. Turn 0 is the built-in control: no cache exists yet, so every
+   arm must agree there -- and does, 1750-1768 ms.
+-------------------------------------------------------------------------
+   arm        turn0      turn1      turn2     declines
+   fixed-1   1750.3     1738.3     1736.4        0
+   old-1     1750.2    20808.8    20954.9        2
+   old-2     1755.5    21096.9    21170.5        2
+   fixed-2   1767.7     1742.9     1744.5        0
+
+   => 12.0x on turn 2+ (20.9 s -> 1.74 s). ABBA: the fixed arms bracket the old
+      arms and each pair agrees with itself, so drift cannot explain it.
+
+=========================================================================
+D. OUTPUT PARITY  (the part that makes this a correctness fix, not only perf)
+   Reference = each prompt sent as the ONLY request to a fresh server, i.e. an
+   unambiguous cold GPU prefill from an empty cache.
+-------------------------------------------------------------------------
+   seed 500  reference: "The list appears to be a repetition of the Greek alphabet."
+   seed 501  reference: "Your notes appear to be a repetition of the Greek alphabet."
+   seed 502  reference: "Your notes appear to be a repetition of the Greek alphabet."
+
+   fixed arm  turn0 "The list appears..."   turn1 "Your notes appear..."   turn2 "Your notes appear..."
+              -> matches the reference on 3 of 3.
+   old arm    turn0 "The list appears..."   turn1 "The list appears..."    turn2 "The list appears..."
+              -> matches on 1 of 3; turns 1 and 2 return turn 0's answer.
+
+   The CPU-tail resume did not merely cost time, it produced different tokens
+   than the reference path for the same prompt. Declining the partial hit
+   restores agreement.

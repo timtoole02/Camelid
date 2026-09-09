@@ -49,6 +49,21 @@ target/release/camelid serve --model /path/to/model.gguf
 
 That startup path loads the model immediately and applies the default `auto` execution profile for the current host. Use `CAMELID_PROFILE=safe|auto|experimental|debug` when you need to change planner behavior; keep lower-level experiment env vars as developer overrides rather than the primary user workflow.
 
+### Prompt-prefix cache: partial hits on the Metal lane
+
+A partial prompt-prefix-cache hit resumes a cached session at a non-zero KV position, and
+the batched Metal prefill only builds a cache from empty — so the divergent suffix would
+fall to the CPU dense forward. Measured on an M4 / 16 GiB with
+Llama-3.2-3B-Instruct-Q4_K_M and a ~500-token prompt, taking that hit cost 20.79 s against
+1.33 s for a cold miss, and returned different tokens than a cold prefill of the same
+prompt. Camelid therefore declines a partial resume when the batched Metal prefill would
+otherwise have applied, and prefills the whole prompt on the GPU instead. Exact hits, and
+every non-Metal session, are unaffected.
+
+`CAMELID_METAL_PREFIX_PARTIAL_RESUME=1` restores the old unconditional resume. It exists
+so the measurement can be reproduced against a single binary
+(`qa/evidence-bundles/metal-partial-prefix-hit-20260909/`), not as a tuning knob.
+
 ## Production HTTP policy
 
 Anonymous loopback serving remains the default. A non-loopback address has to answer two separate
