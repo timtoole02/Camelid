@@ -1,0 +1,24 @@
+# arm off-1
+[resident-cuda] GPU prefill 10 tokens in 24737 ms
+[resident-cuda] GPU prefill 1424 tokens in 10347 ms
+[resident-cuda] GPU prefill 3025 tokens in 25694 ms
+[resident-cuda] GPU prefill 6024 tokens in 70428 ms
+
+# arm on-1
+[resident-cuda] GPU prefill 10 tokens in 2801 ms
+[resident-cuda] GPU prefill 1424 tokens in 11546 ms
+[resident-cuda] GPU prefill 3025 tokens in 30361 ms
+[resident-cuda] GPU prefill 6024 tokens in 88294 ms
+
+# arm on-2
+[resident-cuda] GPU prefill 10 tokens in 2521 ms
+[resident-cuda] GPU prefill 1424 tokens in 11529 ms
+[resident-cuda] GPU prefill 3025 tokens in 30366 ms
+[resident-cuda] GPU prefill 6024 tokens in 88242 ms
+
+# arm off-2
+[resident-cuda] GPU prefill 10 tokens in 2896 ms
+[resident-cuda] GPU prefill 1424 tokens in 10472 ms
+[resident-cuda] GPU prefill 3025 tokens in 26260 ms
+[resident-cuda] GPU prefill 6024 tokens in 73762 ms
+

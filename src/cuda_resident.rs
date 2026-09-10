@@ -12720,8 +12720,20 @@ pub(crate) fn launch_attention_splitk(
 }
 
 /// Whether flash prefill attention is enabled.
-/// Opt-in via `CAMELID_FLASH_PREFILL=1` (prefill-only, token-parity).
-/// Default is off (retaining bit-identity with serial forward pass).
+/// Opt-in via `CAMELID_FLASH_PREFILL=1`, prefill-only. Default off, which retains
+/// bit-identity with the serial forward pass.
+///
+/// MEASURED 2026-09-10 on an RTX 3060 Laptop (sm_86), and both halves are worth
+/// knowing before enabling it — receipts in
+/// `qa/evidence-bundles/cuda-flash-prefill-ab-20260910/`:
+///   - It is SLOWER here, and worse with context: 1.11x / 1.17x / 1.22x at
+///     1424 / 3025 / 6024 prompt tokens. Developed and reported on sm_89, where the
+///     register-vs-occupancy tradeoff may land differently; no committed evidence
+///     isolates this flag on any device.
+///   - It is NOT token-parity in general. The online-softmax reassociation runs per
+///     LAYER, so its error compounds: greedy output was identical 3/3 at 1429 tokens
+///     but only 1/3 at 6029 tokens, deterministically. Earlier comments here claimed
+///     token-parity without a length bound; that claim did not survive measurement.
 fn flash_prefill_enabled() -> bool {
     std::env::var("CAMELID_FLASH_PREFILL").is_ok_and(|v| {
         v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off")
@@ -17810,8 +17822,10 @@ impl CudaResidentDecode {
     /// projection reproduces its decode GEMV's integer decomposition and ordered fp32 sum,
     /// and the batched norm/RoPE/scatter/attention kernels match their serial counterparts.
     /// When opt-in flash prefill is enabled (`CAMELID_FLASH_PREFILL=1`, prefill only), the fused
-    /// online-softmax attention kernel preserves greedy token-parity while eliminating intermediate
-    /// DRAM scratch.
+    /// online-softmax attention kernel eliminates intermediate DRAM scratch but is an
+    /// APPROXIMATION whose error grows with context: measured greedy-identical 3/3 at
+    /// 1429 prompt tokens and 1/3 at 6029 (see `flash_prefill_enabled`). It is off by
+    /// default, so this stack is bit-identical to the serial path unless asked otherwise.
     /// All K/V of the current chunk are scattered before attention reads them, so a
     /// token attends to every earlier position (prior chunks + earlier tokens in this
     /// chunk) exactly as sequential decoding would.
