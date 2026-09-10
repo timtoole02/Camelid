@@ -10975,9 +10975,15 @@ kernel void rope_scatter_qh_batch(
     constant uint& half_rope [[buffer(13)]],
     constant uint& pairing [[buffer(14)]],
     constant uint& max_positions [[buffer(15)]],
+    // Absolute position of batch row 0. 0 for an ordinary prefill; the reused prefix
+    // length when continuing over KV the cache already holds. RoPE stays batch-relative
+    // (the host passes tables already sliced to this batch); only the CACHE WRITE is
+    // absolute, so a row must land at `base_position + t`, not at `t`.
+    constant uint& base_position [[buffer(16)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint t = gid.y;
+    const uint pos = t + base_position;
     const uint q_dim = n_heads * head_dim;
     const uint kv_dim = n_kv_heads * head_dim;
     const uint nq_pairs = n_heads * half_rope;
@@ -11030,8 +11036,8 @@ kernel void rope_scatter_qh_batch(
         const uint d0 = dim0 % head_dim;
         const uint h1 = dim1 / head_dim;
         const uint d1 = dim1 % head_dim;
-        const uint dst0 = (h0 * max_positions + t) * head_dim + d0;
-        const uint dst1 = (h1 * max_positions + t) * head_dim + d1;
+        const uint dst0 = (h0 * max_positions + pos) * head_dim + d0;
+        const uint dst1 = (h1 * max_positions + pos) * head_dim + d1;
         cache_k[dst0] = r0;
         cache_k[dst1] = r1;
         cache_k16[dst0] = half(r0);
@@ -11043,7 +11049,7 @@ kernel void rope_scatter_qh_batch(
         const uint h = x / head_dim;
         const uint d = x % head_dim;
         const float v = v_in[t * kv_dim + x];
-        const uint dst = (h * max_positions + t) * head_dim + d;
+        const uint dst = (h * max_positions + pos) * head_dim + d;
         cache_v[dst] = v;
         cache_v16[dst] = half(v);
     }
@@ -11067,9 +11073,15 @@ kernel void rope_scatter_qh_batch_h(
     constant uint& half_rope [[buffer(13)]],
     constant uint& pairing [[buffer(14)]],
     constant uint& max_positions [[buffer(15)]],
+    // Absolute position of batch row 0. 0 for an ordinary prefill; the reused prefix
+    // length when continuing over KV the cache already holds. RoPE stays batch-relative
+    // (the host passes tables already sliced to this batch); only the CACHE WRITE is
+    // absolute, so a row must land at `base_position + t`, not at `t`.
+    constant uint& base_position [[buffer(16)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint t = gid.y;
+    const uint pos = t + base_position;
     const uint q_dim = n_heads * head_dim;
     const uint kv_dim = n_kv_heads * head_dim;
     const uint nq_pairs = n_heads * half_rope;
@@ -11122,8 +11134,8 @@ kernel void rope_scatter_qh_batch_h(
         const uint d0 = dim0 % head_dim;
         const uint h1 = dim1 / head_dim;
         const uint d1 = dim1 % head_dim;
-        const uint dst0 = (h0 * max_positions + t) * head_dim + d0;
-        const uint dst1 = (h1 * max_positions + t) * head_dim + d1;
+        const uint dst0 = (h0 * max_positions + pos) * head_dim + d0;
+        const uint dst1 = (h1 * max_positions + pos) * head_dim + d1;
         cache_k[dst0] = r0;
         cache_k[dst1] = r1;
         cache_k16[dst0] = half(r0);
@@ -11135,7 +11147,7 @@ kernel void rope_scatter_qh_batch_h(
         const uint h = x / head_dim;
         const uint d = x % head_dim;
         const float v = float(v_in[t * kv_dim + x]);
-        const uint dst = (h * max_positions + t) * head_dim + d;
+        const uint dst = (h * max_positions + pos) * head_dim + d;
         cache_v[dst] = v;
         cache_v16[dst] = half(v);
     }
@@ -40222,8 +40234,59 @@ impl ResidentDecodeState {
         sin_all: &[f32],
         scale: f32,
     ) -> Option<()> {
-        self.prefill_tokens_inner(embeddings, n_tokens, layers, cos_all, sin_all, scale, &[])
-            .map(|_| ())
+        self.prefill_tokens_inner(
+            embeddings,
+            n_tokens,
+            layers,
+            cos_all,
+            sin_all,
+            scale,
+            &[],
+            0,
+        )
+        .map(|_| ())
+    }
+
+    /// Prefill `n_tokens` that begin at absolute position `base_position`, over KV this
+    /// engine already holds for `[0, base_position)`.
+    ///
+    /// This is the reuse half of prefix continuation: a KV row is a pure function of the
+    /// token prefix that produced it, so rows the engine already holds for an identical
+    /// prefix ARE the rows this prompt needs. Nothing round-trips through the host, so the
+    /// f16-rounding hazard that keeps the prompt-prefix cache off this lane never arises.
+    ///
+    /// The caller owns the prefix claim: `base_position` must be a count of leading rows
+    /// this cache genuinely holds for THESE tokens. Over-claiming is not a slow path, it is
+    /// silently wrong output. `cos_all`/`sin_all` are indexed by batch row, so they must be
+    /// built for `[base_position, base_position + n_tokens)`.
+    ///
+    /// Returns `None` (prefill declined, caller falls back) when `base_position > 0` and
+    /// the attention-as-matmul lane is not selected. That lane's kernels already carry the
+    /// query offset through the causal mask and the PV clamp; the scalar fallback
+    /// `attention_prefill_v3_*` does not — its causal logic assumes batch index IS absolute
+    /// position — so continuation is admitted only where it is already expressible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_from(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        layers: &[ResidentLayerWeights],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        scale: f32,
+        base_position: usize,
+    ) -> Option<()> {
+        self.prefill_tokens_inner(
+            embeddings,
+            n_tokens,
+            layers,
+            cos_all,
+            sin_all,
+            scale,
+            &[],
+            base_position,
+        )
+        .map(|_| ())
     }
 
     /// Resident prompt prefill with snapshots of selected target decoder layer inputs.
@@ -40253,6 +40316,7 @@ impl ResidentDecodeState {
             sin_all,
             scale,
             capture_layer_ids,
+            0,
         )
     }
 
@@ -40266,10 +40330,11 @@ impl ResidentDecodeState {
         sin_all: &[f32],
         scale: f32,
         capture_layer_ids: &[usize],
+        base_position: usize,
     ) -> Option<Vec<Vec<f32>>> {
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(
-                "[resident-prefill] prefill_tokens ENTER n_tokens={n_tokens} moe={}",
+                "[resident-prefill] prefill_tokens ENTER n_tokens={n_tokens} base={base_position} moe={}",
                 layers.iter().any(|l| l.moe.is_some())
             );
         }
@@ -40282,6 +40347,9 @@ impl ResidentDecodeState {
                 return None;
             }
         }
+        // Total sequence length this prefill leaves in the cache: the reused prefix plus
+        // this batch. Equals `n_tokens` for an ordinary prefill (`base_position == 0`).
+        let kv_len = base_position + n_tokens;
         if n_tokens == 0
             || !wire_weights_enabled()
             || !self.head_dim.is_multiple_of(32)
@@ -40292,8 +40360,13 @@ impl ResidentDecodeState {
                 .last()
                 .is_some_and(|&layer_id| layer_id >= self.n_layers)
             || capture_layer_ids.windows(2).any(|pair| pair[0] >= pair[1])
-            || self.filled != 0
-            || !self.ensure_capacity(n_tokens)
+            // The cache must hold EXACTLY the prefix being continued over: `base_position`
+            // rows and no more. `filled > base_position` would attend rows this prompt does
+            // not own; `filled < base_position` would attend rows that were never written.
+            // An ordinary prefill passes `base_position == 0`, which reduces this to the
+            // original "the cache must be empty".
+            || self.filled != base_position
+            || !self.ensure_capacity(kv_len)
         {
             {
                 prefill_decline("prefill_tokens", 2);
@@ -40436,7 +40509,16 @@ impl ResidentDecodeState {
         // decided before buffer allocation: when active, the layer chain's working
         // buffers are half-precision end to end (GEMM outputs, residual stream,
         // norms, silu), halving activation traffic.
-        let n_pad = n_tokens.next_multiple_of(128);
+        // Two DIFFERENT padded extents, equal only when `base_position == 0`, which is why
+        // one `n_pad` sufficed before continuation existed:
+        //   * `q_pad`  — the QUERY extent. Sizes the per-token activation stream (q_h,
+        //     normf_h, ctx_h, silu_h) and bounds the query-block width.
+        //   * `kv_pad` — the KEY/POSITION extent, covering the whole cache `[0, kv_len)`
+        //     this prefill attends over. Sizes the S/P panels, the transposed V, and every
+        //     stride that walks positions.
+        // Conflating them is silent: plausible-looking wrong output, not a crash.
+        let q_pad = n_tokens.next_multiple_of(128);
+        let kv_pad = kv_len.next_multiple_of(128);
         let gqa_group = self.n_heads / self.n_kv_heads;
         // A Q8 primary is admitted here by staging its blocks into a transient half K/V
         // buffer below (`kv_dequant_q8_to_h`); kv16-primary is still excluded because its
@@ -40498,18 +40580,30 @@ impl ResidentDecodeState {
             && self.hidden.is_multiple_of(128)
             && self.ffn_dim.is_multiple_of(128)
             && attention_matmul_prefill_head_dim_supported(self.head_dim)
-            && self.n_heads * n_pad * 256 * 4 <= attn_mm_scratch_cap_bytes();
-        // Query-block width for the S/P panels: the panels are [head][qb][n_pad], so
+            && self.n_heads * kv_pad * 256 * 4 <= attn_mm_scratch_cap_bytes();
+        // Continuation is admitted only on the attention-as-matmul lane. Its kernels
+        // already carry an absolute query offset through both the causal mask and the PV
+        // k-clamp (`half_mm_batched_f16o`'s `q_offset`, and `softmax_causal_rows`'s
+        // `q_abs = q + q_offset`), so a non-zero base is already expressible there. The
+        // scalar fallback `attention_prefill_v3_*` is not: its `kv_base_offset` is a MEMORY
+        // offset, and its causal arithmetic (`p_max = tq0 + qn`) assumes the batch index IS
+        // the absolute position. Declining is a correctness gate, not a tuning choice —
+        // running it would silently attend the wrong range.
+        if base_position != 0 && !use_attn_mm {
+            prefill_decline("prefill_tokens", 9);
+            return None;
+        }
+        // Query-block width for the S/P panels: the panels are [head][qb][kv_pad], so
         // memory is linear in the block width and the budget sets how many query
         // columns are materialized at once. Prompts that fit in one block reproduce
         // the untiled math bit-for-bit (q_offset = 0).
         let attn_qb = if use_attn_mm {
-            let per_col = self.n_heads * n_pad * 4; // S + P bytes per query column
-                                                    // max-then-min, NOT clamp: short prompts have n_pad < 256 and clamp(256,
-                                                    // n_pad) panics on min > max; a single block covering n_pad is correct there.
+            let per_col = self.n_heads * kv_pad * 4; // S + P bytes per query column
+                                                     // max-then-min, NOT clamp: short prompts have q_pad < 256 and clamp(256,
+                                                     // q_pad) panics on min > max; a single block covering q_pad is correct there.
             ((attn_mm_scratch_cap_bytes() / per_col) & !63)
                 .max(256)
-                .min(n_pad)
+                .min(q_pad)
         } else {
             0
         };
@@ -40621,7 +40715,10 @@ impl ResidentDecodeState {
             let sc = scatter_scalar.contents() as *mut u32;
             *sc = self.head_dim as u32;
             *sc.add(1) = self.max_positions as u32;
-            *sc.add(2) = 0u32; // base position: prefill always starts an empty cache
+            // Absolute position of batch row 0: 0 for an ordinary prefill, and the reused
+            // prefix length when continuing over KV this cache already holds. The scatter
+            // writes row t at cache position base + t.
+            *sc.add(2) = base_position as u32;
             *sc.add(3) = if self.kvq8 {
                 (self.n_kv_heads * (self.head_dim / 32)) as u32
             } else {
@@ -40713,19 +40810,19 @@ impl ResidentDecodeState {
             *(kv16_flag.contents() as *mut u32) = 1u32;
         }
 
-        let q_h = nb(if use_attn_mm { n_pad * q_dim * 2 } else { 2 });
+        let q_h = nb(if use_attn_mm { q_pad * q_dim * 2 } else { 2 });
         let s_big = nb(if use_attn_mm {
-            self.n_heads * n_pad * attn_qb * 2
+            self.n_heads * kv_pad * attn_qb * 2
         } else {
             2
         });
         let p_big = nb(if use_attn_mm {
-            self.n_heads * n_pad * attn_qb * 2
+            self.n_heads * kv_pad * attn_qb * 2
         } else {
             2
         });
         let vt_scratch = nb(if use_attn_mm {
-            self.n_kv_heads * self.head_dim * n_pad * 2
+            self.n_kv_heads * self.head_dim * kv_pad * 2
         } else {
             2
         });
@@ -40749,15 +40846,15 @@ impl ResidentDecodeState {
             unsafe {
                 let p = q8_stage_scalar.contents() as *mut u32;
                 *p = self.head_dim as u32;
-                *p.add(1) = n_pad as u32; // rows to fill
-                *p.add(2) = n_tokens as u32; // rows actually materialized
+                *p.add(1) = kv_pad as u32; // rows to fill
+                *p.add(2) = kv_len as u32; // rows actually materialized
                 *p.add(3) = ((self.head_dim / 32) * 34) as u32; // src position stride (bytes)
                 *p.add(4) = (self.max_positions * (self.head_dim / 32) * 34) as u32; // src kv-head stride (bytes)
                 *p.add(5) = self.head_dim as u32; // dst position stride (elements)
                 *p.add(6) = (self.max_positions * self.head_dim) as u32; // dst kv-head stride (elements)
             }
         }
-        let fused_rope_scalar = nb(24);
+        let fused_rope_scalar = nb(28);
         let vt_scalar = nb(16);
         unsafe {
             let p = fused_rope_scalar.contents() as *mut u32;
@@ -40767,28 +40864,29 @@ impl ResidentDecodeState {
             *p.add(3) = half_rope as u32;
             *p.add(4) = u32::from(self.split_half_pairing);
             *p.add(5) = self.max_positions as u32;
+            *p.add(6) = base_position as u32;
         }
         unsafe {
             let p = vt_scalar.contents() as *mut u32;
             *p = self.head_dim as u32;
             *p.add(1) = self.max_positions as u32;
-            *p.add(2) = n_pad as u32;
-            *p.add(3) = n_tokens as u32;
+            *p.add(2) = kv_pad as u32;
+            *p.add(3) = kv_len as u32;
         }
         let attn_mm_scalar = nb(48);
         unsafe {
             let p = attn_mm_scalar.contents() as *mut u32;
-            // S pass: kdim=head_dim, rows=n_pad (positions), cols=n_tokens (queries)
+            // S pass: kdim=head_dim, rows=kv_pad (positions), cols=n_tokens (queries)
             *p = self.head_dim as u32;
-            *p.add(1) = n_pad as u32;
+            *p.add(1) = kv_pad as u32;
             *p.add(2) = n_tokens as u32;
-            // PV pass: kdim=n_pad, rows=head_dim, cols=n_tokens
-            *p.add(3) = n_pad as u32;
+            // PV pass: kdim=kv_pad, rows=head_dim, cols=n_tokens
+            *p.add(3) = kv_pad as u32;
             *p.add(4) = self.head_dim as u32;
             *p.add(5) = n_tokens as u32;
             // shared strides and modes filled per-dispatch below
             *p.add(6) = (self.max_positions * self.head_dim) as u32; // kv batch stride
-            *p.add(7) = (n_pad * attn_qb) as u32; // S/P batch stride (per query block)
+            *p.add(7) = (kv_pad * attn_qb) as u32; // S/P batch stride (per query block)
             *p.add(8) = self.head_dim as u32; // q batch stride / kv row stride
             *p.add(9) = q_dim as u32; // q row stride (also ctx row stride)
             *p.add(10) = 1u32; // group=1 placeholder (real group below)
@@ -40797,15 +40895,15 @@ impl ResidentDecodeState {
         let softmax_scalar = nb(20);
         unsafe {
             let p = softmax_scalar.contents() as *mut u32;
-            *p = n_pad as u32;
-            *p.add(1) = n_tokens as u32;
+            *p = kv_pad as u32;
+            *p.add(1) = kv_len as u32;
             *(p.add(2) as *mut f32) = scale;
             *p.add(3) = attn_qb as u32; // rows per query block
             *p.add(4) = 0; // window = 0: full causal, this path serves no windowed arch
         }
-        let normf_h = nb(if use_mm { n_pad * self.hidden * 2 } else { 2 });
-        let ctx_h = nb(if use_mm { n_pad * q_dim * 2 } else { 2 });
-        let silu_h = nb(if use_mm { n_pad * self.ffn_dim * 2 } else { 2 });
+        let normf_h = nb(if use_mm { q_pad * self.hidden * 2 } else { 2 });
+        let ctx_h = nb(if use_mm { q_pad * q_dim * 2 } else { 2 });
+        let silu_h = nb(if use_mm { q_pad * self.ffn_dim * 2 } else { 2 });
         let convert = |e: &metal::ComputeCommandEncoderRef,
                        src: &Buffer,
                        dst: &Buffer,
@@ -41253,7 +41351,7 @@ impl ResidentDecodeState {
                 e.set_buffer(7, Some(&self.cache_v16[i]), 0);
                 e.set_buffer(8, Some(&cos_buf), 0);
                 e.set_buffer(9, Some(&sin_buf), 0);
-                for j in 0..6u64 {
+                for j in 0..7u64 {
                     e.set_buffer(10 + j, Some(&fused_rope_scalar), j * 4);
                 }
                 dispatch_rows(
@@ -41546,7 +41644,7 @@ impl ResidentDecodeState {
                         e.dispatch_threads(
                             metal::MTLSize {
                                 width: self.head_dim as u64,
-                                height: n_pad as u64,
+                                height: kv_pad as u64,
                                 depth: self.n_kv_heads as u64,
                             },
                             metal::MTLSize {
@@ -41585,7 +41683,7 @@ impl ResidentDecodeState {
                 }
                 e.dispatch_threads(
                     metal::MTLSize {
-                        width: n_pad as u64,
+                        width: kv_pad as u64,
                         height: self.head_dim as u64,
                         depth: self.n_kv_heads as u64,
                     },
@@ -41613,21 +41711,21 @@ impl ResidentDecodeState {
                         0,
                         (self.max_positions * self.head_dim) as u32,
                         self.head_dim as u32,
-                        (n_pad * attn_qb) as u32,
+                        (kv_pad * attn_qb) as u32,
                         self.head_dim as u32,
                         q_dim as u32,
-                        n_pad as u32,
+                        kv_pad as u32,
                         1,
                         gqa_group as u32,
                         1,
-                        qb as u32,
-                        n_pad,
+                        (base_position + qb) as u32,
+                        kv_pad,
                         cols_b,
                     );
                     // causal softmax rows -> P
                     let qoff_buf = nb(4);
                     unsafe {
-                        *(qoff_buf.contents() as *mut u32) = qb as u32;
+                        *(qoff_buf.contents() as *mut u32) = (base_position + qb) as u32;
                     }
                     e.set_compute_pipeline_state(&k.softmax_causal_rows_pipeline);
                     e.set_buffer(0, Some(&s_big), 0);
@@ -41660,16 +41758,16 @@ impl ResidentDecodeState {
                         &ctx_h,
                         qh_off,
                         12,
-                        (self.head_dim * n_pad) as u32,
-                        (n_pad * attn_qb) as u32,
+                        (self.head_dim * kv_pad) as u32,
+                        (kv_pad * attn_qb) as u32,
                         self.head_dim as u32,
-                        n_pad as u32,
-                        n_pad as u32,
+                        kv_pad as u32,
+                        kv_pad as u32,
                         q_dim as u32,
                         1,
                         gqa_group as u32,
                         2,
-                        qb as u32,
+                        (base_position + qb) as u32,
                         self.head_dim,
                         cols_b,
                     );
@@ -42290,7 +42388,8 @@ impl ResidentDecodeState {
                 out
             })
             .collect();
-        self.filled = n_tokens;
+        // The cache now vouches for the reused prefix AND this batch, not just this batch.
+        self.filled = kv_len;
         Some(layer_inputs)
     }
 
@@ -46466,6 +46565,344 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Prefix continuation must be BIT-IDENTICAL to a cold prefill of the same tokens.
+    ///
+    /// This is the whole safety argument for reusing KV across turns: a KV row is a pure
+    /// function of the token prefix that produced it, so prefilling `[0, n)` in one batch
+    /// and prefilling `[0, k)` then continuing `[k, n)` must leave the same cache. Anything
+    /// less than bit-identity means the reuse changes output, and the reuse is not worth
+    /// having.
+    ///
+    /// The geometry is chosen so the attention-as-matmul lane can actually engage (every
+    /// dim a multiple of 128), and the split is chosen so `q_pad != kv_pad` on the
+    /// continuation batch — 128 query rows over a 192-position cache — because that
+    /// inequality is exactly what the old single `n_pad` conflated.
+    ///
+    /// RoPE tables are position-dependent on purpose: with a constant table a wrong base
+    /// position would still produce matching KV and the test would pass vacuously.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_prefix_continuation_is_bit_identical_to_a_cold_prefill() {
+        use super::*;
+
+        if !detect_metal_device().available {
+            return;
+        }
+        // House rule: read the gates, never arm them from a test — a process-wide OnceLock
+        // would latch sibling tests onto different kernels.
+        if !wire_weights_enabled() || !mm_prefill_enabled() {
+            eprintln!(
+                "SKIP metal_prefix_continuation_is_bit_identical_to_a_cold_prefill: run with \
+                 CAMELID_METAL_WIRE=1 CAMELID_METAL_MM=1"
+            );
+            return;
+        }
+
+        const N: usize = 192; // total prompt
+        const SPLIT: usize = 64; // reused prefix length
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let head_dim = 64usize;
+        let hidden = 256usize;
+        let ffn = 256usize;
+        let max_positions = 256usize;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q: mkw(q_dim, hidden / 32, s + 1),
+                    k: mkw(kv_dim, hidden / 32, s + 2),
+                    v: mkw(kv_dim, hidden / 32, s + 3),
+                    o: mkw(hidden, q_dim / 32, s + 4),
+                    gate: mkw(ffn, hidden / 32, s + 5),
+                    up: mkw(ffn, hidden / 32, s + 6),
+                    down: mkw(hidden, ffn / 32, s + 7),
+                }
+            })
+            .collect();
+        let layers: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                moe: None,
+                qk_l2_norm_after_rope: false,
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_norm: None,
+                k_norm: None,
+                post_attn_norm: None,
+                post_ffw_norm: None,
+                ffn_geglu: false,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+            })
+            .collect();
+
+        let embeddings: Vec<f32> = (0..N * hidden)
+            .map(|i| ((i % 251) as f32 - 125.0) * 0.0078125 + 0.125)
+            .collect();
+        // Position-dependent RoPE, indexed by ABSOLUTE position.
+        let cos_all: Vec<f32> = (0..N * half)
+            .map(|i| ((i / half) as f32 * 0.013 + (i % half) as f32 * 0.001).cos())
+            .collect();
+        let sin_all: Vec<f32> = (0..N * half)
+            .map(|i| ((i / half) as f32 * 0.013 + (i % half) as f32 * 0.001).sin())
+            .collect();
+
+        let new_session = || {
+            ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                max_positions,
+                max_positions,
+                eps,
+                false,
+                None,
+            )
+            .expect("resident session")
+        };
+
+        // Arm A: one cold prefill of the whole prompt.
+        let mut cold = new_session();
+        cold.prefill_tokens(&embeddings, N, &layers, &cos_all, &sin_all, scale)
+            .expect("cold prefill");
+        assert_eq!(cold.filled(), N);
+
+        // Arm B: prefill the prefix, then CONTINUE over it.
+        let mut cont = new_session();
+        cont.prefill_tokens(
+            &embeddings[..SPLIT * hidden],
+            SPLIT,
+            &layers,
+            &cos_all[..SPLIT * half],
+            &sin_all[..SPLIT * half],
+            scale,
+        )
+        .expect("prefix prefill");
+        assert_eq!(cont.filled(), SPLIT);
+        cont.prefill_tokens_from(
+            &embeddings[SPLIT * hidden..],
+            N - SPLIT,
+            &layers,
+            &cos_all[SPLIT * half..],
+            &sin_all[SPLIT * half..],
+            scale,
+            SPLIT,
+        )
+        .expect(
+            "continuation prefill declined — if the attention-as-matmul lane did not engage \
+             for this geometry the test is vacuous, so this is a failure, not a skip",
+        );
+        assert_eq!(
+            cont.filled(),
+            N,
+            "continuation must leave the cache vouching for prefix + batch"
+        );
+
+        for layer in 0..n_layers {
+            let (ck, cv) = cold.read_kv_layer(layer, N).expect("cold KV");
+            let (nk, nv) = cont.read_kv_layer(layer, N).expect("continued KV");
+            assert_eq!(ck.len(), nk.len());
+            for (i, (&a, &b)) in ck.iter().zip(&nk).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "layer {layer} K element {i}: continuation {b} != cold prefill {a}"
+                );
+            }
+            for (i, (&a, &b)) in cv.iter().zip(&nv).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "layer {layer} V element {i}: continuation {b} != cold prefill {a}"
+                );
+            }
+        }
+    }
+
+    /// Continuation must DECLINE rather than run on the scalar attention fallback.
+    ///
+    /// The scalar `attention_prefill_v3_*` causal arithmetic assumes the batch index IS
+    /// the absolute position, so a non-zero base there would silently attend the wrong
+    /// range — wrong output, not a crash. The admission is therefore a correctness gate,
+    /// and this pins it.
+    ///
+    /// The lane is refused here by GEOMETRY rather than by an env gate: `hidden` is not a
+    /// multiple of 128, which `use_attn_mm` requires. That keeps the test honest on a host
+    /// where the MM lane is armed, and avoids arming a process-wide OnceLock from a test.
+    /// A base of 0 on the same geometry must still be accepted — the gate has to cost
+    /// ordinary prefills nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_continuation_declines_when_the_matmul_attention_lane_is_unavailable() {
+        use super::*;
+
+        if !detect_metal_device().available {
+            return;
+        }
+        if !wire_weights_enabled() {
+            eprintln!(
+                "SKIP metal_continuation_declines_when_the_matmul_attention_lane_is_unavailable: \
+                 run with CAMELID_METAL_WIRE=1"
+            );
+            return;
+        }
+
+        let n_layers = 1usize;
+        let n_heads = 2usize;
+        let n_kv = 2usize;
+        let head_dim = 32usize;
+        let hidden = 64usize; // NOT a multiple of 128 -> use_attn_mm is false
+        let ffn = 128usize;
+        let max_positions = 32usize;
+        let q_dim = n_heads * head_dim;
+        let half = head_dim / 2;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        let attn_norm: Vec<f32> = vec![1.0; hidden];
+        let ffn_norm: Vec<f32> = vec![1.0; hidden];
+        let (q, k_w, v, o) = (
+            mkw(q_dim, hidden / 32, 1),
+            mkw(n_kv * head_dim, hidden / 32, 2),
+            mkw(n_kv * head_dim, hidden / 32, 3),
+            mkw(hidden, q_dim / 32, 4),
+        );
+        let (gate, up, down) = (
+            mkw(ffn, hidden / 32, 5),
+            mkw(ffn, hidden / 32, 6),
+            mkw(hidden, ffn / 32, 7),
+        );
+        let layers = vec![ResidentLayerWeights {
+            moe: None,
+            qk_l2_norm_after_rope: false,
+            attn_norm: &attn_norm,
+            ffn_norm: &ffn_norm,
+            q_norm: None,
+            k_norm: None,
+            post_attn_norm: None,
+            post_ffw_norm: None,
+            ffn_geglu: false,
+            q_weight_blocks: ResidentWeightBytes::Blocks36(&q),
+            k_weight_blocks: ResidentWeightBytes::Blocks36(&k_w),
+            v_weight_blocks: ResidentWeightBytes::Blocks36(&v),
+            o_weight_blocks: ResidentWeightBytes::Blocks36(&o),
+            gate_weight_blocks: ResidentWeightBytes::Blocks36(&gate),
+            up_weight_blocks: ResidentWeightBytes::Blocks36(&up),
+            down_weight_blocks: ResidentWeightBytes::Blocks36(&down),
+        }];
+
+        let n = 8usize;
+        let embeddings: Vec<f32> = (0..n * hidden).map(|i| (i % 13) as f32 * 0.01).collect();
+        let cos_all: Vec<f32> = vec![1.0; n * half];
+        let sin_all: Vec<f32> = vec![0.0; n * half];
+        let mut session = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            max_positions,
+            max_positions,
+            1.0e-5,
+            false,
+            None,
+        )
+        .expect("resident session");
+
+        // Base 0 on this geometry is an ordinary prefill and must still work.
+        session
+            .prefill_tokens(
+                &embeddings[..4 * hidden],
+                4,
+                &layers,
+                &cos_all[..4 * half],
+                &sin_all[..4 * half],
+                scale,
+            )
+            .expect("a base-0 prefill must not be affected by the continuation gate");
+        assert_eq!(session.filled(), 4);
+
+        // A non-zero base on the same geometry must be refused, not run on the scalar lane.
+        assert!(
+            session
+                .prefill_tokens_from(
+                    &embeddings[4 * hidden..],
+                    4,
+                    &layers,
+                    &cos_all[4 * half..],
+                    &sin_all[4 * half..],
+                    scale,
+                    4,
+                )
+                .is_none(),
+            "continuation must decline when attention-as-matmul is unavailable"
+        );
+        assert_eq!(
+            session.filled(),
+            4,
+            "a declined continuation must leave the cache untouched"
+        );
     }
 
     #[cfg(target_os = "macos")]
