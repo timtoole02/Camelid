@@ -104,6 +104,186 @@
 .cx-btn--danger .cx-btn__spinner { color: var(--color-error); }
 .cx-btn { position: relative; }
 
+/* ---- Button: Graphic Load Bar ----
+   An indeterminate "something is happening" treatment for long actions
+   (loading a model). Built ONLY from the steel-blue interactive accent:
+   verified copper is the receipt-stamp color and a load in progress is not a
+   verified claim — see the status color doctrine in tokens.css.
+
+   Reduced motion is handled globally by the `*` rule in base.css; do not add a
+   local prefers-reduced-motion block here. The text label stays visible when
+   the animations are stopped, so the state is still readable. */
+.cx-btn.is-loading-bar {
+  position: relative;
+  overflow: hidden;
+  cursor: wait;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 40%, var(--color-border-strong));
+  background: color-mix(in srgb, var(--color-surface-subtle) 90%, #000);
+}
+
+/* The button is disabled while loading, and .cx-btn:disabled dims to 0.5 —
+   which would composite the whole bar AND its label at half strength, dropping
+   the label to ~2.1-2.8:1 against the card (AA needs 4.5:1 at this size). The
+   loading state is deliberate, not unavailable, so it keeps full opacity. */
+.cx-btn.is-loading-bar:disabled { opacity: 1; }
+
+.cx-btn__loadbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  overflow: hidden;
+}
+
+.cx-btn__loadbar-track {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  overflow: hidden;
+}
+
+.cx-btn__loadbar-fill {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-accent) 22%, transparent) 0%,
+    /* 42% is the ceiling: above it the brightest gradient stop plus a stripe
+       band pushes the label under 4.5:1 in the dark theme. */
+    color-mix(in srgb, var(--color-accent) 42%, transparent) 50%,
+    color-mix(in srgb, var(--color-accent-hover) 30%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  animation: cxBarGradientSweep 2.8s ease-in-out infinite alternate;
+}
+
+/* 22.63px tile is exact, not a magic number: a -45deg gradient across a
+   22.63px square has a 32px gradient line — precisely two 16px stripe
+   periods — so the tile repeats seamlessly and one animation cycle advances
+   by exactly one tile. Do not "round" it to 22 or 24. */
+.cx-btn__loadbar-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.06) 0,
+    rgba(255, 255, 255, 0.06) 8px,
+    transparent 8px,
+    transparent 16px
+  );
+  background-size: 22.63px 22.63px;
+  animation: cxBarStripes 1s linear infinite;
+}
+
+.cx-btn__loadbar-line {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: color-mix(in srgb, var(--color-border-soft) 80%, transparent);
+  overflow: hidden;
+}
+
+.cx-btn__loadbar-line::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 45%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--color-accent) 35%,
+    #ffffff 70%,
+    var(--color-accent) 100%
+  );
+  border-radius: var(--radius-pill);
+  box-shadow: 0 0 8px var(--color-accent),
+    0 0 14px color-mix(in srgb, var(--color-accent) 55%, transparent);
+  animation: cxBarRunner 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.cx-btn__loadbar-shimmer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 45%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.22) 50%,
+    transparent 100%
+  );
+  transform: translateX(-150%) skewX(-20deg);
+  animation: cxBarShimmer 2s ease-in-out infinite;
+}
+
+.cx-btn__loadbar-content {
+  position: relative;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+  color: var(--color-text);
+  font-weight: 600;
+  font-size: var(--text-xs);
+  letter-spacing: 0.01em;
+  /* Halo, not drop-shadow: mixing toward --color-bg makes it dark on the dark
+     theme and light on the light one, so the label stays readable as the
+     gradient sweeps under it — without a second palette to keep in sync. */
+  text-shadow: 0 1px 2px color-mix(in srgb, var(--color-bg) 70%, transparent);
+  pointer-events: none;
+}
+
+.cx-btn__loadbar-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  box-shadow: 0 0 6px var(--color-accent);
+  animation: cxPulse 1.2s var(--ease-standard) infinite;
+  flex-shrink: 0;
+}
+
+.cx-btn__loadbar-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@keyframes cxBarRunner {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(250%); }
+}
+
+@keyframes cxBarStripes {
+  from { background-position: 0 0; }
+  to { background-position: 22.63px 0; }
+}
+
+@keyframes cxBarGradientSweep {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 100% 50%; }
+}
+
+@keyframes cxBarShimmer {
+  0% { transform: translateX(-150%) skewX(-20deg); }
+  60%, 100% { transform: translateX(250%) skewX(-20deg); }
+}
+
 /* ---- IconButton ---- */
 .cx-iconbtn {
   display: inline-grid;

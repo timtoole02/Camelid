@@ -320,6 +320,12 @@ export default function DownloadedModelsView({
         </Button>
       </div>
 
+      {/* The Load button is disabled while loading, which blurs it, so its name
+          change is never announced. This carries the state instead. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {modelAction.type === 'load' && modelAction.filename ? `Loading ${modelAction.filename}…` : ''}
+      </span>
+
       {!spine.local && spine.localLoading ? (
         <p className="lane-empty">Scanning the model folder…</p>
       ) : filteredModels.length ? (
@@ -335,9 +341,10 @@ export default function DownloadedModelsView({
             const generationCapable = isGenerationCapableModel(entry, runtime)
             const standaloneRuntime = embeddingOnly || generationCapable
             const actionBusy = Boolean(modelAction.filename)
+            const isModelLoading = modelAction.filename === entry.filename && modelAction.type === 'load'
             return (
               <article
-                className={`cxv-card downloaded-model${isActive ? ' downloaded-model--active' : ''}`}
+                className={`cxv-card downloaded-model${isActive ? ' downloaded-model--active' : ''}${isModelLoading ? ' downloaded-model--loading' : ''}`}
                 key={entry.filename}
               >
                 <div className="cxv-card__head">
@@ -391,7 +398,9 @@ export default function DownloadedModelsView({
                         size="sm"
                         icon={<IconPlay size={16} />}
                         onClick={() => load(entry)}
-                        loading={modelAction.filename === entry.filename && modelAction.type === 'load'}
+                        loading={isModelLoading}
+                        loadingVariant="bar"
+                        loadingLabel="Loading model…"
                         disabled={!canLoad || actionBusy || Boolean(deletingFilename)}
                         aria-label={`Load ${entry.filename}`}
                         title={canLoad ? 'Load this model into Camelid' : 'Camelid can’t run this model type'}
