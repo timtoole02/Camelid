@@ -2511,6 +2511,19 @@ pub struct LlamaInferenceSession {
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
     resident_paths_disabled: bool,
+    /// Whether a CUDA-resident prefill mirrors its KV back to the host EAGERLY.
+    ///
+    /// Defaults to `true`, which is the historical behaviour, so any caller this was not
+    /// audited against keeps it. `prepare_generation` clears it for requests that cannot
+    /// reach `rollback_to_position` — that is, requests with no speculation — and those get
+    /// the lazy mirror instead.
+    ///
+    /// The direction of the default is the point. `rollback_to_position` needs
+    /// CPU-authoritative KV, and the lazy recovery can only supply it while
+    /// `filled == position`; a speculative rollback may run with drafts written past
+    /// `position`, where it cannot. Rather than argue about whether that is reachable,
+    /// speculating sessions simply keep the eager copy.
+    cpu_kv_mirror_eager: bool,
     /// Whether Metal resident decode may pre-commit the next token graph. Continuous-batch
     /// jobs disable this because another session can run before this one is scheduled again:
     /// a session-local graph waiting at the head of Metal's shared serial queue would
@@ -2604,6 +2617,7 @@ impl LlamaInferenceSession {
             ),
             resident_decode: self.resident_decode.take(),
             resident_paths_disabled: self.resident_paths_disabled,
+            cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: self.execution_trace.take(),
             resident_cache_key: self.resident_cache_key,
@@ -2695,6 +2709,7 @@ impl Clone for LlamaInferenceSession {
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
             resident_paths_disabled: self.resident_paths_disabled,
+            cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: None,
             resident_cache_key: self.resident_cache_key,
@@ -2736,6 +2751,7 @@ impl LlamaInferenceSession {
             kv_cache: LlamaKvCache::new(plan, kv_quant)?,
             resident_decode: None,
             resident_paths_disabled: false,
+            cpu_kv_mirror_eager: true,
             resident_encode_ahead_enabled: true,
             execution_trace: None,
             resident_cache_key: None,
@@ -2768,6 +2784,16 @@ impl LlamaInferenceSession {
     /// pins sessions to CPU because KV rollback only exists for CPU state.
     pub fn set_resident_paths_disabled(&mut self, disabled: bool) {
         self.resident_paths_disabled = disabled;
+    }
+
+    /// Allow a CUDA-resident prefill to skip the eager GPU->host KV mirror.
+    ///
+    /// Only safe for a request that cannot reach `rollback_to_position`, because that is
+    /// the one CPU-KV consumer the lazy path cannot always satisfy (it needs
+    /// `filled == position`, and a speculative rollback may run with drafts written past
+    /// `position`). Callers that do not know pass nothing and keep the eager default.
+    pub fn set_cpu_kv_mirror_eager(&mut self, eager: bool) {
+        self.cpu_kv_mirror_eager = eager;
     }
 
     /// Enable or disable Metal's single-session next-token encode-ahead pipeline.
@@ -2818,6 +2844,12 @@ impl LlamaInferenceSession {
     /// rollback, so any resident session is dropped and reseeds from CPU on
     /// next use.
     pub fn rollback_to_position(&mut self, position: usize) -> Result<()> {
+        // Materialize on demand, exactly as the three CPU forward readers do. A
+        // GPU-resident prefill no longer mirrors its KV back eagerly, so on that lane
+        // the history this rollback needs lives only on the device until something
+        // asks for it — and this is one of the things that asks. Never returns Err for
+        // a failed recovery, so the authority check below still decides.
+        self.ensure_cpu_kv_materialized()?;
         if !self.cpu_kv_authoritative() {
             return Err(BackendError::RuntimeShapeMismatch(
                 "KV rollback requires CPU-authoritative KV state; the GPU-resident prefill \
@@ -3421,20 +3453,63 @@ impl LlamaInferenceSession {
                 n - reuse
             );
         }
-        // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
-        // KV cache is authoritative too: otherwise any later forward that takes the
-        // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
-        // an all-zero history and generation degenerates. The copy is a few MB of
-        // device->host transfer ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â negligible next to the prefill compute it follows,
-        // and it keeps both backends in lockstep.
-        if let Err(e) =
-            self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
-        {
-            if trace {
-                eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+        // The GPU prefill fills only the GPU KV cache. The CPU-side cache is mirrored
+        // back LAZILY, by `ensure_cpu_kv_materialized`, at the moment a CPU reader
+        // actually needs the history — not here.
+        //
+        // This used to mirror eagerly on every request, justified by a comment saying
+        // the copy was "a few MB of device->host transfer, negligible next to the
+        // prefill compute it follows". Both halves stopped being true. The copy is
+        // `n_layers * n_kv * n * head_dim * 2` elements, so it scales with the WHOLE
+        // context (~170 MiB on the wire for a 3B at 1.5k positions, plus a scalar
+        // host-side expansion loop); and once prefix continuation cut the prefill down
+        // to the newly appended tokens, there was no longer a large compute for it to
+        // be negligible next to. Measured on the RTX 3060 Laptop reference, the mirror
+        // was 62-74% of a follow-up turn's reported prefill time.
+        //
+        // Lazy is safe for the readers that can always be satisfied on demand: the three
+        // CPU forward readers (`forward_layer_range_from_hidden`,
+        // `forward_single_token_timed_internal`, and the verify path) call
+        // `ensure_cpu_kv_materialized` before touching the history, and they do so while
+        // `filled == position` still holds, which is what the recovery requires. On the
+        // common path — GPU prefill, GPU decode, no fallback — nothing reads it at all.
+        //
+        // `rollback_to_position` is the one that CANNOT always be satisfied that way: a
+        // speculative rollback may run with drafts written past `position`, and the
+        // recovery declines whenever `filled != position`. So rather than reason about
+        // whether that is reachable, sessions that speculate keep the eager copy
+        // (`cpu_kv_mirror_eager`, default true, cleared only by `prepare_generation` for
+        // requests with no speculation).
+        //
+        // REMAINING EXPOSURE, stated rather than argued away: if the resident engine is
+        // rebuilt or evicted BETWEEN this prefill and a later decode of the same request,
+        // a reseed is needed (`filled != position`) at exactly the moment the recovery
+        // declines for the same reason, and that forward attends over a zero-filled
+        // prefix — degraded output with only a one-shot stderr warning. The eager copy
+        // left a host copy that covered this. It needs the engine displaced DURING a
+        // request, which run-to-completion scheduling on this lane makes very hard to
+        // reach, but it is not proven unreachable.
+        // `CAMELID_CUDA_EAGER_KV_MIRROR=1` restores the eager copy everywhere.
+        if self.cpu_kv_mirror_eager || eager_kv_mirror_enabled() {
+            let mirror_started = Instant::now();
+            if let Err(e) =
+                self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
+            {
+                if trace {
+                    eprintln!(
+                        "[resident-cuda] KV readback to host failed ({e}); using CPU prefill"
+                    );
+                }
+                slot.engine.set_filled(0);
+                slot.engine.set_resident_tokens(&[]);
+                return Ok(false);
             }
-            slot.engine.set_filled(0);
-            return Ok(false);
+            if trace {
+                eprintln!(
+                    "[resident-cuda] KV mirror to host: {n} positions in {} ms",
+                    mirror_started.elapsed().as_millis()
+                );
+            }
         }
         drop(guard);
         self.kv_cache.position = n;
@@ -14120,6 +14195,25 @@ fn resident_cuda_max_context() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v >= 256)
         .unwrap_or(usize::MAX)
+}
+
+/// Restore the eager GPU->host KV mirror after a CUDA-resident prefill.
+///
+/// Default OFF: the mirror is lazy, performed by `ensure_cpu_kv_materialized` when a
+/// CPU reader actually needs the history. This exists so the saving can be A/B'd
+/// against the same binary, and as an escape hatch if a host turns out to reach the
+/// CPU KV through a path that does not materialize on demand.
+#[cfg(feature = "cuda")]
+fn eager_kv_mirror_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CAMELID_CUDA_EAGER_KV_MIRROR")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
 }
 
 #[allow(dead_code)]

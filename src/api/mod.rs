@@ -20934,6 +20934,14 @@ async fn prepare_generation(
     session.set_resident_paths_disabled(
         speculative.is_some() && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
     );
+    // A CUDA-resident prefill can skip the eager GPU->host KV mirror only for a request
+    // that cannot reach `rollback_to_position`. Speculation is the caller that reaches it
+    // (`run_speculative_round` rolls back to the accepted prefix after every round), and a
+    // rollback taken with drafts written past `position` is exactly the case the lazy
+    // recovery declines. So the mirror stays eager whenever this request may speculate,
+    // and only a non-speculating request opts into lazy. The session defaults to eager, so
+    // any path that never reaches this line keeps the historical behaviour.
+    session.set_cpu_kv_mirror_eager(speculative.is_some());
 
     let telemetry_backend = {
         let plans = state.execution_plans.read().await;
