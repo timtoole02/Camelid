@@ -479,6 +479,27 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:streaming
 
+      # The markdown renderer's own gate. It shipped with the renderer but was
+      # never wired here, so tables, link-scheme sanitization, the no-raw-HTML
+      # invariant and per-language highlighting were all ungated.
+      - name: Frontend markdown smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:markdown
+
+      # Math and diagram rendering. The pure half is mostly the NOT-math half:
+      # model output is full of dollar signs that are currency, and a renderer
+      # that typesets them turns a sentence into a garbled formula.
+      - name: Frontend math + diagram smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:math-diagram
+
+      # KaTeX and Mermaid both work in an effect, so only a real browser can
+      # show they render at all. This gate also holds the regression guard for
+      # writing into a React-owned node, which unmounts the entire app.
+      - name: Frontend math + diagram browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:math-diagram-browser
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one
