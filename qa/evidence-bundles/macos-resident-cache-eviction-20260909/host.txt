@@ -1,0 +1,6 @@
+host      tims-mac-mini-2.lan (mini2)
+cpu       Apple M4, 10 cores
+memory    17179869184 bytes (16 GiB unified)
+os        macOS 26.6.2 (25G83)
+models    Llama-3.2-3B-Instruct-Q8_0.gguf (~3.4 GB), Llama-3.2-1B-Instruct-Q8_0.gguf (~1.3 GB)
+stock     origin/main @ eb73c08f
