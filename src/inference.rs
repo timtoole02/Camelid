@@ -13406,8 +13406,27 @@ pub fn reset_resident_caches() {
     // unload path exists to prevent).
     crate::cuda::release_async_pool();
 }
+/// Non-CUDA hosts have no resident CUDA engine to drop, but macOS still holds resident
+/// weights: the process-global Metal buffer cache pins each model's page-aligned wire
+/// allocation, and on the default `serve` path (`CAMELID_METAL_NOCOPY`) that allocation IS
+/// the weights. This arm was an empty stub, so `release_model` freed the registries and
+/// none of the memory — the outgoing model stayed resident for the life of the process,
+/// a reload took a second full copy at a new address, and the fit advisor's "releasing it
+/// frees ~N GB" was false on this platform. Evicting only what no live model still owns
+/// makes the existing call site do on macOS what it already did on CUDA.
 #[cfg(not(feature = "cuda"))]
-pub fn reset_resident_caches() {}
+pub fn reset_resident_caches() {
+    #[cfg(target_os = "macos")]
+    {
+        let freed = crate::metal::evict_unreferenced_resident_weights();
+        if freed > 0 && std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-cache] evicted {:.2} GiB of unreferenced resident weights",
+                freed as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+    }
+}
 
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.

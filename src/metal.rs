@@ -677,6 +677,59 @@ impl MetalLinearCache {
             .insert(key, (buffer.to_owned(), std::sync::Arc::clone(pages)));
         buffer
     }
+
+    /// Drop the no-copy entries whose backing allocation has no owner left, and report
+    /// the bytes released.
+    ///
+    /// `strong_count == 1` means this cache holds the ONLY `Arc`, so the model that
+    /// loaded those pages is gone. That is the whole safety argument, and it holds
+    /// without any ownership plumbing: an `Arc` can only be obtained by cloning an
+    /// existing one, so anything still able to reach these pages is itself already
+    /// counted. A live model therefore reads `>= 2` and is kept. The mutex is held
+    /// across the sweep, and a count of 1 cannot race upwards for the same reason.
+    ///
+    /// Deliberately scoped to `q8_wire_nocopy_buffers`. The other four permanent maps
+    /// hold GPU COPIES keyed by a source `(ptr, len)`, with no owner handle to test, so
+    /// nothing here can tell a live entry from a dead one — and `serve` enables
+    /// `CAMELID_METAL_NOCOPY` by default, which is what puts the GB-scale weights in
+    /// this map in the first place. Reclaiming the copy caches needs a per-model owner
+    /// and is a separate change.
+    fn evict_unreferenced_nocopy(&mut self) -> usize {
+        let mut freed = 0usize;
+        self.q8_wire_nocopy_buffers.retain(|_, (_, pages)| {
+            if std::sync::Arc::strong_count(pages) == 1 {
+                freed += pages.byte_len();
+                false
+            } else {
+                true
+            }
+        });
+        freed
+    }
+}
+
+/// Release resident weight allocations that no live model still owns; returns bytes freed.
+///
+/// `release_model` drops the CPU-side registries and then calls
+/// `inference::reset_resident_caches`, whose macOS arm was an empty stub — so on this
+/// platform unload freed the registries and essentially none of the weights. On the
+/// default `serve` path `CAMELID_METAL_NOCOPY` is on, so a model's weights ARE its
+/// `WirePages` allocation, and the process-global buffer cache is the surviving owner:
+/// the pages stay resident for the life of the process, a reload maps the file again at a
+/// new address and takes a second full copy, and the fit advisor then reads the phantom
+/// occupancy and reports that releasing the model "frees ~N GB" when it frees nothing.
+///
+/// Nothing is reclaimable while a single model is live, so this costs zero in a
+/// one-model process. It pays on switching models in place, which is what the app's Load
+/// button does.
+#[cfg(target_os = "macos")]
+pub(crate) fn evict_unreferenced_resident_weights() -> usize {
+    let Some(cache) = METAL_LINEAR_CACHE.get() else {
+        // Never populated: nothing was ever made resident in this process.
+        return 0;
+    };
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    guard.evict_unreferenced_nocopy()
 }
 
 /// Hardware GPU timestamps from a completed command buffer: (GPU busy window µs,
@@ -45679,6 +45732,59 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    /// Eviction must free a dropped model's pages and must NOT touch a live model's.
+    ///
+    /// The distinction is the whole safety argument, so it is asserted in both
+    /// directions on one cache: insert while an owner is alive (a sweep must be a
+    /// no-op), then drop the owner (the same sweep must reclaim). Runs on a local
+    /// `MetalLinearCache` rather than the process-global one so it cannot perturb any
+    /// other test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_weight_eviction_frees_only_pages_no_model_still_owns() {
+        use std::io::Write;
+
+        let Some(device) = super::Device::system_default() else {
+            eprintln!("SKIP: no Metal device on this host");
+            return;
+        };
+        let mut file = tempfile::tempfile().expect("temporary wire file");
+        let bytes = vec![0u8; 64 * 1024];
+        file.write_all(&bytes).expect("write wire bytes");
+        file.flush().expect("flush wire bytes");
+        let pages = crate::wire_mmap::WirePages::read_from_file(&file, 0, bytes.len())
+            .expect("page-backed wire bytes");
+
+        let mut cache = super::MetalLinearCache::new();
+        let _buffer = cache.q8_wire_nocopy_buffer(&device, &pages);
+        assert_eq!(cache.q8_wire_nocopy_buffers.len(), 1);
+
+        // A live owner holds a second Arc, so the sweep must leave the entry alone.
+        assert_eq!(
+            cache.evict_unreferenced_nocopy(),
+            0,
+            "pages a live model still owns must never be freed"
+        );
+        assert_eq!(cache.q8_wire_nocopy_buffers.len(), 1);
+
+        // Model gone: the cache is now the only owner, which is exactly the condition
+        // that made unload free nothing on macOS.
+        drop(pages);
+        let freed = cache.evict_unreferenced_nocopy();
+        assert_eq!(
+            freed,
+            bytes.len(),
+            "the dropped model's allocation must be reported as reclaimed"
+        );
+        assert!(
+            cache.q8_wire_nocopy_buffers.is_empty(),
+            "the entry must be gone, not merely counted"
+        );
+
+        // Idempotent: a second unload must not double-count or panic.
+        assert_eq!(cache.evict_unreferenced_nocopy(), 0);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // one chunk covering the whole batch
