@@ -1,3 +1,5 @@
+import { normalizeMessageVariants } from './messageVariants.js'
+
 export function cleanLegacyDemoCapCopy(value) {
   if (typeof value !== 'string') return value
   const stripped = value
@@ -15,7 +17,12 @@ export function cleanLegacyDemoCapCopy(value) {
 
 export function normalizeStoredMessage(message, { clearStaleStreaming = false } = {}) {
   if (!message || typeof message !== 'object') return message
-  const { demo_token_cap: _demoTokenCap, ...rest } = message
+  const { demo_token_cap: _demoTokenCap, ...stored } = message
+  /* Keep the sibling list and the mirrored top-level fields in step. A
+     transcript restored from an export, hand-edited, or written by a build
+     that predates variants must never render one alternative's text beside
+     another's token counts. */
+  const rest = normalizeMessageVariants(stored)
   const content = cleanLegacyDemoCapCopy(rest.content)
   if (clearStaleStreaming && rest.streaming) {
     return {

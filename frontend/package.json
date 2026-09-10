@@ -50,6 +50,8 @@
     "smoke:context-meter": "node scripts/context-meter-smoke.mjs",
     "smoke:context-compaction": "node scripts/context-compaction-smoke.mjs",
     "smoke:continuation": "node scripts/chat-continuation-smoke.mjs",
+    "smoke:variants": "node scripts/message-variants-smoke.mjs",
+    "smoke:variants-browser": "node scripts/message-variants-browser-smoke.mjs",
     "smoke:continuation-browser": "node scripts/chat-continuation-browser-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },

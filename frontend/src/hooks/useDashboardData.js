@@ -19,6 +19,7 @@ import {
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { CONTINUATION_INSTRUCTION, canContinueMessage, joinContinuation, mergeContinuedUsage } from '../lib/chatContinuation'
+import { canBranchMessage, variantsOf, withActiveVariant, withActiveVariantRemoved, withVariantAppended } from '../lib/messageVariants'
 import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, normalizeInspection, readInspectionContract } from '../lib/tokenInspection'
 import { STRUCTURED_MODES, DEFAULT_SCHEMA, DEFAULT_GRAMMAR, readStructuredOutputContract, structuredOutputForcesNonStreaming, structuredOutputRequestFields, structuredOutputReadiness } from '../lib/structuredOutput'
 import { DEFAULT_TOOLS, detectRepeatedCall, normalizeToolCalls, readModelToolCapability, readToolContract, toolCallSignature, toolReadiness, toolRequestFields } from '../lib/toolCalling'
@@ -1192,6 +1193,46 @@ export function useDashboardData({ showNotice, clearNotice }) {
     return true
   }
 
+  /* Re-roll a reply, keeping the one already there as a sibling. Regenerate
+     was destructive before this: if the first answer was better it was gone,
+     which is exactly what makes people not press it. */
+  const regenerateAsVariant = async (messageId) => {
+    const target = (selectedConversation?.messages || []).find((message) => message.id === messageId)
+    if (!canBranchMessage(target)) return
+    await sendMessage({ variantOfMessageId: messageId })
+  }
+
+  /* Switching is a pure local edit -- no request, no model, no cost -- so it
+     stays available while another turn is streaming. */
+  const selectMessageVariant = (messageId, index) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === selectedConversationIdRef.current
+        ? {
+            ...conversation,
+            messages: (conversation.messages || []).map((message) => (
+              message.id === messageId ? withActiveVariant(message, index) : message
+            )),
+          }
+        : conversation
+    )))
+  }
+
+  /* Discarding the shown alternative selects a neighbour. The last remaining
+     one cannot be discarded: a reply with no content has nothing to render. */
+  const discardMessageVariant = (messageId) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === selectedConversationIdRef.current
+        ? {
+            ...conversation,
+            messages: (conversation.messages || []).map((message) => (
+              message.id === messageId ? withActiveVariantRemoved(message) : message
+            )),
+            updated_at: nowIso(),
+          }
+        : conversation
+    )))
+  }
+
   /* Resume a reply that stopped on the response budget. The gate checks, the
      model lane and the send path are the ordinary ones -- only the transcript
      bookkeeping differs, and that lives in sendMessage. */
@@ -1217,6 +1258,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       citations = [],
       truncateFromMessageId = null,
       continueFromMessageId = null,
+      variantOfMessageId = null,
     } = options
     /* Continuing supplies its own request text, so it never reads the composer
        and never blocks on an empty one. */
@@ -1224,11 +1266,34 @@ export function useDashboardData({ showNotice, clearNotice }) {
       ? (selectedConversation?.messages || []).find((message) => message.id === continueFromMessageId) || null
       : null
     if (continueFromMessageId && !canContinueMessage(continuedMessage)) return
+    /* Regenerating into a variant re-asks the SAME question: the prompt is
+       already the last turn of the stored history, so no user turn is added
+       and the reply lands on the existing message as a new alternative. */
+    const variantMessage = variantOfMessageId
+      ? (selectedConversation?.messages || []).find((message) => message.id === variantOfMessageId) || null
+      : null
+    if (variantOfMessageId && !canBranchMessage(variantMessage)) return
+    const reusedMessage = continuedMessage || variantMessage
     const continuationPrefix = continuedMessage ? String(continuedMessage.content || '') : ''
     const continuedCompletionTokens = continuedMessage
       ? Math.max(0, Number(continuedMessage.usage?.completion_tokens) || 0)
       : 0
-    const draftContent = continuedMessage ? CONTINUATION_INSTRUCTION : (overrideContent ?? composer)
+    /* Neither reuse path reads the composer. A continuation supplies its own
+       instruction; a variant re-sends the question already in the transcript. */
+    const priorPromptForVariant = variantMessage
+      ? (() => {
+          const messages = selectedConversation?.messages || []
+          const at = messages.findIndex((message) => message.id === variantOfMessageId)
+          const prior = at > 0 ? [...messages.slice(0, at)].reverse().find((m) => m.role === 'user') : null
+          return String(prior?.content || '')
+        })()
+      : ''
+    if (variantMessage && !priorPromptForVariant.trim()) return
+    const draftContent = continuedMessage
+      ? CONTINUATION_INSTRUCTION
+      : variantMessage
+        ? priorPromptForVariant
+        : (overrideContent ?? composer)
     if (!draftContent.trim()) return
     // Supported rows chat through the full gate. Implemented-but-unsupported rows
     // chat through the weaker EXPERIMENTAL lane (every turn marked unverified). Only
@@ -1275,12 +1340,21 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const continueIndex = continueFromMessageId
         ? (conversation.messages || []).findIndex((message) => message.id === continueFromMessageId)
         : -1
+      const variantIndex = variantOfMessageId
+        ? (conversation.messages || []).findIndex((message) => message.id === variantOfMessageId)
+        : -1
       const baseMessages = truncateIndex >= 0
         ? (conversation.messages || []).slice(0, truncateIndex)
         : continueIndex >= 0
           ? (conversation.messages || []).slice(0, continueIndex + 1)
-          : (conversation.messages || [])
-      const history = [...baseMessages, userMessage]
+          : variantIndex >= 0
+            /* Everything BEFORE the reply being re-rolled, which already ends
+               with the question that produced it. */
+            ? (conversation.messages || []).slice(0, variantIndex)
+            : (conversation.messages || [])
+      /* A variant adds no user turn: appending one would duplicate the
+         question in the prompt and in the transcript. */
+      const history = variantMessage ? [...baseMessages] : [...baseMessages, userMessage]
         // A token budget can end entirely inside a model-hidden channel. Keep
         // that diagnostic turn in the transcript, but never feed an empty
         // assistant message back into the next model prompt.
@@ -1377,7 +1451,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       /* The continuation instruction is request-only: storing it would leave a
          "Continue your previous reply..." turn in the transcript and re-send it
          on every later turn. */
-      if (!continuedMessage) {
+      if (!reusedMessage) {
         persistConversations((current) => current.map((item) => (
           item.id === conversation.id
             ? {
@@ -1623,7 +1697,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       /* Continuing reuses the truncated message's id, so every stream patch
          below lands on the reply already on screen instead of opening a second
          bubble under it. */
-      assistantId = continuedMessage ? continuedMessage.id : makeId('message')
+      assistantId = reusedMessage ? reusedMessage.id : makeId('message')
       /* Snapshot of the support claim that was active when this send left the
          composer: row id + status only (never paths) so the message footer can
          cite the exact contract row that gated this generation. */
@@ -1637,8 +1711,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const experimentalLaneAtSend = sendGate.chatMode === 'experimental'
       const assistantMessageBase = {
         ...(continuedMessage || {}),
+        /* A variant is a FRESH reply that only shares an id and a sibling
+           list. Spreading the old reply here would carry its receipt, its web
+           sources and its continuation count onto a generation that produced
+           none of them. */
+        ...(variantMessage ? { variants: variantsOf(variantMessage) } : {}),
         id: assistantId,
         role: 'assistant',
+        /* A continuation keeps what it already generated on screen; a variant
+           starts empty, and its siblings ride along untouched until the
+           terminal write appends this reply to them. */
         content: continuationPrefix,
         model_id: selectedModelId,
         model_name: selectedModel?.name || selectedModelId,
@@ -1674,10 +1756,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
         item.id === conversation.id
           ? {
               ...item,
-              title: item.title === 'New conversation' && !continuedMessage
+              title: item.title === 'New conversation' && !reusedMessage
                 ? messageContent.slice(0, 64)
                 : item.title,
-              messages: continuedMessage
+              messages: reusedMessage
                 ? (item.messages || []).map((message) => (
                     message.id === assistantId ? assistantMessageBase : message
                   ))
@@ -2158,7 +2240,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
           ? {
               ...item,
               messages: (item.messages || []).map((message) => (
-                message.id === assistantId ? assistantMessage : message
+                message.id === assistantId
+                  /* Siblings come from the message as it was BEFORE this
+                     regeneration, so a re-roll of a re-roll keeps the whole
+                     set rather than collapsing to two. */
+                  ? (variantMessage ? withVariantAppended(variantMessage, assistantMessage) : assistantMessage)
+                  : message
               )),
               updated_at: nowIso(),
             }
@@ -2693,6 +2780,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     sendMessage,
     resendFromMessage,
     continueFromMessage,
+    regenerateAsVariant,
+    selectMessageVariant,
+    discardMessageVariant,
     stopGeneration,
     saveToMemory,
     createMemory,

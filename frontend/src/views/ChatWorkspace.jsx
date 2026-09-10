@@ -17,6 +17,7 @@ import { ChatControls } from '../components/chat/ChatControls'
 import { ContextMeter } from '../components/chat/ContextMeter'
 import { composeContextBudget } from '../lib/contextBudget.js'
 import { canContinueMessage } from '../lib/chatContinuation.js'
+import { canBranchMessage } from '../lib/messageVariants.js'
 import {
   AUTO_COMPACT_THRESHOLD_PERCENT,
   applySendCompaction,
@@ -176,6 +177,9 @@ export default function ChatWorkspace({
   sendMessage,
   resendFromMessage = null,
   continueFromMessage = null,
+  regenerateAsVariant = null,
+  selectMessageVariant = null,
+  discardMessageVariant = null,
   stopGeneration,
   sending,
   receiptMode = false,
@@ -1356,6 +1360,15 @@ export default function ChatWorkspace({
                   && canChat
                   && isLastMessage
                   && canContinueMessage(message)
+                /* Re-rolling the LAST reply keeps the old one as a sibling --
+                   nothing after it can go stale, because nothing is after it.
+                   Mid-thread it stays the old resend, which does discard the
+                   turns below and now says so. */
+                const canBranchHere = Boolean(regenerateAsVariant)
+                  && !requestActive
+                  && canChat
+                  && isLastMessage
+                  && canBranchMessage(message)
                 const priorMessage = index > 0 ? visibleMessages[index - 1] : null
                 const dayKey = dayKeyOf(message.created_at)
                 const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null
@@ -1372,7 +1385,12 @@ export default function ChatWorkspace({
                       generationElapsedSeconds={generationElapsedSeconds}
                       priorUserPrompt={priorUserPrompt}
                       onReusePrompt={setComposer}
-                      onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
+                      onRegenerate={canBranchHere
+                        ? () => regenerateAsVariant(message.id)
+                        : (canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null)}
+                      regenerateReplacesThread={!canBranchHere}
+                      onSelectVariant={selectMessageVariant ? (index) => selectMessageVariant(message.id, index) : null}
+                      onDiscardVariant={discardMessageVariant && !requestActive ? () => discardMessageVariant(message.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
                       onContinue={canContinue ? () => continueFromMessage(message.id) : null}
                       tokenInspection={tokenInspections?.[message.id] || null}
