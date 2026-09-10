@@ -87,6 +87,25 @@ token for token; leave it unset when it does not. It additionally requires
 `CAMELID_METAL_KQUANT_MM` (already on by default), and does nothing on its own.
 Receipts: `qa/evidence-bundles/metal-kquant-attn-mm-20260909/`.
 
+### Trading prefill for KV memory on Q8_0 models (macOS/Metal)
+
+A Q8_0 model keeps an F32 resident KV cache by default. `CAMELID_METAL_KV_DTYPE=f16`
+switches it to a half primary, which halves the KV footprint.
+
+Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q8_0: **597 MB saved** at ~4200
+positions (6554 MB → 5957 MB physical footprint), against **~11% slower prefill** on a
+2900-token prompt (4.53 s → 5.03 s). Decode is unchanged (29.9 vs 30.0 tok/s) and
+generated text was identical on every prompt compared.
+
+The saving scales with context and layer count, so it matters most where memory is the
+binding constraint — a long-context 8B on a 16 GiB machine — and least on short prompts,
+where there is little KV to halve and the prefill cost still applies.
+
+This is off by default. Prior to the `all_q8` admission in `use_attn_mm` it was a much
+worse deal (2.24x prefill, because an F16 primary silently lost the attention-as-matmul
+lane); the numbers above are on a tree that has it. Receipts:
+`qa/evidence-bundles/metal-q8-f16-kv-primary-20260909/`.
+
 ## Production HTTP policy
 
 Anonymous loopback serving remains the default. A non-loopback address has to answer two separate
