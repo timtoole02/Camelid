@@ -45466,6 +45466,28 @@ impl ResidentDecodeState {
         None
     }
 
+    /// Non-macOS stub: there is no resident engine, so continuation never applies. Present
+    /// because `inference::metal_resident` compiles on every target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_from(
+        &mut self,
+        _embeddings: &[f32],
+        _n_tokens: usize,
+        _layers: &[ResidentLayerWeights],
+        _cos_all: &[f32],
+        _sin_all: &[f32],
+        _scale: f32,
+        _base_position: usize,
+    ) -> Option<()> {
+        None
+    }
+
+    /// Non-macOS stub: zeroed geometry. Nothing can park on this target, so no caller ever
+    /// compares it.
+    pub fn geometry(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (0, 0, 0, 0, 0, 0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_tokens_windowed(
         &mut self,
