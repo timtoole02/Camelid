@@ -112,16 +112,61 @@ the fourth and last consumer: `rollback_to_position`, which gates on
 `cpu_kv_authoritative()` and is reached by GPU speculative decode. Without that
 addition it would have started returning `speculative_rollback_failed`.
 
-## Known tradeoff
+## Tradeoffs
 
-If a reseed is ever needed with a hollow history — the engine evicted or rebuilt
-mid-generation — the eager mirror would have left a host copy to re-seed the GPU
-from, whereas now that token routes to the CPU path instead. That path is correct
-and warns; it is never silently wrong (`history_materialized` declines rather than
-laundering zeros through the GPU cache). It also requires the engine to be
-displaced *during* a request, which the CUDA lane's run-to-completion scheduling
-makes very hard to reach. `CAMELID_CUDA_EAGER_KV_MIRROR=1` restores the old
-behaviour if some host reaches it.
+The lazy recovery's guard is `filled() == position`. A reseed is needed precisely
+when `filled != position`. **Those two conditions are mutually exclusive**, so in
+the exact case where the GPU needs re-seeding, the lazy recovery also declines.
+Everything below follows from that.
+
+### 1. Speculative rollback — closed structurally, not by argument
+
+`rollback_to_position` requires `cpu_kv_authoritative()`, and a speculative
+rollback can run with drafts written past `position`, which is the case the lazy
+recovery cannot satisfy. That would turn a working opt-in feature into a
+`speculative_rollback_failed` 503.
+
+**This was NOT closed by reasoning about reachability.** Attempts to exercise GPU
+speculative decode on this lane were all uninformative — identical replies prove
+nothing if speculation never ran; `CAMELID_SPEC_VERIFY_TRACE` turned out to print
+only from Metal paths, so it is structurally blind to CUDA; and a 400-token
+maximally-repetitive generation produced no CUDA-visible signal either. There is
+no per-request speculative field to observe.
+
+So the mirror simply stays **eager whenever the request may speculate**
+(`cpu_kv_mirror_eager`, default `true`, cleared by `prepare_generation` only when
+`speculative.is_none()`). The default direction is the point: any caller this was
+not audited against keeps the historical behaviour.
+
+### 2. Reseed with a hollow history — REAL, and not fully closed
+
+If the resident engine is rebuilt or evicted **between** this request's prefill
+and a later decode step of the same request, the reseed and the recovery decline
+for the same reason, and that forward attends over a zero-filled prefix. That is
+**degraded output**, surfaced only as a one-shot stderr warning a user will not
+see. The eager copy left a host copy that covered this.
+
+It requires the engine to be displaced *during* a request, which the CUDA lane's
+run-to-completion scheduling makes very hard to reach — but that scheduling was
+not verified against a concurrent model load/unload, so this is mitigated, not
+proven unreachable. `CAMELID_CUDA_EAGER_KV_MIRROR=1` restores the old behaviour
+everywhere.
+
+### 3. The first CPU fallback pays the copy inline
+
+Previously the cost was spent at prefill, so a fallback was cheap. Now the first
+fallback pays the full copy as a latency spike on that one token. Net still far
+better, because fallbacks are rare — but it is moved, not removed.
+
+### 4. The invariant's gate is a deletion-guard only
+
+`check-cuda-prefill-parity-gate.mjs` now pins the count of
+`ensure_cpu_kv_materialized` callers at 4 and the safe default at
+`cpu_kv_mirror_eager: true`, and both mutations were negative-tested (removing a
+call and flipping the default each fail the gate). But grep cannot know what
+*reads* the history, so it cannot catch a NEW reader added without the call. That
+reader would get degraded output rather than a failure. The gate says so in a
+comment addressed to whoever adds the fifth one.
 
 ## Caveat
 

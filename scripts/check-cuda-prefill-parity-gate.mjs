@@ -79,6 +79,36 @@ const checks = [
     ],
   },
   {
+    file: 'src/inference.rs',
+    label: 'every CPU KV-history reader materializes the GPU mirror on demand',
+    // A CUDA-resident prefill no longer mirrors its KV back eagerly (except for
+    // speculating sessions), so the CPU history exists only when someone asks for it.
+    // Each reader must ask BEFORE touching `kv_cache`, or it silently attends over a
+    // zero-filled prefix — degraded output with one stderr warning, not a failure.
+    //
+    // Four callers today: the three CPU forward readers
+    // (forward_layer_range_from_hidden, forward_single_token_timed_internal, the verify
+    // path) plus rollback_to_position, which gates on cpu_kv_authoritative().
+    //
+    // HONEST LIMIT: this pins the count, so DELETING a call fails the gate. It cannot
+    // detect a NEW reader added without one — grep cannot know what reads the history.
+    // If you are adding a CPU path that attends over `kv_cache`, call
+    // `ensure_cpu_kv_materialized()` first and raise this number.
+    needs: [
+      { token: 'self.ensure_cpu_kv_materialized()', atLeast: 4 },
+      // The safe default: sessions start eager, and only an audited caller opts out.
+      'cpu_kv_mirror_eager: true',
+      'fn set_cpu_kv_mirror_eager',
+    ],
+  },
+  {
+    file: 'src/api/mod.rs',
+    label: 'only non-speculating requests opt into the lazy KV mirror',
+    // Speculation reaches rollback_to_position, which the lazy recovery cannot always
+    // satisfy. Widening this to unconditional lazy re-opens speculative_rollback_failed.
+    needs: ['session.set_cpu_kv_mirror_eager(speculative.is_some())'],
+  },
+  {
     file: 'src/cuda_resident/tests.rs',
     label: 'batched-prefill parity test present and asserts token-identity',
     needs: [
