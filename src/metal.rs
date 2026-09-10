@@ -24241,6 +24241,34 @@ fn kquant_mm_prefill_from(value: Option<&str>) -> bool {
 /// lossless part.
 ///
 /// Requires `CAMELID_METAL_KQUANT_MM=1` as well; on its own it does nothing.
+///
+/// Measured 2026-09-09 on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M, which had no
+/// numbers of its own before. `CAMELID_PREFILL_TRACE=1`, 2351-token prompt, hardware
+/// GPU-busy per stage — every stage but attention matches within 1 ms, which is the
+/// control that says the flag moves attention and nothing else:
+///
+/// ```text
+///   stage           off        on
+///   attention     5519 ms    381 ms      14.5x
+///   gemm_qkv       625 ms    624 ms
+///   gemm_gateup   1881 ms   1881 ms
+///   gemm_down     1029 ms   1030 ms
+///   gemm_o         354 ms    354 ms
+///   TOTAL         9511 ms   4372 ms      2.18x
+/// ```
+///
+/// The precision trade generalises past 1B, so the opt-in stays. Greedy, 128 tokens,
+/// five prompt shapes, two independent runs, one server per arm: four cases token
+/// identical (filler at 390 / 1186 / 2355 prompt tokens, and prose at 1171), one case
+/// divergent — prose at 595 prompt tokens, first differing at generated character 238,
+/// reproducing byte-for-byte across both runs. Divergence is occasional and
+/// content-dependent rather than absent, exactly as the flatter-logits argument predicts,
+/// and it is deterministic rather than flaky.
+///
+/// So this is genuinely a choice and not a missing qualification: 2.18x off the prefill,
+/// against output that sometimes differs from the exact lane. That is why it is not
+/// promoted to default-on the way `kquant_mm_prefill_enabled` was.
+/// Receipts: `qa/evidence-bundles/metal-kquant-attn-mm-20260909/`.
 #[cfg(target_os = "macos")]
 fn kquant_attn_mm_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -40436,11 +40464,16 @@ impl ResidentDecodeState {
             && (!stage_q8_kv || q8_stage_bytes.is_some())
             // A K-quant model staged onto the MM lane has the same half activation stream
             // this path needs; the attention matmuls never touch a weight, so `all_q8` was
-            // only ever standing in for "the f16 stream is available". Note the surviving
-            // `!self.kv16` conjunct above still excludes the K-quant DEFAULT, whose primary
-            // is F16 — this admits a K-quant model only when it is running an F32 primary.
-            // Admitting the F16 primary needs the same "the primary IS the half cache"
-            // binding the split-K path uses, at the `cache_k16`/`cache_v16` sites below.
+            // only ever standing in for "the f16 stream is available".
+            //
+            // The `!self.kv16` conjunct above does NOT exclude the K-quant default. Its
+            // `|| (use_kq_mm && kquant_attn_mm_prefill_enabled())` arm admits an F16
+            // primary, and the binding that arm needs is already in place: the
+            // `attn_k16`/`attn_v16` selection below takes `&self.cache_k[i]` when
+            // `self.kv16`, i.e. the primary IS the half cache, exactly as the upper
+            // comment says. (Under `kv16 || kvq8` the f16 mirrors are `Vec::new()`, so
+            // binding those instead would have been the bug.) What the conjunct still
+            // excludes is a Q8_0 model on an F16 primary, which is not `use_kq_mm`.
             && (all_q8 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && mm_prefill_enabled()
             && !has_qk_norm

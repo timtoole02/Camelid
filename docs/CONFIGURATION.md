@@ -64,6 +64,29 @@ every non-Metal session, are unaffected.
 so the measurement can be reproduced against a single binary
 (`qa/evidence-bundles/metal-partial-prefix-hit-20260909/`), not as a tuning knob.
 
+### Trading prefill speed for exactness on K-quant models (macOS/Metal)
+
+`CAMELID_METAL_KQUANT_ATTN_MM=1` admits a K-quant model's attention to the
+attention-as-matmul prefill. It is **off by default, deliberately** — this is a choice
+about output, not a feature waiting on qualification, so it is documented here rather than
+left to be discovered.
+
+Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M and a 2351-token prompt
+(hardware GPU-busy per stage): prefill attention **5519 ms → 381 ms**, total prefill
+**9511 ms → 4372 ms** — a **2.18x** cut in time to first token. Every non-attention stage
+matches within 1 ms, so the flag moves attention and nothing else.
+
+The cost is that attention-as-matmul stages K/Q scores as half, and on a K-quant model's
+flatter logits that can move greedy output. Across five prompt shapes at greedy/128
+tokens, run twice: four token-identical, one divergent (prose at 595 prompt tokens, first
+differing at generated character 238, reproducing byte-for-byte). Divergence is occasional
+and content-dependent, and deterministic rather than flaky.
+
+Set it when time to first token on long prompts matters more than matching the exact lane
+token for token; leave it unset when it does not. It additionally requires
+`CAMELID_METAL_KQUANT_MM` (already on by default), and does nothing on its own.
+Receipts: `qa/evidence-bundles/metal-kquant-attn-mm-20260909/`.
+
 ## Production HTTP policy
 
 Anonymous loopback serving remains the default. A non-loopback address has to answer two separate

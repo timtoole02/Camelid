@@ -1,0 +1,57 @@
+=========================================================================
+A. SPEED  --  CAMELID_PREFILL_TRACE=1, 2351-token prompt
+   Hardware GPU-busy per prefill stage. The flag is the only difference.
+-------------------------------------------------------------------------
+   stage              off        on      ratio
+   1:norm+cvt         12 ms     12 ms
+   2:gemm_qkv        625 ms    624 ms
+   3:rope+scatter     30 ms     30 ms
+   4:attention      5519 ms    381 ms     14.5x
+   5:gemm_o          354 ms    354 ms
+   6:norm2+cvt        34 ms     34 ms
+   7:gemm_gateup    1881 ms   1881 ms
+   8:gemm_down      1029 ms   1030 ms
+   9:resid+silu       22 ms     21 ms
+   ---------------------------------------------
+   TOTAL            9511 ms   4372 ms     2.18x
+
+   Every non-attention stage matches within 1 ms. That is the control: the flag
+   moves the attention stage and nothing else, so the 2.18x is not drift.
+
+   Short-prompt sanity (n_tokens=10): 327 ms vs 287 ms total, attention 0 vs 1 ms
+   -- nothing to win, as expected, since the attention term is quadratic in prompt
+   length while the GEMM terms are linear.
+
+   NOTE: CAMELID_PREFILL_TRACE=1 splits each stage into its own command buffer and
+   waits, so it INFLATES wall time. These are per-stage GPU-busy attributions, not
+   wall-clock TTFT.
+
+=========================================================================
+B. EXACTNESS  --  greedy, temperature 0, max_tokens 128, two independent runs
+   metal.rs records divergence at generated token 4 on Llama-3.2-1B-Q4_K_M. No
+   equivalent measurement existed for any other model; this is 3B.
+-------------------------------------------------------------------------
+   case          prompt_tokens   run1        run2
+   filler-350         390        IDENTICAL   IDENTICAL
+   filler-1100       1186        IDENTICAL   IDENTICAL
+   filler-2200       2355        IDENTICAL   IDENTICAL
+   prose-900          595        DIVERGES    DIVERGES
+   prose-1800        1171        IDENTICAL   IDENTICAL
+
+   prose-900 first differs at generated character 238, byte-for-byte the same in
+   both runs:
+     off: "of their machines' memory. They struggle"
+     on:  "and speed of their machines' memory. The"
+
+   So the precision trade generalises past 1B: occasional, content-dependent, and
+   deterministic rather than flaky. Prose diverges where filler does not, which is
+   what the flatter-logits argument predicts. Note prose-1800 did NOT diverge --
+   this is not monotone in prompt length.
+
+=========================================================================
+C. CONCLUSION
+   2.18x off prefill, against output that sometimes differs from the exact lane.
+   That is a real choice, so the flag stays opt-in and is now documented as such
+   in docs/CONFIGURATION.md rather than being undiscoverable. It is NOT the same
+   situation as CAMELID_METAL_KQUANT_MM, which was opt-in only for want of a
+   second host and was promoted once it had one.

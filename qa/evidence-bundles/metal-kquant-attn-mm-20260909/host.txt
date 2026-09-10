@@ -1,0 +1,10 @@
+host      tims-mac-mini-2.lan (mini2)
+cpu       Apple M4, 10 cores
+memory    17179869184 bytes (16 GiB unified)
+os        macOS 26.6.2 (25G83)
+model     Llama-3.2-3B-Instruct-Q4_K_M.gguf  sha256:6c1a2b41161032677be168d354123594...
+baseline  origin/main @ fabbb818 (v0.7.2)
+
+One server per arm: kquant_attn_mm_prefill_enabled() latches its env read in a OnceLock,
+so the flag is fixed for the life of the process and cannot be flipped between requests.
+Machine otherwise idle for every arm.
