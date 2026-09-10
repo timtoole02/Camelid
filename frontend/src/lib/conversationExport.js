@@ -66,6 +66,45 @@ export function conversationToJson(conversation) {
   return JSON.stringify(exportableConversation(conversation), null, 2)
 }
 
+/* Bulk export. Same per-conversation whitelist, so the field policy above is
+   the only place that decides what may leave this machine -- a second shape
+   here is how an export starts leaking local paths again. Tags ride along so
+   an import lands organized; pinned/archived deliberately do not, because
+   they describe THIS machine's list, not the conversation. */
+export function exportableConversations(conversations) {
+  return {
+    format: 'camelid.conversations/v1',
+    exported_at: new Date().toISOString(),
+    telemetry_note: 'Timing/token fields are operational telemetry (client-measured unless usage_source=backend). They are not compatibility or support evidence.',
+    conversation_count: (conversations || []).length,
+    conversations: (conversations || []).map((conversation) => {
+      const exported = exportableConversation(conversation)
+      const tags = Array.isArray(conversation?.tags)
+        ? conversation.tags.map((tag) => String(tag)).filter(Boolean)
+        : []
+      if (tags.length) exported.tags = tags
+      return exported
+    }),
+  }
+}
+
+export function conversationsToJson(conversations) {
+  return JSON.stringify(exportableConversations(conversations), null, 2)
+}
+
+export function downloadAllConversations(conversations) {
+  const blob = new Blob([conversationsToJson(conversations)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  const stamp = new Date().toISOString().slice(0, 10)
+  anchor.href = url
+  anchor.download = `camelid-conversations-${stamp}.json`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
 export function conversationToMarkdown(conversation) {
   const data = exportableConversation(conversation)
   const lines = [`# ${data.title}`, '']
