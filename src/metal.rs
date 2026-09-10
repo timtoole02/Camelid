@@ -677,6 +677,59 @@ impl MetalLinearCache {
             .insert(key, (buffer.to_owned(), std::sync::Arc::clone(pages)));
         buffer
     }
+
+    /// Drop the no-copy entries whose backing allocation has no owner left, and report
+    /// the bytes released.
+    ///
+    /// `strong_count == 1` means this cache holds the ONLY `Arc`, so the model that
+    /// loaded those pages is gone. That is the whole safety argument, and it holds
+    /// without any ownership plumbing: an `Arc` can only be obtained by cloning an
+    /// existing one, so anything still able to reach these pages is itself already
+    /// counted. A live model therefore reads `>= 2` and is kept. The mutex is held
+    /// across the sweep, and a count of 1 cannot race upwards for the same reason.
+    ///
+    /// Deliberately scoped to `q8_wire_nocopy_buffers`. The other four permanent maps
+    /// hold GPU COPIES keyed by a source `(ptr, len)`, with no owner handle to test, so
+    /// nothing here can tell a live entry from a dead one — and `serve` enables
+    /// `CAMELID_METAL_NOCOPY` by default, which is what puts the GB-scale weights in
+    /// this map in the first place. Reclaiming the copy caches needs a per-model owner
+    /// and is a separate change.
+    fn evict_unreferenced_nocopy(&mut self) -> usize {
+        let mut freed = 0usize;
+        self.q8_wire_nocopy_buffers.retain(|_, (_, pages)| {
+            if std::sync::Arc::strong_count(pages) == 1 {
+                freed += pages.byte_len();
+                false
+            } else {
+                true
+            }
+        });
+        freed
+    }
+}
+
+/// Release resident weight allocations that no live model still owns; returns bytes freed.
+///
+/// `release_model` drops the CPU-side registries and then calls
+/// `inference::reset_resident_caches`, whose macOS arm was an empty stub — so on this
+/// platform unload freed the registries and essentially none of the weights. On the
+/// default `serve` path `CAMELID_METAL_NOCOPY` is on, so a model's weights ARE its
+/// `WirePages` allocation, and the process-global buffer cache is the surviving owner:
+/// the pages stay resident for the life of the process, a reload maps the file again at a
+/// new address and takes a second full copy, and the fit advisor then reads the phantom
+/// occupancy and reports that releasing the model "frees ~N GB" when it frees nothing.
+///
+/// Nothing is reclaimable while a single model is live, so this costs zero in a
+/// one-model process. It pays on switching models in place, which is what the app's Load
+/// button does.
+#[cfg(target_os = "macos")]
+pub(crate) fn evict_unreferenced_resident_weights() -> usize {
+    let Some(cache) = METAL_LINEAR_CACHE.get() else {
+        // Never populated: nothing was ever made resident in this process.
+        return 0;
+    };
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    guard.evict_unreferenced_nocopy()
 }
 
 /// Hardware GPU timestamps from a completed command buffer: (GPU busy window µs,
@@ -24188,6 +24241,34 @@ fn kquant_mm_prefill_from(value: Option<&str>) -> bool {
 /// lossless part.
 ///
 /// Requires `CAMELID_METAL_KQUANT_MM=1` as well; on its own it does nothing.
+///
+/// Measured 2026-09-09 on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M, which had no
+/// numbers of its own before. `CAMELID_PREFILL_TRACE=1`, 2351-token prompt, hardware
+/// GPU-busy per stage — every stage but attention matches within 1 ms, which is the
+/// control that says the flag moves attention and nothing else:
+///
+/// ```text
+///   stage           off        on
+///   attention     5519 ms    381 ms      14.5x
+///   gemm_qkv       625 ms    624 ms
+///   gemm_gateup   1881 ms   1881 ms
+///   gemm_down     1029 ms   1030 ms
+///   gemm_o         354 ms    354 ms
+///   TOTAL         9511 ms   4372 ms      2.18x
+/// ```
+///
+/// The precision trade generalises past 1B, so the opt-in stays. Greedy, 128 tokens,
+/// five prompt shapes, two independent runs, one server per arm: four cases token
+/// identical (filler at 390 / 1186 / 2355 prompt tokens, and prose at 1171), one case
+/// divergent — prose at 595 prompt tokens, first differing at generated character 238,
+/// reproducing byte-for-byte across both runs. Divergence is occasional and
+/// content-dependent rather than absent, exactly as the flatter-logits argument predicts,
+/// and it is deterministic rather than flaky.
+///
+/// So this is genuinely a choice and not a missing qualification: 2.18x off the prefill,
+/// against output that sometimes differs from the exact lane. That is why it is not
+/// promoted to default-on the way `kquant_mm_prefill_enabled` was.
+/// Receipts: `qa/evidence-bundles/metal-kquant-attn-mm-20260909/`.
 #[cfg(target_os = "macos")]
 fn kquant_attn_mm_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -40374,20 +40455,40 @@ impl ResidentDecodeState {
         let use_attn_mm = (!has_moe || (moe_prefill_mm_enabled() && moe_prefill_grouped_enabled()))
             // An F16 primary IS the half cache this path reads, exactly as it is for the
             // split-K decode attention: `attn_k16`/`attn_v16` below bind the primary
-            // instead of the (empty) mirrors. Scoped to the K-quant MM lane rather than
-            // opened for every kv16 primary, so the blast radius is the lane being
-            // measured -- a Q8_0 model forced to `CAMELID_METAL_KV_DTYPE=f16` keeps its
-            // current behaviour.
-            && (!self.kv16 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
+            // instead of the (empty) mirrors.
+            //
+            // `all_q8` is admitted here for the same reason it is admitted below: a Q8_0
+            // model already runs this path by default on its F32 primary, and already
+            // accepts the half-staged scores that come with it. Being moved onto an F16
+            // primary does not change that trade -- it only changes where the half K/V is
+            // read from -- so excluding it was a pure loss.
+            //
+            // Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q8_0 under
+            // `CAMELID_METAL_KV_DTYPE=f16`, ~2900-token prompt, against the 4.53 s F32
+            // default. Without this clause the F16 primary took 10.15 s, a 2.24x prefill
+            // regression -- which is the "~2.2x" the KQUANT_LANE_ENGAGED comment records,
+            // reproduced. With it, 5.03 s: 1.11x, with decode and output unchanged.
+            //
+            // (A first measurement of the same case read 42.7 s. That was NOT this
+            // exclusion: ~32 s of it was the partial-prefix-cache hit falling to the CPU
+            // dense forward, fixed separately. Worth stating because the two stack, and
+            // the larger number is the one an unpatched tree will show.)
+            && (!self.kv16 || all_q8 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && (!self.kvq8 || stage_q8_kv)
             && (!stage_q8_kv || q8_stage_bytes.is_some())
             // A K-quant model staged onto the MM lane has the same half activation stream
             // this path needs; the attention matmuls never touch a weight, so `all_q8` was
-            // only ever standing in for "the f16 stream is available". Note the surviving
-            // `!self.kv16` conjunct above still excludes the K-quant DEFAULT, whose primary
-            // is F16 — this admits a K-quant model only when it is running an F32 primary.
-            // Admitting the F16 primary needs the same "the primary IS the half cache"
-            // binding the split-K path uses, at the `cache_k16`/`cache_v16` sites below.
+            // only ever standing in for "the f16 stream is available".
+            //
+            // The `!self.kv16` conjunct above does NOT exclude the K-quant default. Its
+            // `|| (use_kq_mm && kquant_attn_mm_prefill_enabled())` arm admits an F16
+            // primary, and the binding that arm needs is already in place: the
+            // `attn_k16`/`attn_v16` selection below takes `&self.cache_k[i]` when
+            // `self.kv16`, i.e. the primary IS the half cache, exactly as the upper
+            // comment says. (Under `kv16 || kvq8` the f16 mirrors are `Vec::new()`, so
+            // binding those instead would have been the bug.) A Q8_0 model on an F16
+            // primary is admitted by the `all_q8` arm added above, for the reason given
+            // there, so the conjunct now excludes nothing that reaches this lane.
             && (all_q8 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && mm_prefill_enabled()
             && !has_qk_norm
@@ -45679,6 +45780,59 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    /// Eviction must free a dropped model's pages and must NOT touch a live model's.
+    ///
+    /// The distinction is the whole safety argument, so it is asserted in both
+    /// directions on one cache: insert while an owner is alive (a sweep must be a
+    /// no-op), then drop the owner (the same sweep must reclaim). Runs on a local
+    /// `MetalLinearCache` rather than the process-global one so it cannot perturb any
+    /// other test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_weight_eviction_frees_only_pages_no_model_still_owns() {
+        use std::io::Write;
+
+        let Some(device) = super::Device::system_default() else {
+            eprintln!("SKIP: no Metal device on this host");
+            return;
+        };
+        let mut file = tempfile::tempfile().expect("temporary wire file");
+        let bytes = vec![0u8; 64 * 1024];
+        file.write_all(&bytes).expect("write wire bytes");
+        file.flush().expect("flush wire bytes");
+        let pages = crate::wire_mmap::WirePages::read_from_file(&file, 0, bytes.len())
+            .expect("page-backed wire bytes");
+
+        let mut cache = super::MetalLinearCache::new();
+        let _buffer = cache.q8_wire_nocopy_buffer(&device, &pages);
+        assert_eq!(cache.q8_wire_nocopy_buffers.len(), 1);
+
+        // A live owner holds a second Arc, so the sweep must leave the entry alone.
+        assert_eq!(
+            cache.evict_unreferenced_nocopy(),
+            0,
+            "pages a live model still owns must never be freed"
+        );
+        assert_eq!(cache.q8_wire_nocopy_buffers.len(), 1);
+
+        // Model gone: the cache is now the only owner, which is exactly the condition
+        // that made unload free nothing on macOS.
+        drop(pages);
+        let freed = cache.evict_unreferenced_nocopy();
+        assert_eq!(
+            freed,
+            bytes.len(),
+            "the dropped model's allocation must be reported as reclaimed"
+        );
+        assert!(
+            cache.q8_wire_nocopy_buffers.is_empty(),
+            "the entry must be gone, not merely counted"
+        );
+
+        // Idempotent: a second unload must not double-count or panic.
+        assert_eq!(cache.evict_unreferenced_nocopy(), 0);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // one chunk covering the whole batch

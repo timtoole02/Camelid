@@ -49,6 +49,63 @@ target/release/camelid serve --model /path/to/model.gguf
 
 That startup path loads the model immediately and applies the default `auto` execution profile for the current host. Use `CAMELID_PROFILE=safe|auto|experimental|debug` when you need to change planner behavior; keep lower-level experiment env vars as developer overrides rather than the primary user workflow.
 
+### Prompt-prefix cache: partial hits on the Metal lane
+
+A partial prompt-prefix-cache hit resumes a cached session at a non-zero KV position, and
+the batched Metal prefill only builds a cache from empty — so the divergent suffix would
+fall to the CPU dense forward. Measured on an M4 / 16 GiB with
+Llama-3.2-3B-Instruct-Q4_K_M and a ~500-token prompt, taking that hit cost 20.79 s against
+1.33 s for a cold miss, and returned different tokens than a cold prefill of the same
+prompt. Camelid therefore declines a partial resume when the batched Metal prefill would
+otherwise have applied, and prefills the whole prompt on the GPU instead. Exact hits, and
+every non-Metal session, are unaffected.
+
+`CAMELID_METAL_PREFIX_PARTIAL_RESUME=1` restores the old unconditional resume. It exists
+so the measurement can be reproduced against a single binary
+(`qa/evidence-bundles/metal-partial-prefix-hit-20260909/`), not as a tuning knob.
+
+### Trading prefill speed for exactness on K-quant models (macOS/Metal)
+
+`CAMELID_METAL_KQUANT_ATTN_MM=1` admits a K-quant model's attention to the
+attention-as-matmul prefill. It is **off by default, deliberately** — this is a choice
+about output, not a feature waiting on qualification, so it is documented here rather than
+left to be discovered.
+
+Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M and a 2351-token prompt
+(hardware GPU-busy per stage): prefill attention **5519 ms → 381 ms**, total prefill
+**9511 ms → 4372 ms** — a **2.18x** cut in time to first token. Every non-attention stage
+matches within 1 ms, so the flag moves attention and nothing else.
+
+The cost is that attention-as-matmul stages K/Q scores as half, and on a K-quant model's
+flatter logits that can move greedy output. Across five prompt shapes at greedy/128
+tokens, run twice: four token-identical, one divergent (prose at 595 prompt tokens, first
+differing at generated character 238, reproducing byte-for-byte). Divergence is occasional
+and content-dependent, and deterministic rather than flaky.
+
+Set it when time to first token on long prompts matters more than matching the exact lane
+token for token; leave it unset when it does not. It additionally requires
+`CAMELID_METAL_KQUANT_MM` (already on by default), and does nothing on its own.
+Receipts: `qa/evidence-bundles/metal-kquant-attn-mm-20260909/`.
+
+### Trading prefill for KV memory on Q8_0 models (macOS/Metal)
+
+A Q8_0 model keeps an F32 resident KV cache by default. `CAMELID_METAL_KV_DTYPE=f16`
+switches it to a half primary, which halves the KV footprint.
+
+Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q8_0: **597 MB saved** at ~4200
+positions (6554 MB → 5957 MB physical footprint), against **~11% slower prefill** on a
+2900-token prompt (4.53 s → 5.03 s). Decode is unchanged (29.9 vs 30.0 tok/s) and
+generated text was identical on every prompt compared.
+
+The saving scales with context and layer count, so it matters most where memory is the
+binding constraint — a long-context 8B on a 16 GiB machine — and least on short prompts,
+where there is little KV to halve and the prefill cost still applies.
+
+This is off by default. Prior to the `all_q8` admission in `use_attn_mm` it was a much
+worse deal (2.24x prefill, because an F16 primary silently lost the attention-as-matmul
+lane); the numbers above are on a tree that has it. Receipts:
+`qa/evidence-bundles/metal-q8-f16-kv-primary-20260909/`.
+
 ## Production HTTP policy
 
 Anonymous loopback serving remains the default. A non-loopback address has to answer two separate
