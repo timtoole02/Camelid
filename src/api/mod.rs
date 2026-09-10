@@ -22095,6 +22095,24 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
 /// A malformed/stale cache entry must never make generation fail: when
 /// rollback cannot establish the requested prefix position the caller retains
 /// the fresh session and performs a cold prefill.
+/// `1` restores the unconditional partial resume this function used to do, so the
+/// regression it now avoids can be measured against the SAME binary. Not a tuning knob:
+/// the only reason to set it is to reproduce the A/B in
+/// `qa/evidence-bundles/metal-partial-prefix-hit-*`.
+fn partial_resume_forced() -> bool {
+    partial_resume_forced_from(
+        std::env::var("CAMELID_METAL_PREFIX_PARTIAL_RESUME")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The env half of [`partial_resume_forced`], split out so the DEFAULT is covered by a
+/// test rather than by whatever the ambient environment happens to hold.
+fn partial_resume_forced_from(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 fn resume_partial_prefix_hit(
     prepared: &mut PreparedGeneration,
     mut cached_session: LlamaInferenceSession,
@@ -22102,6 +22120,24 @@ fn resume_partial_prefix_hit(
     input: &mut Vec<u32>,
 ) {
     if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return;
+    }
+    // A partial hit is only worth taking if the divergent suffix can still be prefilled
+    // on the GPU. It cannot: resuming sets `kv_position = prefix_len > 0`, and the
+    // batched Metal prefill declines outright on a non-zero position, dropping the
+    // suffix onto the CPU dense forward. Measured on an M4 / 16 GiB,
+    // Llama-3.2-3B-Instruct-Q4_K_M, ~500-token prompt: cold miss 1.33 s, partial hit
+    // 20.79 s. Taking the hit was a 15.6x LOSS on exactly the shape it was built for —
+    // turn 2 of a conversation with a system prompt.
+    //
+    // Declining leaves `prepared.session` as the fresh session, so the caller prefills
+    // the whole prompt on the GPU from position 0: faster, and the bit-exact reference
+    // path. Exact hits never reach here (they replay stored logits and skip prefill).
+    if !partial_resume_forced()
+        && prepared
+            .session
+            .metal_resident_prefill_would_apply(prepared.token_ids.len())
+    {
         return;
     }
     if cached_session.rollback_to_position(prefix_len).is_ok() {
@@ -31875,6 +31911,60 @@ mod tests {
             "the control fixture must store — otherwise this test is not \
              exercising the windowed-arch bypass"
         );
+    }
+
+    /// The partial-resume escape hatch is OFF unless explicitly set to 1/true. It exists
+    /// only to reproduce the A/B against one binary, so anything else — unset, empty, 0,
+    /// or a stray value — must leave the regression avoided.
+    #[test]
+    fn partial_resume_is_forced_only_by_an_explicit_opt_in() {
+        assert!(!partial_resume_forced_from(None));
+        assert!(!partial_resume_forced_from(Some("")));
+        assert!(!partial_resume_forced_from(Some("0")));
+        assert!(!partial_resume_forced_from(Some("false")));
+        assert!(!partial_resume_forced_from(Some("yes")));
+        assert!(partial_resume_forced_from(Some("1")));
+        assert!(partial_resume_forced_from(Some("true")));
+        assert!(partial_resume_forced_from(Some("TRUE")));
+    }
+
+    /// A partial resume must be declined whenever the batched Metal prefill would have
+    /// taken the prompt, because resuming forces the divergent suffix onto the CPU dense
+    /// forward: measured 1.33 s -> 20.79 s on Llama-3.2-3B-Instruct-Q4_K_M, and the CPU
+    /// tail also diverges from the cold-prefill reference tokens. This covers the
+    /// bookkeeping half with no GPU: a tiny CPU fixture is never resident-eligible, so
+    /// the predicate must answer `false` and the resume must still happen — which is what
+    /// keeps every non-Metal deployment on exactly its previous behaviour.
+    #[test]
+    fn a_cpu_only_session_still_takes_the_partial_resume() {
+        let _env_guard = crate::test_support::env_lock();
+        let cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        assert!(
+            !cold.metal_resident_prefill_would_apply(3),
+            "a tiny CPU fixture must not claim the batched Metal prefill applies"
+        );
+        assert!(
+            !cold.metal_resident_prefill_would_apply(0),
+            "a degenerate length must never admit the batched prefill"
+        );
+
+        let mut warm = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        warm.generate_next_token_with_history_diagnostics(
+            &[1, 2],
+            crate::inference::LlamaSampler::Greedy,
+            &[1, 2],
+            false,
+            None,
+        )
+        .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 1], cold);
+        let mut input = prepared.token_ids.clone();
+        resume_partial_prefix_hit(&mut prepared, warm, 2, &mut input);
+        assert!(
+            prepared.timings.prompt_cache_hit,
+            "the CPU path keeps its partial resume: nothing about it regressed"
+        );
+        assert_eq!(input, vec![1], "the CPU path resumes from the suffix");
     }
 
     /// gemma3→Metal Phase 3a hazard H1, resume sites: a windowed-attention
