@@ -40455,11 +40455,25 @@ impl ResidentDecodeState {
         let use_attn_mm = (!has_moe || (moe_prefill_mm_enabled() && moe_prefill_grouped_enabled()))
             // An F16 primary IS the half cache this path reads, exactly as it is for the
             // split-K decode attention: `attn_k16`/`attn_v16` below bind the primary
-            // instead of the (empty) mirrors. Scoped to the K-quant MM lane rather than
-            // opened for every kv16 primary, so the blast radius is the lane being
-            // measured -- a Q8_0 model forced to `CAMELID_METAL_KV_DTYPE=f16` keeps its
-            // current behaviour.
-            && (!self.kv16 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
+            // instead of the (empty) mirrors.
+            //
+            // `all_q8` is admitted here for the same reason it is admitted below: a Q8_0
+            // model already runs this path by default on its F32 primary, and already
+            // accepts the half-staged scores that come with it. Being moved onto an F16
+            // primary does not change that trade -- it only changes where the half K/V is
+            // read from -- so excluding it was a pure loss.
+            //
+            // Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q8_0 under
+            // `CAMELID_METAL_KV_DTYPE=f16`, ~2900-token prompt, against the 4.53 s F32
+            // default. Without this clause the F16 primary took 10.15 s, a 2.24x prefill
+            // regression -- which is the "~2.2x" the KQUANT_LANE_ENGAGED comment records,
+            // reproduced. With it, 5.03 s: 1.11x, with decode and output unchanged.
+            //
+            // (A first measurement of the same case read 42.7 s. That was NOT this
+            // exclusion: ~32 s of it was the partial-prefix-cache hit falling to the CPU
+            // dense forward, fixed separately. Worth stating because the two stack, and
+            // the larger number is the one an unpatched tree will show.)
+            && (!self.kv16 || all_q8 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && (!self.kvq8 || stage_q8_kv)
             && (!stage_q8_kv || q8_stage_bytes.is_some())
             // A K-quant model staged onto the MM lane has the same half activation stream
@@ -40472,8 +40486,9 @@ impl ResidentDecodeState {
             // `attn_k16`/`attn_v16` selection below takes `&self.cache_k[i]` when
             // `self.kv16`, i.e. the primary IS the half cache, exactly as the upper
             // comment says. (Under `kv16 || kvq8` the f16 mirrors are `Vec::new()`, so
-            // binding those instead would have been the bug.) What the conjunct still
-            // excludes is a Q8_0 model on an F16 primary, which is not `use_kq_mm`.
+            // binding those instead would have been the bug.) A Q8_0 model on an F16
+            // primary is admitted by the `all_q8` arm added above, for the reason given
+            // there, so the conjunct now excludes nothing that reaches this lane.
             && (all_q8 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && mm_prefill_enabled()
             && !has_qk_norm

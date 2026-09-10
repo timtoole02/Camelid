@@ -1,0 +1,56 @@
+=========================================================================
+What an F16 KV primary costs a Q8_0 model, and what it saves.
+M4 / 16 GiB, Llama-3.2-3B-Instruct-Q8_0, ABBA (f32, f16, f16, f32).
+The F16 primary is selected with CAMELID_METAL_KV_DTYPE=f16 -- no default is
+changed by this PR.
+-------------------------------------------------------------------------
+WITH THIS CLAUSE (and the partial-prefix-hit fix):
+
+  metric               f32 r1    f32 r2    f16 r1    f16 r2    ratio
+  decode tok/s          29.94     30.02     29.98     30.03    1.00
+  prefill 700w  (ms)     1518      1521      1677      1674    1.10x
+  prefill 2200w (ms)     4532      4540      5036      5031    1.11x
+  short 20w     (ms)     1006      1008      1010      1013    1.00
+  short 40w     (ms)     1016      1019      1024      1023    1.01
+
+  Generated text identical across all arms on every prompt.
+
+MEMORY, measured with `footprint` after growing the cache on a ~4200-position
+prompt:
+
+  f32 primary   6554 MB
+  f16 primary   5957 MB      -> 597 MB saved
+
+=========================================================================
+HOW THE PRIOR "9.4x" DECOMPOSES
+   A first run measured the f16 arm at 42.7 s on the 2200w prompt. That figure
+   is real but is TWO separate defects stacked, only one of which is this one:
+
+     42.70 s   stock origin/main, F16 primary
+              -32.5 s   partial prompt-prefix-cache hit falling to the CPU dense
+                        forward (fixed separately; nothing to do with KV dtype)
+     10.15 s   -> 2.24x vs the 4.53 s F32 baseline. THIS is the attention-as-matmul
+                        exclusion, and it reproduces the "~2.2x" recorded on
+                        KQUANT_LANE_ENGAGED.
+              - 5.1 s   this clause
+      5.03 s   -> 1.11x
+
+   Reporting the 42.7 s as the cost of the KV dtype would have been wrong, and
+   the two must be measured on a tree carrying both fixes to see either clearly.
+
+=========================================================================
+ON THE STALE WARNING
+   The KQUANT_LANE_ENGAGED comment says moving Q8_0 onto a half KV cache "cost
+   ~26% decode and ~2.2x prefill". The prefill half reproduces exactly. The
+   DECODE half does not: 29.94/30.02 (f32) against 29.98/30.03 (f16) is no
+   difference at all. Split-K decode attention gained kv16-primary support after
+   that note was written, so that half of the warning is now out of date.
+
+=========================================================================
+WHAT THIS PR DOES AND DOES NOT DO
+   DOES: remove the exclusion, so a Q8_0 model on an F16 primary keeps the
+   attention-as-matmul prefill it already had on its F32 primary. This makes
+   CAMELID_METAL_KV_DTYPE=f16 a usable option instead of a 2.24x trap.
+
+   DOES NOT: change any default. Whether 597 MB is worth 11% prefill is a
+   product decision, and it is now a decision that can be made on numbers.
