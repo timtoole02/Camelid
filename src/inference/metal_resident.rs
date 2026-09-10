@@ -52,6 +52,13 @@ fn resident_metal_park() -> &'static std::sync::Mutex<Option<ResidentMetalParkin
 
 /// Drop whatever is parked. Used when a model is released, and by tests that must not
 /// inherit another test's engine.
+///
+/// macOS-only: its sole caller is the macOS arm of `reset_resident_caches`, and nothing can
+/// park on a target with no resident engine, so on every other target this is dead code
+/// that `-D dead-code` rejects. The park/reclaim pair below stays unconditional because the
+/// `Drop` hook and the prefill both reach them on every target — they simply decline at
+/// runtime.
+#[cfg(target_os = "macos")]
 pub(crate) fn clear_parked_resident_metal() {
     *resident_metal_park()
         .lock()
