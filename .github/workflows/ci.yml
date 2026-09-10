@@ -479,6 +479,21 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:streaming
 
+      # Continuing a reply that stopped on the response budget. Pure half:
+      # which replies may be continued, how the resumed text rejoins the kept
+      # text (mid-word resumes, restated sentences), and cumulative usage.
+      - name: Frontend chat continuation smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:continuation
+
+      # The half a pure test cannot reach: that the continuation lands on the
+      # SAME assistant message, that the request-only instruction never enters
+      # the stored transcript, and that a later turn therefore sends one merged
+      # reply instead of replaying a "continue" turn forever.
+      - name: Frontend chat continuation browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:continuation-browser
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one

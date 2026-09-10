@@ -16,6 +16,7 @@ import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
 import { ContextMeter } from '../components/chat/ContextMeter'
 import { composeContextBudget } from '../lib/contextBudget.js'
+import { canContinueMessage } from '../lib/chatContinuation.js'
 import {
   AUTO_COMPACT_THRESHOLD_PERCENT,
   applySendCompaction,
@@ -174,6 +175,7 @@ export default function ChatWorkspace({
   saveToMemory,
   sendMessage,
   resendFromMessage = null,
+  continueFromMessage = null,
   stopGeneration,
   sending,
   receiptMode = false,
@@ -1345,6 +1347,15 @@ export default function ChatWorkspace({
                   : null
                 const priorUserPrompt = priorUserMessage?.content || null
                 const canResend = Boolean(resendFromMessage) && !requestActive && canChat
+                /* Continue is offered on the LAST reply only. Resuming a reply
+                   from the middle of a thread would have to discard every turn
+                   after it, which is what Edit & resend already does and says. */
+                const isLastMessage = index === visibleMessages.length - 1
+                const canContinue = Boolean(continueFromMessage)
+                  && !requestActive
+                  && canChat
+                  && isLastMessage
+                  && canContinueMessage(message)
                 const priorMessage = index > 0 ? visibleMessages[index - 1] : null
                 const dayKey = dayKeyOf(message.created_at)
                 const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null
@@ -1363,6 +1374,7 @@ export default function ChatWorkspace({
                       onReusePrompt={setComposer}
                       onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
+                      onContinue={canContinue ? () => continueFromMessage(message.id) : null}
                       tokenInspection={tokenInspections?.[message.id] || null}
                       structuredRecord={structuredRecords?.[message.id] || null}
                       toolCallRepeat={message.tool_calls
