@@ -513,6 +513,10 @@
   border-color: color-mix(in srgb, var(--color-ready) 44%, var(--color-border-soft));
   box-shadow: inset 3px 0 0 var(--color-ready), var(--shadow-1);
 }
+.downloaded-model--loading {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-border-soft));
+  box-shadow: inset 3px 0 0 var(--color-accent), var(--shadow-1);
+}
 .downloaded-model__tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-1); }
 .downloaded-model .cxv-card__foot {
   align-items: stretch;
@@ -527,6 +531,9 @@
   justify-content: flex-end;
 }
 .downloaded-model .cxv-card__actions .cx-btn { width: 100%; }
+/* Tracks are minmax(0, 160px) and shrink freely, so a bare 140px floor
+   overflows into the delete button on narrow cards. */
+.downloaded-model .cxv-card__actions .cx-btn.is-loading-bar { min-width: min(140px, 100%); }
 .downloaded-model .cxv-card__actions .cxv-danger { grid-column: 2; }
 .downloaded-empty {
   display: flex;
