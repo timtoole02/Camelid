@@ -39,10 +39,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::tools::{Risk, Sandbox, ToolSpec};
+use super::tools::{Risk, Sandbox, ToolImage, ToolSpec};
 
 /// The config file, read from the workspace root only.
 pub const CONFIG_FILE: &str = "camelid.mcp.json";
@@ -58,6 +59,17 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cap on a single MCP tool result, mirroring the native output cap.
 const MAX_RESULT_BYTES: usize = 16 * 1024;
+/// Images ride beside the text rather than inside it, so they need their own
+/// bounds — an MCP server is untrusted and this payload is persisted.
+///
+/// These are sized against the agent session file, not against what an image
+/// "should" be: `agent_session::MAX_SESSION_BYTES` is 4 MiB for the *whole*
+/// transcript, and base64 costs ~4/3. Two images of 768 KiB decoded is ~2 MiB
+/// encoded, leaving half the budget for the conversation. A more generous cap
+/// would let one tool result make the session unsaveable, which loses the run
+/// rather than one image. Measured on the decoded bytes.
+const MAX_RESULT_IMAGES: usize = 2;
+const MAX_RESULT_IMAGE_BYTES: usize = 768 * 1024;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_SERVERS: usize = 8;
 const MAX_SERVER_ARGS: usize = 64;
@@ -664,7 +676,7 @@ impl Server {
         args: &Value,
         cancel: &AtomicBool,
         shutdown: &AtomicBool,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<ToolImage>), String> {
         let res = self.request(
             "tools/call",
             json!({"name": tool, "arguments": args}),
@@ -675,6 +687,7 @@ impl Server {
         // MCP returns content blocks; flatten the text ones. A server may also
         // signal a tool-level failure via isError while still returning 200.
         let mut text = String::new();
+        let mut images: Vec<ToolImage> = Vec::new();
         if let Some(blocks) = res.get("content").and_then(Value::as_array) {
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
@@ -683,6 +696,19 @@ impl Server {
                             text.push_str(t);
                             text.push('\n');
                         }
+                    }
+                    // Keep the image out of `text` and carry it structurally.
+                    // The marker below stays byte-identical to what the
+                    // fall-through used to write, because it is still true of
+                    // what the model reads: nothing feeds these into a prompt.
+                    // Holding them here stops the discard at the boundary.
+                    Some("image") => {
+                        if let Some(image) = mcp_image_block(b) {
+                            if images.len() < MAX_RESULT_IMAGES {
+                                images.push(image);
+                            }
+                        }
+                        text.push_str("[image content omitted]\n");
                     }
                     Some(other) => text.push_str(&format!("[{other} content omitted]\n")),
                     None => {}
@@ -703,7 +729,7 @@ impl Server {
         if res.get("isError").and_then(Value::as_bool) == Some(true) {
             return Err(text);
         }
-        Ok(text)
+        Ok((text, images))
     }
 
     fn terminate(&mut self) {
@@ -967,17 +993,48 @@ pub fn has_tool(public: &str) -> bool {
         .is_some_and(|r| r.tools.iter().any(|e| e.public == public))
 }
 
+/// Parse one MCP `image` content block into a [`ToolImage`].
+///
+/// Returns `None` unless the block names a mime type the chat API's image
+/// decoder accepts and carries base64 that decodes within the size bound.
+/// Validating at the producer means a server cannot put something downstream
+/// would have to reject into a session file.
+fn mcp_image_block(block: &Value) -> Option<ToolImage> {
+    let mime = block.get("mimeType").and_then(Value::as_str)?;
+    if !matches!(mime, "image/png" | "image/jpeg" | "image/jpg") {
+        return None;
+    }
+    let data = block.get("data").and_then(Value::as_str)?;
+    // Bound the decode itself: base64 is ~4/3 of the payload, so an encoded
+    // length past that ratio cannot fit and is rejected without allocating.
+    if data.len() / 4 * 3 > MAX_RESULT_IMAGE_BYTES {
+        return None;
+    }
+    let decoded = BASE64_STANDARD.decode(data).ok()?;
+    if decoded.is_empty() || decoded.len() > MAX_RESULT_IMAGE_BYTES {
+        return None;
+    }
+    Some(ToolImage {
+        mime: mime.to_string(),
+        data_base64: data.to_string(),
+    })
+}
+
 /// Invoke a namespaced MCP tool. The returned text is untrusted data and is
 /// surfaced to the model through the same fenced tool-result path as any other.
 #[cfg(test)]
-pub fn call(public: &str, args: &Value) -> Result<String, String> {
+pub fn call(public: &str, args: &Value) -> Result<(String, Vec<ToolImage>), String> {
     call_with_cancel(public, args, &super::session::CANCEL)
 }
 
 /// Cancellation-aware invocation used by the agent loop. Only registry lookup
 /// happens under the process-wide mutex; the potentially long round trip is
 /// serialized by the selected server's own mutex.
-pub fn call_with_cancel(public: &str, args: &Value, cancel: &AtomicBool) -> Result<String, String> {
+pub fn call_with_cancel(
+    public: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+) -> Result<(String, Vec<ToolImage>), String> {
     let guard = registry()
         .lock()
         .map_err(|_| "mcp registry poisoned".to_string())?;
@@ -1002,6 +1059,67 @@ pub fn call_with_cancel(public: &str, args: &Value, cancel: &AtomicBool) -> Resu
         .lock()
         .map_err(|_| format!("MCP server '{server_name}' lock poisoned"))?;
     inner.call(&tool, args, cancel, &server.stop)
+}
+
+#[cfg(test)]
+mod image_block_tests {
+    use super::*;
+
+    fn block(mime: &str, decoded_len: usize) -> Value {
+        let data = BASE64_STANDARD.encode(vec![0u8; decoded_len]);
+        json!({"type": "image", "mimeType": mime, "data": data})
+    }
+
+    #[test]
+    fn a_png_block_is_carried_rather_than_discarded() {
+        let parsed = mcp_image_block(&block("image/png", 64)).expect("a valid png is carried");
+        assert_eq!(parsed.mime, "image/png");
+        assert_eq!(
+            BASE64_STANDARD.decode(&parsed.data_base64).unwrap().len(),
+            64
+        );
+    }
+
+    #[test]
+    fn a_mime_the_image_decoder_would_reject_is_refused_at_the_producer() {
+        // Validating here means a server cannot put something downstream would
+        // have to reject into a session file.
+        for mime in ["image/gif", "image/webp", "image/svg+xml", "text/plain"] {
+            assert!(
+                mcp_image_block(&block(mime, 64)).is_none(),
+                "{mime} must not be carried"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_past_the_session_budget_is_refused() {
+        assert!(mcp_image_block(&block("image/png", MAX_RESULT_IMAGE_BYTES + 1)).is_none());
+        assert!(mcp_image_block(&block("image/png", MAX_RESULT_IMAGE_BYTES)).is_some());
+    }
+
+    #[test]
+    fn a_malformed_or_empty_block_is_refused_without_panicking() {
+        assert!(mcp_image_block(&json!({"type": "image"})).is_none());
+        assert!(mcp_image_block(&json!({"type":"image","mimeType":"image/png"})).is_none());
+        assert!(mcp_image_block(
+            &json!({"type":"image","mimeType":"image/png","data":"not base64!"})
+        )
+        .is_none());
+        assert!(
+            mcp_image_block(&json!({"type":"image","mimeType":"image/png","data":""})).is_none()
+        );
+    }
+
+    /// The images must stay OUT of the text: the text is what the model reads
+    /// and what the byte cap bounds, and base64 in there would be truncated
+    /// mid-payload as well as flooding the prompt.
+    #[test]
+    fn the_carried_image_never_enters_the_result_text() {
+        let parsed = mcp_image_block(&block("image/png", 4096)).unwrap();
+        assert!(parsed.data_base64.len() > 1024);
+        assert!(!"[image content omitted]\n".contains(&parsed.data_base64[..64]));
+    }
 }
 
 #[cfg(test)]
@@ -1423,8 +1541,9 @@ for line in sys.stdin:
         assert!(echo.description.contains("Echo a value."));
 
         // A real call round-trips, tolerating the server's non-JSON stderr noise.
-        let out = call("mcp__stub__echo", &json!({"v":"hi"})).unwrap();
+        let (out, images) = call("mcp__stub__echo", &json!({"v":"hi"})).unwrap();
         assert!(out.contains("echo:hi"), "{out}");
+        assert!(images.is_empty(), "a text-only reply carries no images");
 
         // A tool-level failure comes back as an error, not a silent success.
         let err = call("mcp__stub__boom", &json!({})).unwrap_err();
