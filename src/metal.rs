@@ -30501,6 +30501,31 @@ fn kv16_enabled() -> bool {
     resident_kv_format() == ResidentKvFormat::F16
 }
 
+/// True when the resident KV primary is the half cache rather than an F32 primary with
+/// half mirrors.
+///
+/// Read by prefix continuation, which is admitted ONLY on an F32 primary. Continuation is
+/// bit-identical there (`metal_prefix_continuation_is_bit_identical_to_a_cold_prefill`,
+/// and end-to-end on Llama-3.2-3B-Q8_0: four chat turns correct, reusing 1014/1170/1322 of
+/// each prompt). On an F16 primary the same path measurably produces WRONG OUTPUT --
+/// Llama-3.2-3B-Q4_K_M degenerates to "!!!!" from turn 2 while a cold prefill of the same
+/// conversation is correct -- and the cause is not yet understood. The scatter is not it:
+/// `kv_scatter_batch_kv16` already takes `base_position` and writes
+/// `(h * max_positions + base_position + t)`.
+///
+/// So this fails closed on the configuration that is not proven, rather than shipping a
+/// lane that is right for one KV format and silently wrong for the other.
+#[cfg(target_os = "macos")]
+pub fn resident_kv_primary_is_half() -> bool {
+    kv16_enabled()
+}
+
+/// Non-macOS stub: there is no resident Metal KV cache to describe.
+#[cfg(not(target_os = "macos"))]
+pub fn resident_kv_primary_is_half() -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn kvq8_enabled() -> bool {
     resident_kv_format() == ResidentKvFormat::Q8
@@ -39514,6 +39539,20 @@ impl ResidentDecodeState {
         self.filled
     }
 
+    /// The dimensions this engine was built for. Read when parking it between requests: a
+    /// parked engine may only be handed back to a session whose geometry matches exactly,
+    /// because every per-layer stride below is derived from these.
+    pub fn geometry(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.n_layers,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            self.hidden,
+            self.ffn_dim,
+        )
+    }
+
     /// Whether THIS engine's KV survives a GPU -> CPU -> GPU round trip unchanged.
     ///
     /// The CPU KV history always stores f16-ROUNDED values — `store_kv_head_row`
@@ -45425,6 +45464,28 @@ impl ResidentDecodeState {
         _capture_layer_ids: &[usize],
     ) -> Option<Vec<Vec<f32>>> {
         None
+    }
+
+    /// Non-macOS stub: there is no resident engine, so continuation never applies. Present
+    /// because `inference::metal_resident` compiles on every target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_from(
+        &mut self,
+        _embeddings: &[f32],
+        _n_tokens: usize,
+        _layers: &[ResidentLayerWeights],
+        _cos_all: &[f32],
+        _sin_all: &[f32],
+        _scale: f32,
+        _base_position: usize,
+    ) -> Option<()> {
+        None
+    }
+
+    /// Non-macOS stub: zeroed geometry. Nothing can park on this target, so no caller ever
+    /// compares it.
+    pub fn geometry(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (0, 0, 0, 0, 0, 0)
     }
 
     #[allow(clippy::too_many_arguments)]
