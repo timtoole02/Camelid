@@ -500,3 +500,103 @@
   padding: var(--space-1) var(--space-4);
   cursor: pointer;
 }
+
+/* ---- Conversation organization: pins, tags, archive ----------------------
+   All of it is conditional on the user having organized something. A rail
+   with no pins and no tags renders exactly as it did before. */
+.rail-convo__pin { flex: none; color: var(--color-accent); }
+.rail-convo__tags {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: auto;
+  flex: none;
+  overflow: hidden;
+}
+.rail-convo__tag {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--color-surface-hover);
+  color: var(--color-text-faint);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  max-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rail-convo__tag--more { color: var(--color-text-muted); }
+
+.rail__tag-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 var(--space-3) var(--space-2);
+}
+.rail__tag-chip {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-border-soft);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+.rail__tag-chip:hover { border-color: var(--color-accent); color: var(--color-text); }
+.rail__tag-chip.is-active {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-accent-contrast, #fff);
+}
+.rail__tag-chip--clear { border-style: dashed; }
+.rail__tag-chip:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+
+.rail__archived-toggle {
+  width: 100%;
+  margin-top: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-faint);
+  font-size: var(--text-2xs);
+  text-align: left;
+  cursor: pointer;
+}
+.rail__archived-toggle:hover { background: var(--color-surface-hover); color: var(--color-text-muted); }
+.rail__archived-toggle.is-active { color: var(--color-accent-text); }
+
+.rail-menu__tags {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-1) var(--space-2);
+  border-top: 1px solid var(--color-border-soft);
+}
+.rail-menu__tag-list { display: flex; flex-wrap: wrap; gap: 3px; }
+.rail-menu__tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 4px;
+  border: none;
+  border-radius: 3px;
+  background: var(--color-surface-hover);
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+.rail-menu__tag:hover { color: var(--color-error); }
+.rail-menu__tag-input {
+  width: 100%;
+  padding: 2px var(--space-1);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--text-2xs);
+}
+
+.history-view__tools { display: flex; gap: var(--space-2); align-items: center; }
+/* The picker is opened by the Import button; the input itself is never the
+   control the user sees. */
+.history-view__import-input { display: none; }

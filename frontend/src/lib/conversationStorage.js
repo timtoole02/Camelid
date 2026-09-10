@@ -1,4 +1,5 @@
 import { normalizeMessageVariants } from './messageVariants.js'
+import { normalizeConversationOrganization } from './conversationOrganization.js'
 
 export function cleanLegacyDemoCapCopy(value) {
   if (typeof value !== 'string') return value
@@ -40,7 +41,7 @@ export function normalizeStoredMessage(message, { clearStaleStreaming = false } 
 }
 
 export function normalizeStoredConversations(records, options = {}) {
-  return (Array.isArray(records) ? records : []).map((conversation) => ({
+  return (Array.isArray(records) ? records : []).map((conversation) => normalizeConversationOrganization({
     ...conversation,
     messages: Array.isArray(conversation?.messages)
       ? conversation.messages.map((message) => normalizeStoredMessage(message, options))

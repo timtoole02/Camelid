@@ -5,6 +5,7 @@ import { ThemeToggle } from '../ui/ThemeToggle'
 import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
 import { apiSurfaceAllowsTab } from '../../lib/apiSurface.js'
+import { isPinned } from '../../lib/conversationOrganization.js'
 import {
   IconAnalytics, IconApi, IconBolt, IconChart, IconChat, IconClose, IconHistory, IconMemory, IconModels,
   IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
@@ -73,16 +74,34 @@ export function SidebarRail({
   onSelectConversation,
   renameConversation,
   requestDeleteConversation,
+  conversationTags = [],
+  tagFilter = [],
+  onToggleTagFilter,
+  onClearTagFilter,
+  archivedCount = 0,
+  showArchived = false,
+  onToggleShowArchived,
+  onTogglePin,
+  onToggleArchive,
+  onAddTag,
+  onRemoveTag,
   runtime,
   apiSurface = 'full',
   themePreference,
   themeResolved,
   onCycleTheme,
 }) {
+  /* Pinned threads form their own group ABOVE the date buckets and are never
+     subject to the recent limit -- a pin that scrolls off after six other
+     chats is not a pin. The limit still applies to everything else, which is
+     what keeps the rail short. */
   const grouped = useMemo(() => {
+    const pinned = filteredConversations.filter(isPinned)
+    const rest = filteredConversations.filter((c) => !isPinned(c)).slice(0, RECENT_LIMIT)
     const groups = new Map(BUCKETS.map((b) => [b, []]))
-    filteredConversations.slice(0, RECENT_LIMIT).forEach((c) => groups.get(bucketFor(c.updated_at))?.push(c))
-    return BUCKETS.map((label) => ({ label, items: groups.get(label) || [] })).filter((g) => g.items.length)
+    rest.forEach((c) => groups.get(bucketFor(c.updated_at))?.push(c))
+    const dated = BUCKETS.map((label) => ({ label, items: groups.get(label) || [] })).filter((g) => g.items.length)
+    return pinned.length ? [{ label: 'Pinned', items: pinned }, ...dated] : dated
   }, [filteredConversations])
   const visibleSections = useMemo(() => NAV_SECTIONS
     .map((section) => ({
@@ -168,6 +187,33 @@ export function SidebarRail({
         )}
       </div>
 
+      {/* Tag filter. Rendered only when tags exist, so a user who never tags
+          anything sees the rail exactly as it was. */}
+      {conversationTags.length > 0 && (
+        <div className="rail__tag-filter" role="group" aria-label="Filter chats by tag">
+          {conversationTags.slice(0, 12).map(({ tag, count }) => {
+            const active = tagFilter.includes(tag)
+            return (
+              <button
+                key={tag}
+                type="button"
+                className={`rail__tag-chip ${active ? 'is-active' : ''}`}
+                aria-pressed={active}
+                onClick={() => onToggleTagFilter?.(tag)}
+                title={`${count} ${count === 1 ? 'chat' : 'chats'} tagged “${tag}”`}
+              >
+                {tag}
+              </button>
+            )
+          })}
+          {tagFilter.length > 0 && (
+            <button type="button" className="rail__tag-chip rail__tag-chip--clear" onClick={() => onClearTagFilter?.()}>
+              Clear
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="rail__scroll">
         <div className="rail__section">
           <div className="rail__section-label">Recent</div>
@@ -188,10 +234,24 @@ export function SidebarRail({
                   onSelect={onSelectConversation}
                   onRename={renameConversation}
                   onDelete={requestDeleteConversation}
+                  onTogglePin={onTogglePin}
+                  onToggleArchive={onToggleArchive}
+                  onAddTag={onAddTag}
+                  onRemoveTag={onRemoveTag}
                 />
               ))}
             </div>
           ))}
+          {archivedCount > 0 && (
+            <button
+              type="button"
+              className={`rail__archived-toggle ${showArchived ? 'is-active' : ''}`}
+              aria-pressed={showArchived}
+              onClick={() => onToggleShowArchived?.(!showArchived)}
+            >
+              {showArchived ? 'Hide archived' : `Show archived (${archivedCount})`}
+            </button>
+          )}
           {filteredConversations.length > 0 && (
             <button type="button" className="rail__nav-item" onClick={() => setTab('history')}>
               <IconHistory size={20} />

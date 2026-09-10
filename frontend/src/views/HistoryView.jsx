@@ -1,8 +1,9 @@
+import { useRef } from 'react'
 import { clampText, formatCompactNumber, formatHistoryDate, formatModelLabel, formatPreview } from '../lib/formatters'
 import { Button } from '../components/ui/Button'
-import { downloadConversation } from '../lib/conversationExport'
+import { downloadAllConversations, downloadConversation } from '../lib/conversationExport'
 import { EmptyState } from '../components/ui/EmptyState'
-import { IconHistory, IconChat, IconDownload, IconTrash } from '../components/ui/icons'
+import { IconHistory, IconChat, IconDownload, IconFile, IconTrash } from '../components/ui/icons'
 
 function getConversationStats(conversation) {
   const messageCount = conversation.messages?.length || 0
@@ -11,7 +12,8 @@ function getConversationStats(conversation) {
   return { messageCount, assistantCount, latestMessage }
 }
 
-export default function HistoryView({ filteredConversations, setSelectedConversationId, setTab, deleteConversation }) {
+export default function HistoryView({ filteredConversations, setSelectedConversationId, setTab, deleteConversation, importConversationsFromText }) {
+  const importInputRef = useRef(null)
   const totalMessages = filteredConversations.reduce((sum, c) => sum + (c.messages?.length || 0), 0)
   const activeToday = filteredConversations.filter((c) => {
     if (!c.updated_at) return false
@@ -38,6 +40,48 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
             <strong>{formatCompactNumber(totalMessages)}</strong>
             <small>stored locally</small>
           </div>
+        </div>
+        {/* Export existed per-conversation; import did not, which meant a
+            transcript could leave this machine but never arrive on another
+            one. Both live here, next to the list they act on. */}
+        <div className="history-view__tools">
+          <Button
+            variant="ghost"
+            icon={<IconDownload size={16} />}
+            disabled={!hasConversations}
+            onClick={() => downloadAllConversations(filteredConversations)}
+            title={hasConversations
+              ? `Export the ${filteredConversations.length} ${filteredConversations.length === 1 ? 'conversation' : 'conversations'} shown as one JSON file`
+              : 'Nothing to export in this view'}
+          >
+            Export all
+          </Button>
+          {importConversationsFromText && (
+            <>
+              <Button
+                variant="ghost"
+                icon={<IconFile size={16} />}
+                onClick={() => importInputRef.current?.click()}
+                title="Import conversations from a Camelid export file"
+              >
+                Import
+              </Button>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept="application/json,.json"
+                className="history-view__import-input"
+                aria-label="Choose a Camelid export file to import"
+                onChange={async (event) => {
+                  const file = event.target.files?.[0]
+                  // Reset first: picking the same file twice must re-fire.
+                  event.target.value = ''
+                  if (!file) return
+                  importConversationsFromText(await file.text())
+                }}
+              />
+            </>
+          )}
         </div>
       </header>
 

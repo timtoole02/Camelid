@@ -1,7 +1,8 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { clampText } from '../../lib/formatters'
-import { IconDots, IconEdit, IconTrash } from '../ui/icons'
+import { IconClose, IconDots, IconEdit, IconFile, IconPin, IconTrash } from '../ui/icons'
+import { MAX_TAG_LENGTH, isArchived, isPinned, tagsOf } from '../../lib/conversationOrganization.js'
 
 function ConversationListItemInner({
   conversation,
@@ -10,7 +11,14 @@ function ConversationListItemInner({
   onSelect,
   onRename,
   onDelete,
+  onTogglePin,
+  onToggleArchive,
+  onAddTag,
+  onRemoveTag,
 }) {
+  const pinned = isPinned(conversation)
+  const archived = isArchived(conversation)
+  const tags = tagsOf(conversation)
   /* Non-null while the menu is open: viewport coordinates for the portalled
      popover. Portalling (instead of position:absolute in the row) lets the
      menu escape the sidebar's overflow-y:auto scroll container. */
@@ -130,7 +138,16 @@ function ConversationListItemInner({
         title={rawTitle}
         onClick={() => onSelect(conversation.id)}
       >
+        {pinned && !collapsed && <IconPin size={12} className="rail-convo__pin" aria-label="Pinned" />}
         <span className="rail-convo__title">{collapsed ? rawTitle.slice(0, 1).toUpperCase() : title}</span>
+        {/* Tags are shown on the row, not only in the menu: a label nobody can
+            see is a label nobody applies twice. */}
+        {!collapsed && tags.length > 0 && (
+          <span className="rail-convo__tags">
+            {tags.slice(0, 2).map((tag) => <span key={tag} className="rail-convo__tag">{tag}</span>)}
+            {tags.length > 2 && <span className="rail-convo__tag rail-convo__tag--more">+{tags.length - 2}</span>}
+          </span>
+        )}
       </button>
       {!collapsed && (
         <div className="rail-convo__actions">
@@ -157,6 +174,63 @@ function ConversationListItemInner({
               <button type="button" role="menuitem" className="rail-menu__item" onClick={beginRename}>
                 <IconEdit size={16} /> <span>Rename</span>
               </button>
+              {onTogglePin && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="rail-menu__item"
+                  onClick={() => { closeMenu(); onTogglePin(conversation.id, !pinned) }}
+                >
+                  <IconPin size={16} /> <span>{pinned ? 'Unpin' : 'Pin to top'}</span>
+                </button>
+              )}
+              {onToggleArchive && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="rail-menu__item"
+                  onClick={() => { closeMenu(); onToggleArchive(conversation.id, !archived) }}
+                >
+                  <IconFile size={16} /> <span>{archived ? 'Unarchive' : 'Archive'}</span>
+                </button>
+              )}
+              {onAddTag && (
+                <div className="rail-menu__tags">
+                  {tags.length > 0 && (
+                    <div className="rail-menu__tag-list">
+                      {tags.map((tag) => (
+                        <button
+                          key={tag}
+                          type="button"
+                          className="rail-menu__tag"
+                          onClick={() => onRemoveTag?.(conversation.id, tag)}
+                          title={`Remove tag “${tag}”`}
+                          aria-label={`Remove tag ${tag}`}
+                        >
+                          {tag} <IconClose size={11} />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <input
+                    className="rail-menu__tag-input"
+                    placeholder="Add tag…"
+                    maxLength={MAX_TAG_LENGTH}
+                    aria-label={`Add a tag to ${title}`}
+                    /* Enter commits and keeps the menu open: tagging is
+                       usually more than one tag, and reopening the menu per
+                       tag is the difference between using this and not. */
+                    onKeyDown={(event) => {
+                      if (event.key !== 'Enter') return
+                      event.preventDefault()
+                      const value = event.currentTarget.value
+                      if (!value.trim()) return
+                      onAddTag(conversation.id, value)
+                      event.currentTarget.value = ''
+                    }}
+                  />
+                </div>
+              )}
               <button
                 type="button"
                 role="menuitem"

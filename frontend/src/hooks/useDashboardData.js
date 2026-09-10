@@ -9,6 +9,8 @@ import { readExactTargetVerifiedRender, readTargetVerifiedMtp12 } from '../lib/n
 import { readExactTargetVerifiedSegmentedRender } from '../lib/nativeGenerationMetrics'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
+import { allTags, archivedCount, organizeConversations, withArchived, withPinned, withTagAdded, withTagRemoved } from '../lib/conversationOrganization.js'
+import { parseImportedConversations } from '../lib/conversationImport.js'
 import { appStorage } from '../lib/appStorage.js'
 import { composeContextBudget } from '../lib/contextBudget.js'
 import {
@@ -703,6 +705,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [selectedConversationId, setSelectedConversationIdState] = useState(getInitialConversationId)
   const [selectedModelId, setSelectedModelId] = useState(getInitialModelId)
   const [search, setSearch] = useState('')
+  /* Session-scoped on purpose. A filter that survived a restart would hide
+     most of the list with no obvious cause; the pins and tags it filters on
+     are the durable part. */
+  const [conversationTagFilter, setConversationTagFilter] = useState([])
+  const [showArchivedConversations, setShowArchivedConversations] = useState(false)
   const [memorySearch, setMemorySearch] = useState('')
   const [composer, setComposer] = useState('')
   const [newChatTitle, setNewChatTitle] = useState('')
@@ -1114,14 +1121,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
     ? pendingChat
     : null
 
-  const filteredConversations = useMemo(() => {
-    if (!search.trim()) return conversations
-    const q = search.toLowerCase()
-    return conversations.filter((conversation) =>
-      conversation.title.toLowerCase().includes(q)
-      || conversation.messages.some((message) => message.content.toLowerCase().includes(q)),
-    )
-  }, [conversations, search])
+  /* One place decides what the list contains and how it is ordered, so the
+     sidebar, the history page and the tag counts cannot disagree. Search now
+     also matches tags, and pinned threads sort above the rest. */
+  const filteredConversations = useMemo(() => organizeConversations(conversations, {
+    search,
+    tags: conversationTagFilter,
+    includeArchived: showArchivedConversations,
+  }), [conversations, search, conversationTagFilter, showArchivedConversations])
+
+  const conversationTags = useMemo(() => allTags(conversations), [conversations])
+  const archivedConversationCount = useMemo(() => archivedCount(conversations), [conversations])
 
   const filteredMemories = useMemo(() => {
     if (!memorySearch.trim()) return memories
@@ -2324,6 +2334,47 @@ export function useDashboardData({ showNotice, clearNotice }) {
     }
   }
 
+  const updateConversationRecord = (id, update) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === id ? { ...update(conversation), updated_at: conversation.updated_at } : conversation
+    )))
+  }
+
+  /* Organizing a thread is not editing it: updated_at stays put above, so
+     pinning or tagging does not shuffle the recency order it is meant to
+     work with. */
+  const setConversationPinned = (id, pinned) => updateConversationRecord(id, (c) => withPinned(c, pinned))
+  const setConversationArchived = (id, archived) => updateConversationRecord(id, (c) => withArchived(c, archived))
+  const addConversationTag = (id, tag) => updateConversationRecord(id, (c) => withTagAdded(c, tag))
+  const removeConversationTag = (id, tag) => updateConversationRecord(id, (c) => withTagRemoved(c, tag))
+
+  const toggleConversationTagFilter = (tag) => {
+    setConversationTagFilter((current) => (
+      current.includes(tag) ? current.filter((entry) => entry !== tag) : [...current, tag]
+    ))
+  }
+  const clearConversationTagFilter = () => setConversationTagFilter([])
+
+  /* Imported threads are prepended, never merged onto existing ids: an import
+     that silently overwrites a conversation already here is worse than no
+     import at all. */
+  const importConversationsFromText = (text) => {
+    const { conversations: imported, skipped, error } = parseImportedConversations(text)
+    if (error) {
+      showNotice(error, 'error')
+      return { imported: 0, skipped }
+    }
+    persistConversations((current) => [...imported, ...current])
+    const noun = imported.length === 1 ? 'conversation' : 'conversations'
+    showNotice(
+      skipped > 0
+        ? `Imported ${imported.length} ${noun}; skipped ${skipped} with no readable messages.`
+        : `Imported ${imported.length} ${noun}.`,
+      'success',
+    )
+    return { imported: imported.length, skipped }
+  }
+
   const renameConversation = async (id, nextTitle) => {
     const trimmedTitle = nextTitle.trim()
     if (!trimmedTitle) {
@@ -2783,6 +2834,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
     regenerateAsVariant,
     selectMessageVariant,
     discardMessageVariant,
+    conversationTags,
+    archivedConversationCount,
+    conversationTagFilter,
+    toggleConversationTagFilter,
+    clearConversationTagFilter,
+    showArchivedConversations,
+    setShowArchivedConversations,
+    setConversationPinned,
+    setConversationArchived,
+    addConversationTag,
+    removeConversationTag,
+    importConversationsFromText,
     stopGeneration,
     saveToMemory,
     createMemory,

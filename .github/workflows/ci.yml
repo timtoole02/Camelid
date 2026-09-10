@@ -509,6 +509,22 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:variants-browser
 
+      # Pins, archive, tags, bulk export and import. Most of this gate is the
+      # IMPORT half: it reads a user-chosen file into stored state, so the
+      # bounds, the field whitelist, the regenerated ids and the refusal to
+      # trust a claimed usage_source are all asserted here.
+      - name: Frontend conversation organization smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:organization
+
+      # The wiring an organization feature actually fails on: a pin that still
+      # falls off the recent limit, a filter that hides everything, an archive
+      # with no way back, and the export -> import round trip through the real
+      # file picker.
+      - name: Frontend conversation organization browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:organization-browser
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one
