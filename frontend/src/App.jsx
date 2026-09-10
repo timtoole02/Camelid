@@ -93,7 +93,8 @@ function App() {
     loadingModelId, registerForm, setRegisterForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
-    createConversation, showNewChatLanding, sendMessage, resendFromMessage, continueFromMessage, stopGeneration, saveToMemory,
+    createConversation, showNewChatLanding, sendMessage, resendFromMessage, continueFromMessage,
+    regenerateAsVariant, selectMessageVariant, discardMessageVariant, stopGeneration, saveToMemory,
     createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
     activateModel, unloadCurrentModel,
     registerModel, loadDashboard, stoppingGeneration,
@@ -421,6 +422,9 @@ function App() {
               sendMessage={sendMessage}
               resendFromMessage={resendFromMessage}
               continueFromMessage={continueFromMessage}
+              regenerateAsVariant={regenerateAsVariant}
+              selectMessageVariant={selectMessageVariant}
+              discardMessageVariant={discardMessageVariant}
               stopGeneration={stopGeneration}
               sending={sending}
               receiptMode={receiptMode}

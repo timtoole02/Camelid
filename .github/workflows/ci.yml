@@ -494,6 +494,21 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:continuation-browser
 
+      # Regenerated replies kept side by side. The contract under test is the
+      # mirroring one: the active version's fields are also the message's own,
+      # so every existing reader keeps working without knowing versions exist.
+      - name: Frontend reply variants smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:variants
+
+      # What a pure test cannot reach: that a re-roll does not duplicate the
+      # question or show the model the answer it is replacing, that switching
+      # moves the telemetry with the text, and that the NEXT turn sends
+      # whichever version is selected.
+      - name: Frontend reply variants browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:variants-browser
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one
