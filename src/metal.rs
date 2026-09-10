@@ -30501,6 +30501,31 @@ fn kv16_enabled() -> bool {
     resident_kv_format() == ResidentKvFormat::F16
 }
 
+/// True when the resident KV primary is the half cache rather than an F32 primary with
+/// half mirrors.
+///
+/// Read by prefix continuation, which is admitted ONLY on an F32 primary. Continuation is
+/// bit-identical there (`metal_prefix_continuation_is_bit_identical_to_a_cold_prefill`,
+/// and end-to-end on Llama-3.2-3B-Q8_0: four chat turns correct, reusing 1014/1170/1322 of
+/// each prompt). On an F16 primary the same path measurably produces WRONG OUTPUT --
+/// Llama-3.2-3B-Q4_K_M degenerates to "!!!!" from turn 2 while a cold prefill of the same
+/// conversation is correct -- and the cause is not yet understood. The scatter is not it:
+/// `kv_scatter_batch_kv16` already takes `base_position` and writes
+/// `(h * max_positions + base_position + t)`.
+///
+/// So this fails closed on the configuration that is not proven, rather than shipping a
+/// lane that is right for one KV format and silently wrong for the other.
+#[cfg(target_os = "macos")]
+pub fn resident_kv_primary_is_half() -> bool {
+    kv16_enabled()
+}
+
+/// Non-macOS stub: there is no resident Metal KV cache to describe.
+#[cfg(not(target_os = "macos"))]
+pub fn resident_kv_primary_is_half() -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn kvq8_enabled() -> bool {
     resident_kv_format() == ResidentKvFormat::Q8
@@ -30562,6 +30587,64 @@ fn splitk_kv16_primary_from(value: Option<&str>) -> bool {
 #[cfg(target_os = "macos")]
 fn splitk_kv_format_admits(kv16_primary: bool, kv16_primary_gate: bool) -> bool {
     !kv16_primary || kv16_primary_gate
+}
+
+/// Which split-K kv16 kernel family a call site needs.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SplitkKv16Family {
+    /// `encode_attention`'s linear decode.
+    Linear,
+    /// `encode_attention_tree`'s speculative-tree clone.
+    Tree,
+    /// The batched verify clone, one dispatch for a whole width-k round.
+    Batch,
+}
+
+/// Whether the `_direct` split-K kv16 kernels may be dispatched at this width.
+///
+/// `attention_decode_splitk_kv16_direct` and its `_tree` / `_batch` clones are a
+/// **head_dim-128 specialization**, and nothing in their signature or their name says so.
+/// They load the query as `float4` at `query + qh * 128 + lane * 4`, write partials at a
+/// hardcoded row stride of `(128 + 2)`, and store the running max at `dst[128]`.
+///
+/// The host disagrees at every other width: it sizes `partials` as
+/// `n_heads * n_splits * (head_dim + 2)`, and `attention_decode_splitk_merge_f32` reads
+/// back at that same head_dim-derived stride. Producer and consumer coincide at 128 and
+/// nowhere else — below it the kernel also writes past the end of the allocation.
+///
+/// This has been correct only because each call site separately remembered to write
+/// `if head_dim == 128`. Nothing enforced it, the `_direct` pipelines sit beside their
+/// general twins in the same struct, and the count of call sites has since grown from
+/// three to four. Collapsing the decision here means a new call site inherits the
+/// precondition instead of having to remember it.
+///
+/// The guard is load-bearing, and that was checked rather than assumed: dispatching
+/// `_direct` at head_dim 64 does not merely return wrong numbers, it **wedges the GPU
+/// command buffer** — writing at stride 130 into partials sized for 66 runs off the end of
+/// the allocation.
+#[cfg(target_os = "macos")]
+fn splitk_kv16_direct_admits(head_dim: usize) -> bool {
+    head_dim == 128
+}
+
+/// The split-K kv16 pipeline for `head_dim`, choosing the `_direct` specialization only
+/// where its hardcoded geometry is actually correct.
+#[cfg(target_os = "macos")]
+fn splitk_kv16_pipeline(
+    k: &MetalLinearKernel,
+    head_dim: usize,
+    family: SplitkKv16Family,
+) -> &ComputePipelineState {
+    let direct = splitk_kv16_direct_admits(head_dim);
+    match (family, direct) {
+        (SplitkKv16Family::Linear, true) => &k.attention_decode_splitk_kv16_direct_pipeline,
+        (SplitkKv16Family::Linear, false) => &k.attention_decode_splitk_kv16_pipeline,
+        (SplitkKv16Family::Tree, true) => &k.attention_decode_splitk_kv16_direct_tree_pipeline,
+        (SplitkKv16Family::Tree, false) => &k.attention_decode_splitk_kv16_tree_pipeline,
+        (SplitkKv16Family::Batch, true) => &k.attention_decode_splitk_kv16_direct_batch_pipeline,
+        (SplitkKv16Family::Batch, false) => &k.attention_decode_splitk_kv16_batch_pipeline,
+    }
 }
 
 /// Opt-in: tiled decode attention with online softmax (4 simdgroups per head, coalesced
@@ -31766,11 +31849,11 @@ fn encode_attention(
             // This branch also closes that hazard in the other direction: the final
             // `else` is now reachable only with mirrors present, i.e. a proven f32
             // primary.
-            if head_dim == 128 {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_pipeline);
-            } else {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
-            }
+            e.set_compute_pipeline_state(splitk_kv16_pipeline(
+                k,
+                head_dim,
+                SplitkKv16Family::Linear,
+            ));
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
@@ -31780,11 +31863,11 @@ fn encode_attention(
             // barriers -> more resident threadgroups; GQA re-reads hit the SLC.
             // Probe @7.7k positions: 11.4ms vs 14.3ms staged (and better at
             // every shallower depth). Staged kernel remains the general fallback.
-            if head_dim == 128 {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_pipeline);
-            } else {
-                e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
-            }
+            e.set_compute_pipeline_state(splitk_kv16_pipeline(
+                k,
+                head_dim,
+                SplitkKv16Family::Linear,
+            ));
             e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(mk), 0);
             e.set_buffer(2, Some(mv), 0);
@@ -31971,11 +32054,7 @@ fn encode_attention_tree(
         if kv16 {
             TREE_KV16_SPLITK_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if head_dim == 128 {
-            e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_tree_pipeline);
-        } else {
-            e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_tree_pipeline);
-        }
+        e.set_compute_pipeline_state(splitk_kv16_pipeline(k, head_dim, SplitkKv16Family::Tree));
         e.set_buffer(0, Some(query), query_off);
         e.set_buffer(1, Some(mk), 0);
         e.set_buffer(2, Some(mv), 0);
@@ -32157,11 +32236,7 @@ fn encode_attention_splitk_kv16_batch(
         }
     }
 
-    e.set_compute_pipeline_state(if head_dim == 128 {
-        &k.attention_decode_splitk_kv16_direct_batch_pipeline
-    } else {
-        &k.attention_decode_splitk_kv16_batch_pipeline
-    });
+    e.set_compute_pipeline_state(splitk_kv16_pipeline(k, head_dim, SplitkKv16Family::Batch));
     e.set_buffer(0, Some(query), 0);
     e.set_buffer(1, Some(keys), 0);
     e.set_buffer(2, Some(values), 0);
@@ -39514,6 +39589,20 @@ impl ResidentDecodeState {
         self.filled
     }
 
+    /// The dimensions this engine was built for. Read when parking it between requests: a
+    /// parked engine may only be handed back to a session whose geometry matches exactly,
+    /// because every per-layer stride below is derived from these.
+    pub fn geometry(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.n_layers,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            self.hidden,
+            self.ffn_dim,
+        )
+    }
+
     /// Whether THIS engine's KV survives a GPU -> CPU -> GPU round trip unchanged.
     ///
     /// The CPU KV history always stores f16-ROUNDED values — `store_kv_head_row`
@@ -45427,6 +45516,28 @@ impl ResidentDecodeState {
         None
     }
 
+    /// Non-macOS stub: there is no resident engine, so continuation never applies. Present
+    /// because `inference::metal_resident` compiles on every target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_from(
+        &mut self,
+        _embeddings: &[f32],
+        _n_tokens: usize,
+        _layers: &[ResidentLayerWeights],
+        _cos_all: &[f32],
+        _sin_all: &[f32],
+        _scale: f32,
+        _base_position: usize,
+    ) -> Option<()> {
+        None
+    }
+
+    /// Non-macOS stub: zeroed geometry. Nothing can park on this target, so no caller ever
+    /// compares it.
+    pub fn geometry(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (0, 0, 0, 0, 0, 0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_tokens_windowed(
         &mut self,
@@ -45879,6 +45990,33 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    /// The `_direct` split-K kv16 kernels are a head_dim-128 specialization: they hardcode
+    /// a partials row stride of `(128 + 2)` while the host sizes partials by
+    /// `(head_dim + 2)`, so producer and consumer agree at 128 and nowhere else.
+    ///
+    /// Every production call site now asks `splitk_kv16_pipeline` instead of remembering
+    /// its own `if head_dim == 128`, so this pins the predicate they all share. Widths
+    /// below 128 matter most: there `_direct` would write past the end of the allocation,
+    /// which does not return wrong numbers, it wedges the GPU command buffer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn splitk_kv16_direct_is_admitted_at_exactly_the_width_its_geometry_assumes() {
+        use super::splitk_kv16_direct_admits;
+
+        assert!(
+            splitk_kv16_direct_admits(128),
+            "128 is the specialized width"
+        );
+        // LFM2 is 64, phi-3 is 96; gemma3/gemma4 are 256/512.
+        for width in [32usize, 64, 96, 112, 129, 160, 256, 512] {
+            assert!(
+                !splitk_kv16_direct_admits(width),
+                "head_dim {width} must take the staged kernel: the _direct partials stride \
+                 is hardcoded at 128 + 2 and the host sizes by head_dim + 2"
+            );
+        }
+    }
+
     /// Eviction must free a dropped model's pages and must NOT touch a live model's.
     ///
     /// The distinction is the whole safety argument, so it is asserted in both

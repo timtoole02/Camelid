@@ -9,6 +9,8 @@ import { readExactTargetVerifiedRender, readTargetVerifiedMtp12 } from '../lib/n
 import { readExactTargetVerifiedSegmentedRender } from '../lib/nativeGenerationMetrics'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
+import { allTags, archivedCount, organizeConversations, withArchived, withPinned, withTagAdded, withTagRemoved } from '../lib/conversationOrganization.js'
+import { parseImportedConversations } from '../lib/conversationImport.js'
 import { appStorage } from '../lib/appStorage.js'
 import { composeContextBudget } from '../lib/contextBudget.js'
 import {
@@ -18,6 +20,8 @@ import {
 } from '../lib/conversationCompaction.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
+import { CONTINUATION_INSTRUCTION, canContinueMessage, joinContinuation, mergeContinuedUsage } from '../lib/chatContinuation'
+import { canBranchMessage, variantsOf, withActiveVariant, withActiveVariantRemoved, withVariantAppended } from '../lib/messageVariants'
 import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, normalizeInspection, readInspectionContract } from '../lib/tokenInspection'
 import { STRUCTURED_MODES, DEFAULT_SCHEMA, DEFAULT_GRAMMAR, readStructuredOutputContract, structuredOutputForcesNonStreaming, structuredOutputRequestFields, structuredOutputReadiness } from '../lib/structuredOutput'
 import { DEFAULT_TOOLS, detectRepeatedCall, normalizeToolCalls, readModelToolCapability, readToolContract, toolCallSignature, toolReadiness, toolRequestFields } from '../lib/toolCalling'
@@ -701,6 +705,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [selectedConversationId, setSelectedConversationIdState] = useState(getInitialConversationId)
   const [selectedModelId, setSelectedModelId] = useState(getInitialModelId)
   const [search, setSearch] = useState('')
+  /* Session-scoped on purpose. A filter that survived a restart would hide
+     most of the list with no obvious cause; the pins and tags it filters on
+     are the durable part. */
+  const [conversationTagFilter, setConversationTagFilter] = useState([])
+  const [showArchivedConversations, setShowArchivedConversations] = useState(false)
   const [memorySearch, setMemorySearch] = useState('')
   const [composer, setComposer] = useState('')
   const [newChatTitle, setNewChatTitle] = useState('')
@@ -1112,14 +1121,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
     ? pendingChat
     : null
 
-  const filteredConversations = useMemo(() => {
-    if (!search.trim()) return conversations
-    const q = search.toLowerCase()
-    return conversations.filter((conversation) =>
-      conversation.title.toLowerCase().includes(q)
-      || conversation.messages.some((message) => message.content.toLowerCase().includes(q)),
-    )
-  }, [conversations, search])
+  /* One place decides what the list contains and how it is ordered, so the
+     sidebar, the history page and the tag counts cannot disagree. Search now
+     also matches tags, and pinned threads sort above the rest. */
+  const filteredConversations = useMemo(() => organizeConversations(conversations, {
+    search,
+    tags: conversationTagFilter,
+    includeArchived: showArchivedConversations,
+  }), [conversations, search, conversationTagFilter, showArchivedConversations])
+
+  const conversationTags = useMemo(() => allTags(conversations), [conversations])
+  const archivedConversationCount = useMemo(() => archivedCount(conversations), [conversations])
 
   const filteredMemories = useMemo(() => {
     if (!memorySearch.trim()) return memories
@@ -1191,11 +1203,63 @@ export function useDashboardData({ showNotice, clearNotice }) {
     return true
   }
 
+  /* Re-roll a reply, keeping the one already there as a sibling. Regenerate
+     was destructive before this: if the first answer was better it was gone,
+     which is exactly what makes people not press it. */
+  const regenerateAsVariant = async (messageId) => {
+    const target = (selectedConversation?.messages || []).find((message) => message.id === messageId)
+    if (!canBranchMessage(target)) return
+    await sendMessage({ variantOfMessageId: messageId })
+  }
+
+  /* Switching is a pure local edit -- no request, no model, no cost -- so it
+     stays available while another turn is streaming. */
+  const selectMessageVariant = (messageId, index) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === selectedConversationIdRef.current
+        ? {
+            ...conversation,
+            messages: (conversation.messages || []).map((message) => (
+              message.id === messageId ? withActiveVariant(message, index) : message
+            )),
+          }
+        : conversation
+    )))
+  }
+
+  /* Discarding the shown alternative selects a neighbour. The last remaining
+     one cannot be discarded: a reply with no content has nothing to render. */
+  const discardMessageVariant = (messageId) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === selectedConversationIdRef.current
+        ? {
+            ...conversation,
+            messages: (conversation.messages || []).map((message) => (
+              message.id === messageId ? withActiveVariantRemoved(message) : message
+            )),
+            updated_at: nowIso(),
+          }
+        : conversation
+    )))
+  }
+
+  /* Resume a reply that stopped on the response budget. The gate checks, the
+     model lane and the send path are the ordinary ones -- only the transcript
+     bookkeeping differs, and that lives in sendMessage. */
+  const continueFromMessage = async (messageId) => {
+    const target = (selectedConversation?.messages || []).find((message) => message.id === messageId)
+    if (!canContinueMessage(target)) return
+    await sendMessage({ continueFromMessageId: messageId })
+  }
+
   /* options.overrideContent: replace the composer draft in both transcript and
      request (regenerate / edit-and-resend). options.requestContent: replace only
      the current request payload while preserving what the user typed in the
      transcript. options.truncateFromMessageId drops that message and everything
-     after it first. The gate checks below are identical for every path. */
+     after it first. options.continueFromMessageId resumes a length-truncated
+     assistant message in place: no user turn is stored, the reply streams onto
+     the existing message, and the instruction that drives it is request-only.
+     The gate checks below are identical for every path. */
   const sendMessage = async (options = {}) => {
     const {
       overrideContent = null,
@@ -1203,8 +1267,43 @@ export function useDashboardData({ showNotice, clearNotice }) {
       requestContent = null,
       citations = [],
       truncateFromMessageId = null,
+      continueFromMessageId = null,
+      variantOfMessageId = null,
     } = options
-    const draftContent = overrideContent ?? composer
+    /* Continuing supplies its own request text, so it never reads the composer
+       and never blocks on an empty one. */
+    const continuedMessage = continueFromMessageId
+      ? (selectedConversation?.messages || []).find((message) => message.id === continueFromMessageId) || null
+      : null
+    if (continueFromMessageId && !canContinueMessage(continuedMessage)) return
+    /* Regenerating into a variant re-asks the SAME question: the prompt is
+       already the last turn of the stored history, so no user turn is added
+       and the reply lands on the existing message as a new alternative. */
+    const variantMessage = variantOfMessageId
+      ? (selectedConversation?.messages || []).find((message) => message.id === variantOfMessageId) || null
+      : null
+    if (variantOfMessageId && !canBranchMessage(variantMessage)) return
+    const reusedMessage = continuedMessage || variantMessage
+    const continuationPrefix = continuedMessage ? String(continuedMessage.content || '') : ''
+    const continuedCompletionTokens = continuedMessage
+      ? Math.max(0, Number(continuedMessage.usage?.completion_tokens) || 0)
+      : 0
+    /* Neither reuse path reads the composer. A continuation supplies its own
+       instruction; a variant re-sends the question already in the transcript. */
+    const priorPromptForVariant = variantMessage
+      ? (() => {
+          const messages = selectedConversation?.messages || []
+          const at = messages.findIndex((message) => message.id === variantOfMessageId)
+          const prior = at > 0 ? [...messages.slice(0, at)].reverse().find((m) => m.role === 'user') : null
+          return String(prior?.content || '')
+        })()
+      : ''
+    if (variantMessage && !priorPromptForVariant.trim()) return
+    const draftContent = continuedMessage
+      ? CONTINUATION_INSTRUCTION
+      : variantMessage
+        ? priorPromptForVariant
+        : (overrideContent ?? composer)
     if (!draftContent.trim()) return
     // Supported rows chat through the full gate. Implemented-but-unsupported rows
     // chat through the weaker EXPERIMENTAL lane (every turn marked unverified). Only
@@ -1245,10 +1344,27 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const truncateIndex = truncateFromMessageId
         ? (conversation.messages || []).findIndex((message) => message.id === truncateFromMessageId)
         : -1
+      /* A continuation resumes ONE reply, so the request stops at it. The
+         button is only offered on the last reply, but bounding here keeps a
+         stale click from silently re-sending turns that came after it. */
+      const continueIndex = continueFromMessageId
+        ? (conversation.messages || []).findIndex((message) => message.id === continueFromMessageId)
+        : -1
+      const variantIndex = variantOfMessageId
+        ? (conversation.messages || []).findIndex((message) => message.id === variantOfMessageId)
+        : -1
       const baseMessages = truncateIndex >= 0
         ? (conversation.messages || []).slice(0, truncateIndex)
-        : (conversation.messages || [])
-      const history = [...baseMessages, userMessage]
+        : continueIndex >= 0
+          ? (conversation.messages || []).slice(0, continueIndex + 1)
+          : variantIndex >= 0
+            /* Everything BEFORE the reply being re-rolled, which already ends
+               with the question that produced it. */
+            ? (conversation.messages || []).slice(0, variantIndex)
+            : (conversation.messages || [])
+      /* A variant adds no user turn: appending one would duplicate the
+         question in the prompt and in the transcript. */
+      const history = variantMessage ? [...baseMessages] : [...baseMessages, userMessage]
         // A token budget can end entirely inside a model-hidden channel. Keep
         // that diagnostic turn in the transcript, but never feed an empty
         // assistant message back into the next model prompt.
@@ -1340,18 +1456,23 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
 
       setPendingChat({ conversationId: conversation.id, content: messageContent, modelId: selectedModelId })
-      if (overrideContent === null) setComposer('')
+      if (overrideContent === null && !continuedMessage) setComposer('')
 
-      persistConversations((current) => current.map((item) => (
-        item.id === conversation.id
-          ? {
-              ...item,
-              model_id: selectedModelId,
-              messages: truncateIndex >= 0 ? [...baseMessages, userMessage] : [...(item.messages || []), userMessage],
-              updated_at: nowIso(),
-            }
-          : item
-      )))
+      /* The continuation instruction is request-only: storing it would leave a
+         "Continue your previous reply..." turn in the transcript and re-send it
+         on every later turn. */
+      if (!reusedMessage) {
+        persistConversations((current) => current.map((item) => (
+          item.id === conversation.id
+            ? {
+                ...item,
+                model_id: selectedModelId,
+                messages: truncateIndex >= 0 ? [...baseMessages, userMessage] : [...(item.messages || []), userMessage],
+                updated_at: nowIso(),
+              }
+            : item
+        )))
+      }
 
       // Gemma 4 26B is not advertised as function-tool-capable by Camelid, so
       // Web UI research is a deterministic preflight: resolve linked/current
@@ -1583,7 +1704,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
           startPacing()
         })
       }
-      assistantId = makeId('message')
+      /* Continuing reuses the truncated message's id, so every stream patch
+         below lands on the reply already on screen instead of opening a second
+         bubble under it. */
+      assistantId = reusedMessage ? reusedMessage.id : makeId('message')
       /* Snapshot of the support claim that was active when this send left the
          composer: row id + status only (never paths) so the message footer can
          cite the exact contract row that gated this generation. */
@@ -1596,14 +1720,25 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // their contract status in support_row.
       const experimentalLaneAtSend = sendGate.chatMode === 'experimental'
       const assistantMessageBase = {
+        ...(continuedMessage || {}),
+        /* A variant is a FRESH reply that only shares an id and a sibling
+           list. Spreading the old reply here would carry its receipt, its web
+           sources and its continuation count onto a generation that produced
+           none of them. */
+        ...(variantMessage ? { variants: variantsOf(variantMessage) } : {}),
         id: assistantId,
         role: 'assistant',
-        content: '',
+        /* A continuation keeps what it already generated on screen; a variant
+           starts empty, and its siblings ride along untouched until the
+           terminal write appends this reply to them. */
+        content: continuationPrefix,
         model_id: selectedModelId,
         model_name: selectedModel?.name || selectedModelId,
         support_row: supportRowAtSend,
         experimental_lane: experimentalLaneAtSend,
-        created_at: nowIso(),
+        /* A continued reply keeps the timestamp it was first sent at — the
+           footer time is when the reader asked, not when they resumed. */
+        created_at: continuedMessage?.created_at || nowIso(),
         tokens_in_per_sec: null,
         tokens_out_per_sec: null,
         generated_token_ids: [],
@@ -1613,8 +1748,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         // is replaced by backend-reported totals when they arrive.
         usage: {
           prompt_tokens: promptTokenEstimate,
-          completion_tokens: 0,
-          total_tokens: promptTokenEstimate,
+          completion_tokens: continuedCompletionTokens,
+          total_tokens: promptTokenEstimate + continuedCompletionTokens,
         },
         usage_source: 'client_estimate',
         streaming: true,
@@ -1631,8 +1766,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
         item.id === conversation.id
           ? {
               ...item,
-              title: item.title === 'New conversation' ? messageContent.slice(0, 64) : item.title,
-              messages: [...(item.messages || []), assistantMessageBase],
+              title: item.title === 'New conversation' && !reusedMessage
+                ? messageContent.slice(0, 64)
+                : item.title,
+              messages: reusedMessage
+                ? (item.messages || []).map((message) => (
+                    message.id === assistantId ? assistantMessageBase : message
+                  ))
+                : [...(item.messages || []), assistantMessageBase],
               updated_at: nowIso(),
             }
           : item
@@ -1805,13 +1946,26 @@ export function useDashboardData({ showNotice, clearNotice }) {
             ? {
                 ...item,
                 messages: (item.messages || []).map((message) => (
-                  message.id === assistantId ? { ...message, ...patch } : message
+                  message.id === assistantId
+                    ? { ...message, ...patch, ...contentPatchForContinuation(patch) }
+                    : message
                 )),
                 updated_at: nowIso(),
               }
             : item
         )))
       }
+      /* The stream reports only what THIS request generated. On a continuation
+         the message already holds everything the earlier request produced, so
+         a raw content patch would wipe it and replay the reply from the
+         resume point. Re-joining here keeps the single choke point single: the
+         pacer, the token counters and the terminal write all stay unaware that
+         a continuation is in flight. */
+      const contentPatchForContinuation = (patch) => (
+        continuedMessage && patch.content !== undefined
+          ? { content: joinContinuation(continuationPrefix, patch.content) }
+          : {}
+      )
       const flushAssistantStreamPatch = () => {
         pendingAssistantFrame = null
         if (!pendingAssistantPatch) return
@@ -2045,9 +2199,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
           }))
         }
       }
+      const streamedContent = paceDrain(pacer, streamed.content || '')
       const assistantMessage = {
         ...assistantMessageBase,
-        content: paceDrain(pacer, streamed.content || ''),
+        content: continuedMessage
+          ? joinContinuation(continuationPrefix, streamedContent)
+          : streamedContent,
         tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, modelTtftMs),
         tokens_out_per_sec: targetVerifiedRender
           ? (targetVerifiedSegmentedDiagnostics || targetVerifiedRenderDiagnostics).render_tokens_per_second
@@ -2055,13 +2212,24 @@ export function useDashboardData({ showNotice, clearNotice }) {
             ?? (responseIsStreaming ? tokensPerSecond(decodedTokenCount, decodeElapsedMs) : null),
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
-        usage: streamed.usage || {
-          prompt_tokens: promptTokenEstimate,
-          completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
-          total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
-        },
+        usage: continuedMessage
+          /* Output accumulates across continuations so the footer describes the
+             whole reply on screen; the prompt count stays the LAST request's,
+             because a summed prompt would describe no request ever made. */
+          ? mergeContinuedUsage(continuedMessage.usage, streamed.usage || {
+              prompt_tokens: promptTokenEstimate,
+              completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
+            })
+          : streamed.usage || {
+              prompt_tokens: promptTokenEstimate,
+              completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
+              total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
+            },
         /* Footer labeling: backend-reported usage vs client estimate (I4). */
         usage_source: streamed.usage ? 'backend' : 'client_estimate',
+        ...(continuedMessage
+          ? { continuation_count: Math.max(0, Number(continuedMessage.continuation_count) || 0) + 1 }
+          : {}),
         camelid: streamed.camelid || null,
         planner_camelid: targetVerifiedPlannerCamelid,
         camelid_receipt: streamed.camelidReceipt || null,
@@ -2082,7 +2250,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
           ? {
               ...item,
               messages: (item.messages || []).map((message) => (
-                message.id === assistantId ? assistantMessage : message
+                message.id === assistantId
+                  /* Siblings come from the message as it was BEFORE this
+                     regeneration, so a re-roll of a re-roll keeps the whole
+                     set rather than collapsing to two. */
+                  ? (variantMessage ? withVariantAppended(variantMessage, assistantMessage) : assistantMessage)
+                  : message
               )),
               updated_at: nowIso(),
             }
@@ -2159,6 +2332,47 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setSending(false)
       await loadDashboard({ silent: true })
     }
+  }
+
+  const updateConversationRecord = (id, update) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === id ? { ...update(conversation), updated_at: conversation.updated_at } : conversation
+    )))
+  }
+
+  /* Organizing a thread is not editing it: updated_at stays put above, so
+     pinning or tagging does not shuffle the recency order it is meant to
+     work with. */
+  const setConversationPinned = (id, pinned) => updateConversationRecord(id, (c) => withPinned(c, pinned))
+  const setConversationArchived = (id, archived) => updateConversationRecord(id, (c) => withArchived(c, archived))
+  const addConversationTag = (id, tag) => updateConversationRecord(id, (c) => withTagAdded(c, tag))
+  const removeConversationTag = (id, tag) => updateConversationRecord(id, (c) => withTagRemoved(c, tag))
+
+  const toggleConversationTagFilter = (tag) => {
+    setConversationTagFilter((current) => (
+      current.includes(tag) ? current.filter((entry) => entry !== tag) : [...current, tag]
+    ))
+  }
+  const clearConversationTagFilter = () => setConversationTagFilter([])
+
+  /* Imported threads are prepended, never merged onto existing ids: an import
+     that silently overwrites a conversation already here is worse than no
+     import at all. */
+  const importConversationsFromText = (text) => {
+    const { conversations: imported, skipped, error } = parseImportedConversations(text)
+    if (error) {
+      showNotice(error, 'error')
+      return { imported: 0, skipped }
+    }
+    persistConversations((current) => [...imported, ...current])
+    const noun = imported.length === 1 ? 'conversation' : 'conversations'
+    showNotice(
+      skipped > 0
+        ? `Imported ${imported.length} ${noun}; skipped ${skipped} with no readable messages.`
+        : `Imported ${imported.length} ${noun}.`,
+      'success',
+    )
+    return { imported: imported.length, skipped }
   }
 
   const renameConversation = async (id, nextTitle) => {
@@ -2616,6 +2830,22 @@ export function useDashboardData({ showNotice, clearNotice }) {
     showNewChatLanding,
     sendMessage,
     resendFromMessage,
+    continueFromMessage,
+    regenerateAsVariant,
+    selectMessageVariant,
+    discardMessageVariant,
+    conversationTags,
+    archivedConversationCount,
+    conversationTagFilter,
+    toggleConversationTagFilter,
+    clearConversationTagFilter,
+    showArchivedConversations,
+    setShowArchivedConversations,
+    setConversationPinned,
+    setConversationArchived,
+    addConversationTag,
+    removeConversationTag,
+    importConversationsFromText,
     stopGeneration,
     saveToMemory,
     createMemory,

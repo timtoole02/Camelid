@@ -51,6 +51,12 @@
     "smoke:byte-units": "node scripts/byte-units-smoke.mjs",
     "smoke:context-meter": "node scripts/context-meter-smoke.mjs",
     "smoke:context-compaction": "node scripts/context-compaction-smoke.mjs",
+    "smoke:continuation": "node scripts/chat-continuation-smoke.mjs",
+    "smoke:variants": "node scripts/message-variants-smoke.mjs",
+    "smoke:organization": "node scripts/conversation-organization-smoke.mjs",
+    "smoke:organization-browser": "node scripts/conversation-organization-browser-smoke.mjs",
+    "smoke:variants-browser": "node scripts/message-variants-browser-smoke.mjs",
+    "smoke:continuation-browser": "node scripts/chat-continuation-browser-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },
   "dependencies": {

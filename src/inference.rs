@@ -2505,6 +2505,17 @@ pub struct LlamaInferenceSession {
     /// Lazily-built GPU resident-decode session (a transient on-GPU cache; rebuilt on demand
     /// and not part of the session's logical identity, so it is skipped by Clone/PartialEq/Debug).
     resident_decode: Option<metal_resident::ResidentDecodeState>,
+    /// The exact prompt whose KV rows `resident_decode` holds in `[0, len)`, or empty when
+    /// nothing is vouched for.
+    ///
+    /// This is the record prefix continuation needs: a KV row is a pure function of the
+    /// token prefix that produced it, so the next turn can reuse the leading run its prompt
+    /// shares with THIS one. Over-claiming is not a slow path, it is silently wrong output,
+    /// so the record is set only by a prefill that actually wrote those rows and is cleared
+    /// by anything that writes the cache another way. Skipped by Clone/PartialEq/Debug for
+    /// the same reason `resident_decode` is: a clone gets no engine, so it vouches for
+    /// nothing.
+    resident_tokens: Vec<u32>,
     /// CUDA analog of `resident_decode` (the GPU-resident decode engine on
     /// NVIDIA hardware). Same transient-cache role; skipped by Clone/PartialEq/Debug.
     /// When set, the session never takes the GPU-resident prefill/decode paths, keeping the
@@ -2548,6 +2559,21 @@ pub struct LlamaInferenceSession {
     /// True for a speculative draft-model session: routes its GPU resident engine to
     /// the dedicated drafter cache so draft + target models stay resident at once.
     is_drafter: bool,
+}
+
+/// Park the resident Metal engine instead of dropping it.
+///
+/// The API builds a fresh `LlamaInferenceSession` per request and lets it fall out of
+/// scope, so `Drop` is the only hook that catches every way a request can end — including
+/// the error paths, where dropping the engine is exactly what we want and parking refuses
+/// on its own (a failed prefill leaves the record and the watermark disagreeing).
+///
+/// A hollow placeholder from `take_for_step`, and every `clone()`, carry no engine, so this
+/// is a no-op for them.
+impl Drop for LlamaInferenceSession {
+    fn drop(&mut self) {
+        self.park_resident_metal_engine();
+    }
 }
 
 impl LlamaInferenceSession {
@@ -2616,6 +2642,7 @@ impl LlamaInferenceSession {
                 },
             ),
             resident_decode: self.resident_decode.take(),
+            resident_tokens: std::mem::take(&mut self.resident_tokens),
             resident_paths_disabled: self.resident_paths_disabled,
             cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
@@ -2708,6 +2735,7 @@ impl Clone for LlamaInferenceSession {
             weights: self.weights.clone(),
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
+            resident_tokens: Vec::new(),
             resident_paths_disabled: self.resident_paths_disabled,
             cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
@@ -2750,6 +2778,7 @@ impl LlamaInferenceSession {
             weights,
             kv_cache: LlamaKvCache::new(plan, kv_quant)?,
             resident_decode: None,
+            resident_tokens: Vec::new(),
             resident_paths_disabled: false,
             cpu_kv_mirror_eager: true,
             resident_encode_ahead_enabled: true,
@@ -2858,6 +2887,9 @@ impl LlamaInferenceSession {
             ));
         }
         self.resident_decode = None;
+        // The engine is gone, so nothing vouches for those rows any more. Leaving the
+        // record behind would let a later turn claim a prefix no engine holds.
+        self.resident_tokens.clear();
         self.kv_cache.rollback_to_position(position)
     }
 
@@ -13542,6 +13574,11 @@ pub fn reset_resident_caches() {
 pub fn reset_resident_caches() {
     #[cfg(target_os = "macos")]
     {
+        // Drop the parked resident engine FIRST. It holds this model's GPU KV cache and,
+        // more to the point, it is the thing standing between the weight buffers and the
+        // eviction sweep below — a parked engine outliving its model would keep its
+        // allocation referenced and make the sweep a no-op.
+        metal_resident::clear_parked_resident_metal();
         let freed = crate::metal::evict_unreferenced_resident_weights();
         if freed > 0 && std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(

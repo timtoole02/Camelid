@@ -499,6 +499,51 @@ jobs:
       - name: Frontend math + diagram browser smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:math-diagram-browser
+      # Continuing a reply that stopped on the response budget. Pure half:
+      # which replies may be continued, how the resumed text rejoins the kept
+      # text (mid-word resumes, restated sentences), and cumulative usage.
+      - name: Frontend chat continuation smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:continuation
+
+      # The half a pure test cannot reach: that the continuation lands on the
+      # SAME assistant message, that the request-only instruction never enters
+      # the stored transcript, and that a later turn therefore sends one merged
+      # reply instead of replaying a "continue" turn forever.
+      - name: Frontend chat continuation browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:continuation-browser
+
+      # Regenerated replies kept side by side. The contract under test is the
+      # mirroring one: the active version's fields are also the message's own,
+      # so every existing reader keeps working without knowing versions exist.
+      - name: Frontend reply variants smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:variants
+
+      # What a pure test cannot reach: that a re-roll does not duplicate the
+      # question or show the model the answer it is replacing, that switching
+      # moves the telemetry with the text, and that the NEXT turn sends
+      # whichever version is selected.
+      - name: Frontend reply variants browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:variants-browser
+
+      # Pins, archive, tags, bulk export and import. Most of this gate is the
+      # IMPORT half: it reads a user-chosen file into stored state, so the
+      # bounds, the field whitelist, the regenerated ids and the refusal to
+      # trust a claimed usage_source are all asserted here.
+      - name: Frontend conversation organization smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:organization
+
+      # The wiring an organization feature actually fails on: a pin that still
+      # falls off the recent limit, a filter that hides everything, an archive
+      # with no way back, and the export -> import round trip through the real
+      # file picker.
+      - name: Frontend conversation organization browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:organization-browser
 
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,

@@ -9,6 +9,166 @@ use crate::metal;
 
 pub(super) type ResidentDecodeState = metal::ResidentDecodeState;
 
+/// The engine geometry a parked state was built for. Compared on reclaim so a state can
+/// only ever be handed to a session whose dimensions match it exactly — a key collision, or
+/// the same model id reloaded at different dimensions, must rebuild rather than reuse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct ResidentMetalGeometry {
+    n_layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+    ffn_dim: usize,
+}
+
+/// A resident Metal engine parked between requests, with the prompt its KV rows hold.
+///
+/// The API builds a fresh `LlamaInferenceSession` per request, so a session-owned engine
+/// dies at the end of every turn and the next turn re-prefills the whole conversation.
+/// CUDA does not have this problem because its engine lives in a process-global cache. This
+/// is the Metal equivalent, kept deliberately smaller: the session still OWNS the engine
+/// while it runs, and only hands it back here on the way out, so the ~30 sites that use
+/// `resident_decode` are untouched.
+struct ResidentMetalParking {
+    /// `LlamaInferenceSession::resident_cache_key` — the API sets it from the model id
+    /// precisely so the same model is recognised across separately-loaded weight Arcs.
+    key: u64,
+    geometry: ResidentMetalGeometry,
+    state: ResidentDecodeState,
+    /// The prompt whose rows `state` holds in `[0, tokens.len())`. `state.filled()` is kept
+    /// equal to this length when parking, so the record and the watermark cannot disagree.
+    tokens: Vec<u32>,
+}
+
+/// The single parking slot. One entry, like the CUDA engine cache: two models alternating
+/// will evict each other rather than both staying resident, which is the same trade that
+/// cache already makes and is what a 16 GiB unified-memory budget wants.
+fn resident_metal_park() -> &'static std::sync::Mutex<Option<ResidentMetalParking>> {
+    static PARK: std::sync::OnceLock<std::sync::Mutex<Option<ResidentMetalParking>>> =
+        std::sync::OnceLock::new();
+    PARK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Drop whatever is parked. Used when a model is released, and by tests that must not
+/// inherit another test's engine.
+///
+/// macOS-only: its sole caller is the macOS arm of `reset_resident_caches`, and nothing can
+/// park on a target with no resident engine, so on every other target this is dead code
+/// that `-D dead-code` rejects. The park/reclaim pair below stays unconditional because the
+/// `Drop` hook and the prefill both reach them on every target — they simply decline at
+/// runtime.
+#[cfg(target_os = "macos")]
+pub(crate) fn clear_parked_resident_metal() {
+    *resident_metal_park()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// Hand a finished engine back for the next request, or drop it.
+///
+/// The two directions of disagreement between the record and the watermark are NOT
+/// symmetric, and treating them alike is what makes parking never fire:
+///
+/// * `filled > tokens.len()` is the ORDINARY case, not an error. Decode advances the
+///   watermark past the prompt, one row per generated token, so by the time a request ends
+///   the engine holds prompt + reply while the record names only the prompt. Those extra
+///   rows are real K/V, they simply have no name here, so the watermark is rewound to the
+///   record and they stop being vouched for. The next turn overwrites them anyway: its
+///   prompt continues from the end of THIS prompt, and the reply is re-prefilled as part of
+///   its suffix. (Recording generated tokens too would extend the reuse across the reply;
+///   that is a follow-up, not a correctness matter.)
+/// * `filled < tokens.len()` IS an error — the record claims rows the engine never wrote,
+///   which is what a failed prefill or a rewind leaves behind. Keep nothing.
+fn park_resident_metal(
+    key: u64,
+    geometry: ResidentMetalGeometry,
+    mut state: ResidentDecodeState,
+    tokens: Vec<u32>,
+) {
+    if tokens.is_empty() || state.filled() < tokens.len() {
+        return;
+    }
+    state.set_filled(tokens.len());
+    *resident_metal_park()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(ResidentMetalParking {
+        key,
+        geometry,
+        state,
+        tokens,
+    });
+}
+
+/// Take the parked engine when it belongs to this model AND was built at these dimensions.
+///
+/// Both halves matter. The key alone does not pin geometry — the same model id reloaded with
+/// a different context or layer range would collide — and handing a session an engine whose
+/// per-layer strides differ from its own would read another shape's rows as if they were
+/// this one's.
+fn reclaim_resident_metal(
+    key: u64,
+    geometry: ResidentMetalGeometry,
+) -> Option<(ResidentDecodeState, Vec<u32>)> {
+    let mut guard = resident_metal_park()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let matches = guard
+        .as_ref()
+        .is_some_and(|p| p.key == key && p.geometry == geometry);
+    if !matches {
+        return None;
+    }
+    guard.take().map(|p| (p.state, p.tokens))
+}
+
+/// Leading run two token sequences share.
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+impl ResidentMetalGeometry {
+    fn of(state: &ResidentDecodeState) -> Self {
+        let (n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn_dim) = state.geometry();
+        Self {
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+        }
+    }
+}
+
+impl super::LlamaInferenceSession {
+    /// Hand this session's resident Metal engine to the parking slot on the way out, so the
+    /// next turn of the same conversation can continue from the rows it already holds.
+    ///
+    /// Called from `Drop`, which is the only hook that catches every way a request ends —
+    /// the API builds a fresh session per request and simply lets it fall out of scope.
+    /// Everything that would make the handoff unsafe is refused rather than papered over:
+    /// no model identity, no engine, or a record that disagrees with the watermark.
+    pub(super) fn park_resident_metal_engine(&mut self) {
+        // Never park what can never be continued. Continuation is admitted only on an F32
+        // KV primary (see `metal::resident_kv_primary_is_half`), so on a half primary this
+        // would hold a GPU KV cache alive between requests to no purpose. Refusing here
+        // keeps that configuration byte-for-byte on its previous behaviour.
+        if metal::resident_kv_primary_is_half() {
+            return;
+        }
+        let Some(key) = self.resident_cache_key else {
+            return;
+        };
+        let Some(state) = self.resident_decode.take() else {
+            return;
+        };
+        let tokens = std::mem::take(&mut self.resident_tokens);
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(key, geometry, state, tokens);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MetalSampleRequest {
     Greedy {
@@ -447,26 +607,87 @@ impl super::LlamaInferenceSession {
                 .as_ref()
                 .is_some_and(|g| g.rope_neox_pairing);
         let schedule = self.gemma3_resident_schedule(0..n_layers);
-        let mut session = match metal::ResidentDecodeState::new(
+        // Prefix continuation: an engine parked by an earlier turn of this conversation may
+        // already hold the leading rows this prompt needs. Reclaim it only when the model
+        // identity AND the geometry both match, then reuse the run its recorded prompt
+        // shares with this one.
+        //
+        // The claim is bounded three ways, and all three carry weight: by the RECORD (rows
+        // whose tokens we know), by `filled()` (rows the engine still vouches for), and by
+        // `n - 1` so the prefill still ends by writing the last position, which is the state
+        // the decode lane expects. Capture mode opts out — it has no continuation entry
+        // point, and a diagnostic path is not worth a second one.
+        let geometry = ResidentMetalGeometry {
             n_layers,
             n_heads,
-            n_kv,
+            n_kv_heads: n_kv,
             head_dim,
-            dims.embedding_length,
-            dims.feed_forward_length,
-            initial_positions,
-            kv_cap,
-            rms_eps,
-            split_half_pairing,
-            schedule,
-        ) {
-            Some(s) => s,
-            None => {
-                if trace {
-                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 4");
+            hidden: dims.embedding_length,
+            ffn_dim: dims.feed_forward_length,
+        };
+        let reclaimed = self
+            .resident_cache_key
+            .and_then(|key| reclaim_resident_metal(key, geometry))
+            .and_then(|(mut state, parked)| {
+                // Decide the claim BEFORE committing to the engine. A reclaimed engine is
+                // only safe for a CONTINUATION: it carries the previous turn's KV, and a
+                // from-scratch prefill driven through one produced corrupt output where a
+                // fresh (zero-filled) engine was correct. So with nothing to reuse, drop it
+                // and take the ordinary build path.
+                let reuse = if capture_layer_ids.is_empty() && !metal::resident_kv_primary_is_half()
+                {
+                    common_prefix_len(&parked, token_ids)
+                        .min(state.filled())
+                        .min(n.saturating_sub(1))
+                } else {
+                    0
+                };
+                // Reuse has to be worth what it costs. A parked engine was sized for the
+                // prompt that built it, so continuing a much longer one through it forces a
+                // KV growth realloc — and growth reallocates, zero-fills and blits the
+                // whole cache behind a blocking wait. Measured: the server's own 10-token
+                // warm-up parked an engine whose 2 shared positions turn 1 then "reused",
+                // paying that growth to save two rows — 6.8 s against 2.1 s for simply
+                // building at the right size. A fresh engine is allocated for the prompt it
+                // will actually hold, so below this floor that is strictly better.
+                const MIN_REUSE_POSITIONS: usize = 256;
+                if reuse < MIN_REUSE_POSITIONS {
+                    return None;
                 }
-                return Ok(None);
+                // Drop the watermark to exactly the reused span BEFORE prefilling the rest,
+                // so a failure below leaves no claim on rows this prefill never wrote.
+                state.set_filled(reuse);
+                Some((state, reuse))
+            });
+        let mut reused = 0usize;
+        let mut session = match reclaimed {
+            Some((state, reuse)) => {
+                reused = reuse;
+                state
             }
+            None => match metal::ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                dims.embedding_length,
+                dims.feed_forward_length,
+                initial_positions,
+                kv_cap,
+                rms_eps,
+                split_half_pairing,
+                schedule,
+            ) {
+                Some(s) => s,
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[resident-prefill] try_metal_resident_prefill declined at site 4"
+                        );
+                    }
+                    return Ok(None);
+                }
+            },
         };
 
         let session_us = session_started.elapsed().as_micros();
@@ -533,6 +754,74 @@ impl super::LlamaInferenceSession {
                     metal::gemma3_batch_prefill_rows(),
                 )
                 .map(|_| Vec::new())
+        } else if reused > 0 {
+            // Continue over the reused rows. The RoPE tables are indexed by batch row, so
+            // they are sliced to `[reused, n)` exactly as the embeddings are.
+            let hidden = dims.embedding_length;
+            let half_rope = cos_all.len() / n;
+            let continued = session
+                .prefill_tokens_from(
+                    &embeddings.data[reused * hidden..],
+                    n - reused,
+                    &layer_views,
+                    &cos_all[reused * half_rope..],
+                    &sin_all[reused * half_rope..],
+                    scale,
+                    reused,
+                )
+                .map(|_| Vec::new());
+            match continued {
+                Some(v) => Some(v),
+                // Continuation is refused off the attention-as-matmul lane. That is a
+                // correctness gate, not a failure: fall back to a cold full prefill of the
+                // whole prompt rather than dropping the request to the CPU. The rewind
+                // below is what makes the retry legitimate — the engine must claim nothing
+                // before a prefill that starts from empty.
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[resident-prefill] continuation declined (reuse={reused}); \
+                             rebuilding for a full prefill"
+                        );
+                    }
+                    reused = 0;
+                    // REBUILD rather than rewind. A reclaimed engine is only safe on the
+                    // path prefix continuation was proven on; driving a from-scratch
+                    // prefill through one produced corrupt output (measured: turns 2+ of a
+                    // 3B-Q4_K_M chat degenerated to "!!!!" where a fresh engine was
+                    // correct, and a fresh engine differs exactly in carrying no prior KV).
+                    // `ResidentDecodeState::new` zero-fills, so a fresh engine restores the
+                    // from-empty precondition every non-continuation prefill assumes.
+                    let schedule = self.gemma3_resident_schedule(0..n_layers);
+                    match metal::ResidentDecodeState::new(
+                        n_layers,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        dims.embedding_length,
+                        dims.feed_forward_length,
+                        initial_positions,
+                        kv_cap,
+                        rms_eps,
+                        split_half_pairing,
+                        schedule,
+                    ) {
+                        Some(fresh) => {
+                            session = fresh;
+                            session.prefill_tokens_with_layer_inputs(
+                                &embeddings.data,
+                                n,
+                                &layer_views,
+                                &cos_all,
+                                &sin_all,
+                                scale,
+                                capture_layer_ids,
+                            )
+                        }
+                        None => None,
+                    }
+                }
+            }
         } else {
             session.prefill_tokens_with_layer_inputs(
                 &embeddings.data,
@@ -573,6 +862,16 @@ impl super::LlamaInferenceSession {
         // GPU cache now holds positions 0..n; the resident decode continues this sequence.
         self.kv_cache.position = n;
         self.resident_decode = Some(session);
+        // Record the sequence those rows hold, so a later turn of this conversation can
+        // continue from it. Only a prefill that actually wrote them may set this.
+        self.resident_tokens = token_ids.to_vec();
+        if trace && reused > 0 {
+            eprintln!(
+                "[resident-prefill] prefix continuation: reused {reused} of {n} positions, \
+                 prefilled {}",
+                n - reused
+            );
+        }
         if trace {
             eprintln!("[resident-prefill] try_metal_resident_prefill OK");
         }
@@ -1136,6 +1435,11 @@ impl super::LlamaInferenceSession {
             }
             session.set_filled(position);
             self.resident_decode = Some(session);
+            // These rows were RESEEDED from the CPU KV cache, which stores f16-rounded
+            // values — not bit-identical to what a GPU prefill would have written. A later
+            // turn must not treat them as a known-good prefix, which is the whole reason
+            // prefix continuation never round-trips through the host. Stop vouching.
+            self.resident_tokens.clear();
         }
 
         // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
@@ -1829,5 +2133,101 @@ impl super::LlamaInferenceSession {
         _capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(None)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod parking_tests {
+    use super::*;
+
+    /// A minimal engine. `None` on a host with no Metal device, which skips the test.
+    fn tiny_state(hidden: usize) -> Option<ResidentDecodeState> {
+        metal::ResidentDecodeState::new(1, 1, 1, 32, hidden, 64, 8, 8, 1.0e-5, false, None)
+    }
+
+    /// The slot has exactly one writer in the test binary: this module. A session parks
+    /// only when `resident_cache_key` is set, and only the API sets it, so no other test
+    /// can leave an engine here or take this one.
+    #[test]
+    fn a_parked_engine_is_reclaimed_only_by_an_exact_key_and_geometry_match() {
+        clear_parked_resident_metal();
+        let Some(mut state) = tiny_state(32) else {
+            eprintln!("SKIP: no Metal device");
+            return;
+        };
+        state.set_filled(3);
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
+
+        assert!(
+            reclaim_resident_metal(0xBEEF, geometry).is_none(),
+            "another model's key must not take this engine"
+        );
+        let mut other = geometry;
+        other.hidden += 128;
+        assert!(
+            reclaim_resident_metal(0xD00D, other).is_none(),
+            "a geometry mismatch must rebuild, never reuse another shape's strides"
+        );
+
+        let (state, tokens) =
+            reclaim_resident_metal(0xD00D, geometry).expect("an exact match reclaims");
+        assert_eq!(tokens, vec![7, 8, 9], "the record must survive parking");
+        assert_eq!(
+            state.filled(),
+            3,
+            "the watermark must survive parking, or the next turn cannot bound its claim"
+        );
+        assert!(
+            reclaim_resident_metal(0xD00D, geometry).is_none(),
+            "reclaiming takes the engine: the slot must not hand the same one out twice"
+        );
+    }
+
+    /// Parking is refused when the record and the watermark disagree, because that is
+    /// exactly the state a failed prefill or a rewind leaves behind — rows the record
+    /// claims but the engine does not hold, or rows it holds but cannot name. Reusing
+    /// either as a known prefix is silently wrong output.
+    #[test]
+    fn an_engine_whose_record_disagrees_with_its_watermark_is_not_parked() {
+        clear_parked_resident_metal();
+        let Some(mut state) = tiny_state(32) else {
+            eprintln!("SKIP: no Metal device");
+            return;
+        };
+        state.set_filled(2);
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
+        assert!(
+            reclaim_resident_metal(0xD00D, geometry).is_none(),
+            "filled=2 against a 3-token record claims rows never written: drop, do not park"
+        );
+
+        // The opposite direction is ordinary, not an error: decode leaves the watermark
+        // past the prompt, and parking rewinds it to the record rather than refusing.
+        clear_parked_resident_metal();
+        let Some(mut state) = tiny_state(32) else {
+            return;
+        };
+        state.set_filled(6); // prompt of 3, then 3 generated tokens
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
+        let (state, tokens) = reclaim_resident_metal(0xD00D, geometry)
+            .expect("a decoded-past engine must still park: this is every real request");
+        assert_eq!(tokens, vec![7, 8, 9]);
+        assert_eq!(
+            state.filled(),
+            3,
+            "the watermark must be rewound to the record, so the next turn cannot claim              generated rows the record does not name"
+        );
+
+        clear_parked_resident_metal();
+        let Some(state) = tiny_state(32) else { return };
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, Vec::new());
+        assert!(
+            reclaim_resident_metal(0xD00D, geometry).is_none(),
+            "an empty record vouches for nothing and must not park"
+        );
     }
 }

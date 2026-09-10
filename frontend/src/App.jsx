@@ -93,8 +93,13 @@ function App() {
     loadingModelId, registerForm, setRegisterForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
-    createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
+    createConversation, showNewChatLanding, sendMessage, resendFromMessage, continueFromMessage,
+    regenerateAsVariant, selectMessageVariant, discardMessageVariant, stopGeneration, saveToMemory,
     createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
+    conversationTags, archivedConversationCount, conversationTagFilter, toggleConversationTagFilter,
+    clearConversationTagFilter, showArchivedConversations, setShowArchivedConversations,
+    setConversationPinned, setConversationArchived, addConversationTag, removeConversationTag,
+    importConversationsFromText,
     activateModel, unloadCurrentModel,
     registerModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
@@ -348,6 +353,17 @@ function App() {
           onSelectConversation={selectConversation}
           renameConversation={renameConversation}
           requestDeleteConversation={requestDeleteConversation}
+          conversationTags={conversationTags}
+          tagFilter={conversationTagFilter}
+          onToggleTagFilter={toggleConversationTagFilter}
+          onClearTagFilter={clearConversationTagFilter}
+          archivedCount={archivedConversationCount}
+          showArchived={showArchivedConversations}
+          onToggleShowArchived={setShowArchivedConversations}
+          onTogglePin={setConversationPinned}
+          onToggleArchive={setConversationArchived}
+          onAddTag={addConversationTag}
+          onRemoveTag={removeConversationTag}
           runtime={runtime}
           apiSurface={apiSurface}
           themePreference={preference}
@@ -420,6 +436,10 @@ function App() {
               saveToMemory={saveToMemory}
               sendMessage={sendMessage}
               resendFromMessage={resendFromMessage}
+              continueFromMessage={continueFromMessage}
+              regenerateAsVariant={regenerateAsVariant}
+              selectMessageVariant={selectMessageVariant}
+              discardMessageVariant={discardMessageVariant}
               stopGeneration={stopGeneration}
               sending={sending}
               receiptMode={receiptMode}
@@ -486,6 +506,7 @@ function App() {
           {tab === 'history' && (
             <HistoryView
               filteredConversations={filteredConversations}
+              importConversationsFromText={importConversationsFromText}
               setSelectedConversationId={selectConversation}
               setTab={navigateTab}
               deleteConversation={requestDeleteConversation}
