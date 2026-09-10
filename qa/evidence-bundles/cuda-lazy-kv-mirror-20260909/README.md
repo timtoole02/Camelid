@@ -28,6 +28,25 @@ The copy is now performed by `ensure_cpu_kv_materialized` at the moment a CPU
 reader actually needs the history. On the common path — GPU prefill, GPU decode,
 no fallback — nothing reads it and it is never paid.
 
+## Scope: lazy only where it is safe
+
+The mirror is skipped only for requests that cannot reach `rollback_to_position`.
+`cpu_kv_mirror_eager` defaults to `true`; `prepare_generation` clears it solely
+when `speculative.is_none()`. Verified on the shipped binary (`scope-proof.txt`):
+
+| arm | `KV mirror to host` lines over 5 turns |
+|---|---|
+| default (no speculation) | **0** |
+| `CAMELID_SPEC_DECODE=ngram CAMELID_SPEC_GPU=1` | **6** |
+
+The wall-clock in that particular run is contaminated — another engine held
+5161 MiB of the 6 GiB card — so it is not used as a measurement. The line count
+is a boolean and is unaffected.
+
+The timings in the next section were taken on a **clean, exclusive GPU before the
+scoping flag existed**. The flag does not change the non-speculating path (that
+path still emits zero mirror lines, above), so they remain the receipt for it.
+
 ## Result
 
 Llama 3.2 3B Q8_0 fully resident, RTX 3060 Laptop, growing 5-turn conversation,

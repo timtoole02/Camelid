@@ -1,0 +1,21 @@
+# Scope proof: the mirror is skipped ONLY for non-speculating requests.
+# Same binary (post-flag), same 5-turn conversation, arm = CAMELID_SPEC_DECODE/CAMELID_SPEC_GPU.
+# NOTE: wall-clock in this run is CONTAMINATED (another camelid engine held 5161 MiB of the
+# 6 GiB card). The mirror-line COUNT is a boolean and is unaffected; the timings here are
+# NOT a perf measurement and are not used as one.
+
+## A. no speculation -> lazy
+KV mirror lines: 0
+[resident-cuda] GPU prefill 10 tokens in 20899 ms
+[resident-cuda] prefix continuation: reused 2 of 1436 positions, prefilled 1434
+[resident-cuda] GPU prefill 1436 tokens in 59086 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+
+## B. CAMELID_SPEC_DECODE=ngram CAMELID_SPEC_GPU=1 -> eager kept
+KV mirror lines: 6
+[resident-cuda] KV mirror to host: 10 positions in 10 ms
+[resident-cuda] KV mirror to host: 1436 positions in 732 ms
+[resident-cuda] KV mirror to host: 1473 positions in 744 ms
+[resident-cuda] KV mirror to host: 1511 positions in 535 ms
+[resident-cuda] KV mirror to host: 1549 positions in 462 ms
+[resident-cuda] KV mirror to host: 1589 positions in 450 ms
