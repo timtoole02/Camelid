@@ -1,9 +1,10 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Avatar } from '../ui/Avatar'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal } from '../ui/icons'
+import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal, IconPlay } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
 import { capabilityStatusLabel } from '../../lib/capabilities'
+import { continuationCountOf } from '../../lib/chatContinuation'
 import { formatModelLabel } from '../../lib/formatters'
 import { cleanLegacyDemoCapCopy } from '../../lib/conversationStorage'
 import {
@@ -112,6 +113,9 @@ function MessageMetaFooter({ message }) {
   const duration = formatMs(message.elapsed_ms)
   const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
   const sentAt = formatTimeOfDay(message.created_at)
+  /* A continued reply is more than one request. Disclose that rather than
+     letting one set of timings quietly describe only its last segment. */
+  const continuedTimes = continuationCountOf(message)
   if (!usage && !ttft && !rate && !message.model_id && !sentAt) return null
   return (
     <footer className="cxturn__meta" aria-label="Generation details (client-measured telemetry)">
@@ -154,6 +158,14 @@ function MessageMetaFooter({ message }) {
       {ttft && <span className="cxturn__meta-item" title="Time to first content (TTFT), measured in this browser">first token {ttft}</span>}
       {rate && <span className="cxturn__meta-item" title="Decode rate, measured in this browser">{rate}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
+      {continuedTimes > 0 && (
+        <span
+          className="cxturn__meta-item"
+          title={`Resumed ${continuedTimes === 1 ? 'once' : `${continuedTimes} times`} after hitting the response budget. Token counts cover the whole reply; the timings here cover the last segment only.`}
+        >
+          continued{continuedTimes > 1 ? ` ×${continuedTimes}` : ''}
+        </span>
+      )}
       {sentAt && <time className="cxturn__meta-item" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>}
       <span className="cxturn__meta-item cxturn__meta-note">client-measured</span>
     </footer>
@@ -258,7 +270,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
+export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onContinue, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -337,7 +349,22 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
         )}
 
         {showLengthWarning && (
-          <div className="cxturn__warning" role="status">Stopped before completing. Ask “continue” for a complete file.</div>
+          <div className="cxturn__warning" role="status">
+            <span>Stopped at the response budget, not at the end of the answer.</span>
+            {onContinue && (
+              /* Resumes this same reply in place. Regenerate, one row down,
+                 throws the text away and starts over — keep the two verbs
+                 visibly different so neither is clicked for the other. */
+              <button
+                type="button"
+                className="cxturn__warning-action"
+                onClick={() => onContinue()}
+                title="Ask the model to pick up exactly where it stopped and add to this reply"
+              >
+                <IconPlay size={13} /> <span>Continue</span>
+              </button>
+            )}
+          </div>
         )}
         {showErrorWarning && (
           <div className="cxturn__warning cxturn__warning--error" role="status">Generation stopped before Camelid returned a complete reply.</div>
