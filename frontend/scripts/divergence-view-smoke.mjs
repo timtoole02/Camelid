@@ -58,14 +58,16 @@ const DIVERGENT = {
     applied_sampling: { temperature: 'sent', seed: 'sent' },
     samples: [{ text: '12', sha256: 'aaaa', elapsed_ms: 30 }, { text: '12', sha256: 'aaaa', elapsed_ms: 28 }],
     stability: { kind: 'stable' },
-    template: { kind: 'captured', source: 'GET /props', template: CAMELID_TEMPLATE },
+    advertised_template: { kind: 'captured', source: 'GET /props', template: CAMELID_TEMPLATE },
+    rendered_prompt: { kind: 'captured', source: 'POST /apply-template', text: '<|user|>What is 7 plus 5?' },
   },
   right: {
     label: 'studio', engine: 'ollama', engine_version: '0.33.3', model: 'llama-3.2-1b',
     applied_sampling: { temperature: 'sent', seed: 'sent' },
     samples: [{ text: '7', sha256: 'bbbb', elapsed_ms: 41 }, { text: '7', sha256: 'bbbb', elapsed_ms: 39 }],
     stability: { kind: 'stable' },
-    template: { kind: 'captured', source: 'POST /api/show', template: OLLAMA_TEMPLATE },
+    advertised_template: { kind: 'captured', source: 'POST /api/show', template: OLLAMA_TEMPLATE },
+    rendered_prompt: { kind: 'unavailable', reason: "Ollama's documented API has no route that renders a chat prompt without generating" },
   },
   verdict: { kind: 'divergent' },
   diff: { kind: 'lines', lines: [{ op: 'removed', text: '12' }, { op: 'added', text: '7' }] },
@@ -97,7 +99,8 @@ const LMSTUDIO_UNSEEDED = {
     applied_sampling: { temperature: 'sent', seed: 'unsupported' },
     samples: [{ text: '7', sha256: 'bbbb', elapsed_ms: 41 }, { text: '7', sha256: 'bbbb', elapsed_ms: 39 }],
     stability: { kind: 'stable' },
-    template: { kind: 'not_exposed', detail: "LM Studio's documented API exposes no prompt template" },
+    advertised_template: { kind: 'not_exposed', detail: "LM Studio's documented API exposes no prompt template" },
+    rendered_prompt: { kind: 'unavailable', reason: "LM Studio's documented API has no route that renders a chat prompt without generating" },
   },
   uncontrolled: ['seed'],
 }
@@ -132,8 +135,19 @@ const LINE_ENDINGS = {
   },
 }
 
+/* The live receipt: both engines advertise the same template, and still answer
+   differently. */
+const SAME_TEMPLATE = {
+  ...DIVERGENT,
+  right: {
+    ...DIVERGENT.right,
+    advertised_template: { kind: 'captured', source: 'POST /api/show', template: CAMELID_TEMPLATE },
+  },
+}
+
 const BODIES = {
   divergent: DIVERGENT,
+  same_template: SAME_TEMPLATE,
   unstable: UNSTABLE,
   different_models: DIFFERENT_MODELS,
   lmstudio: LMSTUDIO_UNSEEDED,
@@ -214,6 +228,12 @@ function comparisonFor(fixture, request) {
   if (proxy.legacy) {
     delete body.uncontrolled
     for (const line of body.diff.lines || []) delete line.eol
+    // An older proxy sent the advertised capture as `template`, and no render.
+    for (const side of [body.left, body.right]) {
+      side.template = side.advertised_template
+      delete side.advertised_template
+      delete side.rendered_prompt
+    }
     return body
   }
   const leftId = request.left_model ?? request.model
@@ -493,7 +513,36 @@ try {
       els.map((el) => el.textContent.replace(/\s+/g, ' ').trim()))
     assert.ok(templates.some((t) => /GET \/props/.test(t)), 'our own template is shown')
     assert.ok(templates.some((t) => /Cutting Knowledge Date/.test(t)), 'the other template is shown')
-    check('both chat templates are shown, which is the explanation')
+    check('both advertised chat templates are shown')
+
+    // C1: an advertised template is what an engine publishes. Only a rendered
+    // prompt shows what it applied, so nothing about the templates may say so.
+    const templatesHead = await textOf(page, '[data-testid="divergence-templates"] h2')
+    assert.equal(templatesHead, 'Advertised chat templates')
+    const claims = await page.evaluate(() => [
+      document.querySelector('.divergence__lede')?.textContent || '',
+      document.querySelector('[data-testid="divergence-templates"]')?.textContent || '',
+    ].join(' '))
+    assert.doesNotMatch(claims, /\bappl(y|ied)\b/i, 'an advertised template is not the one applied')
+    const headings = await page.$$eval('[data-testid="divergence-templates"] .divergence-template h4', (els) =>
+      els.map((el) => el.textContent.replace(/\s+/g, ' ').trim()))
+    assert.deepEqual(headings, ['win · advertised via GET /props', 'studio · advertised via POST /api/show'])
+    check('the templates are labelled advertised, and nothing calls them applied')
+
+    const renderedWin = await page.$eval('[data-testid="rendered-win"]', (el) => ({
+      kind: el.getAttribute('data-rendered-kind'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(renderedWin.kind, 'captured')
+    assert.match(renderedWin.text, /rendered via POST \/apply-template/)
+    assert.match(renderedWin.text, /What is 7 plus 5\?/)
+    const renderedStudio = await page.$eval('[data-testid="rendered-studio"]', (el) => ({
+      kind: el.getAttribute('data-rendered-kind'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(renderedStudio.kind, 'unavailable')
+    assert.match(renderedStudio.text, /no route that renders a chat prompt/)
+    check('a rendered prompt is shown under its own name, and an engine that cannot render says so')
 
     // Everything except the lede, which states the rule and therefore has to
     // use the word. What must never judge a side is the *result*.
@@ -558,6 +607,23 @@ try {
     assert.match(unstable, /did not agree with itself/)
     assert.match(unstable, /2 distinct answers/)
     check('the unstable side is named, with how many answers it gave')
+    await page.close()
+  }
+
+  /* ---- the same advertised template, and still a divergence ---- */
+  resetProxy({ mode: 'same_template' })
+  {
+    const { page } = await openDivergence()
+    await submit(page)
+    await page.waitForSelector('[data-testid="divergence-template-note"]', { timeout: 10000 })
+    const note = await page.$eval('[data-testid="divergence-template-note"]', (el) => ({
+      unexplained: el.getAttribute('data-unexplained'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(note.unexplained, 'true')
+    assert.match(note.text, /advertise byte-identical chat templates, so the advertised template does not explain this difference/)
+    assert.doesNotMatch(note.text, /usually the explanation/)
+    check('identical advertised templates beside a divergence say they do not explain it')
     await page.close()
   }
 
@@ -782,6 +848,15 @@ try {
       'an unreported list is unknown, never "nothing uncontrolled"',
     )
     assert.equal(await page.$$eval('[data-eol-marker]', (els) => els.length), 0, 'no eol, rendered as before')
+    assert.equal(
+      await page.$eval('[data-testid="rendered-win"]', (el) => el.getAttribute('data-rendered-kind')),
+      'not_reported',
+      'a proxy that captured no render is not one whose render failed',
+    )
+    const legacyHeadings = await page.$$eval('[data-testid="divergence-templates"] .divergence-template h4', (els) =>
+      els.map((el) => el.textContent.replace(/\s+/g, ' ').trim()))
+    assert.deepEqual(legacyHeadings, ['win · advertised via GET /props', 'studio · advertised via POST /api/show'],
+      "an older proxy's template is shown as advertised, which is what it always was")
     check('an older proxy that records no identity says so, rather than implying one')
     assert.deepEqual(errors, [], 'no page errors')
     await page.close()

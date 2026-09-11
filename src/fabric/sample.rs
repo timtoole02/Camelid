@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use super::camelid;
 use super::divergence::{
-    stability_of, AppliedSampling, Ask, Sample, SamplingPlan, Side, TemplateEvidence,
-    MAX_COMPARE_REPETITIONS,
+    stability_of, AppliedSampling, Ask, RenderedPrompt, Sample, SamplingPlan, Side,
+    TemplateEvidence, MAX_COMPARE_REPETITIONS,
 };
 use super::engine::NodeEngine;
 use super::lmstudio;
@@ -81,7 +81,8 @@ pub(crate) struct SideRequest<'a> {
 }
 
 /// Probe the node, check it holds the model, run the prompt `plan.repetitions`
-/// times, and capture the template if the engine exposes one.
+/// times, and capture the template the engine advertises and the prompt it
+/// renders, where the engine exposes either.
 pub(crate) fn measure(
     request: &SideRequest<'_>,
     transport: &NodeTransport,
@@ -166,8 +167,48 @@ pub(crate) fn measure(
         applied_sampling: AppliedSampling::for_engine(engine),
         stability: stability_of(&samples),
         samples,
-        template: capture_template(request, engine, transport),
+        advertised_template: capture_template(request, engine, transport),
+        rendered_prompt: capture_rendered_prompt(request, &ask, engine, transport),
     })
+}
+
+/// The prompt the engine builds from the messages this comparison sent, where
+/// the engine can say so without generating.
+fn capture_rendered_prompt(
+    request: &SideRequest<'_>,
+    ask: &Ask<'_>,
+    engine: NodeEngine,
+    transport: &NodeTransport,
+) -> RenderedPrompt {
+    const SOURCE: &str = "POST /apply-template";
+    match engine {
+        NodeEngine::Camelid => match camelid::rendered_prompt(
+            request.spec,
+            ask,
+            request.bearer,
+            request.probe_timeout,
+            transport,
+        ) {
+            Ok(text) => RenderedPrompt::Captured {
+                source: SOURCE.to_string(),
+                text,
+            },
+            Err(detail) => RenderedPrompt::Unavailable {
+                reason: format!("{SOURCE} could not be read: {detail}"),
+            },
+        },
+        // Neither publishes a way to render a chat prompt without generating,
+        // so what either applied cannot be read back; its advertised template
+        // is not a substitute.
+        NodeEngine::Ollama => RenderedPrompt::Unavailable {
+            reason: "Ollama's documented API has no route that renders a chat prompt without generating"
+                .to_string(),
+        },
+        NodeEngine::LmStudio => RenderedPrompt::Unavailable {
+            reason: "LM Studio's documented API has no route that renders a chat prompt without generating"
+                .to_string(),
+        },
+    }
 }
 
 /// What a node's own answers said it served, as one value.

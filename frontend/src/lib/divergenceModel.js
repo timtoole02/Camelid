@@ -20,6 +20,7 @@
 const KNOWN_VERDICTS = ['identical', 'divergent', 'different_models', 'not_attributable']
 const KNOWN_STABILITY = ['stable', 'unstable', 'unmeasured']
 const KNOWN_TEMPLATE = ['captured', 'not_exposed', 'unavailable']
+const KNOWN_RENDERED = ['captured', 'unavailable']
 const KNOWN_DIFF = ['identical', 'lines', 'declined']
 const KNOWN_OPS = ['same', 'removed', 'added']
 const KNOWN_HONOURED = ['sent', 'unsupported']
@@ -65,6 +66,21 @@ function describeTemplate(raw) {
   }
 }
 
+/* The prompt an engine rendered from the messages the comparison sent. The
+ * only evidence of what it applied. A proxy from before the field sent none,
+ * which is "not reported", never "not captured". */
+function describeRenderedPrompt(raw, present) {
+  if (!present) return { kind: null, reported: false, source: null, text: null, reason: null }
+  if (!isPlainObject(raw)) return { kind: null, reported: true, source: null, text: null, reason: null }
+  return {
+    kind: oneOf(KNOWN_RENDERED, raw.kind),
+    reported: true,
+    source: stringOrNull(raw.source),
+    text: typeof raw.text === 'string' ? raw.text : null,
+    reason: stringOrNull(raw.reason),
+  }
+}
+
 /* The model the node's own response named. Three facts, kept apart: an older
  * proxy relays nothing (`not_relayed`), a response can name no model
  * (`unnamed`), or it names one (`named`). */
@@ -106,7 +122,10 @@ function describeSide(raw) {
       temperature: oneOf(KNOWN_HONOURED, sampling.temperature),
       seed: oneOf(KNOWN_HONOURED, sampling.seed),
     },
-    template: describeTemplate(raw.template),
+    // What the engine publishes as the model's template, never what it
+    // applied. An older proxy sent the same capture as `template`.
+    advertisedTemplate: describeTemplate('advertised_template' in raw ? raw.advertised_template : raw.template),
+    renderedPrompt: describeRenderedPrompt(raw.rendered_prompt, 'rendered_prompt' in raw),
   }
 }
 
@@ -278,25 +297,49 @@ export function comparisonCaveats(comparison) {
         `${side.label || 'a node'} did not repeat itself${count ? ` (${count} distinct answers)` : ''}.`,
       )
     }
-    if (side.template.kind === 'not_exposed') {
+    if (side.advertisedTemplate.kind === 'not_exposed') {
       caveats.push(`${side.label || 'a node'} runs an engine that exposes no prompt template.`)
     }
-    if (side.template.kind === 'unavailable') {
-      caveats.push(`${side.label || 'a node'} did not return its template.`)
+    if (side.advertisedTemplate.kind === 'unavailable') {
+      caveats.push(`${side.label || 'a node'} did not return its advertised template.`)
     }
   }
   return caveats
 }
 
-/* The two templates, when both were captured and actually differ. This is the
- * explanation the whole screen exists to surface, so it is only offered when
- * there really are two of them to compare. */
+/* The two advertised templates, when both were captured. `unexplained` marks
+ * the case a reader most easily gets wrong: the same template on both sides
+ * beside an established difference, which that template cannot explain. */
 export function templateDivergence(comparison) {
-  const left = comparison?.left?.template
-  const right = comparison?.right?.template
+  const left = comparison?.left?.advertisedTemplate
+  const right = comparison?.right?.advertisedTemplate
   if (left?.kind !== 'captured' || right?.kind !== 'captured') return null
-  if (left.template === right.template) return { differ: false, left, right }
-  return { differ: true, left, right }
+  const differ = left.template !== right.template
+  return { differ, unexplained: !differ && comparison?.verdict?.kind === 'divergent', left, right }
+}
+
+/* What may be said about the advertised templates. An advertised template is
+ * what an engine publishes, not the prompt it built, so none of these calls it
+ * the template applied. */
+export function advertisedTemplateNote(comparison) {
+  const templates = templateDivergence(comparison)
+  if (!templates) return null
+  if (templates.unexplained) {
+    return 'Both nodes advertise byte-identical chat templates, so the advertised template does not explain this difference.'
+  }
+  if (templates.differ) {
+    return 'The two nodes advertise different chat templates. An advertised template is not proof of the prompt an '
+      + 'engine built; only a rendered prompt shows that.'
+  }
+  return 'Both nodes advertise the same chat template.'
+}
+
+/* The two rendered prompts, when both were captured. */
+export function renderedPromptComparison(comparison) {
+  const left = comparison?.left?.renderedPrompt
+  const right = comparison?.right?.renderedPrompt
+  if (left?.kind !== 'captured' || right?.kind !== 'captured') return null
+  return { same: left.text === right.text }
 }
 
 /* What a node can be asked about, for the model picker.

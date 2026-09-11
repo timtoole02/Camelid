@@ -207,7 +207,7 @@ pub(crate) fn complete(
 ) -> Result<Answer, String> {
     let body = serde_json::json!({
         "model": ask.model,
-        "messages": [{ "role": "user", "content": ask.prompt }],
+        "messages": ask.messages(),
         "temperature": ask.temperature,
         "max_tokens": ask.max_tokens,
         "stream": false,

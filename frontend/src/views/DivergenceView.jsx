@@ -5,6 +5,7 @@ import { useDivergence } from '../hooks/useDivergence.js'
 import { useFabric } from '../hooks/useFabric.js'
 import {
   COMPARE_MAX_TOKENS,
+  advertisedTemplateNote,
   buildCompareRequest,
   comparisonCaveats,
   identityStatement,
@@ -12,6 +13,7 @@ import {
   modelChoices,
   modelLooksAbsent,
   needsIdentityAssertion,
+  renderedPromptComparison,
   reportedModelMismatch,
   templateDivergence,
   tokenCapStatement,
@@ -279,14 +281,38 @@ function Side({ side }) {
 
 function Template({ side }) {
   if (!side) return null
-  const { kind, source, template, detail } = side.template
+  const { kind, source, template, detail } = side.advertisedTemplate
   return (
     <section className="divergence-template" data-template-kind={kind || 'unknown'}>
-      <h4>{side.label} · {kind === 'captured' ? source : 'no template'}</h4>
+      <h4>{side.label} · {kind === 'captured' ? `advertised via ${source}` : 'no advertised template'}</h4>
       {kind === 'captured' && <pre>{template}</pre>}
       {kind === 'not_exposed' && <p className="divergence-note">{detail}</p>}
       {kind === 'unavailable' && <p className="divergence-note">Could not be read: {detail}</p>}
       {!kind && <p className="divergence-note"><Unknown why="The proxy sent a template kind this build does not recognise." /></p>}
+    </section>
+  )
+}
+
+/* The prompt an engine built from the messages this comparison sent, which is
+   the only thing on this page that shows what an engine applied. */
+function Rendered({ side }) {
+  if (!side) return null
+  const { kind, reported, source, text, reason } = side.renderedPrompt
+  return (
+    <section
+      className="divergence-template"
+      data-testid={`rendered-${side.label || 'unlabelled'}`}
+      data-rendered-kind={kind || (reported ? 'unknown' : 'not_reported')}
+    >
+      <h4>{side.label} · {kind === 'captured' ? `rendered via ${source}` : 'not captured'}</h4>
+      {kind === 'captured' && <pre>{text}</pre>}
+      {kind === 'unavailable' && <p className="divergence-note">{reason}</p>}
+      {!kind && reported && <p className="divergence-note"><Unknown why="The proxy sent a rendered-prompt kind this build does not recognise." /></p>}
+      {!reported && (
+        <p className="divergence-note">
+          <Unknown why="This proxy predates rendered prompts, so it captured none.">not reported</Unknown>
+        </p>
+      )}
     </section>
   )
 }
@@ -331,6 +357,8 @@ export default function DivergenceView() {
 
   const caveats = comparison ? comparisonCaveats(comparison) : []
   const templates = comparison ? templateDivergence(comparison) : null
+  const templateNote = comparison ? advertisedTemplateNote(comparison) : null
+  const rendered = comparison ? renderedPromptComparison(comparison) : null
   const identity = comparison ? identityStatement(comparison) : null
   const cap = comparison ? tokenCapStatement(comparison, requested?.max_tokens ?? null) : null
   const problemMessage = problem ? problemText(problem) : null
@@ -344,8 +372,8 @@ export default function DivergenceView() {
         <h1>Compare two nodes</h1>
         <p className="divergence__lede">
           The same prompt on two machines. This never says which answer is correct — it reports
-          what differed, how both sides were sampled, and, where the engine exposes one, the chat
-          template each applied.
+          what differed, how both sides were sampled, the chat template each engine advertises and,
+          where an engine can render one without generating, the exact prompt it built.
         </p>
       </header>
 
@@ -503,19 +531,38 @@ export default function DivergenceView() {
             {!comparison.diff.kind && <p className="divergence-note"><Unknown why="The proxy sent a diff shape this build does not recognise." /></p>}
           </section>
 
-          <section className="divergence__templates">
-            <h2>Templates applied</h2>
-            {templates?.differ && (
-              <p className="divergence-note divergence-note--strong">
-                These two templates are not the same, which is usually the explanation.
+          <section className="divergence__templates" data-testid="divergence-templates">
+            <h2>Advertised chat templates</h2>
+            <p className="divergence-note">
+              What each engine publishes as this model&apos;s template. Not proof of the prompt it built.
+            </p>
+            {templateNote && (
+              <p
+                className={`divergence-note${templates?.differ || templates?.unexplained ? ' divergence-note--strong' : ''}`}
+                data-testid="divergence-template-note"
+                data-unexplained={String(Boolean(templates?.unexplained))}
+              >
+                {templateNote}
               </p>
-            )}
-            {templates && !templates.differ && (
-              <p className="divergence-note">Both nodes applied the same template.</p>
             )}
             <div className="divergence__sides">
               <Template side={comparison.left} />
               <Template side={comparison.right} />
+            </div>
+          </section>
+
+          <section className="divergence__templates" data-testid="divergence-rendered">
+            <h2>Rendered prompts</h2>
+            <p className="divergence-note">
+              The prompt each engine built from exactly the messages this comparison sent — the only
+              evidence here of what an engine applied.
+              {rendered && (rendered.same
+                ? ' Both rendered prompts are byte-identical.'
+                : ' The two rendered prompts differ.')}
+            </p>
+            <div className="divergence__sides">
+              <Rendered side={comparison.left} />
+              <Rendered side={comparison.right} />
             </div>
           </section>
         </>

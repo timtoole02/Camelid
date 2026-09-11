@@ -39,6 +39,8 @@ struct Received {
     path: String,
     /// The `Authorization` header verbatim, or `None` if there was none.
     authorization: Option<String>,
+    /// Kept so a test can show two requests carried the same conversation.
+    body: String,
 }
 
 /// Answers a fixed set of paths from canned bodies, and 404s everything else.
@@ -126,6 +128,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Received> {
                 return Some(Received {
                     path: head.lines().next()?.split_whitespace().nth(1)?.to_string(),
                     authorization: header("authorization"),
+                    body: String::from_utf8_lossy(&raw[end + 4..end + 4 + length]).to_string(),
                 });
             }
         }
@@ -744,5 +747,84 @@ fn each_engine_s_answer_is_read_for_the_model_it_names() {
         unnamed.verdict,
         Verdict::Identical,
         "naming nothing is not evidence of a swap"
+    );
+}
+
+/// C1. What a Camelid side applied is read from `/apply-template`, rendered
+/// from exactly the messages its generations were sent. An engine with no
+/// such route says so, rather than letting its advertised template stand in.
+#[test]
+fn a_rendered_prompt_is_rendered_from_the_messages_the_comparison_sent() {
+    use camelid::fabric::{RenderedPrompt, SamplingPlan, TemplateEvidence, Verdict};
+
+    let camelid = StubEngine::start(HashMap::from([
+        ("/v1/health", camelid_health("m")),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"m","choices":[{"message":{"role":"assistant","content":"Hi!"}}]}"#
+                .to_string(),
+        ),
+        (
+            "/apply-template",
+            r#"{"prompt":"<|start_header_id|>user<|end_header_id|>\n\nSay hi.<|eot_id|>"}"#
+                .to_string(),
+        ),
+        ("/props", r#"{"chat_template":"{{ same }}"}"#.to_string()),
+    ]));
+    let studio = StubEngine::start(with_body(
+        with_body(
+            ollama_bodies(&["m"], &["m"]),
+            "/api/chat",
+            r#"{"model":"m","message":{"role":"assistant","content":"Hi. How can I assist you today?"},"done":true}"#,
+        ),
+        "/api/show",
+        r#"{"template":"{{ same }}"}"#,
+    ));
+    let fabric = Fabric::new(vec![
+        camelid.spec("win", "camelid"),
+        studio.spec("studio", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare_model("win", "studio", "m", "Say hi.", SamplingPlan::default())
+        .expect("both sides answered");
+
+    match &comparison.left.rendered_prompt {
+        RenderedPrompt::Captured { source, text } => {
+            assert_eq!(source, "POST /apply-template");
+            assert!(text.contains("Say hi."), "{text}");
+        }
+        other => panic!("a Camelid side renders its prompt: {other:?}"),
+    }
+    let received = camelid.received();
+    let messages_sent_to = |path: &str| -> serde_json::Value {
+        let request = received
+            .iter()
+            .find(|request| request.path == path)
+            .unwrap_or_else(|| panic!("{path} was never asked: {received:?}"));
+        serde_json::from_str::<serde_json::Value>(&request.body).expect("a JSON body")["messages"]
+            .clone()
+    };
+    assert_eq!(
+        messages_sent_to("/apply-template"),
+        messages_sent_to("/v1/chat/completions"),
+        "a render of another conversation says nothing about this one"
+    );
+
+    match &comparison.right.rendered_prompt {
+        RenderedPrompt::Unavailable { reason } => {
+            assert!(reason.contains("no route that renders"), "{reason}")
+        }
+        other => panic!("Ollama publishes no render route: {other:?}"),
+    }
+    assert!(matches!(
+        comparison.right.advertised_template,
+        TemplateEvidence::Captured { .. }
+    ));
+    assert_eq!(comparison.verdict, Verdict::Divergent);
+    assert!(
+        comparison.unexplained_by_advertised_template().is_some(),
+        "identical advertised templates cannot explain this divergence"
     );
 }

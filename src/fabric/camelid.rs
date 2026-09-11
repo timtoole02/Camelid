@@ -85,7 +85,7 @@ pub(crate) fn complete(
 ) -> Result<Answer, String> {
     let mut body = serde_json::json!({
         "model": ask.model,
-        "messages": [{ "role": "user", "content": ask.prompt }],
+        "messages": ask.messages(),
         "temperature": ask.temperature,
         "max_tokens": ask.max_tokens,
         "stream": false,
@@ -120,12 +120,52 @@ pub(crate) fn complete(
 }
 
 #[derive(Debug, Deserialize)]
+struct RenderedPayload {
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// The prompt this node renders for the question, from `POST /apply-template`,
+/// which renders without generating.
+///
+/// Sent exactly the messages [`complete`] sends, because a render of any
+/// other conversation says nothing about the comparison. It renders for the
+/// node's active model, which for a Camelid node is the only one its health
+/// lists, so it is the model the comparison asked for. It renders with
+/// thinking off, which is also what a chat request that does not ask for
+/// thinking gets.
+pub(crate) fn rendered_prompt(
+    spec: &NodeSpec,
+    ask: &super::divergence::Ask<'_>,
+    bearer: Option<&str>,
+    timeout: Duration,
+    transport: &NodeTransport,
+) -> Result<String, String> {
+    let body = serde_json::json!({ "messages": ask.messages() });
+    let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+    let raw = request(
+        spec,
+        "POST",
+        "/apply-template",
+        Some(&encoded),
+        bearer,
+        timeout,
+        transport,
+    )?;
+    let payload: RenderedPayload = serde_json::from_slice(&raw)
+        .map_err(|error| format!("/apply-template was not readable: {error}"))?;
+    payload
+        .prompt
+        .ok_or_else(|| "/apply-template answered without a prompt".to_string())
+}
+
+#[derive(Debug, Deserialize)]
 struct PropsPayload {
     #[serde(default)]
     chat_template: Option<String>,
 }
 
-/// The chat template this node has loaded, from `GET /props`.
+/// The chat template this node advertises, from `GET /props`.
 pub(crate) fn template(
     spec: &NodeSpec,
     bearer: Option<&str>,

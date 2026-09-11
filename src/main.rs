@@ -1547,7 +1547,10 @@ fn compare_temperature(raw: &str) -> Result<f32, String> {
 /// the thing a reader will over-interpret. Nothing here ranks the two sides.
 /// Built as a string so what a terminal is shown is covered by a test.
 fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
-    use camelid::fabric::{Diff, Eol, ModelIdentity, Op, Stability, TemplateEvidence, Verdict};
+    use camelid::fabric::{
+        Diff, Eol, ModelIdentity, Op, RenderedPrompt, Stability, TemplateEvidence, TextMatch,
+        Verdict,
+    };
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -1637,16 +1640,29 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
                 say!("   run once, so self-consistency was never tested")
             }
         }
-        match &side.template {
+        // What an engine advertises is not what it applied; only the rendered
+        // prompt shows that, so the two are printed under different names.
+        match &side.advertised_template {
             TemplateEvidence::Captured { source, template } => {
-                say!("   template via {source}:");
+                say!("   advertised template via {source}:");
                 for line in template.lines() {
                     say!("     {line}");
                 }
             }
-            TemplateEvidence::NotExposed { detail } => say!("   template: {detail}"),
+            TemplateEvidence::NotExposed { detail } => say!("   advertised template: {detail}"),
             TemplateEvidence::Unavailable { detail } => {
-                say!("   template could not be read: {detail}")
+                say!("   advertised template could not be read: {detail}")
+            }
+        }
+        match &side.rendered_prompt {
+            RenderedPrompt::Captured { source, text } => {
+                say!("   rendered prompt via {source}, from the messages this comparison sent:");
+                for line in text.lines() {
+                    say!("     {line}");
+                }
+            }
+            RenderedPrompt::Unavailable { reason } => {
+                say!("   rendered prompt: not captured — {reason}")
             }
         }
         for (index, sample) in side.samples.iter().enumerate() {
@@ -1654,6 +1670,20 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
             for line in sample.text.lines() {
                 say!("     {line}");
             }
+        }
+    }
+
+    say!();
+    if let Some(note) = comparison.unexplained_by_advertised_template() {
+        say!("NOTE: {note}");
+    } else if comparison.advertised_templates() == TextMatch::Different {
+        say!("NOTE: the advertised chat templates differ; an advertised template is not proof of the prompt an engine rendered");
+    }
+    match comparison.rendered_prompts() {
+        TextMatch::Identical => say!("rendered prompts: byte-identical on both sides"),
+        TextMatch::Different => say!("rendered prompts: they differ"),
+        TextMatch::NotComparable => {
+            say!("rendered prompts: not captured on both sides, so the prompts the engines built are not compared")
         }
     }
 
@@ -1881,8 +1911,10 @@ enum FabricAction {
     /// with itself.
     ///
     /// It never says which answer is correct. It reports difference, how the
-    /// two sides were sampled, and — where the engine exposes one — the chat
-    /// template each applied, which is usually the explanation.
+    /// two sides were sampled, the chat template each engine advertises, and —
+    /// where the engine can render one without generating — the prompt it
+    /// actually built from the messages sent. Only the rendered prompt shows
+    /// what an engine applied; an advertised template does not.
     Compare {
         #[arg(
             long = "node",
@@ -2236,10 +2268,76 @@ mod fabric_command_tests {
             applied_sampling: camelid::fabric::AppliedSampling::for_engine(engine),
             stability: camelid::fabric::divergence::stability_of(&samples),
             samples,
-            template: camelid::fabric::TemplateEvidence::NotExposed {
+            advertised_template: camelid::fabric::TemplateEvidence::NotExposed {
                 detail: "test".to_string(),
             },
+            rendered_prompt: camelid::fabric::RenderedPrompt::Unavailable {
+                reason: "test".to_string(),
+            },
         }
+    }
+
+    /// C1. The terminal must never present a captured template as the one an
+    /// engine applied: only a rendered prompt is that, and it is printed under
+    /// its own name.
+    #[test]
+    fn an_advertised_template_is_never_printed_as_the_one_applied() {
+        use camelid::fabric::{
+            conclude, ModelIdentity, NodeEngine, RenderedPrompt, SamplingPlan, TemplateEvidence,
+        };
+        let template = TemplateEvidence::Captured {
+            source: "GET /props".to_string(),
+            template: "{{ same }}".to_string(),
+        };
+        let mut left = answered("win", NodeEngine::Camelid, "Hi!");
+        left.advertised_template = template.clone();
+        left.rendered_prompt = RenderedPrompt::Captured {
+            source: "POST /apply-template".to_string(),
+            text: "<|user|>Say hi.".to_string(),
+        };
+        let mut right = answered(
+            "studio",
+            NodeEngine::Ollama,
+            "Hi. How can I assist you today?",
+        );
+        right.advertised_template = TemplateEvidence::Captured {
+            source: "POST /api/show".to_string(),
+            template: "{{ same }}".to_string(),
+        };
+        let rendered = render_comparison(&conclude(
+            "Say hi.",
+            SamplingPlan::default(),
+            left,
+            right,
+            ModelIdentity::SameId,
+        ));
+
+        assert!(rendered.starts_with("DIVERGENT"), "{rendered}");
+        assert!(
+            rendered.contains("advertised template via GET /props:")
+                && rendered.contains("advertised template via POST /api/show:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "rendered prompt via POST /apply-template, from the messages this comparison sent:\n     <|user|>Say hi."
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("rendered prompt: not captured — test"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("applied"),
+            "only a rendered prompt shows what an engine applied: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "NOTE: both nodes advertise byte-identical chat templates, so the advertised template does not explain this difference"
+            ),
+            "{rendered}"
+        );
     }
 
     /// Measured live: a newline on one side only was reported DIVERGENT beside

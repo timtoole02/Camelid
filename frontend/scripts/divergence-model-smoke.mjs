@@ -9,6 +9,7 @@
  */
 import assert from 'node:assert/strict'
 import {
+  advertisedTemplateNote,
   buildCompareRequest,
   comparisonCaveats,
   describeComparison,
@@ -17,6 +18,7 @@ import {
   modelChoices,
   modelLooksAbsent,
   needsIdentityAssertion,
+  renderedPromptComparison,
   reportedModelMismatch,
   templateDivergence,
   tokenCapStatement,
@@ -52,7 +54,8 @@ function side(overrides = {}) {
       { text: '12', sha256: 'aa', elapsed_ms: 28 },
     ],
     stability: { kind: 'stable' },
-    template: { kind: 'captured', source: 'GET /props', template: CAMELID_TEMPLATE },
+    advertised_template: { kind: 'captured', source: 'GET /props', template: CAMELID_TEMPLATE },
+    rendered_prompt: { kind: 'captured', source: 'POST /apply-template', text: '<|user|>What is 7 plus 5?' },
     ...overrides,
   }
 }
@@ -71,7 +74,8 @@ function body(overrides = {}) {
         { text: '7', sha256: 'bb', elapsed_ms: 41 },
         { text: '7', sha256: 'bb', elapsed_ms: 39 },
       ],
-      template: { kind: 'captured', source: 'POST /api/show', template: OLLAMA_TEMPLATE },
+      advertised_template: { kind: 'captured', source: 'POST /api/show', template: OLLAMA_TEMPLATE },
+      rendered_prompt: { kind: 'unavailable', reason: "Ollama's documented API has no route that renders a chat prompt without generating" },
     }),
     verdict: { kind: 'divergent' },
     diff: {
@@ -102,6 +106,63 @@ check('the two templates are offered as the explanation only when both were capt
   assert.equal(divergence.differ, true)
   assert.equal(divergence.left.source, 'GET /props')
   assert.equal(divergence.right.source, 'POST /api/show')
+})
+
+/* ---- advertised is not applied (C1) ---- */
+
+check('identical advertised templates beside a divergence are said not to explain it', () => {
+  const comparison = describeComparison(body({
+    right: side({
+      label: 'studio',
+      engine: 'ollama',
+      samples: [{ text: 'Hi. How can I assist you today?', sha256: 'bb', elapsed_ms: 41 }, { text: 'Hi. How can I assist you today?', sha256: 'bb', elapsed_ms: 39 }],
+      advertised_template: { kind: 'captured', source: 'POST /api/show', template: CAMELID_TEMPLATE },
+    }),
+  }))
+  const templates = templateDivergence(comparison)
+  assert.equal(templates.differ, false)
+  assert.equal(templates.unexplained, true)
+  assert.match(advertisedTemplateNote(comparison), /does not explain this difference/)
+  const agreeing = describeComparison(body({ verdict: { kind: 'identical' }, right: side({ label: 'mac' }) }))
+  assert.equal(templateDivergence(agreeing).unexplained, false, 'only a divergence can be left unexplained')
+})
+
+check('no note about templates ever calls an advertised template applied', () => {
+  const cases = [
+    body(),
+    body({ right: side({ label: 'mac', advertised_template: { kind: 'captured', source: 'GET /props', template: CAMELID_TEMPLATE } }) }),
+    body({ verdict: { kind: 'identical' }, right: side({ label: 'mac' }) }),
+  ]
+  for (const raw of cases) {
+    const note = advertisedTemplateNote(describeComparison(raw))
+    assert.ok(note, 'both templates were captured, so something is said')
+    assert.doesNotMatch(note, /\bappl(y|ied)\b/i, note)
+  }
+})
+
+check('an older proxy\'s template is read as advertised, and its rendered prompt as not reported', () => {
+  const legacySide = side()
+  legacySide.template = legacySide.advertised_template
+  delete legacySide.advertised_template
+  delete legacySide.rendered_prompt
+  const comparison = describeComparison(body({ left: legacySide }))
+  assert.equal(comparison.left.advertisedTemplate.kind, 'captured', 'the old capture was always the advertised one')
+  assert.equal(comparison.left.advertisedTemplate.source, 'GET /props')
+  assert.equal(comparison.left.renderedPrompt.reported, false)
+  assert.equal(comparison.left.renderedPrompt.kind, null, 'absent is not "could not be captured"')
+})
+
+check('a rendered prompt keeps its source and text, and one not taken keeps its reason', () => {
+  const comparison = describeComparison(body())
+  assert.deepEqual(
+    [comparison.left.renderedPrompt.kind, comparison.left.renderedPrompt.source, comparison.left.renderedPrompt.text],
+    ['captured', 'POST /apply-template', '<|user|>What is 7 plus 5?'],
+  )
+  assert.equal(comparison.right.renderedPrompt.kind, 'unavailable')
+  assert.match(comparison.right.renderedPrompt.reason, /no route that renders/)
+  assert.equal(renderedPromptComparison(comparison), null, 'one render is not a comparison of two')
+  const both = describeComparison(body({ right: side({ label: 'mac' }) }))
+  assert.deepEqual(renderedPromptComparison(both), { same: true })
 })
 
 /* ---- refusals to conclude are not differences ---- */
@@ -177,7 +238,7 @@ check('an engine with no seed parameter is disclosed even on an attributable ver
         { text: '7', sha256: 'bb', elapsed_ms: 41 },
         { text: '7', sha256: 'bb', elapsed_ms: 39 },
       ],
-      template: { kind: 'not_exposed', detail: "LM Studio's documented API exposes no prompt template" },
+      advertised_template: { kind: 'not_exposed', detail: "LM Studio's documented API exposes no prompt template" },
     }),
     uncontrolled: ['seed'],
   }))
@@ -227,10 +288,10 @@ check('a malformed comparison yields nulls rather than invented structure', () =
 
 check('an unrecognised stability or template kind is null rather than the nearest known one', () => {
   const comparison = describeComparison(body({
-    left: side({ stability: { kind: 'probably_stable' }, template: { kind: 'inferred', template: 'x' } }),
+    left: side({ stability: { kind: 'probably_stable' }, advertised_template: { kind: 'inferred', template: 'x' } }),
   }))
   assert.equal(comparison.left.stability.kind, null)
-  assert.equal(comparison.left.template.kind, null)
+  assert.equal(comparison.left.advertisedTemplate.kind, null)
   assert.equal(comparison.left.settledDigest, null, 'only a known-stable side has a settled digest')
   assert.equal(templateDivergence(comparison), null)
 })

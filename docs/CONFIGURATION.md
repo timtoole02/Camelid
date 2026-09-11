@@ -537,14 +537,20 @@ carries `model_identity: asserted_by_operator`, lists `model identity` among the
 variables, and prints `MODEL IDENTITY ASSERTED, NOT VERIFIED`. Nothing here checks that the weights
 match, and the output never pretends otherwise.
 
-Where the engine exposes it, the chat template each backend applied is captured too — usually the
-actual explanation for a divergence:
+Two different things are captured about each side's prompt, and they are never presented as one:
 
-| Engine | Template source |
-|---|---|
-| Camelid | `GET /props` → `chat_template` |
-| Ollama | `POST /api/show` → `template` |
-| LM Studio | **none** — its documented API exposes no prompt template, reported as such rather than as an empty one |
+| Engine | Advertised template (`advertised_template`) | Rendered prompt (`rendered_prompt`) |
+|---|---|---|
+| Camelid | `GET /props` → `chat_template` | `POST /apply-template` with exactly the messages the comparison sent |
+| Ollama | `POST /api/show` → `template` | **not captured** — no documented route renders a chat prompt without generating |
+| LM Studio | **none** — its documented API exposes no prompt template, reported as such rather than as an empty one | **not captured**, for the same reason |
+
+The advertised template is the text an engine *publishes* as the model's template. It is not
+evidence of what the engine applied: measured on one GGUF, Camelid and Ollama advertised
+byte-identical templates, Camelid's own renderer still built a prompt without the system block that
+template emits, and the two answered "Say hi." differently. Only a rendered prompt shows the text an
+engine built. When both advertised templates are byte-identical and the verdict is `divergent`, the
+result says outright that the advertised template does not explain the difference.
 
 An exposed proxy therefore looks like this:
 

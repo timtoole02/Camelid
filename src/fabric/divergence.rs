@@ -3,8 +3,8 @@
 //!
 //! This is the part of the fabric that exists because of a measured fact: an
 //! identical GGUF, asked *"What is 7 plus 5?"* greedily, answers **12** on
-//! Camelid and **7** on llama.cpp / Ollama / LM Studio, because the backends
-//! apply different chat templates. Mixed-engine routing makes that our problem;
+//! Camelid and **7** on llama.cpp / Ollama / LM Studio, a difference traced to
+//! the prompts the backends build. Mixed-engine routing makes that our problem;
 //! this module makes it visible instead of deniable.
 //!
 //! Four rules do the real work, and every one of them exists to stop a
@@ -46,6 +46,17 @@ pub(crate) struct Ask<'a> {
     pub(crate) temperature: f32,
     pub(crate) seed: Option<u64>,
     pub(crate) max_tokens: u32,
+}
+
+impl Ask<'_> {
+    /// The chat messages every adapter sends for this question.
+    ///
+    /// One definition, because a rendered prompt is only evidence about a
+    /// comparison when it was rendered from exactly the messages that
+    /// comparison generated from.
+    pub(crate) fn messages(&self) -> serde_json::Value {
+        serde_json::json!([{ "role": "user", "content": self.prompt }])
+    }
 }
 
 /// One reply, as the engine itself described it.
@@ -211,7 +222,14 @@ pub enum Stability {
     Unmeasured,
 }
 
-/// The template a backend applied, where it can be obtained at all.
+/// The chat template an engine **advertises** for a model: the text it
+/// publishes as that model's template, where it publishes one at all.
+///
+/// Never evidence of what the engine applied. Measured live: Camelid and
+/// Ollama advertised byte-identical templates for one GGUF, and Camelid's own
+/// renderer still produced a prompt without the system block that template
+/// emits. What an engine applied is only shown by a rendered prompt; see
+/// [`RenderedPrompt`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TemplateEvidence {
@@ -226,6 +244,24 @@ pub enum TemplateEvidence {
     /// We asked and the request failed.
     Unavailable {
         detail: String,
+    },
+}
+
+/// The prompt an engine rendered from exactly the messages a comparison sent,
+/// without generating from it.
+///
+/// This, and not [`TemplateEvidence`], is what shows the text an engine built.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderedPrompt {
+    Captured {
+        source: String,
+        text: String,
+    },
+    /// No render was obtained. The reason says whether the engine has no way
+    /// to render without generating or whether asking failed.
+    Unavailable {
+        reason: String,
     },
 }
 
@@ -251,7 +287,11 @@ pub struct Side {
     pub applied_sampling: AppliedSampling,
     pub samples: Vec<Sample>,
     pub stability: Stability,
-    pub template: TemplateEvidence,
+    /// Named for what it is on the wire as well. It was `template` beside a
+    /// view titled "templates applied", and a reader took the advertised text
+    /// for the prompt the engine built.
+    pub advertised_template: TemplateEvidence,
+    pub rendered_prompt: RenderedPrompt,
 }
 
 impl Side {
@@ -346,6 +386,62 @@ pub struct Comparison {
     /// Controls the plan asked for that at least one side could not honour.
     /// Empty when both sides were fully controlled.
     pub uncontrolled: Vec<String>,
+}
+
+/// Whether two captured texts are the same bytes, when both were captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextMatch {
+    Identical,
+    Different,
+    /// At least one side has no captured text, so nothing can be said.
+    NotComparable,
+}
+
+impl Comparison {
+    /// How the two advertised templates compare.
+    pub fn advertised_templates(&self) -> TextMatch {
+        match (
+            &self.left.advertised_template,
+            &self.right.advertised_template,
+        ) {
+            (
+                TemplateEvidence::Captured { template: l, .. },
+                TemplateEvidence::Captured { template: r, .. },
+            ) => text_match(l, r),
+            _ => TextMatch::NotComparable,
+        }
+    }
+
+    /// How the two rendered prompts compare.
+    pub fn rendered_prompts(&self) -> TextMatch {
+        match (&self.left.rendered_prompt, &self.right.rendered_prompt) {
+            (
+                RenderedPrompt::Captured { text: l, .. },
+                RenderedPrompt::Captured { text: r, .. },
+            ) => text_match(l, r),
+            _ => TextMatch::NotComparable,
+        }
+    }
+
+    /// The sentence a reader needs when the advertised templates cannot be
+    /// the explanation for an established difference.
+    ///
+    /// Without it, two identical templates shown beside a divergence invite
+    /// the reading that the templates were checked and are the cause.
+    pub fn unexplained_by_advertised_template(&self) -> Option<&'static str> {
+        (self.verdict == Verdict::Divergent && self.advertised_templates() == TextMatch::Identical)
+            .then_some(
+                "both nodes advertise byte-identical chat templates, so the advertised template does not explain this difference",
+            )
+    }
+}
+
+fn text_match(left: &str, right: &str) -> TextMatch {
+    if left == right {
+        TextMatch::Identical
+    } else {
+        TextMatch::Different
+    }
 }
 
 /// Build the verdict and diff from two completed sides.
@@ -499,10 +595,126 @@ mod tests {
             applied_sampling: AppliedSampling::for_engine(engine),
             stability: stability_of(&samples),
             samples,
-            template: TemplateEvidence::NotExposed {
+            advertised_template: TemplateEvidence::NotExposed {
                 detail: "test".to_string(),
             },
+            rendered_prompt: RenderedPrompt::Unavailable {
+                reason: "test".to_string(),
+            },
         }
+    }
+
+    fn advertising(mut side: Side, template: &str) -> Side {
+        side.advertised_template = TemplateEvidence::Captured {
+            source: "GET /props".to_string(),
+            template: template.to_string(),
+        };
+        side
+    }
+
+    /// C1. The captured template is what the engine publishes, and the wire
+    /// has to say so: under the old `template` key, beside a view titled
+    /// "templates applied", a reader took it for the prompt the engine built.
+    #[test]
+    fn a_captured_template_is_serialised_as_advertised_never_as_applied() {
+        let side = advertising(
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            "{{ x }}",
+        );
+        let wire = serde_json::to_value(&side).expect("serialises");
+        let object = wire.as_object().expect("an object");
+        assert_eq!(
+            wire["advertised_template"]["kind"], "captured",
+            "the capture travels under its own name: {wire}"
+        );
+        assert!(
+            !object.contains_key("template"),
+            "an unqualified `template` key reads as the one applied: {wire}"
+        );
+        for key in object.keys() {
+            assert!(
+                key == "applied_sampling" || !key.contains("applied"),
+                "nothing but a rendered prompt may be called applied: {key}"
+            );
+        }
+        assert_eq!(wire["rendered_prompt"]["kind"], "unavailable");
+    }
+
+    /// The live receipt: byte-identical advertised templates, and still a
+    /// divergence. The comparison has to say the template is not the cause.
+    #[test]
+    fn identical_advertised_templates_beside_a_divergence_are_said_not_to_explain_it() {
+        let comparison = conclude(
+            "Say hi.",
+            SamplingPlan::default(),
+            advertising(
+                side("win", NodeEngine::Camelid, "m", &["Hi!", "Hi!"]),
+                "{{ same }}",
+            ),
+            advertising(
+                side(
+                    "studio",
+                    NodeEngine::Ollama,
+                    "m",
+                    &["Hi. How can I assist you today?"; 2],
+                ),
+                "{{ same }}",
+            ),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(comparison.verdict, Verdict::Divergent);
+        assert_eq!(comparison.advertised_templates(), TextMatch::Identical);
+        let note = comparison
+            .unexplained_by_advertised_template()
+            .expect("a divergence beside identical templates is called out");
+        assert!(note.contains("does not explain"), "{note}");
+    }
+
+    /// Paired: templates that differ, or a verdict that is not a divergence,
+    /// carry no such sentence.
+    #[test]
+    fn the_unexplained_note_appears_only_for_identical_templates_and_a_divergence() {
+        let differing = conclude(
+            "q",
+            SamplingPlan::default(),
+            advertising(
+                side("win", NodeEngine::Camelid, "m", &["a", "a"]),
+                "{{ l }}",
+            ),
+            advertising(
+                side("mac", NodeEngine::Camelid, "m", &["b", "b"]),
+                "{{ r }}",
+            ),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(differing.advertised_templates(), TextMatch::Different);
+        assert_eq!(differing.unexplained_by_advertised_template(), None);
+
+        let identical = conclude(
+            "q",
+            SamplingPlan::default(),
+            advertising(
+                side("win", NodeEngine::Camelid, "m", &["a", "a"]),
+                "{{ t }}",
+            ),
+            advertising(
+                side("mac", NodeEngine::Camelid, "m", &["a", "a"]),
+                "{{ t }}",
+            ),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(identical.verdict, Verdict::Identical);
+        assert_eq!(identical.unexplained_by_advertised_template(), None);
+
+        let uncaptured = conclude(
+            "q",
+            SamplingPlan::default(),
+            side("win", NodeEngine::Camelid, "m", &["a", "a"]),
+            side("mac", NodeEngine::Camelid, "m", &["b", "b"]),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(uncaptured.advertised_templates(), TextMatch::NotComparable);
+        assert_eq!(uncaptured.unexplained_by_advertised_template(), None);
     }
 
     #[test]

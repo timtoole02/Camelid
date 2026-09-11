@@ -184,7 +184,7 @@ pub(crate) fn complete(
     }
     let body = serde_json::json!({
         "model": ask.model,
-        "messages": [{ "role": "user", "content": ask.prompt }],
+        "messages": ask.messages(),
         "stream": false,
         "options": options,
     });
