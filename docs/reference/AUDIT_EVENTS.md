@@ -47,7 +47,8 @@ Both events share one JSON shape. `outcome` and `duration_ms` are `null` on
   "approval_tier": "confirm",        // tier applied: "auto" | "confirm" | "deny"
   "args_digest": "sha256:9f86d0…",   // SHA-256 of the canonical args JSON
   "outcome": "ok",                   // "ok" | "error" | null (null on tool_call)
-  "duration_ms": 12                  // execution wall time | null (null on tool_call)
+  "duration_ms": 12,                 // execution wall time | null (null on tool_call)
+  "images": 0                        // images the result carried | null (null on tool_call)
 }
 ```
 
@@ -66,6 +67,11 @@ Both events share one JSON shape. `outcome` and `duration_ms` are `null` on
   shell command, a read error), not a transport error. The raw output text is
   deliberately **not** included (it, too, can carry secrets or injected
   content).
+- **`images`** — how many images the tool result carried, and never the image
+  data itself, for the same reason the raw output text is excluded. A tool can
+  return image content (an MCP server's `image` blocks, for example); the count
+  makes that visible to an operator without putting an untrusted payload on the
+  audit path.
 - **`timestamp_unix_ms`** — wall-clock at event construction. The
   `tool_result` timestamp minus the `tool_call` timestamp will be close to, but
   is not authoritative for, `duration_ms`; use `duration_ms` for timing.

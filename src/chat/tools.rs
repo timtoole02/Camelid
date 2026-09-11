@@ -187,21 +187,67 @@ pub struct ToolCall {
     pub args: Value,
 }
 
+/// An image a tool produced, carried alongside its text.
+///
+/// Base64 rather than `Vec<u8>` on purpose: this rides inside the agent session
+/// file, where a byte vector serializes as a JSON integer array (~7x the size
+/// and unreadable), and the one decoder that would ever consume it wants a
+/// base64 data URL anyway. `mime` is constrained at the producer to the types
+/// that decoder accepts, so a tool cannot manufacture something unrepresentable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolImage {
+    pub mime: String,
+    pub data_base64: String,
+}
+
 /// The result of running a tool — text the model consumes as data.
+///
+/// `OkWith` is a success that also carries images. It is deliberately a third
+/// variant rather than a field on `Ok`: the two tuple variants stay
+/// byte-identical, so the ~137 construction sites and every `matches!` pattern
+/// in the tree keep compiling.
+///
+/// Test the success/failure axis with [`ToolOutcome::is_err`], never with
+/// `matches!(out, ToolOutcome::Ok(_))` — the latter is false for an
+/// image-bearing success.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutcome {
     Ok(String),
     Err(String),
+    OkWith {
+        text: String,
+        images: Vec<ToolImage>,
+    },
 }
 
 impl ToolOutcome {
     pub fn text(&self) -> &str {
         match self {
             ToolOutcome::Ok(s) | ToolOutcome::Err(s) => s,
+            ToolOutcome::OkWith { text, .. } => text,
         }
     }
     pub fn is_err(&self) -> bool {
         matches!(self, ToolOutcome::Err(_))
+    }
+
+    /// Images this outcome carries; empty for every text-only outcome, so
+    /// existing callers need no change.
+    pub fn images(&self) -> &[ToolImage] {
+        match self {
+            ToolOutcome::OkWith { images, .. } => images,
+            _ => &[],
+        }
+    }
+
+    /// Rebuild this outcome with new text, keeping any images. Use this instead
+    /// of reconstructing from `text()` + `is_err()`, which silently drops them.
+    pub fn with_text(self, text: String) -> Self {
+        match self {
+            ToolOutcome::Ok(_) => ToolOutcome::Ok(text),
+            ToolOutcome::Err(_) => ToolOutcome::Err(text),
+            ToolOutcome::OkWith { images, .. } => ToolOutcome::OkWith { text, images },
+        }
     }
 
     pub fn clipped(self, max_bytes: usize) -> Self {
@@ -219,6 +265,12 @@ impl ToolOutcome {
         match self {
             Self::Ok(text) => Self::Ok(clip_text(text)),
             Self::Err(text) => Self::Err(clip_text(text)),
+            // Clip the text, pass the images through: the byte budget exists to
+            // bound what the model reads, and an image is not read as text.
+            Self::OkWith { text, images } => Self::OkWith {
+                text: clip_text(text),
+                images,
+            },
         }
     }
 }
@@ -1301,7 +1353,14 @@ impl Action {
             // the same fenced tool-result path as every native tool.
             Action::McpCall { name, args } => {
                 match super::mcp::call_with_cancel(name, args, cancel) {
-                    Ok(text) => ToolOutcome::Ok(clip(&text)),
+                    Ok((text, images)) if images.is_empty() => ToolOutcome::Ok(clip(&text)),
+                    // The text is clipped as before; the images ride beside it
+                    // so the byte budget for what the model reads does not
+                    // destroy them. Nothing feeds them into a prompt yet.
+                    Ok((text, images)) => ToolOutcome::OkWith {
+                        text: clip(&text),
+                        images,
+                    },
                     Err(error) => ToolOutcome::Err(error),
                 }
             }
@@ -3949,6 +4008,78 @@ fn write_summary(path: &Path, content: &str) -> String {
             };
             format!("  create: {new_lines} lines\n{}{tail}", head.join("\n"))
         }
+    }
+}
+
+#[cfg(test)]
+mod outcome_image_tests {
+    use super::*;
+
+    fn with_image(text: &str) -> ToolOutcome {
+        ToolOutcome::OkWith {
+            text: text.to_string(),
+            images: vec![ToolImage {
+                mime: "image/png".to_string(),
+                data_base64: "aGVsbG8=".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn an_image_bearing_success_is_not_an_error() {
+        let out = with_image("done");
+        assert!(!out.is_err(), "OkWith is a success");
+        assert_eq!(out.text(), "done");
+        assert_eq!(out.images().len(), 1);
+    }
+
+    #[test]
+    fn text_only_outcomes_carry_no_images() {
+        assert!(ToolOutcome::Ok("x".into()).images().is_empty());
+        assert!(ToolOutcome::Err("x".into()).images().is_empty());
+    }
+
+    /// The observation byte cap exists to bound what the model READS. An image
+    /// is not read as text, so clipping must not destroy it — this is the path
+    /// every Workspace-profile result takes at 2 KiB.
+    #[test]
+    fn clipping_bounds_the_text_and_keeps_the_images() {
+        let clipped = with_image(&"a".repeat(10_000)).clipped(128);
+        assert!(clipped.text().len() <= 128, "text is bounded");
+        assert_eq!(clipped.images().len(), 1, "the image survives clipping");
+    }
+
+    /// Rebuilding from `text()` + `is_err()` is what silently dropped payloads;
+    /// `with_text` is the replacement and must preserve them.
+    #[test]
+    fn rebuilding_with_new_text_preserves_images_and_the_error_axis() {
+        let rebuilt = with_image("original").with_text("excerpt".into());
+        assert_eq!(rebuilt.text(), "excerpt");
+        assert_eq!(rebuilt.images().len(), 1);
+        assert!(!rebuilt.is_err());
+
+        assert!(ToolOutcome::Err("boom".into())
+            .with_text("clipped".into())
+            .is_err());
+        assert!(!ToolOutcome::Ok("fine".into())
+            .with_text("clipped".into())
+            .is_err());
+    }
+
+    /// Images are persisted to the agent session file, so the encoding has to
+    /// round-trip. Base64 rather than a byte vector keeps that file readable
+    /// and roughly 7x smaller than a JSON integer array would be.
+    #[test]
+    fn an_image_bearing_outcome_round_trips_through_json() {
+        let json = serde_json::to_string(&with_image("done")).unwrap();
+        assert!(
+            json.contains("aGVsbG8="),
+            "base64 stays a string in the session file: {json}"
+        );
+        let back: ToolOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.images().len(), 1);
+        assert_eq!(back.images()[0].mime, "image/png");
+        assert_eq!(back.text(), "done");
     }
 }
 
